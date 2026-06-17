@@ -1472,10 +1472,12 @@ function buildSessionRow(row, onDismiss) {
     ? Number(row.synced_to_height).toLocaleString()
     : "0";
   const target = row.target_height ? Number(row.target_height).toLocaleString() : "?";
+  const birthday =
+    row.birthday != null ? Number(row.birthday).toLocaleString() : "?";
   const meta = document.createElement("div");
   meta.className = "session-meta";
   meta.textContent =
-    `${row.network} · birthday ${Number(row.birthday).toLocaleString()} · ` +
+    `${row.network} · birthday ${birthday} · ` +
     `scanned ${synced} of ${target} · ${fmtRelativeTime(row.last_run_at_epoch_seconds)}`;
   info.appendChild(meta);
   li.appendChild(info);
@@ -1506,25 +1508,31 @@ function buildSessionRow(row, onDismiss) {
 async function refreshResumePanel() {
   const dataDir = $("data-dir").value.trim() || null;
   let rows = [];
+  let listOk = true;
   try {
     rows = await invoke("list_incomplete_sessions", { dataDir });
   } catch (err) {
     // Non-fatal — the user can still start a new scan from welcome.
+    listOk = false;
     console.warn("list_incomplete_sessions failed:", err);
     rows = [];
   }
   const dismissed = getDismissedSessions();
-  // Prune dismissals for sessions no longer reported as incomplete (completed,
-  // deleted, or under a different data dir) so the map can't grow unbounded.
-  const livePaths = new Set(rows.map((r) => r.workspace_path));
-  let pruned = false;
-  for (const path of Object.keys(dismissed)) {
-    if (!livePaths.has(path)) {
-      delete dismissed[path];
-      pruned = true;
+  // Prune dismissals for sessions no longer reported as incomplete (completed
+  // or deleted) so the map can't grow unbounded. Only when the listing
+  // succeeded: a transient backend error returns an empty list and must not be
+  // mistaken for "every session is gone" — that would wipe all dismissals.
+  if (listOk) {
+    const livePaths = new Set(rows.map((r) => r.workspace_path));
+    let pruned = false;
+    for (const path of Object.keys(dismissed)) {
+      if (!livePaths.has(path)) {
+        delete dismissed[path];
+        pruned = true;
+      }
     }
+    if (pruned) saveDismissedSessions(dismissed);
   }
-  if (pruned) saveDismissedSessions(dismissed);
   // Hide a dismissed session only while it has not advanced past the height it
   // was dismissed at; renewed progress brings it back.
   rows = rows.filter(
