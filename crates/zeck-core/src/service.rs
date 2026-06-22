@@ -427,7 +427,12 @@ fn build_sweep_proposal(
         .iter()
         .filter(|account| account.total_zatoshis > 0)
     {
-        let shielded_existing = account.sapling_zatoshis + account.orchard_zatoshis;
+        let shielded_existing = account
+            .sapling_zatoshis
+            .checked_add(account.orchard_zatoshis)
+            .ok_or_else(|| {
+                ZeckError::Internal("shielded balance overflowed the supported range".to_owned())
+            })?;
         let mut shielded_available = shielded_existing;
 
         if account.transparent_zatoshis > 0 {
@@ -905,7 +910,9 @@ fn build_donation_split_proposal(
     send_max_fee: u64,
     donation: u64,
 ) -> ZeckResult<Option<zcash_client_backend::proposal::Proposal<StandardFeeRule, ReceivedNoteId>>> {
-    let total_spendable = send_amount + send_max_fee;
+    let total_spendable = send_amount.checked_add(send_max_fee).ok_or_else(|| {
+        ZeckError::Internal("send amount plus fee overflowed the supported range".to_owned())
+    })?;
     // Iterative fee convergence: two fixed payments summing to
     // (total_spendable - fee) drive change to zero once the candidate fee
     // matches the proposal's computed fee. The extra output adds at most one
