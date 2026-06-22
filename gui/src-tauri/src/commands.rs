@@ -237,6 +237,43 @@ pub fn donation_address() -> String {
     argos_core::DONATION_ADDRESS.to_owned()
 }
 
+/// Exact set of external URLs the UI is allowed to open in the OS browser.
+///
+/// This is the egress allowlist that replaces the broad `opener:default`
+/// capability grant (audit Issue D). Code running in the webview can only open
+/// one of these exact URLs, so a future webview compromise cannot use the
+/// opener as a channel to exfiltrate the seed (e.g. opening a URL of the form
+/// `https://evil/?s=<seed>`). Keep this in sync with the `<a href>` links in
+/// `gui/src/*.html`. Adding a link there without adding it here means the link
+/// will silently fail to open, which is the intended fail-closed behavior.
+const ALLOWED_EXTERNAL_URLS: &[&str] = &[
+    "https://github.com/sovright/argos/discussions",
+    "https://github.com/zingolabs/zexcavator",
+    "https://leastauthority.com",
+    "https://signal.group/#CjQKIKE0kww-DmAPcnN92JPeSt7_e2YYyLOy11l1up_vHvC1EhDUYW2_t9TDKpeXh7lP2l5Q",
+    "https://sovright.com",
+    "https://www.theblock.co/post/175259/someone-is-clogging-up-the-zcash-blockchain-with-a-spam-attack",
+    "mailto:support@sovright.com",
+];
+
+/// Open an external URL in the OS default handler, but only if it is on the
+/// hard-coded allowlist. Replaces direct frontend access to the opener
+/// plugin's `open_url` (audit Issue D): the plugin is still invoked, but from
+/// Rust and only for vetted destinations, so the webview has no arbitrary
+/// outbound-egress primitive.
+#[tauri::command]
+pub fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    if !ALLOWED_EXTERNAL_URLS.contains(&url.as_str()) {
+        return Err(format!("refusing to open non-allowlisted URL: {url}"));
+    }
+
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub async fn estimate_birthday_from_date(
     date: String,
