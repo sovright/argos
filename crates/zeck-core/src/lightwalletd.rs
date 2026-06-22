@@ -169,9 +169,11 @@ pub fn validate_lightwalletd_network(network: ZeckNetwork, info: &LightdInfo) ->
             ZeckNetwork::Mainnet => MAINNET_SAPLING_ACTIVATION,
             ZeckNetwork::Testnet => TESTNET_SAPLING_ACTIVATION,
         };
-        if info.sapling_activation_height != 0
-            && info.sapling_activation_height != expected_activation
-        {
+        // Real lightwalletd servers always report the expected nonzero
+        // Sapling activation height. A reported height of 0 is rejected
+        // outright so a malicious or broken server cannot use it to bypass
+        // the height comparison below (audit Suggestion 5).
+        if info.sapling_activation_height != expected_activation {
             return Err(ZeckError::Lightwalletd(format!(
                 "server Sapling activation height {} does not match expected {} for {}",
                 info.sapling_activation_height,
@@ -327,6 +329,26 @@ mod tests {
             .expect_err("wrong chain should be rejected");
 
         assert!(err.to_string().contains("does not match selected mainnet"));
+    }
+
+    #[test]
+    fn network_validation_rejects_zero_sapling_activation_height() {
+        // A server reporting a Sapling activation height of 0 must be
+        // rejected: real servers always report the expected nonzero value,
+        // and allowing 0 would let a hostile server bypass the height check
+        // (audit Suggestion 5).
+        let info = LightdInfo {
+            chain_name: "test".to_owned(),
+            sapling_activation_height: 0,
+            ..LightdInfo::default()
+        };
+        let err = validate_lightwalletd_network(ZeckNetwork::Testnet, &info)
+            .expect_err("zero sapling activation height should be rejected");
+
+        assert!(
+            err.to_string().contains("Sapling activation height"),
+            "got: {err}"
+        );
     }
 
     // ─── argos-network feature flag ──────────────────────────────────────────
