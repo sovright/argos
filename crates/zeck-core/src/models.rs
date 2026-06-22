@@ -364,6 +364,26 @@ pub struct TxBroadcastResult {
     pub confirmed_height: Option<u32>,
 }
 
+/// Outcome of an `execute_sweep`, reported even when the sweep aborts partway.
+///
+/// A multi-account sweep broadcasts transactions one account at a time. If a
+/// later account fails after an earlier one has already been broadcast, the
+/// earlier transactions are on-chain and irreversible. `transactions` always
+/// lists every transaction that was broadcast — on full success and on a
+/// partial abort alike — so the caller never loses the record of funds that
+/// have already moved (audit Issue E).
+///
+/// `error` is `None` on full success and `Some(message)` when the sweep
+/// aborted after broadcasting the transactions in `transactions`. A failure
+/// *before any* transaction is broadcast is reported as an `Err` from
+/// `execute_sweep` instead, so an empty `transactions` with `error: Some` is
+/// never produced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepOutcome {
+    pub transactions: Vec<TxBroadcastResult>,
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

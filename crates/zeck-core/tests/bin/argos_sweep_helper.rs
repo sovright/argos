@@ -331,19 +331,22 @@ async fn main() {
     // to deliver SIGKILL before the next account is processed.
     //
     // We can't interleave a callback because `execute_sweep_with_test_pause`
-    // returns a `Vec<TxBroadcastResult>` only at the end. So we emit the
-    // broadcast events here after the sweep returns. For the SIGKILL test
-    // this is fine: the kill lands during the library's sleep, before the
-    // second broadcast happens, so the second broadcast is never produced and
-    // the loop never completes. The first broadcast's effect on the wallet DB
-    // is already committed before the sleep, which is exactly the invariant
-    // the test verifies.
+    // returns a `SweepOutcome` only at the end. So we emit the broadcast events
+    // here after the sweep returns. For the SIGKILL test this is fine: the kill
+    // lands during the library's sleep, before the second broadcast happens, so
+    // the second broadcast is never produced and the loop never completes. The
+    // first broadcast's effect on the wallet DB is already committed before the
+    // sleep, which is exactly the invariant the test verifies.
+    //
+    // A `SweepOutcome` carries `transactions` on both full success and a
+    // mid-sequence abort (audit Issue E); only a failure before any broadcast
+    // is an `Err`. Emit the broadcast records in either case.
     let pause = Duration::from_millis(args.pause_millis_between_broadcasts);
-    let results = match service
+    let outcome = match service
         .execute_sweep_with_test_pause(&handle, sweep_request, pause)
         .await
     {
-        Ok(r) => r,
+        Ok(outcome) => outcome,
         Err(err) => {
             emit(&HelperEvent::Error {
                 message: &err.to_string(),
@@ -352,7 +355,7 @@ async fn main() {
         }
     };
 
-    for r in &results {
+    for r in &outcome.transactions {
         emit(&HelperEvent::Broadcast {
             source_account: r.source_account,
             txid: r.txid.as_deref(),
@@ -362,7 +365,11 @@ async fn main() {
         });
     }
 
+    if let Some(message) = &outcome.error {
+        emit(&HelperEvent::Error { message });
+    }
+
     emit(&HelperEvent::SweepComplete {
-        broadcast_count: results.len(),
+        broadcast_count: outcome.transactions.len(),
     });
 }
