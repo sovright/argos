@@ -4,7 +4,7 @@
 
 ## 0. At a glance
 
-This section summarises the document for readers who don't have time for the full text. The detail lives in §1–§11 and is the source of truth.
+This section summarises the document for readers who don't have time for the full text. The detail lives in §1–§11 and is the source of truth. It is **assessment** content (the "Where we stand" column is a point-in-time judgement, per §1.1), not part of the stable threat model itself.
 
 ### If you're in a hurry
 
@@ -47,6 +47,15 @@ This threat model covers:
 - the build / release / distribution pipeline (GitHub Actions, Vercel marketing site, signed installers)
 
 It does **not** cover the security of the user's host operating system, the user's destination wallet, the lightwalletd nodes operated by third parties, or the Zcash consensus protocol itself.
+
+### 1.1 Model vs. assessment
+
+This document contains two distinct kinds of content, and keeping them apart matters for reading it correctly:
+
+- **The threat model** — the *stable* description of what we are protecting and against whom: the system as designed (§2), the assets (§3), the trust relationships (§4), the threat actors (§5), and what is out of scope (§9). These define the frame and change only when the design or the adversary set changes.
+- **The threat assessment** — our *current evaluation* of how Argos stands against that model: the per-threat severity/status/mitigation tables (§6, including the supply-chain assessment in §6.6), the dependency-posture assessment (§7), the build/release assessment (§8 open items), and the at-a-glance summary (§0). These reflect the state of the software at a point in time and are expected to move as the code, CI, and release pipeline evolve.
+
+Where the two unavoidably touch — for example, an asset in the model (§3) referenced by a mitigation in the assessment (§6) — the assessment side carries the `T-*` identifiers and the ✅/⚠️/❌ status. The model side states *what is true by design*; the assessment side states *how well we currently meet it*.
 
 ## 2. System overview
 
@@ -100,28 +109,33 @@ In rough priority order:
 2. **Recovered ZEC.** Sweep transactions move value from the legacy ZWL accounts to the user's chosen destination.
 3. **The destination unified address.** Privacy-sensitive linkage between the user and the recovered funds.
 4. **Workspace contents.** Contains full viewing keys (FVKs), incoming viewing keys (IVKs), per-account note cache, witnesses, and historic balances. With FVKs alone an attacker cannot spend, but can fully reconstruct the wallet's transaction history.
-5. **The shared compact-block cache.** Public chain data; not sensitive by itself, but the *set of heights present* leaks an upper bound on which wallets have been scanned on this host.
-6. **The recovery report.** Plaintext file written by the user with workspace path, txids, account labels, and net amounts.
+5. **The recovery report.** Plaintext file written by the user with workspace path, txids, account labels, and net amounts. Contains much of the same information as the workspace contents above, and is more sensitive than the compact-block cache below.
+6. **The shared compact-block cache.** Public chain data; not sensitive by itself, but the *set of heights present* leaks an upper bound on which wallets have been scanned on this host.
 
-## 4. Trust boundaries
+## 4. Trust relationships
 
-- **User ↔ host OS:** Argos trusts the host. A compromised OS defeats every other mitigation.
-- **Tauri host process ↔ WebView renderer:** The renderer can only reach the host via explicit `#[tauri::command]` handlers and is constrained by the CSP in `gui/src-tauri/tauri.conf.json` (`default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: asset: http://asset.localhost; font-src 'self'; connect-src ipc: http://ipc.localhost`). No remote script or remote `connect-src` is permitted.
-- **Argos ↔ lightwalletd:** Untrusted server reachable only over TLS. Default endpoints (`zec.rocks`, `na.zec.rocks` for mainnet; `lightwalletd.testnet.electriccoin.co` for testnet) are configurable per scan.
-- **Argos ↔ local disk:** Workspace directories and database files are written to a user-chosen directory (defaulting to the platform `AppDataDir/workspace`). Workspace directories are created with `0o700` and database files with `0o600` (`workspace.rs:set_private_file_permissions`). The `session.json` sidecar contains no keys — only label, network, birthday, and timestamps — and inherits the OS umask.
-- **Build pipeline ↔ release artifact:** Signing happens in GitHub Actions environments gated to protected branches (PR #48). macOS signing uses Apple Developer ID secrets; Windows signing uses **Azure Trusted Signing** (cloud-held key, no secret in CI — the runner authenticates via OIDC; PR #96) under the Iqlusion Inc organization identity (see §8, T-B3). The SLSA Level 3 build-provenance attestation (T-SC6) additionally gives every artifact a third-party-verifiable source-to-binary chain, generated by the first-party `actions/attest-build-provenance` and verified with `gh attestation verify`.
+Each entry below names two parties and states how much one trusts the other, and on what basis. (This section describes *relationships* between components, not the internal trust boundary of any single process — the per-process boundaries are in the §2.1 table.)
+
+- **User ↔ host OS:** Argos fully trusts the host it runs on. This trust is unverified and unconditional: a compromised OS defeats every other mitigation in this document.
+- **Tauri host process ↔ WebView renderer:** The host process does *not* trust the renderer with arbitrary access. The renderer can only reach the host via explicit `#[tauri::command]` handlers, and is itself constrained by the CSP in `gui/src-tauri/tauri.conf.json` (`default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: asset: http://asset.localhost; font-src 'self'; connect-src ipc: http://ipc.localhost`). No remote script or remote `connect-src` is permitted, so the renderer cannot be steered by remote content.
+- **Argos ↔ lightwalletd:** Argos does *not* trust the server. Confidentiality and integrity in transit rest entirely on TLS (standard webpki trust roots — see T-N2 for the no-pinning caveat); a hostile server cannot inject spendable state because no scanning-side spending keys are sent and crafted compact blocks are rejected by `librustzcash` sync (T-N3). What the server unavoidably learns is the *that* and *when* of scanning, not key material. The default endpoints (`zec.rocks`, `na.zec.rocks` for mainnet; `lightwalletd.testnet.electriccoin.co` for testnet) are configurable per scan, so a user who trusts a specific operator (e.g. their own node) can substitute it.
+- **Argos ↔ local disk:** Argos trusts the local filesystem to the same degree it trusts the host OS, and relies on filesystem permissions to keep workspace contents private from other local users. Workspace directories and database files are written to a user-chosen directory (defaulting to the platform `AppDataDir/workspace`). Workspace directories are created with `0o700` and database files with `0o600` (`workspace.rs:set_private_file_permissions`). The `session.json` sidecar contains no keys — only label, network, birthday, and timestamps — and inherits the OS umask.
+- **Build pipeline ↔ release artifact:** Users trust a released artifact only insofar as it is code-signed and provenance-attested by the pipeline. Signing happens in GitHub Actions environments gated to protected branches (PR #48). macOS signing uses Apple Developer ID secrets; Windows signing uses **Azure Trusted Signing** (cloud-held key, no secret in CI — the runner authenticates via OIDC; PR #96) under the Iqlusion Inc organization identity (see §8, T-B3). The SLSA Level 3 build-provenance attestation (T-SC6) additionally gives every artifact a third-party-verifiable source-to-binary chain, generated by the first-party `actions/attest-build-provenance` and verified with `gh attestation verify`.
 
 ## 5. Threat actors
 
+"In scope" means the actor's capability is something Argos attempts to mitigate or bound; "out of scope" means Argos cannot meaningfully defend against it and treats it as the user's or platform's responsibility.
+
 | Actor | Capability | In scope? |
 |---|---|---|
-| Curious local user with shell access | Read files under the user's account, list processes | Yes |
-| Malware running as the user | Read memory, read disk, intercept clipboard, screen-capture, keylog | Partially — we mitigate disk/clipboard exposure but cannot defeat in-process attackers |
-| Malware running as a *different* unprivileged user | Read processes / files of the Argos user via OS bugs | OS-level — out of scope |
-| Network observer on the local segment | Passive sniffing | Yes |
+| Another local user / process running *as the Argos user's account* | Read files under that account (workspace DB, recovery report) and list/inspect that account's processes, using only ordinary OS-account access | Yes — disk exposure is bounded by `0o700`/`0o600` permissions (T-L1) |
+| Code running *inside* the Argos process (in-process attacker — e.g. malware that has already injected into Argos) | Read process memory, read disk, intercept clipboard, screen-capture, keylog | Partially — we mitigate disk/clipboard exposure (T-S1, T-S4) but cannot defeat an attacker already executing inside our address space |
+| A *different* unprivileged user / process crossing the OS account boundary | Reach the Argos user's processes or files via OS isolation bugs or privilege escalation | Out of scope — defending the OS account boundary is the host OS's responsibility |
+| Network observer (passive sniffer, anywhere on the path) | Passively observe Argos's network traffic, on the local segment or any upstream hop | Yes — all lightwalletd traffic is TLS (T-N1) |
 | Hostile lightwalletd operator | Serve crafted compact blocks, log query patterns | Yes |
-| Hostile DNS / TLS-trust-store attacker | Substitute lightwalletd endpoint | Partially — webpki trust roots only |
-| Compromised upstream Rust dependency | Inject malicious code at build time | Partially — `cargo-deny` + `cargo-vet` cover the 73% of our tree shared with upstream Zcash projects; the Tauri-side residue (§6.6.4) is tracked. See §6.6, §7. No JS at runtime (§7). |
+| Hostile DNS operator | Return a malicious address for a lightwalletd hostname to redirect the connection | Partially — DNS substitution alone is caught by TLS certificate validation against webpki roots; the residual gap is the absence of certificate pinning (T-N2) |
+| Attacker able to compromise the local TLS trust store | Install a rogue CA / trust anchor so a substituted endpoint presents a valid-looking certificate | Partially — webpki trust roots are honoured as-is; a poisoned local trust store defeats TLS validation (no certificate pinning of the default endpoints — T-N2) |
+| Compromised upstream Rust dependency | Inject malicious code at build time (`build.rs`, proc macros, or runtime code) | Partially — *build-time* compromise of the ≈73% of the tree shared with upstream Zcash projects is covered by `cargo-deny` + `cargo-vet`; the Tauri-side residue (§6.6.4) is exempted-but-tracked, and `build.rs`/proc-macro sandboxing (Geiger-style enumeration) is *not yet* adopted (T-SC1). No JS at runtime (§7). See §6.6, §7 |
 | Compromised GitHub Actions / signing key | Sign a malicious installer | Yes — see §8 |
 | Casual shoulder-surfer | Read the screen while seed is visible | Yes |
 | Coerced user ($5 wrench attack) | Forced to run a sweep under duress | Out of scope |
@@ -129,7 +143,7 @@ In rough priority order:
 
 ## 6. Threats and mitigations
 
-Severity: **C**ritical / **H**igh / **M**edium / **L**ow. Status: ✅ mitigated, ⚠️ partial, ❌ open.
+This section is the **threat assessment** (see §1.1): for each threat implied by the model in §2–§5, it records our current evaluation rather than a fixed design property. Severity: **C**ritical / **H**igh / **M**edium / **L**ow. Status: ✅ mitigated, ⚠️ partial, ❌ open — the status is a point-in-time judgement that moves as the software changes.
 
 ### 6.1 Secret handling
 
@@ -368,3 +382,4 @@ Please **do not** open a public GitHub issue for a security vulnerability. Email
 | 2026-05-28 | Zaki | T-B3 status moved ❌ → ⚠️: Windows code-signing certificate procurement is in progress. §4 build-pipeline trust boundary and §6.6.1 comparison-table release-binary row updated to reflect (a) Windows signing in progress, (b) SLSA Level 3 provenance attestation (T-SC6) coming via PR #71 as the third-party-verifiable source-to-binary chain in the interim. |
 | 2026-05-29 | Zaki | T-B3 status moved ⚠️ → ✅ (PR #96): Windows code-signing landed via Azure Trusted Signing under the Iqlusion Inc organization identity. Signs the inner `Argos.exe` + MSI/NSIS installers during the build, in the protected `release-sign` environment, authenticated by OIDC with no stored signing secret (also tightening T-B2). Updated §0 at-a-glance, §4 build-pipeline boundary, T-B2/T-B3, §6.6.1 release-binary row, and §8 checklist. Runbook: `RELEASE_SIGNING.md`. |
 | 2026-05-29 | Zaki | Migrated SLSA provenance from the `slsa-github-generator` reusable workflow to the first-party `actions/attest-build-provenance` (per-build-job, SHA-pinned). The generator was incompatible with the `sha_pinning_required` policy (T-SC10) because it internally calls tag-pinned actions, which silently broke provenance on every release. Updated §4 boundary, T-B3, T-SC6, and the README verification section (now `gh attestation verify` instead of `slsa-verifier` + `.intoto.jsonl`). |
+| 2026-06-22 | Zaki | Least Authority audit clarifications (Suggestions 10–13), docs-only: added §1.1 separating the stable threat **model** (§2–§5, §9) from the point-in-time threat **assessment** (§0, §6–§8) and signposted §0 and §6 accordingly (S10); renamed §4 "Trust boundaries" → "Trust relationships" and reworded each entry to state the trust decision and its basis, notably the Argos ↔ lightwalletd relationship (S11); clarified the §5 threat-actor definitions and scope wording, and split the former "Hostile DNS / TLS-trust-store attacker" row into separate "Hostile DNS operator" and "local TLS trust store" actors (S12); moved the recovery report above the compact-block cache in the §3 asset priority list (S13). No substantive change to the model. |
