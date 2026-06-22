@@ -2,14 +2,40 @@ use std::str::FromStr;
 
 use zcash_address::unified::{self, Encoding};
 use zcash_address::ZcashAddress;
+use zcash_protocol::consensus::NetworkType;
 use zcash_protocol::PoolType;
 
 use crate::{
     error::{ZeckError, ZeckResult},
-    models::AddressInfo,
+    models::{AddressInfo, ZeckNetwork},
 };
 
-pub fn validate_destination_address(address: &str) -> ZeckResult<AddressInfo> {
+fn network_type(network: ZeckNetwork) -> NetworkType {
+    match network {
+        ZeckNetwork::Mainnet => NetworkType::Main,
+        ZeckNetwork::Testnet => NetworkType::Test,
+    }
+}
+
+fn network_type_label(net: NetworkType) -> &'static str {
+    match net {
+        NetworkType::Main => "mainnet",
+        NetworkType::Test => "testnet",
+        NetworkType::Regtest => "regtest",
+    }
+}
+
+/// Validates a sweep destination against the scan's network.
+///
+/// The destination must be a Unified Address with an Orchard or Sapling
+/// receiver, and its network (recovered from the UA's network-unique HRP) must
+/// match the scan's network. Mismatches are rejected up front with
+/// [`ZeckError::WrongNetwork`] rather than surfacing later as an opaque
+/// proposal-construction error.
+pub fn validate_destination_address(
+    address: &str,
+    network: ZeckNetwork,
+) -> ZeckResult<AddressInfo> {
     let parsed = ZcashAddress::from_str(address)
         .or_else(|_| ZcashAddress::try_from_encoded(address))
         .map_err(|err| ZeckError::InvalidAddress(err.to_string()))?;
@@ -17,10 +43,24 @@ pub fn validate_destination_address(address: &str) -> ZeckResult<AddressInfo> {
     let has_orchard = parsed.can_receive_as(PoolType::ORCHARD);
     let has_sapling = parsed.can_receive_as(PoolType::SAPLING);
     let has_transparent = parsed.can_receive_as(PoolType::TRANSPARENT);
-    let is_unified = unified::Address::decode(address).is_ok();
+
+    // `unified::Address::decode` recovers the address's network from its HRP.
+    // UA HRPs are network-unique, so this also correctly rejects regtest
+    // addresses on a mainnet or testnet scan.
+    let decoded = unified::Address::decode(address);
+    let is_unified = decoded.is_ok();
 
     if !is_unified {
         return Err(ZeckError::DestinationMustBeUnified);
+    }
+
+    let (address_net, _) = decoded.expect("is_unified implies decode succeeded");
+    let expected_net = network_type(network);
+    if address_net != expected_net {
+        return Err(ZeckError::WrongNetwork {
+            expected: network_type_label(expected_net).to_owned(),
+            actual: network_type_label(address_net).to_owned(),
+        });
     }
 
     let destination_ok = has_orchard || has_sapling;
@@ -48,9 +88,16 @@ mod tests {
     const UA_ORCHARD_SAPLING: &str =
         "u1nvgt6yr35mhc9wdf4wckvl38476vqy96dx3cwkfdwy4jet9300l5v8l2yg27ql7w9qwm0lf8kncnj9nus4mgete06j3cu3mhrqvstg6swvdya6xgzwhh6a9xxdhxkavvvmztqeuaurjtqfk3dzetuzgnu0zjvmdpe8ehvj53sy6yhzxj";
 
+    // BIP-39 all-"abandon" test vector (no real funds). Used to derive a
+    // testnet UA on the fly so the network-mismatch test does not depend on a
+    // hard-coded testnet encoding.
+    const TEST_SEED: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon abandon abandon art";
+
     #[test]
     fn valid_unified_address_accepted() {
-        let info = validate_destination_address(UA_ORCHARD_SAPLING).unwrap();
+        let info = validate_destination_address(UA_ORCHARD_SAPLING, ZeckNetwork::Mainnet).unwrap();
         assert!(info.is_unified);
         assert!(info.has_orchard);
         assert!(info.has_sapling);
@@ -61,7 +108,7 @@ mod tests {
     #[test]
     fn transparent_address_rejected() {
         // t1 address — not a unified address at all
-        let err = validate_destination_address("t1dUDJ62ANtmebE8drFg7g2MWYwXHQ6Xu3F").unwrap_err();
+        let err = validate_destination_address("t1dUDJ62ANtmebE8drFg7g2MWYwXHQ6Xu3F", ZeckNetwork::Mainnet).unwrap_err();
         assert!(
             matches!(err, ZeckError::DestinationMustBeUnified),
             "got {err:?}"
@@ -73,6 +120,7 @@ mod tests {
         // zs1 address — valid Zcash address but not unified
         let err = validate_destination_address(
             "zs16uhd4mux24se6wkm74vld0ec63d4dxt3d7m80l5xytreplkkllrrf9c7fj859mhp8tkcq9hxfvj",
+            ZeckNetwork::Mainnet,
         )
         .unwrap_err();
         assert!(
@@ -83,7 +131,7 @@ mod tests {
 
     #[test]
     fn garbage_string_rejected() {
-        let err = validate_destination_address("not-an-address").unwrap_err();
+        let err = validate_destination_address("not-an-address", ZeckNetwork::Mainnet).unwrap_err();
         assert!(
             matches!(err, ZeckError::InvalidAddress(_)),
             "got {err:?}"
@@ -92,7 +140,7 @@ mod tests {
 
     #[test]
     fn empty_string_rejected() {
-        let err = validate_destination_address("").unwrap_err();
+        let err = validate_destination_address("", ZeckNetwork::Mainnet).unwrap_err();
         assert!(
             matches!(err, ZeckError::InvalidAddress(_)),
             "got {err:?}"
@@ -112,7 +160,7 @@ mod tests {
         // with the expected prefix — the decoder must reject rather than
         // hang on a giant Bech32m payload.
         let huge = "u".to_owned() + &"q".repeat(100_000);
-        let err = validate_destination_address(&huge).unwrap_err();
+        let err = validate_destination_address(&huge, ZeckNetwork::Mainnet).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
     }
 
@@ -125,7 +173,7 @@ mod tests {
         // Skip if the test UA happens to already be uppercase (impossible for
         // a `u1…` prefix, defensive).
         assert!(upper.starts_with("U1"));
-        let err = validate_destination_address(&upper).unwrap_err();
+        let err = validate_destination_address(&upper, ZeckNetwork::Mainnet).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
     }
 
@@ -136,12 +184,12 @@ mod tests {
         // partial parse.
         let with_space = format!("{}{}{}",
             &UA_ORCHARD_SAPLING[..40], " ", &UA_ORCHARD_SAPLING[40..]);
-        let err = validate_destination_address(&with_space).unwrap_err();
+        let err = validate_destination_address(&with_space, ZeckNetwork::Mainnet).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
 
         let with_nul = format!("{}{}{}",
             &UA_ORCHARD_SAPLING[..40], "\x00", &UA_ORCHARD_SAPLING[40..]);
-        let err = validate_destination_address(&with_nul).unwrap_err();
+        let err = validate_destination_address(&with_nul, ZeckNetwork::Mainnet).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
     }
 
@@ -153,7 +201,52 @@ mod tests {
         // ZIP-321 URI (including amount/memo parameters) being silently
         // accepted and partially parsed.
         let uri = format!("zcash:{UA_ORCHARD_SAPLING}");
-        let err = validate_destination_address(&uri).unwrap_err();
+        let err = validate_destination_address(&uri, ZeckNetwork::Mainnet).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
+    }
+
+    // ─── Audit Suggestion 1: destination network validation ───────────────────
+
+    fn testnet_unified_address() -> String {
+        let seed = secrecy::SecretString::new(TEST_SEED.to_owned());
+        let accounts = crate::derivation::derive_accounts(&seed, ZeckNetwork::Testnet, 1)
+            .expect("derive testnet account 0");
+        accounts[0].unified_address.clone()
+    }
+
+    #[test]
+    fn matching_network_unified_address_accepted() {
+        // Same testnet UA validated against a testnet scan must pass.
+        let ua = testnet_unified_address();
+        let info = validate_destination_address(&ua, ZeckNetwork::Testnet).unwrap();
+        assert!(info.destination_ok, "got {info:?}");
+    }
+
+    #[test]
+    fn testnet_address_rejected_on_mainnet_scan() {
+        // A testnet UA on a mainnet scan must be rejected up front with
+        // WrongNetwork, not surface later as an opaque proposal error.
+        let ua = testnet_unified_address();
+        let err = validate_destination_address(&ua, ZeckNetwork::Mainnet).unwrap_err();
+        match err {
+            ZeckError::WrongNetwork { expected, actual } => {
+                assert_eq!(expected, "mainnet");
+                assert_eq!(actual, "testnet");
+            }
+            other => panic!("expected WrongNetwork, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mainnet_address_rejected_on_testnet_scan() {
+        let err = validate_destination_address(UA_ORCHARD_SAPLING, ZeckNetwork::Testnet)
+            .unwrap_err();
+        match err {
+            ZeckError::WrongNetwork { expected, actual } => {
+                assert_eq!(expected, "testnet");
+                assert_eq!(actual, "mainnet");
+            }
+            other => panic!("expected WrongNetwork, got {other:?}"),
+        }
     }
 }

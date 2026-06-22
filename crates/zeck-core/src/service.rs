@@ -411,7 +411,7 @@ fn build_sweep_proposal(
     network: crate::models::ZeckNetwork,
     donation_address: &str,
 ) -> ZeckResult<SweepProposal> {
-    let destination = validate_destination_address(&request.destination)?;
+    let destination = validate_destination_address(&request.destination, network)?;
     let memo = normalized_memo_text(request.memo.as_deref())?;
     let minimum_fee_zatoshis = u64::from(MINIMUM_FEE);
 
@@ -600,7 +600,7 @@ async fn execute_sweep_for_session(
     // the function signature stays stable across feature configurations.
     pause_between_broadcasts: Option<std::time::Duration>,
 ) -> ZeckResult<SweepOutcome> {
-    let destination = validate_destination_address(&request.destination)?;
+    let destination = validate_destination_address(&request.destination, session.runtime.network)?;
     let memo_text = normalized_memo_text(request.memo.as_deref())?;
     let memo_bytes = Some(
         MemoBytes::from_bytes(memo_text.as_bytes())
@@ -1455,6 +1455,20 @@ mod tests {
             .clone()
     }
 
+    fn derived_destination_testnet() -> String {
+        derive_accounts(
+            &SecretString::new(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                    .to_owned(),
+            ),
+            ZeckNetwork::Testnet,
+            1,
+        )
+        .expect("derived account")[0]
+            .unified_address
+            .clone()
+    }
+
     fn progress_with_account(account: AccountBalancePreview) -> ScanProgress {
         ScanProgress {
             handle: ScanHandle::new(),
@@ -1537,7 +1551,7 @@ mod tests {
                 status: "ok".to_owned(),
             }),
             SweepRequest {
-                destination: derived_destination(),
+                destination: derived_destination_testnet(),
                 memo: None,
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
