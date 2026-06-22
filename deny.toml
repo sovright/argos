@@ -45,6 +45,7 @@ ignore = [
 
     # Other unmaintained / yanked transitive dependencies with no upstream fix.
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained (via syn macros)
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained (fork of the above; same transitive macro path)
     "RUSTSEC-2025-0057", # fxhash unmaintained (transitive)
     "RUSTSEC-2025-0075", # unic-char-property et al. unmaintained
     "RUSTSEC-2025-0098", # unic-* unmaintained
