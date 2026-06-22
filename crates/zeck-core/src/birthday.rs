@@ -169,6 +169,32 @@ pub fn estimate_date_from_height_offline(height: u32) -> String {
     CalendarDate::from_days_since_unix_epoch(absolute_days).format()
 }
 
+/// Caution appended to an auto-detected birthday that was derived from
+/// server-reported history (transparent UTXOs or shielded-window probes).
+///
+/// Auto-detection trusts the lightwalletd server: a hostile server can withhold
+/// early history, pushing the detected birthday later than the wallet's true
+/// age, so every note received before that point falls outside the scan and the
+/// user is shown an empty (or incomplete) result. Making the detected birthday
+/// — with its approximate calendar date on mainnet — and this caution explicit
+/// lets a late detection be noticed and corrected rather than failing silently
+/// (audit Issue C). The date is omitted on testnet, where the mainnet-calibrated
+/// offline estimator does not apply.
+fn late_birthday_caution(birthday: u32, network: ZeckNetwork) -> String {
+    let date_hint = match network {
+        ZeckNetwork::Mainnet => {
+            format!(" (around {})", estimate_date_from_height_offline(birthday))
+        }
+        ZeckNetwork::Testnet => String::new(),
+    };
+    format!(
+        "Argos will scan only from block {birthday}{date_hint} forward, so any notes \
+         received before it will not be found. If this wallet is older than that — for \
+         example if the lightwalletd server returned incomplete early history — set an \
+         earlier birthday and rescan."
+    )
+}
+
 async fn fetch_block_time(
     client: &mut CompactTxStreamerClient<Channel>,
     height: u32,
@@ -326,7 +352,8 @@ where
             method: "transparent".to_owned(),
             message: format!(
                 "Transparent activity detected at block {earliest}. \
-                 Birthday set {BIRTHDAY_BUFFER_BLOCKS} blocks earlier to {birthday}."
+                 Birthday set {BIRTHDAY_BUFFER_BLOCKS} blocks earlier to {birthday}. {}",
+                late_birthday_caution(birthday, network)
             ),
         });
     }
@@ -380,7 +407,8 @@ where
                 method: "shielded_probe".to_owned(),
                 message: format!(
                     "Shielded activity detected near year ~{year_label} \
-                     (block {probe_height}). Birthday set to {birthday}."
+                     (block {probe_height}). Birthday set to {birthday}. {}",
+                    late_birthday_caution(birthday, network)
                 ),
             });
         }
@@ -392,7 +420,9 @@ where
         method: "no_activity".to_owned(),
         message: format!(
             "No activity found in any probe window. \
-             Using Sapling activation ({sapling_floor}) for a complete scan."
+             Using Sapling activation ({sapling_floor}) for a complete scan. \
+             If you expected to recover funds, the lightwalletd server may have \
+             returned incomplete history — retry against a server you trust."
         ),
     })
 }
@@ -532,6 +562,24 @@ fn check_probe_activity(wallet_db_path: &std::path::Path) -> ZeckResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_birthday_caution_warns_and_dates_on_mainnet() {
+        let note = late_birthday_caution(SAPLING_ACTIVATION_HEIGHT + 1_000_000, ZeckNetwork::Mainnet);
+        // Tells the user to rescan with an earlier birthday...
+        assert!(note.contains("rescan"));
+        assert!(note.contains("earlier"));
+        // ...and anchors the detected height to an approximate calendar date.
+        assert!(note.contains("around 20"));
+    }
+
+    #[test]
+    fn late_birthday_caution_omits_date_on_testnet() {
+        let note = late_birthday_caution(1_000_000, ZeckNetwork::Testnet);
+        assert!(note.contains("rescan"));
+        // The mainnet-calibrated estimator must not emit a (wrong) testnet date.
+        assert!(!note.contains("around 20"));
+    }
 
     #[test]
     fn sapling_activation_date_returns_activation_height() {
