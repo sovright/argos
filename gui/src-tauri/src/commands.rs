@@ -288,10 +288,18 @@ pub async fn save_recovery_report(
         }
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    // Restrict the report to 0o600 at creation time on Unix so the recovery
+    // report (which can contain sweep details) is protected at the file level
+    // regardless of the parent directory's mode (audit Suggestion 3). Windows
+    // has no mode-bit equivalent; behavior there is unchanged.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&path)
         .map_err(|err| format!("opening {}: {err}", path.display()))?;
     file.write_all(report.as_bytes())

@@ -221,6 +221,38 @@ fn set_private_file_permissions(path: &Path) -> ZeckResult<()> {
     Ok(())
 }
 
+/// Create (or truncate) `path` and write `bytes`, restricting the file to
+/// `0o600` at creation time on Unix via `OpenOptions::mode`. This keeps
+/// file-level protection in place independent of the parent directory's
+/// mode (audit Suggestion 3). On non-Unix platforms there is no mode-bit
+/// equivalent, so this degrades to a plain create-truncate write and the
+/// `0o700` parent directory remains the sole protection.
+fn write_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", path.display())))?;
+
+    // `OpenOptions::mode` only constrains the bits of a newly-created file; an
+    // existing tmp file keeps its old mode. Re-tighten so a reused path can't
+    // retain looser perms from a previous run.
+    set_private_file_permissions(path)?;
+
+    Ok(())
+}
+
 /// Seconds a wallet-database connection waits on a locked database before
 /// returning `SQLITE_BUSY`. The scan writer and the once-per-second progress
 /// poller share the file, so lock collisions are routine rather than exceptional.
@@ -331,8 +363,7 @@ pub fn write_session_metadata(workspace_root: &Path, meta: &SessionMetadata) -> 
     let tmp_path = workspace_root.join(format!("{SESSION_FILE_NAME}.tmp"));
     let bytes = serde_json::to_vec_pretty(meta)
         .map_err(|err| ZeckError::Serialization(err.to_string()))?;
-    fs::write(&tmp_path, &bytes)
-        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", tmp_path.display())))?;
+    write_private_file(&tmp_path, &bytes)?;
     fs::rename(&tmp_path, &final_path).map_err(|err| {
         ZeckError::Storage(format!(
             "renaming {} -> {}: {err}",
@@ -1118,6 +1149,28 @@ mod tests {
         super::set_private_file_permissions(&file).expect("set perms");
         let mode = std::fs::metadata(&file).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "file mode is {:o}", mode & 0o777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_session_metadata_creates_file_with_mode_0o600() {
+        // Audit Suggestion 3: session.json must be created with 0o600 at
+        // creation time, not rely solely on the 0o700 parent directory.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meta = SessionMetadata::new_in_progress(
+            "perm check".to_owned(),
+            ZeckNetwork::Mainnet,
+            3_280_000,
+            None,
+            1,
+        );
+        write_session_metadata(dir.path(), &meta).expect("write");
+        let mode = std::fs::metadata(dir.path().join(SESSION_FILE_NAME))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "session.json mode is {:o}", mode & 0o777);
     }
 
     #[test]
