@@ -565,6 +565,7 @@ async fn run_recovery_scan_inner(
         let sync_result = run_wallet_sync_with_retry(
             &workspace,
             &network,
+            config.network,
             &mut client,
             &config.lightwalletd_url,
             &state,
@@ -870,6 +871,7 @@ async fn run_wallet_sync_with_stall_watchdog(
 async fn run_wallet_sync_with_retry(
     workspace: &RecoveryWorkspace,
     network: &zcash_protocol::consensus::Network,
+    zeck_network: crate::models::ZeckNetwork,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     lightwalletd_url: &str,
     state: &SharedScanTaskState,
@@ -916,16 +918,35 @@ async fn run_wallet_sync_with_retry(
                 tokio::time::sleep(std::time::Duration::from_secs(SYNC_RETRY_DELAY_SECS)).await;
 
                 match probe_lightwalletd_endpoints(lightwalletd_url).await {
-                    Ok((new_client, endpoint, _)) => {
+                    Ok((new_client, endpoint, info)) => {
+                        // Re-run the same network validation the initial probe
+                        // performs (chain name + Sapling activation height).
+                        // The reconnect path must not silently adopt an
+                        // endpoint on the wrong chain: otherwise a network
+                        // attacker who forces a transport drop could steer the
+                        // sync onto a server of their choosing, corrupting the
+                        // user's view of recoverable transparent funds (audit
+                        // Issue I). On a mismatch, reject the endpoint and keep
+                        // retrying; this fails closed once MAX_SYNC_RETRIES is
+                        // reached.
+                        if let Err(validation_err) =
+                            validate_lightwalletd_network(zeck_network, &info)
+                        {
+                            warn!(
+                                "reconnect endpoint {endpoint} failed network validation, rejecting: {validation_err}"
+                            );
+                            continue;
+                        }
                         *client = new_client;
                         let mut guard = state.lock().await;
                         guard.progress.message = Some(format!(
                             "Reconnected to {endpoint}, resuming sync…"
                         ));
-                        guard.progress.server = Some(crate::lightwalletd::build_probe(
-                            endpoint,
-                            &Default::default(),
-                        ));
+                        // Pass the real `LightdInfo` so the displayed server
+                        // identity reflects the endpoint actually in use rather
+                        // than a zeroed default (audit Issue I).
+                        guard.progress.server =
+                            Some(crate::lightwalletd::build_probe(endpoint, &info));
                     }
                     Err(reconnect_err) => {
                         warn!("reconnect failed: {reconnect_err}");
