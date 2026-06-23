@@ -641,7 +641,7 @@ async fn execute_sweep_for_session(
         .server
         .as_ref()
         .map(|server| server.endpoint.as_str());
-    let (mut client, _) =
+    let (mut client, primary_endpoint) =
         connect_lightwalletd_endpoints(&runtime.lightwalletd_url, preferred_endpoint).await?;
     let lightwalletd_info = client
         .get_lightd_info(zcash_client_backend::proto::service::Empty {})
@@ -698,6 +698,8 @@ async fn execute_sweep_for_session(
                     donation_address: effective_donation_address,
                     donation_rate: request.donation_rate,
                     donation_memo: donation_memo.clone(),
+                    lightwalletd_url: runtime.lightwalletd_url.as_str(),
+                    primary_endpoint: primary_endpoint.as_str(),
                 };
                 execute_shielding_step(
                     &mut ctx,
@@ -737,6 +739,8 @@ async fn execute_sweep_for_session(
                 donation_address: effective_donation_address,
                 donation_rate: request.donation_rate,
                 donation_memo: donation_memo.clone(),
+                lightwalletd_url: runtime.lightwalletd_url.as_str(),
+                primary_endpoint: primary_endpoint.as_str(),
             };
             execute_send_max_step(
                 &mut ctx,
@@ -773,6 +777,11 @@ struct SweepStepCtx<'a> {
     donation_address: &'a str,
     donation_rate: Option<f64>,
     donation_memo: Option<MemoBytes>,
+    // For the best-effort confirmation cross-check (audit Issue B follow-up):
+    // the full configured endpoint list and the endpoint this sweep is using,
+    // so a second distinct endpoint can be picked to verify confirmations.
+    lightwalletd_url: &'a str,
+    primary_endpoint: &'a str,
 }
 
 /// The change strategy used for every Argos proposal: ZIP-317 fees, no change
@@ -851,6 +860,8 @@ async fn execute_shielding_step(
         txids.into_iter().collect(),
         "shielding",
         ctx.results,
+        ctx.lightwalletd_url,
+        ctx.primary_endpoint,
     )
     .await?;
 
@@ -1076,12 +1087,15 @@ async fn execute_send_max_step(
         txids.into_iter().collect(),
         "sweep",
         ctx.results,
+        ctx.lightwalletd_url,
+        ctx.primary_endpoint,
     )
     .await?;
 
     Ok(fee_zatoshis)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn broadcast_transactions(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
@@ -1094,6 +1108,8 @@ async fn broadcast_transactions(
     txids: Vec<TxId>,
     label: &str,
     results: &mut Vec<TxBroadcastResult>,
+    lightwalletd_url: &str,
+    primary_endpoint: &str,
 ) -> ZeckResult<()> {
     for txid in txids {
         let tx = wallet_db
@@ -1131,6 +1147,25 @@ async fn broadcast_transactions(
 
         let (status, detail, confirmed_height) =
             wait_for_confirmation(wallet_db, client, txid, label).await?;
+        // Cross-check a "confirmed" status against a second configured endpoint
+        // before presenting it as final, so a single hostile server cannot fake
+        // a confirmation (audit Issue B follow-up). Best-effort: never fails the
+        // sweep, only annotates the detail with the independent result.
+        let detail = if status == "confirmed" {
+            match cross_verify_mined(lightwalletd_url, primary_endpoint, txid).await {
+                Some(true) => format!(
+                    "{detail} A second endpoint independently confirmed this transaction is mined."
+                ),
+                Some(false) => format!(
+                    "{detail} WARNING: a second endpoint did NOT report this transaction as mined — \
+                     treat the confirmation with suspicion and verify on a block explorer before \
+                     trusting it."
+                ),
+                None => detail,
+            }
+        } else {
+            detail
+        };
         results.push(TxBroadcastResult {
             source_account: account_index,
             txid: Some(txid.to_string()),
@@ -1141,6 +1176,39 @@ async fn broadcast_transactions(
     }
 
     Ok(())
+}
+
+/// Best-effort cross-check of a confirmation against a second configured
+/// lightwalletd endpoint (audit Issue B follow-up).
+///
+/// Returns `Some(true)` if a distinct second endpoint also reports `txid`
+/// mined, `Some(false)` if it reports the transaction as not in the main chain,
+/// and `None` if there is no distinct second endpoint or it could not be
+/// reached/queried. This never errors: a confirmation that cannot be
+/// independently checked falls back to the single-server attestation already
+/// disclosed to the user, rather than failing the sweep.
+async fn cross_verify_mined(
+    lightwalletd_url: &str,
+    primary_endpoint: &str,
+    txid: TxId,
+) -> Option<bool> {
+    let secondary = validated_lightwalletd_endpoints(lightwalletd_url)
+        .ok()?
+        .into_iter()
+        .find(|endpoint| endpoint != primary_endpoint)?;
+    let mut client = CompactTxStreamerClient::connect(secondary).await.ok()?;
+    let response = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+        })
+        .await
+        .ok()?
+        .into_inner();
+    // Mined iff the height is a real block height: 0 means mempool/not found and
+    // u64::MAX means reorged out.
+    Some(response.height != 0 && response.height != u64::MAX)
 }
 
 async fn wait_for_confirmation(
