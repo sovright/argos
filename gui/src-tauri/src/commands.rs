@@ -261,11 +261,18 @@ const ALLOWED_EXTERNAL_URLS: &[&str] = &[
 /// plugin's `open_url` (audit Issue D): the plugin is still invoked, but from
 /// Rust and only for vetted destinations, so the webview has no arbitrary
 /// outbound-egress primitive.
+/// Exact-match allowlist check. Pulled out of the command so it is unit-testable
+/// without an `AppHandle`. Full-string equality (not prefix/substring), so
+/// `https://evil/?s=<seed>` or `https://sovright.com.evil/` are rejected.
+fn is_allowed_external_url(url: &str) -> bool {
+    ALLOWED_EXTERNAL_URLS.contains(&url)
+}
+
 #[tauri::command]
 pub fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
 
-    if !ALLOWED_EXTERNAL_URLS.contains(&url.as_str()) {
+    if !is_allowed_external_url(&url) {
         return Err(format!("refusing to open non-allowlisted URL: {url}"));
     }
 
@@ -853,5 +860,47 @@ mod tests {
         assert_eq!(mode, 0o600, "a reused report file must be re-tightened to 0o600");
         assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_url_allowlist_accepts_listed_and_rejects_everything_else() {
+        use super::is_allowed_external_url;
+        // Every allowlisted URL is accepted.
+        for url in super::ALLOWED_EXTERNAL_URLS {
+            assert!(is_allowed_external_url(url), "{url} should be allowed");
+        }
+        // Exfiltration and look-alike attempts are rejected (exact match, not prefix/substring).
+        assert!(!is_allowed_external_url("https://evil.example/?s=secret-seed"));
+        assert!(!is_allowed_external_url("https://sovright.com.evil.example/"));
+        assert!(!is_allowed_external_url("https://sovright.com/extra"));
+        assert!(!is_allowed_external_url("file:///etc/passwd"));
+        assert!(!is_allowed_external_url("javascript:alert(1)"));
+        assert!(!is_allowed_external_url(""));
+    }
+
+    // Fail-closed sync guard: every external http(s)/mailto link in the shipped
+    // HTML must be on the allowlist, or the UI link silently breaks (audit Issue
+    // D). This catches a maintainer adding a link without updating the allowlist.
+    #[test]
+    fn every_html_external_link_is_allowlisted() {
+        let html = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/index.html"
+        ))
+        .expect("read index.html");
+        for (idx, _) in html.match_indices("href=\"") {
+            let rest = &html[idx + 6..];
+            let end = rest.find('"').expect("closing quote");
+            let href = &rest[..end];
+            if href.starts_with("http://")
+                || href.starts_with("https://")
+                || href.starts_with("mailto:")
+            {
+                assert!(
+                    super::is_allowed_external_url(href),
+                    "external link {href} in index.html is not in ALLOWED_EXTERNAL_URLS"
+                );
+            }
+        }
     }
 }
