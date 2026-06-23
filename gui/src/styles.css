@@ -680,6 +680,35 @@ pre {
   overflow: hidden;
 }
 
+/* Mandatory Terms of Service gate: centered, wider, no dismiss control. */
+.tos-overlay {
+  align-items: center;
+  justify-content: center;
+}
+
+.tos-panel {
+  width: min(820px, 100%);
+}
+
+.tos-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--ink);
+  margin: 0;
+}
+
+.tos-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 20px 28px;
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
 .guide-header {
   display: flex;
   align-items: flex-start;

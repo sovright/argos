@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
@@ -282,6 +283,50 @@ pub fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|err| err.to_string())
+}
+
+#[derive(Serialize)]
+pub struct TosStatus {
+    pub accepted: bool,
+    pub version: String,
+    pub text: String,
+}
+
+/// Base directory for the TOS acceptance record: the app data dir root, so it
+/// survives "Delete workspace" (which only removes the `workspace` subdir).
+fn tos_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|err| format!("resolving app data dir: {err}"))
+}
+
+/// Whether the current Terms of Service version has been accepted, plus the
+/// version and full text for the acceptance gate to render.
+#[tauri::command]
+pub fn tos_status(app: AppHandle) -> Result<TosStatus, String> {
+    let base = tos_base_dir(&app)?;
+    Ok(TosStatus {
+        accepted: argos_core::is_tos_accepted(&base),
+        version: argos_core::TOS_VERSION.to_owned(),
+        text: argos_core::terms_text().to_owned(),
+    })
+}
+
+/// Record acceptance of the current Terms of Service version.
+#[tauri::command]
+pub fn accept_tos(app: AppHandle) -> Result<(), String> {
+    let base = tos_base_dir(&app)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    argos_core::record_tos_acceptance(&base, now).map_err(|err| err.to_string())
+}
+
+/// Reject the Terms of Service: nothing is recorded and the app exits.
+#[tauri::command]
+pub fn reject_tos(app: AppHandle) {
+    app.exit(0);
 }
 
 #[tauri::command]

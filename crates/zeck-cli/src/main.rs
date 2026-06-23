@@ -1,4 +1,10 @@
-use std::{collections::VecDeque, fs, io::Write, path::PathBuf, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    fs,
+    io::{IsTerminal, Write},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 
@@ -70,6 +76,11 @@ struct Cli {
     #[arg(long)]
     verbose: bool,
 
+    /// Accept the Argos Terms of Service non-interactively (for scripted/CI
+    /// runs). Records acceptance under --data-dir without prompting.
+    #[arg(long)]
+    accept_tos: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -133,6 +144,12 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose)?;
+
+    // Gate the network/funds-moving commands on Terms of Service acceptance.
+    // `show-keys` is purely local key derivation and is intentionally ungated.
+    if matches!(cli.command, Commands::Scan | Commands::Sweep { .. }) {
+        ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
+    }
 
     let network: ZeckNetwork = cli.network.into();
 
@@ -332,6 +349,73 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Require Terms of Service acceptance before a network/funds-moving command.
+///
+/// Skips silently if the current TOS version was already accepted under
+/// `data_dir`. Otherwise: `--accept-tos` records acceptance non-interactively;
+/// an interactive TTY gets a short notice and a `y/N` prompt; a non-interactive
+/// run without the flag errors with guidance (so it fails closed).
+fn ensure_tos_accepted(data_dir: &Path, accept_flag: bool) -> Result<()> {
+    if argos_core::is_tos_accepted(data_dir) {
+        return Ok(());
+    }
+
+    if accept_flag {
+        record_tos(data_dir)?;
+        eprintln!(
+            "Argos Terms of Service ({}) accepted via --accept-tos.",
+            argos_core::TOS_VERSION
+        );
+        return Ok(());
+    }
+
+    let notice = format!(
+        "\n\
+         ──────────────────────────────────────────────────────────────\n\
+         Argos Terms of Service ({version})\n\n\
+         By accepting, you agree to the Argos Terms of Service, which include a\n\
+         MANDATORY BINDING ARBITRATION clause and a WAIVER OF JURY TRIAL and\n\
+         CLASS ACTIONS, and limits on Sovright's liability.\n\n\
+         Read the full Terms in the Argos desktop app, or at:\n  \
+         https://github.com/sovright/argos/blob/main/crates/zeck-core/assets/terms-of-service.md\n\
+         ──────────────────────────────────────────────────────────────",
+        version = argos_core::TOS_VERSION
+    );
+
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "{notice}\n\nThe Terms of Service must be accepted before scanning or sweeping. \
+             Re-run with --accept-tos to accept them non-interactively."
+        );
+    }
+
+    eprintln!("{notice}");
+    eprint!("Accept these Terms? [y/N]: ");
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading Terms of Service response")?;
+    let answer = answer.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        record_tos(data_dir)?;
+        eprintln!("Terms of Service accepted.");
+        Ok(())
+    } else {
+        bail!("Terms of Service not accepted; aborting.");
+    }
+}
+
+/// Record TOS acceptance under `data_dir` stamped with the current Unix time.
+fn record_tos(data_dir: &Path) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    argos_core::record_tos_acceptance(data_dir, now)
+        .context("recording Terms of Service acceptance")
 }
 
 fn init_tracing(verbose: bool) -> Result<()> {

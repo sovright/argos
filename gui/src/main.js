@@ -46,6 +46,45 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => (Number(n) / 1e8).toFixed(8) + " ZEC";
 
+// ─── Terms of Service gate ──────────────────────────────────────────────────
+// The #tos-overlay starts visible (display:flex in markup) so the wizard is
+// never reachable before acceptance is resolved. If the current TOS version is
+// already accepted, hide it; otherwise show the full terms with Accept/Reject.
+// Reject exits the app; Accept records acceptance and reveals the wizard.
+(async function initTosGate() {
+  const overlay = $("tos-overlay");
+  const accept = $("tos-accept");
+  const reject = $("tos-reject");
+  reject.addEventListener("click", () => {
+    invoke("reject_tos").catch((err) => console.error("reject_tos failed:", err));
+  });
+  accept.addEventListener("click", async () => {
+    accept.disabled = true;
+    reject.disabled = true;
+    try {
+      await invoke("accept_tos");
+      overlay.style.display = "none";
+    } catch (err) {
+      accept.disabled = false;
+      reject.disabled = false;
+      $("tos-text").textContent = `Could not record acceptance: ${err}\n\n` + $("tos-text").textContent;
+    }
+  });
+  try {
+    const status = await invoke("tos_status");
+    if (status.accepted) {
+      overlay.style.display = "none";
+    } else {
+      $("tos-text").textContent = status.text;
+    }
+  } catch (err) {
+    // Fail closed: keep the gate up with an error rather than letting the
+    // wizard through if the status check fails.
+    $("tos-text").textContent = `Unable to load the Terms of Service: ${err}`;
+    console.error("tos_status failed:", err);
+  }
+})();
+
 function phaseLabel(phase) {
   const labels = {
     idle: "Idle",
