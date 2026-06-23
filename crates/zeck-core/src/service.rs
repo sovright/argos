@@ -862,6 +862,7 @@ async fn execute_shielding_step(
         ctx.results,
         ctx.lightwalletd_url,
         ctx.primary_endpoint,
+        ctx.network,
     )
     .await?;
 
@@ -1089,6 +1090,7 @@ async fn execute_send_max_step(
         ctx.results,
         ctx.lightwalletd_url,
         ctx.primary_endpoint,
+        ctx.network,
     )
     .await?;
 
@@ -1110,6 +1112,7 @@ async fn broadcast_transactions(
     results: &mut Vec<TxBroadcastResult>,
     lightwalletd_url: &str,
     primary_endpoint: &str,
+    network: crate::models::ZeckNetwork,
 ) -> ZeckResult<()> {
     for txid in txids {
         let tx = wallet_db
@@ -1152,7 +1155,7 @@ async fn broadcast_transactions(
         // a confirmation (audit Issue B follow-up). Best-effort: never fails the
         // sweep, only annotates the detail with the independent result.
         let detail = if status == "confirmed" {
-            match cross_verify_mined(lightwalletd_url, primary_endpoint, txid).await {
+            match cross_verify_mined(lightwalletd_url, primary_endpoint, network, txid).await {
                 Some(true) => format!(
                     "{detail} A second endpoint independently confirmed this transaction is mined."
                 ),
@@ -1190,6 +1193,7 @@ async fn broadcast_transactions(
 async fn cross_verify_mined(
     lightwalletd_url: &str,
     primary_endpoint: &str,
+    network: crate::models::ZeckNetwork,
     txid: TxId,
 ) -> Option<bool> {
     let secondary = validated_lightwalletd_endpoints(lightwalletd_url)
@@ -1197,6 +1201,15 @@ async fn cross_verify_mined(
         .into_iter()
         .find(|endpoint| endpoint != primary_endpoint)?;
     let mut client = CompactTxStreamerClient::connect(secondary).await.ok()?;
+    // Validate the secondary's network (chain name + Sapling activation height)
+    // before trusting its answer, so a wrong-chain endpoint cannot produce a
+    // misleading confirmation result (audit Issue B follow-up review).
+    let info = client
+        .get_lightd_info(zcash_client_backend::proto::service::Empty {})
+        .await
+        .ok()?
+        .into_inner();
+    validate_lightwalletd_network(network, &info).ok()?;
     let response = client
         .get_transaction(TxFilter {
             block: None,
@@ -1207,7 +1220,9 @@ async fn cross_verify_mined(
         .ok()?
         .into_inner();
     // Mined iff the height is a real block height: 0 means mempool/not found and
-    // u64::MAX means reorged out.
+    // u64::MAX means reorged out. A `Some(false)` can also reflect benign
+    // propagation lag on a healthy second endpoint, which is why the caller only
+    // warns (never blocks) on it.
     Some(response.height != 0 && response.height != u64::MAX)
 }
 
