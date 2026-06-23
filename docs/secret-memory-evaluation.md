@@ -19,12 +19,17 @@ before it is dropped.
 
 | Crate | Version | Downloads (recent) | Last release | Memory protection | Extra deps |
 |---|---|---|---|---|---|
-| **secrecy** (incumbent) | 0.10.3 | 122M (27.9M) | 2024-10 | zeroize-on-drop only | none beyond `zeroize` |
+| **secrecy** (incumbent) | **0.8.0** (in tree; crate latest 0.10.3) | 122M (27.9M) | 2024-10 | zeroize-on-drop only | none beyond `zeroize` |
 | **secrets** | 1.3.0 | 76k (7.5k) | 2026-04 | `mlock` + `mprotect` guard pages + canaries, via **libsodium** | `libsodium-sys` (C library) |
 | **shush-rs** | 0.1.11 | 13.8k (0.3k) | 2024-11 | `mlock`/`munlock` + zeroize, `secrecy`-style API | `libc` only |
 
 (`secrecy` is maintained by iqlusion; it is the de-facto standard, hence the
-122M downloads.)
+122M downloads. Argos pins the 0.8.x API — `Secret<T>` / `SecretString::new(String)`.
+Note that `secrecy` 0.10 replaced `Secret<T>` with `SecretBox<T>` and changed
+`SecretString::new` to take `Box<str>`, so even *upgrading* secrecy is a
+breaking migration — and `shush-rs` deliberately mirrors that 0.10 `SecretBox`
+API, making a swap to it a larger change than the version numbers suggest. This
+strengthens the "don't swap" conclusion below.)
 
 ## Analysis
 
@@ -69,9 +74,10 @@ Instead:
    access to in-scope. If so, the lowest-friction path is to pilot `shush-rs`
    behind a focused review, or to `mlock` only the seed buffer via a small
    `region`/`memsec`-based wrapper rather than replacing `secrecy` wholesale.
-3. **Keep the exemption/audit posture** ([supply-chain/README.md](../supply-chain/README.md))
-   in mind: any of these alternatives adds a new dependency that would itself
-   need vetting.
+3. **Keep the supply-chain posture** (the `cargo vet` config in
+   [supply-chain/config.toml](../supply-chain/config.toml) and the audit
+   discussion in [THREAT_MODEL.md](THREAT_MODEL.md)) in mind: any of these
+   alternatives adds a new dependency that would itself need vetting.
 
 This keeps Argos aligned with the broad Zcash-ecosystem dependency set (which
 standardizes on `secrecy`) while recording the deliberate decision and the
