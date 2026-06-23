@@ -21,6 +21,62 @@ user-id = 2396
 user-login = "jdm"
 user-name = "Josh Matthews"
 
+[[publisher.halo2_gadgets]]
+version = "0.5.0"
+when = "2026-06-03"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.orchard]]
+version = "0.14.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.ring]]
+version = "0.17.14"
+when = "2025-03-11"
+user-id = 2342
+user-login = "briansmith"
+user-name = "Brian Smith"
+
+[[publisher.rustls]]
+version = "0.23.37"
+when = "2026-02-24"
+user-id = 209038
+user-login = "cpu"
+user-name = "Daniel McCarney"
+
+[[publisher.sapling-crypto]]
+version = "0.7.0"
+when = "2026-04-21"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.secp256k1]]
+version = "0.29.1"
+when = "2024-09-06"
+user-id = 1588
+user-login = "apoelstra"
+user-name = "Andrew Poelstra"
+
+[[publisher.secrecy]]
+version = "0.8.0"
+when = "2021-07-18"
+user-id = 19631
+user-login = "tony-iqlusion"
+user-name = "Tony Arcieri (iqlusion)"
+
+[[publisher.tonic]]
+version = "0.14.5"
+when = "2026-02-19"
+user-id = 3959
+user-login = "LucioFranco"
+user-name = "Lucio Franco"
+
 [[publisher.unicode-normalization]]
 version = "0.1.25"
 when = "2025-10-30"
@@ -115,6 +171,76 @@ trusted-publisher = "github:bytecodealliance/wasm-tools"
 version = "0.244.0"
 when = "2026-01-06"
 trusted-publisher = "github:bytecodealliance/wasm-tools"
+
+[[publisher.zcash_address]]
+version = "0.12.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_client_backend]]
+version = "0.23.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_client_sqlite]]
+version = "0.21.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_encoding]]
+version = "0.4.0"
+when = "2026-04-24"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_keys]]
+version = "0.14.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_primitives]]
+version = "0.28.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_proofs]]
+version = "0.28.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_protocol]]
+version = "0.9.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_transparent]]
+version = "0.8.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zip321]]
+version = "0.8.0"
+when = "2026-06-03"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
 
 [[audits.bytecode-alliance.wildcard-audits.bumpalo]]
 who = "Nick Fitzgerald <fitzgen@gmail.com>"

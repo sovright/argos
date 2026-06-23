@@ -2,3 +2,111 @@
 # cargo-vet audits file
 
 [audits]
+
+[[trusted.halo2_gadgets]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2022-02-15"
+end = "2027-06-23"
+
+[[trusted.orchard]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-12"
+end = "2027-06-23"
+
+[[trusted.ring]]
+criteria = "safe-to-deploy"
+user-id = 2342 # Brian Smith (briansmith)
+start = "2019-07-03"
+end = "2027-06-23"
+
+[[trusted.rustls]]
+criteria = "safe-to-deploy"
+user-id = 209038 # Daniel McCarney (cpu)
+start = "2023-07-05"
+end = "2027-06-23"
+
+[[trusted.sapling-crypto]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-12"
+end = "2027-06-23"
+
+[[trusted.secp256k1]]
+criteria = "safe-to-deploy"
+user-id = 1588 # Andrew Poelstra (apoelstra)
+start = "2019-05-21"
+end = "2027-06-23"
+
+[[trusted.secrecy]]
+criteria = "safe-to-deploy"
+user-id = 19631 # Tony Arcieri (iqlusion) (tony-iqlusion)
+start = "2019-05-23"
+end = "2027-06-23"
+
+[[trusted.tonic]]
+criteria = "safe-to-deploy"
+user-id = 3959 # Lucio Franco (LucioFranco)
+start = "2019-10-02"
+end = "2027-06-23"
+
+[[trusted.zcash_address]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-20"
+end = "2027-06-23"
+
+[[trusted.zcash_client_backend]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-03-25"
+end = "2027-06-23"
+
+[[trusted.zcash_client_sqlite]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-03-25"
+end = "2027-06-23"
+
+[[trusted.zcash_encoding]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-19"
+end = "2027-06-23"
+
+[[trusted.zcash_keys]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-01-15"
+end = "2027-06-23"
+
+[[trusted.zcash_primitives]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-20"
+end = "2027-06-23"
+
+[[trusted.zcash_proofs]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-20"
+end = "2027-06-23"
+
+[[trusted.zcash_protocol]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-01-27"
+end = "2027-06-23"
+
+[[trusted.zcash_transparent]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-12-17"
+end = "2027-06-23"
+
+[[trusted.zip321]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-01-15"
+end = "2027-06-23"
