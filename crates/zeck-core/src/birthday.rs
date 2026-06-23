@@ -12,7 +12,7 @@ use zcash_client_backend::{
 use crate::{
     derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
     error::{ZeckError, ZeckResult},
-    lightwalletd::probe_lightwalletd_endpoints,
+    lightwalletd::{probe_lightwalletd_endpoints, validated_lightwalletd_endpoints},
     models::{BirthdayDetectResult, RuntimeScanConfig, ZeckNetwork},
     scan::{import_probe_account, run_wallet_sync},
     workspace::{consensus_network, RecoveryWorkspace},
@@ -330,7 +330,7 @@ where
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     on_progress("Connecting to lightwalletd…");
-    let (mut client, _endpoint, chain_info) =
+    let (mut client, primary_endpoint, chain_info) =
         probe_lightwalletd_endpoints(lightwalletd_url).await?;
     let chain_tip = u32::try_from(chain_info.block_height)
         .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
@@ -339,8 +339,22 @@ where
         .saturating_add(1);
 
     // ── Phase 1: transparent probe ────────────────────────────────────────────
-    on_progress("Checking transparent address history (instant)…");
-    if let Ok(Some(earliest)) = probe_transparent(&mut client, seed_phrase, network).await {
+    // Cross-check the earliest transparent UTXO across ALL configured endpoints
+    // and take the minimum, so a single hostile server cannot hide early history
+    // by withholding UTXOs and pushing the detected birthday later (audit Issue C
+    // follow-up). Any honest endpoint that reports earlier activity lowers the
+    // birthday.
+    on_progress("Checking transparent address history across endpoints (instant)…");
+    let earliest = earliest_transparent_across_endpoints(
+        lightwalletd_url,
+        &mut client,
+        &primary_endpoint,
+        seed_phrase,
+        network,
+        &on_progress,
+    )
+    .await;
+    if let Some(earliest) = earliest {
         let birthday = earliest
             .saturating_sub(BIRTHDAY_BUFFER_BLOCKS)
             .max(sapling_floor);
@@ -425,6 +439,71 @@ where
              returned incomplete history — retry against a server you trust."
         ),
     })
+}
+
+/// Combine two "earliest transparent activity" observations, taking the earlier
+/// (minimum) of the two when both are present. A `None` from one endpoint never
+/// raises the floor, so a hostile server that withholds early UTXOs cannot push
+/// the detected birthday later than what an honest endpoint reports (audit
+/// Issue C follow-up).
+fn combine_earliest(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) => Some(x),
+        (None, b) => b,
+    }
+}
+
+/// Probe the earliest transparent UTXO height across every configured
+/// lightwalletd endpoint and return the minimum.
+///
+/// The already-connected `primary_client` (at `primary_endpoint`) is probed
+/// first; every other configured endpoint is connected to and probed
+/// independently, and unreachable secondaries are skipped best-effort. Taking
+/// the minimum across endpoints means a single hostile server cannot hide early
+/// history by withholding UTXOs (audit Issue C follow-up).
+async fn earliest_transparent_across_endpoints<F>(
+    lightwalletd_url: &str,
+    primary_client: &mut CompactTxStreamerClient<Channel>,
+    primary_endpoint: &str,
+    seed_phrase: &SecretString,
+    network: ZeckNetwork,
+    on_progress: &F,
+) -> Option<u32>
+where
+    F: Fn(&str),
+{
+    let mut earliest = probe_transparent(primary_client, seed_phrase, network)
+        .await
+        .ok()
+        .flatten();
+
+    let endpoints = validated_lightwalletd_endpoints(lightwalletd_url).unwrap_or_default();
+    for endpoint in endpoints.iter().filter(|e| e.as_str() != primary_endpoint) {
+        match CompactTxStreamerClient::connect(endpoint.clone()).await {
+            Ok(mut client) => {
+                let observed = probe_transparent(&mut client, seed_phrase, network)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(h) = observed {
+                    if earliest.is_none_or(|e| h < e) {
+                        on_progress(&format!(
+                            "Endpoint {endpoint} reported earlier transparent activity at block {h}; lowering birthday."
+                        ));
+                    }
+                }
+                earliest = combine_earliest(earliest, observed);
+            }
+            Err(err) => {
+                on_progress(&format!(
+                    "Secondary endpoint {endpoint} unreachable for birthday cross-check (skipping): {err}"
+                ));
+            }
+        }
+    }
+
+    earliest
 }
 
 /// Call `GetAddressUtxos` for the first `PROBE_ACCOUNT_COUNT` accounts (both
@@ -571,6 +650,17 @@ mod tests {
         assert!(note.contains("earlier"));
         // ...and anchors the detected height to an approximate calendar date.
         assert!(note.contains("around 20"));
+    }
+
+    #[test]
+    fn combine_earliest_takes_minimum_and_never_raised_by_none() {
+        use super::combine_earliest;
+        assert_eq!(combine_earliest(Some(900_000), Some(500_000)), Some(500_000));
+        assert_eq!(combine_earliest(Some(500_000), Some(900_000)), Some(500_000));
+        // A withholding or unreachable endpoint (None) must never raise the floor.
+        assert_eq!(combine_earliest(Some(500_000), None), Some(500_000));
+        assert_eq!(combine_earliest(None, Some(500_000)), Some(500_000));
+        assert_eq!(combine_earliest(None, None), None);
     }
 
     #[test]
