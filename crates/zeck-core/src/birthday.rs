@@ -5,14 +5,17 @@ use uuid::Uuid;
 use zcash_client_backend::{
     data_api::AccountBirthday,
     proto::service::{
-        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, GetAddressUtxosArg,
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, GetAddressUtxosArg,
     },
 };
 
 use crate::{
     derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
     error::{ZeckError, ZeckResult},
-    lightwalletd::{probe_lightwalletd_endpoints, validated_lightwalletd_endpoints},
+    lightwalletd::{
+        probe_lightwalletd_endpoints, validate_lightwalletd_network,
+        validated_lightwalletd_endpoints,
+    },
     models::{BirthdayDetectResult, RuntimeScanConfig, ZeckNetwork},
     scan::{import_probe_account, run_wallet_sync},
     workspace::{consensus_network, RecoveryWorkspace},
@@ -482,6 +485,19 @@ where
     for endpoint in endpoints.iter().filter(|e| e.as_str() != primary_endpoint) {
         match CompactTxStreamerClient::connect(endpoint.clone()).await {
             Ok(mut client) => {
+                // Validate the secondary's network before trusting its UTXO
+                // heights, so a wrong-chain endpoint cannot influence the
+                // detected birthday (audit Issue C follow-up review).
+                let network_ok = match client.get_lightd_info(Empty {}).await {
+                    Ok(info) => validate_lightwalletd_network(network, &info.into_inner()).is_ok(),
+                    Err(_) => false,
+                };
+                if !network_ok {
+                    on_progress(&format!(
+                        "Secondary endpoint {endpoint} failed network validation for birthday cross-check (skipping)."
+                    ));
+                    continue;
+                }
                 let observed = probe_transparent(&mut client, seed_phrase, network)
                     .await
                     .ok()
