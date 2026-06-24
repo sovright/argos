@@ -28,7 +28,8 @@ fn main() {
             commands::notify_user,
             commands::list_incomplete_sessions,
             commands::resume_session,
-            commands::donation_address
+            commands::donation_address,
+            commands::open_external_url
         ])
         .setup(|app| {
             let _window = app.get_webview_window("main");

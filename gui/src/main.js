@@ -7,14 +7,17 @@ function listen(...args) {
 
 // External links open in the OS default app. The Tauri webview has no in-app
 // browser and a strict CSP, so a bare target="_blank" would die silently —
-// route http(s)/mailto clicks through the opener plugin instead.
+// route http(s)/mailto clicks through the `open_external_url` command. That
+// command enforces a hard-coded allowlist in Rust (audit Issue D); the broad
+// `opener:default` grant has been removed, so this is the only egress path and
+// it only opens vetted URLs.
 document.addEventListener("click", (event) => {
   const link = event.target.closest("a[href]");
   if (!link) return;
   const href = link.getAttribute("href");
   if (!href || !/^(https?|mailto):/i.test(href)) return;
   event.preventDefault();
-  invoke("plugin:opener|open_url", { url: href }).catch((err) => {
+  invoke("open_external_url", { url: href }).catch((err) => {
     console.error("Failed to open external link:", href, err);
   });
 });

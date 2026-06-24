@@ -237,6 +237,50 @@ pub fn donation_address() -> String {
     argos_core::DONATION_ADDRESS.to_owned()
 }
 
+/// Exact set of external URLs the UI is allowed to open in the OS browser.
+///
+/// This is the egress allowlist that replaces the broad `opener:default`
+/// capability grant (audit Issue D). Code running in the webview can only open
+/// one of these exact URLs, so a future webview compromise cannot use the
+/// opener as a channel to exfiltrate the seed (e.g. opening a URL of the form
+/// `https://evil/?s=<seed>`). Keep this in sync with the `<a href>` links in
+/// `gui/src/*.html`. Adding a link there without adding it here means the link
+/// will silently fail to open, which is the intended fail-closed behavior.
+const ALLOWED_EXTERNAL_URLS: &[&str] = &[
+    "https://github.com/sovright/argos/discussions",
+    "https://github.com/zingolabs/zexcavator",
+    "https://leastauthority.com",
+    "https://signal.group/#CjQKIKE0kww-DmAPcnN92JPeSt7_e2YYyLOy11l1up_vHvC1EhDUYW2_t9TDKpeXh7lP2l5Q",
+    "https://sovright.com",
+    "https://www.theblock.co/post/175259/someone-is-clogging-up-the-zcash-blockchain-with-a-spam-attack",
+    "mailto:support@sovright.com",
+];
+
+/// Open an external URL in the OS default handler, but only if it is on the
+/// hard-coded allowlist. Replaces direct frontend access to the opener
+/// plugin's `open_url` (audit Issue D): the plugin is still invoked, but from
+/// Rust and only for vetted destinations, so the webview has no arbitrary
+/// outbound-egress primitive.
+/// Exact-match allowlist check. Pulled out of the command so it is unit-testable
+/// without an `AppHandle`. Full-string equality (not prefix/substring), so
+/// `https://evil/?s=<seed>` or `https://sovright.com.evil/` are rejected.
+fn is_allowed_external_url(url: &str) -> bool {
+    ALLOWED_EXTERNAL_URLS.contains(&url)
+}
+
+#[tauri::command]
+pub fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    if !is_allowed_external_url(&url) {
+        return Err(format!("refusing to open non-allowlisted URL: {url}"));
+    }
+
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub async fn estimate_birthday_from_date(
     date: String,
@@ -816,5 +860,47 @@ mod tests {
         assert_eq!(mode, 0o600, "a reused report file must be re-tightened to 0o600");
         assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_url_allowlist_accepts_listed_and_rejects_everything_else() {
+        use super::is_allowed_external_url;
+        // Every allowlisted URL is accepted.
+        for url in super::ALLOWED_EXTERNAL_URLS {
+            assert!(is_allowed_external_url(url), "{url} should be allowed");
+        }
+        // Exfiltration and look-alike attempts are rejected (exact match, not prefix/substring).
+        assert!(!is_allowed_external_url("https://evil.example/?s=secret-seed"));
+        assert!(!is_allowed_external_url("https://sovright.com.evil.example/"));
+        assert!(!is_allowed_external_url("https://sovright.com/extra"));
+        assert!(!is_allowed_external_url("file:///etc/passwd"));
+        assert!(!is_allowed_external_url("javascript:alert(1)"));
+        assert!(!is_allowed_external_url(""));
+    }
+
+    // Fail-closed sync guard: every external http(s)/mailto link in the shipped
+    // HTML must be on the allowlist, or the UI link silently breaks (audit Issue
+    // D). This catches a maintainer adding a link without updating the allowlist.
+    #[test]
+    fn every_html_external_link_is_allowlisted() {
+        let html = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/index.html"
+        ))
+        .expect("read index.html");
+        for (idx, _) in html.match_indices("href=\"") {
+            let rest = &html[idx + 6..];
+            let end = rest.find('"').expect("closing quote");
+            let href = &rest[..end];
+            if href.starts_with("http://")
+                || href.starts_with("https://")
+                || href.starts_with("mailto:")
+            {
+                assert!(
+                    super::is_allowed_external_url(href),
+                    "external link {href} in index.html is not in ALLOWED_EXTERNAL_URLS"
+                );
+            }
+        }
     }
 }
