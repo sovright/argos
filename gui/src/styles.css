@@ -38,11 +38,11 @@
   --bg: #f4efe6;
   --panel: rgba(255, 252, 247, 0.92);
   --panel-strong: #fffaf2;
-  --ink: #18251f;
-  --muted: #5e685f;
-  --line: rgba(24, 37, 31, 0.12);
-  --accent: #1f6b56;
-  --accent-soft: rgba(31, 107, 86, 0.12);
+  --ink: #1a2535;
+  --muted: #5e6878;
+  --line: rgba(26, 37, 53, 0.12);
+  --accent: #5d8aa8;
+  --accent-soft: rgba(93, 138, 168, 0.12);
   --danger: #a73b2a;
   --warning: #8b5a20;
   --shadow: 0 24px 80px rgba(23, 34, 28, 0.12);
@@ -203,7 +203,7 @@ h1 {
   line-height: 1;
   font-family: Georgia, "Times New Roman", serif;
   white-space: nowrap;
-  color: #2c2218;
+  color: var(--ink);
 }
 
 h2 {
@@ -218,6 +218,10 @@ h3 {
 }
 
 .lead,
+.sidebar-top .eyebrow {
+  color: var(--muted);
+}
+
 .sidebar-copy {
   color: var(--muted);
   font-size: 1.02rem;
@@ -435,7 +439,11 @@ button:hover,
 
 button.primary {
   color: white;
-  background: linear-gradient(135deg, #1f6b56, #154a3c);
+  background: #5d8aa8;
+}
+
+button.primary:hover {
+  background: #4a7a98;
 }
 
 button.secondary,
@@ -521,7 +529,7 @@ button:disabled {
   height: 100%;
   width: 0;
   border-radius: inherit;
-  background: linear-gradient(90deg, #c99649, #1f6b56);
+  background: linear-gradient(90deg, #c99649, #5d8aa8);
   transition: width 180ms ease;
 }
 
@@ -1062,8 +1070,8 @@ select {
   display: block;
 }
 .preset-chip[aria-pressed="true"] {
-  background: linear-gradient(135deg, #1f6b56, #154a3c);
-  border-color: #154a3c;
+  background: #5d8aa8;
+  border-color: #4a7a98;
 }
 .preset-chip[aria-pressed="true"] .preset-pct,
 .preset-chip[aria-pressed="true"] .preset-amt {
