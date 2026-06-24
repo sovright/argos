@@ -207,6 +207,19 @@ jobs:
           TS_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           TS_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           TS_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          # Audit Issue G: pin the Microsoft.Trusted.Signing.Client NuGet package
+          # by content, not just by version, so a tampered download (NuGet/CDN
+          # compromise, malicious mirror, MITM of Invoke-WebRequest) cannot run
+          # inside this privileged signing job.
+          #
+          # MAINTAINER ACTION REQUIRED: when bumping $nugetVersion below, set this
+          # to the SHA-256 of the exact pinned package version. Obtain it from a
+          # trusted machine, e.g.:
+          #   curl -sL https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/<version> -o pkg.zip
+          #   sha256sum pkg.zip   # or: Get-FileHash -Algorithm SHA256 pkg.zip
+          # The job fails closed if this value does not match the downloaded bytes,
+          # including if a future bump accidentally leaves the placeholder in place.
+          TRUSTED_SIGNING_CLIENT_SHA256: 3BFCF1E0A3CB42AF1692F0A8ED45C15DE070C2DE86F28A59B2795D904D8A920F
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -219,6 +232,21 @@ jobs:
           Invoke-WebRequest -UseBasicParsing `
             -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/$nugetVersion" `
             -OutFile $pkgZip
+
+          # Audit Issue G: verify the downloaded package by content before
+          # expanding it. Fail the job on any mismatch so attacker-supplied bytes
+          # never reach Expand-Archive or signtool.
+          $expectedHash = $env:TRUSTED_SIGNING_CLIENT_SHA256
+          $actualHash = (Get-FileHash -Path $pkgZip -Algorithm SHA256).Hash
+          Write-Host "Microsoft.Trusted.Signing.Client $nugetVersion SHA-256: $actualHash"
+          if ($expectedHash -eq "PLACEHOLDER_SET_TO_SHA256_OF_PINNED_PACKAGE" -or `
+              [string]::IsNullOrWhiteSpace($expectedHash)) {
+            throw "TRUSTED_SIGNING_CLIENT_SHA256 is not configured. Set it to the SHA-256 of Microsoft.Trusted.Signing.Client $nugetVersion (observed: $actualHash) and re-run."
+          }
+          if ($actualHash -ne $expectedHash.Trim().ToUpperInvariant()) {
+            throw "Microsoft.Trusted.Signing.Client $nugetVersion hash mismatch. Expected $($expectedHash.Trim().ToUpperInvariant()), got $actualHash. Refusing to expand a potentially tampered signing package."
+          }
+
           Expand-Archive -Path $pkgZip -DestinationPath $pkgDir -Force
           $dlib = Join-Path $pkgDir "bin\x64\Azure.CodeSigning.Dlib.dll"
           if (-not (Test-Path $dlib)) {
