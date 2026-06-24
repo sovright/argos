@@ -100,6 +100,25 @@ mod tests {
     }
 
     #[test]
+    fn terms_text_uses_delaware_jurisdiction_and_wilmington_venue() {
+        let text = terms_text();
+        assert!(text.contains("laws of the State of Delaware, United States of America"));
+        assert!(text.contains(
+            "STATE OR FEDERAL COURT LOCATED IN WILMINGTON, DELAWARE, UNITED STATES OF AMERICA"
+        ));
+        assert!(text.contains(
+            "site specified by Sovright in Wilmington, Delaware, United States of America"
+        ));
+        assert!(text.contains(
+            "state or federal courts located in Wilmington, Delaware, United States of America"
+        ));
+        assert!(
+            !text.contains("San Francisco"),
+            "embedded terms must not retain the old San Francisco venue"
+        );
+    }
+
+    #[test]
     fn unaccepted_dir_reports_not_accepted() {
         let dir = std::env::temp_dir().join(format!("argos-tos-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
