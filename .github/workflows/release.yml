@@ -20,11 +20,13 @@ on:
 #   - `release-publish` — used by the release job; gates creation of the
 #                         GitHub Release.
 #
-# BOTH environments MUST be configured in repo settings with:
-#   - Required reviewers (so a human must approve before a tag build can sign
-#     or publish), and ideally
-#   - A deployment branch/tag protection rule restricting the environments to
-#     the protected release tags/branches.
+# BOTH environments MUST be configured in repo settings with required reviewers
+# so a human must approve before a tag build can sign or publish.
+#
+# Maintainers SHOULD also configure a deployment branch/tag protection rule for
+# these environments, restricting them to the protected release refs. That rule
+# is an environment setting, not something this workflow can express; if it is
+# absent, reviewer approval is the active environment gate.
 #
 # This gating is enforced by the Environment protection settings, NOT by this
 # workflow file. Adding a tag/branch check here would be a false assurance:
