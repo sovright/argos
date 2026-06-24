@@ -1,4 +1,4 @@
-use bip0039::{English, Mnemonic};
+use bip0039::{English, Error as Bip39Error, Language, Mnemonic};
 use secrecy::{ExposeSecret, Secret, SecretString};
 use zcash_address::unified::{Address as UnifiedAddress, Encoding, Receiver};
 use zcash_keys::{encoding::AddressCodec, keys::sapling};
@@ -15,8 +15,8 @@ use crate::{
 
 pub fn validate_mnemonic_words(words: &[String]) -> ZeckResult<()> {
     let phrase = normalize_words(words)?;
-    let _ = Mnemonic::<English>::from_phrase(phrase)
-        .map_err(|err| ZeckError::InvalidMnemonic(err.to_string()))?;
+    let _ = Mnemonic::<English>::from_phrase(&phrase)
+        .map_err(|err| redact_mnemonic_error(&err, &phrase))?;
     Ok(())
 }
 
@@ -53,7 +53,7 @@ pub fn derive_accounts(
 
 pub(crate) fn mnemonic_seed(seed_phrase: &SecretString) -> ZeckResult<Secret<[u8; 64]>> {
     let mnemonic = Mnemonic::<English>::from_phrase(seed_phrase.expose_secret())
-        .map_err(|err| ZeckError::InvalidMnemonic(err.to_string()))?;
+        .map_err(|err| redact_mnemonic_error(&err, seed_phrase.expose_secret()))?;
     Ok(Secret::new(mnemonic.to_seed("")))
 }
 
@@ -191,6 +191,35 @@ fn transparent_child_index(index: u32) -> ZeckResult<NonHardenedChildIndex> {
     })
 }
 
+/// Convert a `bip0039` validation error into a `ZeckError::InvalidMnemonic`
+/// without ever leaking the literal seed word.
+///
+/// Audit Suggestion 6 (Least Authority): the `bip0039` `UnknownWord` Display
+/// embeds the offending word verbatim. Because a typo is often only a single
+/// edit away from the intended BIP-39 word, that string can leak partial seed
+/// material through screenshots or pasted logs. For `UnknownWord` we therefore
+/// report only the 1-based position of the first offending word, derived by
+/// locating it in the caller's phrase, and never the word itself. All other
+/// `bip0039` variants carry no secret material and are forwarded as-is.
+fn redact_mnemonic_error(err: &Bip39Error, phrase: &str) -> ZeckError {
+    match err {
+        Bip39Error::UnknownWord(_) => {
+            let position = phrase
+                .split_whitespace()
+                .position(|word| English::index_of(word).is_none())
+                .map(|index| index + 1);
+            let message = match position {
+                Some(position) => {
+                    format!("word {position} is not in the BIP-39 wordlist")
+                }
+                None => "mnemonic contains a word that is not in the BIP-39 wordlist".to_owned(),
+            };
+            ZeckError::InvalidMnemonic(message)
+        }
+        other => ZeckError::InvalidMnemonic(other.to_string()),
+    }
+}
+
 fn normalize_words(words: &[String]) -> ZeckResult<String> {
     if words.len() != 24 {
         return Err(ZeckError::InvalidMnemonic(format!(
@@ -254,6 +283,56 @@ mod tests {
         words[0] = "zzzznotaword".to_owned();
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
+    }
+
+    // Audit Suggestion 6 (Least Authority): an unknown seed word must never be
+    // echoed back in the error message, because a typo is usually a single edit
+    // away from the real BIP-39 word and leaks partial seed material. Only the
+    // 1-based position of the offending word may appear.
+    #[test]
+    fn unknown_word_error_reports_index_not_word() {
+        // A near-miss typo: "abandom" is one edit from the valid word "abandon".
+        let offending_word = "abandom";
+        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
+        words[6] = offending_word.to_owned(); // 7th word (1-based position 7)
+
+        let err = validate_mnemonic_words(&words).unwrap_err();
+        let ZeckError::InvalidMnemonic(message) = &err else {
+            panic!("expected InvalidMnemonic, got {err:?}");
+        };
+
+        assert!(
+            !message.contains(offending_word),
+            "error message leaked the literal seed word: {message:?}"
+        );
+        assert!(
+            message.contains("word 7"),
+            "error message should report the 1-based position: {message:?}"
+        );
+    }
+
+    // The same redaction must hold on the seed-derivation path, not just the
+    // standalone validator, so no entry point leaks the literal word.
+    #[test]
+    fn mnemonic_seed_unknown_word_error_redacted() {
+        let offending_word = "abandom";
+        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
+        words[0] = offending_word.to_owned();
+        let phrase = SecretString::new(words.join(" "));
+
+        let err = mnemonic_seed(&phrase).unwrap_err();
+        let ZeckError::InvalidMnemonic(message) = &err else {
+            panic!("expected InvalidMnemonic, got {err:?}");
+        };
+
+        assert!(
+            !message.contains(offending_word),
+            "error message leaked the literal seed word: {message:?}"
+        );
+        assert!(
+            message.contains("word 1"),
+            "error message should report the 1-based position: {message:?}"
+        );
     }
 
     #[test]
