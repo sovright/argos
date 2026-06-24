@@ -1230,12 +1230,13 @@ async fn broadcast_transactions(
         let detail = if status == "confirmed" {
             match cross_verify_mined(lightwalletd_url, primary_endpoint, network, txid).await {
                 Some(true) => format!(
-                    "{detail} A second endpoint independently confirmed this transaction is mined."
+                    "{detail} A second configured endpoint also reported this transaction as mined."
                 ),
                 Some(false) => format!(
-                    "{detail} WARNING: a second endpoint did NOT report this transaction as mined — \
-                     treat the confirmation with suspicion and verify on a block explorer before \
-                     trusting it."
+                    "{detail} NOTE: a second configured endpoint did not report this transaction as \
+                     mined yet. This is most often benign propagation lag right after broadcast, but \
+                     if it persists, verify the transaction on a block explorer before treating the \
+                     recovery as final."
                 ),
                 None => detail,
             }
