@@ -259,6 +259,7 @@ async fn main() -> Result<()> {
             dry_run,
             confirm_sweep,
         } => {
+            let birthday = birthday.expect("sweep command requires birthday");
             let address = validate_destination_address(&destination, network)?;
             println!(
                 "Destination: Unified Address (Orchard={}, Sapling={}, Transparent={})",
