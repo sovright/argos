@@ -1266,9 +1266,22 @@ async fn wait_for_confirmation(
                                 "marking mined transaction {txid} in wallet db: {err}"
                             ))
                         })?;
+                    // The mined height is reported by the single connected
+                    // lightwalletd server and trusted verbatim. A hostile
+                    // server can return a success code without relaying the
+                    // transaction and then answer the confirmation poll with a
+                    // fabricated height. Theft is not possible (signatures
+                    // commit to the user's own outputs), but a recovery tool
+                    // must not let the user treat a single server's word as
+                    // final. Make the attestation explicit (audit Issue B).
                     return Ok((
                         "confirmed".to_owned(),
-                        format!("{label} transaction mined at height {mined_height}."),
+                        format!(
+                            "{label} transaction reported mined at height {mined_height} by the \
+                             connected lightwalletd server. This confirmation is attested by a \
+                             single server — verify it against a block explorer or a second node \
+                             before treating the recovery as final."
+                        ),
                         Some(mined_height),
                     ));
                 }

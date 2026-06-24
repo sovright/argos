@@ -538,6 +538,11 @@
           <h2>Recovery complete</h2>
           <p class="lead" id="complete-summary">Transactions broadcast successfully.</p>
           <div id="complete-txids" class="complete-txids"></div>
+          <!-- Audit Issue B: confirmation is attested by the single connected
+               lightwalletd server, so this advises independent verification. -->
+          <p class="status-line" id="complete-confirmation-note">
+            Confirmation status is reported by the lightwalletd server you connected to. Before treating your recovery as final, verify each transaction ID on an independent Zcash block explorer or a second node.
+          </p>
           <div class="report-card" id="complete-report" style="display:none"></div>
           <div class="donate-card report-card">
             <h3>Help us keep doing this</h3>
