@@ -8,8 +8,8 @@ Least Authority audit Suggestion 9 notes that the threat model states Argos
 avoids writing the seed to disk and explicitly names writing it to swap as a
 threat, while also acknowledging that `secrecy` does not protect against swap.
 The suggestion is to *consider* alternatives that prevent the OS from paging
-sensitive data to disk — `secrets` or `shush-rs` — both of which can `mlock`
-secret pages.
+sensitive data to disk — for example `secrets`, or `shush-rs` after source
+review confirms it locks the actual secret backing memory Argos would use.
 
 `secrecy` zeroizes on drop but does **not** `mlock`: nothing stops the kernel
 from paging a live `SecretString` to swap, or capturing it in a core dump,
@@ -20,8 +20,8 @@ before it is dropped.
 | Crate | Version | Downloads (recent) | Last release | Memory protection | Extra deps |
 |---|---|---|---|---|---|
 | **secrecy** (incumbent) | **0.8.0** (in tree; crate latest 0.10.3) | 122M (27.9M) | 2024-10 | zeroize-on-drop only | none beyond `zeroize` |
-| **secrets** | 1.3.0 | 76k (7.5k) | 2026-04 | `mlock` + `mprotect` guard pages + canaries, via **libsodium** | `libsodium-sys` (C library) |
-| **shush-rs** | 0.1.11 | 13.8k (0.3k) | 2024-11 | `mlock`/`munlock` + zeroize, `secrecy`-style API | `libc` only |
+| **secrets** | 1.3.0 | 76k (7.5k) | 2026-04 | `mlock` + `mprotect` guard pages + canaries, via **libsodium** | system libsodium by default (`pkg-config`/vcpkg), optional bundled `libsodium-sys` |
+| **shush-rs** | 0.1.11 | 13.8k (0.3k) | 2024-11 | advertises `mlock`/`munlock` + zeroize for its own allocations; needs source audit for Argos seed buffers | `libc` only |
 
 (`secrecy` is maintained by iqlusion; it is the de-facto standard, hence the
 122M downloads. Argos pins the 0.8.x API — `Secret<T>` / `SecretString::new(String)`.
@@ -42,20 +42,23 @@ wrapper can seal it. The strongest mitigation (encrypted or disabled swap) is an
 OS-level control the audit itself places outside an individual application.
 
 **`secrets` — strongest protection, highest cost.** libsodium guarded
-allocations are the gold standard, but `libsodium-sys` introduces a C build
-dependency. Argos ships a cross-platform Tauri matrix (macOS, Linux, Windows
-x64 **and ARM64**) with a code-signing release pipeline (audit Issues G/H, PR
-#96). Adding a bundled/linked C library to that matrix is a material build- and
-release-integrity risk for a modest in-memory benefit — it directly complicates
-the pipeline we are otherwise hardening.
+allocations are the gold standard, but `secrets` still introduces a libsodium C
+library dependency (system-provided via `pkg-config`/vcpkg by default, or
+optionally bundled through `libsodium-sys`). Argos ships a cross-platform Tauri
+matrix (macOS, Linux, and Windows x64) with a code-signing release pipeline
+(audit Issues G/H, PR #96). Adding a bundled/linked C library to that matrix is
+a material build- and release-integrity risk for a modest in-memory benefit —
+it directly complicates the pipeline we are otherwise hardening.
 
-**`shush-rs` — lowest-friction, but immature.** It mirrors `secrecy`'s API
-(`SecretBox`) and adds `mlock` with only a `libc` dependency, so it would be a
-near drop-in. But it is 0.1.x, ~14k downloads, single-maintainer, and ~19 months
-since its last release as of this writing. Swapping the crate that wraps the
-**wallet seed** — our most security-critical value — from a battle-tested
-dependency (122M downloads) to an unproven one trades a known quantity for
-maintenance and correctness risk in exactly the wrong place.
+**`shush-rs` — potentially lower-friction, but immature and unaudited here.**
+It mirrors `secrecy` 0.10's `SecretBox` API and advertises `mlock` with only a
+`libc` dependency, so it is worth revisiting only after a focused source review
+confirms the bytes that hold Argos seed material would actually be page-locked.
+It is also 0.1.x, ~14k downloads, single-maintainer, and ~19 months since its
+last release as of this writing. Swapping the crate that wraps the **wallet
+seed** — our most security-critical value — from a battle-tested dependency
+(122M downloads) to an unproven one trades a known quantity for maintenance and
+correctness risk in exactly the wrong place.
 
 ## Recommendation
 
@@ -71,9 +74,10 @@ Instead:
    recovery on a machine with encrypted swap, or with swap disabled, and avoid
    suspend/hibernate during a recovery. This belongs in the user guide.
 2. **Revisit if the threat model elevates** a local attacker with swap/core-dump
-   access to in-scope. If so, the lowest-friction path is to pilot `shush-rs`
-   behind a focused review, or to `mlock` only the seed buffer via a small
-   `region`/`memsec`-based wrapper rather than replacing `secrecy` wholesale.
+   access to in-scope. If so, first source-audit `shush-rs` to verify it locks
+   the actual secret backing memory Argos would use before piloting it; otherwise
+   prefer `mlock`ing only the seed buffer via a small `region`/`memsec`-based
+   wrapper rather than replacing `secrecy` wholesale.
 3. **Keep the supply-chain posture** (the `cargo vet` config in
    [supply-chain/config.toml](../supply-chain/config.toml) and the audit
    discussion in [THREAT_MODEL.md](THREAT_MODEL.md)) in mind: any of these
