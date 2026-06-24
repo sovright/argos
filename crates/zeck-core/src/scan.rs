@@ -25,7 +25,8 @@ use zcash_client_backend::{
     proto::{
         compact_formats::CompactBlock,
         service::{
-            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, GetAddressUtxosArg,
+            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty,
+            GetAddressUtxosArg, LightdInfo,
         },
     },
     sync,
@@ -41,8 +42,8 @@ use crate::{
     },
     error::{ZeckError, ZeckResult},
     lightwalletd::{
-        build_probe, describe_lightwalletd_endpoints, probe_lightwalletd_endpoints,
-        validate_lightwalletd_network,
+        build_probe, describe_lightwalletd_endpoints, validate_lightwalletd_network,
+        validated_lightwalletd_endpoints,
     },
     models::{
         in_sandblasting_zone, AccountBalancePreview, AddressScope, DerivedAccount, DiscoveryPool,
@@ -156,7 +157,12 @@ impl BlockCache for MemoryBlockCache {
         range: Option<&ScanRange>,
     ) -> Result<Option<BlockHeight>, Self::Error> {
         let (start_height, end_height) = range
-            .map(|r| (u32::from(r.block_range().start), u32::from(r.block_range().end)))
+            .map(|r| {
+                (
+                    u32::from(r.block_range().start),
+                    u32::from(r.block_range().end),
+                )
+            })
             .unwrap_or((0, u32::MAX));
         Ok(self
             .lock()?
@@ -313,8 +319,7 @@ impl ProgressPoller {
 
                 let mut guard = state.lock().await;
                 if let Some(scanned_height) = scanned_height {
-                    guard.progress.blocks_scanned =
-                        block_delta(scanned_height, effective_birthday);
+                    guard.progress.blocks_scanned = block_delta(scanned_height, effective_birthday);
                     guard.progress.synced_to_height = Some(u64::from(scanned_height));
                     // Store scan-phase elapsed so get_scan_progress can compute an
                     // accurate rate that excludes pre-scan phases (seed validation,
@@ -448,8 +453,7 @@ async fn run_recovery_scan_inner(
 
     let _ = default_provider().install_default();
     let (mut client, endpoint, response) =
-        probe_lightwalletd_endpoints(&config.lightwalletd_url).await?;
-    validate_lightwalletd_network(config.network, &response)?;
+        probe_valid_lightwalletd_endpoints(&config.lightwalletd_url, config.network).await?;
     let chain_tip_height = u32::try_from(response.block_height)
         .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
     let probe: LightwalletdProbe = build_probe(endpoint, &response);
@@ -565,6 +569,7 @@ async fn run_recovery_scan_inner(
         let sync_result = run_wallet_sync_with_retry(
             &workspace,
             &network,
+            config.network,
             &mut client,
             &config.lightwalletd_url,
             &state,
@@ -811,8 +816,7 @@ async fn stall_watchdog(state: &SharedScanTaskState) -> ZeckError {
     let mut stalled_ticks: u32 = 0;
     // `max_stalled_ticks` is computed at call time rather than as a const so
     // future tuning of either constant stays internally consistent.
-    let max_stalled_ticks =
-        (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS).max(1) as u32;
+    let max_stalled_ticks = (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS).max(1) as u32;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STALL_CHECK_INTERVAL_SECS)).await;
         let current = state.lock().await.progress.synced_to_height;
@@ -870,6 +874,7 @@ async fn run_wallet_sync_with_stall_watchdog(
 async fn run_wallet_sync_with_retry(
     workspace: &RecoveryWorkspace,
     network: &zcash_protocol::consensus::Network,
+    zeck_network: crate::models::ZeckNetwork,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     lightwalletd_url: &str,
     state: &SharedScanTaskState,
@@ -900,9 +905,7 @@ async fn run_wallet_sync_with_retry(
                 // "last run" timestamp on each reconnect — useful for users
                 // who interrupt a long-running scan and want to confirm
                 // it's the one they were running today.
-                if let Err(err) =
-                    touch_session_last_run(workspace.root(), now_epoch_seconds())
-                {
+                if let Err(err) = touch_session_last_run(workspace.root(), now_epoch_seconds()) {
                     warn!("failed to touch session sidecar (continuing): {err}");
                 }
 
@@ -915,17 +918,17 @@ async fn run_wallet_sync_with_retry(
 
                 tokio::time::sleep(std::time::Duration::from_secs(SYNC_RETRY_DELAY_SECS)).await;
 
-                match probe_lightwalletd_endpoints(lightwalletd_url).await {
-                    Ok((new_client, endpoint, _)) => {
+                match probe_valid_lightwalletd_endpoints(lightwalletd_url, zeck_network).await {
+                    Ok((new_client, endpoint, info)) => {
                         *client = new_client;
                         let mut guard = state.lock().await;
-                        guard.progress.message = Some(format!(
-                            "Reconnected to {endpoint}, resuming sync…"
-                        ));
-                        guard.progress.server = Some(crate::lightwalletd::build_probe(
-                            endpoint,
-                            &Default::default(),
-                        ));
+                        guard.progress.message =
+                            Some(format!("Reconnected to {endpoint}, resuming sync…"));
+                        // Pass the real `LightdInfo` so the displayed server
+                        // identity reflects the endpoint actually in use rather
+                        // than a zeroed default (audit Issue I).
+                        guard.progress.server =
+                            Some(crate::lightwalletd::build_probe(endpoint, &info));
                     }
                     Err(reconnect_err) => {
                         warn!("reconnect failed: {reconnect_err}");
@@ -935,6 +938,41 @@ async fn run_wallet_sync_with_retry(
             }
         }
     }
+}
+
+async fn probe_valid_lightwalletd_endpoints(
+    raw: &str,
+    network: crate::models::ZeckNetwork,
+) -> ZeckResult<(
+    CompactTxStreamerClient<tonic::transport::Channel>,
+    String,
+    LightdInfo,
+)> {
+    let endpoints = validated_lightwalletd_endpoints(raw)?;
+    let mut errors = Vec::new();
+
+    for endpoint in endpoints {
+        match CompactTxStreamerClient::connect(endpoint.clone()).await {
+            Ok(mut client) => match client.get_lightd_info(Empty {}).await {
+                Ok(response) => {
+                    let info = response.into_inner();
+                    match validate_lightwalletd_network(network, &info) {
+                        Ok(()) => return Ok((client, endpoint, info)),
+                        Err(err) => {
+                            errors.push(format!("{endpoint}: network validation failed: {err}"));
+                        }
+                    }
+                }
+                Err(err) => errors.push(format!("{endpoint}: {err}")),
+            },
+            Err(err) => errors.push(format!("{endpoint}: {err}")),
+        }
+    }
+
+    Err(ZeckError::Lightwalletd(format!(
+        "no configured lightwalletd endpoint passed network validation: {}",
+        errors.join(" | ")
+    )))
 }
 
 pub(crate) async fn run_wallet_sync<ChT>(
@@ -1085,8 +1123,7 @@ pub(crate) async fn refresh_scan_progress(
         block_delta(summary.chain_tip_height().into(), effective_birthday);
     guard.progress.blocks_scanned =
         block_delta(summary.fully_scanned_height().into(), effective_birthday);
-    guard.progress.synced_to_height =
-        Some(u64::from(u32::from(summary.fully_scanned_height())));
+    guard.progress.synced_to_height = Some(u64::from(u32::from(summary.fully_scanned_height())));
     guard.progress.summary = Some(ScanSummary {
         total_zatoshis,
         authoritative_balances: true,
@@ -1259,8 +1296,7 @@ async fn run_transparent_quick_probe(
         });
     }
     guard.progress.message = Some(
-        "Transparent quick-check complete. Continuing with shielded compact-block scan…"
-            .to_owned(),
+        "Transparent quick-check complete. Continuing with shielded compact-block scan…".to_owned(),
     );
 
     Ok(())
@@ -1296,26 +1332,25 @@ fn append_new_discoveries(
         .map(|d| (d.account_index, d.pool))
         .collect();
 
-    let mut try_append =
-        |discoveries: &mut Vec<ScanDiscovery>,
-         account_index: u32,
-         pool: DiscoveryPool,
-         zatoshis: u64,
-         address: String| {
-            if zatoshis == 0 {
-                return;
-            }
-            if !seen.insert((account_index, pool)) {
-                return;
-            }
-            discoveries.push(ScanDiscovery {
-                account_index,
-                pool,
-                zatoshis,
-                at_block_height,
-                address,
-            });
-        };
+    let mut try_append = |discoveries: &mut Vec<ScanDiscovery>,
+                          account_index: u32,
+                          pool: DiscoveryPool,
+                          zatoshis: u64,
+                          address: String| {
+        if zatoshis == 0 {
+            return;
+        }
+        if !seen.insert((account_index, pool)) {
+            return;
+        }
+        discoveries.push(ScanDiscovery {
+            account_index,
+            pool,
+            zatoshis,
+            at_block_height,
+            address,
+        });
+    };
 
     for account in current {
         try_append(
@@ -1463,9 +1498,7 @@ pub(crate) fn import_probe_account(
         legacy_transparent_pubkey(transparent_account, AddressScope::External, 0)?;
     let existing_receivers = wallet_db
         .get_transparent_receivers(wallet_account_id, true, true)
-        .map_err(|err| {
-            ZeckError::Wallet(format!("loading probe transparent receivers: {err}"))
-        })?;
+        .map_err(|err| ZeckError::Wallet(format!("loading probe transparent receivers: {err}")))?;
     let external_address = TransparentAddress::from_pubkey(&external_pubkey);
 
     if !existing_receivers.contains_key(&external_address) {
@@ -2183,8 +2216,10 @@ mod tests {
             // 419_199 with empty Sapling/Orchard frontiers.
             let birthday_height: u32 = 419_200;
             let scan_height = BlockHeight::from_u32(birthday_height);
-            let chain_state_before_scan =
-                ChainState::empty(BlockHeight::from_u32(birthday_height - 1), BlockHash([0u8; 32]));
+            let chain_state_before_scan = ChainState::empty(
+                BlockHeight::from_u32(birthday_height - 1),
+                BlockHash([0u8; 32]),
+            );
 
             // ─── Initial scan: import + scan one empty block ─────────────────
             let workspace1 = RecoveryWorkspace::from_runtime(&config).expect("workspace");
@@ -2207,13 +2242,9 @@ mod tests {
 
             {
                 let cache = MemoryBlockCache::new();
-                let mut wallet_db = WalletDb::for_path(
-                    &wallet_db_path,
-                    network,
-                    SystemClock,
-                    rand_core::OsRng,
-                )
-                .expect("wallet_db");
+                let mut wallet_db =
+                    WalletDb::for_path(&wallet_db_path, network, SystemClock, rand_core::OsRng)
+                        .expect("wallet_db");
 
                 // Prime the wallet's commitment-tree state and chain tip — the
                 // same calls that `zcash_client_backend::sync` issues before
@@ -2330,7 +2361,10 @@ mod tests {
         use super::super::{CacheError, MemoryBlockCache};
 
         fn test_block(height: u32) -> CompactBlock {
-            CompactBlock { height: u64::from(height), ..Default::default() }
+            CompactBlock {
+                height: u64::from(height),
+                ..Default::default()
+            }
         }
 
         fn scan_range(start: u32, end: u32) -> ScanRange {
@@ -2451,7 +2485,9 @@ mod tests {
             let scoped = cache.get_tip_height(Some(&range)).expect("tip scoped");
             assert_eq!(scoped, Some(BlockHeight::from_u32(101)));
             let empty_range = scan_range(600, 700);
-            let empty = cache.get_tip_height(Some(&empty_range)).expect("tip of empty range");
+            let empty = cache
+                .get_tip_height(Some(&empty_range))
+                .expect("tip of empty range");
             assert_eq!(empty, None);
         }
 
@@ -2462,7 +2498,10 @@ mod tests {
                 .insert((100..106).map(test_block).collect())
                 .await
                 .expect("insert");
-            cache.delete(scan_range(102, 104)).await.expect("delete range");
+            cache
+                .delete(scan_range(102, 104))
+                .await
+                .expect("delete range");
             assert_eq!(
                 collect_heights(&cache, Some(100), Some(2)).expect("prefix survives"),
                 vec![100, 101]
@@ -2527,9 +2566,7 @@ mod tests {
             .await;
             tokio::task::yield_now().await;
 
-            let err = watchdog
-                .await
-                .expect("watchdog task did not panic");
+            let err = watchdog.await.expect("watchdog task did not panic");
             let msg = err.to_string();
             assert!(
                 msg.contains("scan stalled") && msg.contains("h2 protocol error"),
@@ -2549,8 +2586,7 @@ mod tests {
 
             // Make the height advance every STALL_CHECK_INTERVAL_SECS for
             // twice the trip threshold. The watchdog should never fire.
-            let ticks_to_run =
-                (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS) * 2 + 4;
+            let ticks_to_run = (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS) * 2 + 4;
             for tick in 1..=ticks_to_run {
                 tokio::time::advance(Duration::from_secs(STALL_CHECK_INTERVAL_SECS)).await;
                 tokio::task::yield_now().await;
@@ -2576,16 +2612,14 @@ mod tests {
             };
 
             // Stall for half the threshold, then resume advancing.
-            let half_ticks =
-                (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS) / 2;
+            let half_ticks = (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS) / 2;
             for _ in 0..half_ticks {
                 tokio::time::advance(Duration::from_secs(STALL_CHECK_INTERVAL_SECS)).await;
                 tokio::task::yield_now().await;
             }
 
             // Resume advancement for past the original threshold.
-            let resumed_ticks =
-                (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS) + 4;
+            let resumed_ticks = (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS) + 4;
             for tick in 1..=resumed_ticks {
                 tokio::time::advance(Duration::from_secs(STALL_CHECK_INTERVAL_SECS)).await;
                 tokio::task::yield_now().await;
