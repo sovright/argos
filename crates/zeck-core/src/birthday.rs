@@ -47,6 +47,7 @@ const DATE_SAFETY_BUFFER_BLOCKS: u32 = 8_064;
 const PROBE_YEAR_STEP: u32 = 420_480;
 /// Wall-clock limit per shielded probe window (seconds).
 const PROBE_TIMEOUT_SECS: u64 = 45;
+const SECONDARY_PROBE_TIMEOUT_SECS: u64 = 5;
 /// Safety margin subtracted from the detected transparent activity height.
 const BIRTHDAY_BUFFER_BLOCKS: u32 = 10_000;
 /// Number of accounts (and their transparent addresses) to check for transparent activity.
@@ -91,10 +92,7 @@ pub fn estimate_birthday_from_date_offline(date: &str) -> ZeckResult<u32> {
 ///
 /// A safety margin of ~1 week (`DATE_SAFETY_BUFFER_BLOCKS`) is subtracted so
 /// we err toward over-scanning rather than missing notes.
-pub async fn estimate_birthday_from_date(
-    date: &str,
-    lightwalletd_url: &str,
-) -> ZeckResult<u32> {
+pub async fn estimate_birthday_from_date(date: &str, lightwalletd_url: &str) -> ZeckResult<u32> {
     let parsed = CalendarDate::parse(date)?;
     if parsed <= SAPLING_ACTIVATION_DATE {
         return Ok(SAPLING_ACTIVATION_HEIGHT);
@@ -102,9 +100,7 @@ pub async fn estimate_birthday_from_date(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let target_unix = parsed
-        .days_since_unix_epoch()
-        .saturating_mul(DAY_SECONDS);
+    let target_unix = parsed.days_since_unix_epoch().saturating_mul(DAY_SECONDS);
 
     let probed = match probe_lightwalletd_endpoints(lightwalletd_url).await {
         Ok(probe) => probe,
@@ -116,8 +112,8 @@ pub async fn estimate_birthday_from_date(
         Ok(h) => h,
         Err(_) => return estimate_birthday_from_date_offline(date),
     };
-    let sapling_floor = u32::try_from(chain_info.sapling_activation_height)
-        .unwrap_or(SAPLING_ACTIVATION_HEIGHT);
+    let sapling_floor =
+        u32::try_from(chain_info.sapling_activation_height).unwrap_or(SAPLING_ACTIVATION_HEIGHT);
 
     let tip_time = match fetch_block_time(&mut client, chain_tip).await {
         Ok(t) => t,
@@ -144,7 +140,9 @@ pub async fn estimate_birthday_from_date(
         }
     }
 
-    Ok(lo.saturating_sub(DATE_SAFETY_BUFFER_BLOCKS).max(sapling_floor))
+    Ok(lo
+        .saturating_sub(DATE_SAFETY_BUFFER_BLOCKS)
+        .max(sapling_floor))
 }
 
 /// Inverse of the offline estimator: given a block height, return the
@@ -272,12 +270,10 @@ impl CalendarDate {
         let z = days + 719_468;
         let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
         let day_of_era = z - era * 146_097;
-        let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524
-            - day_of_era / 146_096)
-            / 365;
+        let year_of_era =
+            (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
         let year = year_of_era + era * 400;
-        let day_of_year =
-            day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
         let mp = (5 * day_of_year + 2) / 153;
         let day = day_of_year - (153 * mp + 2) / 5 + 1;
         let month = if mp < 10 { mp + 3 } else { mp - 9 };
@@ -483,14 +479,26 @@ where
 
     let endpoints = validated_lightwalletd_endpoints(lightwalletd_url).unwrap_or_default();
     for endpoint in endpoints.iter().filter(|e| e.as_str() != primary_endpoint) {
-        match CompactTxStreamerClient::connect(endpoint.clone()).await {
-            Ok(mut client) => {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(SECONDARY_PROBE_TIMEOUT_SECS),
+            CompactTxStreamerClient::connect(endpoint.clone()),
+        )
+        .await
+        {
+            Ok(Ok(mut client)) => {
                 // Validate the secondary's network before trusting its UTXO
                 // heights, so a wrong-chain endpoint cannot influence the
                 // detected birthday (audit Issue C follow-up review).
-                let network_ok = match client.get_lightd_info(Empty {}).await {
-                    Ok(info) => validate_lightwalletd_network(network, &info.into_inner()).is_ok(),
-                    Err(_) => false,
+                let network_ok = match tokio::time::timeout(
+                    std::time::Duration::from_secs(SECONDARY_PROBE_TIMEOUT_SECS),
+                    client.get_lightd_info(Empty {}),
+                )
+                .await
+                {
+                    Ok(Ok(info)) => {
+                        validate_lightwalletd_network(network, &info.into_inner()).is_ok()
+                    }
+                    Ok(Err(_)) | Err(_) => false,
                 };
                 if !network_ok {
                     on_progress(&format!(
@@ -498,10 +506,20 @@ where
                     ));
                     continue;
                 }
-                let observed = probe_transparent(&mut client, seed_phrase, network)
-                    .await
-                    .ok()
-                    .flatten();
+                let observed = match tokio::time::timeout(
+                    std::time::Duration::from_secs(SECONDARY_PROBE_TIMEOUT_SECS),
+                    probe_transparent(&mut client, seed_phrase, network),
+                )
+                .await
+                {
+                    Ok(result) => result.ok().flatten(),
+                    Err(_) => {
+                        on_progress(&format!(
+                            "Secondary endpoint {endpoint} timed out for birthday cross-check (skipping)."
+                        ));
+                        None
+                    }
+                };
                 if let Some(h) = observed {
                     if earliest.is_none_or(|e| h < e) {
                         on_progress(&format!(
@@ -511,9 +529,14 @@ where
                 }
                 earliest = combine_earliest(earliest, observed);
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 on_progress(&format!(
                     "Secondary endpoint {endpoint} unreachable for birthday cross-check (skipping): {err}"
+                ));
+            }
+            Err(_) => {
+                on_progress(&format!(
+                    "Secondary endpoint {endpoint} timed out connecting for birthday cross-check (skipping)."
                 ));
             }
         }
@@ -613,7 +636,13 @@ async fn probe_shielded_window(
         ZeckError::Wallet("constructing probe account birthday from treestate".to_owned())
     })?;
 
-    import_probe_account(&workspace, network, seed, &account_birthday, transparent_account)?;
+    import_probe_account(
+        &workspace,
+        network,
+        seed,
+        &account_birthday,
+        transparent_account,
+    )?;
 
     let net = consensus_network(network);
     let timed_out = tokio::time::timeout(
@@ -640,9 +669,7 @@ fn check_probe_activity(wallet_db_path: &std::path::Path) -> ZeckResult<bool> {
         wallet_db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|err| {
-        ZeckError::Storage(format!("opening probe wallet for activity check: {err}"))
-    })?;
+    .map_err(|err| ZeckError::Storage(format!("opening probe wallet for activity check: {err}")))?;
 
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sapling_received_notes)
@@ -660,7 +687,8 @@ mod tests {
 
     #[test]
     fn late_birthday_caution_warns_and_dates_on_mainnet() {
-        let note = late_birthday_caution(SAPLING_ACTIVATION_HEIGHT + 1_000_000, ZeckNetwork::Mainnet);
+        let note =
+            late_birthday_caution(SAPLING_ACTIVATION_HEIGHT + 1_000_000, ZeckNetwork::Mainnet);
         // Tells the user to rescan with an earlier birthday...
         assert!(note.contains("rescan"));
         assert!(note.contains("earlier"));
@@ -671,8 +699,14 @@ mod tests {
     #[test]
     fn combine_earliest_takes_minimum_and_never_raised_by_none() {
         use super::combine_earliest;
-        assert_eq!(combine_earliest(Some(900_000), Some(500_000)), Some(500_000));
-        assert_eq!(combine_earliest(Some(500_000), Some(900_000)), Some(500_000));
+        assert_eq!(
+            combine_earliest(Some(900_000), Some(500_000)),
+            Some(500_000)
+        );
+        assert_eq!(
+            combine_earliest(Some(500_000), Some(900_000)),
+            Some(500_000)
+        );
         // A withholding or unreachable endpoint (None) must never raise the floor.
         assert_eq!(combine_earliest(Some(500_000), None), Some(500_000));
         assert_eq!(combine_earliest(None, Some(500_000)), Some(500_000));
@@ -770,7 +804,10 @@ mod tests {
             let parsed_out = CalendarDate::parse(&back).unwrap();
             let drift =
                 (parsed_in.days_since_unix_epoch() - parsed_out.days_since_unix_epoch()).abs();
-            assert!(drift <= 1, "round-trip drift {drift} days for {date} -> {back}");
+            assert!(
+                drift <= 1,
+                "round-trip drift {drift} days for {date} -> {back}"
+            );
         }
     }
 
@@ -789,13 +826,12 @@ mod tests {
 
     #[test]
     fn calendar_date_round_trip_via_days_since_epoch() {
-        for (y, m, d) in [
-            (1970, 1, 1),
-            (2000, 2, 29),
-            (2018, 10, 28),
-            (2024, 12, 31),
-        ] {
-            let cd = CalendarDate { year: y, month: m, day: d };
+        for (y, m, d) in [(1970, 1, 1), (2000, 2, 29), (2018, 10, 28), (2024, 12, 31)] {
+            let cd = CalendarDate {
+                year: y,
+                month: m,
+                day: d,
+            };
             let back = CalendarDate::from_days_since_unix_epoch(cd.days_since_unix_epoch());
             assert_eq!(back, cd, "round trip failed for {y}-{m}-{d}");
         }
