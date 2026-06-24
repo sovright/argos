@@ -1385,10 +1385,6 @@ criteria = "safe-to-deploy"
 version = "1.2.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.secp256k1-sys]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.selectors]]
 version = "0.24.0"
 criteria = "safe-to-deploy"

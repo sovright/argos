@@ -39,6 +39,13 @@ user-id = 1588 # Andrew Poelstra (apoelstra)
 start = "2019-05-21"
 end = "2027-06-23"
 
+[[trusted.secp256k1-sys]]
+criteria = "safe-to-deploy"
+user-id = 1588 # Andrew Poelstra (apoelstra)
+start = "2019-12-10"
+end = "2027-06-24"
+notes = "Seed-handling native secp256k1 binding; trusting upstream rust-bitcoin publisher for audit Issue F."
+
 [[trusted.secrecy]]
 criteria = "safe-to-deploy"
 user-id = 19631 # Tony Arcieri (iqlusion) (tony-iqlusion)
