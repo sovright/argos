@@ -1431,18 +1431,31 @@ let pendingResumeRow = null;
 
 const DISMISSED_SESSIONS_KEY = "argos-dismissed-sessions";
 
+// Map of workspace_path -> synced_to_height recorded at dismissal time. A
+// dismissed session is hidden only while it stays at that height; if it later
+// makes progress it resurfaces (so a stray ✕ can't permanently bury a
+// resumable recovery scan). Entries self-heal — paths no longer reported as
+// incomplete are pruned on read, bounding localStorage growth.
 function getDismissedSessions() {
   try {
-    return new Set(JSON.parse(localStorage.getItem(DISMISSED_SESSIONS_KEY) || "[]"));
+    const raw = JSON.parse(localStorage.getItem(DISMISSED_SESSIONS_KEY) || "{}");
+    // Ignore the legacy array format (and any non-object) — those entries are
+    // dropped, surfacing previously-buried sessions once, which is the safe
+    // direction for a recovery tool.
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   } catch {
-    return new Set();
+    return {};
   }
 }
 
-function dismissSession(workspacePath) {
+function saveDismissedSessions(map) {
+  localStorage.setItem(DISMISSED_SESSIONS_KEY, JSON.stringify(map));
+}
+
+function dismissSession(workspacePath, syncedToHeight) {
   const dismissed = getDismissedSessions();
-  dismissed.add(workspacePath);
-  localStorage.setItem(DISMISSED_SESSIONS_KEY, JSON.stringify([...dismissed]));
+  dismissed[workspacePath] = Number(syncedToHeight) || 0;
+  saveDismissedSessions(dismissed);
 }
 
 function buildSessionRow(row, onDismiss) {
@@ -1459,10 +1472,12 @@ function buildSessionRow(row, onDismiss) {
     ? Number(row.synced_to_height).toLocaleString()
     : "0";
   const target = row.target_height ? Number(row.target_height).toLocaleString() : "?";
+  const birthday =
+    row.birthday != null ? Number(row.birthday).toLocaleString() : "?";
   const meta = document.createElement("div");
   meta.className = "session-meta";
   meta.textContent =
-    `${row.network} · birthday ${Number(row.birthday).toLocaleString()} · ` +
+    `${row.network} · birthday ${birthday} · ` +
     `scanned ${synced} of ${target} · ${fmtRelativeTime(row.last_run_at_epoch_seconds)}`;
   info.appendChild(meta);
   li.appendChild(info);
@@ -1481,7 +1496,7 @@ function buildSessionRow(row, onDismiss) {
   dismissBtn.textContent = "✕";
   dismissBtn.title = "Dismiss from list";
   dismissBtn.addEventListener("click", () => {
-    dismissSession(row.workspace_path);
+    dismissSession(row.workspace_path, row.synced_to_height);
     onDismiss();
   });
   actions.appendChild(dismissBtn);
@@ -1493,15 +1508,38 @@ function buildSessionRow(row, onDismiss) {
 async function refreshResumePanel() {
   const dataDir = $("data-dir").value.trim() || null;
   let rows = [];
+  let listOk = true;
   try {
     rows = await invoke("list_incomplete_sessions", { dataDir });
   } catch (err) {
     // Non-fatal — the user can still start a new scan from welcome.
+    listOk = false;
     console.warn("list_incomplete_sessions failed:", err);
     rows = [];
   }
   const dismissed = getDismissedSessions();
-  rows = rows.filter((r) => !dismissed.has(r.workspace_path));
+  // Prune dismissals for sessions no longer reported as incomplete (completed
+  // or deleted) so the map can't grow unbounded. Only when the listing
+  // succeeded: a transient backend error returns an empty list and must not be
+  // mistaken for "every session is gone" — that would wipe all dismissals.
+  if (listOk) {
+    const livePaths = new Set(rows.map((r) => r.workspace_path));
+    let pruned = false;
+    for (const path of Object.keys(dismissed)) {
+      if (!livePaths.has(path)) {
+        delete dismissed[path];
+        pruned = true;
+      }
+    }
+    if (pruned) saveDismissedSessions(dismissed);
+  }
+  // Hide a dismissed session only while it has not advanced past the height it
+  // was dismissed at; renewed progress brings it back.
+  rows = rows.filter(
+    (r) =>
+      !(r.workspace_path in dismissed) ||
+      (Number(r.synced_to_height) || 0) > dismissed[r.workspace_path]
+  );
   const panel = $("resume-panel");
   const list = $("resume-sessions");
   list.innerHTML = "";
