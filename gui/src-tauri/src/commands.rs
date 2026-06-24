@@ -22,9 +22,13 @@ pub struct AppState {
     pub service: RecoveryService,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// No `Debug`/`Serialize`/`Clone`: this struct carries the cleartext seed, so it
+// must never be debug-printed, serialized, or duplicated. It only deserializes
+// the Tauri command payload, and its `SecretString` seed field redacts and
+// zeroizes the seed once parsed (audit Issue A).
+#[derive(Deserialize)]
 pub struct ScanConfigInput {
-    pub seed: String,
+    pub seed: SecretString,
     pub birthday: u32,
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
@@ -69,7 +73,7 @@ pub async fn start_scan(
                 network: config.network,
                 label: config.label.unwrap_or_default(),
             },
-            SecretString::new(config.seed),
+            config.seed,
         )
         .await
         .map_err(|err| err.to_string())?;
@@ -246,11 +250,13 @@ pub async fn estimate_birthday_from_date(
 #[tauri::command]
 pub async fn detect_birthday(
     app: AppHandle,
-    seed: String,
+    // `SecretString`, not `String`: the seed must not cross the Tauri boundary
+    // as a plain string that could be debug-printed or logged (audit Issue A).
+    seed: SecretString,
     lightwalletd_url: String,
     network: ZeckNetwork,
 ) -> Result<BirthdayDetectResult, String> {
-    let seed_phrase = SecretString::new(seed);
+    let seed_phrase = seed;
     let app_clone = app.clone();
     zeck_detect_birthday(
         &seed_phrase,
@@ -494,10 +500,12 @@ pub async fn list_incomplete_sessions(
     Ok(rows)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+// No `Debug`/`Clone`: carries the cleartext seed (see `ScanConfigInput`). The
+// `SecretString` seed field redacts and zeroizes once parsed (audit Issue A).
+#[derive(Deserialize)]
 pub struct ResumeSessionInput {
     pub workspace_path: String,
-    pub seed: String,
+    pub seed: SecretString,
     pub lightwalletd_url: String,
     /// If supplied (non-empty after trimming), overwrites the existing
     /// label in the sidecar at resume time. Mostly useful when resuming a
@@ -521,7 +529,7 @@ pub async fn resume_session(
     if workspace_path.as_os_str().is_empty() {
         return Err("workspace path cannot be empty".to_owned());
     }
-    let seed_phrase = SecretString::new(input.seed);
+    let seed_phrase = input.seed;
 
     verify_seed_for_workspace(&workspace_path, &seed_phrase).map_err(|err| err.to_string())?;
     let keying = parse_workspace_keying(&workspace_path).map_err(|err| err.to_string())?;

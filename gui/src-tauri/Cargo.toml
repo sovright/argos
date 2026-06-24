@@ -12,7 +12,10 @@ publish = false
 tauri-build.workspace = true
 
 [dependencies]
-secrecy.workspace = true
+# `serde` feature lets seed-bearing command inputs deserialize directly into
+# `SecretString` at the Tauri boundary, so the cleartext seed is never held in
+# a plain `String` field carrying `Debug`/`Serialize` (audit Issue A).
+secrecy = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
