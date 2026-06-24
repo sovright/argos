@@ -81,6 +81,7 @@ type SweepWalletDb = WalletDb<
 >;
 const CONFIRMATION_POLL_INTERVAL_SECS: u64 = 5;
 const CONFIRMATION_POLL_ATTEMPTS: u32 = 24;
+const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
 
 struct ScanSession {
     state: SharedScanTaskState,
@@ -656,7 +657,7 @@ async fn execute_sweep_for_session(
         .server
         .as_ref()
         .map(|server| server.endpoint.as_str());
-    let (mut client, _) =
+    let (mut client, primary_endpoint) =
         connect_lightwalletd_endpoints(&runtime.lightwalletd_url, preferred_endpoint).await?;
     let lightwalletd_info = client
         .get_lightd_info(zcash_client_backend::proto::service::Empty {})
@@ -719,6 +720,8 @@ async fn execute_sweep_for_session(
                         donation_address: effective_donation_address,
                         donation_rate: request.donation_rate,
                         donation_memo: donation_memo.clone(),
+                        lightwalletd_url: runtime.lightwalletd_url.as_str(),
+                        primary_endpoint: primary_endpoint.as_str(),
                     };
                     execute_shielding_step(&mut ctx, &tracked_account, &transparent_account, &usk)
                         .await?
@@ -753,6 +756,8 @@ async fn execute_sweep_for_session(
                     donation_address: effective_donation_address,
                     donation_rate: request.donation_rate,
                     donation_memo: donation_memo.clone(),
+                    lightwalletd_url: runtime.lightwalletd_url.as_str(),
+                    primary_endpoint: primary_endpoint.as_str(),
                 };
                 execute_send_max_step(
                     &mut ctx,
@@ -823,6 +828,11 @@ struct SweepStepCtx<'a> {
     donation_address: &'a str,
     donation_rate: Option<f64>,
     donation_memo: Option<MemoBytes>,
+    // For the best-effort confirmation cross-check (audit Issue B follow-up):
+    // the full configured endpoint list and the endpoint this sweep is using,
+    // so a second distinct endpoint can be picked to verify confirmations.
+    lightwalletd_url: &'a str,
+    primary_endpoint: &'a str,
 }
 
 /// The change strategy used for every Argos proposal: ZIP-317 fees, no change
@@ -908,6 +918,9 @@ async fn execute_shielding_step(
         txids.into_iter().collect(),
         "shielding",
         ctx.results,
+        ctx.lightwalletd_url,
+        ctx.primary_endpoint,
+        ctx.network,
     )
     .await?;
 
@@ -1135,12 +1148,16 @@ async fn execute_send_max_step(
         txids.into_iter().collect(),
         "sweep",
         ctx.results,
+        ctx.lightwalletd_url,
+        ctx.primary_endpoint,
+        ctx.network,
     )
     .await?;
 
     Ok(fee_zatoshis)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn broadcast_transactions(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
@@ -1153,6 +1170,9 @@ async fn broadcast_transactions(
     txids: Vec<TxId>,
     label: &str,
     results: &mut Vec<TxBroadcastResult>,
+    lightwalletd_url: &str,
+    primary_endpoint: &str,
+    network: crate::models::ZeckNetwork,
 ) -> ZeckResult<()> {
     for txid in txids {
         let tx = wallet_db
@@ -1203,6 +1223,25 @@ async fn broadcast_transactions(
 
         let (status, detail, confirmed_height) =
             wait_for_confirmation(wallet_db, client, txid, label).await?;
+        // Cross-check a "confirmed" status against a second configured endpoint
+        // before presenting it as final, so a single hostile server cannot fake
+        // a confirmation (audit Issue B follow-up). Best-effort: never fails the
+        // sweep, only annotates the detail with the independent result.
+        let detail = if status == "confirmed" {
+            match cross_verify_mined(lightwalletd_url, primary_endpoint, network, txid).await {
+                Some(true) => format!(
+                    "{detail} A second endpoint independently confirmed this transaction is mined."
+                ),
+                Some(false) => format!(
+                    "{detail} WARNING: a second endpoint did NOT report this transaction as mined — \
+                     treat the confirmation with suspicion and verify on a block explorer before \
+                     trusting it."
+                ),
+                None => detail,
+            }
+        } else {
+            detail
+        };
         let entry = &mut results[result_index];
         entry.status = status;
         entry.detail = detail;
@@ -1210,6 +1249,80 @@ async fn broadcast_transactions(
     }
 
     Ok(())
+}
+
+/// Best-effort cross-check of a confirmation against a second configured
+/// lightwalletd endpoint (audit Issue B follow-up).
+///
+/// Returns `Some(true)` if a distinct second endpoint also reports `txid`
+/// mined, `Some(false)` if it reports the transaction as not in the main chain,
+/// and `None` if there is no distinct second endpoint or it could not be
+/// reached/queried. This never errors: a confirmation that cannot be
+/// independently checked falls back to the single-server attestation already
+/// disclosed to the user, rather than failing the sweep.
+async fn cross_verify_mined(
+    lightwalletd_url: &str,
+    primary_endpoint: &str,
+    network: crate::models::ZeckNetwork,
+    txid: TxId,
+) -> Option<bool> {
+    let secondary = validated_lightwalletd_endpoints(lightwalletd_url)
+        .ok()?
+        .into_iter()
+        .find(|endpoint| is_distinct_lightwalletd_endpoint(endpoint, primary_endpoint))?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
+        CompactTxStreamerClient::connect(secondary),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    // Validate the secondary's network (chain name + Sapling activation height)
+    // before trusting its answer, so a wrong-chain endpoint cannot produce a
+    // misleading confirmation result (audit Issue B follow-up review).
+    let info = tokio::time::timeout(
+        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
+        client.get_lightd_info(zcash_client_backend::proto::service::Empty {}),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .into_inner();
+    validate_lightwalletd_network(network, &info).ok()?;
+    let response = tokio::time::timeout(
+        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
+        client.get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+        }),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .into_inner();
+    // Mined iff the height is a real block height: 0 means mempool/not found and
+    // u64::MAX means reorged out. A `Some(false)` can also reflect benign
+    // propagation lag on a healthy second endpoint, which is why the caller only
+    // warns (never blocks) on it.
+    Some(response.height != 0 && response.height != u64::MAX)
+}
+
+fn is_distinct_lightwalletd_endpoint(candidate: &str, primary: &str) -> bool {
+    normalized_endpoint_authority(candidate) != normalized_endpoint_authority(primary)
+}
+
+fn normalized_endpoint_authority(endpoint: &str) -> String {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
+    };
+    let scheme = url.scheme().to_ascii_lowercase();
+    let host = url
+        .host_str()
+        .map(|host| host.to_ascii_lowercase())
+        .unwrap_or_default();
+    let port = url.port_or_known_default().unwrap_or(0);
+    format!("{scheme}://{host}:{port}")
 }
 
 async fn wait_for_confirmation(
@@ -1431,7 +1544,7 @@ fn estimate_remaining_seconds(progress: &ScanProgress, elapsed_seconds: u64) -> 
 mod tests {
     use secrecy::SecretString;
 
-    use super::build_sweep_proposal;
+    use super::{build_sweep_proposal, is_distinct_lightwalletd_endpoint};
     use crate::{
         derive_accounts,
         error::ZeckError,
@@ -1440,6 +1553,18 @@ mod tests {
             SweepRequest, ZeckNetwork,
         },
     };
+
+    #[test]
+    fn equivalent_lightwalletd_urls_are_not_distinct_confirmation_sources() {
+        assert!(!is_distinct_lightwalletd_endpoint(
+            "https://zec.rocks",
+            "https://zec.rocks:443/"
+        ));
+        assert!(is_distinct_lightwalletd_endpoint(
+            "https://na.zec.rocks:443",
+            "https://zec.rocks:443"
+        ));
+    }
 
     fn derived_destination() -> String {
         derive_accounts(

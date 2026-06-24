@@ -1152,6 +1152,12 @@ function renderCompleteScreen(results, error) {
       note.className = "txid-note";
       note.textContent = `Mined at block ${r.confirmed_height.toLocaleString()}`;
       card.appendChild(note);
+      if (r.detail) {
+        const detail = document.createElement("div");
+        detail.className = "txid-note";
+        detail.textContent = r.detail;
+        card.appendChild(detail);
+      }
     } else if (r.detail && r.status !== "confirmed") {
       const note = document.createElement("div");
       note.className = "txid-note";
