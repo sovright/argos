@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
             dry_run,
             confirm_sweep,
         } => {
-            let address = validate_destination_address(&destination)?;
+            let address = validate_destination_address(&destination, network)?;
             println!(
                 "Destination: Unified Address (Orchard={}, Sapling={}, Transparent={})",
                 address.has_orchard, address.has_sapling, address.has_transparent

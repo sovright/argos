@@ -51,8 +51,11 @@ pub async fn validate_seed(words: Vec<String>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn validate_address(address: String) -> Result<argos_core::AddressInfo, String> {
-    validate_destination_address(&address).map_err(|err| err.to_string())
+pub async fn validate_address(
+    address: String,
+    network: ZeckNetwork,
+) -> Result<argos_core::AddressInfo, String> {
+    validate_destination_address(&address, network).map_err(|err| err.to_string())
 }
 
 #[tauri::command]

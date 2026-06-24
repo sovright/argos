@@ -13,6 +13,9 @@ pub enum ZeckError {
     #[error("destination must be a Zcash Unified Address")]
     DestinationMustBeUnified,
 
+    #[error("destination address is for the wrong network: expected {expected}, got {actual}")]
+    WrongNetwork { expected: String, actual: String },
+
     #[error("destination must include an Orchard or Sapling receiver")]
     UnsupportedDestination,
 

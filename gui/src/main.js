@@ -490,7 +490,7 @@ async function validateDestination() {
     return;
   }
   try {
-    const info = await invoke("validate_address", { address });
+    const info = await invoke("validate_address", { address, network: $("network-select").value });
     if (!info.destination_ok) {
       setStatus("config-status", "✗ Address must have an Orchard or Sapling receiver.", "error");
     } else {
@@ -522,7 +522,7 @@ $("start-scan").addEventListener("click", async () => {
   }
 
   try {
-    const info = await invoke("validate_address", { address });
+    const info = await invoke("validate_address", { address, network: $("network-select").value });
     if (!info.destination_ok) {
       setStatus("config-status", "✗ Address must have an Orchard or Sapling receiver.", "error");
       return;
