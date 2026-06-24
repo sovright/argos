@@ -14,7 +14,7 @@ use argos_core::{
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
     validate_destination_address, validate_mnemonic_words, verify_seed_for_workspace,
     BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle,
-    SweepProposal, SweepRequest, TxBroadcastResult, ZeckNetwork,
+    SweepOutcome, SweepProposal, SweepRequest, ZeckNetwork,
 };
 
 #[derive(Clone)]
@@ -182,7 +182,7 @@ pub async fn execute_sweep(
     max_fee_zec: Option<String>,
     donation_rate: Option<f64>,
     donor_email: Option<String>,
-) -> Result<Vec<TxBroadcastResult>, String> {
+) -> Result<SweepOutcome, String> {
     let max_fee_zatoshis = max_fee_zec
         .as_deref()
         .map(str::trim)
@@ -190,7 +190,11 @@ pub async fn execute_sweep(
         .map(parse_zec_to_zatoshis)
         .transpose()?;
 
-    let results = state
+    // `execute_sweep` returns an `Err` only when nothing was broadcast. A
+    // mid-sequence abort *after* one or more broadcasts comes back as an `Ok`
+    // outcome carrying the partial records plus `error`, so the records of
+    // funds already on-chain are never lost to the frontend (audit Issue E).
+    let outcome = state
         .service
         .execute_sweep(
             &handle,
@@ -205,14 +209,14 @@ pub async fn execute_sweep(
         .await
         .map_err(|err| err.to_string())?;
 
-    for result in &results {
+    for result in &outcome.transactions {
         let _ = app.emit("sweep-tx-broadcast", result);
         if result.status == "confirmed" {
             let _ = app.emit("sweep-tx-confirmed", result);
         }
     }
 
-    Ok(results)
+    Ok(outcome)
 }
 
 #[tauri::command]

@@ -46,7 +46,8 @@ use crate::{
     },
     models::{
         ProposedTx, ProposedTxKind, RuntimeScanConfig, ScanConfig, ScanHandle, ScanPhase,
-        ScanProgress, SkippedSweepAccount, SweepProposal, SweepRequest, TxBroadcastResult,
+        ScanProgress, SkippedSweepAccount, SweepOutcome, SweepProposal, SweepRequest,
+        TxBroadcastResult,
     },
     scan::{
         refresh_scan_progress, run_recovery_scan, run_wallet_sync, ScanTaskState,
@@ -61,6 +62,15 @@ const SESSION_RETENTION_SECS: u64 = 300;
 /// donation output adds at most one ZIP-317 marginal action, so convergence is
 /// expected within 2 iterations; 4 leaves headroom.
 const MAX_FEE_CONVERGENCE_ITERS: usize = 4;
+
+/// ZIP-317 conventional fee floor in zatoshis: `marginal_fee (5000) *
+/// grace_actions (2)`. A shielded send can never cost less than this, so it is
+/// a safe lower bound to reserve for the send-max step that always follows a
+/// shielding step in the per-account sweep. Reserving it lets a foreseeable
+/// `MaxFeeExceeded` abort *before* the shielding transaction is broadcast,
+/// rather than after it is already mined and its fee unrecoverable (audit
+/// Issue E).
+const MIN_SHIELDED_SEND_FEE_ZATOSHIS: u64 = 10_000;
 
 /// The concrete wallet database type used throughout the execution path.
 type SweepWalletDb = WalletDb<
@@ -250,7 +260,7 @@ impl RecoveryService {
         &self,
         handle: &ScanHandle,
         request: SweepRequest,
-    ) -> ZeckResult<Vec<TxBroadcastResult>> {
+    ) -> ZeckResult<SweepOutcome> {
         self.execute_sweep_inner(handle, request, None).await
     }
 
@@ -265,7 +275,7 @@ impl RecoveryService {
         handle: &ScanHandle,
         request: SweepRequest,
         pause_between_broadcasts: std::time::Duration,
-    ) -> ZeckResult<Vec<TxBroadcastResult>> {
+    ) -> ZeckResult<SweepOutcome> {
         self.execute_sweep_inner(handle, request, Some(pause_between_broadcasts))
             .await
     }
@@ -275,7 +285,7 @@ impl RecoveryService {
         handle: &ScanHandle,
         request: SweepRequest,
         pause_between_broadcasts: Option<std::time::Duration>,
-    ) -> ZeckResult<Vec<TxBroadcastResult>> {
+    ) -> ZeckResult<SweepOutcome> {
         let session = self.session(handle).await?;
         let progress = session.state.lock().await.progress.clone();
         if progress.phase != ScanPhase::Complete {
@@ -584,7 +594,7 @@ async fn execute_sweep_for_session(
     // speed. Threaded as `Option<Duration>` rather than gated behind cfg so
     // the function signature stays stable across feature configurations.
     pause_between_broadcasts: Option<std::time::Duration>,
-) -> ZeckResult<Vec<TxBroadcastResult>> {
+) -> ZeckResult<SweepOutcome> {
     let destination = validate_destination_address(&request.destination)?;
     let memo_text = normalized_memo_text(request.memo.as_deref())?;
     let memo_bytes = Some(
@@ -659,33 +669,73 @@ async fn execute_sweep_for_session(
     )
     .await?;
 
-    for tracked_account in tracked_accounts {
-        if account_total_zatoshis(
-            &workspace,
-            runtime.network,
-            tracked_account.wallet_account_id,
-        )? == 0
-        {
-            continue;
-        }
+    // The per-account loop broadcasts transactions one account at a time. Run
+    // it inside a block whose `?` failures are *caught* rather than propagated,
+    // so a mid-sequence abort still surfaces the records of every transaction
+    // already broadcast (audit Issue E) instead of discarding `results`.
+    let sweep_result: ZeckResult<()> = async {
+        for tracked_account in tracked_accounts {
+            if account_total_zatoshis(
+                &workspace,
+                runtime.network,
+                tracked_account.wallet_account_id,
+            )? == 0
+            {
+                continue;
+            }
 
-        let zip32_index =
-            zip32::AccountId::try_from(tracked_account.derived.index).map_err(|_| {
-                ZeckError::InvalidConfig(format!(
-                    "account index {} is out of range",
-                    tracked_account.derived.index
-                ))
-            })?;
-        let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), zip32_index).map_err(|err| {
-            ZeckError::Wallet(format!(
-                "deriving account {}: {err}",
-                tracked_account.derived.index
-            ))
-        })?;
+            let zip32_index =
+                zip32::AccountId::try_from(tracked_account.derived.index).map_err(|_| {
+                    ZeckError::InvalidConfig(format!(
+                        "account index {} is out of range",
+                        tracked_account.derived.index
+                    ))
+                })?;
+            let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), zip32_index)
+                .map_err(|err| {
+                    ZeckError::Wallet(format!(
+                        "deriving account {}: {err}",
+                        tracked_account.derived.index
+                    ))
+                })?;
 
-        let transparent_balance =
-            account_transparent_zatoshis(&workspace, runtime.network, &tracked_account)?;
-        if transparent_balance > 0 {
+            let transparent_balance =
+                account_transparent_zatoshis(&workspace, runtime.network, &tracked_account)?;
+            if transparent_balance > 0 {
+                let fee = {
+                    let mut ctx = SweepStepCtx {
+                        workspace: &workspace,
+                        network: runtime.network,
+                        client: &mut client,
+                        prover: &prover,
+                        results: &mut results,
+                        prior_fee_zatoshis: total_fee_zatoshis,
+                        max_fee_zatoshis: request.max_fee_zatoshis,
+                        donation_address: effective_donation_address,
+                        donation_rate: request.donation_rate,
+                        donation_memo: donation_memo.clone(),
+                    };
+                    execute_shielding_step(&mut ctx, &tracked_account, &transparent_account, &usk)
+                        .await?
+                };
+                // Step already enforced the cap against (prior + step fee) before broadcast;
+                // recompute here purely to advance the running total for the next step.
+                total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
+
+                if !last_account_confirmed(&results, tracked_account.derived.index) {
+                    continue;
+                }
+
+                run_wallet_sync(&workspace, &network, &mut client).await?;
+                refresh_scan_progress(
+                    &session.state,
+                    &workspace,
+                    runtime.network,
+                    runtime.birthday.min(chain_tip_height(&mut client).await?),
+                )
+                .await?;
+            }
+
             let fee = {
                 let mut ctx = SweepStepCtx {
                     workspace: &workspace,
@@ -699,67 +749,62 @@ async fn execute_sweep_for_session(
                     donation_rate: request.donation_rate,
                     donation_memo: donation_memo.clone(),
                 };
-                execute_shielding_step(
+                execute_send_max_step(
                     &mut ctx,
                     &tracked_account,
-                    &transparent_account,
                     &usk,
+                    &destination_address,
+                    memo_bytes.clone(),
                 )
                 .await?
             };
             // Step already enforced the cap against (prior + step fee) before broadcast;
-            // recompute here purely to advance the running total for the next step.
+            // recompute here purely to advance the running total for the next account.
             total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
 
-            if !last_account_confirmed(&results, tracked_account.derived.index) {
-                continue;
+            // R-S29 hook: pause between per-account broadcasts so the test parent
+            // can SIGKILL the helper subprocess deterministically in the gap. The
+            // pause is unconditional; in production this is always None.
+            if let Some(d) = pause_between_broadcasts {
+                tokio::time::sleep(d).await;
             }
-
-            run_wallet_sync(&workspace, &network, &mut client).await?;
-            refresh_scan_progress(
-                &session.state,
-                &workspace,
-                runtime.network,
-                runtime.birthday.min(chain_tip_height(&mut client).await?),
-            )
-            .await?;
         }
+        Ok(())
+    }
+    .await;
 
-        let fee = {
-            let mut ctx = SweepStepCtx {
-                workspace: &workspace,
-                network: runtime.network,
-                client: &mut client,
-                prover: &prover,
-                results: &mut results,
-                prior_fee_zatoshis: total_fee_zatoshis,
-                max_fee_zatoshis: request.max_fee_zatoshis,
-                donation_address: effective_donation_address,
-                donation_rate: request.donation_rate,
-                donation_memo: donation_memo.clone(),
-            };
-            execute_send_max_step(
-                &mut ctx,
-                &tracked_account,
-                &usk,
-                &destination_address,
-                memo_bytes.clone(),
-            )
-            .await?
-        };
-        // Step already enforced the cap against (prior + step fee) before broadcast;
-        // recompute here purely to advance the running total for the next account.
-        total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
+    assemble_sweep_outcome(results, sweep_result)
+}
 
-        // R-S29 hook: pause between per-account broadcasts so the test parent
-        // can SIGKILL the helper subprocess deterministically in the gap. The
-        // pause is unconditional; in production this is always None.
-        if let Some(d) = pause_between_broadcasts {
-            tokio::time::sleep(d).await;
+/// Fold the accumulated broadcast records and the loop's terminal status into a
+/// [`SweepOutcome`].
+///
+/// - Full success (`Ok(())`) → `Ok` with no error.
+/// - Aborted *after* broadcasting at least one transaction → `Ok` carrying the
+///   partial records plus the error message, so the caller never loses the
+///   record of funds already on-chain (audit Issue E).
+/// - Aborted *before* any broadcast (empty `results`) → propagate the `Err`, so
+///   "no transaction was sent" remains a faithful report.
+fn assemble_sweep_outcome(
+    results: Vec<TxBroadcastResult>,
+    sweep_result: ZeckResult<()>,
+) -> ZeckResult<SweepOutcome> {
+    match sweep_result {
+        Ok(()) => Ok(SweepOutcome {
+            transactions: results,
+            error: None,
+        }),
+        Err(err) => {
+            if results.is_empty() {
+                Err(err)
+            } else {
+                Ok(SweepOutcome {
+                    transactions: results,
+                    error: Some(err.to_string()),
+                })
+            }
         }
     }
-
-    Ok(results)
 }
 
 struct SweepStepCtx<'a> {
@@ -811,8 +856,15 @@ async fn execute_shielding_step(
     )
     .map_err(|err| ZeckError::TransactionBuild(format!("building shielding proposal: {err}")))?;
     let fee_zatoshis = proposal_fee_zatoshis(&proposal)?;
+    let fee_through_shield = checked_fee_total(ctx.prior_fee_zatoshis, fee_zatoshis)?;
+    enforce_max_fee(fee_through_shield, ctx.max_fee_zatoshis)?;
+    // A shielding step is always followed by a send-max step for the same
+    // account. Reserve the ZIP-317 minimum for that step so a foreseeable
+    // `MaxFeeExceeded` aborts here, before this shielding transaction is
+    // broadcast — otherwise the shield can be mined and its fee stranded only
+    // for the subsequent send-max to blow the cap (audit Issue E).
     enforce_max_fee(
-        checked_fee_total(ctx.prior_fee_zatoshis, fee_zatoshis)?,
+        checked_fee_total(fee_through_shield, MIN_SHIELDED_SEND_FEE_ZATOSHIS)?,
         ctx.max_fee_zatoshis,
     )?;
 
@@ -1129,15 +1181,25 @@ async fn broadcast_transactions(
             )));
         }
 
-        let (status, detail, confirmed_height) =
-            wait_for_confirmation(wallet_db, client, txid, label).await?;
+        // The transaction is on the network now. Record it immediately as
+        // pending so the record survives even if confirmation polling fails
+        // below (audit Issue E); `execute_sweep` surfaces it either way. The
+        // entry is then updated in place once polling resolves.
+        let result_index = results.len();
         results.push(TxBroadcastResult {
             source_account: account_index,
             txid: Some(txid.to_string()),
-            status,
-            detail,
-            confirmed_height,
+            status: "pending".to_owned(),
+            detail: format!("{label} transaction broadcast; awaiting confirmation"),
+            confirmed_height: None,
         });
+
+        let (status, detail, confirmed_height) =
+            wait_for_confirmation(wallet_db, client, txid, label).await?;
+        let entry = &mut results[result_index];
+        entry.status = status;
+        entry.detail = detail;
+        entry.confirmed_height = confirmed_height;
     }
 
     Ok(())
@@ -1553,6 +1615,67 @@ mod tests {
         let err = checked_fee_total(u64::MAX, 1).expect_err("fee total should overflow");
 
         assert!(matches!(err, ZeckError::Internal(_)));
+    }
+
+    fn sample_broadcast_result(account: u32) -> crate::models::TxBroadcastResult {
+        crate::models::TxBroadcastResult {
+            source_account: account,
+            txid: Some(format!("tx-{account}")),
+            status: "confirmed".to_owned(),
+            detail: "mined".to_owned(),
+            confirmed_height: Some(1_000_000),
+        }
+    }
+
+    #[test]
+    fn sweep_outcome_full_success_carries_no_error() {
+        use super::assemble_sweep_outcome;
+        let outcome =
+            assemble_sweep_outcome(vec![sample_broadcast_result(0)], Ok(())).expect("Ok");
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.transactions.len(), 1);
+    }
+
+    #[test]
+    fn sweep_outcome_partial_failure_preserves_records_and_error() {
+        use super::assemble_sweep_outcome;
+        let outcome = assemble_sweep_outcome(
+            vec![sample_broadcast_result(0), sample_broadcast_result(1)],
+            Err(ZeckError::Broadcast("account 2 rejected".to_owned())),
+        )
+        .expect("a partial failure with broadcast records is reported as Ok, not lost");
+        assert_eq!(outcome.transactions.len(), 2);
+        let message = outcome
+            .error
+            .expect("a partial failure carries the underlying error message");
+        assert!(message.contains("account 2 rejected"));
+    }
+
+    #[test]
+    fn sweep_outcome_failure_before_any_broadcast_propagates_err() {
+        use super::assemble_sweep_outcome;
+        let err = assemble_sweep_outcome(
+            Vec::new(),
+            Err(ZeckError::Broadcast("first account rejected".to_owned())),
+        )
+        .expect_err("a failure before any broadcast must stay an Err");
+        assert!(matches!(err, ZeckError::Broadcast(_)));
+    }
+
+    #[test]
+    fn shield_step_reserves_send_max_floor_before_broadcast() {
+        use super::{checked_fee_total, enforce_max_fee, MIN_SHIELDED_SEND_FEE_ZATOSHIS};
+        // A shield fee of 8000 zats fits a 10000-zat cap on its own...
+        let shield_total = checked_fee_total(0, 8_000).expect("fits");
+        assert!(enforce_max_fee(shield_total, Some(10_000)).is_ok());
+        // ...but once the mandatory send-max floor is reserved, the combined
+        // total exceeds the cap and must abort before the shield is broadcast.
+        let reserved =
+            checked_fee_total(shield_total, MIN_SHIELDED_SEND_FEE_ZATOSHIS).expect("fits");
+        assert!(matches!(
+            enforce_max_fee(reserved, Some(10_000)),
+            Err(ZeckError::MaxFeeExceeded(_))
+        ));
     }
 
     #[test]

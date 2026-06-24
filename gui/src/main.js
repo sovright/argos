@@ -1024,7 +1024,10 @@ $("execute-sweep").addEventListener("click", async () => {
 
   try {
     const { donationRate, donorEmail } = donationParamsFromForm();
-    const results = await invoke("execute_sweep", {
+    // `execute_sweep` rejects only when nothing was broadcast. A mid-sequence
+    // abort after one or more broadcasts resolves with `{ transactions, error }`
+    // so the already-broadcast transaction IDs are still shown (audit Issue E).
+    const outcome = await invoke("execute_sweep", {
       handle: state.scanHandle,
       destination: state.destination,
       memo: state.memo,
@@ -1033,7 +1036,7 @@ $("execute-sweep").addEventListener("click", async () => {
       donorEmail,
     });
     setStatus("sweep-execute-status", "", "");
-    renderCompleteScreen(results);
+    renderCompleteScreen(outcome.transactions, outcome.error);
     goTo("complete");
   } catch (err) {
     $("execute-sweep").disabled = false;
@@ -1044,13 +1047,21 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
-function renderCompleteScreen(results) {
+function renderCompleteScreen(results, error) {
   const confirmed = results.filter((r) => r.status === "confirmed").length;
   const pending = results.filter((r) => r.status === "pending").length;
   const failed = results.filter((r) => r.status === "failed").length;
   const broadcast = confirmed + pending;
 
-  if (failed === results.length) {
+  if (error) {
+    // The sweep aborted partway. The transactions below were already
+    // broadcast and are irreversible; the remaining accounts were not swept.
+    // Surface this so the user does not assume nothing was sent and retry
+    // (which would double-broadcast) — audit Issue E.
+    $("complete-summary").textContent =
+      `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
+      `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
+  } else if (failed === results.length) {
     $("complete-summary").textContent = "All transactions failed to broadcast. No funds were moved.";
   } else if (confirmed > 0) {
     $("complete-summary").textContent =

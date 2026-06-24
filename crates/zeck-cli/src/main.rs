@@ -289,16 +289,34 @@ async fn main() -> Result<()> {
                 println!("Broadcasting sweep transactions…");
                 let execution = service.execute_sweep(&handle, request).await;
                 match execution {
-                    Ok(results) => {
+                    Ok(outcome) => {
                         println!();
-                        for result in &results {
+                        for result in &outcome.transactions {
                             println!(
                                 "  account {}  {}  {}",
                                 result.source_account, result.status, result.detail
                             );
                         }
                         println!();
-                        println!("Sweep complete.");
+                        match outcome.error {
+                            None => println!("Sweep complete."),
+                            // A mid-sequence abort: the transactions above were
+                            // already broadcast and are irreversible, but the
+                            // remaining accounts were not swept (audit Issue E).
+                            // Make this loud so the operator does not assume
+                            // nothing was sent and retry into a double-broadcast.
+                            Some(message) => {
+                                eprintln!(
+                                    "Sweep aborted after broadcasting the transactions listed \
+                                     above. Those funds are already on-chain; the remaining \
+                                     accounts were NOT swept. Rescan or check a block explorer \
+                                     for the destination before retrying, to avoid broadcasting \
+                                     duplicates."
+                                );
+                                eprintln!("Error: {message}");
+                                std::process::exit(1);
+                            }
+                        }
                     }
                     Err(err) => {
                         eprintln!();
