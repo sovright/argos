@@ -218,8 +218,8 @@ jobs:
           #   curl -sL https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/<version> -o pkg.zip
           #   sha256sum pkg.zip   # or: Get-FileHash -Algorithm SHA256 pkg.zip
           # The job fails closed if this value does not match the downloaded bytes,
-          # including while the placeholder below is left unchanged.
-          TRUSTED_SIGNING_CLIENT_SHA256: PLACEHOLDER_SET_TO_SHA256_OF_PINNED_PACKAGE
+          # including if a future bump accidentally leaves the placeholder in place.
+          TRUSTED_SIGNING_CLIENT_SHA256: 3BFCF1E0A3CB42AF1692F0A8ED45C15DE070C2DE86F28A59B2795D904D8A920F
         run: |
           $ErrorActionPreference = "Stop"
 
