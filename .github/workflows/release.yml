@@ -5,6 +5,34 @@ on:
     tags:
       - "v*"
 
+# SECURITY — required out-of-tree gating for this workflow (audit Suggestion 7):
+#
+# The `v*` push trigger above means ANY account with push access to the
+# repository can push a matching tag and start the signing/publishing jobs
+# below. The workflow file alone provides NO gate on who may cut a release.
+#
+# The REAL control is the GitHub Environment protection rules, which live in
+# repo settings (Settings -> Environments) and are NOT visible in this file or
+# anywhere in the repository tree:
+#   - `release-sign`    — used by the build-macos and build-windows jobs; gates
+#                         access to the Apple signing secrets and the Azure
+#                         Trusted Signing OIDC federated credential.
+#   - `release-publish` — used by the release job; gates creation of the
+#                         GitHub Release.
+#
+# BOTH environments MUST be configured in repo settings with required reviewers
+# so a human must approve before a tag build can sign or publish.
+#
+# Maintainers SHOULD also configure a deployment branch/tag protection rule for
+# these environments, restricting them to the protected release refs. That rule
+# is an environment setting, not something this workflow can express; if it is
+# absent, reviewer approval is the active environment gate.
+#
+# This gating is enforced by the Environment protection settings, NOT by this
+# workflow file. Adding a tag/branch check here would be a false assurance:
+# the authoritative control is the out-of-tree Environment configuration, which
+# maintainers must verify (and keep enabled) per audit Suggestion 7.
+
 # Least-privilege default: every job opts in explicitly. Each build job needs
 # `id-token: write` + `attestations: write` to produce a Sigstore-signed SLSA
 # build-provenance attestation for the artifacts it creates (via the
@@ -84,6 +112,9 @@ jobs:
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     runs-on: macos-latest
+    # Gated by the `release-sign` Environment — its required-reviewer protection
+    # rule (in repo settings) is the real control on who can trigger signing.
+    # See the SECURITY note at the top of this file (audit Suggestion 7).
     environment: release-sign
     permissions:
       contents: read
@@ -149,6 +180,9 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    # Gated by the `release-sign` Environment — its required-reviewer protection
+    # rule (in repo settings) is the real control on who can trigger signing.
+    # See the SECURITY note at the top of this file (audit Suggestion 7).
     environment: release-sign
     permissions:
       contents: read
@@ -312,6 +346,9 @@ jobs:
   release:
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
+    # Gated by the `release-publish` Environment — its required-reviewer
+    # protection rule (in repo settings) is the real control on who can publish
+    # a Release. See the SECURITY note at the top of this file (audit Suggestion 7).
     environment: release-publish
     permissions:
       contents: write
