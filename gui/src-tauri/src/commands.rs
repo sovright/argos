@@ -164,6 +164,7 @@ pub async fn cancel_scan(state: State<'_, AppState>, handle: ScanHandle) -> Resu
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn propose_sweep(
     app: AppHandle,
     state: State<'_, AppState>,
