@@ -162,19 +162,19 @@ You may end this Agreement with Sovright at any time by discontinuing use of Arg
 
 Choice of Law and Venue
 
-This Agreement and the interpretation of the rights and obligations of the parties under this Agreement, including, to the extent applicable, any negotiations, arbitrations, or other proceedings hereunder, will be governed exclusively by and construed in accordance with the laws of the [state/country], excluding conflict-of-laws provisions that would indicate the application of the laws of any other jurisdiction.
+This Agreement and the interpretation of the rights and obligations of the parties under this Agreement, including, to the extent applicable, any negotiations, arbitrations, or other proceedings hereunder, will be governed exclusively by and construed in accordance with the laws of the State of California, excluding conflict-of-laws provisions that would indicate the application of the laws of any other jurisdiction.
 
-EACH PARTY WILL BRING ANY LEGAL ACTION OR PROCEEDING RELATING TO ANY DISPUTE OR OTHERWISE ARISING FROM THIS AGREEMENT OR YOUR ACCESS TO OR USE OF THE SERVICES ONLY IN A STATE OR FEDERAL COURT LOCATED IN [state/country]. YOU AND WE IRREVOCABLY AGREE TO CONSENT AND SUBMIT TO THE JURISDICTION AND VENUE OF SUCH COURTS.
+EACH PARTY WILL BRING ANY LEGAL ACTION OR PROCEEDING RELATING TO ANY DISPUTE OR OTHERWISE ARISING FROM THIS AGREEMENT OR YOUR ACCESS TO OR USE OF THE SERVICES ONLY IN A STATE OR FEDERAL COURT LOCATED IN SAN FRANCISCO COUNTY, CALIFORNIA. YOU AND WE IRREVOCABLY AGREE TO CONSENT AND SUBMIT TO THE JURISDICTION AND VENUE OF SUCH COURTS.
 
 You expressly waive any claim of improper venue and any claim that such courts are an inconvenient forum.
 
 Dispute Resolution
 
-Before filing a claim, you agree to contact us at [legal contact email address] and to use good-faith efforts to attempt to resolve any disputes, controversies, or claims arising under, out of, or relating to this Agreement, Argos, or the Services, including relating to the formation, validity, binding effect, interpretation, performance, breach, or termination of this Agreement (“Dispute”), informally for at least thirty (30) days.
+Before filing a claim, you agree to contact us at support@sovright.com and to use good-faith efforts to attempt to resolve any disputes, controversies, or claims arising under, out of, or relating to this Agreement, Argos, or the Services, including relating to the formation, validity, binding effect, interpretation, performance, breach, or termination of this Agreement (“Dispute”), informally for at least thirty (30) days.
 
-If any Dispute cannot be resolved through such informal negotiations between the parties within thirty (30) days, then, except where prohibited by law, at the request of either party such Dispute will be resolved exclusively by binding individual arbitration administered by Judicial Arbitration and Mediation Services (“JAMS”) under the rules then in effect (the “Rules”). Either party may commence the arbitration by delivering a request for arbitration as specified in the Rules. The arbitration will be conducted before a sole neutral arbitrator selected by agreement of the parties. If the parties cannot agree on the appointment of a single arbitrator within thirty (30) days (the “Initial Period”) after either party delivers a request for arbitration, a neutral arbitrator will be selected as provided in the Rules. The arbitration will be conducted exclusively in the English language at a site specified by Sovright in [city, state]. The award of the arbitrator will be the exclusive remedy of the parties for all claims, counterclaims, issues, or accountings presented or pleaded to the arbitrator. The award of the arbitrator will require payment of the costs, fees, and expenses incurred by the prevailing party in any such arbitration by the non-prevailing party. Judgment upon the award may be entered in any court or governmental body having jurisdiction thereof. Any additional costs, fees, or expenses incurred in enforcing the award may be charged against the party that resists its enforcement.
+If any Dispute cannot be resolved through such informal negotiations between the parties within thirty (30) days, then, except where prohibited by law, at the request of either party such Dispute will be resolved exclusively by binding individual arbitration administered by Judicial Arbitration and Mediation Services (“JAMS”) under the rules then in effect (the “Rules”). Either party may commence the arbitration by delivering a request for arbitration as specified in the Rules. The arbitration will be conducted before a sole neutral arbitrator selected by agreement of the parties. If the parties cannot agree on the appointment of a single arbitrator within thirty (30) days (the “Initial Period”) after either party delivers a request for arbitration, a neutral arbitrator will be selected as provided in the Rules. The arbitration will be conducted exclusively in the English language at a site specified by Sovright in San Francisco, California. The award of the arbitrator will be the exclusive remedy of the parties for all claims, counterclaims, issues, or accountings presented or pleaded to the arbitrator. The award of the arbitrator will require payment of the costs, fees, and expenses incurred by the prevailing party in any such arbitration by the non-prevailing party. Judgment upon the award may be entered in any court or governmental body having jurisdiction thereof. Any additional costs, fees, or expenses incurred in enforcing the award may be charged against the party that resists its enforcement.
 
-If arbitration is unavailable or unenforceable, the exclusive venue for disputes will be the state or federal courts located in [venue—should match Section 19 venue], and you consent to personal jurisdiction there.
+If arbitration is unavailable or unenforceable, the exclusive venue for disputes will be the state or federal courts located in San Francisco County, California, and you consent to personal jurisdiction there.
 
 Waivers of Collective Action and Jury Trial
 
@@ -226,13 +226,13 @@ Claims of Infringement
 
 Sovright respects your copyrights and other intellectual property rights and those of other third parties. If you believe in good faith that your copyrighted work has been reproduced on the Platform without your authorization in a way that constitutes copyright infringement, you may notify our designated copyright agent by mail to:
 
-[Sovright entity name and mailing address]
+Sovright
 
 Attn: Copyright Infringement Agent
 
-[Street address, city, state, and ZIP code]
+See the Sovright website for the current mailing address.
 
-[Email address for copyright infringement agent]
+support@sovright.com
 
 Please provide the following information to Sovright's Copyright Infringement Agent: (1) the identity of the infringed work and of the allegedly infringing work; (2) your name, address, daytime phone number, and email address, if available; (3) a statement that you have a good-faith belief that the use of the copyrighted work is not authorized by the owner, his or her agent, or the law; (4) a statement that the information in the notification is accurate and, under penalty of perjury, that you are authorized to act on behalf of the owner; and (5) your electronic or physical signature.
 
@@ -258,4 +258,4 @@ Contact
 
 Questions about these Terms may be sent to:
 
-[sovright legal/contact email]
+support@sovright.com

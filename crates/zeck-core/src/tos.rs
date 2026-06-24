@@ -91,6 +91,15 @@ mod tests {
     }
 
     #[test]
+    fn terms_text_has_no_template_placeholders() {
+        let text = terms_text();
+        assert!(
+            !text.contains('[') && !text.contains(']'),
+            "embedded terms must not ship bracketed legal placeholders"
+        );
+    }
+
+    #[test]
     fn unaccepted_dir_reports_not_accepted() {
         let dir = std::env::temp_dir().join(format!("argos-tos-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
