@@ -71,6 +71,7 @@ type SweepWalletDb = WalletDb<
 >;
 const CONFIRMATION_POLL_INTERVAL_SECS: u64 = 5;
 const CONFIRMATION_POLL_ATTEMPTS: u32 = 24;
+const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
 
 struct ScanSession {
     state: SharedScanTaskState,
@@ -676,12 +677,13 @@ async fn execute_sweep_for_session(
                     tracked_account.derived.index
                 ))
             })?;
-        let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), zip32_index).map_err(|err| {
-            ZeckError::Wallet(format!(
-                "deriving account {}: {err}",
-                tracked_account.derived.index
-            ))
-        })?;
+        let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), zip32_index)
+            .map_err(|err| {
+                ZeckError::Wallet(format!(
+                    "deriving account {}: {err}",
+                    tracked_account.derived.index
+                ))
+            })?;
 
         let transparent_balance =
             account_transparent_zatoshis(&workspace, runtime.network, &tracked_account)?;
@@ -701,13 +703,8 @@ async fn execute_sweep_for_session(
                     lightwalletd_url: runtime.lightwalletd_url.as_str(),
                     primary_endpoint: primary_endpoint.as_str(),
                 };
-                execute_shielding_step(
-                    &mut ctx,
-                    &tracked_account,
-                    &transparent_account,
-                    &usk,
-                )
-                .await?
+                execute_shielding_step(&mut ctx, &tracked_account, &transparent_account, &usk)
+                    .await?
             };
             // Step already enforced the cap against (prior + step fee) before broadcast;
             // recompute here purely to advance the running total for the next step.
@@ -802,8 +799,10 @@ async fn execute_shielding_step(
     transparent_account: &zcash_transparent::keys::AccountPrivKey,
     usk: &UnifiedSpendingKey,
 ) -> ZeckResult<u64> {
-    let mut wallet_db =
-        open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
+    let mut wallet_db = open_wallet_db(
+        ctx.workspace.wallet_db_path(),
+        consensus_network(ctx.network),
+    )?;
     let input_selector = GreedyInputSelector::<_>::new();
     let change_strategy = standard_zip317_change_strategy();
 
@@ -994,8 +993,10 @@ async fn execute_send_max_step(
     destination_address: &ZcashAddress,
     memo_bytes: Option<MemoBytes>,
 ) -> ZeckResult<u64> {
-    let mut wallet_db =
-        open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
+    let mut wallet_db = open_wallet_db(
+        ctx.workspace.wallet_db_path(),
+        consensus_network(ctx.network),
+    )?;
 
     // Pass 1 — measure the full-account send-max proposal (build only, no broadcast).
     let max_proposal = propose_send_max_transfer::<_, _, _, Infallible>(
@@ -1028,15 +1029,18 @@ async fn execute_send_max_step(
             )
         })?;
 
-    let donation =
-        crate::donation::donation_for_send_amount(ctx.donation_address, ctx.donation_rate, send_amount);
+    let donation = crate::donation::donation_for_send_amount(
+        ctx.donation_address,
+        ctx.donation_rate,
+        send_amount,
+    );
 
     let proposal = if donation == 0 {
         // No donation output: behavior is unchanged from the single-pass sweep.
         max_proposal
     } else {
-        let donation_zcash_address = ZcashAddress::try_from_encoded(ctx.donation_address)
-            .map_err(|err| {
+        let donation_zcash_address =
+            ZcashAddress::try_from_encoded(ctx.donation_address).map_err(|err| {
                 ZeckError::InvalidAddress(format!("failed to decode donation address: {err}"))
             })?;
         // On non-convergence (or a non-positive user remainder) fall back to the
@@ -1057,11 +1061,7 @@ async fn execute_send_max_step(
             send_max_fee,
             donation,
         );
-        donation_proposal_or_fallback(
-            split_result,
-            max_proposal,
-            tracked_account.derived.index,
-        )
+        donation_proposal_or_fallback(split_result, max_proposal, tracked_account.derived.index)
     };
 
     let fee_zatoshis = proposal_fee_zatoshis(&proposal)?;
@@ -1199,31 +1199,60 @@ async fn cross_verify_mined(
     let secondary = validated_lightwalletd_endpoints(lightwalletd_url)
         .ok()?
         .into_iter()
-        .find(|endpoint| endpoint != primary_endpoint)?;
-    let mut client = CompactTxStreamerClient::connect(secondary).await.ok()?;
+        .find(|endpoint| is_distinct_lightwalletd_endpoint(endpoint, primary_endpoint))?;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
+        CompactTxStreamerClient::connect(secondary),
+    )
+    .await
+    .ok()?
+    .ok()?;
     // Validate the secondary's network (chain name + Sapling activation height)
     // before trusting its answer, so a wrong-chain endpoint cannot produce a
     // misleading confirmation result (audit Issue B follow-up review).
-    let info = client
-        .get_lightd_info(zcash_client_backend::proto::service::Empty {})
-        .await
-        .ok()?
-        .into_inner();
+    let info = tokio::time::timeout(
+        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
+        client.get_lightd_info(zcash_client_backend::proto::service::Empty {}),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .into_inner();
     validate_lightwalletd_network(network, &info).ok()?;
-    let response = client
-        .get_transaction(TxFilter {
+    let response = tokio::time::timeout(
+        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
+        client.get_transaction(TxFilter {
             block: None,
             index: 0,
             hash: txid.as_ref().to_vec(),
-        })
-        .await
-        .ok()?
-        .into_inner();
+        }),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .into_inner();
     // Mined iff the height is a real block height: 0 means mempool/not found and
     // u64::MAX means reorged out. A `Some(false)` can also reflect benign
     // propagation lag on a healthy second endpoint, which is why the caller only
     // warns (never blocks) on it.
     Some(response.height != 0 && response.height != u64::MAX)
+}
+
+fn is_distinct_lightwalletd_endpoint(candidate: &str, primary: &str) -> bool {
+    normalized_endpoint_authority(candidate) != normalized_endpoint_authority(primary)
+}
+
+fn normalized_endpoint_authority(endpoint: &str) -> String {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
+    };
+    let scheme = url.scheme().to_ascii_lowercase();
+    let host = url
+        .host_str()
+        .map(|host| host.to_ascii_lowercase())
+        .unwrap_or_default();
+    let port = url.port_or_known_default().unwrap_or(0);
+    format!("{scheme}://{host}:{port}")
 }
 
 async fn wait_for_confirmation(
@@ -1445,7 +1474,7 @@ fn estimate_remaining_seconds(progress: &ScanProgress, elapsed_seconds: u64) -> 
 mod tests {
     use secrecy::SecretString;
 
-    use super::build_sweep_proposal;
+    use super::{build_sweep_proposal, is_distinct_lightwalletd_endpoint};
     use crate::{
         derive_accounts,
         error::ZeckError,
@@ -1528,7 +1557,10 @@ mod tests {
         assert!(sweep.donation_zatoshis > 0);
         assert_eq!(proposal.total_donation_zatoshis, sweep.donation_zatoshis);
         // estimate invariant unchanged
-        assert_eq!(sweep.net_zatoshis + sweep.fee_zatoshis, sweep.gross_zatoshis);
+        assert_eq!(
+            sweep.net_zatoshis + sweep.fee_zatoshis,
+            sweep.gross_zatoshis
+        );
         // donation is strictly less than the amount being sent
         assert!(sweep.donation_zatoshis < sweep.net_zatoshis);
     }
@@ -1685,6 +1717,18 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_lightwalletd_urls_are_not_distinct_confirmation_sources() {
+        assert!(!is_distinct_lightwalletd_endpoint(
+            "https://zec.rocks",
+            "https://zec.rocks:443/"
+        ));
+        assert!(is_distinct_lightwalletd_endpoint(
+            "https://na.zec.rocks:443",
+            "https://zec.rocks:443"
+        ));
+    }
+
+    #[test]
     fn memo_with_ascii_is_accepted() {
         use super::normalized_memo_text;
         let result = normalized_memo_text(Some("Argos recovery"));
@@ -1733,11 +1777,7 @@ mod tests {
 
     #[test]
     fn donation_fallback_ok_none_returns_max() {
-        let got = super::donation_proposal_or_fallback::<&str>(
-            Ok(None),
-            "donation-free-max",
-            0,
-        );
+        let got = super::donation_proposal_or_fallback::<&str>(Ok(None), "donation-free-max", 0);
         assert_eq!(got, "donation-free-max");
     }
 
@@ -1747,7 +1787,9 @@ mod tests {
         // sweep proceeds donation-free. Pre-fix, an Err here aborted the
         // entire sweep — see PR #66 review (Kristi, 2026-05-28).
         let got = super::donation_proposal_or_fallback::<&str>(
-            Err(ZeckError::TransactionBuild("synthetic regression".to_owned())),
+            Err(ZeckError::TransactionBuild(
+                "synthetic regression".to_owned(),
+            )),
             "donation-free-max",
             42,
         );
@@ -1836,8 +1878,10 @@ mod tests {
         // of net in the estimate).
         for s in &sweeps {
             assert_eq!(s.net_zatoshis + s.fee_zatoshis, s.gross_zatoshis);
-            assert!(s.donation_zatoshis < s.net_zatoshis,
-                "donation must remain strictly below net so user receives positive remainder");
+            assert!(
+                s.donation_zatoshis < s.net_zatoshis,
+                "donation must remain strictly below net so user receives positive remainder"
+            );
         }
     }
 
