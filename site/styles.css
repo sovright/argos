@@ -4,8 +4,8 @@
   --ink: #17221d;
   --muted: #5d685f;
   --line: #d8d1c4;
-  --green: #1f6b56;
-  --green-dark: #143d34;
+  --green: #5d8aa8;
+  --green-dark: #4a7a98;
   --gold: #c99649;
   --blue: #254f73;
   --warning-bg: #fff3dc;
@@ -244,7 +244,7 @@ p {
   gap: 8px;
   min-height: 42px;
   padding: 0 16px;
-  color: #dfe6df;
+  color: #dde4ec;
   background: #111;
 }
 
@@ -260,7 +260,7 @@ p {
 }
 
 .window-bar span:nth-child(3) {
-  background: #70a38d;
+  background: #7aa3bf;
 }
 
 .window-bar strong {
@@ -282,7 +282,7 @@ p {
 
 .sidebar-preview p {
   margin-bottom: 8px;
-  color: #95c9ae;
+  color: #95bdd4;
   font-weight: 800;
   text-transform: uppercase;
 }
