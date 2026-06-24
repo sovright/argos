@@ -1,18 +1,24 @@
-use std::{collections::VecDeque, fs, io::Write, path::PathBuf, time::{Duration, Instant}};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
+use std::{
+    collections::VecDeque,
+    fs,
+    io::{IsTerminal, Write},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context, Result};
+use argos_core::{
+    derive_accounts, detect_birthday, estimate_birthday_from_date, validate_destination_address,
+    RecoveryService, ScanConfig, ScanDiscovery, ScanHandle, ScanPhase, SweepProposal, SweepRequest,
+    ZeckNetwork,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
 use indicatif::{ProgressBar, ProgressStyle};
 use secrecy::SecretString;
 use tracing_subscriber::EnvFilter;
-use argos_core::{
-    detect_birthday, derive_accounts, estimate_birthday_from_date, validate_destination_address,
-    RecoveryService, ScanConfig, ScanDiscovery, ScanHandle, ScanPhase, SweepProposal, SweepRequest,
-    ZeckNetwork,
-};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -69,6 +75,11 @@ struct Cli {
     /// Enable debug-level logging from argos-core.
     #[arg(long)]
     verbose: bool,
+
+    /// Accept the Argos Terms of Service non-interactively (for scripted/CI
+    /// runs). Records acceptance under --data-dir without prompting.
+    #[arg(long)]
+    accept_tos: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -129,31 +140,50 @@ enum Commands {
     },
 }
 
+fn command_uses_birthday_inputs(command: &Commands) -> bool {
+    matches!(command, Commands::Scan | Commands::Sweep { .. })
+}
+
+async fn resolve_birthday(
+    cli: &Cli,
+    seed_phrase: &SecretString,
+    network: ZeckNetwork,
+) -> Result<u32> {
+    if cli.birthday_auto_detect {
+        eprintln!("Auto-detecting wallet birthday from on-chain history…");
+        let result = detect_birthday(seed_phrase, network, &cli.lightwalletd_url, |msg| {
+            eprintln!("  {msg}")
+        })
+        .await
+        .context("birthday auto-detection failed")?;
+        eprintln!("✓ {}", result.message);
+        Ok(result.birthday)
+    } else if let Some(date) = &cli.birthday_date {
+        Ok(estimate_birthday_from_date(date, &cli.lightwalletd_url).await?)
+    } else {
+        Ok(cli.birthday)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose)?;
 
+    // Gate the network/funds-moving commands on Terms of Service acceptance.
+    // `show-keys` is purely local key derivation and is intentionally ungated.
+    if command_uses_birthday_inputs(&cli.command) {
+        ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
+    }
+
     let network: ZeckNetwork = cli.network.into();
 
-    let seed_phrase = load_seed_phrase(cli.seed_file)?;
+    let seed_phrase = load_seed_phrase(cli.seed_file.clone())?;
 
-    let birthday = if cli.birthday_auto_detect {
-        eprintln!("Auto-detecting wallet birthday from on-chain history…");
-        let result = detect_birthday(
-            &seed_phrase,
-            network,
-            &cli.lightwalletd_url,
-            |msg| eprintln!("  {msg}"),
-        )
-        .await
-        .context("birthday auto-detection failed")?;
-        eprintln!("✓ {}", result.message);
-        result.birthday
-    } else if let Some(date) = &cli.birthday_date {
-        estimate_birthday_from_date(date, &cli.lightwalletd_url).await?
+    let birthday = if command_uses_birthday_inputs(&cli.command) {
+        Some(resolve_birthday(&cli, &seed_phrase, network).await?)
     } else {
-        cli.birthday
+        None
     };
     let account_count = cli.num_accounts.unwrap_or(20);
 
@@ -192,6 +222,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Scan => {
+            let birthday = birthday.expect("scan command requires birthday");
             let service = RecoveryService::new();
             let handle = service
                 .start_scan(
@@ -334,6 +365,73 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Require Terms of Service acceptance before a network/funds-moving command.
+///
+/// Skips silently if the current TOS version was already accepted under
+/// `data_dir`. Otherwise: `--accept-tos` records acceptance non-interactively;
+/// an interactive TTY gets a short notice and a `y/N` prompt; a non-interactive
+/// run without the flag errors with guidance (so it fails closed).
+fn ensure_tos_accepted(data_dir: &Path, accept_flag: bool) -> Result<()> {
+    if argos_core::is_tos_accepted(data_dir) {
+        return Ok(());
+    }
+
+    if accept_flag {
+        record_tos(data_dir)?;
+        eprintln!(
+            "Argos Terms of Service ({}) accepted via --accept-tos.",
+            argos_core::TOS_VERSION
+        );
+        return Ok(());
+    }
+
+    let notice = format!(
+        "\n\
+         ──────────────────────────────────────────────────────────────\n\
+         Argos Terms of Service ({version})\n\n\
+         By accepting, you agree to the Argos Terms of Service, which include a\n\
+         MANDATORY BINDING ARBITRATION clause and a WAIVER OF JURY TRIAL and\n\
+         CLASS ACTIONS, and limits on Sovright's liability.\n\n\
+         Read the full Terms in the Argos desktop app, or at:\n  \
+         https://github.com/sovright/argos/blob/main/crates/zeck-core/assets/terms-of-service.md\n\
+         ──────────────────────────────────────────────────────────────",
+        version = argos_core::TOS_VERSION
+    );
+
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "{notice}\n\nThe Terms of Service must be accepted before scanning or sweeping. \
+             Re-run with --accept-tos to accept them non-interactively."
+        );
+    }
+
+    eprintln!("{notice}");
+    eprint!("Accept these Terms? [y/N]: ");
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading Terms of Service response")?;
+    let answer = answer.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        record_tos(data_dir)?;
+        eprintln!("Terms of Service accepted.");
+        Ok(())
+    } else {
+        bail!("Terms of Service not accepted; aborting.");
+    }
+}
+
+/// Record TOS acceptance under `data_dir` stamped with the current Unix time.
+fn record_tos(data_dir: &Path) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    argos_core::record_tos_acceptance(data_dir, now)
+        .context("recording Terms of Service acceptance")
+}
+
 fn init_tracing(verbose: bool) -> Result<()> {
     let filter = if verbose {
         EnvFilter::new("argos_core=debug,argos_cli=debug")
@@ -449,10 +547,7 @@ async fn wait_for_scan(
 ) -> Result<argos_core::ScanProgress> {
     // Start with a spinner; upgrade to a real progress bar once we know total blocks.
     let bar = ProgressBar::new_spinner();
-    bar.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg}")?
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
-    );
+    bar.set_style(ProgressStyle::with_template("{spinner:.green} {msg}")?.tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "));
     bar.enable_steady_tick(Duration::from_millis(120));
 
     let mut bar_has_total = false;
@@ -602,7 +697,10 @@ impl EtaTracker {
     const WINDOW: Duration = Duration::from_secs(45);
 
     fn new() -> Self {
-        Self { samples: VecDeque::new(), last_total: 0 }
+        Self {
+            samples: VecDeque::new(),
+            last_total: 0,
+        }
     }
 
     fn observe(&mut self, scanned: u64, total: u64) {
@@ -785,7 +883,10 @@ fn print_scan_result(progress: &argos_core::ScanProgress) {
     }
 
     println!();
-    println!("{:<8}  {:>16}  {:>16}  {:>16}  Status", "Account", "Sapling", "Orchard", "Transparent");
+    println!(
+        "{:<8}  {:>16}  {:>16}  {:>16}  Status",
+        "Account", "Sapling", "Orchard", "Transparent"
+    );
     println!("{}", "─".repeat(80));
     for account in &progress.accounts {
         println!(
@@ -806,8 +907,14 @@ fn print_scan_result(progress: &argos_core::ScanProgress) {
             println!("Account {}  addresses:", account.account_index);
             println!("  Unified:              {}", account.unified_address);
             println!("  Sapling:              {}", account.sapling_address);
-            println!("  Transparent receive:  {}", account.transparent_receive_address);
-            println!("  Transparent change:   {}", account.transparent_change_address);
+            println!(
+                "  Transparent receive:  {}",
+                account.transparent_receive_address
+            );
+            println!(
+                "  Transparent change:   {}",
+                account.transparent_change_address
+            );
             println!();
         }
     }
@@ -816,9 +923,15 @@ fn print_scan_result(progress: &argos_core::ScanProgress) {
 fn print_sweep_preview(proposal: &SweepProposal) {
     println!();
     println!("Sweep preview:");
-    println!("  Send:        {}", format_zec(proposal.total_send_zatoshis));
+    println!(
+        "  Send:        {}",
+        format_zec(proposal.total_send_zatoshis)
+    );
     println!("  Fee:         {}", format_zec(proposal.total_fee_zatoshis));
-    println!("  Net receive: {}", format_zec(proposal.net_received_zatoshis));
+    println!(
+        "  Net receive: {}",
+        format_zec(proposal.net_received_zatoshis)
+    );
 
     if !proposal.transactions.is_empty() {
         println!();
@@ -920,8 +1033,7 @@ fn scan_completion_summary(progress: &argos_core::ScanProgress) -> String {
     // cancelled scan that hadn't yet observed any funds shouldn't claim
     // the seed is empty — it just stopped early.
     if progress.phase == ScanPhase::Cancelled {
-        return "Scan stopped before completion. Re-run with the same flags to resume."
-            .to_string();
+        return "Scan stopped before completion. Re-run with the same flags to resume.".to_string();
     }
     let funded: Vec<_> = progress
         .accounts
@@ -962,7 +1074,13 @@ fn powershell_quote(input: &str) -> String {
     let escaped: String = input
         .chars()
         .filter(|c| !c.is_control())
-        .map(|c| if c == '\'' { "''".to_string() } else { c.to_string() })
+        .map(|c| {
+            if c == '\'' {
+                "''".to_string()
+            } else {
+                c.to_string()
+            }
+        })
         .collect();
     format!("'{escaped}'")
 }
@@ -1017,6 +1135,23 @@ mod tests {
     }
 
     #[test]
+    fn show_keys_does_not_use_birthday_or_network_probe_inputs() {
+        let cli = Cli::try_parse_from([
+            "argos",
+            "--birthday-auto-detect",
+            "--lightwalletd-url",
+            "https://example.invalid:443",
+            "show-keys",
+        ])
+        .expect("show-keys should accept global scan flags for compatibility");
+
+        assert!(
+            !command_uses_birthday_inputs(&cli.command),
+            "show-keys must stay purely local even when global birthday flags are present"
+        );
+    }
+
+    #[test]
     fn eta_under_a_minute_is_friendly() {
         assert_eq!(format_eta_range(45), "less than a minute remaining");
     }
@@ -1046,7 +1181,10 @@ mod tests {
 
     #[test]
     fn eta_multi_hour_band_is_a_one_hour_window() {
-        assert_eq!(format_eta_range(3 * 3600 + 1800), "about 3-4 hours remaining");
+        assert_eq!(
+            format_eta_range(3 * 3600 + 1800),
+            "about 3-4 hours remaining"
+        );
         assert_eq!(format_eta_range(7 * 3600), "about 7-8 hours remaining");
     }
 
@@ -1117,10 +1255,7 @@ mod tests {
 
     #[test]
     fn completion_summary_multiple_accounts() {
-        let progress = make_progress(
-            ScanPhase::Complete,
-            &[(0, 100_000_000), (3, 50_000_000)],
-        );
+        let progress = make_progress(ScanPhase::Complete, &[(0, 100_000_000), (3, 50_000_000)]);
         assert_eq!(
             scan_completion_summary(&progress),
             "Found 1.50000000 ZEC across 2 accounts."
@@ -1137,10 +1272,7 @@ mod tests {
         );
     }
 
-    fn make_progress(
-        phase: ScanPhase,
-        funded: &[(u32, u64)],
-    ) -> argos_core::ScanProgress {
+    fn make_progress(phase: ScanPhase, funded: &[(u32, u64)]) -> argos_core::ScanProgress {
         let accounts = funded
             .iter()
             .map(|(idx, amount)| argos_core::AccountBalancePreview {

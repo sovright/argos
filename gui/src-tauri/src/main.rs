@@ -29,7 +29,10 @@ fn main() {
             commands::list_incomplete_sessions,
             commands::resume_session,
             commands::donation_address,
-            commands::open_external_url
+            commands::open_external_url,
+            commands::tos_status,
+            commands::accept_tos,
+            commands::reject_tos
         ])
         .setup(|app| {
             let _window = app.get_webview_window("main");

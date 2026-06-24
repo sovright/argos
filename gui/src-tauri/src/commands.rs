@@ -1,14 +1,12 @@
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+use std::process::Command;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-use std::process::Command;
 
-use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
@@ -16,10 +14,29 @@ use argos_core::{
     BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle,
     SweepOutcome, SweepProposal, SweepRequest, ZeckNetwork,
 };
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: RecoveryService,
+}
+
+fn ensure_tos_accepted(app: &AppHandle) -> Result<(), String> {
+    let base = tos_base_dir(app)?;
+    ensure_tos_accepted_for_base(&base)
+}
+
+fn ensure_tos_accepted_for_base(base: &Path) -> Result<(), String> {
+    if argos_core::is_tos_accepted(base) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Argos Terms of Service ({}) must be accepted before scanning, probing, or sweeping.",
+            argos_core::TOS_VERSION
+        ))
+    }
 }
 
 // No `Debug`/`Serialize`/`Clone`: this struct carries the cleartext seed, so it
@@ -64,6 +81,7 @@ pub async fn start_scan(
     state: State<'_, AppState>,
     config: ScanConfigInput,
 ) -> Result<ScanHandle, String> {
+    ensure_tos_accepted(&app)?;
     let handle = state
         .service
         .start_scan(
@@ -147,6 +165,7 @@ pub async fn cancel_scan(state: State<'_, AppState>, handle: ScanHandle) -> Resu
 
 #[tauri::command]
 pub async fn propose_sweep(
+    app: AppHandle,
     state: State<'_, AppState>,
     handle: ScanHandle,
     destination: String,
@@ -155,6 +174,7 @@ pub async fn propose_sweep(
     donation_rate: Option<f64>,
     donor_email: Option<String>,
 ) -> Result<SweepProposal, String> {
+    ensure_tos_accepted(&app)?;
     let max_fee_zatoshis = max_fee_zec
         .as_deref()
         .map(str::trim)
@@ -190,6 +210,7 @@ pub async fn execute_sweep(
     donation_rate: Option<f64>,
     donor_email: Option<String>,
 ) -> Result<SweepOutcome, String> {
+    ensure_tos_accepted(&app)?;
     let max_fee_zatoshis = max_fee_zec
         .as_deref()
         .map(str::trim)
@@ -284,11 +305,57 @@ pub fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+#[derive(Serialize)]
+pub struct TosStatus {
+    pub accepted: bool,
+    pub version: String,
+    pub text: String,
+}
+
+/// Base directory for the TOS acceptance record: the app data dir root, so it
+/// survives "Delete workspace" (which only removes the `workspace` subdir).
+fn tos_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|err| format!("resolving app data dir: {err}"))
+}
+
+/// Whether the current Terms of Service version has been accepted, plus the
+/// version and full text for the acceptance gate to render.
+#[tauri::command]
+pub fn tos_status(app: AppHandle) -> Result<TosStatus, String> {
+    let base = tos_base_dir(&app)?;
+    Ok(TosStatus {
+        accepted: argos_core::is_tos_accepted(&base),
+        version: argos_core::TOS_VERSION.to_owned(),
+        text: argos_core::terms_text().to_owned(),
+    })
+}
+
+/// Record acceptance of the current Terms of Service version.
+#[tauri::command]
+pub fn accept_tos(app: AppHandle) -> Result<(), String> {
+    let base = tos_base_dir(&app)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    argos_core::record_tos_acceptance(&base, now).map_err(|err| err.to_string())
+}
+
+/// Reject the Terms of Service: nothing is recorded and the app exits.
+#[tauri::command]
+pub fn reject_tos(app: AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 pub async fn estimate_birthday_from_date(
+    app: AppHandle,
     date: String,
     lightwalletd_url: String,
 ) -> Result<u32, String> {
+    ensure_tos_accepted(&app)?;
     estimate_birthday(&date, &lightwalletd_url)
         .await
         .map_err(|err| err.to_string())
@@ -303,6 +370,7 @@ pub async fn detect_birthday(
     lightwalletd_url: String,
     network: ZeckNetwork,
 ) -> Result<BirthdayDetectResult, String> {
+    ensure_tos_accepted(&app)?;
     let seed_phrase = seed;
     let app_clone = app.clone();
     zeck_detect_birthday(
@@ -572,6 +640,7 @@ pub async fn resume_session(
     state: State<'_, AppState>,
     input: ResumeSessionInput,
 ) -> Result<ScanHandle, String> {
+    ensure_tos_accepted(&app)?;
     let workspace_path = PathBuf::from(input.workspace_path.trim());
     if workspace_path.as_os_str().is_empty() {
         return Err("workspace path cannot be empty".to_owned());
@@ -627,7 +696,13 @@ fn powershell_quote(input: &str) -> String {
     let escaped: String = input
         .chars()
         .filter(|c| !c.is_control())
-        .map(|c| if c == '\'' { "''".to_string() } else { c.to_string() })
+        .map(|c| {
+            if c == '\'' {
+                "''".to_string()
+            } else {
+                c.to_string()
+            }
+        })
         .collect();
     format!("'{escaped}'")
 }
@@ -692,10 +767,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "argos-report-path-test-{}-{n}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("argos-report-path-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&path).expect("temp workspace should be created");
         path
     }
@@ -820,6 +893,17 @@ mod tests {
     #[test]
     fn overflow_rejected() {
         assert!(parse_zec_to_zatoshis("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn sensitive_commands_fail_closed_before_tos_acceptance() {
+        let dir =
+            std::env::temp_dir().join(format!("argos-gui-tos-unaccepted-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let err = ensure_tos_accepted_for_base(&dir)
+            .expect_err("unaccepted TOS should block sensitive commands");
+        assert!(err.contains("Terms of Service"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "macos")]

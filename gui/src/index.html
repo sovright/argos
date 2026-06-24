@@ -7,6 +7,26 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <!-- Mandatory Terms of Service gate. Shown on top of everything until the
+         current TOS version is accepted; Reject exits the app. Starts visible
+         so the wizard is never reachable before acceptance is resolved. -->
+    <div class="guide-overlay tos-overlay" id="tos-overlay" role="dialog" aria-modal="true" aria-label="Terms of Service" style="display:flex">
+      <div class="guide-panel tos-panel">
+        <div class="guide-header">
+          <div>
+            <p class="eyebrow">Please review and accept</p>
+            <h2>Argos Terms of Service</h2>
+          </div>
+        </div>
+        <div class="guide-body">
+          <pre class="tos-text" id="tos-text">Loading…</pre>
+        </div>
+        <div class="tos-actions">
+          <button class="ghost" id="tos-reject">Reject &amp; quit</button>
+          <button class="primary" id="tos-accept">Accept</button>
+        </div>
+      </div>
+    </div>
     <div class="app-shell">
       <aside class="sidebar">
         <div class="sidebar-top">
