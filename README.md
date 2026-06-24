@@ -66,11 +66,15 @@ To verify a downloaded artifact, run this before installing or running it:
 
 ```bash
 # Uses the GitHub CLI (gh). The attestation lives in this repo's attestation
-# store — no separate provenance file to download.
-gh attestation verify <downloaded-file> --repo sovright/argos
+# store — no separate provenance file to download. Replace <release-tag> with
+# the tag you downloaded from, e.g. v0.1.0.
+gh attestation verify <downloaded-file> \
+  --repo sovright/argos \
+  --signer-workflow sovright/argos/.github/workflows/release.yml \
+  --source-ref refs/tags/<release-tag>
 ```
 
-A passing verification confirms that `<downloaded-file>` was produced by this repository's release workflow. (Pin the producing workflow with `--signer-workflow sovright/argos/.github/workflows/release.yml` for a stricter check.) Release bundles are also code-signed: macOS via Apple Developer ID (notarized), and Windows via Azure Trusted Signing under the Iqlusion Inc organization identity. The provenance attestation complements the platform code-signing by anchoring each artifact to a specific source-tree commit rather than only to a signing identity.
+A passing verification confirms that `<downloaded-file>` was produced by this repository's release workflow for the tag you selected. Release bundles are also code-signed: macOS via Apple Developer ID (notarized), and Windows via Azure Trusted Signing under the Iqlusion Inc organization identity. The provenance attestation complements the platform code-signing by anchoring each artifact to a specific source-tree commit rather than only to a signing identity.
 
 ### SHA256 checksums (corruption check only)
 
