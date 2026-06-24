@@ -473,10 +473,27 @@ struct ShieldedProbeKeys<'a> {
     sapling_floor: u32,
 }
 
+/// RAII guard that removes a probe's temporary directory on drop.
+///
+/// The probe workspace imports a viewing key into a throwaway `wallet.sqlite`.
+/// Without this guard the directory would only be cleaned up on the success
+/// path, leaving the viewing-key-bearing database behind on any early `?`
+/// return, panic, or unwind. Cleanup is best-effort: errors are ignored
+/// because there is no meaningful recovery while tearing down a probe.
+struct ProbeDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for ProbeDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Create a temporary workspace at `probe_height`, import account-0, run a
 /// time-limited compact-block sync (≤`PROBE_TIMEOUT_SECS` seconds), then check
-/// whether any notes were written to the wallet DB.  Cleans up the temp
-/// directory before returning.
+/// whether any notes were written to the wallet DB.  A `ProbeDirGuard` removes
+/// the temporary directory on every exit path (success, error, or unwind).
 async fn probe_shielded_window(
     client: &mut CompactTxStreamerClient<Channel>,
     lightwalletd_url: &str,
@@ -489,6 +506,11 @@ async fn probe_shielded_window(
     let transparent_account = keys.transparent_account;
     let sapling_floor = keys.sapling_floor;
     let probe_dir = std::env::temp_dir().join(format!("zeck_probe_{}", Uuid::new_v4()));
+    // Guard ensures the probe directory (and its viewing-key-bearing wallet DB)
+    // is removed on every exit path, not just the success path below.
+    let _probe_dir_guard = ProbeDirGuard {
+        path: probe_dir.clone(),
+    };
     let effective_height = probe_height.max(sapling_floor.saturating_add(1));
 
     let probe_config = RuntimeScanConfig {
@@ -536,7 +558,7 @@ async fn probe_shielded_window(
     }
 
     let has_activity = check_probe_activity(workspace.wallet_db_path()).unwrap_or(false);
-    let _ = std::fs::remove_dir_all(&probe_dir);
+    // `_probe_dir_guard` removes the temporary directory when it drops here.
     Ok(has_activity)
 }
 
