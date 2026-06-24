@@ -65,7 +65,8 @@ impl RecoveryWorkspace {
             None => format!("auto-gap-{}", config.gap_limit),
         };
 
-        let workspace_id = derive_workspace_id(config.network, &fingerprint, config.birthday, &scope);
+        let workspace_id =
+            derive_workspace_id(config.network, &fingerprint, config.birthday, &scope);
         let private_root = config
             .data_dir
             .join(config.network.label())
@@ -221,6 +222,41 @@ fn set_private_file_permissions(path: &Path) -> ZeckResult<()> {
     Ok(())
 }
 
+/// Create (or truncate) `path` and write `bytes`, restricting the file to
+/// `0o600` at creation time on Unix via `OpenOptions::mode`. This keeps
+/// file-level protection in place independent of the parent directory's
+/// mode (audit Suggestion 3). On non-Unix platforms there is no mode-bit
+/// equivalent, so this degrades to a plain create-truncate write and the
+/// `0o700` parent directory remains the sole protection.
+fn write_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
+    // `OpenOptions::mode` only constrains newly-created files. If this path
+    // already existed with looser permissions, tighten it before writing fresh
+    // sensitive contents into the truncated file.
+    set_private_file_permissions(path)?;
+    file.write_all(bytes)
+        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", path.display())))?;
+
+    // Keep the final mode tight even if a platform/filesystem changes metadata
+    // during the write.
+    set_private_file_permissions(path)?;
+
+    Ok(())
+}
+
 /// Seconds a wallet-database connection waits on a locked database before
 /// returning `SQLITE_BUSY`. The scan writer and the once-per-second progress
 /// poller share the file, so lock collisions are routine rather than exceptional.
@@ -240,9 +276,7 @@ fn open_tuned_wallet_connection(path: &Path) -> Result<rusqlite::Connection, rus
     conn.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
     // `PRAGMA journal_mode` returns the resulting mode as a row, so it needs
     // the query form rather than `pragma_update`.
-    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
-        row.get::<_, String>(0)
-    })?;
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(conn)
 }
@@ -255,10 +289,7 @@ pub(crate) fn open_wallet_db(
     network: Network,
 ) -> ZeckResult<WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>> {
     let conn = open_tuned_wallet_connection(path).map_err(|err| {
-        ZeckError::Storage(format!(
-            "opening wallet database {}: {err}",
-            path.display()
-        ))
+        ZeckError::Storage(format!("opening wallet database {}: {err}", path.display()))
     })?;
     Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng))
 }
@@ -329,10 +360,9 @@ pub fn write_session_metadata(workspace_root: &Path, meta: &SessionMetadata) -> 
     })?;
     let final_path = session_path(workspace_root);
     let tmp_path = workspace_root.join(format!("{SESSION_FILE_NAME}.tmp"));
-    let bytes = serde_json::to_vec_pretty(meta)
-        .map_err(|err| ZeckError::Serialization(err.to_string()))?;
-    fs::write(&tmp_path, &bytes)
-        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", tmp_path.display())))?;
+    let bytes =
+        serde_json::to_vec_pretty(meta).map_err(|err| ZeckError::Serialization(err.to_string()))?;
+    write_private_file(&tmp_path, &bytes)?;
     fs::rename(&tmp_path, &final_path).map_err(|err| {
         ZeckError::Storage(format!(
             "renaming {} -> {}: {err}",
@@ -404,7 +434,11 @@ pub fn list_incomplete_sessions(data_dir: &Path) -> ZeckResult<Vec<IncompleteSes
     };
 
     for network_entry in networks.flatten() {
-        if !network_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !network_entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         let network_name = network_entry.file_name();
@@ -456,8 +490,7 @@ pub fn list_incomplete_sessions(data_dir: &Path) -> ZeckResult<Vec<IncompleteSes
                         continue;
                     }
                     let workspace_path = scope_entry.path();
-                    if let Some(row) =
-                        try_build_incomplete_row(&workspace_path, network, birthday)
+                    if let Some(row) = try_build_incomplete_row(&workspace_path, network, birthday)
                     {
                         rows.push(row);
                     }
@@ -545,8 +578,7 @@ pub fn verify_seed_for_workspace(
     let fingerprint = SeedFingerprint::from_seed(seed.expose_secret()).ok_or_else(|| {
         ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
     })?;
-    let expected_id =
-        derive_workspace_id(keying.network, &fingerprint, keying.birthday, &scope);
+    let expected_id = derive_workspace_id(keying.network, &fingerprint, keying.birthday, &scope);
 
     if expected_id != path_id {
         return Err(ZeckError::InvalidConfig(
@@ -635,14 +667,14 @@ pub fn parse_workspace_keying(workspace_path: &Path) -> ZeckResult<WorkspaceKeyi
     // Two scope shapes: `auto-gap-N` (gap_limit driven) or `accounts-N`
     // (explicit num_accounts). These are exclusive; pick whichever matches.
     let (num_accounts, gap_limit) = if let Some(rest) = scope.strip_prefix("auto-gap-") {
-        let gap = rest.parse::<u32>().map_err(|_| {
-            ZeckError::InvalidConfig(format!("malformed scope segment {scope:?}"))
-        })?;
+        let gap = rest
+            .parse::<u32>()
+            .map_err(|_| ZeckError::InvalidConfig(format!("malformed scope segment {scope:?}")))?;
         (None, gap)
     } else if let Some(rest) = scope.strip_prefix("accounts-") {
-        let count = rest.parse::<u32>().map_err(|_| {
-            ZeckError::InvalidConfig(format!("malformed scope segment {scope:?}"))
-        })?;
+        let count = rest
+            .parse::<u32>()
+            .map_err(|_| ZeckError::InvalidConfig(format!("malformed scope segment {scope:?}")))?;
         // gap_limit is unused when num_accounts is set, but the validator
         // still requires gap_limit >= 1; pick the same value as `count`
         // so it round-trips through the existing config pipeline cleanly.
@@ -876,7 +908,9 @@ mod tests {
             1_715_000_000,
         );
         write_session_metadata(dir.path(), &meta).expect("write");
-        let read = read_session_metadata(dir.path()).expect("read").expect("present");
+        let read = read_session_metadata(dir.path())
+            .expect("read")
+            .expect("present");
         assert_eq!(read, meta);
     }
 
@@ -905,7 +939,9 @@ mod tests {
         );
         write_session_metadata(dir.path(), &meta).expect("write");
         mark_session_completed(dir.path(), 2).expect("mark");
-        let read = read_session_metadata(dir.path()).expect("read").expect("present");
+        let read = read_session_metadata(dir.path())
+            .expect("read")
+            .expect("present");
         assert!(read.completed);
         assert_eq!(read.last_run_at_epoch_seconds, 2);
     }
@@ -1030,8 +1066,7 @@ mod tests {
 
     #[test]
     fn list_incomplete_sessions_empty_for_missing_data_dir() {
-        let rows =
-            list_incomplete_sessions(Path::new("/tmp/zeck-nonexistent-zzz")).expect("list");
+        let rows = list_incomplete_sessions(Path::new("/tmp/zeck-nonexistent-zzz")).expect("list");
         assert!(rows.is_empty());
     }
 
@@ -1095,10 +1130,18 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let leaf = temp.path().join("workspace-leaf");
         super::create_private_dir_all(&leaf).expect("create_private_dir_all should succeed");
-        let mode = std::fs::metadata(&leaf).expect("metadata").permissions().mode();
+        let mode = std::fs::metadata(&leaf)
+            .expect("metadata")
+            .permissions()
+            .mode();
         // Only inspect the permission bits — file type bits live in the upper
         // half of `mode` and are not what we're asserting.
-        assert_eq!(mode & 0o777, 0o700, "leaf workspace dir mode is {:o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "leaf workspace dir mode is {:o}",
+            mode & 0o777
+        );
     }
 
     #[cfg(unix)]
@@ -1116,8 +1159,38 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
             .expect("seed perms");
         super::set_private_file_permissions(&file).expect("set perms");
-        let mode = std::fs::metadata(&file).expect("metadata").permissions().mode();
+        let mode = std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "file mode is {:o}", mode & 0o777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_session_metadata_creates_file_with_mode_0o600() {
+        // Audit Suggestion 3: session.json must be created with 0o600 at
+        // creation time, not rely solely on the 0o700 parent directory.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meta = SessionMetadata::new_in_progress(
+            "perm check".to_owned(),
+            ZeckNetwork::Mainnet,
+            3_280_000,
+            None,
+            1,
+        );
+        write_session_metadata(dir.path(), &meta).expect("write");
+        let mode = std::fs::metadata(dir.path().join(SESSION_FILE_NAME))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "session.json mode is {:o}",
+            mode & 0o777
+        );
     }
 
     #[test]
@@ -1142,7 +1215,11 @@ mod tests {
         // would surface as a path inequality after the round-trip.
         let as_string = ws.root().to_string_lossy().into_owned();
         let back = PathBuf::from(&as_string);
-        assert_eq!(ws.root(), back, "unicode path mangled through string round-trip");
+        assert_eq!(
+            ws.root(),
+            back,
+            "unicode path mangled through string round-trip"
+        );
         // And the path actually contains the unicode segment, not a
         // percent-encoded or stripped version.
         assert!(as_string.contains("tëst"));

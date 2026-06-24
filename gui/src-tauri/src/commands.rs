@@ -292,15 +292,35 @@ pub async fn save_recovery_report(
         }
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&path)
-        .map_err(|err| format!("opening {}: {err}", path.display()))?;
-    file.write_all(report.as_bytes())
+    write_private_report(&path, report.as_bytes())
         .map_err(|err| format!("writing {}: {err}", path.display()))?;
     Ok(path.display().to_string())
+}
+
+/// Write `contents` to `path` with owner-only (`0o600`) permissions on Unix.
+///
+/// `OpenOptions::mode` only constrains the bits of a *newly created* file, and
+/// the caller deliberately permits writing into an existing regular file (which
+/// with `truncate` would retain its prior, looser mode). So this both creates
+/// at `0o600` AND re-tightens after the write, ensuring a reused report path is
+/// protected too (audit Suggestion 3). Windows has no mode bits; there it is a
+/// plain create+truncate write. The caller owns the symlink/regular-file guard.
+fn write_private_report(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Recursive-delete the on-disk recovery workspace for a completed scan.
@@ -769,5 +789,24 @@ mod tests {
     #[test]
     fn applescript_quote_strips_control_chars() {
         assert_eq!(applescript_quote("abc\x00def"), "\"abcdef\"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_report_tightens_a_reused_file_to_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("argos-report-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("recovery-report.txt");
+        // Simulate a pre-existing, world-readable report file at the target path.
+        std::fs::write(&path, b"stale").expect("seed file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        super::write_private_report(&path, b"fresh").expect("write report");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a reused report file must be re-tightened to 0o600");
+        assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
