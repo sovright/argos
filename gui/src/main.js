@@ -340,7 +340,7 @@ async function clearOsClipboard(statusEl) {
   }
 }
 
-$("seed-clear-clipboard").addEventListener("click", () => clearOsClipboard("seed-status"));
+$("seed-clear-clipboard")?.addEventListener("click", () => clearOsClipboard("seed-status"));
 
 // ─── Step 3: Configuration ────────────────────────────────────────────────────
 
