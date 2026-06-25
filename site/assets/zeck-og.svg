@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
-  <title id="title">ZECK Rescue Wallet</title>
-  <desc id="desc">A Sovright social preview card for the ZECK Rescue Wallet static site.</desc>
+  <title id="title">Argos Rescue Wallet</title>
+  <desc id="desc">A Sovright social preview card for the Argos Rescue Wallet static site.</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#fbf8f1"/>
@@ -20,7 +20,7 @@
 
   <g transform="translate(100 92)">
     <image href="./zeck-icon.svg" width="48" height="48"/>
-    <text x="64" y="32" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="24" font-weight="800" fill="#17221d">ZECK</text>
+    <text x="64" y="32" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="24" font-weight="800" fill="#17221d">Argos</text>
   </g>
 
   <g opacity="0.82">
@@ -29,7 +29,7 @@
   </g>
 
   <g transform="translate(100 194)">
-    <text font-family="Georgia, Times New Roman, serif" font-size="68" font-weight="700" fill="#17221d">ZECK Rescue Wallet</text>
+    <text font-family="Georgia, Times New Roman, serif" font-size="68" font-weight="700" fill="#17221d">Argos Rescue Wallet</text>
     <text y="74" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="30" fill="#5d685f">Recover legacy ZecWallet Lite seeds with a</text>
     <text y="116" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="30" fill="#5d685f">local-first desktop flow.</text>
 
