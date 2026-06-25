@@ -13,14 +13,14 @@ rescue wallet subdomain.
 - `assets/sovright-logo-caption.svg`: Sovright caption wordmark used in the header
 - `assets/zeck-og.png`: 1200x630 Open Graph and Twitter Card preview image
 - `assets/zeck-og.svg`: editable source for the social preview image
-- `CNAME`: GitHub Pages custom-domain hint for `rescue.sovright.com`
+- `CNAME`: GitHub Pages custom-domain hint for `argos.sovright.com`
 
 ## Hosting
 
 The site is static and can be served from any CDN or static host. For GitHub
 Pages, publish the `site/` directory and keep `CNAME` set to the target
 subdomain. For Cloudflare Pages, Netlify, or Vercel, set the publish directory
-to `site` and configure the DNS record for `rescue.sovright.com`.
+to `site` and configure the DNS record for `argos.sovright.com`.
 
 Update the download links in `index.html` once release assets are signed and
 published.
