@@ -875,7 +875,7 @@ async fn run_wallet_sync_with_stall_watchdog(
 /// Runs `run_wallet_sync`, reconnecting to lightwalletd on transient transport
 /// errors.  Each reconnection attempt tries all configured endpoints in order.
 /// Permanent errors (wallet database corruption, etc.) are returned immediately.
-async fn run_wallet_sync_with_retry(
+pub(crate) async fn run_wallet_sync_with_retry(
     workspace: &RecoveryWorkspace,
     network: &zcash_protocol::consensus::Network,
     zeck_network: crate::models::ZeckNetwork,

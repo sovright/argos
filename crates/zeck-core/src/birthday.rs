@@ -13,8 +13,8 @@ use crate::{
     derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
     error::{ZeckError, ZeckResult},
     lightwalletd::{
-        probe_lightwalletd_endpoints, validate_lightwalletd_network,
-        validated_lightwalletd_endpoints,
+        probe_lightwalletd_endpoints, probe_lightwalletd_endpoints_with_retry,
+        validate_lightwalletd_network, validated_lightwalletd_endpoints,
     },
     models::{BirthdayDetectResult, RuntimeScanConfig, ZeckNetwork},
     scan::{import_probe_account, run_wallet_sync},
@@ -330,7 +330,7 @@ where
 
     on_progress("Connecting to lightwalletd…");
     let (mut client, primary_endpoint, chain_info) =
-        probe_lightwalletd_endpoints(lightwalletd_url).await?;
+        probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
     let chain_tip = u32::try_from(chain_info.block_height)
         .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
     let sapling_floor = u32::try_from(chain_info.sapling_activation_height)

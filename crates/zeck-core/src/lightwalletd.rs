@@ -140,6 +140,59 @@ pub async fn probe_lightwalletd_endpoints(
     )))
 }
 
+/// Attempts for an initial connect/probe before giving up, so a transient
+/// DNS/network blip at startup doesn't fail an operation before it begins.
+const INITIAL_CONNECT_ATTEMPTS: u32 = 4;
+const INITIAL_CONNECT_RETRY_DELAY_SECS: u64 = 5;
+
+/// [`probe_lightwalletd_endpoints`] with bounded retry on transient
+/// (transport/DNS) failures — see [`is_transient_network_error`]. A
+/// configuration/validation error is returned immediately (not retried).
+pub async fn probe_lightwalletd_endpoints_with_retry(
+    raw: &str,
+) -> ZeckResult<(CompactTxStreamerClient<Channel>, String, LightdInfo)> {
+    let mut attempt = 1u32;
+    loop {
+        match probe_lightwalletd_endpoints(raw).await {
+            Ok(ready) => return Ok(ready),
+            Err(err) if attempt < INITIAL_CONNECT_ATTEMPTS
+                && is_transient_network_error(&err.to_string()) =>
+            {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    INITIAL_CONNECT_RETRY_DELAY_SECS,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// [`connect_lightwalletd_endpoints`] with bounded retry on transient
+/// (transport/DNS) failures — see [`is_transient_network_error`].
+pub async fn connect_lightwalletd_endpoints_with_retry(
+    raw: &str,
+    preferred: Option<&str>,
+) -> ZeckResult<(CompactTxStreamerClient<Channel>, String)> {
+    let mut attempt = 1u32;
+    loop {
+        match connect_lightwalletd_endpoints(raw, preferred).await {
+            Ok(ready) => return Ok(ready),
+            Err(err) if attempt < INITIAL_CONNECT_ATTEMPTS
+                && is_transient_network_error(&err.to_string()) =>
+            {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    INITIAL_CONNECT_RETRY_DELAY_SECS,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 pub fn describe_lightwalletd_endpoints(raw: &str) -> String {
     let endpoints = parse_lightwalletd_endpoints(raw);
     match endpoints.as_slice() {
