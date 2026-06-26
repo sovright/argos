@@ -666,6 +666,11 @@ async fn execute_sweep_for_session(
         })?;
     let prover = LocalTxProver::bundled();
     let mut total_fee_zatoshis = 0u64;
+    // Sum of the donation outputs actually broadcast (0 when a per-account
+    // donation was below the floor or its split fell back). Reported on the
+    // outcome so the completion screen shows the true donated total rather than
+    // the proposal's estimate.
+    let mut total_donation_zatoshis = 0u64;
     let mut results = Vec::new();
     // Accounts that held a balance but moved nothing (all spendable value below
     // the ZIP-317 fee floor). Collected so the completion screen can show the
@@ -864,7 +869,7 @@ async fn execute_sweep_for_session(
             };
             // `None` => no selectable shielded value for this account; skip it
             // rather than aborting the whole sweep.
-            let Some(fee) = send_max_fee else {
+            let Some((fee, account_donation)) = send_max_fee else {
                 if !account_shielded {
                     skipped_accounts.push(SkippedSweepAccount {
                         account_index: tracked_account.derived.index,
@@ -879,6 +884,10 @@ async fn execute_sweep_for_session(
             // Step already enforced the cap against (prior + step fee) before broadcast;
             // recompute here purely to advance the running total for the next account.
             total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
+            total_donation_zatoshis =
+                total_donation_zatoshis.checked_add(account_donation).ok_or_else(|| {
+                    ZeckError::Internal("donation total overflowed the supported range".to_owned())
+                })?;
 
             // R-S29 hook: pause between per-account broadcasts so the test parent
             // can SIGKILL the helper subprocess deterministically in the gap. The
@@ -891,7 +900,12 @@ async fn execute_sweep_for_session(
     }
     .await;
 
-    assemble_sweep_outcome(results, skipped_accounts, sweep_result)
+    assemble_sweep_outcome(
+        results,
+        skipped_accounts,
+        total_donation_zatoshis,
+        sweep_result,
+    )
 }
 
 /// Fold the accumulated broadcast records and the loop's terminal status into a
@@ -910,12 +924,14 @@ async fn execute_sweep_for_session(
 fn assemble_sweep_outcome(
     results: Vec<TxBroadcastResult>,
     skipped_accounts: Vec<SkippedSweepAccount>,
+    total_donation_zatoshis: u64,
     sweep_result: ZeckResult<()>,
 ) -> ZeckResult<SweepOutcome> {
     match sweep_result {
         Ok(()) => Ok(SweepOutcome {
             transactions: results,
             skipped_accounts,
+            total_donation_zatoshis,
             error: None,
         }),
         Err(err) => {
@@ -925,6 +941,7 @@ fn assemble_sweep_outcome(
                 Ok(SweepOutcome {
                     transactions: results,
                     skipped_accounts,
+                    total_donation_zatoshis,
                     error: Some(err.to_string()),
                 })
             }
@@ -1072,17 +1089,20 @@ async fn execute_shielding_step(
 fn donation_proposal_or_fallback<P>(
     split_result: ZeckResult<Option<P>>,
     max_proposal: P,
+    donation: u64,
     account_index: u32,
-) -> P {
+) -> (P, u64) {
     match split_result {
-        Ok(Some(proposal)) => proposal,
-        Ok(None) => max_proposal,
+        // Split built: the donation output carries `donation` zatoshis.
+        Ok(Some(proposal)) => (proposal, donation),
+        // Fell back to the donation-free sweep: nothing was actually donated.
+        Ok(None) => (max_proposal, 0),
         Err(err) => {
             tracing::warn!(
                 "donation split proposal failed for account {account_index}: {err}; \
                  falling back to donation-free sweep for this account",
             );
-            max_proposal
+            (max_proposal, 0)
         }
     }
 }
@@ -1180,7 +1200,7 @@ async fn execute_send_max_step(
     usk: &UnifiedSpendingKey,
     destination_address: &ZcashAddress,
     memo_bytes: Option<MemoBytes>,
-) -> ZeckResult<Option<u64>> {
+) -> ZeckResult<Option<(u64, u64)>> {
     let mut wallet_db =
         open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
 
@@ -1229,9 +1249,14 @@ async fn execute_send_max_step(
     let donation =
         crate::donation::donation_for_send_amount(ctx.donation_address, ctx.donation_rate, send_amount);
 
-    let proposal = if donation == 0 {
+    // `donation_zatoshis` is the amount *actually* placed in a donation output:
+    // the requested `donation` when the split proposal is used, or 0 when there
+    // is no donation or the split fell back to the donation-free sweep. Returned
+    // so the caller can report the true donated total (the proposal figure is
+    // only an estimate).
+    let (proposal, donation_zatoshis) = if donation == 0 {
         // No donation output: behavior is unchanged from the single-pass sweep.
-        max_proposal
+        (max_proposal, 0)
     } else {
         let donation_zcash_address = ZcashAddress::try_from_encoded(ctx.donation_address)
             .map_err(|err| {
@@ -1258,6 +1283,7 @@ async fn execute_send_max_step(
         donation_proposal_or_fallback(
             split_result,
             max_proposal,
+            donation,
             tracked_account.derived.index,
         )
     };
@@ -1292,7 +1318,7 @@ async fn execute_send_max_step(
     )
     .await?;
 
-    Ok(Some(fee_zatoshis))
+    Ok(Some((fee_zatoshis, donation_zatoshis)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1928,11 +1954,13 @@ mod tests {
     #[test]
     fn sweep_outcome_full_success_carries_no_error() {
         use super::assemble_sweep_outcome;
-        let outcome = assemble_sweep_outcome(vec![sample_broadcast_result(0)], Vec::new(), Ok(()))
-            .expect("Ok");
+        let outcome =
+            assemble_sweep_outcome(vec![sample_broadcast_result(0)], Vec::new(), 25_000, Ok(()))
+                .expect("Ok");
         assert!(outcome.error.is_none());
         assert_eq!(outcome.transactions.len(), 1);
         assert!(outcome.skipped_accounts.is_empty());
+        assert_eq!(outcome.total_donation_zatoshis, 25_000);
     }
 
     #[test]
@@ -1945,6 +1973,7 @@ mod tests {
                 gross_zatoshis: 9_000,
                 reason: "dust".to_owned(),
             }],
+            0,
             Err(ZeckError::Broadcast("account 2 rejected".to_owned())),
         )
         .expect("a partial failure with broadcast records is reported as Ok, not lost");
@@ -1964,6 +1993,7 @@ mod tests {
         let err = assemble_sweep_outcome(
             Vec::new(),
             Vec::new(),
+            0,
             Err(ZeckError::Broadcast("first account rejected".to_owned())),
         )
         .expect_err("a failure before any broadcast must stay an Err");
@@ -2104,35 +2134,41 @@ mod tests {
 
     #[test]
     fn donation_fallback_ok_some_returns_split() {
+        // Split built → its proposal AND the requested donation amount.
         let got = super::donation_proposal_or_fallback::<&str>(
             Ok(Some("donation-split")),
             "donation-free-max",
+            5_000,
             0,
         );
-        assert_eq!(got, "donation-split");
+        assert_eq!(got, ("donation-split", 5_000));
     }
 
     #[test]
     fn donation_fallback_ok_none_returns_max() {
+        // Fell back → donation-free proposal AND zero actual donation.
         let got = super::donation_proposal_or_fallback::<&str>(
             Ok(None),
             "donation-free-max",
+            5_000,
             0,
         );
-        assert_eq!(got, "donation-free-max");
+        assert_eq!(got, ("donation-free-max", 0));
     }
 
     #[test]
     fn donation_fallback_err_returns_max() {
         // The critical safety property: an Err must NOT propagate. The user's
         // sweep proceeds donation-free. Pre-fix, an Err here aborted the
-        // entire sweep — see PR #66 review (Kristi, 2026-05-28).
+        // entire sweep — see PR #66 review (Kristi, 2026-05-28). The actual
+        // donation is reported as 0 so the outcome doesn't over-count.
         let got = super::donation_proposal_or_fallback::<&str>(
             Err(ZeckError::TransactionBuild("synthetic regression".to_owned())),
             "donation-free-max",
+            5_000,
             42,
         );
-        assert_eq!(got, "donation-free-max");
+        assert_eq!(got, ("donation-free-max", 0));
     }
 
     // ─── Multi-account proposal donation logic ────────────────────────────────

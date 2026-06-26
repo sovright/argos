@@ -388,6 +388,12 @@ pub struct SweepOutcome {
     /// user, mirroring the dry-run proposal's `skipped_accounts`.
     #[serde(default)]
     pub skipped_accounts: Vec<SkippedSweepAccount>,
+    /// Total zatoshis *actually* placed in donation outputs and broadcast — the
+    /// truth, as opposed to the dry-run proposal's `total_donation_zatoshis`
+    /// estimate, which assumes the minimum fee and that all transparent is
+    /// shielded and can read higher than what execution delivers.
+    #[serde(default)]
+    pub total_donation_zatoshis: u64,
     pub error: Option<String>,
 }
 

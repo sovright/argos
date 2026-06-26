@@ -348,6 +348,13 @@ async fn main() -> Result<()> {
                             }
                             println!();
                         }
+                        // Actual donated total (the truth, vs the proposal's
+                        // estimate). Always print it so a 0 is never silent.
+                        println!(
+                            "Donated to the Argos project: {}",
+                            format_zec(outcome.total_donation_zatoshis)
+                        );
+                        println!();
                         match outcome.error {
                             None => println!("Sweep complete."),
                             // A mid-sequence abort: the transactions above were
