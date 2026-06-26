@@ -7,6 +7,16 @@ use tauri::Manager;
 use argos_core::RecoveryService;
 
 fn main() {
+    // Surface argos-core diagnostics to stderr (visible in `npm run dev`).
+    // Honors RUST_LOG; defaults to info, with debug for argos-core so the
+    // per-account donation decision and any fallback warnings are observable.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,argos_core=debug")),
+        )
+        .try_init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {

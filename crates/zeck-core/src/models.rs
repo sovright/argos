@@ -381,6 +381,19 @@ pub struct TxBroadcastResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepOutcome {
     pub transactions: Vec<TxBroadcastResult>,
+    /// Accounts that held a balance but moved nothing because every spendable
+    /// note was below the ZIP-317 fee floor (only dust UTXOs, or funds outside
+    /// the shieldable receivers). The sweep skipped them and continued with the
+    /// other accounts rather than aborting; surfaced so a skip is visible to the
+    /// user, mirroring the dry-run proposal's `skipped_accounts`.
+    #[serde(default)]
+    pub skipped_accounts: Vec<SkippedSweepAccount>,
+    /// Total zatoshis *actually* placed in donation outputs and broadcast — the
+    /// truth, as opposed to the dry-run proposal's `total_donation_zatoshis`
+    /// estimate, which assumes the minimum fee and that all transparent is
+    /// shielded and can read higher than what execution delivers.
+    #[serde(default)]
+    pub total_donation_zatoshis: u64,
     pub error: Option<String>,
 }
 

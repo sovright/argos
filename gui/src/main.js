@@ -1025,7 +1025,9 @@ function renderSweepProposal(proposal) {
   const preview = $("donate-amount-preview");
   if (donated > 0) {
     const net = (proposal.net_received_zatoshis || 0) - donated;
-    preview.textContent = `Donation: ${fmt(donated)} · Net to you: ${fmt(net)} (estimate)`;
+    preview.textContent =
+      `Estimated donation: ${fmt(donated)} · Net to you: ${fmt(net)}. ` +
+      "This is an estimate — the donation is computed per-account at the real network fee when the sweep runs, and may be lower (or 0) if your funds are spread across several small accounts. The actual donated amount is shown when the sweep completes.";
   } else if (state.donationEnabled && $("donate-enabled").checked && state.scanConfig?.network !== "testnet") {
     // The proposal estimate uses a fixed ZIP-317 floor; execution uses the
     // real fee. Right at the donation threshold the two can disagree by a
@@ -1038,6 +1040,10 @@ function renderSweepProposal(proposal) {
   }
 
   $("irreversible-check").checked = false;
+  // Re-enable the checkbox: a prior sweep's execute click disables it (and only
+  // the error path re-enables it), so without this a second proposal in the
+  // same session leaves the checkbox stuck disabled and the sweep unclickable.
+  $("irreversible-check").disabled = false;
   $("execute-sweep").disabled = true;
 }
 
@@ -1078,7 +1084,13 @@ $("execute-sweep").addEventListener("click", async () => {
       donorEmail,
     });
     setStatus("sweep-execute-status", "", "");
-    renderCompleteScreen(outcome.transactions, outcome.error);
+    renderCompleteScreen(
+      outcome.transactions,
+      outcome.skipped_accounts,
+      outcome.total_donation_zatoshis || 0,
+      donationRate,
+      outcome.error,
+    );
     goTo("complete");
   } catch (err) {
     $("execute-sweep").disabled = false;
@@ -1089,7 +1101,7 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
-function renderCompleteScreen(results, error) {
+function renderCompleteScreen(results, skipped, donated, donationRate, error) {
   const confirmed = results.filter((r) => r.status === "confirmed").length;
   const pending = results.filter((r) => r.status === "pending").length;
   const failed = results.filter((r) => r.status === "failed").length;
@@ -1103,6 +1115,12 @@ function renderCompleteScreen(results, error) {
     $("complete-summary").textContent =
       `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
       `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
+  } else if (results.length === 0) {
+    // Nothing was broadcast because every account with a balance was skipped
+    // (below the fee floor, or transparent funds that couldn't be shielded).
+    // The reasons are listed below — this is NOT a broadcast failure.
+    $("complete-summary").textContent =
+      "No funds were swept — every account with a balance was skipped (reasons below).";
   } else if (failed === results.length) {
     $("complete-summary").textContent = "All transactions failed to broadcast. No funds were moved.";
   } else if (confirmed > 0) {
@@ -1167,6 +1185,47 @@ function renderCompleteScreen(results, error) {
 
     container.appendChild(card);
   });
+
+  // Accounts that held a balance but moved nothing (every spendable note below
+  // the ZIP-317 fee floor). Surfaced so the skip is visible rather than silent,
+  // mirroring the dry-run proposal's skipped-accounts list.
+  const skippedEl = $("complete-skipped");
+  skippedEl.replaceChildren();
+  if (Array.isArray(skipped) && skipped.length > 0) {
+    const heading = document.createElement("p");
+    heading.style.margin = "6px 0 4px";
+    heading.style.fontWeight = "700";
+    heading.style.color = "var(--muted)";
+    heading.textContent =
+      `${skipped.length} account${skipped.length > 1 ? "s" : ""} skipped — not swept (reasons below)`;
+    skippedEl.appendChild(heading);
+
+    const list = document.createElement("ul");
+    list.className = "discovery-list";
+    skipped.forEach((s) => {
+      const li = document.createElement("li");
+      li.textContent = `Account ${s.account_index}: ${s.reason} (${fmt(s.gross_zatoshis)})`;
+      list.appendChild(li);
+    });
+    skippedEl.appendChild(list);
+  }
+
+  // Actual donated total (the truth, vs the proposal's estimate). Shown whenever
+  // a donation was requested — including when it came out to 0, so a proposal
+  // estimate that execution couldn't deliver is never silent.
+  const donationEl = $("complete-donation");
+  const donationRequested = Number.isFinite(donationRate) && donationRate > 0;
+  if (donated > 0) {
+    donationEl.hidden = false;
+    donationEl.textContent = `Donated ${fmt(donated)} to the Argos project — thank you for supporting Zcash recovery.`;
+  } else if (donationRequested && broadcast > 0) {
+    donationEl.hidden = false;
+    donationEl.textContent =
+      "No donation was sent: at the real network fee, each account's share fell below the 0.001 ZEC minimum, so your full balance went to your address.";
+  } else {
+    donationEl.hidden = true;
+    donationEl.textContent = "";
+  }
 
   const report = buildReport(results);
   $("save-report").dataset.report = report;
