@@ -120,7 +120,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "argos-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "argos-core",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "argos-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "argos-gui"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "argos-core",
  "secrecy",
