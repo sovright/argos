@@ -1,0 +1,43 @@
+name: deploy-site
+
+# Auto-deploys the static marketing/download site (site/) to the Cloudflare
+# Pages project `argos-sovright` on every push to main that touches site/.
+# Replaces the previous manual `wrangler pages deploy` step.
+#
+# SETUP (one-time): add a repository secret CLOUDFLARE_API_TOKEN — a Cloudflare
+# API token scoped to *Account → Cloudflare Pages → Edit* for this account only
+# (no other permissions). The account ID below is an identifier, not a secret.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch: {}
+
+# Least-privilege default (matches ci.yml): jobs opt in explicitly.
+permissions: {}
+
+# Never run two site deploys at once; a newer push supersedes an in-flight one.
+concurrency:
+  group: deploy-site
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy site to Cloudflare Pages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Deploy site/ to Cloudflare Pages (production)
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: "350baf44d2c9b174b9dbf7ea61a7e414"
+          command: pages deploy site --project-name=argos-sovright --branch=main
