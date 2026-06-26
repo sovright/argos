@@ -1152,9 +1152,14 @@ fn build_donation_split_proposal(
     })?;
     // Iterative fee convergence: two fixed payments summing to
     // (total_spendable - fee) drive change to zero once the candidate fee
-    // matches the proposal's computed fee. The extra output adds at most one
-    // ZIP-317 marginal action, so this converges in <=2 iterations.
-    let mut candidate_fee = send_max_fee;
+    // matches the proposal's computed fee. Seed from the send-max fee PLUS one
+    // ZIP-317 marginal action: the extra donation output costs exactly that, so
+    // iteration 1 already has enough fee budget and `propose_transfer` doesn't
+    // fail with insufficient funds before the loop can adjust. (Seeding from the
+    // bare single-output send-max fee under-budgets the donation output and was
+    // the bug that made every donation silently fall back to a donation-free
+    // sweep.)
+    let mut candidate_fee = send_max_fee.saturating_add(u64::from(MARGINAL_FEE));
     for _ in 0..MAX_FEE_CONVERGENCE_ITERS {
         let remainder = total_spendable
             .checked_sub(donation)

@@ -21,4 +21,8 @@ serde_json.workspace = true
 tauri.workspace = true
 tauri-plugin-opener.workspace = true
 tokio.workspace = true
+# Surface argos-core diagnostics (scan reconnects, donation decisions/fallbacks)
+# to the dev console / stderr. Both are already workspace dependencies.
+tracing.workspace = true
+tracing-subscriber.workspace = true
 argos-core = { path = "../../crates/zeck-core" }
