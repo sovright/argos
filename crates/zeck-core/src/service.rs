@@ -104,6 +104,32 @@ fn is_insufficient_funds_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("insufficient funds")
 }
 
+/// The donation recipient used during sweep *execution* on a given network.
+///
+/// Mainnet uses the baked-in [`crate::donation::DONATION_ADDRESS`]; testnet
+/// disables the donation feature (empty string). Under the dev/test-only
+/// `argos-network` feature ONLY, the testnet branch honors
+/// `ARGOS_TEST_DONATION_ADDRESS` so the regtest harness can drive the
+/// donation-split path end-to-end with a regtest UA (the baked mainnet address
+/// can't be used on regtest). Production builds compile that override out — same
+/// rationale as the rest of the `argos-network` escape hatch — so testnet
+/// donation stays off in released binaries.
+fn execution_donation_address(network: crate::models::ZeckNetwork) -> String {
+    match network {
+        crate::models::ZeckNetwork::Mainnet => crate::donation::DONATION_ADDRESS.to_owned(),
+        crate::models::ZeckNetwork::Testnet => {
+            #[cfg(feature = "argos-network")]
+            {
+                std::env::var("ARGOS_TEST_DONATION_ADDRESS").unwrap_or_default()
+            }
+            #[cfg(not(feature = "argos-network"))]
+            {
+                String::new()
+            }
+        }
+    }
+}
+
 /// The concrete wallet database type used throughout the execution path.
 type SweepWalletDb = WalletDb<
     rusqlite::Connection,
@@ -680,13 +706,9 @@ async fn execute_sweep_for_session(
     // skip instead of it being silent.
     let mut skipped_accounts: Vec<SkippedSweepAccount> = Vec::new();
 
-    // Testnet kill-switch: forces the donation feature off.
-    let effective_donation_address =
-        if matches!(runtime.network, crate::models::ZeckNetwork::Testnet) {
-            ""
-        } else {
-            crate::donation::DONATION_ADDRESS
-        };
+    // Testnet kill-switch: forces the donation feature off (except under the
+    // dev/test-only `argos-network` feature; see `execution_donation_address`).
+    let effective_donation_address = execution_donation_address(runtime.network);
     let donation_memo = Some(
         MemoBytes::from_bytes(
             crate::donation::donation_memo_body(request.donor_email.as_deref()).as_bytes(),
@@ -775,7 +797,7 @@ async fn execute_sweep_for_session(
                         results: &mut results,
                         prior_fee_zatoshis: total_fee_zatoshis,
                         max_fee_zatoshis: request.max_fee_zatoshis,
-                        donation_address: effective_donation_address,
+                        donation_address: effective_donation_address.as_str(),
                         donation_rate: request.donation_rate,
                         donation_memo: donation_memo.clone(),
                         lightwalletd_url: runtime.lightwalletd_url.as_str(),
@@ -855,7 +877,7 @@ async fn execute_sweep_for_session(
                     results: &mut results,
                     prior_fee_zatoshis: total_fee_zatoshis,
                     max_fee_zatoshis: request.max_fee_zatoshis,
-                    donation_address: effective_donation_address,
+                    donation_address: effective_donation_address.as_str(),
                     donation_rate: request.donation_rate,
                     donation_memo: donation_memo.clone(),
                     lightwalletd_url: runtime.lightwalletd_url.as_str(),

@@ -2036,6 +2036,75 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
     eprintln!("[regtest] propose_sweep failed as expected after chmod 0o000: {err}");
 }
 
+// ─── Donation split (end-to-end) ────────────────────────────────────────────
+//
+// First end-to-end coverage of the donation path. Regression target: the
+// donation-split fee convergence seeded the candidate fee with the
+// *single-output* send-max fee, so `propose_transfer` failed with "insufficient
+// funds" on the first iteration and the split silently fell back to a
+// donation-free sweep — donating 0 on every sweep. No prior test exercised it
+// (all other sweep tests pass `donation_rate: None`; the unit tests use string
+// stand-ins), which is why it shipped broken.
+//
+// Donation is disabled on testnet (the baked address is mainnet-only and
+// undecodable on regtest), so this injects a regtest donation UA via
+// `ARGOS_TEST_DONATION_ADDRESS`, honored only under the `argos-network` feature.
+// Requires the harness funded enough that 10% of a swept account clears the
+// 0.001 ZEC floor (regtest coinbase amounts do).
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported) and --features argos-network"]
+#[tokio::test]
+async fn sweep_places_a_donation_output_when_rate_is_set() {
+    let harness = RegtestHarness::require();
+    let temp_data_dir = tempfile::tempdir().expect("tempdir for donation sweep");
+    let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-donate").await;
+
+    // A regtest donation recipient, distinct from the sweep destination, so the
+    // donation-split path runs against a decodable testnet UA.
+    let accounts = derive_accounts(
+        &SecretString::new(harness.test_seed().to_owned()),
+        ZeckNetwork::Testnet,
+        3,
+    )
+    .expect("derive_accounts for donation UA");
+    let donation_ua = accounts[2].unified_address.clone();
+    assert_ne!(
+        donation_ua, fixture.destination_ua,
+        "donation recipient must differ from the sweep destination"
+    );
+    std::env::set_var("ARGOS_TEST_DONATION_ADDRESS", &donation_ua);
+
+    let request = SweepRequest {
+        destination: fixture.destination_ua.clone(),
+        memo: None,
+        max_fee_zatoshis: None,
+        donation_rate: Some(0.10),
+        donor_email: None,
+    };
+    let outcome = fixture.service.execute_sweep(&fixture.handle, request).await;
+
+    // Always clear the override, even on assertion failure below.
+    std::env::remove_var("ARGOS_TEST_DONATION_ADDRESS");
+
+    let outcome = outcome.expect("execute_sweep with a 10% donation rate should succeed");
+    assert!(
+        !outcome.transactions.is_empty(),
+        "[regtest] sweep should have broadcast at least one transaction"
+    );
+    assert!(
+        outcome.total_donation_zatoshis > 0,
+        "[regtest] a 10% donation on a funded sweep must place a donation output; \
+         regression: the fee convergence fell back to a donation-free sweep and donated 0 \
+         (broadcast {} tx, skipped {} account(s))",
+        outcome.transactions.len(),
+        outcome.skipped_accounts.len(),
+    );
+    eprintln!(
+        "[regtest] donation sweep placed {} zats across {} tx(s)",
+        outcome.total_donation_zatoshis,
+        outcome.transactions.len()
+    );
+}
+
 // ─── FakeLightwalletd fixture smoke test ────────────────────────────────────
 //
 // Validates the proto-codegen and tonic-server plumbing for the in-process
