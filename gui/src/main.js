@@ -1197,7 +1197,7 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error) {
     heading.style.fontWeight = "700";
     heading.style.color = "var(--muted)";
     heading.textContent =
-      `${skipped.length} account${skipped.length > 1 ? "s" : ""} skipped — balance below the ZIP-317 fee floor`;
+      `${skipped.length} account${skipped.length > 1 ? "s" : ""} skipped — not swept (reasons below)`;
     skippedEl.appendChild(heading);
 
     const list = document.createElement("ul");
