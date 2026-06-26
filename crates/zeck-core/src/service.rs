@@ -41,7 +41,7 @@ use crate::{
     derivation::{legacy_transparent_account_key, legacy_transparent_secret_key, mnemonic_seed},
     error::{ZeckError, ZeckResult},
     lightwalletd::{
-        connect_lightwalletd_endpoints, validate_lightwalletd_network,
+        connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
         validated_lightwalletd_endpoints,
     },
     models::{
@@ -50,7 +50,7 @@ use crate::{
         TxBroadcastResult,
     },
     scan::{
-        refresh_scan_progress, run_recovery_scan, run_wallet_sync, ScanTaskState,
+        refresh_scan_progress, run_recovery_scan, run_wallet_sync_with_retry, ScanTaskState,
         SharedScanTaskState, TrackedAccount,
     },
     workspace::{consensus_network, open_wallet_db, RecoveryWorkspace},
@@ -671,7 +671,8 @@ async fn execute_sweep_for_session(
         .as_ref()
         .map(|server| server.endpoint.as_str());
     let (mut client, primary_endpoint) =
-        connect_lightwalletd_endpoints(&runtime.lightwalletd_url, preferred_endpoint).await?;
+        connect_lightwalletd_endpoints_with_retry(&runtime.lightwalletd_url, preferred_endpoint)
+            .await?;
     let lightwalletd_info = client
         .get_lightd_info(zcash_client_backend::proto::service::Empty {})
         .await
@@ -679,7 +680,15 @@ async fn execute_sweep_for_session(
         .into_inner();
     validate_lightwalletd_network(runtime.network, &lightwalletd_info)?;
 
-    run_wallet_sync(&workspace, &network, &mut client).await?;
+    run_wallet_sync_with_retry(
+        &workspace,
+        &network,
+        runtime.network,
+        &mut client,
+        &runtime.lightwalletd_url,
+        &session.state,
+    )
+    .await?;
     refresh_scan_progress(
         &session.state,
         &workspace,
@@ -752,7 +761,15 @@ async fn execute_sweep_for_session(
                     continue;
                 }
 
-                run_wallet_sync(&workspace, &network, &mut client).await?;
+                run_wallet_sync_with_retry(
+                    &workspace,
+                    &network,
+                    runtime.network,
+                    &mut client,
+                    &runtime.lightwalletd_url,
+                    &session.state,
+                )
+                .await?;
                 refresh_scan_progress(
                     &session.state,
                     &workspace,
