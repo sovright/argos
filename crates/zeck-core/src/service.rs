@@ -61,6 +61,20 @@ use crate::{
 
 const RECOVERY_MEMO_DEFAULT: &str = "Argos recovery";
 const SESSION_RETENTION_SECS: u64 = 300;
+/// After a shielding tx is broadcast, how long to wait for it to mine so its
+/// shielded note becomes spendable by the following send-max. zcash_client_backend
+/// forbids spending transparent funds straight to an external address, so a
+/// shield→sweep is necessarily two transactions and the second can't build on an
+/// unconfirmed/unmined note — without this wait the send-max finds nothing and
+/// strands the just-shielded funds. ~10 min covers several mainnet blocks.
+#[cfg(not(feature = "argos-network"))]
+const SHIELD_CONFIRM_TIMEOUT_SECS: u64 = 600;
+/// Short timeout under the regtest harness (which doesn't auto-mine) so a
+/// shield→sweep test fails fast instead of hanging for the production timeout.
+#[cfg(feature = "argos-network")]
+const SHIELD_CONFIRM_TIMEOUT_SECS: u64 = 30;
+/// Delay between re-sync polls while waiting for the shield to confirm.
+const SHIELD_CONFIRM_POLL_SECS: u64 = 10;
 /// Maximum iterations for the donation-split fee-convergence loop. The extra
 /// donation output adds at most one ZIP-317 marginal action, so convergence is
 /// expected within 2 iterations; 4 leaves headroom.
@@ -817,19 +831,36 @@ async fn execute_sweep_for_session(
                     // running total for the next step.
                     total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
 
-                    if !last_account_confirmed(&results, tracked_account.derived.index) {
+                    // The shield was just broadcast (pending in the mempool). It
+                    // MUST mine before the send-max can spend the resulting
+                    // shielded note — zcash_client_backend won't send transparent
+                    // funds straight to an external address, so this is two txs
+                    // and the second can't build on an unconfirmed note. Skip a
+                    // shield that outright failed; otherwise wait for it to
+                    // confirm. A timeout leaves the funds shielded (re-running
+                    // the sweep picks them up) and moves on without aborting.
+                    if last_account_broadcast_failed(&results, tracked_account.derived.index) {
                         continue;
                     }
-
-                    run_wallet_sync_with_retry(
+                    let shielded_before = shielded_spendable_zatoshis(
+                        &workspace,
+                        runtime.network,
+                        &tracked_account,
+                    )?;
+                    if !wait_for_shielded_funds_to_confirm(
                         &workspace,
                         &network,
                         runtime.network,
                         &mut client,
                         &runtime.lightwalletd_url,
                         &session.state,
+                        &tracked_account,
+                        shielded_before,
                     )
-                    .await?;
+                    .await?
+                    {
+                        continue;
+                    }
                     refresh_scan_progress(
                         &session.state,
                         &workspace,
@@ -845,16 +876,8 @@ async fn execute_sweep_for_session(
             // shielded balance — total minus any unshielded remainder — and skip
             // the account if it is at or below the fee floor, matching the dry
             // run's shielded-dust skip.
-            let shielded_spendable = account_total_zatoshis(
-                &workspace,
-                runtime.network,
-                tracked_account.wallet_account_id,
-            )?
-            .saturating_sub(account_transparent_zatoshis(
-                &workspace,
-                runtime.network,
-                &tracked_account,
-            )?);
+            let shielded_spendable =
+                shielded_spendable_zatoshis(&workspace, runtime.network, &tracked_account)?;
             if !balance_covers_sweep_fee(shielded_spendable) {
                 if !account_shielded {
                     skipped_accounts.push(SkippedSweepAccount {
@@ -1729,13 +1752,65 @@ fn enforce_max_fee(total_fee_zatoshis: u64, max_fee_zatoshis: Option<u64>) -> Ze
     Ok(())
 }
 
-fn last_account_confirmed(results: &[TxBroadcastResult], account_index: u32) -> bool {
+/// Whether the most recent broadcast for `account_index` outright failed (vs
+/// merely pending in the mempool). A failed shield is skipped immediately rather
+/// than waited on.
+fn last_account_broadcast_failed(results: &[TxBroadcastResult], account_index: u32) -> bool {
     results
         .iter()
         .rev()
         .find(|result| result.source_account == account_index)
-        .map(|result| result.status == "confirmed")
-        .unwrap_or(true)
+        .map(|result| result.status == "failed")
+        .unwrap_or(false)
+}
+
+/// Spendable shielded balance for an account = total spendable minus the
+/// unshielded (transparent) portion.
+fn shielded_spendable_zatoshis(
+    workspace: &RecoveryWorkspace,
+    network: crate::models::ZeckNetwork,
+    tracked_account: &TrackedAccount,
+) -> ZeckResult<u64> {
+    let total = account_total_zatoshis(workspace, network, tracked_account.wallet_account_id)?;
+    let transparent = account_transparent_zatoshis(workspace, network, tracked_account)?;
+    Ok(total.saturating_sub(transparent))
+}
+
+/// Wait for a just-broadcast shielding tx to mine so its shielded note becomes
+/// spendable by the following send-max. Polls (re-sync + balance check) until
+/// the account's spendable shielded balance rises above `shielded_before` —
+/// meaning the shield was mined, scanned, and is spendable — or until the
+/// timeout. Returns `Ok(true)` once confirmed, `Ok(false)` on timeout (the
+/// caller leaves the funds shielded and continues without aborting the sweep).
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_shielded_funds_to_confirm(
+    workspace: &RecoveryWorkspace,
+    network: &zcash_protocol::consensus::Network,
+    zeck_network: crate::models::ZeckNetwork,
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    lightwalletd_url: &str,
+    state: &SharedScanTaskState,
+    tracked_account: &TrackedAccount,
+    shielded_before: u64,
+) -> ZeckResult<bool> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SHIELD_CONFIRM_TIMEOUT_SECS);
+    loop {
+        {
+            let mut guard = state.lock().await;
+            guard.progress.message =
+                Some("Waiting for the shielding transaction to confirm before sweeping…".to_owned());
+        }
+        run_wallet_sync_with_retry(workspace, network, zeck_network, client, lightwalletd_url, state)
+            .await?;
+        if shielded_spendable_zatoshis(workspace, zeck_network, tracked_account)? > shielded_before {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(SHIELD_CONFIRM_POLL_SECS)).await;
+    }
 }
 
 fn normalized_memo_text(memo: Option<&str>) -> ZeckResult<String> {
