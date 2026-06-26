@@ -14,8 +14,8 @@ const LOGIN_PAGE = `<!doctype html>
     h1 { margin: 0 0 6px; font-family: Georgia, serif; font-size: 1.6rem; text-align: center; }
     p { margin: 0 0 24px; color: #5d685f; font-size: 0.9rem; text-align: center; }
     input { width: 100%; box-sizing: border-box; padding: 11px 14px; border: 1px solid #d8d1c4; border-radius: 6px; font-size: 1rem; background: #fbf8f1; }
-    button { margin-top: 12px; width: 100%; padding: 12px; border: none; border-radius: 6px; background: #1f6b56; color: #fff; font-size: 1rem; font-weight: 800; cursor: pointer; }
-    button:hover { background: #143d34; }
+    button { margin-top: 12px; width: 100%; padding: 12px; border: none; border-radius: 6px; background: #5d8aa8; color: #fff; font-size: 1rem; font-weight: 800; cursor: pointer; }
+    button:hover { background: #4a7a98; }
     .error { margin-top: 12px; color: #b84040; font-size: 0.88rem; text-align: center; }
   </style>
 </head>
