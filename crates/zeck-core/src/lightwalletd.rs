@@ -12,6 +12,42 @@ use crate::{
 const MAINNET_SAPLING_ACTIVATION: u64 = 419_200;
 const TESTNET_SAPLING_ACTIVATION: u64 = 280_000;
 
+/// Whether a lightwalletd error string looks like a *transient* network failure
+/// worth retrying — a transport/stream drop **or** a DNS-resolution failure — as
+/// opposed to a configuration or network-validation error that won't improve by
+/// waiting.
+///
+/// Matching is by lowercased substring because the underlying tonic/hyper/std
+/// errors don't expose a stable typed cause and their wording (especially for
+/// DNS) varies by platform resolver. Used by both the mid-sync reconnect loop
+/// and the startup connect retry so the two agree on what is retryable.
+pub(crate) fn is_transient_network_error(msg: &str) -> bool {
+    let msg = msg.to_ascii_lowercase();
+    // Lowercased tokens. The transport set preserves the previous matcher's
+    // behaviour (e.g. "GoAway" -> "goaway", "UnexpectedEof" -> "unexpectedeof").
+    const TOKENS: &[&str] = &[
+        // transport / stream drops
+        "transport error",
+        "h2 protocol error",
+        "goaway",
+        "timedout",
+        "close_notify",
+        "unexpectedeof",
+        "connection refused",
+        "connection reset",
+        "broken pipe",
+        // DNS resolution failures (resolver wording differs across OSes)
+        "dns error",
+        "failed to lookup address",
+        "name resolution",
+        "temporary failure in name resolution",
+        "no such host",
+        "nodename nor servname",
+        "name or service not known",
+    ];
+    TOKENS.iter().any(|token| msg.contains(token))
+}
+
 pub fn parse_lightwalletd_endpoints(raw: &str) -> Vec<String> {
     let mut endpoints = Vec::new();
     for endpoint in raw
@@ -102,6 +138,59 @@ pub async fn probe_lightwalletd_endpoints(
         "all configured lightwalletd endpoints failed probing: {}",
         errors.join(" | ")
     )))
+}
+
+/// Attempts for an initial connect/probe before giving up, so a transient
+/// DNS/network blip at startup doesn't fail an operation before it begins.
+const INITIAL_CONNECT_ATTEMPTS: u32 = 4;
+const INITIAL_CONNECT_RETRY_DELAY_SECS: u64 = 5;
+
+/// [`probe_lightwalletd_endpoints`] with bounded retry on transient
+/// (transport/DNS) failures — see [`is_transient_network_error`]. A
+/// configuration/validation error is returned immediately (not retried).
+pub async fn probe_lightwalletd_endpoints_with_retry(
+    raw: &str,
+) -> ZeckResult<(CompactTxStreamerClient<Channel>, String, LightdInfo)> {
+    let mut attempt = 1u32;
+    loop {
+        match probe_lightwalletd_endpoints(raw).await {
+            Ok(ready) => return Ok(ready),
+            Err(err) if attempt < INITIAL_CONNECT_ATTEMPTS
+                && is_transient_network_error(&err.to_string()) =>
+            {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    INITIAL_CONNECT_RETRY_DELAY_SECS,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// [`connect_lightwalletd_endpoints`] with bounded retry on transient
+/// (transport/DNS) failures — see [`is_transient_network_error`].
+pub async fn connect_lightwalletd_endpoints_with_retry(
+    raw: &str,
+    preferred: Option<&str>,
+) -> ZeckResult<(CompactTxStreamerClient<Channel>, String)> {
+    let mut attempt = 1u32;
+    loop {
+        match connect_lightwalletd_endpoints(raw, preferred).await {
+            Ok(ready) => return Ok(ready),
+            Err(err) if attempt < INITIAL_CONNECT_ATTEMPTS
+                && is_transient_network_error(&err.to_string()) =>
+            {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    INITIAL_CONNECT_RETRY_DELAY_SECS,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 pub fn describe_lightwalletd_endpoints(raw: &str) -> String {
@@ -510,5 +599,44 @@ mod tests {
         // lightwalletd URLs are out of scope.
         let result = validated_lightwalletd_endpoints("https://user:pass@wallet.example.com:443");
         assert!(result.is_ok(), "current behaviour: credentialed URLs pass validation");
+    }
+
+    #[test]
+    fn classifies_transient_transport_and_dns_errors_as_retryable() {
+        use super::is_transient_network_error;
+        // Transport/stream drops the previous matcher already caught (regression
+        // guard — these must keep matching after the case-insensitive rework).
+        assert!(is_transient_network_error(
+            "status: Unavailable, message: transport error"
+        ));
+        assert!(is_transient_network_error("h2 protocol error: GoAway"));
+        assert!(is_transient_network_error("operation TimedOut"));
+        assert!(is_transient_network_error("received fatal alert: close_notify"));
+        assert!(is_transient_network_error("connection closed: UnexpectedEof"));
+        // DNS resolution failures (varied OS resolver wording) — the gap this fixes.
+        assert!(is_transient_network_error(
+            "error trying to connect: dns error: failed to lookup address information: \
+             nodename nor servname provided, or not known"
+        ));
+        assert!(is_transient_network_error("Temporary failure in name resolution"));
+        assert!(is_transient_network_error("No such host is known. (os error 11001)"));
+        assert!(is_transient_network_error("Name or service not known"));
+        // Connection-level transients.
+        assert!(is_transient_network_error("tcp connect error: Connection refused"));
+        assert!(is_transient_network_error("Connection reset by peer"));
+    }
+
+    #[test]
+    fn does_not_classify_config_or_validation_errors_as_retryable() {
+        use super::is_transient_network_error;
+        // A wrong-chain / validation failure or a bad endpoint won't get better
+        // by waiting, so it must NOT be retried.
+        assert!(!is_transient_network_error(
+            "network validation failed: server chain 'main' does not match selected testnet network"
+        ));
+        assert!(!is_transient_network_error(
+            "endpoint must use the https:// scheme"
+        ));
+        assert!(!is_transient_network_error("wallet summary is unavailable"));
     }
 }

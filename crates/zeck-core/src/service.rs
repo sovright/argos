@@ -41,7 +41,7 @@ use crate::{
     derivation::{legacy_transparent_account_key, legacy_transparent_secret_key, mnemonic_seed},
     error::{ZeckError, ZeckResult},
     lightwalletd::{
-        connect_lightwalletd_endpoints, validate_lightwalletd_network,
+        connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
         validated_lightwalletd_endpoints,
     },
     models::{
@@ -50,7 +50,7 @@ use crate::{
         TxBroadcastResult,
     },
     scan::{
-        refresh_scan_progress, run_recovery_scan, run_wallet_sync, ScanTaskState,
+        refresh_scan_progress, run_recovery_scan, run_wallet_sync_with_retry, ScanTaskState,
         SharedScanTaskState, TrackedAccount,
     },
     workspace::{consensus_network, open_wallet_db, RecoveryWorkspace},
@@ -71,6 +71,19 @@ const MAX_FEE_CONVERGENCE_ITERS: usize = 4;
 /// rather than after it is already mined and its fee unrecoverable (audit
 /// Issue E).
 const MIN_SHIELDED_SEND_FEE_ZATOSHIS: u64 = 10_000;
+
+/// Whether a balance is worth sweeping: it must *strictly exceed* the ZIP-317
+/// fee floor. At or below the floor, the shielding/sweep transaction's fee would
+/// consume the entire balance, so building it fails ("Insufficient funds:
+/// required 10000 zatoshis, but only 0 were available").
+///
+/// `build_sweep_proposal` (the dry run) already skips such accounts; this is the
+/// same predicate, used to gate the shielding and send-max steps in
+/// `execute_sweep_for_session` so execution applies the identical dust-skip and
+/// never hard-fails the whole sweep on an account the dry run quietly skipped.
+fn balance_covers_sweep_fee(zatoshis: u64) -> bool {
+    zatoshis > MIN_SHIELDED_SEND_FEE_ZATOSHIS
+}
 
 /// The concrete wallet database type used throughout the execution path.
 type SweepWalletDb = WalletDb<
@@ -658,7 +671,8 @@ async fn execute_sweep_for_session(
         .as_ref()
         .map(|server| server.endpoint.as_str());
     let (mut client, primary_endpoint) =
-        connect_lightwalletd_endpoints(&runtime.lightwalletd_url, preferred_endpoint).await?;
+        connect_lightwalletd_endpoints_with_retry(&runtime.lightwalletd_url, preferred_endpoint)
+            .await?;
     let lightwalletd_info = client
         .get_lightd_info(zcash_client_backend::proto::service::Empty {})
         .await
@@ -666,7 +680,15 @@ async fn execute_sweep_for_session(
         .into_inner();
     validate_lightwalletd_network(runtime.network, &lightwalletd_info)?;
 
-    run_wallet_sync(&workspace, &network, &mut client).await?;
+    run_wallet_sync_with_retry(
+        &workspace,
+        &network,
+        runtime.network,
+        &mut client,
+        &runtime.lightwalletd_url,
+        &session.state,
+    )
+    .await?;
     refresh_scan_progress(
         &session.state,
         &workspace,
@@ -707,7 +729,12 @@ async fn execute_sweep_for_session(
 
             let transparent_balance =
                 account_transparent_zatoshis(&workspace, runtime.network, &tracked_account)?;
-            if transparent_balance > 0 {
+            // Only shield a transparent balance that exceeds the fee floor; a
+            // sub-floor (dust) balance can't cover the shielding fee and would
+            // hard-fail `propose_shielding`. The dry-run proposal skips it, so
+            // execution must too (otherwise the whole sweep aborts). The dust is
+            // left unshielded, exactly as the proposal excludes it.
+            if balance_covers_sweep_fee(transparent_balance) {
                 let fee = {
                     let mut ctx = SweepStepCtx {
                         workspace: &workspace,
@@ -734,7 +761,15 @@ async fn execute_sweep_for_session(
                     continue;
                 }
 
-                run_wallet_sync(&workspace, &network, &mut client).await?;
+                run_wallet_sync_with_retry(
+                    &workspace,
+                    &network,
+                    runtime.network,
+                    &mut client,
+                    &runtime.lightwalletd_url,
+                    &session.state,
+                )
+                .await?;
                 refresh_scan_progress(
                     &session.state,
                     &workspace,
@@ -742,6 +777,25 @@ async fn execute_sweep_for_session(
                     runtime.birthday.min(chain_tip_height(&mut client).await?),
                 )
                 .await?;
+            }
+
+            // The shielded balance must cover the send-max fee, or the transfer
+            // proposal fails the same way. Re-query the (post-shield) spendable
+            // shielded balance — total minus any unshielded remainder — and skip
+            // the account if it is at or below the fee floor, matching the dry
+            // run's shielded-dust skip.
+            let shielded_spendable = account_total_zatoshis(
+                &workspace,
+                runtime.network,
+                tracked_account.wallet_account_id,
+            )?
+            .saturating_sub(account_transparent_zatoshis(
+                &workspace,
+                runtime.network,
+                &tracked_account,
+            )?);
+            if !balance_covers_sweep_fee(shielded_spendable) {
+                continue;
             }
 
             let fee = {
@@ -1836,6 +1890,29 @@ mod tests {
             enforce_max_fee(reserved, Some(10_000)),
             Err(ZeckError::MaxFeeExceeded(_))
         ));
+    }
+
+    #[test]
+    fn balance_at_or_below_fee_floor_is_not_sweepable() {
+        use super::{balance_covers_sweep_fee, MIN_SHIELDED_SEND_FEE_ZATOSHIS};
+        // A balance at or below the ZIP-317 fee floor cannot be swept — the fee
+        // would consume it all, hard-failing the shielding/send proposal. This
+        // predicate is what gates both execution steps so they skip such dust
+        // exactly as `build_sweep_proposal` does (instead of erroring the sweep).
+        assert!(!balance_covers_sweep_fee(0));
+        assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1));
+        assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS)); // == floor: fee eats it all
+        assert!(balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS + 1));
+    }
+
+    #[test]
+    fn execution_dust_floor_matches_proposal_minimum_fee() {
+        use super::MIN_SHIELDED_SEND_FEE_ZATOSHIS;
+        use zcash_primitives::transaction::fees::zip317::MINIMUM_FEE;
+        // The execution-side dust floor MUST equal the proposal's ZIP-317
+        // `minimum_fee_zatoshis`, or the dry run and the actual sweep would
+        // disagree on which accounts to skip — the divergence this fix closes.
+        assert_eq!(MIN_SHIELDED_SEND_FEE_ZATOSHIS, u64::from(MINIMUM_FEE));
     }
 
     #[test]

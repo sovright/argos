@@ -781,6 +781,10 @@ async fn import_accounts(
 
 const MAX_SYNC_RETRIES: u32 = 10;
 const SYNC_RETRY_DELAY_SECS: u64 = 5;
+/// Attempts for the initial lightwalletd probe (before the sync stream starts),
+/// so a transient DNS/network blip at startup doesn't fail a recovery before it
+/// begins. Reuses `SYNC_RETRY_DELAY_SECS` between attempts.
+const INITIAL_PROBE_ATTEMPTS: u32 = 4;
 
 /// Stall watchdog: how long we wait without seeing `synced_to_height` advance
 /// before declaring the gRPC stream hung. 60 s comfortably exceeds:
@@ -871,7 +875,7 @@ async fn run_wallet_sync_with_stall_watchdog(
 /// Runs `run_wallet_sync`, reconnecting to lightwalletd on transient transport
 /// errors.  Each reconnection attempt tries all configured endpoints in order.
 /// Permanent errors (wallet database corruption, etc.) are returned immediately.
-async fn run_wallet_sync_with_retry(
+pub(crate) async fn run_wallet_sync_with_retry(
     workspace: &RecoveryWorkspace,
     network: &zcash_protocol::consensus::Network,
     zeck_network: crate::models::ZeckNetwork,
@@ -885,14 +889,12 @@ async fn run_wallet_sync_with_retry(
             Ok(()) => return Ok(()),
             Err(err) => {
                 let msg = err.to_string();
-                let is_transport = msg.contains("transport error")
-                    || msg.contains("h2 protocol error")
-                    || msg.contains("GoAway")
-                    || msg.contains("TimedOut")
-                    || msg.contains("close_notify")
-                    || msg.contains("UnexpectedEof");
+                // Transport/stream drops AND DNS-resolution failures are
+                // transient and worth reconnecting on (shared classifier so the
+                // mid-sync and startup paths agree on what is retryable).
+                let is_transient = crate::lightwalletd::is_transient_network_error(&msg);
 
-                if !is_transport || attempts >= MAX_SYNC_RETRIES {
+                if !is_transient || attempts >= MAX_SYNC_RETRIES {
                     return Err(err);
                 }
 
@@ -941,6 +943,40 @@ async fn run_wallet_sync_with_retry(
 }
 
 async fn probe_valid_lightwalletd_endpoints(
+    raw: &str,
+    network: crate::models::ZeckNetwork,
+) -> ZeckResult<(
+    CompactTxStreamerClient<tonic::transport::Channel>,
+    String,
+    LightdInfo,
+)> {
+    // Bounded retry for the initial probe: a transient DNS/network blip at
+    // startup must not fail a recovery before it begins. The mid-sync reconnect
+    // loop only triggers on a drop *mid-stream*, so a clean connection failure
+    // here would otherwise never be retried. Only retry transient errors — a
+    // wrong-chain / validation failure won't get better by waiting.
+    let mut attempt = 1u32;
+    loop {
+        match probe_valid_lightwalletd_endpoints_once(raw, network).await {
+            Ok(ready) => return Ok(ready),
+            Err(err) => {
+                if attempt < INITIAL_PROBE_ATTEMPTS
+                    && crate::lightwalletd::is_transient_network_error(&err.to_string())
+                {
+                    warn!(
+                        "initial lightwalletd probe failed (attempt {attempt}/{INITIAL_PROBE_ATTEMPTS}), retrying in {SYNC_RETRY_DELAY_SECS}s: {err}"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(SYNC_RETRY_DELAY_SECS)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+async fn probe_valid_lightwalletd_endpoints_once(
     raw: &str,
     network: crate::models::ZeckNetwork,
 ) -> ZeckResult<(
