@@ -349,12 +349,19 @@ async fn main() -> Result<()> {
                             println!();
                         }
                         // Actual donated total (the truth, vs the proposal's
-                        // estimate). Always print it so a 0 is never silent.
-                        println!(
-                            "Donated to the Argos project: {}",
-                            format_zec(outcome.total_donation_zatoshis)
-                        );
-                        println!();
+                        // estimate). Print it only when a donation was actually
+                        // requested, so a "Donated: 0" line never appears on a
+                        // sweep the user never opted into (e.g. testnet, where
+                        // donation is disabled, or no --donation-rate). When a
+                        // donation WAS requested, a 0 is shown so a fallback to a
+                        // donation-free sweep is never silent. Mirrors the GUI.
+                        if donation_rate.is_some() {
+                            println!(
+                                "Donated to the Argos project: {}",
+                                format_zec(outcome.total_donation_zatoshis)
+                            );
+                            println!();
+                        }
                         match outcome.error {
                             None => println!("Sweep complete."),
                             // A mid-sequence abort: the transactions above were
