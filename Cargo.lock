@@ -184,6 +184,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
