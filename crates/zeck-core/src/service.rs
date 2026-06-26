@@ -85,6 +85,22 @@ fn balance_covers_sweep_fee(zatoshis: u64) -> bool {
     zatoshis > MIN_SHIELDED_SEND_FEE_ZATOSHIS
 }
 
+/// Whether a proposal-build error reflects "insufficient funds" — the input
+/// selector found no spendable value that clears the ZIP-317 fee floor.
+///
+/// `balance_covers_sweep_fee` gates on an account's *summed* balance, but a
+/// proposal can still come up empty: the value may be many sub-threshold dust
+/// UTXOs the selector won't pick, or transparent funds at addresses outside the
+/// two shieldable receivers. Such an account is simply unsweepable, so the
+/// sweep must *skip* it (and continue with the other accounts) instead of
+/// aborting the whole multi-account sweep on a `?`. Matched on the error text
+/// because the underlying `zcash_client_backend` proposal error is a deep
+/// generic type with no stable typed variant to match here; a false match only
+/// downgrades a fatal abort to a skip (recorded), never the reverse.
+fn is_insufficient_funds_error(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("insufficient funds")
+}
+
 /// The concrete wallet database type used throughout the execution path.
 type SweepWalletDb = WalletDb<
     rusqlite::Connection,
@@ -735,7 +751,7 @@ async fn execute_sweep_for_session(
             // execution must too (otherwise the whole sweep aborts). The dust is
             // left unshielded, exactly as the proposal excludes it.
             if balance_covers_sweep_fee(transparent_balance) {
-                let fee = {
+                let shielded_fee = {
                     let mut ctx = SweepStepCtx {
                         workspace: &workspace,
                         network: runtime.network,
@@ -753,30 +769,37 @@ async fn execute_sweep_for_session(
                     execute_shielding_step(&mut ctx, &tracked_account, &transparent_account, &usk)
                         .await?
                 };
-                // Step already enforced the cap against (prior + step fee) before broadcast;
-                // recompute here purely to advance the running total for the next step.
-                total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
+                // `None` => the account's transparent balance isn't shieldable
+                // (only dust UTXOs, or funds outside the two receivers); leave it
+                // unshielded and fall through to sweep any existing shielded
+                // balance instead of aborting the whole sweep.
+                if let Some(fee) = shielded_fee {
+                    // Step already enforced the cap against (prior + step fee)
+                    // before broadcast; recompute here purely to advance the
+                    // running total for the next step.
+                    total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
 
-                if !last_account_confirmed(&results, tracked_account.derived.index) {
-                    continue;
+                    if !last_account_confirmed(&results, tracked_account.derived.index) {
+                        continue;
+                    }
+
+                    run_wallet_sync_with_retry(
+                        &workspace,
+                        &network,
+                        runtime.network,
+                        &mut client,
+                        &runtime.lightwalletd_url,
+                        &session.state,
+                    )
+                    .await?;
+                    refresh_scan_progress(
+                        &session.state,
+                        &workspace,
+                        runtime.network,
+                        runtime.birthday.min(chain_tip_height(&mut client).await?),
+                    )
+                    .await?;
                 }
-
-                run_wallet_sync_with_retry(
-                    &workspace,
-                    &network,
-                    runtime.network,
-                    &mut client,
-                    &runtime.lightwalletd_url,
-                    &session.state,
-                )
-                .await?;
-                refresh_scan_progress(
-                    &session.state,
-                    &workspace,
-                    runtime.network,
-                    runtime.birthday.min(chain_tip_height(&mut client).await?),
-                )
-                .await?;
             }
 
             // The shielded balance must cover the send-max fee, or the transfer
@@ -798,7 +821,7 @@ async fn execute_sweep_for_session(
                 continue;
             }
 
-            let fee = {
+            let send_max_fee = {
                 let mut ctx = SweepStepCtx {
                     workspace: &workspace,
                     network: runtime.network,
@@ -821,6 +844,11 @@ async fn execute_sweep_for_session(
                     memo_bytes.clone(),
                 )
                 .await?
+            };
+            // `None` => no selectable shielded value for this account; skip it
+            // rather than aborting the whole sweep.
+            let Some(fee) = send_max_fee else {
+                continue;
             };
             // Step already enforced the cap against (prior + step fee) before broadcast;
             // recompute here purely to advance the running total for the next account.
@@ -906,13 +934,13 @@ async fn execute_shielding_step(
     tracked_account: &TrackedAccount,
     transparent_account: &zcash_transparent::keys::AccountPrivKey,
     usk: &UnifiedSpendingKey,
-) -> ZeckResult<u64> {
+) -> ZeckResult<Option<u64>> {
     let mut wallet_db =
         open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
     let input_selector = GreedyInputSelector::<_>::new();
     let change_strategy = standard_zip317_change_strategy();
 
-    let proposal = propose_shielding::<_, _, _, _, Infallible>(
+    let proposal = match propose_shielding::<_, _, _, _, Infallible>(
         &mut wallet_db,
         &consensus_network(ctx.network),
         &input_selector,
@@ -922,8 +950,20 @@ async fn execute_shielding_step(
         tracked_account.wallet_account_id,
         ConfirmationsPolicy::MIN,
         TransparentOutputFilter::All,
-    )
-    .map_err(|err| ZeckError::TransactionBuild(format!("building shielding proposal: {err}")))?;
+    ) {
+        Ok(proposal) => proposal,
+        Err(err) => {
+            let message = format!("building shielding proposal: {err}");
+            if is_insufficient_funds_error(&message) {
+                // No selectable transparent UTXOs clear the fee floor (dust, or
+                // funds outside the two shieldable receivers). Leave this
+                // account's transparent balance unshielded and let the caller
+                // fall through to sweep any existing shielded balance.
+                return Ok(None);
+            }
+            return Err(ZeckError::TransactionBuild(message));
+        }
+    };
     let fee_zatoshis = proposal_fee_zatoshis(&proposal)?;
     let fee_through_shield = checked_fee_total(ctx.prior_fee_zatoshis, fee_zatoshis)?;
     enforce_max_fee(fee_through_shield, ctx.max_fee_zatoshis)?;
@@ -978,7 +1018,7 @@ async fn execute_shielding_step(
     )
     .await?;
 
-    Ok(fee_zatoshis)
+    Ok(Some(fee_zatoshis))
 }
 
 /// Build a two-output proposal that splits the full account balance between a
@@ -1107,12 +1147,12 @@ async fn execute_send_max_step(
     usk: &UnifiedSpendingKey,
     destination_address: &ZcashAddress,
     memo_bytes: Option<MemoBytes>,
-) -> ZeckResult<u64> {
+) -> ZeckResult<Option<u64>> {
     let mut wallet_db =
         open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
 
     // Pass 1 — measure the full-account send-max proposal (build only, no broadcast).
-    let max_proposal = propose_send_max_transfer::<_, _, _, Infallible>(
+    let max_proposal = match propose_send_max_transfer::<_, _, _, Infallible>(
         &mut wallet_db,
         &consensus_network(ctx.network),
         tracked_account.wallet_account_id,
@@ -1122,8 +1162,19 @@ async fn execute_send_max_step(
         memo_bytes.clone(),
         MaxSpendMode::MaxSpendable,
         ConfirmationsPolicy::MIN,
-    )
-    .map_err(|err| ZeckError::TransactionBuild(format!("building sweep proposal: {err}")))?;
+    ) {
+        Ok(proposal) => proposal,
+        Err(err) => {
+            let message = format!("building sweep proposal: {err}");
+            if is_insufficient_funds_error(&message) {
+                // No selectable shielded value clears the fee floor (dust
+                // notes, or nothing spendable at the required confirmations).
+                // Skip this account rather than aborting the whole sweep.
+                return Ok(None);
+            }
+            return Err(ZeckError::TransactionBuild(message));
+        }
+    };
     let send_max_fee = proposal_fee_zatoshis(&max_proposal)?;
     // Send-max is single-step with exactly one payment; read the amount destined
     // for the user (the full account spendable equals send_amount + send_max_fee).
@@ -1208,7 +1259,7 @@ async fn execute_send_max_step(
     )
     .await?;
 
-    Ok(fee_zatoshis)
+    Ok(Some(fee_zatoshis))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1903,6 +1954,29 @@ mod tests {
         assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1));
         assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS)); // == floor: fee eats it all
         assert!(balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS + 1));
+    }
+
+    #[test]
+    fn insufficient_funds_proposal_errors_are_detected_for_skip() {
+        use super::is_insufficient_funds_error;
+        // The exact zcash_client_backend phrasing the sweep must treat as
+        // "this account is unsweepable, skip it" rather than a fatal sweep abort
+        // — this is the case `balance_covers_sweep_fee` (summed balance) misses
+        // when the value is dust UTXOs or outside the shieldable receivers.
+        assert!(is_insufficient_funds_error(
+            "building shielding proposal: Change output generation failed: \
+             Insufficient funds: required 10000 zatoshis, but only 0 zatoshis were available"
+        ));
+        assert!(is_insufficient_funds_error(
+            "building sweep proposal: Insufficient funds: required 10000, but only 5000 were available"
+        ));
+        // Unrelated build failures MUST still abort (not be silently skipped).
+        assert!(!is_insufficient_funds_error(
+            "building shielding proposal: network validation failed"
+        ));
+        assert!(!is_insufficient_funds_error(
+            "creating shielding transaction: prover initialization failed"
+        ));
     }
 
     #[test]
