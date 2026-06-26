@@ -32,7 +32,10 @@ use zcash_client_backend::{
 use zcash_client_backend::zip321;
 use zcash_client_sqlite::{util::SystemClock, AccountUuid, ReceivedNoteId, WalletDb};
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_primitives::transaction::{fees::zip317::MINIMUM_FEE, TxId};
+use zcash_primitives::transaction::{
+    fees::zip317::{MARGINAL_FEE, MINIMUM_FEE},
+    TxId,
+};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, ShieldedProtocol};
 
@@ -61,7 +64,7 @@ const SESSION_RETENTION_SECS: u64 = 300;
 /// Maximum iterations for the donation-split fee-convergence loop. The extra
 /// donation output adds at most one ZIP-317 marginal action, so convergence is
 /// expected within 2 iterations; 4 leaves headroom.
-const MAX_FEE_CONVERGENCE_ITERS: usize = 4;
+const MAX_FEE_CONVERGENCE_ITERS: usize = 8;
 
 /// ZIP-317 conventional fee floor in zatoshis: `marginal_fee (5000) *
 /// grace_actions (2)`. A shielded send can never cost less than this, so it is
@@ -1173,7 +1176,7 @@ fn build_donation_split_proposal(
         })?;
         let input_selector = GreedyInputSelector::<_>::new();
         let change_strategy = standard_zip317_change_strategy();
-        let proposal = propose_transfer::<_, _, _, _, Infallible>(
+        match propose_transfer::<_, _, _, _, Infallible>(
             wallet_db,
             &consensus_network(network),
             account_id,
@@ -1181,16 +1184,40 @@ fn build_donation_split_proposal(
             &change_strategy,
             request,
             ConfirmationsPolicy::MIN,
-        )
-        .map_err(|err| {
-            ZeckError::TransactionBuild(format!("building donation sweep proposal: {err}"))
-        })?;
-        let fee = proposal_fee_zatoshis(&proposal)?;
-        if fee == candidate_fee {
-            return Ok(Some(proposal));
+        ) {
+            Ok(proposal) => {
+                let fee = proposal_fee_zatoshis(&proposal)?;
+                if fee == candidate_fee {
+                    return Ok(Some(proposal));
+                }
+                candidate_fee = fee;
+            }
+            // The seed candidate fee is the *single-output* send-max fee, which
+            // under-budgets the extra donation output — so the first proposal
+            // fails with "insufficient funds" before the fee can converge. Raise
+            // the candidate by one ZIP-317 marginal action and retry rather than
+            // aborting the donation. THIS is the bug that made the donation split
+            // silently fall back to a donation-free sweep on every sweep; the
+            // path was never exercised end-to-end (all tests pass donation_rate
+            // = None / use string stand-ins).
+            Err(err) if is_insufficient_funds_error(&err.to_string()) => {
+                candidate_fee = candidate_fee.checked_add(u64::from(MARGINAL_FEE)).ok_or_else(|| {
+                    ZeckError::Internal(
+                        "donation fee convergence overflowed the supported range".to_owned(),
+                    )
+                })?;
+            }
+            Err(err) => {
+                return Err(ZeckError::TransactionBuild(format!(
+                    "building donation sweep proposal: {err}"
+                )));
+            }
         }
-        candidate_fee = fee;
     }
+    tracing::warn!(
+        "donation split did not converge within {MAX_FEE_CONVERGENCE_ITERS} iterations; \
+         falling back to a donation-free sweep for this account",
+    );
     Ok(None)
 }
 
@@ -1287,6 +1314,18 @@ async fn execute_send_max_step(
             tracked_account.derived.index,
         )
     };
+
+    // Diagnostic (amounts only, no key material): makes a donation shortfall
+    // observable — `donation` is what the rate/threshold asked for, while
+    // `donation_zatoshis` is what was actually placed in an output (0 => the
+    // split fell back).
+    tracing::info!(
+        "account {} donation — send_amount={} requested={} placed={}",
+        tracked_account.derived.index,
+        send_amount,
+        donation,
+        donation_zatoshis,
+    );
 
     let fee_zatoshis = proposal_fee_zatoshis(&proposal)?;
     enforce_max_fee(
