@@ -667,6 +667,10 @@ async fn execute_sweep_for_session(
     let prover = LocalTxProver::bundled();
     let mut total_fee_zatoshis = 0u64;
     let mut results = Vec::new();
+    // Accounts that held a balance but moved nothing (all spendable value below
+    // the ZIP-317 fee floor). Collected so the completion screen can show the
+    // skip instead of it being silent.
+    let mut skipped_accounts: Vec<SkippedSweepAccount> = Vec::new();
 
     // Testnet kill-switch: forces the donation feature off.
     let effective_donation_address =
@@ -719,14 +723,17 @@ async fn execute_sweep_for_session(
     // already broadcast (audit Issue E) instead of discarding `results`.
     let sweep_result: ZeckResult<()> = async {
         for tracked_account in tracked_accounts {
-            if account_total_zatoshis(
+            let account_total = account_total_zatoshis(
                 &workspace,
                 runtime.network,
                 tracked_account.wallet_account_id,
-            )? == 0
-            {
+            )?;
+            if account_total == 0 {
                 continue;
             }
+            // Set once a shielding tx is broadcast for this account, so a later
+            // skip path doesn't mislabel an account that already moved funds.
+            let mut account_shielded = false;
 
             let zip32_index =
                 zip32::AccountId::try_from(tracked_account.derived.index).map_err(|_| {
@@ -774,6 +781,7 @@ async fn execute_sweep_for_session(
                 // unshielded and fall through to sweep any existing shielded
                 // balance instead of aborting the whole sweep.
                 if let Some(fee) = shielded_fee {
+                    account_shielded = true;
                     // Step already enforced the cap against (prior + step fee)
                     // before broadcast; recompute here purely to advance the
                     // running total for the next step.
@@ -818,6 +826,15 @@ async fn execute_sweep_for_session(
                 &tracked_account,
             )?);
             if !balance_covers_sweep_fee(shielded_spendable) {
+                if !account_shielded {
+                    skipped_accounts.push(SkippedSweepAccount {
+                        account_index: tracked_account.derived.index,
+                        gross_zatoshis: account_total,
+                        reason: format!(
+                            "Balance is too small to cover the ZIP 317 sweep fee floor of {MIN_SHIELDED_SEND_FEE_ZATOSHIS} zats."
+                        ),
+                    });
+                }
                 continue;
             }
 
@@ -848,6 +865,15 @@ async fn execute_sweep_for_session(
             // `None` => no selectable shielded value for this account; skip it
             // rather than aborting the whole sweep.
             let Some(fee) = send_max_fee else {
+                if !account_shielded {
+                    skipped_accounts.push(SkippedSweepAccount {
+                        account_index: tracked_account.derived.index,
+                        gross_zatoshis: account_total,
+                        reason: format!(
+                            "No spendable balance cleared the ZIP 317 fee floor of {MIN_SHIELDED_SEND_FEE_ZATOSHIS} zats."
+                        ),
+                    });
+                }
                 continue;
             };
             // Step already enforced the cap against (prior + step fee) before broadcast;
@@ -865,7 +891,7 @@ async fn execute_sweep_for_session(
     }
     .await;
 
-    assemble_sweep_outcome(results, sweep_result)
+    assemble_sweep_outcome(results, skipped_accounts, sweep_result)
 }
 
 /// Fold the accumulated broadcast records and the loop's terminal status into a
@@ -877,13 +903,19 @@ async fn execute_sweep_for_session(
 ///   record of funds already on-chain (audit Issue E).
 /// - Aborted *before* any broadcast (empty `results`) → propagate the `Err`, so
 ///   "no transaction was sent" remains a faithful report.
+///
+/// `skipped_accounts` records accounts that held a balance but moved nothing
+/// (every spendable note below the ZIP-317 fee floor); it rides along on the
+/// `Ok` outcomes so the UI can surface the skip.
 fn assemble_sweep_outcome(
     results: Vec<TxBroadcastResult>,
+    skipped_accounts: Vec<SkippedSweepAccount>,
     sweep_result: ZeckResult<()>,
 ) -> ZeckResult<SweepOutcome> {
     match sweep_result {
         Ok(()) => Ok(SweepOutcome {
             transactions: results,
+            skipped_accounts,
             error: None,
         }),
         Err(err) => {
@@ -892,6 +924,7 @@ fn assemble_sweep_outcome(
             } else {
                 Ok(SweepOutcome {
                     transactions: results,
+                    skipped_accounts,
                     error: Some(err.to_string()),
                 })
             }
@@ -1895,10 +1928,11 @@ mod tests {
     #[test]
     fn sweep_outcome_full_success_carries_no_error() {
         use super::assemble_sweep_outcome;
-        let outcome =
-            assemble_sweep_outcome(vec![sample_broadcast_result(0)], Ok(())).expect("Ok");
+        let outcome = assemble_sweep_outcome(vec![sample_broadcast_result(0)], Vec::new(), Ok(()))
+            .expect("Ok");
         assert!(outcome.error.is_none());
         assert_eq!(outcome.transactions.len(), 1);
+        assert!(outcome.skipped_accounts.is_empty());
     }
 
     #[test]
@@ -1906,10 +1940,18 @@ mod tests {
         use super::assemble_sweep_outcome;
         let outcome = assemble_sweep_outcome(
             vec![sample_broadcast_result(0), sample_broadcast_result(1)],
+            vec![crate::models::SkippedSweepAccount {
+                account_index: 7,
+                gross_zatoshis: 9_000,
+                reason: "dust".to_owned(),
+            }],
             Err(ZeckError::Broadcast("account 2 rejected".to_owned())),
         )
         .expect("a partial failure with broadcast records is reported as Ok, not lost");
         assert_eq!(outcome.transactions.len(), 2);
+        // Skipped accounts ride along on the partial-success outcome.
+        assert_eq!(outcome.skipped_accounts.len(), 1);
+        assert_eq!(outcome.skipped_accounts[0].account_index, 7);
         let message = outcome
             .error
             .expect("a partial failure carries the underlying error message");
@@ -1920,6 +1962,7 @@ mod tests {
     fn sweep_outcome_failure_before_any_broadcast_propagates_err() {
         use super::assemble_sweep_outcome;
         let err = assemble_sweep_outcome(
+            Vec::new(),
             Vec::new(),
             Err(ZeckError::Broadcast("first account rejected".to_owned())),
         )

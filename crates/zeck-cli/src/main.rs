@@ -330,6 +330,24 @@ async fn main() -> Result<()> {
                             );
                         }
                         println!();
+                        // Accounts that held a balance but moved nothing (all
+                        // spendable value below the ZIP-317 fee floor): surface
+                        // the skip rather than leaving it silent.
+                        if !outcome.skipped_accounts.is_empty() {
+                            println!(
+                                "Skipped {} account(s) with balances below the ZIP-317 fee floor:",
+                                outcome.skipped_accounts.len()
+                            );
+                            for skipped in &outcome.skipped_accounts {
+                                println!(
+                                    "  account {}  {}  {}",
+                                    skipped.account_index,
+                                    format_zec(skipped.gross_zatoshis),
+                                    skipped.reason
+                                );
+                            }
+                            println!();
+                        }
                         match outcome.error {
                             None => println!("Sweep complete."),
                             // A mid-sequence abort: the transactions above were

@@ -1078,7 +1078,7 @@ $("execute-sweep").addEventListener("click", async () => {
       donorEmail,
     });
     setStatus("sweep-execute-status", "", "");
-    renderCompleteScreen(outcome.transactions, outcome.error);
+    renderCompleteScreen(outcome.transactions, outcome.skipped_accounts, outcome.error);
     goTo("complete");
   } catch (err) {
     $("execute-sweep").disabled = false;
@@ -1089,7 +1089,7 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
-function renderCompleteScreen(results, error) {
+function renderCompleteScreen(results, skipped, error) {
   const confirmed = results.filter((r) => r.status === "confirmed").length;
   const pending = results.filter((r) => r.status === "pending").length;
   const failed = results.filter((r) => r.status === "failed").length;
@@ -1167,6 +1167,30 @@ function renderCompleteScreen(results, error) {
 
     container.appendChild(card);
   });
+
+  // Accounts that held a balance but moved nothing (every spendable note below
+  // the ZIP-317 fee floor). Surfaced so the skip is visible rather than silent,
+  // mirroring the dry-run proposal's skipped-accounts list.
+  const skippedEl = $("complete-skipped");
+  skippedEl.replaceChildren();
+  if (Array.isArray(skipped) && skipped.length > 0) {
+    const heading = document.createElement("p");
+    heading.style.margin = "6px 0 4px";
+    heading.style.fontWeight = "700";
+    heading.style.color = "var(--muted)";
+    heading.textContent =
+      `${skipped.length} account${skipped.length > 1 ? "s" : ""} skipped — balance below the ZIP-317 fee floor`;
+    skippedEl.appendChild(heading);
+
+    const list = document.createElement("ul");
+    list.className = "discovery-list";
+    skipped.forEach((s) => {
+      const li = document.createElement("li");
+      li.textContent = `Account ${s.account_index}: ${s.reason} (${fmt(s.gross_zatoshis)})`;
+      list.appendChild(li);
+    });
+    skippedEl.appendChild(list);
+  }
 
   const report = buildReport(results);
   $("save-report").dataset.report = report;

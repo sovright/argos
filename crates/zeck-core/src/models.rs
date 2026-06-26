@@ -381,6 +381,13 @@ pub struct TxBroadcastResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepOutcome {
     pub transactions: Vec<TxBroadcastResult>,
+    /// Accounts that held a balance but moved nothing because every spendable
+    /// note was below the ZIP-317 fee floor (only dust UTXOs, or funds outside
+    /// the shieldable receivers). The sweep skipped them and continued with the
+    /// other accounts rather than aborting; surfaced so a skip is visible to the
+    /// user, mirroring the dry-run proposal's `skipped_accounts`.
+    #[serde(default)]
+    pub skipped_accounts: Vec<SkippedSweepAccount>,
     pub error: Option<String>,
 }
 
