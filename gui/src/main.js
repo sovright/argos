@@ -1115,6 +1115,12 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error) {
     $("complete-summary").textContent =
       `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
       `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
+  } else if (results.length === 0) {
+    // Nothing was broadcast because every account with a balance was skipped
+    // (below the fee floor, or transparent funds that couldn't be shielded).
+    // The reasons are listed below — this is NOT a broadcast failure.
+    $("complete-summary").textContent =
+      "No funds were swept — every account with a balance was skipped (reasons below).";
   } else if (failed === results.length) {
     $("complete-summary").textContent = "All transactions failed to broadcast. No funds were moved.";
   } else if (confirmed > 0) {

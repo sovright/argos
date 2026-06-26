@@ -778,6 +778,11 @@ async fn execute_sweep_for_session(
             // Set once a shielding tx is broadcast for this account, so a later
             // skip path doesn't mislabel an account that already moved funds.
             let mut account_shielded = false;
+            // Set when an account HAS transparent funds above the fee floor but
+            // `propose_shielding` couldn't select any (unconfirmed / unsupported
+            // address), so the skip reason reflects "couldn't shield real funds"
+            // rather than the misleading "balance too small".
+            let mut transparent_unshieldable = false;
 
             let zip32_index =
                 zip32::AccountId::try_from(tracked_account.derived.index).map_err(|_| {
@@ -868,6 +873,10 @@ async fn execute_sweep_for_session(
                         runtime.birthday.min(chain_tip_height(&mut client).await?),
                     )
                     .await?;
+                } else {
+                    // Shielding returned None: the account has transparent funds
+                    // above the fee floor that propose_shielding couldn't select.
+                    transparent_unshieldable = true;
                 }
             }
 
@@ -880,12 +889,21 @@ async fn execute_sweep_for_session(
                 shielded_spendable_zatoshis(&workspace, runtime.network, &tracked_account)?;
             if !balance_covers_sweep_fee(shielded_spendable) {
                 if !account_shielded {
+                    let reason = if transparent_unshieldable {
+                        "Transparent funds could not be swept: no spendable UTXOs were available to \
+                         shield (they may be unconfirmed, or held at an address Argos cannot spend \
+                         from). Check the address on a block explorer and retry once it has \
+                         confirmations."
+                            .to_owned()
+                    } else {
+                        format!(
+                            "Balance is too small to cover the ZIP 317 sweep fee floor of {MIN_SHIELDED_SEND_FEE_ZATOSHIS} zats."
+                        )
+                    };
                     skipped_accounts.push(SkippedSweepAccount {
                         account_index: tracked_account.derived.index,
                         gross_zatoshis: account_total,
-                        reason: format!(
-                            "Balance is too small to cover the ZIP 317 sweep fee floor of {MIN_SHIELDED_SEND_FEE_ZATOSHIS} zats."
-                        ),
+                        reason,
                     });
                 }
                 continue;
@@ -1053,10 +1071,17 @@ async fn execute_shielding_step(
         Err(err) => {
             let message = format!("building shielding proposal: {err}");
             if is_insufficient_funds_error(&message) {
-                // No selectable transparent UTXOs clear the fee floor (dust, or
-                // funds outside the two shieldable receivers). Leave this
-                // account's transparent balance unshielded and let the caller
-                // fall through to sweep any existing shielded balance.
+                // No selectable transparent UTXOs (unconfirmed at the required
+                // confirmations, dust, or held outside the two shieldable
+                // receivers). Leave this account's transparent unshielded and let
+                // the caller fall through to sweep any existing shielded balance.
+                // Logged because the account's summary balance can read non-zero
+                // while the proposal selects nothing — a recovery shortfall worth
+                // seeing (the error carries the available/required amounts).
+                tracing::warn!(
+                    "account {}: transparent funds not shieldable — {message}",
+                    tracked_account.derived.index,
+                );
                 return Ok(None);
             }
             return Err(ZeckError::TransactionBuild(message));
