@@ -1040,6 +1040,10 @@ function renderSweepProposal(proposal) {
   }
 
   $("irreversible-check").checked = false;
+  // Re-enable the checkbox: a prior sweep's execute click disables it (and only
+  // the error path re-enables it), so without this a second proposal in the
+  // same session leaves the checkbox stuck disabled and the sweep unclickable.
+  $("irreversible-check").disabled = false;
   $("execute-sweep").disabled = true;
 }
 
