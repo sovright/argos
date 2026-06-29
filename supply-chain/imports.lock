@@ -1,6 +1,20 @@
 
 # cargo-vet imports lock
 
+[[publisher.bellman]]
+version = "0.14.0"
+when = "2023-03-20"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.bls12_381]]
+version = "0.8.0"
+when = "2023-02-27"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
 [[publisher.bumpalo]]
 version = "3.20.2"
 when = "2026-02-19"
@@ -20,6 +34,48 @@ when = "2020-09-15"
 user-id = 2396
 user-login = "jdm"
 user-name = "Josh Matthews"
+
+[[publisher.corez]]
+version = "0.1.1"
+when = "2026-04-17"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.equihash]]
+version = "0.3.0"
+when = "2026-04-24"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.f4jumble]]
+version = "0.1.1"
+when = "2024-12-13"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.ff]]
+version = "0.13.1"
+when = "2025-03-09"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.fpe]]
+version = "0.6.1"
+when = "2023-04-13"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.group]]
+version = "0.13.0"
+when = "2022-12-06"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
 
 [[publisher.halo2_gadgets]]
 version = "0.5.0"
@@ -49,12 +105,61 @@ user-id = 6289
 user-login = "str4d"
 user-name = "Jack Grigg"
 
+[[publisher.incrementalmerkletree]]
+version = "0.8.2"
+when = "2025-02-01"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.jubjub]]
+version = "0.10.0"
+when = "2023-02-28"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.memuse]]
+version = "0.2.2"
+when = "2024-12-13"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
 [[publisher.orchard]]
 version = "0.14.0"
 when = "2026-06-03"
 user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"
+
+[[publisher.pairing]]
+version = "0.23.0"
+when = "2022-12-06"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.pasta_curves]]
+version = "0.5.1"
+when = "2023-03-02"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.reddsa]]
+version = "0.5.1"
+when = "2023-07-12"
+user-id = 159631
+user-login = "conradoplg"
+user-name = "Conrado"
+
+[[publisher.redjubjub]]
+version = "0.8.0"
+when = "2025-02-18"
+user-id = 159631
+user-login = "conradoplg"
+user-name = "Conrado"
 
 [[publisher.ring]]
 version = "0.17.14"
@@ -77,6 +182,20 @@ user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"
 
+[[publisher.schemerz]]
+version = "0.2.0"
+when = "2024-10-16"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
+[[publisher.schemerz-rusqlite]]
+version = "0.370.0"
+when = "2025-10-26"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
+
 [[publisher.secp256k1]]
 version = "0.29.1"
 when = "2024-09-06"
@@ -97,6 +216,20 @@ when = "2021-07-18"
 user-id = 19631
 user-login = "tony-iqlusion"
 user-name = "Tony Arcieri (iqlusion)"
+
+[[publisher.shardtree]]
+version = "0.6.2"
+when = "2026-02-21"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.sinsemilla]]
+version = "0.1.0"
+when = "2024-12-14"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
 
 [[publisher.tonic]]
 version = "0.14.5"
@@ -256,12 +389,33 @@ user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"
 
+[[publisher.zcash_script]]
+version = "0.4.3"
+when = "2026-02-23"
+user-id = 228785
+user-login = "oxarbitrage"
+user-name = "Alfredo Garcia"
+
+[[publisher.zcash_spec]]
+version = "0.2.1"
+when = "2025-02-20"
+user-id = 199950
+user-login = "daira"
+user-name = "Daira-Emma Hopwood"
+
 [[publisher.zcash_transparent]]
 version = "0.8.0"
 when = "2026-06-03"
 user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"
+
+[[publisher.zip32]]
+version = "0.2.1"
+when = "2025-09-17"
+user-id = 6289
+user-login = "str4d"
+user-name = "Jack Grigg"
 
 [[publisher.zip321]]
 version = "0.8.0"

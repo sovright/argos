@@ -3,6 +3,60 @@
 
 [audits]
 
+[[trusted.bellman]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-06-04"
+end = "2027-06-26"
+
+[[trusted.bls12_381]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-06-03"
+end = "2027-06-26"
+
+[[trusted.corez]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2026-04-17"
+end = "2027-06-26"
+
+[[trusted.equihash]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2020-06-26"
+end = "2027-06-26"
+
+[[trusted.equihash]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2025-02-21"
+end = "2027-06-26"
+
+[[trusted.f4jumble]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-09-22"
+end = "2027-06-26"
+
+[[trusted.ff]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-08-11"
+end = "2027-06-26"
+
+[[trusted.fpe]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2019-07-22"
+end = "2027-06-26"
+
+[[trusted.group]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2022-10-13"
+end = "2027-06-26"
+
 [[trusted.halo2_gadgets]]
 criteria = "safe-to-deploy"
 user-id = 6289 # Jack Grigg (str4d)
@@ -27,11 +81,59 @@ user-id = 6289 # Jack Grigg (str4d)
 start = "2022-01-20"
 end = "2027-06-26"
 
+[[trusted.incrementalmerkletree]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-12-17"
+end = "2027-06-26"
+
+[[trusted.incrementalmerkletree]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2023-02-28"
+end = "2027-06-26"
+
+[[trusted.jubjub]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-06-03"
+end = "2027-06-26"
+
+[[trusted.memuse]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-09-03"
+end = "2027-06-26"
+
 [[trusted.orchard]]
 criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-08-12"
 end = "2027-06-23"
+
+[[trusted.pairing]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2022-12-06"
+end = "2027-06-26"
+
+[[trusted.pasta_curves]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2021-03-03"
+end = "2027-06-26"
+
+[[trusted.reddsa]]
+criteria = "safe-to-deploy"
+user-id = 159631 # Conrado (conradoplg)
+start = "2023-03-09"
+end = "2027-06-26"
+
+[[trusted.redjubjub]]
+criteria = "safe-to-deploy"
+user-id = 159631 # Conrado (conradoplg)
+start = "2025-02-18"
+end = "2027-06-26"
 
 [[trusted.ring]]
 criteria = "safe-to-deploy"
@@ -51,6 +153,18 @@ user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-08-12"
 end = "2027-06-23"
 
+[[trusted.schemerz]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2024-10-15"
+end = "2027-06-26"
+
+[[trusted.schemerz-rusqlite]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2024-10-15"
+end = "2027-06-26"
+
 [[trusted.secp256k1]]
 criteria = "safe-to-deploy"
 user-id = 1588 # Andrew Poelstra (apoelstra)
@@ -69,6 +183,24 @@ criteria = "safe-to-deploy"
 user-id = 19631 # Tony Arcieri (iqlusion) (tony-iqlusion)
 start = "2019-05-23"
 end = "2027-06-23"
+
+[[trusted.shardtree]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2023-09-08"
+end = "2027-06-26"
+
+[[trusted.shardtree]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2022-12-15"
+end = "2027-06-26"
+
+[[trusted.sinsemilla]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2024-12-13"
+end = "2027-06-26"
 
 [[trusted.tonic]]
 criteria = "safe-to-deploy"
@@ -124,11 +256,41 @@ user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-01-27"
 end = "2027-06-23"
 
+[[trusted.zcash_script]]
+criteria = "safe-to-deploy"
+user-id = 159631 # Conrado (conradoplg)
+start = "2022-08-31"
+end = "2027-06-26"
+
+[[trusted.zcash_script]]
+criteria = "safe-to-deploy"
+user-id = 228785 # Alfredo Garcia (oxarbitrage)
+start = "2023-10-18"
+end = "2027-06-26"
+
+[[trusted.zcash_spec]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2023-12-07"
+end = "2027-06-26"
+
+[[trusted.zcash_spec]]
+criteria = "safe-to-deploy"
+user-id = 199950 # Daira-Emma Hopwood (daira)
+start = "2025-02-20"
+end = "2027-06-26"
+
 [[trusted.zcash_transparent]]
 criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-12-17"
 end = "2027-06-23"
+
+[[trusted.zip32]]
+criteria = "safe-to-deploy"
+user-id = 6289 # Jack Grigg (str4d)
+start = "2023-12-06"
+end = "2027-06-26"
 
 [[trusted.zip321]]
 criteria = "safe-to-deploy"
