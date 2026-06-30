@@ -728,6 +728,57 @@ details p {
   margin-bottom: 10px;
 }
 
+.demo-section {
+  scroll-margin-top: 96px;
+  border-bottom: 1px solid var(--line);
+  text-align: center;
+}
+
+.demo-heading {
+  max-width: 720px;
+  margin-inline: auto;
+}
+
+.demo-figure {
+  margin: 0;
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+}
+
+.demo-frame {
+  width: min(520px, 100%);
+  padding: 12px;
+  border: 1px solid #b9c3b9;
+  border-radius: 16px;
+  background: #f7f3eb;
+  box-shadow: var(--shadow);
+}
+
+.demo-video {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  background: var(--paper);
+}
+
+.demo-figure figcaption {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.demo-figure figcaption a {
+  font-weight: 700;
+  color: var(--green);
+  text-decoration: none;
+}
+
+.demo-figure figcaption a:hover {
+  color: var(--green-dark);
+}
+
 @media (max-width: 980px) {
   .site-header {
     position: static;

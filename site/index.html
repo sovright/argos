@@ -42,6 +42,14 @@
       name="twitter:image:alt"
       content="Argos Rescue Wallet social card with Sovright branding and a desktop recovery preview."
     />
+    <meta property="og:video" content="https://argos.sovright.com/assets/argos-demo.mp4" />
+    <meta
+      property="og:video:secure_url"
+      content="https://argos.sovright.com/assets/argos-demo.mp4"
+    />
+    <meta property="og:video:type" content="video/mp4" />
+    <meta property="og:video:width" content="1080" />
+    <meta property="og:video:height" content="1080" />
     <title>Argos Rescue Wallet | Sovright</title>
     <link rel="icon" href="./assets/zeck-icon.svg" />
     <link rel="stylesheet" href="./styles.css" />
@@ -54,6 +62,7 @@
       </a>
       <div class="header-right">
         <nav class="site-nav" aria-label="Primary navigation">
+          <a href="#demo">Demo</a>
           <a href="#recovery-flow">How it works</a>
           <a href="#support">Support</a>
           <a href="#safety">Safety</a>
@@ -84,6 +93,7 @@
           <ul class="assurance-list" aria-label="Product assurances">
             <li>Seed-only recovery path</li>
             <li>Local Rust backend</li>
+            <li>Independently audited</li>
             <li>Mainnet and testnet support</li>
           </ul>
         </div>
@@ -163,6 +173,38 @@
           signing) happens locally on your machine. If any website ever asks for your ZecWallet
           Lite seed, leave.
         </p>
+      </section>
+
+      <section class="section demo-section" id="demo">
+        <div class="section-heading demo-heading">
+          <p class="eyebrow">See it in action</p>
+          <h2>Recover a wallet in about a minute</h2>
+          <p>
+            A silent, captioned walkthrough of the whole flow — paste your seed, scan every
+            account, review, and sweep. Nothing sensitive ever leaves your machine.
+          </p>
+        </div>
+        <figure class="demo-figure">
+          <div class="demo-frame">
+            <video
+              class="demo-video"
+              src="./assets/argos-demo.mp4"
+              poster="./assets/argos-demo-poster.jpg"
+              width="1080"
+              height="1080"
+              autoplay
+              muted
+              loop
+              playsinline
+              preload="metadata"
+              aria-label="Argos recovery walkthrough: paste seed, scan accounts, review, and sweep funds"
+            ></video>
+          </div>
+          <figcaption>
+            Prefer the long version? Read the <a href="./guide.html">User Guide</a> or
+            <a href="#download">get the desktop app</a>.
+          </figcaption>
+        </figure>
       </section>
 
       <section class="section" id="recovery-flow">
@@ -320,6 +362,12 @@
             <a href="https://github.com/sovright/argos/releases">project release page on GitHub</a>.
             Verify checksums or signatures when they are published alongside a release.
           </p>
+          <p>
+            Argos has been independently audited by
+            <a href="https://leastauthority.com">Least Authority</a> — every issue and
+            suggestion in the final report is marked resolved.
+            <a href="./assets/least-authority-argos-audit-2026-06-29.pdf">Read the audit report (PDF)</a>.
+          </p>
         </div>
         <div class="download-grid">
           <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.0.3/Argos_1.0.3_universal.dmg">
@@ -434,6 +482,7 @@
       <span>Argos Rescue Wallet</span>
       <a href="./guide.html">User Guide</a>
       <a href="#help">Get help</a>
+      <a href="./assets/least-authority-argos-audit-2026-06-29.pdf">Security audit</a>
       <a href="https://github.com/sovright/argos">Source</a>
     </footer>
   </body>

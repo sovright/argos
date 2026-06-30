@@ -23,6 +23,18 @@ Argos now includes the major recovery phases end to end:
 - lightwalletd endpoint fallback, using comma-separated server URLs tried in order
 - Progress metadata for elapsed time and ETA, plus GUI discovery notifications and recovery-report export
 
+## Security audit
+
+Argos was independently audited by [Least Authority](https://leastauthority.com). The audit
+covered the Rust core, CLI, and Tauri GUI, and reviewed the project [threat model](docs/THREAT_MODEL.md).
+
+- **Final Audit Report (29 June 2026):** [`site/assets/least-authority-argos-audit-2026-06-29.pdf`](site/assets/least-authority-argos-audit-2026-06-29.pdf)
+- Initial review revision: `78ffb4d`; verification revision: `11bb6dbd`
+- The report raised **9 issues** (8 Medium, 1 Low) and **13 suggestions**. As of the final
+  report, **every issue and suggestion is marked Resolved.**
+
+The findings and their fixes are tracked in this repository's pull-request history.
+
 ## Operational Notes
 
 - Recovery sessions persist wallet/cache state on disk for auditability and sweep construction. Workspace subdirectories are random per session so the path does not reveal a stable seed fingerprint.
