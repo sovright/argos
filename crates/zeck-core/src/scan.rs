@@ -872,6 +872,23 @@ async fn run_wallet_sync_with_stall_watchdog(
     }
 }
 
+/// Decides the retry budget to carry into the next attempt after a transient
+/// failure. Returns 0 (a full reset) when `synced_to_height` has advanced since
+/// the previous failure — an isolated stall that recovered must not count
+/// toward the lifetime cap on a multi-hour scan. Otherwise the accumulated
+/// `attempts` is preserved so that only *consecutive* failures with no forward
+/// progress exhaust `MAX_SYNC_RETRIES` (issue #174).
+fn retry_budget_after_failure(
+    attempts: u32,
+    last_failure_height: Option<u64>,
+    current_height: Option<u64>,
+) -> u32 {
+    match (last_failure_height, current_height) {
+        (Some(prev), Some(curr)) if curr > prev => 0,
+        _ => attempts,
+    }
+}
+
 /// Runs `run_wallet_sync`, reconnecting to lightwalletd on transient transport
 /// errors.  Each reconnection attempt tries all configured endpoints in order.
 /// Permanent errors (wallet database corruption, etc.) are returned immediately.
@@ -884,6 +901,9 @@ pub(crate) async fn run_wallet_sync_with_retry(
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
     let mut attempts = 0u32;
+    // Height observed at the most recent transient failure. Forward progress
+    // past this between failures resets the retry budget (issue #174).
+    let mut last_failure_height: Option<u64> = None;
     loop {
         match run_wallet_sync_with_stall_watchdog(workspace, network, client, state).await {
             Ok(()) => return Ok(()),
@@ -894,7 +914,21 @@ pub(crate) async fn run_wallet_sync_with_retry(
                 // mid-sync and startup paths agree on what is retryable).
                 let is_transient = crate::lightwalletd::is_transient_network_error(&msg);
 
-                if !is_transient || attempts >= MAX_SYNC_RETRIES {
+                if !is_transient {
+                    return Err(err);
+                }
+
+                // Reset the retry budget when the sync advanced since the last
+                // failure: on a long scan against a loaded public endpoint,
+                // isolated stalls that each recover must not accumulate toward
+                // MAX_SYNC_RETRIES. Only consecutive no-progress failures (a
+                // genuinely hung server) exhaust the budget.
+                let current_height = state.lock().await.progress.synced_to_height;
+                attempts =
+                    retry_budget_after_failure(attempts, last_failure_height, current_height);
+                last_failure_height = current_height;
+
+                if attempts >= MAX_SYNC_RETRIES {
                     return Err(err);
                 }
 
@@ -2667,6 +2701,79 @@ mod tests {
                 "watchdog tripped after stall was resolved by resumed progress"
             );
             watchdog.abort();
+        }
+    }
+
+    // ─── retry-budget reset (issue #174) ─────────────────────────────────
+    //
+    // The retry loop in `run_wallet_sync_with_retry` must bound *consecutive*
+    // failures with no forward progress, not the lifetime total. These tests
+    // exercise the pure decision helper directly.
+    mod retry_budget_tests {
+        use super::super::{retry_budget_after_failure, MAX_SYNC_RETRIES};
+
+        #[test]
+        fn resets_when_height_advanced_since_last_failure() {
+            // 9 consecutive stalls, then the sync advanced before the next
+            // failure — the intervening stall recovered, so the budget resets.
+            assert_eq!(
+                retry_budget_after_failure(9, Some(1_000), Some(1_500)),
+                0
+            );
+        }
+
+        #[test]
+        fn preserves_budget_when_stuck_at_same_height() {
+            // No forward progress between the two failures — budget carries.
+            assert_eq!(
+                retry_budget_after_failure(5, Some(1_000), Some(1_000)),
+                5
+            );
+        }
+
+        #[test]
+        fn preserves_budget_on_first_failure_before_any_progress() {
+            // No prior failure height and no progress yet: nothing to reset.
+            assert_eq!(retry_budget_after_failure(0, None, None), 0);
+            assert_eq!(retry_budget_after_failure(3, None, Some(1_000)), 3);
+        }
+
+        #[test]
+        fn a_scan_that_makes_progress_between_stalls_never_exhausts_budget() {
+            // Simulate many isolated stalls, each preceded by real progress.
+            // Without the reset this would blow past MAX_SYNC_RETRIES; with it,
+            // the budget never climbs above 1.
+            let mut attempts = 0u32;
+            let mut last_failure_height: Option<u64> = None;
+            for i in 0..(MAX_SYNC_RETRIES as u64 * 5) {
+                let current = Some(1_000 + i * 100); // advanced every time
+                attempts = retry_budget_after_failure(attempts, last_failure_height, current);
+                assert!(
+                    attempts < MAX_SYNC_RETRIES,
+                    "budget exhausted despite forward progress between stalls"
+                );
+                last_failure_height = current;
+                attempts += 1;
+            }
+        }
+
+        #[test]
+        fn consecutive_stalls_with_no_progress_still_exhaust_budget() {
+            // A genuinely hung server (no progress) must still hit the cap.
+            let mut attempts = 0u32;
+            let mut last_failure_height: Option<u64> = None;
+            let mut bailed = false;
+            for _ in 0..(MAX_SYNC_RETRIES + 5) {
+                let current = Some(2_000); // stuck forever
+                attempts = retry_budget_after_failure(attempts, last_failure_height, current);
+                if attempts >= MAX_SYNC_RETRIES {
+                    bailed = true;
+                    break;
+                }
+                last_failure_height = current;
+                attempts += 1;
+            }
+            assert!(bailed, "hung server never hit the retry cap");
         }
     }
 }
