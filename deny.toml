@@ -62,12 +62,6 @@ ignore = [
     # plist.
     "RUSTSEC-2026-0194", # quick-xml quadratic run time on duplicate attributes
     "RUSTSEC-2026-0195", # quick-xml unbounded NsReader namespace allocation
-
-    # `spin 0.9.8` was yanked upstream. Reached only via `lazy_static`'s `once`
-    # feature <- `bellman` (multicore) <- `sapling-crypto` <- zcash stack. No
-    # in-range replacement exists without bumping the zcash dependencies; a
-    # crate-level exemption keeps `yanked = "deny"` in force everywhere else.
-    { crate = "spin@0.9.8", reason = "yanked upstream; pinned transitively via lazy_static <- bellman (zcash stack), no in-range fix" },
 ]
 
 # ── Licenses ─────────────────────────────────────────────────────────────────
