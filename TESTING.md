@@ -159,8 +159,21 @@ argos sweep \
 |---------|----------|
 | Mainnet | `zec.rocks:443` |
 | Mainnet | `na.zec.rocks:443` |
-| Testnet | `lightwalletd.testnet.electriccoin.co:9067` |
+| Testnet | `testnet.zec.rocks:443` |
+
+These are the values of `DEFAULT_MAINNET_LIGHTWALLETD` and
+`DEFAULT_TESTNET_LIGHTWALLETD` in `crates/zeck-core/src/lightwalletd.rs`, which
+the CLI's `--lightwalletd-url` default and the GUI's server presets both track.
+
+Public endpoints get retired without notice, so the defaults have a
+network-gated reachability check. It probes each default *individually* — the
+connect helpers fall through to the next endpoint on failure, so a dead primary
+stays invisible behind a healthy fallback. Run it periodically:
+
+```bash
+cargo test -p argos-core -- --ignored default_endpoints_are_reachable
+```
 
 ---
 
-*Last updated: 2026-04-15*
+*Last updated: 2026-07-15*

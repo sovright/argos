@@ -344,9 +344,11 @@ $("seed-clear-clipboard")?.addEventListener("click", () => clearOsClipboard("see
 
 // ─── Step 3: Configuration ────────────────────────────────────────────────────
 
+// Keep in sync with DEFAULT_MAINNET_LIGHTWALLETD / DEFAULT_TESTNET_LIGHTWALLETD
+// in crates/zeck-core/src/lightwalletd.rs.
 const SERVER_PRESETS = {
   mainnet: "https://zec.rocks:443,https://na.zec.rocks:443",
-  testnet: "https://lightwalletd.testnet.electriccoin.co:9067",
+  testnet: "https://testnet.zec.rocks:443",
 };
 
 $("network-select").addEventListener("change", () => {

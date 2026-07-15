@@ -48,6 +48,15 @@ pub(crate) fn is_transient_network_error(msg: &str) -> bool {
     TOKENS.iter().any(|token| msg.contains(token))
 }
 
+/// Default mainnet lightwalletd endpoints, in preference order.
+///
+/// Kept here rather than in each front end so the CLI, the GUI presets and
+/// the docs cannot drift onto a host that has since stopped resolving.
+pub const DEFAULT_MAINNET_LIGHTWALLETD: &str = "https://zec.rocks:443,https://na.zec.rocks:443";
+
+/// Default testnet lightwalletd endpoint.
+pub const DEFAULT_TESTNET_LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
+
 pub fn parse_lightwalletd_endpoints(raw: &str) -> Vec<String> {
     let mut endpoints = Vec::new();
     for endpoint in raw
@@ -318,10 +327,49 @@ mod tests {
     use super::{
         describe_lightwalletd_endpoints, parse_lightwalletd_endpoints,
         prioritized_lightwalletd_endpoints, validate_lightwalletd_network,
-        validated_lightwalletd_endpoints, TESTNET_SAPLING_ACTIVATION,
+        validated_lightwalletd_endpoints, DEFAULT_MAINNET_LIGHTWALLETD,
+        DEFAULT_TESTNET_LIGHTWALLETD, TESTNET_SAPLING_ACTIVATION,
     };
     use crate::models::ZeckNetwork;
     use zcash_client_backend::proto::service::LightdInfo;
+
+    #[test]
+    fn default_endpoints_are_well_formed() {
+        let mainnet = validated_lightwalletd_endpoints(DEFAULT_MAINNET_LIGHTWALLETD)
+            .expect("mainnet defaults must parse and validate");
+        assert!(
+            mainnet.len() >= 2,
+            "mainnet should ship a fallback endpoint, got {mainnet:?}"
+        );
+
+        let testnet = validated_lightwalletd_endpoints(DEFAULT_TESTNET_LIGHTWALLETD)
+            .expect("testnet default must parse and validate");
+        assert_eq!(testnet.len(), 1);
+    }
+
+    /// Every shipped default must actually answer `GetLightdInfo`.
+    ///
+    /// Probed one endpoint at a time on purpose: the connect helpers fall
+    /// through to the next endpoint on failure, so a dead primary stays
+    /// invisible for as long as a healthy fallback masks it. That is how
+    /// the CLI shipped a default whose host had no DNS record at all.
+    ///
+    /// Network-dependent, so `#[ignore]` by default:
+    /// `cargo test -p argos-core -- --ignored default_endpoints_are_reachable`
+    #[tokio::test]
+    #[ignore = "requires network access to public lightwalletd servers"]
+    async fn default_endpoints_are_reachable() {
+        let all = format!("{DEFAULT_MAINNET_LIGHTWALLETD},{DEFAULT_TESTNET_LIGHTWALLETD}");
+        let mut dead = Vec::new();
+
+        for endpoint in parse_lightwalletd_endpoints(&all) {
+            if let Err(err) = super::probe_lightwalletd_endpoints(&endpoint).await {
+                dead.push(format!("{endpoint}: {err}"));
+            }
+        }
+
+        assert!(dead.is_empty(), "unreachable default endpoints: {dead:#?}");
+    }
 
     #[test]
     fn parse_endpoints_splits_and_deduplicates() {
