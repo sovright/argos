@@ -36,6 +36,10 @@ pub(crate) fn is_transient_network_error(msg: &str) -> bool {
         "connection refused",
         "connection reset",
         "broken pipe",
+        // A batch that never committed within its budget. Retrying reconnects
+        // and restarts the batch, which is the right move for a hung stream
+        // and harmless (if wasteful) for a merely slow one.
+        "scan stalled",
         // DNS resolution failures (resolver wording differs across OSes)
         "dns error",
         "failed to lookup address",
