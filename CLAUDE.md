@@ -39,7 +39,7 @@ Best-effort on scan completion. Platform dispatch in `notify_user` (Tauri) and `
 
 ### Lightwalletd endpoints
 - Mainnet: `https://zec.rocks:443`, `https://na.zec.rocks:443`
-- Testnet: `https://lightwalletd.testnet.electriccoin.co:9067`
+- Testnet: `https://testnet.zec.rocks:443`
 - Always include `https://` prefix — bare `host:port` fails TLS
 
 ### Test seed (BIP-39 test vector, no real funds)
