@@ -66,7 +66,7 @@ version = "3.0.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.anyhow]]
-version = "1.0.102"
+version = "1.0.103"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrayref]]
@@ -314,7 +314,7 @@ version = "0.8.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-epoch]]
-version = "0.9.18"
+version = "0.9.20"
 criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-utils]]
@@ -1394,7 +1394,7 @@ version = "0.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.spin]]
-version = "0.9.8"
+version = "0.9.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.stable_deref_trait]]

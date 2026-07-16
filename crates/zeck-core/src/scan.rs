@@ -665,7 +665,42 @@ fn initial_batch_size(config: &RuntimeScanConfig, max_accounts: u32) -> u32 {
 
 async fn initialize_accounts(state: &SharedScanTaskState, accounts: &[DerivedAccount]) {
     let mut guard = state.lock().await;
-    guard.progress.accounts = accounts.iter().map(build_account_preview).collect();
+    let existing = std::mem::take(&mut guard.progress.accounts);
+    guard.progress.accounts = merge_account_previews(existing, accounts);
+}
+
+/// Build the account snapshot for a (re-)derived account set, preserving any
+/// already-populated rows instead of clobbering them back to zero previews.
+///
+/// The gap-limit loop re-derives the *full* account set on every extension
+/// iteration and re-invokes [`initialize_accounts`] over all of it. A naive
+/// rebuild would blank every account already refreshed in a prior batch back
+/// to a zero-balance "Waiting for sync" preview — and, because the authoritative
+/// refresh only runs *after* the next (potentially multi-hour) shielded batch
+/// completes, the account table would show `0.00` for those accounts the whole
+/// time. That contradicts the append-only discovery banner, which correctly and
+/// permanently reports the funds found in the earlier batch.
+///
+/// Merging by `account_index` keeps the earlier authoritative balances (and
+/// status) visible while seeding fresh zero previews only for genuinely-new
+/// indices. Rows follow the freshly-derived account order; any preview whose
+/// index is no longer in the derived set is dropped.
+fn merge_account_previews(
+    existing: Vec<AccountBalancePreview>,
+    accounts: &[DerivedAccount],
+) -> Vec<AccountBalancePreview> {
+    let mut existing: std::collections::HashMap<u32, AccountBalancePreview> = existing
+        .into_iter()
+        .map(|preview| (preview.account_index, preview))
+        .collect();
+    accounts
+        .iter()
+        .map(|account| {
+            existing
+                .remove(&account.index)
+                .unwrap_or_else(|| build_account_preview(account))
+        })
+        .collect()
 }
 
 fn build_account_preview(account: &DerivedAccount) -> AccountBalancePreview {
@@ -1574,11 +1609,12 @@ mod tests {
     use secrecy::SecretString;
 
     use super::{
-        append_new_discoveries, build_account_status, resolve_max_account_count,
-        trailing_gap_limit_reached,
+        append_new_discoveries, build_account_status, merge_account_previews,
+        resolve_max_account_count, trailing_gap_limit_reached,
     };
     use crate::models::{
-        AccountBalancePreview, DiscoveryPool, RuntimeScanConfig, ScanDiscovery, ZeckNetwork,
+        AccountBalancePreview, DerivedAccount, DiscoveryPool, RuntimeScanConfig, ScanDiscovery,
+        ZeckNetwork,
     };
 
     fn config(num_accounts: Option<u32>) -> RuntimeScanConfig {
@@ -2003,6 +2039,59 @@ mod tests {
             1,
             "authoritative refresh must not re-emit a probe discovery"
         );
+    }
+
+    fn derived_account(index: u32) -> DerivedAccount {
+        DerivedAccount {
+            index,
+            sapling_path: String::new(),
+            orchard_path: String::new(),
+            transparent_receive_path: String::new(),
+            transparent_change_path: String::new(),
+            sapling_address: "zs".to_owned(),
+            unified_address: "u".to_owned(),
+            transparent_receive_address: "t1".to_owned(),
+            transparent_change_address: "t2".to_owned(),
+        }
+    }
+
+    #[test]
+    fn gap_extension_reinit_preserves_already_refreshed_balances() {
+        // Regression for the discovery-banner vs account-table discrepancy.
+        // On each gap-extension iteration the scan loop re-derives the full
+        // account set and calls initialize_accounts over all of it. Accounts
+        // already refreshed in a prior batch (with authoritative balances and
+        // a sticky discovery banner) must not be blanked back to zero
+        // "Waiting for sync" previews for the entire duration of the next
+        // (long) shielded batch — otherwise the table contradicts the banner.
+        let refreshed = vec![account_with(0, 12_645_600, 0, 0)];
+        let derived = vec![derived_account(0), derived_account(1)];
+
+        let merged = merge_account_previews(refreshed, &derived);
+
+        assert_eq!(merged.len(), 2);
+        // Account 0 keeps its authoritative sapling balance and status.
+        assert_eq!(merged[0].account_index, 0);
+        assert_eq!(merged[0].sapling_zatoshis, 12_645_600);
+        assert!(merged[0].has_activity);
+        // The genuinely-new account 1 gets a fresh zero preview.
+        assert_eq!(merged[1].account_index, 1);
+        assert_eq!(merged[1].sapling_zatoshis, 0);
+        assert!(merged[1].status.contains("Waiting for"));
+    }
+
+    #[test]
+    fn merge_account_previews_orders_by_derived_set_not_prior_snapshot() {
+        // The returned rows must follow the freshly-derived account order,
+        // and a preview whose index is no longer in the derived set is dropped.
+        let stale = vec![account_with(5, 1, 0, 0), account_with(0, 2, 0, 0)];
+        let derived = vec![derived_account(0), derived_account(1), derived_account(2)];
+
+        let merged = merge_account_previews(stale, &derived);
+
+        let indices: Vec<u32> = merged.iter().map(|a| a.account_index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(merged[0].sapling_zatoshis, 2, "account 0 balance preserved");
     }
 
     /// Cancel-then-resume workspace persistence tests.
