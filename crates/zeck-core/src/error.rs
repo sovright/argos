@@ -28,6 +28,14 @@ pub enum ZeckError {
     #[error("lightwalletd probe failed: {0}")]
     Lightwalletd(String),
 
+    /// A scan batch has not committed within its budget. Deliberately *not*
+    /// a [`ZeckError::Lightwalletd`]: the stall watchdog observes only that
+    /// `synced_to_height` stopped advancing, which a hung stream and an
+    /// unusually dense block range produce identically. Attributing it to
+    /// the server would be a guess presented to the user as a fact.
+    #[error("scan stalled: {0}")]
+    ScanStalled(String),
+
     #[error("scan session not found")]
     UnknownScanHandle,
 

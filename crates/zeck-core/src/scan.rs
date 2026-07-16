@@ -822,24 +822,46 @@ const SYNC_RETRY_DELAY_SECS: u64 = 5;
 const INITIAL_PROBE_ATTEMPTS: u32 = 4;
 
 /// Stall watchdog: how long we wait without seeing `synced_to_height` advance
-/// before declaring the gRPC stream hung. 60 s comfortably exceeds:
+/// before giving up on the current batch. 60 s comfortably exceeds:
 ///
 ///   - librustzcash's default ~100-block batch boundary (committed in one tick
 ///     even under the R-N13 300 ms/block latency profile = 30 s per batch),
 ///   - the R-N14 32 KB/s throttle's per-batch budget,
 ///   - the regtest harness's typical mid-scan ProgressPoller refresh cycle.
 ///
-/// A stall this long against a real chain means the server stopped sending —
-/// the R-N15 failure mode the watchdog exists to surface.
+/// Every bound above is a *latency* bound, which is why this budget does not
+/// hold inside the sandblasting window — see
+/// [`SANDBLASTING_STALL_TIMEOUT_SECS`].
 const STALL_TIMEOUT_SECS: u64 = 60;
+
+/// Stall budget inside the sandblasting window
+/// ([`SANDBLASTING_START_HEIGHT`]..=[`SANDBLASTING_END_HEIGHT`]).
+///
+/// Those blocks are packed with shielded outputs, so a batch there is bound by
+/// local trial-decryption CPU rather than by network latency, and can run for
+/// many minutes on ordinary hardware. [`STALL_TIMEOUT_SECS`] was calibrated
+/// against the wrong bottleneck for this range.
+///
+/// Applying the normal budget here is not merely impatient, it is a livelock:
+/// the retry restarts the batch from the last committed height, so a batch
+/// needing longer than the budget is killed at the same point on every
+/// attempt, the retry budget drains, and the scan can never cross the era.
+/// A wallet with a pre-2023 birthday must cross it to be recovered at all.
+const SANDBLASTING_STALL_TIMEOUT_SECS: u64 = 900;
 
 /// How often the watchdog polls `synced_to_height`. 5 s keeps the cost
 /// negligible and gives the watchdog 12 ticks before tripping.
 const STALL_CHECK_INTERVAL_SECS: u64 = 5;
 
-/// Returns a [`ZeckError`] when `synced_to_height` has not advanced for
-/// `STALL_TIMEOUT_SECS`. The returned future *only* resolves on stall — used
+/// Returns a [`ZeckError`] when `synced_to_height` has not advanced for the
+/// applicable budget. The returned future *only* resolves on stall — used
 /// inside `tokio::select!` against the actual sync future.
+///
+/// The budget is [`STALL_TIMEOUT_SECS`], widened to
+/// [`SANDBLASTING_STALL_TIMEOUT_SECS`] while the scan is inside the
+/// sandblasting window. `progress.in_sandblasting_zone` is already maintained
+/// by the [`ProgressPoller`] from the live scan height, so the budget tracks
+/// the scan into and back out of the era on its own.
 ///
 /// State lives entirely on the local stack: each call gets a fresh
 /// `last_height` baseline. When the retry loop in
@@ -847,38 +869,54 @@ const STALL_CHECK_INTERVAL_SECS: u64 = 5;
 /// started, so a progress event on the previous attempt doesn't paper over
 /// a stall on the next.
 ///
-/// The error message contains the substring `"h2 protocol error"` so the
-/// existing retry matcher in `run_wallet_sync_with_retry` catches it
-/// without a separate string match.
+/// The error deliberately claims nothing about the network. All this watchdog
+/// observes is that a batch stopped committing; a hung stream and a dense
+/// block range are indistinguishable from here. It is classified as retryable
+/// via the `"scan stalled"` token in
+/// [`crate::lightwalletd::is_transient_network_error`] rather than by
+/// impersonating a transport error.
 async fn stall_watchdog(state: &SharedScanTaskState) -> ZeckError {
     let mut last_height: Option<u64> = None;
-    let mut stalled_ticks: u32 = 0;
-    // `max_stalled_ticks` is computed at call time rather than as a const so
-    // future tuning of either constant stays internally consistent.
-    let max_stalled_ticks = (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS).max(1) as u32;
+    let mut stalled_secs: u64 = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STALL_CHECK_INTERVAL_SECS)).await;
-        let current = state.lock().await.progress.synced_to_height;
+        let (current, in_sandblasting_zone) = {
+            let guard = state.lock().await;
+            (
+                guard.progress.synced_to_height,
+                guard.progress.in_sandblasting_zone,
+            )
+        };
+        let budget_secs = if in_sandblasting_zone {
+            SANDBLASTING_STALL_TIMEOUT_SECS
+        } else {
+            STALL_TIMEOUT_SECS
+        };
         match (last_height, current) {
             // First observation of a height: just record it. We do not count
             // the pre-progress phase (probing/connecting) toward the stall
             // budget — sync begins when the first block lands.
             (None, Some(h)) => {
                 last_height = Some(h);
-                stalled_ticks = 0;
+                stalled_secs = 0;
             }
             // Advancing — reset the counter.
             (Some(prev), Some(curr)) if curr != prev => {
                 last_height = Some(curr);
-                stalled_ticks = 0;
+                stalled_secs = 0;
             }
             // No advance (either still None, or stuck at the same height).
             _ => {
-                stalled_ticks = stalled_ticks.saturating_add(1);
-                if stalled_ticks >= max_stalled_ticks {
-                    return ZeckError::Lightwalletd(format!(
-                        "scan stalled: no new blocks for {STALL_TIMEOUT_SECS}s — \
-                         h2 protocol error: hung stream from lightwalletd"
+                stalled_secs = stalled_secs.saturating_add(STALL_CHECK_INTERVAL_SECS);
+                if stalled_secs >= budget_secs {
+                    let context = if in_sandblasting_zone {
+                        " (scanning the 2022–2023 sandblasting range, where blocks are \
+                          dense and batches are slow)"
+                    } else {
+                        ""
+                    };
+                    return ZeckError::ScanStalled(format!(
+                        "no block committed for {budget_secs}s{context}; reconnecting"
                     ));
                 }
             }
@@ -2692,8 +2730,8 @@ mod tests {
         use tokio::sync::Mutex;
 
         use super::super::{
-            stall_watchdog, ScanTaskState, SharedScanTaskState, STALL_CHECK_INTERVAL_SECS,
-            STALL_TIMEOUT_SECS,
+            stall_watchdog, ScanTaskState, SharedScanTaskState, SANDBLASTING_STALL_TIMEOUT_SECS,
+            STALL_CHECK_INTERVAL_SECS, STALL_TIMEOUT_SECS,
         };
         use crate::ScanHandle;
 
@@ -2703,6 +2741,107 @@ mod tests {
 
         async fn set_height(state: &SharedScanTaskState, h: u64) {
             state.lock().await.progress.synced_to_height = Some(h);
+        }
+
+        async fn set_sandblasting(state: &SharedScanTaskState, value: bool) {
+            state.lock().await.progress.in_sandblasting_zone = value;
+        }
+
+        /// Inside the sandblasting window a batch is bound by local
+        /// trial-decryption CPU, not by network latency, and routinely runs
+        /// past the normal budget. Tripping there is a livelock: the retry
+        /// restarts the same batch, which is killed at the same point, so the
+        /// scan can never cross the era.
+        #[tokio::test(start_paused = true)]
+        async fn does_not_fire_at_the_normal_budget_inside_the_sandblasting_zone() {
+            let state = empty_state();
+            set_height(&state, 2_000_000).await;
+            set_sandblasting(&state, true).await;
+
+            let watchdog = {
+                let state = state.clone();
+                tokio::spawn(async move { stall_watchdog(&state).await })
+            };
+
+            tokio::time::advance(Duration::from_secs(
+                STALL_TIMEOUT_SECS * 4 + STALL_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            tokio::task::yield_now().await;
+
+            assert!(
+                !watchdog.is_finished(),
+                "watchdog tripped at the normal budget inside the sandblasting zone"
+            );
+            watchdog.abort();
+        }
+
+        /// The extended budget is still a budget — a genuinely hung stream in
+        /// the zone must eventually surface rather than hang forever.
+        #[tokio::test(start_paused = true)]
+        async fn fires_at_the_extended_budget_inside_the_sandblasting_zone() {
+            let state = empty_state();
+            set_height(&state, 2_000_000).await;
+            set_sandblasting(&state, true).await;
+
+            let watchdog = {
+                let state = state.clone();
+                tokio::spawn(async move { stall_watchdog(&state).await })
+            };
+
+            tokio::time::advance(Duration::from_secs(
+                SANDBLASTING_STALL_TIMEOUT_SECS + STALL_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            tokio::task::yield_now().await;
+
+            assert!(
+                watchdog.await.expect("watchdog task did not panic").to_string().contains("scan stalled"),
+                "watchdog must still trip at the extended budget"
+            );
+        }
+
+        /// The watchdog observes only that a batch has not committed. It has
+        /// no evidence about the network, so it must not invent any — a
+        /// fabricated transport error sends users chasing servers for what is
+        /// usually local scanning cost.
+        #[tokio::test(start_paused = true)]
+        async fn stall_error_does_not_fabricate_a_network_failure() {
+            let state = empty_state();
+            set_height(&state, 100).await;
+
+            let watchdog = {
+                let state = state.clone();
+                tokio::spawn(async move { stall_watchdog(&state).await })
+            };
+
+            tokio::time::advance(Duration::from_secs(
+                STALL_TIMEOUT_SECS + STALL_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            tokio::task::yield_now().await;
+
+            let msg = watchdog.await.expect("watchdog task did not panic").to_string();
+            assert!(msg.contains("scan stalled"), "got: {msg}");
+            for lie in [
+                "h2 protocol error",
+                "hung stream",
+                "lightwalletd probe failed",
+            ] {
+                assert!(
+                    !msg.contains(lie),
+                    "stall error must not claim {lie:?} — nothing observed the network; got: {msg}"
+                );
+            }
+        }
+
+        /// Dropping the fabricated "h2 protocol error" marker must not cost
+        /// the stall its place in the retry loop.
+        #[test]
+        fn stall_error_is_still_classified_as_retryable() {
+            assert!(crate::lightwalletd::is_transient_network_error(
+                "scan stalled: no block committed for 60s"
+            ));
         }
 
         #[tokio::test(start_paused = true)]
@@ -2728,8 +2867,8 @@ mod tests {
             let err = watchdog.await.expect("watchdog task did not panic");
             let msg = err.to_string();
             assert!(
-                msg.contains("scan stalled") && msg.contains("h2 protocol error"),
-                "watchdog error must include the stall marker AND the retry-matcher string; got: {msg}"
+                msg.contains("scan stalled"),
+                "watchdog error must include the stall marker; got: {msg}"
             );
         }
 
