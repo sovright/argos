@@ -644,11 +644,13 @@ async function startProgressListeners() {
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
   $("back-to-config").style.display = "none";
-  // Reset the sleep + sandblasting banners so a previous scan's state
-  // doesn't carry over into a fresh start.
+  // Reset the sleep + sandblasting + gap-extension banners so a previous
+  // scan's state doesn't carry over into a fresh start.
   $("scan-sleep-banner").style.display = "none";
   $("scan-sleep-detail").textContent = "";
   $("scan-sandblasting-banner").style.display = "none";
+  $("scan-gap-extension-banner").style.display = "none";
+  $("scan-gap-extension-detail").textContent = "";
   eta.reset();
 
   // Await all three subscriptions before returning. If we stored the unlisten
@@ -796,6 +798,21 @@ function updateScanUI(progress) {
   // Sandblasting era toggles based on the current cursor — the banner
   // appears while traversing the slow zone and disappears once past it.
   $("scan-sandblasting-banner").style.display = progress.in_sandblasting_zone ? "" : "none";
+
+  // Gap extension: the block counter resets to zero when the search widens to
+  // a new slice of accounts. Without explanation that reads as the scan
+  // restarting, so surface a banner naming the trigger and the new range.
+  // Only while actively scanning — the completion screen tells the full story.
+  const inTerminalPhase = ["complete", "cancelled", "error"].includes(progress.phase);
+  if (progress.gap_extension && !inTerminalPhase) {
+    const g = progress.gap_extension;
+    $("scan-gap-extension-detail").textContent =
+      `Found activity in account ${g.trigger_account_index}, so the search widened to accounts ` +
+      `${g.accounts_from}–${g.accounts_to} (extension #${g.pass}). `;
+    $("scan-gap-extension-banner").style.display = "";
+  } else {
+    $("scan-gap-extension-banner").style.display = "none";
+  }
 
   const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
   $("cancel-scan").style.display = terminal ? "none" : "";

@@ -47,8 +47,8 @@ use crate::{
     },
     models::{
         in_sandblasting_zone, AccountBalancePreview, AddressScope, DerivedAccount, DiscoveryPool,
-        LightwalletdProbe, RuntimeScanConfig, ScanDiscovery, ScanHandle, ScanPhase, ScanProgress,
-        ScanSummary, SleepEvent,
+        GapExtension, LightwalletdProbe, RuntimeScanConfig, ScanDiscovery, ScanHandle, ScanPhase,
+        ScanProgress, ScanSummary, SleepEvent,
     },
     workspace::{
         consensus_network, mark_session_completed, open_wallet_db, touch_session_last_run,
@@ -246,6 +246,7 @@ impl ScanTaskState {
                 error: None,
                 sleep_event: None,
                 in_sandblasting_zone: false,
+                gap_extension: None,
             },
             cancelled: Arc::new(AtomicBool::new(false)),
             workspace: None,
@@ -429,6 +430,7 @@ async fn run_recovery_scan_inner(
     let max_accounts = resolve_max_account_count(&config)?;
     let mut imported_accounts = 0u32;
     let mut target_accounts = initial_batch_size(&config, max_accounts);
+    let mut gap_extension_pass = 0u32;
     let network = consensus_network(config.network);
     let initial_accounts = derive_accounts(&config.seed_phrase, config.network, target_accounts)?;
 
@@ -591,7 +593,23 @@ async fn run_recovery_scan_inner(
             break;
         }
 
-        target_accounts = (target_accounts + config.gap_limit).min(max_accounts);
+        // Funds were found near the trailing edge, so widen the search and
+        // scan the chain again for the new accounts. Publish a descriptor of
+        // the widening before the next pass resets the block counter, so the
+        // UI can explain the restart rather than let it read as a fault.
+        let new_target = (target_accounts + config.gap_limit).min(max_accounts);
+        gap_extension_pass += 1;
+        {
+            let mut guard = state.lock().await;
+            let extension = describe_gap_extension(
+                &guard.progress.accounts,
+                target_accounts,
+                new_target,
+                gap_extension_pass,
+            );
+            guard.progress.gap_extension = extension;
+        }
+        target_accounts = new_target;
     }
 
     let (workspace_dir, total_zatoshis) = {
@@ -1552,6 +1570,42 @@ fn build_account_status(
     format!("Found {}.", parts.join(", "))
 }
 
+/// Highest account index with note activity, or `None` if none are active.
+///
+/// Uses `has_activity` (not balance) to match [`trailing_gap_limit_reached`]:
+/// an account that received and fully spent funds still keeps the search
+/// alive, so it is still the trigger for a widening.
+fn highest_active_account_index(accounts: &[AccountBalancePreview]) -> Option<u32> {
+    accounts
+        .iter()
+        .filter(|account| account.has_activity)
+        .map(|account| account.account_index)
+        .max()
+}
+
+/// Builds the [`GapExtension`] descriptor for a widening from `previous_target`
+/// to `new_target` accounts, or `None` if nothing in `accounts` is active (in
+/// which case the caller would not be extending). `pass` is the 1-based count
+/// of widenings so far this scan.
+///
+/// `accounts_to` is the last *newly-added* index, `new_target - 1`, so the
+/// range `[accounts_from, accounts_to]` names exactly the accounts whose
+/// blocks the upcoming pass will scan.
+fn describe_gap_extension(
+    accounts: &[AccountBalancePreview],
+    previous_target: u32,
+    new_target: u32,
+    pass: u32,
+) -> Option<GapExtension> {
+    let trigger_account_index = highest_active_account_index(accounts)?;
+    Some(GapExtension {
+        pass,
+        accounts_from: previous_target,
+        accounts_to: new_target.saturating_sub(1),
+        trigger_account_index,
+    })
+}
+
 fn trailing_gap_limit_reached(accounts: &[AccountBalancePreview], gap_limit: u32) -> bool {
     let gap = usize::try_from(gap_limit).unwrap_or(usize::MAX);
     if accounts.len() < gap {
@@ -1681,13 +1735,71 @@ mod tests {
     use secrecy::SecretString;
 
     use super::{
-        append_new_discoveries, build_account_status, merge_account_previews,
-        resolve_max_account_count, trailing_gap_limit_reached,
+        append_new_discoveries, build_account_status, describe_gap_extension,
+        highest_active_account_index, merge_account_previews, resolve_max_account_count,
+        trailing_gap_limit_reached,
     };
     use crate::models::{
         AccountBalancePreview, DerivedAccount, DiscoveryPool, RuntimeScanConfig, ScanDiscovery,
         ZeckNetwork,
     };
+
+    /// Minimal preview carrying only the fields the gap-limit logic reads.
+    fn preview(account_index: u32, has_activity: bool) -> AccountBalancePreview {
+        AccountBalancePreview {
+            account_index,
+            sapling_address: String::new(),
+            unified_address: String::new(),
+            transparent_receive_address: String::new(),
+            transparent_change_address: String::new(),
+            transparent_utxo_count: 0,
+            sapling_zatoshis: 0,
+            orchard_zatoshis: 0,
+            transparent_zatoshis: 0,
+            total_zatoshis: 0,
+            has_activity,
+            status: String::new(),
+        }
+    }
+
+    #[test]
+    fn highest_active_account_index_is_the_trailing_trigger() {
+        // Activity at index 0 and 3; the extension trigger is the *latest*.
+        let accounts = vec![
+            preview(0, true),
+            preview(1, false),
+            preview(2, false),
+            preview(3, true),
+            preview(4, false),
+        ];
+        assert_eq!(highest_active_account_index(&accounts), Some(3));
+    }
+
+    #[test]
+    fn highest_active_account_index_is_none_when_no_activity() {
+        let accounts = vec![preview(0, false), preview(1, false)];
+        assert_eq!(highest_active_account_index(&accounts), None);
+    }
+
+    #[test]
+    fn describe_gap_extension_reports_new_range_and_trigger() {
+        // 20 accounts searched, activity at index 18, widening to 40.
+        let mut accounts: Vec<_> = (0..20).map(|i| preview(i, false)).collect();
+        accounts[18].has_activity = true;
+
+        let ext = describe_gap_extension(&accounts, 20, 40, 1)
+            .expect("activity present, so an extension is described");
+        assert_eq!(ext.pass, 1);
+        assert_eq!(ext.accounts_from, 20);
+        assert_eq!(ext.accounts_to, 39);
+        assert_eq!(ext.trigger_account_index, 18);
+    }
+
+    #[test]
+    fn describe_gap_extension_is_none_without_a_trigger() {
+        let accounts: Vec<_> = (0..20).map(|i| preview(i, false)).collect();
+        assert!(describe_gap_extension(&accounts, 20, 40, 1).is_none());
+    }
 
     fn config(num_accounts: Option<u32>) -> RuntimeScanConfig {
         RuntimeScanConfig {
