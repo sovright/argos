@@ -1339,6 +1339,7 @@ mod tests {
             error: None,
             sleep_event: None,
             in_sandblasting_zone: false,
+            gap_extension: None,
         }
     }
 
