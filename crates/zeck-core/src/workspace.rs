@@ -141,11 +141,31 @@ pub enum ArgosParams {
     Regtest(LocalNetwork),
 }
 
+/// Regtest activation heights with every upgrade through Ironwood active from
+/// height 1, matching what the harness configures on Zebra in
+/// `tests/regtest/zebrad-regtest.toml`. Genesis (height 0) is reserved, so 1
+/// is the earliest an upgrade may activate. These two definitions must stay in
+/// sync: Argos evaluates consensus branch IDs against this copy, and a
+/// mismatch means sweeps are signed for a branch the node will reject.
+#[cfg(feature = "argos-network")]
+pub fn regtest_local_network() -> LocalNetwork {
+    let h = Some(BlockHeight::from_u32(1));
+    LocalNetwork {
+        overwinter: h,
+        sapling: h,
+        blossom: h,
+        heartwood: h,
+        canopy: h,
+        nu5: h,
+        nu6: h,
+        nu6_1: h,
+        nu6_2: h,
+        nu6_3: h,
+    }
+}
+
 impl ArgosParams {
-    /// Regtest parameters with every upgrade through Ironwood active from
-    /// height 1, matching the activation heights the harness configures on
-    /// Zebra. Genesis (height 0) is reserved, so 1 is the earliest an upgrade
-    /// may activate.
+    /// [`regtest_local_network`] wrapped as an [`ArgosParams`].
     #[cfg(feature = "argos-network")]
     pub fn regtest_all_active() -> Self {
         let h = Some(BlockHeight::from_u32(1));
@@ -373,6 +393,20 @@ fn open_tuned_wallet_connection(path: &Path) -> Result<rusqlite::Connection, rus
 /// Opens a wallet database with the connection tuning from
 /// [`open_tuned_wallet_connection`]. All production opens of
 /// `wallet.sqlite` should come through here.
+/// Test-only accessor for [`open_wallet_db`].
+///
+/// The regtest funding helper has to drive `propose_shielding_coinbase` and
+/// `propose_transfer` directly — Zebra has no wallet RPCs, and coinbase output
+/// may not be spent to a transparent address, so funding the test seed cannot
+/// go through Argos's own sweep. Compiled out of production builds.
+#[cfg(feature = "argos-network")]
+pub fn open_wallet_db_for_tests(
+    path: &Path,
+    network: ArgosParams,
+) -> ZeckResult<WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>> {
+    open_wallet_db(path, network)
+}
+
 pub(crate) fn open_wallet_db(
     path: &Path,
     network: ArgosParams,
