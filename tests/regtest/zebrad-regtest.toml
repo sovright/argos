@@ -1,0 +1,71 @@
+# Zebra configuration for the Argos regtest harness.
+#
+# Replaces the previous zcashd-based node. zcashd cannot serve this harness any
+# more: `UPGRADE_NU6_3` appears nowhere in zcash/zcash — not in v6.20.0, the
+# newest release, nor on master — so a zcashd chain can never reach Ironwood
+# (NU6.3) and can never exercise the post-activation sweep path.
+#
+# NEVER POINT THIS AT A REAL NETWORK. Regtest disables proof-of-work, so
+# anything that can reach the RPC port below can mint coins at will. The
+# compose file binds it to loopback only.
+
+[network]
+network = "Regtest"
+
+# Activation heights. Height 0 is reserved for Genesis in Zebra, so 1 is the
+# earliest an upgrade may activate. These must stay in sync with
+# `ArgosParams::regtest_all_active()` in crates/zeck-core/src/workspace.rs —
+# Argos evaluates consensus branch IDs against its own copy of these heights,
+# and a mismatch means sweeps get signed for the wrong branch.
+#
+# Key names are load-bearing: the struct is `deny_unknown_fields` with
+# PascalCase serialization and explicit renames for the NU6.x series, so a
+# typo fails the config load rather than silently defaulting.
+[network.testnet_parameters.activation_heights]
+BeforeOverwinter = 1
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 1
+NU6 = 1
+"NU6.1" = 1
+"NU6.2" = 1
+"NU6.3" = 1
+
+[state]
+# Persistent, not ephemeral: setup.sh is idempotent and re-runnable, and the
+# integration tests restart the stack to exercise resume and crash-recovery
+# paths. The cache lives in a named docker volume (see docker-compose.yml).
+ephemeral = false
+# cache_dir is deliberately NOT set here. docker-compose.yml passes it as
+# ZEBRA_STATE__CACHE_DIR so the image entrypoint creates and chowns the
+# directory to the unprivileged runtime user before zebrad starts; setting it
+# only in this file would leave the mounted volume root-owned.
+
+[rpc]
+listen_addr = "0.0.0.0:18232"
+
+# lightwalletd requires a non-empty rpcuser/rpcpassword pair and sends them as
+# HTTP basic auth. Zebra's cookie auth is a different scheme and would reject
+# those credentials, so it is disabled here and the supplied values ignored.
+# Safe only because the port is loopback-bound.
+enable_cookie_auth = false
+
+[mining]
+# Coinbase recipient for the `generate` RPC. This is the funding helper's
+# throwaway account-0 transparent address, NOT the Argos test seed: coinbase
+# outputs must be shielded alone under consensus, so the helper shields these
+# and then makes ordinary transparent payments to the test seed. Keeping the
+# test seed's funds non-coinbase preserves what the pre-Zebra harness tested.
+#
+# Derived by `argos show-keys` from the funding helper's throwaway seed (the
+# all-`zoo`/`vote` BIP-39 test vector, no real funds), account 0 external:
+#   m / 44' / 1' / 0' / 0 / 0
+miner_address = "tmFzBQeQYURQartF8tcvECq1minSJwyERe2"
+
+[tracing]
+# The setup script and tests grep these logs for tip height and mining
+# progress, so keep them on stdout at info level.
+use_color = false
