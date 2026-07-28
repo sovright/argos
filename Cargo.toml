@@ -17,7 +17,7 @@ bip0039 = "0.14.0"
 clap = { version = "4.5.53", features = ["derive"] }
 dialoguer = "0.12.0"
 indicatif = "0.18.2"
-orchard = "0.14"
+orchard = "0.15"
 prost = "0.14.3"
 rand_core = "0.6.4"
 rusqlite = "0.37.0"
@@ -38,14 +38,26 @@ url = "2.5.8"
 keepawake = "0.6"
 sha2 = "0.10"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
-zcash_address = "0.12"
-zcash_client_backend = { version = "0.23", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "sync", "transparent-inputs", "transparent-key-import"] }
-zcash_client_sqlite = { version = "0.21", default-features = false, features = ["orchard", "transparent-inputs", "transparent-key-import"] }
-zcash_keys = { version = "0.14", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
-zcash_primitives = "0.28"
-zcash_proofs = { version = "0.28", default-features = false, features = ["bundled-prover"] }
-zcash_protocol = "0.9"
-zcash_transparent = { version = "0.8", default-features = false, features = ["std", "transparent-inputs"] }
+# ─── Zcash protocol stack — Ironwood (NU6.3) ──────────────────────────────────
+#
+# NU6.3 / Ironwood activates on mainnet at height 3_428_143. Consensus branch
+# IDs for that upgrade first appear in zcash_protocol 0.10.0, so anything below
+# that line signs sweeps with the NU6.2 branch ID and gets them rejected once
+# the chain passes activation.
+#
+# The wallet crates that expose it — zcash_client_backend / zcash_client_sqlite
+# — have no stable release on the 0.10 protocol line yet, only release
+# candidates. Those two are pinned with `=` rather than a caret so an RC bump
+# upstream cannot silently change what we ship; revisit both pins when 0.24.0 /
+# 0.22.0 go final.
+zcash_address = "0.13"
+zcash_client_backend = { version = "=0.24.0-rc.4", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "sync", "transparent-inputs", "transparent-key-import"] }
+zcash_client_sqlite = { version = "=0.22.0-rc.4", default-features = false, features = ["orchard", "transparent-inputs", "transparent-key-import"] }
+zcash_keys = { version = "0.16", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
+zcash_primitives = "0.30"
+zcash_proofs = { version = "0.30", default-features = false, features = ["bundled-prover"] }
+zcash_protocol = "0.10"
+zcash_transparent = { version = "0.10", default-features = false, features = ["std", "transparent-inputs"] }
 tempfile = "3.20.0"
 zip32 = "0.2.1"
 

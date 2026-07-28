@@ -18,9 +18,9 @@ use zcash_client_backend::{
     data_api::{
         chain::{error::Error as ChainError, BlockCache, BlockSource},
         scanning::ScanRange,
-        wallet::ConfirmationsPolicy,
-        Account as _, AccountBirthday, InputSource, TransparentOutputFilter, WalletRead,
-        WalletWrite, Zip32Derivation,
+        wallet::{input_selection::LockFilter, ConfirmationsPolicy},
+        Account as _, AccountBirthday, CoinbaseFilter, InputSource, WalletRead, WalletWrite,
+        Zip32Derivation,
     },
     proto::{
         compact_formats::CompactBlock,
@@ -1225,7 +1225,14 @@ pub(crate) async fn refresh_scan_progress(
                             address,
                             target_height,
                             ConfirmationsPolicy::MIN,
-                            TransparentOutputFilter::All,
+                            CoinbaseFilter::AllTransparentOutputs,
+                            // Reporting path, not a selection path: this count feeds the
+                            // recovery total shown to the user, so it must reflect
+                            // everything the wallet holds. Argos never takes output locks,
+                            // but `Unfiltered` is the upstream-sanctioned choice for
+                            // retrieval and keeps the total from silently under-reporting
+                            // if a lock ever appears.
+                            LockFilter::Unfiltered,
                         )
                         .map_err(|err| {
                             ZeckError::Wallet(format!(
@@ -2482,7 +2489,6 @@ mod tests {
             let mut hash = [0u8; 32];
             hash[..8].copy_from_slice(&height.to_le_bytes());
             CompactBlock {
-                proto_version: 1,
                 height,
                 hash: hash.to_vec(),
                 prev_hash: prev_hash.to_vec(),
@@ -2492,6 +2498,9 @@ mod tests {
                 chain_metadata: Some(ChainMetadata {
                     sapling_commitment_tree_size: sapling_tree_size,
                     orchard_commitment_tree_size: orchard_tree_size,
+                    // These fixtures model blocks below Ironwood activation, so the
+                    // Ironwood tree has not started growing yet.
+                    ironwood_commitment_tree_size: 0,
                 }),
             }
         }
