@@ -10,11 +10,12 @@ use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
         wallet::{
-            create_proposed_transactions, input_selection::GreedyInputSelector,
+            create_proposed_transactions,
+            input_selection::{GreedyInputSelector, LockedInputPolicy, SpendPolicy},
             propose_send_max_transfer, propose_shielding, propose_transfer, ConfirmationsPolicy,
             SpendingKeys,
         },
-        MaxSpendMode, TransactionStatus, TransparentOutputFilter, WalletRead, WalletWrite,
+        CoinbaseFilter, MaxSpendMode, TransactionStatus, WalletRead, WalletWrite,
     },
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
     proto::service::{
@@ -37,7 +38,7 @@ use zcash_primitives::transaction::{
     TxId,
 };
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, ShieldedProtocol};
+use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, ShieldedPool};
 
 use crate::{
     address::validate_destination_address,
@@ -636,8 +637,7 @@ fn build_sweep_proposal(
     if let Some(max_fee_zatoshis) = request.max_fee_zatoshis {
         if total_fee_zatoshis > max_fee_zatoshis {
             return Err(ZeckError::MaxFeeExceeded(format!(
-                "estimated fee {} zats exceeds limit {} zats",
-                total_fee_zatoshis, max_fee_zatoshis
+                "estimated fee {total_fee_zatoshis} zats exceeds limit {max_fee_zatoshis} zats"
             )));
         }
     }
@@ -1040,7 +1040,11 @@ fn standard_zip317_change_strategy<I>() -> SingleOutputChangeStrategy<I> {
     SingleOutputChangeStrategy::<I>::new(
         StandardFeeRule::Zip317,
         None,
-        ShieldedProtocol::Orchard,
+        // Fallback change pool only. From Ironwood (NU6.3) activation the turnstile
+        // forbids value entering the Orchard pool, and the change strategy coerces this
+        // fallback to Ironwood for those transactions; below activation it still means
+        // Orchard, as before.
+        ShieldedPool::Orchard,
         DustOutputPolicy::default(),
     )
 }
@@ -1065,7 +1069,10 @@ async fn execute_shielding_step(
         &tracked_account.transparent_receivers,
         tracked_account.wallet_account_id,
         ConfirmationsPolicy::MIN,
-        TransparentOutputFilter::All,
+        CoinbaseFilter::AllTransparentOutputs,
+        // Argos is a single-process recovery tool with no concurrent proposals, so it
+        // takes no advisory input locks.
+        None,
     ) {
         Ok(proposal) => proposal,
         Err(err) => {
@@ -1125,6 +1132,8 @@ async fn execute_shielding_step(
         &SpendingKeys::new(usk.clone(), standalone_keys),
         OvkPolicy::Sender,
         &proposal,
+        // No explicit expiry override; keep the library's default expiry.
+        None,
     )
     .map_err(|err| ZeckError::TransactionBuild(format!("creating shielding transaction: {err}")))?;
 
@@ -1259,6 +1268,21 @@ fn build_donation_split_proposal(
             &change_strategy,
             request,
             ConfirmationsPolicy::MIN,
+            // This split runs after shielding, so it spends shielded value only —
+            // matching the pre-0.24 behaviour, where `propose_transfer` had no policy
+            // argument and drew on the shielded pools alone. Ironwood is included for
+            // the same reason it is in the sweep proposal: post-NU6.3 value can live
+            // there.
+            &SpendPolicy::shielded_pools([
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
+            ]),
+            // No advisory input locks; no transaction-version override, so the library
+            // selects the version required at the target height (V6 from Ironwood
+            // activation onward).
+            None,
+            None,
         ) {
             Ok(proposal) => {
                 let fee = proposal_fee_zatoshis(&proposal)?;
@@ -1311,12 +1335,23 @@ async fn execute_send_max_step(
         &mut wallet_db,
         &consensus_network(ctx.network),
         tracked_account.wallet_account_id,
-        &[ShieldedProtocol::Sapling, ShieldedProtocol::Orchard],
+        // Argos sweeps an account empty, so every shielded pool a recovered wallet can
+        // hold value in must be spendable. Ironwood joins the list at NU6.3: funds
+        // landing there after activation would otherwise be left behind by a sweep that
+        // reported success.
+        &[
+            ShieldedPool::Sapling,
+            ShieldedPool::Orchard,
+            ShieldedPool::Ironwood,
+        ],
         &StandardFeeRule::Zip317,
         destination_address.clone(),
         memo_bytes.clone(),
         MaxSpendMode::MaxSpendable,
         ConfirmationsPolicy::MIN,
+        // Argos takes no advisory input locks; never draw on another holder's.
+        &LockedInputPolicy::Exclude,
+        None,
     ) {
         Ok(proposal) => proposal,
         Err(err) => {
@@ -1416,6 +1451,8 @@ async fn execute_send_max_step(
         &SpendingKeys::from_unified_spending_key(usk.clone()),
         OvkPolicy::Sender,
         &proposal,
+        // No explicit expiry override; keep the library's default expiry.
+        None,
     )
     .map_err(|err| ZeckError::TransactionBuild(format!("creating sweep transaction: {err}")))?;
 
@@ -1768,8 +1805,7 @@ fn enforce_max_fee(total_fee_zatoshis: u64, max_fee_zatoshis: Option<u64>) -> Ze
     if let Some(max_fee_zatoshis) = max_fee_zatoshis {
         if total_fee_zatoshis > max_fee_zatoshis {
             return Err(ZeckError::MaxFeeExceeded(format!(
-                "actual fee {} zats exceeds limit {} zats",
-                total_fee_zatoshis, max_fee_zatoshis
+                "actual fee {total_fee_zatoshis} zats exceeds limit {max_fee_zatoshis} zats"
             )));
         }
     }

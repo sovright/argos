@@ -65,10 +65,6 @@ criteria = "safe-to-deploy"
 version = "3.0.11"
 criteria = "safe-to-deploy"
 
-[[exemptions.anyhow]]
-version = "1.0.103"
-criteria = "safe-to-deploy"
-
 [[exemptions.arrayref]]
 version = "0.3.9"
 criteria = "safe-to-deploy"
@@ -501,6 +497,10 @@ criteria = "safe-to-deploy"
 version = "1.1.9"
 criteria = "safe-to-deploy"
 
+[[exemptions.flume]]
+version = "0.11.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.funty]]
 version = "2.0.0"
 criteria = "safe-to-deploy"
@@ -905,6 +905,10 @@ criteria = "safe-to-deploy"
 version = "0.10.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.nanorand]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.ndk]]
 version = "0.9.0"
 criteria = "safe-to-deploy"
@@ -945,10 +949,6 @@ criteria = "safe-to-deploy"
 version = "0.3.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.objc2-core-graphics]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.objc2-exception-helper]]
 version = "0.1.1"
 criteria = "safe-to-deploy"
@@ -981,6 +981,10 @@ criteria = "safe-to-deploy"
 version = "5.3.5"
 criteria = "safe-to-deploy"
 
+[[exemptions.orchard]]
+version = "0.15.3"
+criteria = "safe-to-deploy"
+
 [[exemptions.ordered-stream]]
 version = "0.2.0"
 criteria = "safe-to-deploy"
@@ -1011,6 +1015,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.pbkdf2]]
 version = "0.12.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.pczt]]
+version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.petgraph]]
@@ -2079,6 +2087,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zbus_names]]
 version = "4.3.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.zcash_pool_migration]]
+version = "0.1.0-rc.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]

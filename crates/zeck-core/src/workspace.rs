@@ -145,7 +145,7 @@ fn derive_workspace_id(
     let digest = hasher.finalize();
     let mut out = String::with_capacity(32);
     for byte in digest.iter().take(16) {
-        out.push_str(&format!("{:02x}", byte));
+        out.push_str(&format!("{byte:02x}"));
     }
     out
 }
