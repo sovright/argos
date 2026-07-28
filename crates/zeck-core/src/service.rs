@@ -637,8 +637,7 @@ fn build_sweep_proposal(
     if let Some(max_fee_zatoshis) = request.max_fee_zatoshis {
         if total_fee_zatoshis > max_fee_zatoshis {
             return Err(ZeckError::MaxFeeExceeded(format!(
-                "estimated fee {} zats exceeds limit {} zats",
-                total_fee_zatoshis, max_fee_zatoshis
+                "estimated fee {total_fee_zatoshis} zats exceeds limit {max_fee_zatoshis} zats"
             )));
         }
     }
@@ -1806,8 +1805,7 @@ fn enforce_max_fee(total_fee_zatoshis: u64, max_fee_zatoshis: Option<u64>) -> Ze
     if let Some(max_fee_zatoshis) = max_fee_zatoshis {
         if total_fee_zatoshis > max_fee_zatoshis {
             return Err(ZeckError::MaxFeeExceeded(format!(
-                "actual fee {} zats exceeds limit {} zats",
-                total_fee_zatoshis, max_fee_zatoshis
+                "actual fee {total_fee_zatoshis} zats exceeds limit {max_fee_zatoshis} zats"
             )));
         }
     }
