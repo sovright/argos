@@ -18,7 +18,7 @@ publish = false
 # Deliberately a dev/test-only escape hatch: production builds compile this
 # out, so a hostile mainnet lightwalletd cannot claim to be `regtest` to
 # bypass network validation in a released Argos binary.
-argos-network = []
+argos-network = ["zcash_protocol/local-consensus"]
 
 [dependencies]
 anyhow.workspace = true
