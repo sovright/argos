@@ -56,7 +56,21 @@ pub fn validate_destination_address(
 
     let (address_net, _) = decoded.expect("is_unified implies decode succeeded");
     let expected_net = network_type(network);
-    if address_net != expected_net {
+
+    // The regtest harness derives destinations under regtest parameters, so
+    // they carry the `uregtest` HRP while the scan's network is testnet.
+    // Accept that pairing only when regtest consensus parameters have actually
+    // been installed in this process — a deliberate local act, not something
+    // an address or a server can assert — and only in `argos-network` builds.
+    // A released binary still rejects every regtest address outright.
+    #[cfg(feature = "argos-network")]
+    let regtest_harness_destination = expected_net == NetworkType::Test
+        && address_net == NetworkType::Regtest
+        && crate::workspace::regtest_consensus_params_installed();
+    #[cfg(not(feature = "argos-network"))]
+    let regtest_harness_destination = false;
+
+    if address_net != expected_net && !regtest_harness_destination {
         return Err(ZeckError::WrongNetwork {
             expected: network_type_label(expected_net).to_owned(),
             actual: network_type_label(address_net).to_owned(),

@@ -225,6 +225,17 @@ pub fn set_regtest_consensus_params(params: LocalNetwork) -> ZeckResult<()> {
     }
 }
 
+/// Whether [`set_regtest_consensus_params`] has been called in this process.
+///
+/// Used to gate the harness's relaxation of lightwalletd network validation.
+/// This is a strictly stronger signal than the chain name the server reports:
+/// it reflects a deliberate local act, so a hostile server cannot talk its way
+/// into the relaxation by naming itself `regtest`.
+#[cfg(feature = "argos-network")]
+pub fn regtest_consensus_params_installed() -> bool {
+    REGTEST_PARAMS.get().is_some()
+}
+
 pub fn consensus_network(network: ZeckNetwork) -> ArgosParams {
     #[cfg(feature = "argos-network")]
     if let Some(params) = REGTEST_PARAMS.get() {

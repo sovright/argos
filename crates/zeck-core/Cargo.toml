@@ -91,3 +91,11 @@ required-features = ["argos-network"]
 name = "argos-sweep-helper"
 path = "tests/bin/argos_sweep_helper.rs"
 required-features = ["argos-network"]
+
+# Replaces zcashd's `sendtoaddress` for funding the test seed: Zebra has no
+# wallet RPCs, and coinbase may not be spent to a transparent address, so
+# funding shields the funder's coinbase straight to the test seed instead.
+[[bin]]
+name = "argos-regtest-funder"
+path = "tests/bin/argos_regtest_funder.rs"
+required-features = ["argos-network"]
