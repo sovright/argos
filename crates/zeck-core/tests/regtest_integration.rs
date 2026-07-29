@@ -1459,6 +1459,14 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
 /// hard test-setup error (docker missing, container down, zcash-cli
 /// returning non-zero) — the C2 tests are already `#[ignore]`'d so the
 /// panic only surfaces under `cargo test --ignored`.
+/// NOTE: stale since the Zebra migration. The default below shells into
+/// `argos-zcashd-regtest`, a container the harness no longer starts, so every
+/// caller of this helper fails until it is ported. Its only caller is the
+/// reorg test, which is stale for a second reason anyway — it expects a
+/// transparent-funded seed, and funding is now shielded coinbase (see
+/// tests/regtest/README.md). Porting means talking JSON-RPC to Zebra instead
+/// of `zcash-cli`; note Zebra does not implement `invalidateblock`, so the
+/// reorg has to be produced differently.
 fn zcashd_cli(args: &[&str]) -> String {
     let wrapper = std::env::var("ARGOS_REGTEST_ZCASH_CLI").unwrap_or_else(|_| {
         "docker exec argos-zcashd-regtest zcash-cli -conf=/srv/zcashd/.zcash/zcash.conf".to_owned()
@@ -2289,5 +2297,224 @@ async fn argos_sweep_helper_smoke() {
     assert!(
         status.success(),
         "[regtest] sweep-helper exit status was not success: {status:?}"
+    );
+}
+
+// ─── Post-Ironwood sweep ───────────────────────────────────────────────────
+//
+// The reason the harness moved from zcashd to Zebra. zcashd has no NU6.3, so
+// this scenario was unreachable: `UPGRADE_NU6_3` appears nowhere in
+// zcash/zcash, not even on master.
+//
+// What it guards: from Ironwood activation, a sweep must be signed with the
+// NU6.3 consensus branch ID (0x37a5165b). Argos resolved consensus parameters
+// from `ZeckNetwork` alone, so against a regtest chain it used *testnet*
+// activation heights — under which a few-hundred-block chain resolves to a
+// pre-NU5 branch. Scanning tolerates that; a sweep does not. The node rejects
+// the transaction outright. A green result here means the branch ID Argos
+// signed with is the one Zebra expects.
+
+/// Re-encode a testnet-encoded address under the harness's regtest
+/// parameters. `argos show-keys` and `derive_accounts` emit `utest1...`, while
+/// the regtest parameter set expects `uregtest1...`; the receivers are
+/// identical, only the HRP differs.
+#[cfg(feature = "argos-network")]
+fn regtest_encoded_unified_address(seed: &str) -> String {
+    use argos_core::workspace::consensus_network;
+    use zcash_keys::address::Address;
+
+    let accounts = argos_core::derive_accounts(
+        &secrecy::SecretString::new(seed.to_owned()),
+        argos_core::ZeckNetwork::Testnet,
+        1,
+    )
+    .expect("deriving destination accounts");
+
+    let address = Address::decode(
+        &zcash_protocol::consensus::Network::TestNetwork,
+        &accounts[0].unified_address,
+    )
+    .expect("argos produced an undecodable unified address");
+
+    address.encode(&consensus_network(argos_core::ZeckNetwork::Testnet))
+}
+
+#[tokio::test]
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[cfg(feature = "argos-network")]
+async fn post_ironwood_sweep_is_accepted_by_the_node() {
+    use argos_core::workspace::{regtest_local_network, set_regtest_consensus_params};
+    use argos_core::{RecoveryService, ScanConfig, ScanPhase, SweepRequest, ZeckNetwork};
+
+    let harness = RegtestHarness::require();
+
+    // Install regtest activation heights before anything derives a branch ID.
+    // Without this the sweep below is signed for a pre-NU5 branch and the node
+    // rejects it — which is precisely the regression under test.
+    set_regtest_consensus_params(regtest_local_network())
+        .expect("installing regtest consensus parameters");
+
+    // Fund inside the test rather than relying on setup.sh having run. The
+    // sweep spends everything it finds, so a second run would otherwise find
+    // an empty wallet — or worse, collide with the first run's transaction
+    // still sitting in the mempool. Topping up here keeps the test
+    // independently re-runnable against a long-lived chain.
+    fund_test_seed_with_shielded_coinbase().await;
+
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan(
+            ScanConfig {
+                birthday: 1,
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_path_buf(),
+                network: ZeckNetwork::Testnet,
+                label: "post-ironwood-sweep".to_owned(),
+            },
+            secrecy::SecretString::new(harness.test_seed().to_owned()),
+        )
+        .await
+        .expect("starting scan");
+
+    let discovered: u64 = loop {
+        let progress = service
+            .get_scan_progress(&handle)
+            .await
+            .expect("polling scan");
+        match progress.phase {
+            ScanPhase::Complete => break progress.discoveries.iter().map(|d| d.zatoshis).sum(),
+            ScanPhase::Error => panic!(
+                "scan failed: {}",
+                progress
+                    .error
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no error set".to_owned())
+            ),
+            ScanPhase::Cancelled => panic!("scan was cancelled"),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+        }
+    };
+
+    assert!(
+        discovered > 0,
+        "test seed holds no funds — run tests/regtest/setup.sh to fund it with \
+         shielded coinbase before running this test"
+    );
+
+    // Sweep everything to a destination the test seed does not control. The
+    // funder mnemonic is reused purely as a convenient unrelated identity.
+    let destination = regtest_encoded_unified_address(
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo \
+         zoo zoo vote",
+    );
+
+    // Nothing mines on regtest unless we ask it to, so the sweep's
+    // wait-for-confirmation window would otherwise always expire and report
+    // `pending`. Mine alongside the sweep so confirmation is actually
+    // observed and the assertion below can demand the stronger status.
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+
+    let outcome = service
+        .execute_sweep(
+            &handle,
+            SweepRequest {
+                destination,
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("sweep must not error");
+    mining.abort();
+
+    assert!(
+        !outcome.transactions.is_empty(),
+        "sweep broadcast nothing despite {discovered} zatoshis discovered; skipped: {:?}",
+        outcome.skipped_accounts
+    );
+
+    // The load-bearing assertion. Reaching the node at all means the
+    // transaction was built, proved and signed; being accepted means it
+    // carried the Ironwood consensus branch ID rather than a pre-NU5 one.
+    //
+    // `confirmed` is the strong outcome (the node mined it); `broadcast` means
+    // accepted into the mempool but not yet mined. Both prove the branch ID was
+    // right. `pending` means the confirmation window expired, which happens if
+    // the background miner above is not keeping up, and a rejected branch ID
+    // would have surfaced as an `Err` from `execute_sweep` rather than reaching
+    // here at all.
+    for tx in &outcome.transactions {
+        assert!(
+            matches!(tx.status.as_str(), "confirmed" | "broadcast"),
+            "post-Ironwood sweep was not accepted by the node: {} — {}",
+            tx.status,
+            tx.detail
+        );
+        assert!(tx.txid.is_some(), "accepted sweep has no txid: {tx:?}");
+    }
+}
+
+/// Mine `blocks` blocks on the harness chain via Zebra's JSON-RPC. Regtest
+/// disables proof of work, so `generate` returns as soon as the blocks are
+/// committed. Zebra runs with cookie auth disabled, so no credentials are sent.
+#[cfg(feature = "argos-network")]
+async fn zebra_generate(url: &str, blocks: u32) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host_port = url.strip_prefix("http://").unwrap_or(url).trim_end_matches('/');
+    let payload = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{blocks}]}}"#
+    );
+    let mut stream = tokio::net::TcpStream::connect(host_port).await?;
+    stream
+        .write_all(
+            format!(
+                "POST / HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut sink = Vec::new();
+    stream.read_to_end(&mut sink).await?;
+    Ok(())
+}
+
+/// Mine shielded coinbase to the Argos test seed and then past maturity, by
+/// running the same `argos-regtest-funder` helper `setup.sh` uses. Keeping the
+/// funding in one place means the test and the documented setup path cannot
+/// drift apart.
+#[cfg(feature = "argos-network")]
+async fn fund_test_seed_with_shielded_coinbase() {
+    let zebra_rpc_url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_argos-regtest-funder"))
+        .env("ARGOS_REGTEST_FUND_SEED", RegtestHarness::require().test_seed())
+        .arg("--zebra-rpc-url")
+        .arg(&zebra_rpc_url)
+        .arg("--blocks")
+        .arg("2")
+        .output()
+        .await
+        .expect("spawning argos-regtest-funder");
+
+    assert!(
+        output.status.success(),
+        "funding the test seed failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -148,7 +148,7 @@ fn execution_donation_address(network: crate::models::ZeckNetwork) -> String {
 /// The concrete wallet database type used throughout the execution path.
 type SweepWalletDb = WalletDb<
     rusqlite::Connection,
-    zcash_protocol::consensus::Network,
+    crate::workspace::ArgosParams,
     SystemClock,
     rand_core::OsRng,
 >;
@@ -1476,7 +1476,7 @@ async fn execute_send_max_step(
 async fn broadcast_transactions(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
-        zcash_protocol::consensus::Network,
+        crate::workspace::ArgosParams,
         SystemClock,
         rand_core::OsRng,
     >,
@@ -1644,7 +1644,7 @@ fn normalized_endpoint_authority(endpoint: &str) -> String {
 async fn wait_for_confirmation(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
-        zcash_protocol::consensus::Network,
+        crate::workspace::ArgosParams,
         SystemClock,
         rand_core::OsRng,
     >,
@@ -1846,7 +1846,7 @@ fn shielded_spendable_zatoshis(
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_shielded_funds_to_confirm(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     zeck_network: crate::models::ZeckNetwork,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     lightwalletd_url: &str,

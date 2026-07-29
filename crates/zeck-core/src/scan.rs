@@ -952,7 +952,7 @@ async fn stall_watchdog(state: &SharedScanTaskState) -> ZeckError {
 /// never loses to a coincidentally-tripping watchdog.
 async fn run_wallet_sync_with_stall_watchdog(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
@@ -985,7 +985,7 @@ fn retry_budget_after_failure(
 /// Permanent errors (wallet database corruption, etc.) are returned immediately.
 pub(crate) async fn run_wallet_sync_with_retry(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     zeck_network: crate::models::ZeckNetwork,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     lightwalletd_url: &str,
@@ -1138,7 +1138,7 @@ async fn probe_valid_lightwalletd_endpoints_once(
 
 pub(crate) async fn run_wallet_sync<ChT>(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     client: &mut CompactTxStreamerClient<ChT>,
 ) -> ZeckResult<()>
 where

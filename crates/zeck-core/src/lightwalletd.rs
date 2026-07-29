@@ -254,15 +254,24 @@ pub fn validate_lightwalletd_network(network: ZeckNetwork, info: &LightdInfo) ->
         )));
     }
 
-    // Skip the Sapling-activation-height check when the server identifies
-    // itself as regtest: regtest activates Sapling at height 1 (via the
-    // `nuparams=sapling:1` style config in tests/regtest/zcashd-regtest.conf),
-    // which deliberately differs from public testnet's 280 000. Gated on
-    // the feature so a non-argos-network build still enforces the testnet
-    // activation height even if the chain name match relaxed somehow.
+    // Skip the Sapling-activation-height check on the regtest harness, whose
+    // chain activates Sapling at height 1 (see
+    // tests/regtest/zebrad-regtest.toml) rather than public testnet's 280 000.
+    //
+    // The condition is anchored on `regtest_consensus_params_installed()` — a
+    // deliberate local act — rather than on the chain name alone, so a hostile
+    // server cannot opt itself into the relaxation just by calling itself
+    // `regtest`. The chain name is still required to be a regtest-ish one.
+    //
+    // Both names are accepted because the harness node changed: zcashd
+    // reported `regtest`, while Zebra reports Regtest as `test`.
+    //
+    // Gated on the feature so a non-argos-network build still enforces the
+    // testnet activation height even if the chain name match relaxed somehow.
     #[cfg(feature = "argos-network")]
-    let skip_sapling_check =
-        matches!(network, ZeckNetwork::Testnet) && chain_name == "regtest";
+    let skip_sapling_check = matches!(network, ZeckNetwork::Testnet)
+        && crate::workspace::regtest_consensus_params_installed()
+        && matches!(chain_name.as_str(), "regtest" | "test");
     #[cfg(not(feature = "argos-network"))]
     let skip_sapling_check = false;
 
