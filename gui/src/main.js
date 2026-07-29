@@ -2039,6 +2039,19 @@ $("restart-flow").addEventListener("click", () => {
 
 // ─── Donate ───────────────────────────────────────────────────────────────────
 
+(async function initAppVersion() {
+  try {
+    const version = await invoke("app_version");
+    if (version) {
+      $("app-version").textContent = `Version ${version}`;
+    }
+  } catch (err) {
+    // Leave the element empty. A missing version line is strictly better than
+    // a wrong one: the whole point is answering "which build am I running".
+    console.error("app_version failed:", err);
+  }
+})();
+
 (async function initDonate() {
   try {
     const addr = await invoke("donation_address");
