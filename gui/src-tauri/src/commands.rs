@@ -262,6 +262,21 @@ pub fn donation_address() -> String {
     argos_core::DONATION_ADDRESS.to_owned()
 }
 
+/// The running build's version, for the sidebar.
+///
+/// Support answers increasingly begin "check your version" — most immediately
+/// because builds before 1.1.0 cannot complete a sweep now that Ironwood
+/// (NU6.3) has activated at mainnet height 3_428_143. Someone hitting that has
+/// a wallet that scans correctly and a sweep that fails, and no way to tell
+/// from inside the app which build they are on.
+///
+/// Reports the compiled-in package version rather than anything read at
+/// runtime, so it always describes the binary actually executing.
+#[tauri::command]
+pub fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
+}
+
 /// Exact set of external URLs the UI is allowed to open in the OS browser.
 ///
 /// This is the egress allowlist that replaces the broad `opener:default`
@@ -763,6 +778,21 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sidebar version is a support-facing claim about which binary is
+    /// running, so it must be a real, non-empty version rather than a
+    /// placeholder that silently ships as "0.0.0" or "".
+    #[test]
+    fn app_version_reports_the_compiled_package_version() {
+        let reported = app_version();
+        assert_eq!(reported, env!("CARGO_PKG_VERSION"));
+        assert!(!reported.is_empty(), "version must not be empty");
+        assert!(
+            reported.split('.').count() >= 3,
+            "expected a semver-shaped version, got {reported:?}"
+        );
+        assert_ne!(reported, "0.0.0", "version must not be a placeholder");
+    }
 
     fn temp_workspace() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

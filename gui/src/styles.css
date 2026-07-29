@@ -1094,3 +1094,15 @@ select {
 .donate-collapsed #donate-amount-preview {
   display: none;
 }
+
+/* Sidebar build version. Quiet by default — it is reference information, not
+   a call to action — but selectable so it can be pasted into a support
+   message verbatim. */
+.sidebar-version {
+  margin: 8px 0 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.55;
+  user-select: text;
+  cursor: text;
+}

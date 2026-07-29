@@ -39,6 +39,7 @@ fn main() {
             commands::list_incomplete_sessions,
             commands::resume_session,
             commands::donation_address,
+            commands::app_version,
             commands::open_external_url,
             commands::tos_status,
             commands::accept_tos,
