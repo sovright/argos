@@ -1459,6 +1459,14 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
 /// hard test-setup error (docker missing, container down, zcash-cli
 /// returning non-zero) — the C2 tests are already `#[ignore]`'d so the
 /// panic only surfaces under `cargo test --ignored`.
+/// NOTE: stale since the Zebra migration. The default below shells into
+/// `argos-zcashd-regtest`, a container the harness no longer starts, so every
+/// caller of this helper fails until it is ported. Its only caller is the
+/// reorg test, which is stale for a second reason anyway — it expects a
+/// transparent-funded seed, and funding is now shielded coinbase (see
+/// tests/regtest/README.md). Porting means talking JSON-RPC to Zebra instead
+/// of `zcash-cli`; note Zebra does not implement `invalidateblock`, so the
+/// reorg has to be produced differently.
 fn zcashd_cli(args: &[&str]) -> String {
     let wrapper = std::env::var("ARGOS_REGTEST_ZCASH_CLI").unwrap_or_else(|_| {
         "docker exec argos-zcashd-regtest zcash-cli -conf=/srv/zcashd/.zcash/zcash.conf".to_owned()
@@ -2346,6 +2354,13 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
     set_regtest_consensus_params(regtest_local_network())
         .expect("installing regtest consensus parameters");
 
+    // Fund inside the test rather than relying on setup.sh having run. The
+    // sweep spends everything it finds, so a second run would otherwise find
+    // an empty wallet — or worse, collide with the first run's transaction
+    // still sitting in the mempool. Topping up here keeps the test
+    // independently re-runnable against a long-lived chain.
+    fund_test_seed_with_shielded_coinbase().await;
+
     let data_dir = tempfile::tempdir().expect("temp data dir");
     let service = RecoveryService::new();
     let handle = service
@@ -2476,4 +2491,30 @@ async fn zebra_generate(url: &str, blocks: u32) -> std::io::Result<()> {
     let mut sink = Vec::new();
     stream.read_to_end(&mut sink).await?;
     Ok(())
+}
+
+/// Mine shielded coinbase to the Argos test seed and then past maturity, by
+/// running the same `argos-regtest-funder` helper `setup.sh` uses. Keeping the
+/// funding in one place means the test and the documented setup path cannot
+/// drift apart.
+#[cfg(feature = "argos-network")]
+async fn fund_test_seed_with_shielded_coinbase() {
+    let zebra_rpc_url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_argos-regtest-funder"))
+        .env("ARGOS_REGTEST_FUND_SEED", RegtestHarness::require().test_seed())
+        .arg("--zebra-rpc-url")
+        .arg(&zebra_rpc_url)
+        .arg("--blocks")
+        .arg("2")
+        .output()
+        .await
+        .expect("spawning argos-regtest-funder");
+
+    assert!(
+        output.status.success(),
+        "funding the test seed failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
