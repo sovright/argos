@@ -178,16 +178,17 @@
             <details open>
               <summary>The sweep fails but the scan found my funds</summary>
               <p>
-                If your balance appears correctly but the sweep is rejected, check your Argos
-                version first. Zcash activates the Ironwood network upgrade (NU6.3) at mainnet
-                block <strong>3,428,143</strong>. From that block onward, versions of Argos before
-                <strong>1.1.0</strong> build sweep transactions the network no longer accepts.
+                Check your Argos version first. Zcash activated the Ironwood network upgrade
+                (NU6.3) at mainnet block <strong>3,428,143</strong>. Versions of Argos before
+                <strong>1.1.0</strong> build sweep transactions the network no longer accepts, so
+                the sweep is rejected.
               </p>
               <p>
                 Scanning is unaffected, which is what makes this confusing: your funds are found
                 and displayed normally, and only the final sweep fails. Nothing is lost, and no
-                funds move. <a href="index.html#download">Download the current version</a> and run
-                the recovery again.
+                funds move — the rejected transaction never took effect.
+                <a href="index.html#download">Download the current version</a> and run the
+                recovery again.
               </p>
             </details>
             <details>
