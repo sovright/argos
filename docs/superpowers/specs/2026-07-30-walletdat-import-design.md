@@ -111,10 +111,34 @@ Consequences that sub-spec 3 must design for, not discover:
 4. **The Sapling hop is a visible turnstile crossing.** Value entering and
    leaving the Sapling pool is public even though the addresses are not. This
    belongs in the threat model's privacy discussion for sub-spec 3.
-5. **Whether V4 transactions are still accepted post-Ironwood is a live
-   question** and gates the entire sub-spec. If a future upgrade stops accepting
-   V4, Sprout becomes permanently unspendable by anyone. Verify against current
-   consensus before committing to the sub-spec 3 plan.
+5. **V4 transactions remain accepted after Ironwood** (confirmed by Zaki,
+   2026-07-30). This was the question gating the entire sub-spec: Sprout exists
+   only in V4, so if a future upgrade stopped accepting that version, Sprout
+   would become permanently unspendable by anyone and no amount of key recovery
+   would help. It does not, so the recovery path is real.
+
+### Sprout is a closed pool, but not a sealed one
+
+Two findings taken together describe the situation precisely, and they point in
+opposite directions:
+
+- **Nothing can enter Sprout.** zcashd refuses all inbound transfers —
+  `z_sendmany` to a Sprout address fails with *"Sending funds into the Sprout
+  pool is no longer supported"*, independent of the configured Canopy
+  activation height. Established by attempting exactly that while generating
+  test fixtures; see `tests/regtest/fixtures/README.md`.
+- **Value can still leave**, because V4 is still accepted.
+
+So every Sprout note in existence predates November 2020, the set is closed and
+shrinking, and the funds are recoverable — but only by software that can build
+a V4 transaction with a JoinSplit. zcashd could, and is end-of-life; nothing
+else does.
+
+One practical consequence for sub-spec 3: any witness cached in a wallet file is
+at least five years stale, so bringing it forward means replaying every Sprout
+commitment since it was written. That is cheaper than indexing from genesis, but
+it is not the shortcut the note-preservation work was hoping for. The cached
+witness gives a starting height, not a finished answer.
 
 ## Decisions
 
@@ -469,6 +493,8 @@ Carried forward; none block sub-spec 1 implementation.
 
 1. **Full-block source for sub-spec 3** — Zebra `getblock` endpoint, explorer
    API, or something else. Decide in sub-spec 3's brainstorm.
+   (Resolved separately: V4 transactions remain accepted post-Ironwood, so the
+   sub-spec is worth building.)
 2. **Are wallet.dat's cached `SproutWitness` values usable** after being brought
    forward? Determines whether sub-spec 3 must index from genesis.
 3. **Licensing of the ZeWIF repos.** Not a dependency blocker any more given
