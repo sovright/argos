@@ -2621,7 +2621,7 @@ pub fn import_wallet_file(
 ) -> Result<ImportedKeys, ImportError> {
     match sniff::sniff(bytes)? {
         WalletFormat::Zcashd => zcashd::import_zcashd(bytes, passphrase),
-        WalletFormat::ZecwalletLite => zwl::import_zwl(bytes),
+        WalletFormat::ZecwalletLite => zwl::import_zwl(bytes, passphrase),
     }
 }
 ```
@@ -2663,9 +2663,33 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `ImportedKeys` (Task 7), `ImportError` (Task 1)
-- Produces: `pub fn import_zwl(bytes: &[u8]) -> Result<ImportedKeys, ImportError>`
+- Produces: `pub fn import_zwl(bytes: &[u8], passphrase: Option<&SecretString>) -> Result<ImportedKeys, ImportError>`
 
-**Before starting:** ZecWallet Lite's format has no magic number and no in-repo fixture. Read `zingolabs/zewif-zwl` and the original `zecwallet-light-cli` `lightwallet/mod.rs` to confirm the version-prefixed layout. If the layout cannot be confirmed, stop and report rather than guessing — a wrong parser here silently produces wrong keys.
+**Layout confirmed 2026-07-30** against `zingolabs/zewif-zwl` (default branch is `master`, not `main`). Read these two files before writing code — they are the authority:
+
+- `src/zwl_parser.rs` — top-level file layout
+- `src/keys.rs` — the `Keys` struct, which is what this task extracts
+
+Confirmed structure, all little-endian:
+
+```
+u64            external_version      (max known: 31, from ZwlParser::serialized_version)
+Keys:
+  u64          keys version          (its own version word, checked separately)
+  u8           encrypted flag
+  [u8; 48]     enc_seed              (encrypted seed when locked)
+  Vector<u8>   nonce
+  Vector<WalletOKey>  okeys          (only when keys version > 21)
+  Vector<WalletZKey>  zkeys
+  Vector<WalletTKey>  tkeys          (only when keys version > 20; older versions
+                                      use a separate extsks/extfvks/taddresses path)
+Vector<CompactBlockData>  blocks
+... transactions, chain name, options, birthday, tree state, price info
+```
+
+`Vector::read` is length-prefixed via `zcash_encoding`. Only the version word and the key vectors matter for this task; everything after `Keys` can be ignored.
+
+**ZWL wallets can be encrypted.** The `encrypted` flag, `enc_seed`, and `nonce` exist for exactly that reason, so this task's signature takes a passphrase like the zcashd path does. Do not assume ZWL is always plaintext.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2724,17 +2748,25 @@ Prepend to `crates/argos-wallet-import/src/zwl.rs`:
 
 use crate::{error::ImportError, keys::ImportedKeys};
 
-/// Highest ZWL wallet version this parser understands. Refusing a newer
-/// file is safer than misreading it: a wrong parse yields wrong keys
-/// silently, which is worse than a clear failure.
-const MAX_SUPPORTED_VERSION: u64 = 25;
+/// Highest ZWL wallet version this parser understands, matching
+/// `ZwlParser::serialized_version()` in zingolabs/zewif-zwl. Refusing a
+/// newer file is safer than misreading it: a wrong parse yields wrong
+/// keys silently, which is worse than a clear failure.
+const MAX_SUPPORTED_VERSION: u64 = 31;
 
 fn unreadable(msg: impl Into<String>) -> ImportError {
     ImportError::UnwalkableBtree(msg.into())
 }
 
 /// Parse a ZecWallet Lite wallet file.
-pub fn import_zwl(bytes: &[u8]) -> Result<ImportedKeys, ImportError> {
+///
+/// Takes a passphrase because ZWL wallets carry their own `encrypted`
+/// flag and an `enc_seed`; a locked wallet's keys are unreadable without
+/// it.
+pub fn import_zwl(
+    bytes: &[u8],
+    passphrase: Option<&SecretString>,
+) -> Result<ImportedKeys, ImportError> {
     let head = bytes
         .get(0..8)
         .ok_or_else(|| unreadable("file is too short to contain a ZWL version"))?;
@@ -2766,26 +2798,30 @@ pub fn import_zwl(bytes: &[u8]) -> Result<ImportedKeys, ImportError> {
 
 **The code above is a skeleton, not the deliverable. Do not commit it as written.**
 
-Decided before execution: confirm the layout or report BLOCKED. Concretely:
+The layout is confirmed (see the block at the top of this task), so this is
+implementable — the earlier BLOCKED contingency no longer applies to the
+layout question. Implement, in order:
 
-1. Read `zingolabs/zewif-zwl` and the original `zecwallet-light-cli`
-   `lightwallet/mod.rs` to establish the on-disk layout of the transparent
-   and Sapling key vectors.
-2. If you can establish it, implement real extraction, delete the `warn!`,
-   and write tests that recover known keys.
-3. If you **cannot** establish it with confidence, stop and report
-   **BLOCKED** with what you found and what remains unknown. Do not commit
-   a parser that returns zero keys.
+1. Read the `external_version` word and reject anything above 31.
+2. Parse the `Keys` struct: its own version word, the `encrypted` flag,
+   `enc_seed`, and `nonce`.
+3. If `encrypted` is set and no passphrase was supplied, return
+   `ImportError::WrongPassphrase` — the same contract the zcashd path uses
+   for a locked wallet with no passphrase.
+4. Read the `zkeys` and `tkeys` vectors (and `okeys` when the keys version
+   is above 21), honouring the version gates listed above.
+5. Delete the `warn!` and write tests that recover known keys.
 
-A wallet that silently reports "no keys found" tells a user their funds are
-gone. That failure is worse than not shipping ZWL support at all.
+Still report **BLOCKED** rather than committing if you cannot make the key
+vectors parse. A wallet that silently reports "no keys found" tells a user
+their funds are gone — that failure is worse than not shipping ZWL support.
 
 - [ ] **Step 4: Wire the entry point**
 
 In `crates/argos-wallet-import/src/lib.rs`, replace the stub arm:
 
 ```rust
-        WalletFormat::ZecwalletLite => zwl::import_zwl(bytes),
+        WalletFormat::ZecwalletLite => zwl::import_zwl(bytes, passphrase),
 ```
 
 and add `pub mod zwl;`.
