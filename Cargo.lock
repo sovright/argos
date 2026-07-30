@@ -195,6 +195,7 @@ dependencies = [
  "aes",
  "blake2b_simd",
  "cbc",
+ "secp256k1",
  "secrecy",
  "sha2 0.10.9",
  "tempfile",

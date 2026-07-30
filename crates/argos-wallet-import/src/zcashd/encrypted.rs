@@ -143,10 +143,23 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                 }
             }
 
-            // Key: "ckey" || serialized public key. The pubkey is the IV
-            // identifier and is the whole remainder of the record key.
+            // Key: "ckey" || serialized public key, where the serialized
+            // public key is itself CompactSize(len) || raw pubkey bytes
+            // (`CPubKey::Serialize`). zcashd derives the IV from
+            // `vchPubKey.GetHash()` (`crypter.cpp` `DecryptKey`), and
+            // `CPubKey::GetHash()` hashes only the raw pubkey — it does not
+            // see the CompactSize length prefix (`pubkey.h`). So the IV
+            // identifier is the raw pubkey, not the whole record-key
+            // remainder.
             "ckey" => {
-                let iv = sha256d_iv(&rec.rest);
+                let Some((pubkey, _)) = read_length_prefixed(&rec.rest) else {
+                    out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                        record_type: "ckey".to_owned(),
+                        reason: "record key is not a length-prefixed public key".to_owned(),
+                    });
+                    continue;
+                };
+                let iv = sha256d_iv(pubkey);
                 match read_length_prefixed(value)
                     .and_then(|(ct, _)| decrypt(master, iv, ct))
                     .and_then(|p| {
