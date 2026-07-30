@@ -15,6 +15,7 @@ aes = "0.8.4"
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 bip0039 = "0.14.0"
+blake2b_simd = "1.0.4"
 cbc = { version = "0.1.2", features = ["alloc"] }
 clap = { version = "4.5.53", features = ["derive"] }
 dialoguer = "0.12.0"
