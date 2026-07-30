@@ -75,6 +75,47 @@ Recorded here so they are not rediscovered later.
   of building an index from genesis may collapse. Sub-spec 1 therefore preserves
   them (see [`ImportedKeys`](#components)).
 
+### A Sprout sweep is necessarily two transactions
+
+Sprout funds cannot move directly to Ironwood. This is not a policy choice or a
+turnstile rule that might be relaxed — it is unrepresentable in the transaction
+format. From `zcash_primitives-0.30.0/src/transaction/mod.rs:142,156,166,175`:
+
+| Tx version | Sprout | Sapling | Orchard | Ironwood |
+|---|---|---|---|---|
+| V4 | yes | yes | no | no |
+| V5 | no | yes | yes | no |
+| V6 | no | yes | yes | yes |
+
+Sprout requires a V4 transaction. Ironwood requires V6. **Sapling is the only
+pool present in both**, so it is the mandatory intermediate:
+
+```
+Sprout ──(V4 tx: JoinSplit + Sapling output)──► Sapling ──(V6 tx)──► Ironwood
+```
+
+Consequences that sub-spec 3 must design for, not discover:
+
+1. **Two broadcasts, not one.** The sweep has an intermediate state in which the
+   user's funds sit in Sapling. That state must be durable and resumable: if
+   Argos dies between the two transactions the user must be able to restart and
+   complete the second hop, not be left believing the sweep failed.
+2. **The destination UA must contain a Sapling receiver.** Argos currently
+   accepts any destination with "an Orchard or Sapling receiver"
+   (`ZeckError::DestinationMissingShieldedReceiver`). For a sweep containing
+   Sprout funds, an Orchard-only destination is unusable — the first hop has
+   nowhere to land. This needs a distinct validation and a distinct error.
+3. **Fees are paid twice**, and the `--max-fee` check must account for both hops
+   before broadcasting the first, or a user can be stranded mid-migration with a
+   fee cap that stops the second.
+4. **The Sapling hop is a visible turnstile crossing.** Value entering and
+   leaving the Sapling pool is public even though the addresses are not. This
+   belongs in the threat model's privacy discussion for sub-spec 3.
+5. **Whether V4 transactions are still accepted post-Ironwood is a live
+   question** and gates the entire sub-spec. If a future upgrade stops accepting
+   V4, Sprout becomes permanently unspendable by anyone. Verify against current
+   consensus before committing to the sub-spec 3 plan.
+
 ## Decisions
 
 | # | Question | Decision |
