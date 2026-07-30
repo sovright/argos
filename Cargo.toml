@@ -39,7 +39,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
 url = "2.5.8"
 keepawake = "0.6"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 # ─── Zcash protocol stack — Ironwood (NU6.3) ──────────────────────────────────
 #
