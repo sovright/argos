@@ -206,6 +206,43 @@ The `czkey` **value is a pair** — a receiving key `rk` alongside the encrypted
 secret — a different shape from `ckey`. Writing `czkey` erases the plaintext
 `zkey`.
 
+##### Verified record formats
+
+Established against wallets written by zcashd v6.20.0 and by reading
+`zcash/zcash` source. Recording it here because, for `czkey`, this is the only
+written description of the format that exists — Zallet does not migrate these
+records and `zewif-zcashd` refuses them, so there is nothing else to check
+against.
+
+| Record | Key remainder | Value |
+|---|---|---|
+| `zkey` | 64-byte Sprout payment address | bare 32-byte `a_sk`, **no length prefix** |
+| `sapzkey` | 32-byte IVK | raw 169-byte extended spending key, **no prefix** |
+| `key` | CompactSize(33) + 33-byte pubkey | CompactSize + DER + 32-byte hash; the secret starts **8 bytes into the DER** (`30 81 <len> 02 01 01 04 20`) |
+| `czkey` | 64-byte Sprout payment address | fixed 32-byte `rk` (**a `uint256`, not length-prefixed**) followed by the length-prefixed ciphertext |
+| `ckey` | serialized public key | length-prefixed ciphertext |
+| `csapzkey` | 32-byte IVK | 169-byte `extfvk` then the length-prefixed ciphertext |
+
+**IV derivation is not uniform.** Each record's AES-256-CBC IV comes from that
+record's own public identifier, which is why one master key opens every record —
+but the identifier and the hash differ by record type:
+
+- `ckey`, `czkey`: `SHA256d(identifier)[0..16]`, where the identifier is the
+  serialized public key and the 64-byte Sprout address respectively.
+- `csapzkey`: **not** SHA256d of the IVK. The identifier is
+  `extfvk.fvk.GetFingerprint()` — BLAKE2b-256 personalized `"ZcashSaplingFVFP"`
+  over `ak || nk || ovk`.
+
+Two details that are easy to get wrong and fail silently rather than loudly:
+
+- `extfvk` is **169 bytes, not 165**. zcashd serializes a `parentFVKTag`
+  (`uint32`) that is not obvious from `zip32.h` on a first read.
+- The `key` DER header must be **validated, not assumed**. A short-form header
+  (`30 25 ...`, seven bytes rather than eight) yields the genuine secret shifted
+  by one byte — a well-formed secp256k1 key for an address the user does not
+  control, produced with no error. Real zcashd records always use the long form,
+  so fixtures alone do not catch this.
+
 #### `ImportedKeys` preserves Sprout note data and witnesses
 
 wallet.dat caches them and sub-spec 3's cost depends on whether they are usable.
