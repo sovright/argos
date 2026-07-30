@@ -139,9 +139,21 @@ fn an_imported_key_set_does_not_leak_through_debug() {
         provenance: Provenance::Standalone,
     });
 
-    // Rendering each element is the realistic leak path. ImportedKeys does
-    // have a manual Debug impl (needed for Result::unwrap_err in zcashd
-    // tests), but it only ever prints counts, never the elements below.
+    // ImportedKeys has its own manual Debug impl (Result::unwrap_err needs
+    // Ok: Debug), so the aggregate is a live rendering path in its own
+    // right — and it is the one a caller is most likely to log. Assert it
+    // rather than relying on a comment that it only prints counts.
+    let aggregate = format!("{keys:?}");
+    assert_no_marker(&aggregate, TRANSPARENT_MARKER, "transparent (aggregate)");
+    assert_no_marker(&aggregate, SPROUT_MARKER, "sprout a_sk (aggregate)");
+    assert_no_marker(&aggregate, SAPLING_MARKER, "sapling extsk (aggregate)");
+    assert!(
+        aggregate.contains('1'),
+        "aggregate Debug should still report counts, got: {aggregate}"
+    );
+
+    // And each element individually, in case the aggregate is later changed
+    // to delegate to them.
     for k in &keys.transparent {
         assert_no_marker(&format!("{k:?}"), TRANSPARENT_MARKER, "transparent");
     }
