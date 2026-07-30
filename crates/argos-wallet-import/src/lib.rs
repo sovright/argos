@@ -28,7 +28,10 @@
 
 pub mod bdb;
 pub mod error;
+pub mod keys;
 pub mod sniff;
+pub mod zcashd;
 
 pub use error::{ImportDiagnostic, ImportError};
+pub use keys::{ImportedKeys, Provenance};
 pub use sniff::{sniff, WalletFormat};
