@@ -1604,20 +1604,31 @@ use crate::{
 /// Record types we knowingly ignore: wallet bookkeeping with no key
 /// material. Listed explicitly so genuinely unknown types still produce a
 /// diagnostic.
+// Verified against the golden fixtures: these are every non-key record
+// type a real zcashd v6.20.0 wallet actually contains. Listing them
+// explicitly means a genuinely unknown type still produces a diagnostic
+// rather than being lost in the noise.
 const IGNORED: &[&str] = &[
+    "acc",
     "bestblock",
     "bestblock_nomerkle",
-    "minversion",
-    "orderposnext",
-    "version",
-    "witnesscachesize",
-    "tx",
-    "acc",
-    "keymeta",
+    "cmnemonicphrase",
     "defaultkey",
+    "keymeta",
+    "minversion",
+    "mnemonichdchain",
+    "mnemonicphrase",
+    "name",
+    "networkinfo",
+    "orchard_note_commitment_tree",
+    "orderposnext",
     "pool",
     "purpose",
-    "name",
+    "sapzkeymeta",
+    "tx",
+    "version",
+    "witnesscachesize",
+    "zkeymeta",
 ];
 
 fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
