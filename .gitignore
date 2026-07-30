@@ -11,3 +11,6 @@
 
 # Brainstorming visual companion (local, not committed)
 .superpowers/
+
+crates/argos-wallet-import/fuzz/artifacts/
+crates/argos-wallet-import/fuzz/target/
