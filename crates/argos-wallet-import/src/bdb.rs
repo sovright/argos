@@ -83,10 +83,11 @@ pub fn read_meta(bytes: &[u8]) -> Result<BdbMeta, ImportError> {
     }
 
     let last_page = read_u32(bytes, 32, swapped)?;
-    if u64::from(last_page) >= bytes.len() as u64 {
+    let available_pages = (bytes.len() as u64) / u64::from(page_size);
+    if u64::from(last_page) >= available_pages {
         return Err(unwalkable(format!(
-            "metadata claims last page {last_page} but the file is only {} bytes",
-            bytes.len()
+            "metadata claims {} pages but the file holds {available_pages}",
+            u64::from(last_page) + 1
         )));
     }
 
@@ -110,7 +111,13 @@ mod tests {
     use super::*;
 
     fn meta_page(page_size: u32, last_page: u32, root: u32) -> Vec<u8> {
-        let mut v = vec![0u8; 4096];
+        // Size the buffer to the pages the metadata claims, so the fixture
+        // is self-consistent. Clamped at both ends: at least one 4096-byte
+        // page, and at most 1 MiB so the absurd-page-size case cannot try
+        // to allocate gigabytes.
+        let want = (u64::from(last_page) + 1).saturating_mul(u64::from(page_size));
+        let len = want.clamp(4096, 1 << 20) as usize;
+        let mut v = vec![0u8; len];
         v[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
         v[16..20].copy_from_slice(&10u32.to_le_bytes()); // btree version 10 (BDB 6.2)
         v[20..24].copy_from_slice(&page_size.to_le_bytes());
