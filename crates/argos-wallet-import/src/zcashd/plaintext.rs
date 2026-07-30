@@ -44,6 +44,33 @@ fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
     value.get(consumed..end)
 }
 
+/// Validate that a `key` record's DER blob has the exact header zcashd's
+/// OpenSSL-encoded Bitcoin-style CPrivKey always produces —
+/// `30 81 <len> 02 01 01 04 20` — before trusting a fixed-offset slice into
+/// it. Only byte 2 (the length) is allowed to vary; every other position is
+/// checked explicitly. This is deliberately narrower than "any DER
+/// OCTET STRING": a mismatch (short-form header, garbage, or any other
+/// shape) means we cannot safely locate the secret, so we refuse to guess
+/// rather than risk returning a plausible-looking but wrong key.
+fn secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
+    let header = der.get(..8)?;
+    let expected_fixed: [(usize, u8); 7] = [
+        (0, 0x30),
+        (1, 0x81),
+        (3, 0x02),
+        (4, 0x01),
+        (5, 0x01),
+        (6, 0x04),
+        (7, 0x20),
+    ];
+    for (index, expected) in expected_fixed {
+        if *header.get(index)? != expected {
+            return None;
+        }
+    }
+    der.get(8..40)
+}
+
 /// Extract every unencrypted key record.
 ///
 /// A record we cannot parse is recorded as a diagnostic and skipped; it
@@ -51,6 +78,13 @@ fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
 pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
+            // Do not include any bytes from the record key itself: it can
+            // carry address material, and diagnostics are surfaced to
+            // users and may be logged.
+            out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                record_type: "<unparseable>".to_owned(),
+                reason: "record key could not be parsed".to_owned(),
+            });
             continue;
         };
 
@@ -96,8 +130,13 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                 // Within the DER the secret is NOT at the front: the layout
                 // is 30 81 d3 | 02 01 01 | 04 20 | <32-byte secret>, so the
                 // secret starts 8 bytes into the DER blob. Taking the first
-                // 32 bytes yields DER header bytes, not a key.
-                match read_length_prefixed(value).and_then(|der| der.get(8..40)) {
+                // 32 bytes yields DER header bytes, not a key. We validate
+                // that exact header before slicing — an unvalidated
+                // fixed-offset slice can silently manufacture a wrong key
+                // from garbage, or return the genuine secret shifted by one
+                // byte when the DER uses a short-form length header instead
+                // of the long form zcashd always emits.
+                match read_length_prefixed(value).and_then(secret_from_key_der) {
                     Some(s) => match <[u8; 32]>::try_from(s) {
                         Ok(secret) => out.transparent.push(TransparentKey {
                             secret: Secret::new(secret),
@@ -110,7 +149,8 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                     },
                     None => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                         record_type: "key".to_owned(),
-                        reason: "private key record is truncated".to_owned(),
+                        reason: "private key record is truncated or has an unexpected DER header"
+                            .to_owned(),
                     }),
                 }
             }
@@ -183,6 +223,60 @@ mod tests {
         collect_plaintext(&pairs, &mut out);
         assert!(out.sprout.is_empty());
         assert_eq!(out.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn a_key_record_with_an_unexpected_der_shape_is_rejected() {
+        // Case 1: forty bytes of pure garbage, correctly length-prefixed.
+        // An unchecked der.get(8..40) slice would happily return bytes
+        // [8..40] as a "secret" for an address nobody controls.
+        let mut garbage_value = vec![40u8];
+        garbage_value.extend((0u8..40).collect::<Vec<u8>>());
+
+        // Case 2: a short-form DER header (7 bytes: 30 25 | 02 01 01 |
+        // 04 20) instead of the long form zcashd always emits (8 bytes:
+        // 30 81 XX | 02 01 01 | 04 20). An unchecked slice at [8..40]
+        // returns the genuine secret shifted by one byte.
+        let real_secret: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let mut short_form_der = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
+        short_form_der.extend_from_slice(&real_secret);
+        short_form_der.push(0xFF); // padding so [8..40] is in-bounds
+        let mut short_form_value = vec![short_form_der.len() as u8];
+        short_form_value.extend_from_slice(&short_form_der);
+
+        let pairs = vec![
+            record("key", &[], &garbage_value),
+            record("key", &[], &short_form_value),
+        ];
+
+        let mut out = ImportedKeys::default();
+        collect_plaintext(&pairs, &mut out);
+
+        assert!(
+            out.transparent.is_empty(),
+            "neither malformed DER blob may produce a transparent key"
+        );
+        assert_eq!(out.diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn a_record_with_an_unparseable_key_is_reported() {
+        // Claims a 64-byte record type name but the buffer only holds 2
+        // bytes after the length prefix — parse_record_key returns None.
+        let raw_key = vec![0x40, b'z', b'k'];
+        let pairs = vec![(raw_key, vec![0x00])];
+
+        let mut out = ImportedKeys::default();
+        collect_plaintext(&pairs, &mut out);
+
+        assert!(out.transparent.is_empty());
+        assert!(out.sprout.is_empty());
+        assert!(out.sapling.is_empty());
+        assert_eq!(
+            out.diagnostics.len(),
+            1,
+            "the unparseable key must be reported"
+        );
     }
 
     #[test]
