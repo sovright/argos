@@ -144,6 +144,12 @@ const MAX_RECORDS: usize = 500_000;
 /// Hard ceiling on a single value reassembled from overflow pages.
 const MAX_VALUE_LEN: usize = 16 * 1024 * 1024;
 
+/// Hard ceiling on total pages visited across an entire `walk` call — the
+/// master-level walk plus every subdatabase walk it spawns. Each
+/// `walk_from` invocation gets its own `visited` set (see [`walk`]), so
+/// this budget is what keeps total work bounded across all of them.
+const MAX_PAGES_VISITED: usize = 2_000_000;
+
 fn page_slice(bytes: &[u8], page: u32, page_size: u32) -> Result<&[u8], ImportError> {
     let start = (page as usize)
         .checked_mul(page_size as usize)
@@ -176,6 +182,15 @@ fn read_overflow(
             "overflow value claims {total_len} bytes but the file is {}",
             bytes.len()
         )));
+    }
+    // Page 0 is always the BDB metadata page, never a valid overflow page.
+    // A zeroed or corrupted first-page pointer must be rejected, not read
+    // as a completed zero-length chain when the caller actually wants
+    // `total_len` bytes.
+    if first_page == 0 && total_len > 0 {
+        return Err(unwalkable(
+            "overflow chain claims a nonzero length but starts at page 0",
+        ));
     }
 
     let mut out = Vec::with_capacity(total_len);
@@ -243,12 +258,17 @@ fn resolve_subdb_root(bytes: &[u8], meta: &BdbMeta, value: &[u8]) -> Option<u32>
 /// value)` pairs found to `out`.
 ///
 /// Page pointers form an attacker-controlled graph, so `visited` bounds
-/// traversal: without it a crafted file is a trivial infinite loop.
+/// traversal within this call: without it a crafted file is a trivial
+/// infinite loop. `visited` is private to each `walk_from` invocation (see
+/// [`walk`]) so that one sub-tree's traversal can never cause another's to
+/// be silently skipped; `budget` is shared across every invocation in a
+/// single `walk` call and bounds total work across all of them.
 fn walk_from(
     bytes: &[u8],
     meta: &BdbMeta,
     root: u32,
     visited: &mut BTreeSet<u32>,
+    budget: &mut usize,
     out: &mut Vec<RawRecord>,
 ) {
     let mut stack = vec![root];
@@ -257,12 +277,16 @@ fn walk_from(
         if out.len() >= MAX_RECORDS {
             break;
         }
+        if *budget == 0 {
+            break;
+        }
         if !visited.insert(page) {
             continue;
         }
         if page > meta.last_page {
             continue;
         }
+        *budget -= 1;
 
         let p = match page_slice(bytes, page, meta.page_size) {
             Ok(p) => p,
@@ -294,17 +318,26 @@ fn walk_from(
                 }
             }
             PAGE_TYPE_LBTREE => {
-                // Leaf entries alternate key, value.
-                let mut entries = Vec::with_capacity(count.min(1024));
+                // Leaf entries alternate key, value. Each slot's read result
+                // is kept at its own index — `None` for a failed read — so a
+                // single corrupted entry cannot shift the key/value pairing
+                // of any entry after it. Compacting successful reads into a
+                // dense vector before pairing (e.g. `chunks_exact` over only
+                // the `Some`s) would desynchronize every later entry on the
+                // page; see the leaf-desync regression test below.
+                let mut entries: Vec<Option<Vec<u8>>> = Vec::with_capacity(count.min(1024));
                 for i in 0..count {
                     let Ok(off) = read_u16(p, OFF_INDEX_START + i * 2, meta.swapped) else {
+                        entries.push(None);
                         continue;
                     };
                     let off = off as usize;
                     let Some(&kind) = p.get(off + 2) else {
+                        entries.push(None);
                         continue;
                     };
                     let Ok(len) = read_u16(p, off, meta.swapped) else {
+                        entries.push(None);
                         continue;
                     };
 
@@ -312,9 +345,11 @@ fn walk_from(
                         ENTRY_KEYDATA => p.get(off + 3..off + 3 + len as usize).map(<[u8]>::to_vec),
                         ENTRY_OVERFLOW => {
                             let Ok(pgno) = read_u32(p, off + 4, meta.swapped) else {
+                                entries.push(None);
                                 continue;
                             };
                             let Ok(tlen) = read_u32(p, off + 8, meta.swapped) else {
+                                entries.push(None);
                                 continue;
                             };
                             let mut seen = BTreeSet::new();
@@ -323,13 +358,10 @@ fn walk_from(
                         _ => None,
                     };
 
-                    match item {
-                        Some(v) => entries.push(v),
-                        None => continue,
-                    }
+                    entries.push(item);
                 }
-                for pair in entries.chunks_exact(2) {
-                    if let [k, v] = pair {
+                for pair in entries.chunks(2) {
+                    if let [Some(k), Some(v)] = pair {
                         out.push((k.clone(), v.clone()));
                     }
                 }
@@ -349,10 +381,17 @@ fn walk_from(
 /// were never wrapped in a named subdatabase.
 pub fn walk(bytes: &[u8]) -> Result<Vec<RawRecord>, ImportError> {
     let meta = read_meta(bytes)?;
-    let mut visited = BTreeSet::new();
+    let mut budget = MAX_PAGES_VISITED;
 
     let mut top = Vec::new();
-    walk_from(bytes, &meta, meta.root_page, &mut visited, &mut top);
+    walk_from(
+        bytes,
+        &meta,
+        meta.root_page,
+        &mut BTreeSet::new(),
+        &mut budget,
+        &mut top,
+    );
 
     let mut out = Vec::new();
     let mut real_roots = Vec::new();
@@ -373,10 +412,21 @@ pub fn walk(bytes: &[u8]) -> Result<Vec<RawRecord>, ImportError> {
     // collected alongside it at the master-db level.
     out.clear();
     for root in real_roots {
-        if out.len() >= MAX_RECORDS {
+        if out.len() >= MAX_RECORDS || budget == 0 {
             break;
         }
-        walk_from(bytes, &meta, root, &mut visited, &mut out);
+        // Each subdatabase gets its own `visited` set: a root that
+        // collides with a page number touched elsewhere (by another
+        // sub-tree, or by the master-level walk above) must not cause
+        // this sub-tree to be skipped as "already visited".
+        walk_from(
+            bytes,
+            &meta,
+            root,
+            &mut BTreeSet::new(),
+            &mut budget,
+            &mut out,
+        );
     }
 
     Ok(out)
@@ -495,6 +545,115 @@ mod tests {
             .iter()
             .any(|(k, _)| k.windows(4).any(|w| w == b"zkey"));
         assert!(found, "no zkey record in the Sprout golden fixture");
+    }
+
+    #[test]
+    fn a_bad_leaf_entry_does_not_misalign_its_neighbours() {
+        // Four leaf entries meant to pair as (AAAA,BBBB),(CCCC,DDDD). Entry 1
+        // (BBBB) is corrupted: its index-table offset points past the end
+        // of the page, so reading it fails. Compacting the survivors before
+        // pairing (`chunks_exact` over only the successful reads) would
+        // fuse AAAA — a real key — to CCCC, another key, as though it were
+        // AAAA's value, and silently drop DDDD. Slot-preserving pairing
+        // must instead drop only the (AAAA,BBBB) pair and keep (CCCC,DDDD).
+        let page_size = 512u32;
+        let mut v = meta_page(page_size, 1, 1);
+        let base = page_size as usize; // page 1
+        v[base + OFF_PAGE_TYPE] = PAGE_TYPE_LBTREE;
+        v[base + OFF_ENTRY_COUNT..base + OFF_ENTRY_COUNT + 2].copy_from_slice(&4u16.to_le_bytes());
+
+        let off_a: u16 = 34;
+        let off_b: u16 = 5000; // corrupted: past the end of a 512-byte page.
+        let off_c: u16 = 41;
+        let off_d: u16 = 48;
+        for (i, off) in [off_a, off_b, off_c, off_d].into_iter().enumerate() {
+            let idx = base + OFF_INDEX_START + i * 2;
+            v[idx..idx + 2].copy_from_slice(&off.to_le_bytes());
+        }
+
+        for (off, tag) in [(off_a, *b"AAAA"), (off_c, *b"CCCC"), (off_d, *b"DDDD")] {
+            let start = base + off as usize;
+            v[start..start + 2].copy_from_slice(&4u16.to_le_bytes());
+            v[start + 2] = ENTRY_KEYDATA;
+            v[start + 3..start + 7].copy_from_slice(&tag);
+        }
+
+        let pairs = walk(&v).unwrap();
+        assert!(
+            !pairs.iter().any(|(k, val)| k == b"AAAA" && val == b"CCCC"),
+            "leaf entry desync: AAAA paired with CCCC instead of \
+             being dropped along with its own corrupted neighbour: {pairs:?}"
+        );
+        // The trailing, uncorrupted pair must survive intact.
+        assert!(
+            pairs.iter().any(|(k, val)| k == b"CCCC" && val == b"DDDD"),
+            "CCCC/DDDD pair lost even though neither entry was corrupted: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn a_subdb_root_colliding_with_the_master_walk_still_yields_records() {
+        // Page 1 is the master-db leaf: it holds a "db" -> page-2 pointer
+        // (which resolves through page 2's meta fields to root page 1 —
+        // itself, simulating a crafted or corrupted root collision) plus an
+        // unrelated real record. With a `visited` set shared between the
+        // master-level walk and the subdatabase walk, page 1 is already
+        // marked visited by the time the subdatabase walk tries to read it
+        // again, so the whole subdatabase — including the real record — is
+        // silently skipped and `walk` returns zero records.
+        let page_size = 512u32;
+        let mut v = meta_page(page_size, 2, 1);
+
+        let base1 = page_size as usize; // page 1: master-db leaf
+        v[base1 + OFF_PAGE_TYPE] = PAGE_TYPE_LBTREE;
+        v[base1 + OFF_ENTRY_COUNT..base1 + OFF_ENTRY_COUNT + 2]
+            .copy_from_slice(&4u16.to_le_bytes());
+
+        let off0: u16 = 34; // "db"
+        let off1: u16 = 39; // pgno 2, LE
+        let off2: u16 = 46; // "realkey"
+        let off3: u16 = 56; // "realvalue"
+        for (i, off) in [off0, off1, off2, off3].into_iter().enumerate() {
+            let idx = base1 + OFF_INDEX_START + i * 2;
+            v[idx..idx + 2].copy_from_slice(&off.to_le_bytes());
+        }
+
+        let mut put = |off: u16, kind: u8, data: &[u8]| {
+            let start = base1 + off as usize;
+            v[start..start + 2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+            v[start + 2] = kind;
+            v[start + 3..start + 3 + data.len()].copy_from_slice(data);
+        };
+        put(off0, ENTRY_KEYDATA, b"db");
+        put(off1, ENTRY_KEYDATA, &2u32.to_le_bytes());
+        put(off2, ENTRY_KEYDATA, b"realkey");
+        put(off3, ENTRY_KEYDATA, b"realvalue");
+
+        // Page 2: a subdatabase meta page whose root points back at page 1.
+        let base2 = 2 * page_size as usize;
+        v[base2 + 12..base2 + 16].copy_from_slice(&BDB_BTREE_MAGIC.to_le_bytes());
+        v[base2 + 88..base2 + 92].copy_from_slice(&1u32.to_le_bytes());
+
+        let pairs = walk(&v).unwrap();
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, val)| k == b"realkey" && val == b"realvalue"),
+            "subdatabase root colliding with the master walk lost its records: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn golden_fixtures_yield_the_expected_record_counts() {
+        // Independently confirmed by two separate implementations. If a
+        // change to the walker moves either number, that change broke
+        // correct behaviour — the fixtures are ground truth, not the code.
+        let expected = [("sprout-plaintext", 325), ("sprout-encrypted", 331)];
+        for (name, want) in expected {
+            let bytes = std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap();
+            let pairs = walk(&bytes).unwrap();
+            assert_eq!(pairs.len(), want, "{name}: record count changed");
+        }
     }
 
     #[test]
