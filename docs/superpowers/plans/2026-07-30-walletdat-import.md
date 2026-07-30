@@ -1650,9 +1650,12 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
         match rec.record_type.as_str() {
             "zkey" => {
                 let addr: Option<[u8; 64]> = rec.rest.get(..64).and_then(|s| s.try_into().ok());
-                let a_sk: Option<[u8; 32]> = read_length_prefixed(value)
-                    .and_then(|s| s.get(..32))
-                    .and_then(|s| s.try_into().ok());
+                // Verified against the golden fixtures: the value is the bare
+                // 32-byte a_sk with NO CompactSize prefix (observed value
+                // length is exactly 32). Do not use read_length_prefixed here
+                // — it would read the first key byte as a length.
+                let a_sk: Option<[u8; 32]> =
+                    value.get(..32).and_then(|s| s.try_into().ok());
 
                 match (addr, a_sk) {
                     (Some(address), Some(a_sk)) => out.sprout.push(SproutKey {
@@ -1667,7 +1670,11 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                     }),
                 }
             }
-            "sapzkey" => match read_length_prefixed(value) {
+            // Verified against the fixtures: the value is a raw 169-byte
+            // extended spending key with NO length prefix — depth(1) +
+            // parent_fvk_tag(4) + child_index(4) + chain_code(32) +
+            // expsk(96) + dk(32). The key remainder is the 32-byte IVK.
+            "sapzkey" => match value.get(..169) {
                 Some(extsk) => out.sapling.push(SaplingKey {
                     extsk: Secret::new(extsk.to_vec()),
                     provenance: Provenance::Standalone,
@@ -1678,9 +1685,13 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                 }),
             },
             "key" => {
-                // Value is a length-prefixed private key; the 32-byte
-                // secret is the tail of the DER-ish encoding zcashd uses.
-                match read_length_prefixed(value).and_then(|s| s.get(..32)) {
+                // Verified against the fixtures. The value is
+                // CompactSize(len) || DER EC private key || 32-byte hash.
+                // Within the DER the secret is NOT at the front: the layout
+                // is 30 81 d3 | 02 01 01 | 04 20 | <32-byte secret>, so the
+                // secret starts 8 bytes into the DER blob. Taking the first
+                // 32 bytes yields DER header bytes, not a key.
+                match read_length_prefixed(value).and_then(|der| der.get(8..40)) {
                     Some(s) => match <[u8; 32]>::try_from(s) {
                         Ok(secret) => out.transparent.push(TransparentKey {
                             secret: Secret::new(secret),
