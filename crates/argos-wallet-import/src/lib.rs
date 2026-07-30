@@ -27,5 +27,7 @@
 )]
 
 pub mod error;
+pub mod sniff;
 
 pub use error::{ImportDiagnostic, ImportError};
+pub use sniff::{sniff, WalletFormat};
