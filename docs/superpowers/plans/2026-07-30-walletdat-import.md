@@ -333,12 +333,21 @@ gen_wallet() {
   local datadir="/tmp/zc-$name"
   rm -rf "$datadir"; mkdir -p "$datadir"
 
+  # Consensus branch IDs, verified against zcash/zcash v6.20.0
+  # src/consensus/upgrades.cpp:
+  #   5ba81b19 Overwinter   76b809bb Sapling   2bb40e60 Blossom
+  #   f5b9230b Heartwood    e9ff75a6 Canopy
+  #
+  # Canopy (e9ff75a6) is the one that matters: z_getnewaddress sprout
+  # throws once it is active. Everything below it is activated at height 1
+  # so the chain is otherwise modern.
   cat > "$datadir/zcash.conf" <<EOF
 regtest=1
 nuparams=5ba81b19:1
 nuparams=76b809bb:1
 nuparams=2bb40e60:1
-nuparams=f5b9230b:${canopy_height}
+nuparams=f5b9230b:1
+nuparams=e9ff75a6:${canopy_height}
 rpcuser=fixture
 rpcpassword=fixture
 EOF
@@ -396,7 +405,7 @@ ls -la fixtures/out/
 ```
 Expected: 8 `.dat` files (4 goldens + 4 truncated).
 
-If `electriccoinco/zcashd:v6.20.0` does not exist on Docker Hub, check the available tags with `docker search` or the registry API and pin the newest v6.x tag instead. Record the tag you used in the README.
+The tag `electriccoinco/zcashd:v6.20.0` is confirmed to exist on Docker Hub (verified 2026-07-30 against the registry tag list).
 
 - [ ] **Step 4: Verify the Sprout fixtures actually contain Sprout keys**
 
