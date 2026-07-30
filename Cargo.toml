@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/zeck-core", "crates/zeck-cli", "gui/src-tauri"]
+members = ["crates/zeck-core", "crates/zeck-cli", "crates/argos-wallet-import", "gui/src-tauri"]
 resolver = "2"
 
 [workspace.package]
