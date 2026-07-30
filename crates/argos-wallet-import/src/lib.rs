@@ -26,6 +26,7 @@
     )
 )]
 
+pub mod bdb;
 pub mod error;
 pub mod sniff;
 
