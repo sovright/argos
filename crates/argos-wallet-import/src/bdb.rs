@@ -9,6 +9,10 @@ use crate::error::ImportError;
 
 const BDB_BTREE_MAGIC: u32 = 0x0005_3162;
 
+/// A raw key/value record as stored in the Berkeley DB btree.
+/// Uninterpreted here — `bdb.rs` has no Zcash knowledge.
+pub type RawRecord = (Vec<u8>, Vec<u8>);
+
 pub(crate) const MIN_PAGE_SIZE: u32 = 512;
 pub(crate) const MAX_PAGE_SIZE: u32 = 65_536;
 
@@ -234,7 +238,7 @@ fn walk_from(
     meta: &BdbMeta,
     root: u32,
     visited: &mut BTreeSet<u32>,
-    out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    out: &mut Vec<RawRecord>,
 ) {
     let mut stack = vec![root];
 
@@ -332,8 +336,7 @@ fn walk_from(
 /// resolves to a subdatabase is walked for its real records; anything
 /// that does not resolve is kept as-is, which also covers wallets that
 /// were never wrapped in a named subdatabase.
-#[allow(clippy::type_complexity)] // (key, value) pairs are the crate's public interface.
-pub fn walk(bytes: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ImportError> {
+pub fn walk(bytes: &[u8]) -> Result<Vec<RawRecord>, ImportError> {
     let meta = read_meta(bytes)?;
     let mut visited = BTreeSet::new();
 
@@ -484,4 +487,3 @@ mod tests {
         }
     }
 }
-
