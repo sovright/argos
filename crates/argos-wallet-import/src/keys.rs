@@ -1,27 +1,8 @@
 //! The normalized output of any wallet import.
 
-use secrecy::{zeroize::Zeroize, CloneableSecret, DebugSecret, Secret};
+use secrecy::Secret;
 
 use crate::error::ImportDiagnostic;
-
-/// Owns extended spending key bytes.
-///
-/// `secrecy` 0.8's `DebugSecret`/`CloneableSecret` blanket impls cover only
-/// fixed-size arrays (up to 64 bytes) and `String` — not bare `Vec<u8>`, and
-/// a serialized Sapling extsk is 169 bytes. This wrapper opts `Vec<u8>` into
-/// both marker traits without deriving `Debug`, so the bytes can never leak
-/// through an accidental `{:?}` on the wrapper itself.
-#[derive(Clone)]
-pub struct ExtSpendingKeyBytes(pub Vec<u8>);
-
-impl Zeroize for ExtSpendingKeyBytes {
-    fn zeroize(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-impl CloneableSecret for ExtSpendingKeyBytes {}
-impl DebugSecret for ExtSpendingKeyBytes {}
 
 /// Where a key came from. Surfaced to the user so they can tell
 /// HD-derived keys from ones that exist only in the wallet file.
@@ -34,20 +15,40 @@ pub enum Provenance {
     Standalone,
 }
 
-#[derive(Debug, Clone)]
+/// Deliberately no `#[derive(Debug, Clone)]` on any struct below that holds
+/// a `Secret`. A derived `Debug` on a key-bearing struct is a standing risk
+/// that a spending key ends up in a log line or a panic message, and this
+/// crate exists to handle other people's spending keys. Where a caller
+/// genuinely needs `Debug`, it gets a manual, redacted impl instead.
 pub struct TransparentKey {
     pub secret: Secret<[u8; 32]>,
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for TransparentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransparentKey")
+            .field("secret", &"<redacted>")
+            .field("provenance", &self.provenance)
+            .finish()
+    }
+}
+
 pub struct SaplingKey {
     /// Raw extended spending key bytes, as stored by zcashd.
-    pub extsk: Secret<ExtSpendingKeyBytes>,
+    pub extsk: Secret<Vec<u8>>,
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for SaplingKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaplingKey")
+            .field("extsk", &"<redacted>")
+            .field("provenance", &self.provenance)
+            .finish()
+    }
+}
+
 pub struct SproutKey {
     /// 32-byte Sprout spending key a_sk.
     pub a_sk: Secret<[u8; 32]>,
@@ -56,12 +57,25 @@ pub struct SproutKey {
     pub provenance: Provenance,
 }
 
+impl std::fmt::Debug for SproutKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SproutKey")
+            .field("a_sk", &"<redacted>")
+            .field("address", &self.address)
+            .field("provenance", &self.provenance)
+            .finish()
+    }
+}
+
 /// A Sprout note and its cached witness, preserved verbatim from the
 /// wallet file.
 ///
 /// Sub-spec 3's cost depends on whether these cached witnesses can be
 /// brought forward instead of indexing from genesis. Preserving them here
 /// is nearly free; discarding them at this layer would be irreversible.
+///
+/// Holds no secret material — witnesses and addresses are public — so it
+/// keeps the ordinary derives.
 #[derive(Debug, Clone)]
 pub struct SproutNoteData {
     pub address: [u8; 64],
@@ -70,7 +84,10 @@ pub struct SproutNoteData {
     pub witness: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// No `Debug`/`Clone` derive: it holds `Vec<TransparentKey>` etc., which
+/// carry `Secret`s. Add a manual redacted impl or a clone path if a caller
+/// turns out to need one — not speculatively.
+#[derive(Default)]
 pub struct ImportedKeys {
     pub transparent: Vec<TransparentKey>,
     pub sapling: Vec<SaplingKey>,
