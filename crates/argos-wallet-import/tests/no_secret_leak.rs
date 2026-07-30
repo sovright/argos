@@ -10,10 +10,9 @@
 //! field later, both reintroduce the leak with no compiler complaint. These
 //! tests fail loudly if that happens.
 
-use argos_wallet_import::keys::{
-    ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey,
-};
-use secrecy::Secret;
+use argos_wallet_import::keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey};
+use argos_wallet_import::zcashd::{derive_master_key, MkeyRecord};
+use secrecy::{Secret, SecretString};
 
 /// Distinctive byte patterns, so a leak is unambiguous in the rendered
 /// output rather than something that might coincidentally appear.
@@ -21,6 +20,17 @@ const TRANSPARENT_MARKER: u8 = 0xAB;
 const SPROUT_MARKER: u8 = 0xCD;
 const SAPLING_MARKER: u8 = 0xEF;
 
+/// Passphrase every encrypted golden fixture was created with.
+const FIXTURE_PASSPHRASE: &str = "argos-test-passphrase";
+
+/// Assert that a rendered string does not contain `marker`'s bytes.
+///
+/// **Precondition: the secret being checked must be a uniform fill of
+/// `marker`.** The decimal arm looks for the marker repeated adjacently,
+/// which is what a byte array renders as, and would not catch a single
+/// stray byte surrounded by different ones. Every call site here fills a
+/// buffer with one repeated marker, so that holds — but do not reuse this
+/// helper for a non-uniform payload without strengthening it.
 fn assert_no_marker(rendered: &str, marker: u8, what: &str) {
     let hex_lower = format!("{marker:02x}");
     let hex_upper = format!("{marker:02X}");
@@ -75,6 +85,39 @@ fn sapling_key_debug_is_redacted() {
     };
     let rendered = format!("{k:?}");
     assert_no_marker(&rendered, SAPLING_MARKER, "sapling extsk");
+}
+
+#[test]
+fn master_key_debug_is_redacted() {
+    // The master key unlocks every encrypted record in the wallet — every
+    // transparent key, every Sapling key, and the encrypted Sprout keys
+    // this project exists to recover. Leaking it is strictly worse than
+    // leaking any single key, and it now has a public `expose_secret`
+    // accessor, so the type is a live rendering path.
+    // Derive from a real zcashd-encrypted wallet rather than a synthetic
+    // record. A hand-built mkey does not survive PKCS#7 unpadding, so a
+    // conditional `if let Ok(..)` here would silently assert nothing —
+    // the test would pass while proving nothing at all.
+    let bytes = std::fs::read("tests/fixtures/modern-encrypted.dat")
+        .expect("modern-encrypted.dat fixture must exist");
+    let records = argos_wallet_import::bdb::walk(&bytes).expect("fixture must walk");
+    let mkey: MkeyRecord = argos_wallet_import::zcashd::find_mkey(&records)
+        .expect("encrypted wallet must have an mkey");
+
+    let master = derive_master_key(&SecretString::new(FIXTURE_PASSPHRASE.to_owned()), &mkey)
+        .expect("the fixture passphrase must derive a master key");
+
+    let rendered = format!("{master:?}");
+    let secret_rendered = format!("{:?}", master.expose_secret());
+
+    assert!(
+        !rendered.contains(&secret_rendered),
+        "master key bytes leaked into Debug output: {rendered}"
+    );
+    assert!(
+        rendered.contains("REDACTED") || rendered.contains("redacted"),
+        "expected an explicit redaction marker, got: {rendered}"
+    );
 }
 
 #[test]
