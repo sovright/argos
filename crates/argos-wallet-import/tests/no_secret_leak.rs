@@ -139,8 +139,9 @@ fn an_imported_key_set_does_not_leak_through_debug() {
         provenance: Provenance::Standalone,
     });
 
-    // Rendering each element is the realistic leak path, since ImportedKeys
-    // itself deliberately has no Debug derive.
+    // Rendering each element is the realistic leak path. ImportedKeys does
+    // have a manual Debug impl (needed for Result::unwrap_err in zcashd
+    // tests), but it only ever prints counts, never the elements below.
     for k in &keys.transparent {
         assert_no_marker(&format!("{k:?}"), TRANSPARENT_MARKER, "transparent");
     }

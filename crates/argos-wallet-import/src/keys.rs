@@ -107,3 +107,22 @@ impl ImportedKeys {
         self.transparent.len() + self.sapling.len() + self.sprout.len()
     }
 }
+
+// Manual, redacted impl rather than `#[derive(Debug)]` — needed so
+// `Result<ImportedKeys, _>::unwrap_err()` type-checks in tests, without
+// risking key material reaching a log line or panic message. Field
+// contents are counts only; no secret ever passes through this impl.
+impl std::fmt::Debug for ImportedKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedKeys")
+            .field("transparent", &format!("<{} keys>", self.transparent.len()))
+            .field("sapling", &format!("<{} keys>", self.sapling.len()))
+            .field("sprout", &format!("<{} keys>", self.sprout.len()))
+            .field(
+                "sprout_notes",
+                &format!("<{} notes>", self.sprout_notes.len()),
+            )
+            .field("diagnostics", &self.diagnostics)
+            .finish()
+    }
+}

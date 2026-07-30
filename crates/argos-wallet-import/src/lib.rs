@@ -35,3 +35,17 @@ pub mod zcashd;
 pub use error::{ImportDiagnostic, ImportError};
 pub use keys::{ImportedKeys, Provenance};
 pub use sniff::{sniff, WalletFormat};
+
+use secrecy::SecretString;
+
+/// Parse any supported wallet file into normalized key material.
+pub fn import_wallet_file(
+    bytes: &[u8],
+    passphrase: Option<&SecretString>,
+) -> Result<ImportedKeys, ImportError> {
+    match sniff::sniff(bytes)? {
+        WalletFormat::Zcashd => zcashd::import_zcashd(bytes, passphrase),
+        // Task 13 implements ZecWallet Lite import.
+        WalletFormat::ZecwalletLite => Err(ImportError::UnrecognizedFormat),
+    }
+}
