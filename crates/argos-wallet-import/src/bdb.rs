@@ -31,8 +31,11 @@ fn unwalkable(msg: impl Into<String>) -> ImportError {
 
 /// Read a big- or little-endian u32 at `offset`, bounds-checked.
 pub(crate) fn read_u32(bytes: &[u8], offset: usize, swapped: bool) -> Result<u32, ImportError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| unwalkable(format!("u32 read at {offset} overflows")))?;
     let slice = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .ok_or_else(|| unwalkable(format!("u32 read at {offset} is past end of data")))?;
     let mut buf = [0u8; 4];
     buf.copy_from_slice(slice);
@@ -45,8 +48,11 @@ pub(crate) fn read_u32(bytes: &[u8], offset: usize, swapped: bool) -> Result<u32
 
 /// Read a big- or little-endian u16 at `offset`, bounds-checked.
 pub(crate) fn read_u16(bytes: &[u8], offset: usize, swapped: bool) -> Result<u16, ImportError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| unwalkable(format!("u16 read at {offset} overflows")))?;
     let slice = bytes
-        .get(offset..offset + 2)
+        .get(offset..end)
         .ok_or_else(|| unwalkable(format!("u16 read at {offset} is past end of data")))?;
     let mut buf = [0u8; 2];
     buf.copy_from_slice(slice);
@@ -92,6 +98,11 @@ pub fn read_meta(bytes: &[u8]) -> Result<BdbMeta, ImportError> {
     }
 
     let root_page = read_u32(bytes, 88, swapped)?;
+    if root_page == 0 {
+        return Err(unwalkable(
+            "root page 0 is the metadata page, not a btree root",
+        ));
+    }
     if u64::from(root_page) > u64::from(last_page) {
         return Err(unwalkable(format!(
             "root page {root_page} is beyond last page {last_page}"
@@ -423,6 +434,18 @@ mod tests {
     #[test]
     fn rejects_a_truncated_file() {
         let err = read_meta(&[0u8; 8]).unwrap_err();
+        assert!(matches!(err, ImportError::UnwalkableBtree(_)));
+    }
+
+    #[test]
+    fn rejects_a_zero_root_page() {
+        let err = read_meta(&meta_page(4096, 20, 0)).unwrap_err();
+        assert!(matches!(err, ImportError::UnwalkableBtree(_)));
+    }
+
+    #[test]
+    fn rejects_an_offset_that_would_overflow() {
+        let err = read_u32(&[], usize::MAX, false).unwrap_err();
         assert!(matches!(err, ImportError::UnwalkableBtree(_)));
     }
 
