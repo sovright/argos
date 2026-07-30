@@ -222,6 +222,19 @@ Create `crates/argos-wallet-import/src/lib.rs`:
     clippy::expect_used,
     clippy::panic
 )]
+// Crate-root `deny` reaches `#[cfg(test)]` modules too, and tests
+// legitimately unwrap, index, and panic on known-good fixture data. The
+// gate above still binds all non-test code, which is the code that
+// touches attacker-controlled bytes.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic
+    )
+)]
 
 pub mod error;
 
@@ -2317,18 +2330,24 @@ mod tests {
     }
 
     #[test]
-    fn witness_bytes_are_preserved_verbatim() {
+    fn witness_bytes_survive_collection_unmodified() {
         // Sub-spec 3 may be able to bring these forward instead of
-        // indexing from genesis, so they must survive import unmodified.
-        let mut k = vec![2u8];
-        k.extend_from_slice(b"tx");
-        let note = SproutNoteData {
-            address: [0x77; 64],
-            nullifier: None,
-            witness: vec![0xDE, 0xAD, 0xBE, 0xEF],
-        };
-        assert_eq!(note.witness, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        let _ = k;
+        // indexing from genesis, so they must survive import byte-exact.
+        // This round-trips through collect_sprout_notes rather than
+        // asserting a struct field equals what was just assigned to it.
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+
+        let mut value = b"sprout".to_vec();
+        value.extend_from_slice(&[0x77; 64]);
+        value.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[(key, value)], &mut out);
+
+        assert_eq!(out.sprout_notes.len(), 1);
+        assert_eq!(out.sprout_notes[0].address, [0x77; 64]);
+        assert_eq!(out.sprout_notes[0].witness, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
@@ -2736,7 +2755,21 @@ pub fn import_zwl(bytes: &[u8]) -> Result<ImportedKeys, ImportError> {
 }
 ```
 
-**This step is deliberately incomplete and must not be left this way.** Confirm the layout from `zingolabs/zewif-zwl`, then implement extraction of the transparent and Sapling key vectors and replace the `warn!`. If confirmation is not possible, report back before committing — shipping a parser that silently returns no keys would tell users their wallet is empty when it is not.
+**The code above is a skeleton, not the deliverable. Do not commit it as written.**
+
+Decided before execution: confirm the layout or report BLOCKED. Concretely:
+
+1. Read `zingolabs/zewif-zwl` and the original `zecwallet-light-cli`
+   `lightwallet/mod.rs` to establish the on-disk layout of the transparent
+   and Sapling key vectors.
+2. If you can establish it, implement real extraction, delete the `warn!`,
+   and write tests that recover known keys.
+3. If you **cannot** establish it with confidence, stop and report
+   **BLOCKED** with what you found and what remains unknown. Do not commit
+   a parser that returns zero keys.
+
+A wallet that silently reports "no keys found" tells a user their funds are
+gone. That failure is worse than not shipping ZWL support at all.
 
 - [ ] **Step 4: Wire the entry point**
 
