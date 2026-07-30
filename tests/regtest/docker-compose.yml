@@ -97,6 +97,22 @@ services:
       - "--data-dir=/var/lib/lightwalletd"
       - "--log-file=/dev/stdout"
 
+  # Fixture generation only. NOT part of the regtest stack.
+  #
+  # zcashd is EOL and cannot activate Ironwood (NU6.3), so it is useless
+  # for sweep testing — but it is the only software that writes a
+  # wallet.dat, and it still generates Sprout keys when Canopy is held
+  # inactive (src/wallet/rpcwallet.cpp:3236 in v6.20.0).
+  #
+  # Run with: docker compose --profile fixtures up zcashd-fixtures
+  zcashd-fixtures:
+    profiles: ["fixtures"]
+    image: electriccoinco/zcashd:v6.20.0
+    volumes:
+      - ./fixtures/out:/fixtures
+      - ./fixtures/generate.sh:/generate.sh:ro
+    entrypoint: ["/bin/bash", "/generate.sh"]
+
 volumes:
   zebrad-data:
   lwd-data:
