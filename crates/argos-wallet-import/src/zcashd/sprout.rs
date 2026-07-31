@@ -150,12 +150,14 @@ fn skip_transaction_body(c: &mut Cursor) -> Option<()> {
         c.skip(4)?; // expiry_height
     }
 
+    let mut have_sapling_actions = false;
     if version >= SAPLING_TX_VERSION {
         c.skip(8)?; // valueBalanceSapling
         let n_spend = usize::try_from(c.compact_size()?).ok()?;
         c.skip(n_spend.checked_mul(SPEND_DESCRIPTION_LEN)?)?;
         let n_out = usize::try_from(c.compact_size()?).ok()?;
         c.skip(n_out.checked_mul(OUTPUT_DESCRIPTION_LEN)?)?;
+        have_sapling_actions = n_spend > 0 || n_out > 0;
     }
 
     if version >= 2 {
@@ -167,6 +169,14 @@ fn skip_transaction_body(c: &mut Cursor) -> Option<()> {
             c.skip(32)?; // joinSplitPubKey
             c.skip(64)?; // joinSplitSig
         }
+    }
+
+    // `CTransaction::SerializationOp` (`zcash/zcash`
+    // `src/primitives/transaction.h`): a Sapling-version transaction with
+    // at least one Spend or Output description carries a 64-byte
+    // `bindingSig` after the JoinSplit section.
+    if version >= SAPLING_TX_VERSION && have_sapling_actions {
+        c.skip(64)?; // bindingSig
     }
     Some(())
 }
@@ -200,14 +210,6 @@ fn read_optional_hash(c: &mut Cursor) -> Option<Option<[u8; 32]>> {
     }
     let h: [u8; 32] = c.take(32)?.try_into().ok()?;
     Some(Some(h))
-}
-
-fn skip_optional_i32(c: &mut Cursor) -> Option<()> {
-    let flag = *c.take(1)?.first()?;
-    if flag != 0 {
-        c.skip(4)?;
-    }
-    Some(())
 }
 
 /// `IncrementalMerkleTree`: `left`, `right` (each `Option<uint256>`), and
@@ -281,14 +283,17 @@ fn extract_sprout_notes(value: &[u8], out: &mut ImportedKeys) -> Option<()> {
         let address: [u8; 64] = c.take(64)?.try_into().ok()?;
         let nullifier = read_optional_hash(&mut c)?;
 
-        // The cached witness state: `witnesses`, `witnessHeight`, and
-        // `spentHeight`. Captured as one opaque blob — this module walks
-        // just far enough to find its boundaries and never decodes what
-        // is inside.
+        // The cached witness state: `witnesses` and `witnessHeight`.
+        // `SproutNoteData::SerializationOp` in `zcash/zcash`
+        // `src/wallet/wallet.h` reads exactly these two fields plus
+        // `address`/`nullifier` above — `spentHeight` is declared
+        // `(memory only)` immediately above `SerializationOp` and is never
+        // part of it, so it is not read here either. Captured as one
+        // opaque blob — this module walks just far enough to find its
+        // boundaries and never decodes what is inside.
         let witness_start = c.pos;
         skip_witness_list(&mut c)?;
         c.skip(4)?; // witnessHeight: int32
-        skip_optional_i32(&mut c)?; // spentHeight
         let witness_end = c.pos;
         let witness = c.bytes.get(witness_start..witness_end)?.to_vec();
 
@@ -378,9 +383,16 @@ mod tests {
     /// indexing from genesis, so they must survive collection byte-exact.
     /// This builds a minimal but structurally valid `tx` record value —
     /// a version-1 (pre-JoinSplit) transaction with no inputs or outputs,
-    /// one Sprout note whose witness list holds a single empty witness —
-    /// and checks the captured witness blob against the exact bytes that
-    /// were written into it.
+    /// two Sprout notes in `mapSproutNoteData` — and checks each captured
+    /// witness blob against the exact bytes that were written into it.
+    ///
+    /// `SproutNoteData::SerializationOp` in `zcash/zcash`
+    /// `src/wallet/wallet.h` reads exactly four fields — `address`,
+    /// `nullifier`, `witnesses`, `witnessHeight` — with no `spentHeight`
+    /// on disk (that field is declared `(memory only)` immediately above
+    /// `SerializationOp` and is never part of it). A second note is
+    /// included so a wrong field boundary on the first note would
+    /// misalign the second rather than passing by coincidence.
     #[test]
     fn witness_bytes_survive_collection_unmodified() {
         let mut value = Vec::new();
@@ -397,24 +409,40 @@ mod tests {
         value.push(0x00); // vUnused count = 0
         value.push(0x00); // mapValue count = 0
 
-        value.push(0x01); // mapSproutNoteData count = 1
+        value.push(0x02); // mapSproutNoteData count = 2
+
+        // Note 1.
         value.extend_from_slice(&[0xBB; 32]); // JSOutPoint.hash
         value.extend_from_slice(&0u64.to_le_bytes()); // JSOutPoint.js
         value.push(0x00); // JSOutPoint.n
         value.extend_from_slice(&[0x77; 64]); // SproutNoteData.address
         value.push(0x00); // nullifier: None
+                          // Cached witness state, captured verbatim as `witness`: an empty
+                          // witness list, then witnessHeight. No spentHeight on disk.
+        let witness_1: [u8; 5] = [
+            0x00, // witnesses count = 0
+            0xDE, 0xAD, 0xBE, 0xEF, // witnessHeight (opaque to this test)
+        ];
+        value.extend_from_slice(&witness_1);
 
-        // Cached witness state, captured verbatim as `witness`:
-        let witness_bytes: [u8; 11] = [
+        // Note 2: a single empty witness, and a present nullifier — both
+        // exercise the offset differently from note 1 so a wrong boundary
+        // on note 1 corrupts note 2 instead of happening to still align.
+        value.extend_from_slice(&[0xCC; 32]); // JSOutPoint.hash
+        value.extend_from_slice(&1u64.to_le_bytes()); // JSOutPoint.js
+        value.push(0x01); // JSOutPoint.n
+        value.extend_from_slice(&[0x88; 64]); // SproutNoteData.address
+        value.push(0x01); // nullifier: Some
+        value.extend_from_slice(&[0x99; 32]); // nullifier bytes
+        let witness_2: [u8; 10] = [
             0x01, // witnesses count = 1
             0x00, 0x00, // tree.left = None, tree.right = None
             0x00, // tree.parents count = 0
             0x00, // witness.filled count = 0
             0x00, // witness.cursor = None
-            0xDE, 0xAD, 0xBE, 0xEF, // witnessHeight (opaque to this test)
-            0x00, // spentHeight = None
+            0xFE, 0xED, 0xFA, 0xCE, // witnessHeight (opaque to this test)
         ];
-        value.extend_from_slice(&witness_bytes);
+        value.extend_from_slice(&witness_2);
 
         let mut key = vec![2u8];
         key.extend_from_slice(b"tx");
@@ -422,10 +450,78 @@ mod tests {
         let mut out = ImportedKeys::default();
         collect_sprout_notes(&[(key, value)], &mut out);
 
-        assert_eq!(out.sprout_notes.len(), 1);
+        assert_eq!(out.sprout_notes.len(), 2);
         assert_eq!(out.sprout_notes[0].address, [0x77; 64]);
         assert_eq!(out.sprout_notes[0].nullifier, None);
-        assert_eq!(out.sprout_notes[0].witness, witness_bytes.to_vec());
+        assert_eq!(out.sprout_notes[0].witness, witness_1.to_vec());
+        assert_eq!(out.sprout_notes[1].address, [0x88; 64]);
+        assert_eq!(out.sprout_notes[1].nullifier, Some([0x99; 32]));
+        assert_eq!(out.sprout_notes[1].witness, witness_2.to_vec());
+    }
+
+    /// Regression test for the missing Sapling `bindingSig` skip. A
+    /// Sapling-version transaction with `n_out > 0` (i.e.
+    /// `haveSaplingActions`) carries a 64-byte `bindingSig` after the
+    /// JoinSplit section (`zcash/zcash` `src/primitives/transaction.h`,
+    /// `CTransaction::SerializationOp`). No real fixture exercises this —
+    /// the golden `sprout-encrypted.dat` transactions all have
+    /// `n_spend = n_out = 0` — so this builds one with a single, non-empty
+    /// `OutputDescription` and confirms the walk still lands on the
+    /// correct byte boundaries for `CMerkleTx` and `mapSproutNoteData`
+    /// afterward.
+    #[test]
+    fn skips_the_sapling_binding_sig_when_sapling_actions_are_present() {
+        let mut value = Vec::new();
+        value.extend_from_slice(&0x8000_0004u32.to_le_bytes()); // header: overwintered, version 4
+        value.extend_from_slice(&[0x89, 0xBB, 0x09, 0x00]); // version group id (unchecked)
+        value.push(0x00); // n_vin = 0
+        value.push(0x00); // n_vout = 0
+        value.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        value.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
+
+        value.extend_from_slice(&0i64.to_le_bytes()); // valueBalanceSapling
+        value.push(0x00); // n_spend = 0
+        value.push(0x01); // n_out = 1
+        value.extend_from_slice(&[0xCC; OUTPUT_DESCRIPTION_LEN]); // one OutputDescription
+
+        value.push(0x00); // n_js = 0 (no JoinSplits)
+
+        value.extend_from_slice(&[0xEE; 64]); // bindingSig (present: n_out > 0)
+
+        value.extend_from_slice(&[0xAA; 32]); // hashBlock
+        value.push(0x00); // vMerkleBranch count = 0
+        value.extend_from_slice(&0i32.to_le_bytes()); // nIndex
+
+        value.push(0x00); // vUnused count = 0
+        value.push(0x00); // mapValue count = 0
+
+        value.push(0x01); // mapSproutNoteData count = 1
+        value.extend_from_slice(&[0xBB; 32]); // JSOutPoint.hash
+        value.extend_from_slice(&0u64.to_le_bytes()); // JSOutPoint.js
+        value.push(0x00); // JSOutPoint.n
+        value.extend_from_slice(&[0x77; 64]); // SproutNoteData.address
+        value.push(0x00); // nullifier: None
+
+        // Cached witness state: an empty witness list, then witnessHeight.
+        // `SproutNoteData::SerializationOp` has no `spentHeight` field on
+        // disk (that field is memory-only) — see Finding 2.
+        let mut witness = vec![0x00u8]; // witnesses (SproutWitness list) count = 0
+        witness.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // witnessHeight
+        value.extend_from_slice(&witness);
+
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[(key, value)], &mut out);
+
+        assert_eq!(
+            out.sprout_notes.len(),
+            1,
+            "the note after a non-empty Sapling bundle must still be found"
+        );
+        assert_eq!(out.sprout_notes[0].address, [0x77; 64]);
+        assert_eq!(out.sprout_notes[0].witness, witness);
     }
 
     #[test]

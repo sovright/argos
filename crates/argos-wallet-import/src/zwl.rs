@@ -406,6 +406,23 @@ fn read_key_vectors(cur: &mut Cursor, keys_version: u64, out: &mut ImportedKeys)
         for _ in 0..count {
             skip_okey(cur)?;
         }
+        // `ImportedKeys` has no Orchard variant yet, so these records are
+        // dropped rather than recovered. Unlike a locked zkey/tkey (which
+        // at least leaves a diagnostic per entry), a purely-Orchard wallet
+        // would otherwise report `is_empty() == true` with an empty
+        // diagnostics list — indistinguishable from a wallet that never
+        // held funds. `keys.rs`'s contract is that diagnostics must never
+        // be empty silently, so record what was skipped, without leaking
+        // any key material.
+        if count > 0 {
+            out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                record_type: "zwl-okey".to_owned(),
+                reason: format!(
+                    "{count} Orchard key record(s) skipped: Orchard is not yet \
+                     supported by this wallet-recovery tool"
+                ),
+            });
+        }
     }
 
     let zkeys = cur.vector(|c| read_zkey(c))?;
@@ -769,6 +786,32 @@ mod tests {
         assert_eq!(
             keys.transparent[0].secret.expose_secret(),
             &[0x22; TRANSPARENT_SECRET_LEN]
+        );
+    }
+
+    #[test]
+    fn a_wallet_with_only_orchard_keys_reports_a_diagnostic_instead_of_looking_empty() {
+        // A post-NU5 ZWL wallet whose funds are entirely Orchard-derived
+        // has no sapling or transparent keys at all. `ImportedKeys` has no
+        // Orchard field, so `is_empty()` would read `true` here — the
+        // diagnostics list is the only signal the caller has that
+        // anything was actually skipped, and `keys.rs`'s own contract is
+        // that diagnostics must never be empty silently.
+        let mut vectors = cs(1);
+        vectors.extend_from_slice(&okey_stub());
+        vectors.extend_from_slice(&cs(0)); // zkeys: none
+        vectors.extend_from_slice(&cs(0)); // tkeys: none
+
+        let body = keys_body(22, false, &vectors);
+        let bytes = wallet(25, &body);
+
+        let keys = import_zwl(&bytes, None).unwrap();
+
+        assert!(keys.sapling.is_empty());
+        assert!(keys.transparent.is_empty());
+        assert!(
+            !keys.diagnostics.is_empty(),
+            "a wallet holding only Orchard keys must not report as silently empty"
         );
     }
 
