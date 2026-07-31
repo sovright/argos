@@ -7,6 +7,7 @@
 use argos_wallet_import::ImportedKeys;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
+use zip32::fingerprint::SeedFingerprint;
 
 use crate::{
     derivation::mnemonic_seed,
@@ -41,6 +42,15 @@ pub trait KeySource: Send + Sync {
     /// The 64-byte seed used to initialize the wallet database, when one
     /// exists. Imported key sets have no seed.
     fn wallet_seed(&self) -> ZeckResult<Option<[u8; 64]>>;
+
+    /// The string mixed into the on-disk workspace id.
+    ///
+    /// Deliberately distinct from `fingerprint()`. This value is a
+    /// compatibility constraint, not a design choice: for a seed it must
+    /// remain exactly the ZIP-32 `SeedFingerprint` bech32 string that
+    /// `derive_workspace_id` has always hashed, or existing workspaces
+    /// become unreachable.
+    fn workspace_path_component(&self) -> ZeckResult<String>;
 
     /// Short human-readable description for logs and the resume UI.
     /// Must never contain secret material.
@@ -77,6 +87,14 @@ impl KeySource for SeedKeySource {
     fn wallet_seed(&self) -> ZeckResult<Option<[u8; 64]>> {
         let seed = mnemonic_seed(&self.seed_phrase)?;
         Ok(Some(*seed.expose_secret()))
+    }
+
+    fn workspace_path_component(&self) -> ZeckResult<String> {
+        let seed = mnemonic_seed(&self.seed_phrase)?;
+        let fingerprint = SeedFingerprint::from_seed(seed.expose_secret()).ok_or_else(|| {
+            ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
+        })?;
+        Ok(fingerprint.to_string())
     }
 
     fn describe(&self) -> String {
@@ -133,6 +151,13 @@ impl KeySource for ImportedKeySource {
         // Imported key sets have no seed. `zcash_client_sqlite`'s
         // init_wallet_db accepts None; callers must not fabricate one.
         Ok(None)
+    }
+
+    fn workspace_path_component(&self) -> ZeckResult<String> {
+        // Domain-separated so this can never collide with a bech32 seed
+        // fingerprint, which `SeedKeySource::workspace_path_component`
+        // returns unprefixed.
+        Ok(format!("imported-{}", self.fingerprint()?.to_hex()))
     }
 
     fn describe(&self) -> String {
