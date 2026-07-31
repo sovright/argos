@@ -126,7 +126,10 @@ impl KeySource for ImportedKeySource {
         h.update(b"imported");
 
         // Hash public identifiers only — never secret material. Sprout
-        // addresses and counts are enough to distinguish key sets.
+        // addresses and counts are enough to distinguish key sets; secret
+        // key material (transparent, sapling, the recovered mnemonic) is
+        // bound in via a domain-separated inner digest rather than the
+        // secret bytes themselves.
         h.update((self.keys.transparent.len() as u64).to_le_bytes());
         h.update((self.keys.sapling.len() as u64).to_le_bytes());
         h.update((self.keys.sprout.len() as u64).to_le_bytes());
@@ -141,6 +144,18 @@ impl KeySource for ImportedKeySource {
             inner.update(k.secret.expose_secret());
             h.update(inner.finalize());
         }
+        for k in &self.keys.sapling {
+            let mut inner = Sha256::new();
+            inner.update(b"argos-sapling-id-v1");
+            inner.update(k.extsk.expose_secret());
+            h.update(inner.finalize());
+        }
+        if let Some(mnemonic) = &self.keys.mnemonic {
+            let mut inner = Sha256::new();
+            inner.update(b"argos-mnemonic-id-v1");
+            inner.update(mnemonic.expose_secret().as_bytes());
+            h.update(inner.finalize());
+        }
 
         let mut out = [0u8; 32];
         out.copy_from_slice(&h.finalize());
@@ -148,9 +163,20 @@ impl KeySource for ImportedKeySource {
     }
 
     fn wallet_seed(&self) -> ZeckResult<Option<[u8; 64]>> {
-        // Imported key sets have no seed. `zcash_client_sqlite`'s
-        // init_wallet_db accepts None; callers must not fabricate one.
-        Ok(None)
+        // A zcashd-style flat-key import has no seed — its keys are
+        // stored individually, not HD-derived — and `zcash_client_sqlite`'s
+        // init_wallet_db accepts None; callers must not fabricate one there.
+        // A decrypted ZecWallet Lite wallet is different: its keys are
+        // re-derived from a recovered BIP-39 mnemonic rather than stored
+        // per-key, so the mnemonic *is* the seed source and must be wired
+        // through the same pipeline `SeedKeySource` uses.
+        match &self.keys.mnemonic {
+            Some(mnemonic) => {
+                let seed = mnemonic_seed(mnemonic)?;
+                Ok(Some(*seed.expose_secret()))
+            }
+            None => Ok(None),
+        }
     }
 
     fn workspace_path_component(&self) -> ZeckResult<String> {
@@ -241,5 +267,84 @@ mod tests {
     fn fingerprint_is_stable_across_calls() {
         let s = SeedKeySource::new(SecretString::new(SEED.to_owned()));
         assert_eq!(s.fingerprint().unwrap(), s.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn two_imported_sets_differing_only_in_sapling_keys_do_not_collide() {
+        use argos_wallet_import::keys::{Provenance, SaplingKey};
+        use secrecy::Secret;
+
+        let keys_a = argos_wallet_import::ImportedKeys {
+            sapling: vec![SaplingKey {
+                extsk: Secret::new(vec![0x11; 169]),
+                provenance: Provenance::Standalone,
+            }],
+            ..Default::default()
+        };
+        let a = ImportedKeySource::new(keys_a);
+
+        let keys_b = argos_wallet_import::ImportedKeys {
+            sapling: vec![SaplingKey {
+                extsk: Secret::new(vec![0x99; 169]),
+                provenance: Provenance::Standalone,
+            }],
+            ..Default::default()
+        };
+        let b = ImportedKeySource::new(keys_b);
+
+        assert_ne!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn two_decrypted_zwl_wallets_with_different_mnemonics_do_not_collide() {
+        use bip0039::{English, Mnemonic};
+
+        let other = Mnemonic::<English>::from_entropy(vec![0x02u8; 32])
+            .unwrap()
+            .into_phrase();
+
+        let keys_a = argos_wallet_import::ImportedKeys {
+            mnemonic: Some(SecretString::new(SEED.to_owned())),
+            ..Default::default()
+        };
+        let a = ImportedKeySource::new(keys_a);
+
+        let keys_b = argos_wallet_import::ImportedKeys {
+            mnemonic: Some(SecretString::new(other)),
+            ..Default::default()
+        };
+        let b = ImportedKeySource::new(keys_b);
+
+        assert_ne!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn a_recovered_mnemonic_yields_a_wallet_seed() {
+        let keys = argos_wallet_import::ImportedKeys {
+            mnemonic: Some(SecretString::new(SEED.to_owned())),
+            ..Default::default()
+        };
+        let source = ImportedKeySource::new(keys);
+
+        let seed = source.wallet_seed().unwrap();
+        assert!(
+            seed.is_some(),
+            "expected a wallet seed from a recovered mnemonic"
+        );
+    }
+
+    #[test]
+    fn a_zcashd_flat_key_import_still_has_no_wallet_seed() {
+        use argos_wallet_import::keys::{Provenance, TransparentKey};
+        use secrecy::Secret;
+
+        let mut keys = argos_wallet_import::ImportedKeys::default();
+        keys.transparent.push(TransparentKey {
+            secret: Secret::new([0x42; 32]),
+            provenance: Provenance::Standalone,
+        });
+        let source = ImportedKeySource::new(keys);
+
+        assert!(source.wallet_seed().unwrap().is_none());
     }
 }
