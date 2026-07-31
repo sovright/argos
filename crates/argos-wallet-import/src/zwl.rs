@@ -36,19 +36,41 @@
 //! truncated or unrecognized shape stops parsing and returns whatever key
 //! material was already collected, rather than failing the whole import.
 //! Only two conditions are hard errors: an unreadable/too-new
-//! `external_version`, and an encrypted wallet with no passphrase.
+//! `external_version`, and an encrypted wallet with no passphrase or the
+//! wrong one.
 //!
 //! ZWL never held Sprout keys, so nothing here contributes to sub-spec 3.
 //!
-//! **Encryption is detected but not yet decrypted.** ZWL encrypts with a
-//! libsodium `secretbox` (XSalsa20-Poly1305), a different primitive than
-//! zcashd's AES-256-CBC master key scheme this crate already implements
-//! for `zcashd::crypto`. Adding that cipher — plus, for HD-derived keys,
-//! a BIP-39 mnemonic and Sapling/Orchard zip32 re-derivation, since a
-//! locked wallet's HD key material isn't in the file at all, only the
-//! encrypted seed is — is out of scope for this task. A locked wallet
-//! with a passphrase supplied still refuses to fabricate keys: locked
-//! entries are recorded as diagnostics, never silently dropped.
+//! ## Encrypted wallets: the seed, not the keys
+//!
+//! ZWL encrypts with a libsodium `secretbox` (XSalsa20-Poly1305), a
+//! different primitive than zcashd's AES-256-CBC master key scheme this
+//! crate already implements for `zcashd::crypto`. Confirmed against
+//! `zingolabs/zewif-zwl`'s `src/keys.rs` (`master` branch, ~lines
+//! 299-330):
+//!
+//! ```text
+//! key   = double_sha256(passphrase)         // no salt, no work factor
+//! nonce = self.nonce                        // 24 bytes, stored in the file
+//! seed  = secretbox_open(enc_seed, nonce, key)
+//! ```
+//!
+//! **The KDF is unsalted double-SHA-256 with no work factor.** That is
+//! ZWL's design, not this crate's, but it means a ZWL passphrase is
+//! brute-forceable at plain hashing speed — worth stating plainly since
+//! this crate exists to handle wallets whose threat model includes that.
+//!
+//! A decrypted ZWL wallet does not yield a flat set of keys: ZWL stores no
+//! per-key ciphertext for its HD-derived keys, only this one encrypted
+//! seed, and re-derives every HD key from it on load. So decryption here
+//! produces a BIP-39 mnemonic (`ImportedKeys::mnemonic`), not spending
+//! keys — zip32/Sapling/Orchard re-derivation from that mnemonic belongs
+//! in `argos-core`, which already does it for the unencrypted case, not in
+//! this deliberately minimal, network-free leaf crate. Per-record
+//! ciphertext on an individual locked `zkey`/`tkey` entry (`enc_key` +
+//! its own `nonce`) is a separate, still-unimplemented scheme; those
+//! entries keep surfacing as diagnostics exactly as before, since the
+//! seed does not unlock them at this layer.
 //!
 //! **This is the least-validated code in the crate.** There is no real
 //! ZWL wallet fixture to test against (unlike the zcashd path, which has
@@ -57,7 +79,10 @@
 //! parser reads back what it was given, not that the layout matches every
 //! real-world ZWL wallet on disk.
 
-use secrecy::{Secret, SecretString};
+use bip0039::{English, Mnemonic};
+use crypto_secretbox::{aead::Aead, KeyInit, Nonce as SecretboxNonce, XSalsa20Poly1305};
+use secrecy::{ExposeSecret, Secret, SecretString};
+use sha2::{Digest, Sha256};
 
 use crate::{
     error::{ImportDiagnostic, ImportError},
@@ -104,17 +129,54 @@ const ENC_SEED_LEN: usize = 48;
 const SEED_LEN: usize = 32;
 const TRANSPARENT_SECRET_LEN: usize = 32;
 
+/// XSalsa20-Poly1305 (libsodium `secretbox`) nonce length.
+const NONCE_LEN: usize = 24;
+
 fn unreadable(msg: impl Into<String>) -> ImportError {
     ImportError::UnwalkableBtree(msg.into())
 }
 
+/// Per-record ciphertext on an individual locked `zkey`/`tkey` entry
+/// (`enc_key` + its own `nonce`) is a distinct, still-unimplemented
+/// scheme from the whole-wallet `enc_seed` this module now decrypts — see
+/// the module docs. These entries keep surfacing as diagnostics.
 fn decryption_not_supported(record_type: &str) -> ImportDiagnostic {
     ImportDiagnostic::DecryptionFailed {
         record_type: record_type.to_owned(),
-        reason: "ZecWallet Lite's libsodium-based key encryption is not yet supported by this \
-                 build"
+        reason: "ZecWallet Lite's per-key libsodium ciphertext is not supported by this build; \
+                 this key is only recoverable from the wallet's decrypted seed, via HD \
+                 re-derivation"
             .to_owned(),
     }
+}
+
+/// ZWL's key-derivation function: unsalted double-SHA-256 over the raw
+/// passphrase bytes. See the module docs for why that is worth flagging.
+fn double_sha256(passphrase: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(passphrase);
+    Sha256::digest(first).into()
+}
+
+/// Decrypt `enc_seed` into raw BIP-39 entropy.
+///
+/// Returns `Err(())` on any failure — a malformed nonce or a Poly1305
+/// authentication failure alike — leaving the caller to translate that
+/// into `ImportError::WrongPassphrase`, since a wrong passphrase is the
+/// overwhelmingly likely cause of either.
+fn decrypt_seed(
+    enc_seed: &[u8; ENC_SEED_LEN],
+    nonce: &[u8],
+    passphrase: &SecretString,
+) -> Result<[u8; SEED_LEN], ()> {
+    let nonce_bytes: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| ())?;
+    let key_bytes = double_sha256(passphrase.expose_secret().as_bytes());
+
+    let cipher = XSalsa20Poly1305::new(&key_bytes.into());
+    let plaintext = cipher
+        .decrypt(&SecretboxNonce::from(nonce_bytes), enc_seed.as_slice())
+        .map_err(|_| ())?;
+
+    plaintext.try_into().map_err(|_| ())
 }
 
 /// Minimal, bounds-checked cursor over attacker-controlled bytes.
@@ -214,6 +276,8 @@ impl<'a> Cursor<'a> {
 struct KeysHeader {
     keys_version: u64,
     encrypted: bool,
+    enc_seed: [u8; ENC_SEED_LEN],
+    nonce: Vec<u8>,
 }
 
 fn read_keys_header(cur: &mut Cursor) -> Option<KeysHeader> {
@@ -227,12 +291,14 @@ fn read_keys_header(cur: &mut Cursor) -> Option<KeysHeader> {
         return None;
     }
     let encrypted = cur.u8()? > 0;
-    cur.skip(ENC_SEED_LEN)?;
-    cur.vector_bytes()?; // nonce
+    let enc_seed = cur.array::<ENC_SEED_LEN>()?;
+    let nonce = cur.vector_bytes()?;
     cur.skip(SEED_LEN)?;
     Some(KeysHeader {
         keys_version,
         encrypted,
+        enc_seed,
+        nonce,
     })
 }
 
@@ -388,12 +454,16 @@ fn read_key_vectors(cur: &mut Cursor, keys_version: u64, out: &mut ImportedKeys)
 ///
 /// Takes a passphrase because ZWL wallets carry their own `encrypted`
 /// flag: an encrypted wallet with no passphrase refuses outright, the
-/// same contract `zcashd::import_zcashd` uses for a locked wallet.
-/// Decryption itself is not implemented yet (see the module docs) — a
-/// passphrase-bearing call to an encrypted wallet still succeeds, but
-/// recovers only whatever key material the file happens to hold
-/// unencrypted, and reports every locked entry as a diagnostic rather
-/// than silently omitting it.
+/// same contract `zcashd::import_zcashd` uses for a locked wallet. When a
+/// passphrase is supplied to an encrypted wallet, `enc_seed` is decrypted
+/// into a BIP-39 mnemonic (`ImportedKeys::mnemonic`) — see the module
+/// docs for why that, not flat keys, is what decryption yields here. A
+/// Poly1305 authentication failure on that decryption is reported as
+/// `ImportError::WrongPassphrase`, since a wrong passphrase is by far the
+/// most likely cause and is the actionable message for the user.
+/// Individual locked `zkey`/`tkey` entries — a different, per-record
+/// ciphertext this module still does not decrypt — keep surfacing as
+/// diagnostics rather than being silently dropped.
 pub fn import_zwl(
     bytes: &[u8],
     passphrase: Option<&SecretString>,
@@ -423,8 +493,24 @@ pub fn import_zwl(
         return Ok(out);
     };
 
-    if header.encrypted && passphrase.is_none() {
-        return Err(ImportError::WrongPassphrase);
+    if header.encrypted {
+        let Some(pass) = passphrase else {
+            return Err(ImportError::WrongPassphrase);
+        };
+        match decrypt_seed(&header.enc_seed, &header.nonce, pass) {
+            Ok(entropy) => match Mnemonic::<English>::from_entropy(entropy.to_vec()) {
+                Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
+                Err(_) => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
+                    record_type: "zwl-seed".to_owned(),
+                    reason: "decrypted seed is not a valid BIP-39 entropy length".to_owned(),
+                }),
+            },
+            // Authentication failure on the seed is fatal, not a
+            // per-record diagnostic: it means the passphrase is wrong for
+            // the whole wallet, the same contract zcashd's
+            // `derive_master_key` uses for its master key.
+            Err(()) => return Err(ImportError::WrongPassphrase),
+        }
     }
 
     // Best-effort from here: `None` means "stop parsing", not an error.
@@ -436,7 +522,6 @@ pub fn import_zwl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::ExposeSecret;
 
     fn wallet(version: u64, body: &[u8]) -> Vec<u8> {
         let mut v = version.to_le_bytes().to_vec();
@@ -484,13 +569,57 @@ mod tests {
     /// for an unencrypted wallet: `keys_version` header, then whatever
     /// `zkeys`/`tkeys`/`okeys` bytes the caller supplies.
     fn keys_body(keys_version: u64, encrypted: bool, key_vectors: &[u8]) -> Vec<u8> {
+        keys_body_with_seed(
+            keys_version,
+            encrypted,
+            &[0u8; ENC_SEED_LEN],
+            &[],
+            key_vectors,
+        )
+    }
+
+    /// As `keys_body`, but with caller-supplied `enc_seed`/`nonce` bytes —
+    /// needed to exercise real seed decryption.
+    fn keys_body_with_seed(
+        keys_version: u64,
+        encrypted: bool,
+        enc_seed: &[u8],
+        nonce: &[u8],
+        key_vectors: &[u8],
+    ) -> Vec<u8> {
+        assert_eq!(enc_seed.len(), ENC_SEED_LEN, "test helper misuse");
         let mut v = keys_version.to_le_bytes().to_vec();
         v.push(u8::from(encrypted));
-        v.extend_from_slice(&[0u8; 48]); // enc_seed
-        v.extend_from_slice(&cs(0)); // nonce: empty
-        v.extend_from_slice(&[0u8; 32]); // seed
+        v.extend_from_slice(enc_seed);
+        v.extend_from_slice(&vec_bytes(nonce)); // nonce
+        v.extend_from_slice(&[0u8; SEED_LEN]); // plaintext seed slot, unused when encrypted
         v.extend_from_slice(key_vectors);
         v
+    }
+
+    /// Encrypt `entropy` the way ZWL does: unsalted double-SHA-256 of the
+    /// passphrase as the `secretbox` key, `nonce_bytes` as the nonce.
+    /// Independent of `decrypt_seed` — this is what makes the round-trip
+    /// test below meaningful rather than circular.
+    fn encrypt_test_seed(
+        passphrase: &str,
+        entropy: &[u8; SEED_LEN],
+        nonce_bytes: [u8; NONCE_LEN],
+    ) -> ([u8; ENC_SEED_LEN], [u8; NONCE_LEN]) {
+        use sha2::{Digest, Sha256};
+
+        let first = Sha256::digest(passphrase.as_bytes());
+        let key_bytes: [u8; 32] = Sha256::digest(first).into();
+
+        let cipher = XSalsa20Poly1305::new(&key_bytes.into());
+        let ciphertext = cipher
+            .encrypt(&SecretboxNonce::from(nonce_bytes), entropy.as_slice())
+            .expect("encryption of a well-formed test payload cannot fail");
+
+        (
+            ciphertext.try_into().expect("ciphertext must be 48 bytes"),
+            nonce_bytes,
+        )
     }
 
     fn zkey_hd(extsk_byte: u8) -> Vec<u8> {
@@ -692,16 +821,20 @@ mod tests {
 
     #[test]
     fn an_encrypted_wallet_with_a_passphrase_reports_locked_keys_as_diagnostics() {
-        // Decryption is not implemented (see module docs): a passphrase
-        // must not make locked entries look recovered. Every locked
-        // entry has to show up as a diagnostic, never a fabricated key.
+        // The seed decrypts fine (a correct passphrase), but individual
+        // locked zkey/tkey entries carry their own, still-unimplemented
+        // per-record ciphertext — see the module docs. A passphrase must
+        // not make those look recovered: every locked entry has to show
+        // up as a diagnostic, never a fabricated key.
         // keys_version 21: no okeys vector at all (only present > 21).
         let mut vectors = cs(1);
         vectors.extend_from_slice(&zkey_locked());
         vectors.extend_from_slice(&cs(1));
         vectors.extend_from_slice(&tkey_locked());
 
-        let body = keys_body(21, true, &vectors);
+        let entropy = [0x7A; SEED_LEN];
+        let (enc_seed, nonce) = encrypt_test_seed("whatever", &entropy, [0x24; NONCE_LEN]);
+        let body = keys_body_with_seed(21, true, &enc_seed, &nonce, &vectors);
         let bytes = wallet(25, &body);
 
         let pass = SecretString::new("whatever".to_owned());
@@ -710,6 +843,52 @@ mod tests {
         assert!(keys.sapling.is_empty(), "no fabricated sapling key");
         assert!(keys.transparent.is_empty(), "no fabricated transparent key");
         assert_eq!(keys.diagnostics.len(), 2);
+        assert!(
+            keys.mnemonic.is_some(),
+            "the whole-wallet seed still decrypts even though these two keys don't"
+        );
+    }
+
+    #[test]
+    fn recovers_a_mnemonic_from_an_encrypted_seed() {
+        // Round-trip against a synthetic header: encrypt known entropy
+        // with ZWL's actual scheme (double_sha256 key, secretbox), then
+        // confirm the parser recovers the matching mnemonic.
+        let entropy = [0x11; SEED_LEN];
+        let passphrase = "some passphrase";
+        let (enc_seed, nonce) = encrypt_test_seed(passphrase, &entropy, [0x99; NONCE_LEN]);
+
+        let vectors = [cs(0), cs(0)].concat(); // empty zkeys, empty tkeys
+        let body = keys_body_with_seed(21, true, &enc_seed, &nonce, &vectors);
+        let bytes = wallet(25, &body);
+
+        let pass = SecretString::new(passphrase.to_owned());
+        let keys = import_zwl(&bytes, Some(&pass)).unwrap();
+
+        let expected = Mnemonic::<English>::from_entropy(entropy.to_vec())
+            .unwrap()
+            .into_phrase();
+        assert_eq!(keys.mnemonic.as_ref().unwrap().expose_secret(), &expected);
+        assert!(keys.transparent.is_empty() && keys.sapling.is_empty());
+        assert!(
+            !keys.is_empty(),
+            "a recovered mnemonic alone must count as non-empty"
+        );
+    }
+
+    #[test]
+    fn a_wrong_passphrase_on_an_encrypted_seed_is_reported_as_wrong_passphrase() {
+        let entropy = [0x22; SEED_LEN];
+        let (enc_seed, nonce) =
+            encrypt_test_seed("correct passphrase", &entropy, [0x55; NONCE_LEN]);
+
+        let vectors = [cs(0), cs(0)].concat();
+        let body = keys_body_with_seed(21, true, &enc_seed, &nonce, &vectors);
+        let bytes = wallet(25, &body);
+
+        let wrong = SecretString::new("wrong passphrase".to_owned());
+        let err = import_zwl(&bytes, Some(&wrong)).unwrap_err();
+        assert_eq!(err, ImportError::WrongPassphrase);
     }
 
     #[test]

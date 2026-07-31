@@ -1,6 +1,6 @@
 //! The normalized output of any wallet import.
 
-use secrecy::Secret;
+use secrecy::{Secret, SecretString};
 
 use crate::error::ImportDiagnostic;
 
@@ -93,14 +93,27 @@ pub struct ImportedKeys {
     pub sapling: Vec<SaplingKey>,
     pub sprout: Vec<SproutKey>,
     pub sprout_notes: Vec<SproutNoteData>,
+    /// A recovered BIP-39 mnemonic, when the source wallet held a seed
+    /// rather than (or in addition to) flat key material — currently only
+    /// ZWL, whose HD keys are re-derived from this seed rather than stored
+    /// individually. Deriving keys from it is `argos-core`'s job, not this
+    /// crate's: see the module docs on `zwl` for why.
+    pub mnemonic: Option<SecretString>,
     /// Everything we could not read. Never empty silently — always shown
     /// to the user with counts.
     pub diagnostics: Vec<ImportDiagnostic>,
 }
 
 impl ImportedKeys {
+    /// A recovered mnemonic counts as non-empty even with zero flat keys:
+    /// that is exactly what a decrypted ZWL wallet yields, since its
+    /// HD-derived keys live only in the seed, not the file. See the
+    /// `mnemonic` field's docs.
     pub fn is_empty(&self) -> bool {
-        self.transparent.is_empty() && self.sapling.is_empty() && self.sprout.is_empty()
+        self.transparent.is_empty()
+            && self.sapling.is_empty()
+            && self.sprout.is_empty()
+            && self.mnemonic.is_none()
     }
 
     pub fn total_keys(&self) -> usize {
@@ -121,6 +134,14 @@ impl std::fmt::Debug for ImportedKeys {
             .field(
                 "sprout_notes",
                 &format!("<{} notes>", self.sprout_notes.len()),
+            )
+            .field(
+                "mnemonic",
+                &if self.mnemonic.is_some() {
+                    "<redacted>"
+                } else {
+                    "None"
+                },
             )
             .field("diagnostics", &self.diagnostics)
             .finish()

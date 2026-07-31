@@ -9,8 +9,10 @@ publish = false
 
 [dependencies]
 aes.workspace = true
+bip0039.workspace = true
 blake2b_simd.workspace = true
 cbc.workspace = true
+crypto_secretbox.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

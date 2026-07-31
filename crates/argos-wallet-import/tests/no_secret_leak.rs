@@ -164,3 +164,38 @@ fn an_imported_key_set_does_not_leak_through_debug() {
         assert_no_marker(&format!("{k:?}"), SAPLING_MARKER, "sapling extsk");
     }
 }
+
+#[test]
+fn recovered_mnemonic_does_not_leak_through_debug() {
+    // A decrypted ZWL wallet's recovered seed is a BIP-39 phrase, not a
+    // uniform byte fill, so `assert_no_marker`'s hex/decimal check doesn't
+    // apply here — this checks for the literal phrase text instead.
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                   abandon abandon about";
+
+    let keys = ImportedKeys {
+        mnemonic: Some(SecretString::new(phrase.to_owned())),
+        ..ImportedKeys::default()
+    };
+
+    let rendered = format!("{keys:?}");
+    assert!(
+        !rendered.contains(phrase),
+        "mnemonic phrase leaked into Debug output: {rendered}"
+    );
+    assert!(
+        rendered.contains("mnemonic"),
+        "expected an explicit (redacted) mnemonic field, got: {rendered}"
+    );
+
+    // Non-vacuous: prove the phrase text would actually appear if
+    // `ImportedKeys`'s Debug impl ever rendered this field naively (e.g.
+    // a derive, or delegating to `SecretString`'s inner value directly),
+    // so the negative assertion above is not trivially satisfied.
+    let naively_rendered = format!("{phrase:?}");
+    assert!(
+        naively_rendered.contains(phrase),
+        "sanity check: a plain Debug of the phrase must contain the phrase itself, or this \
+         test proves nothing"
+    );
+}
