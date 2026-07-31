@@ -22,6 +22,7 @@ argos-network = ["zcash_protocol/local-consensus"]
 
 [dependencies]
 anyhow.workspace = true
+argos-wallet-import = { path = "../argos-wallet-import" }
 async-trait.workspace = true
 bip0039.workspace = true
 keepawake.workspace = true

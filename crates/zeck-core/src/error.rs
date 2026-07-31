@@ -68,4 +68,7 @@ pub enum ZeckError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("wallet import failed: {0}")]
+    Import(String),
 }

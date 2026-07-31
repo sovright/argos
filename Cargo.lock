@@ -138,6 +138,7 @@ name = "argos-core"
 version = "1.1.0"
 dependencies = [
  "anyhow",
+ "argos-wallet-import",
  "async-trait",
  "bip0039",
  "keepawake",
