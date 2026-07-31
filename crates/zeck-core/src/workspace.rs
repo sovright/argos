@@ -1378,22 +1378,62 @@ mod tests {
         assert_ne!(a, d);
     }
 
+    /// Verbatim copy of the pre-refactor `derive_workspace_id`, which hashed
+    /// `fingerprint.to_string()` directly rather than a generalized
+    /// `path_component: &str`. Kept here so
+    /// `a_seed_workspace_path_is_unchanged_by_the_refactor` compares two
+    /// independent derivations rather than the production code against
+    /// itself. Do NOT refactor this to call the production helper.
+    fn original_workspace_id(
+        network: ZeckNetwork,
+        fingerprint: &SeedFingerprint,
+        birthday: u32,
+        scope: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zeck-workspace-v1\0");
+        hasher.update(network.label().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(fingerprint.to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(birthday.to_le_bytes());
+        hasher.update(b"\0");
+        hasher.update(scope.as_bytes());
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(32);
+        for byte in digest.iter().take(16) {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
     #[test]
     fn a_seed_workspace_path_is_unchanged_by_the_refactor() {
         // Regression guard: existing users must resume their scans. If
         // this fails, every in-progress scan on disk is orphaned.
         //
-        // `old` is built via `from_runtime`, which is untouched call-site
-        // code — it still does its own seed -> SeedFingerprint -> path
-        // derivation inline (see above). `new` goes through the added
-        // `from_key_source` + `KeySource::workspace_path_component` seam.
-        // These are two independent code paths computing the same path,
-        // not one path compared against itself.
+        // `expected` is built from `original_workspace_id`, a verbatim
+        // copy of the pre-refactor derivation, independent of any
+        // production code touched by this change. `actual` goes through
+        // the new `from_key_source` + `KeySource::workspace_path_component`
+        // seam. This is a genuine differential comparison, not the new
+        // code compared against itself.
         let cfg = runtime_config(SEED);
-        let old = RecoveryWorkspace::from_runtime(&cfg).unwrap();
+        let seed = mnemonic_seed(&cfg.seed_phrase).unwrap();
+        let fingerprint = SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
+        let scope = "auto-gap-20";
+        let expected_id = original_workspace_id(cfg.network, &fingerprint, cfg.birthday, scope);
+        let expected_path = cfg
+            .data_dir
+            .join(cfg.network.label())
+            .join(format!("workspace-{expected_id}"))
+            .join(format!("birthday-{}", cfg.birthday))
+            .join(scope)
+            .join("wallet.sqlite");
+
         let source = SeedKeySource::new(cfg.seed_phrase.clone());
-        let new = RecoveryWorkspace::from_key_source(&source, &cfg).unwrap();
-        assert_eq!(old.wallet_db_path(), new.wallet_db_path());
+        let actual = RecoveryWorkspace::from_key_source(&source, &cfg).unwrap();
+        assert_eq!(actual.wallet_db_path(), expected_path);
     }
 
     #[test]
