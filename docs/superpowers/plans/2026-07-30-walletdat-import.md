@@ -3266,7 +3266,48 @@ In `crates/zeck-core/src/workspace.rs`, add alongside `from_runtime`:
     }
 ```
 
-**Path-compatibility requirement:** `derive_workspace_id_from_fingerprint` must produce, for a `SeedKeySource`, exactly what `derive_workspace_id` produces today from a `SeedFingerprint`. Read the existing `derive_workspace_id` implementation and feed it the same bytes. The `a_seed_workspace_path_is_unchanged_by_the_refactor` test is what proves you got this right — if it fails, do not adjust the test.
+**Path-compatibility requirement — read this before writing any code.**
+
+`derive_workspace_id` (`workspace.rs:250`) hashes
+`fingerprint.to_string()`, the **bech32 rendering of ZIP-32's
+`SeedFingerprint`**. `KeySourceFingerprint` is something else entirely:
+`SHA256(domain || "seed" || seed_bytes)`, a raw 32-byte digest with no
+relationship to the ZIP-32 value.
+
+So you **cannot** feed `KeySourceFingerprint` into the existing hash and get
+today's paths. Doing so changes every seed-derived workspace path, which
+orphans every in-progress scan on every user's disk — the tool would silently
+start over instead of resuming.
+
+Add a second trait method that yields the *path component* specifically,
+separate from the collision-resistance fingerprint:
+
+```rust
+    /// The string mixed into the on-disk workspace id.
+    ///
+    /// Deliberately distinct from `fingerprint()`. This value is a
+    /// compatibility constraint, not a design choice: for a seed it must
+    /// remain exactly the ZIP-32 `SeedFingerprint` bech32 string that
+    /// `derive_workspace_id` has always hashed, or existing workspaces
+    /// become unreachable.
+    fn workspace_path_component(&self) -> ZeckResult<String>;
+```
+
+- `SeedKeySource` returns `SeedFingerprint::from_seed(seed)?.to_string()` —
+  byte-for-byte what the current code hashes.
+- `ImportedKeySource` returns a domain-separated string that can never
+  collide with a bech32 seed fingerprint, e.g. `format!("imported-{}",
+  fingerprint.to_hex())`.
+
+Then generalize `derive_workspace_id` to take `&str` instead of
+`&SeedFingerprint` and pass `fingerprint.to_string()` at the existing call
+site. The hash input is then identical for seeds by construction, rather than
+by coincidence.
+
+`a_seed_workspace_path_is_unchanged_by_the_refactor` is what proves this.
+**If it fails, do not adjust the test** — and do not make it pass by
+comparing the new derivation against itself. It must compare against a path
+built the old way.
 
 - [ ] **Step 4: Generalize wallet initialization**
 
