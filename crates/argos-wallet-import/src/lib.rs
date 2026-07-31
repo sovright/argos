@@ -31,6 +31,7 @@ pub mod error;
 pub mod keys;
 pub mod sniff;
 pub mod zcashd;
+pub mod zwl;
 
 pub use error::{ImportDiagnostic, ImportError};
 pub use keys::{ImportedKeys, Provenance};
@@ -45,7 +46,6 @@ pub fn import_wallet_file(
 ) -> Result<ImportedKeys, ImportError> {
     match sniff::sniff(bytes)? {
         WalletFormat::Zcashd => zcashd::import_zcashd(bytes, passphrase),
-        // Task 13 implements ZecWallet Lite import.
-        WalletFormat::ZecwalletLite => Err(ImportError::UnrecognizedFormat),
+        WalletFormat::ZecwalletLite => zwl::import_zwl(bytes, passphrase),
     }
 }
