@@ -56,8 +56,7 @@ pub struct RecoveryWorkspace {
 
 impl RecoveryWorkspace {
     pub fn from_runtime(config: &RuntimeScanConfig) -> ZeckResult<Self> {
-        let source = SeedKeySource::new(config.seed_phrase.clone());
-        Self::from_key_source(&source, config)
+        Self::from_key_source(config.key_source.as_ref(), config)
     }
 
     /// Build a workspace from any key source.
@@ -955,6 +954,7 @@ mod regtest_params_tests {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use secrecy::{ExposeSecret, SecretString};
     use zip32::fingerprint::SeedFingerprint;
@@ -972,7 +972,7 @@ mod tests {
         network: ZeckNetwork,
     ) -> RuntimeScanConfig {
         RuntimeScanConfig {
-            seed_phrase: SecretString::new(seed.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(seed.to_owned()))),
             birthday,
             num_accounts,
             gap_limit,
@@ -1146,7 +1146,7 @@ mod tests {
         let ws = RecoveryWorkspace::from_runtime(&cfg).unwrap();
         let path_str = ws.root().display().to_string();
 
-        let seed = mnemonic_seed(&cfg.seed_phrase).expect("seed should derive");
+        let seed = mnemonic_seed(&SecretString::new(SEED.to_owned())).expect("seed should derive");
         let fingerprint_str = SeedFingerprint::from_seed(seed.expose_secret())
             .expect("seed fingerprint should derive")
             .to_string();
@@ -1253,7 +1253,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("tempdir");
         // Workspace 1: incomplete with sidecar.
         let cfg1 = RuntimeScanConfig {
-            seed_phrase: SecretString::new(SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(SEED.to_owned()))),
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,
@@ -1282,7 +1282,7 @@ mod tests {
 
         // Workspace 2: legacy, no sidecar.
         let cfg2 = RuntimeScanConfig {
-            seed_phrase: SecretString::new(OTHER_SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(OTHER_SEED.to_owned()))),
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,
@@ -1297,7 +1297,7 @@ mod tests {
 
         // Workspace 3: completed — must be filtered out.
         let cfg3 = RuntimeScanConfig {
-            seed_phrase: SecretString::new(SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(SEED.to_owned()))),
             birthday: 2_500_000,
             num_accounts: None,
             gap_limit: 20,
@@ -1365,8 +1365,7 @@ mod tests {
 
     #[test]
     fn workspace_id_is_deterministic_and_distinct_across_inputs() {
-        let cfg = config(SEED, 3_280_000, None, 20, ZeckNetwork::Mainnet);
-        let seed = mnemonic_seed(&cfg.seed_phrase).unwrap();
+        let seed = mnemonic_seed(&SecretString::new(SEED.to_owned())).unwrap();
         let fp = SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
         let fp = fp.to_string();
         let a = derive_workspace_id(ZeckNetwork::Mainnet, &fp, 3_280_000, "auto-gap-20");
@@ -1419,7 +1418,7 @@ mod tests {
         // seam. This is a genuine differential comparison, not the new
         // code compared against itself.
         let cfg = runtime_config(SEED);
-        let seed = mnemonic_seed(&cfg.seed_phrase).unwrap();
+        let seed = mnemonic_seed(&SecretString::new(SEED.to_owned())).unwrap();
         let fingerprint = SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
         let scope = "auto-gap-20";
         let expected_id = original_workspace_id(cfg.network, &fingerprint, cfg.birthday, scope);
@@ -1431,7 +1430,7 @@ mod tests {
             .join(scope)
             .join("wallet.sqlite");
 
-        let source = SeedKeySource::new(cfg.seed_phrase.clone());
+        let source = SeedKeySource::new(SecretString::new(SEED.to_owned()));
         let actual = RecoveryWorkspace::from_key_source(&source, &cfg).unwrap();
         assert_eq!(actual.wallet_db_path(), expected_path);
     }
@@ -1439,9 +1438,11 @@ mod tests {
     #[test]
     fn an_imported_workspace_differs_from_a_seed_workspace() {
         let cfg = runtime_config(SEED);
-        let seed_ws =
-            RecoveryWorkspace::from_key_source(&SeedKeySource::new(cfg.seed_phrase.clone()), &cfg)
-                .unwrap();
+        let seed_ws = RecoveryWorkspace::from_key_source(
+            &SeedKeySource::new(SecretString::new(SEED.to_owned())),
+            &cfg,
+        )
+        .unwrap();
         let imported = ImportedKeySource::new(argos_wallet_import::ImportedKeys::default());
         let imported_ws = RecoveryWorkspace::from_key_source(&imported, &cfg).unwrap();
         assert_ne!(seed_ws.wallet_db_path(), imported_ws.wallet_db_path());
@@ -1450,7 +1451,7 @@ mod tests {
     #[test]
     fn the_workspace_path_still_does_not_leak_the_fingerprint() {
         let cfg = runtime_config(SEED);
-        let source = SeedKeySource::new(cfg.seed_phrase.clone());
+        let source = SeedKeySource::new(SecretString::new(SEED.to_owned()));
         let ws = RecoveryWorkspace::from_key_source(&source, &cfg).unwrap();
         let fp = source.fingerprint().unwrap().to_hex();
         let path = ws.wallet_db_path().display().to_string();
@@ -1544,7 +1545,7 @@ mod tests {
         // String/PathBuf without mangling. Defends against a regression that
         // would lose data on macOS users with localised account names.
         let cfg = RuntimeScanConfig {
-            seed_phrase: SecretString::new(SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(SEED.to_owned()))),
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,

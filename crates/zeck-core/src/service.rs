@@ -1,6 +1,6 @@
 use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Instant};
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use tokio::{
     sync::{Mutex, RwLock},
     task::JoinHandle,
@@ -42,7 +42,8 @@ use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, S
 
 use crate::{
     address::validate_destination_address,
-    derivation::{legacy_transparent_account_key, legacy_transparent_secret_key, mnemonic_seed},
+    derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
+    key_source::{KeySource, SeedKeySource},
     error::{ZeckError, ZeckResult},
     lightwalletd::{
         connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
@@ -146,12 +147,8 @@ fn execution_donation_address(network: crate::models::ZeckNetwork) -> String {
 }
 
 /// The concrete wallet database type used throughout the execution path.
-type SweepWalletDb = WalletDb<
-    rusqlite::Connection,
-    crate::workspace::ArgosParams,
-    SystemClock,
-    rand_core::OsRng,
->;
+type SweepWalletDb =
+    WalletDb<rusqlite::Connection, crate::workspace::ArgosParams, SystemClock, rand_core::OsRng>;
 const CONFIRMATION_POLL_INTERVAL_SECS: u64 = 5;
 const CONFIRMATION_POLL_ATTEMPTS: u32 = 24;
 const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
@@ -181,12 +178,23 @@ impl RecoveryService {
         config: ScanConfig,
         seed_phrase: SecretString,
     ) -> ZeckResult<ScanHandle> {
+        self.start_scan_from_key_source(config, Arc::new(SeedKeySource::new(seed_phrase)))
+            .await
+    }
+
+    /// Start a scan from any key source — a seed phrase, or keys read out
+    /// of a legacy wallet file.
+    pub async fn start_scan_from_key_source(
+        &self,
+        config: ScanConfig,
+        key_source: Arc<dyn KeySource>,
+    ) -> ZeckResult<ScanHandle> {
         validate_scan_config(&config)?;
 
         let handle = ScanHandle::new();
         let state = Arc::new(tokio::sync::Mutex::new(ScanTaskState::new(handle.clone())));
         let runtime = RuntimeScanConfig {
-            seed_phrase,
+            key_source,
             birthday: config.birthday,
             num_accounts: config.num_accounts,
             gap_limit: config.gap_limit,
@@ -697,9 +705,16 @@ async fn execute_sweep_for_session(
         )
     };
 
-    let seed = mnemonic_seed(&runtime.seed_phrase)?;
-    let transparent_account =
-        legacy_transparent_account_key(&runtime.seed_phrase, runtime.network)?;
+    // A scan cannot have reached this point without a seed — `run_recovery_scan_inner`
+    // rejects a seedless key source before it derives anything — so this is a
+    // consistency check rather than a user-facing path.
+    let seed = runtime.key_source.wallet_seed()?.ok_or_else(|| {
+        ZeckError::InvalidConfig(format!(
+            "cannot sweep {}: standalone keys with no HD seed are not yet spendable",
+            runtime.key_source.describe()
+        ))
+    })?;
+    let transparent_account = legacy_transparent_account_key_from_seed(runtime.network, &seed)?;
     let network = consensus_network(runtime.network);
     let destination_address =
         ZcashAddress::try_from_encoded(&destination.encoded).map_err(|err| {
@@ -791,7 +806,7 @@ async fn execute_sweep_for_session(
                         tracked_account.derived.index
                     ))
                 })?;
-            let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), zip32_index)
+            let usk = UnifiedSpendingKey::from_seed(&network, &seed, zip32_index)
                 .map_err(|err| {
                     ZeckError::Wallet(format!(
                         "deriving account {}: {err}",
@@ -1055,8 +1070,10 @@ async fn execute_shielding_step(
     transparent_account: &zcash_transparent::keys::AccountPrivKey,
     usk: &UnifiedSpendingKey,
 ) -> ZeckResult<Option<u64>> {
-    let mut wallet_db =
-        open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
+    let mut wallet_db = open_wallet_db(
+        ctx.workspace.wallet_db_path(),
+        consensus_network(ctx.network),
+    )?;
     let input_selector = GreedyInputSelector::<_>::new();
     let change_strategy = standard_zip317_change_strategy();
 
@@ -1300,11 +1317,13 @@ fn build_donation_split_proposal(
             // path was never exercised end-to-end (all tests pass donation_rate
             // = None / use string stand-ins).
             Err(err) if is_insufficient_funds_error(&err.to_string()) => {
-                candidate_fee = candidate_fee.checked_add(u64::from(MARGINAL_FEE)).ok_or_else(|| {
-                    ZeckError::Internal(
-                        "donation fee convergence overflowed the supported range".to_owned(),
-                    )
-                })?;
+                candidate_fee = candidate_fee
+                    .checked_add(u64::from(MARGINAL_FEE))
+                    .ok_or_else(|| {
+                        ZeckError::Internal(
+                            "donation fee convergence overflowed the supported range".to_owned(),
+                        )
+                    })?;
             }
             Err(err) => {
                 return Err(ZeckError::TransactionBuild(format!(
@@ -1327,8 +1346,10 @@ async fn execute_send_max_step(
     destination_address: &ZcashAddress,
     memo_bytes: Option<MemoBytes>,
 ) -> ZeckResult<Option<(u64, u64)>> {
-    let mut wallet_db =
-        open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
+    let mut wallet_db = open_wallet_db(
+        ctx.workspace.wallet_db_path(),
+        consensus_network(ctx.network),
+    )?;
 
     // Pass 1 — measure the full-account send-max proposal (build only, no broadcast).
     let max_proposal = match propose_send_max_transfer::<_, _, _, Infallible>(
@@ -1383,8 +1404,11 @@ async fn execute_send_max_step(
             )
         })?;
 
-    let donation =
-        crate::donation::donation_for_send_amount(ctx.donation_address, ctx.donation_rate, send_amount);
+    let donation = crate::donation::donation_for_send_amount(
+        ctx.donation_address,
+        ctx.donation_rate,
+        send_amount,
+    );
 
     // `donation_zatoshis` is the amount *actually* placed in a donation output:
     // the requested `donation` when the split proposal is used, or 0 when there
@@ -1395,8 +1419,8 @@ async fn execute_send_max_step(
         // No donation output: behavior is unchanged from the single-pass sweep.
         (max_proposal, 0)
     } else {
-        let donation_zcash_address = ZcashAddress::try_from_encoded(ctx.donation_address)
-            .map_err(|err| {
+        let donation_zcash_address =
+            ZcashAddress::try_from_encoded(ctx.donation_address).map_err(|err| {
                 ZeckError::InvalidAddress(format!("failed to decode donation address: {err}"))
             })?;
         // On non-convergence (or a non-positive user remainder) fall back to the
@@ -1859,12 +1883,21 @@ async fn wait_for_shielded_funds_to_confirm(
     loop {
         {
             let mut guard = state.lock().await;
-            guard.progress.message =
-                Some("Waiting for the shielding transaction to confirm before sweeping…".to_owned());
+            guard.progress.message = Some(
+                "Waiting for the shielding transaction to confirm before sweeping…".to_owned(),
+            );
         }
-        run_wallet_sync_with_retry(workspace, network, zeck_network, client, lightwalletd_url, state)
-            .await?;
-        if shielded_spendable_zatoshis(workspace, zeck_network, tracked_account)? > shielded_before {
+        run_wallet_sync_with_retry(
+            workspace,
+            network,
+            zeck_network,
+            client,
+            lightwalletd_url,
+            state,
+        )
+        .await?;
+        if shielded_spendable_zatoshis(workspace, zeck_network, tracked_account)? > shielded_before
+        {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -2021,7 +2054,10 @@ mod tests {
         assert!(sweep.donation_zatoshis > 0);
         assert_eq!(proposal.total_donation_zatoshis, sweep.donation_zatoshis);
         // estimate invariant unchanged
-        assert_eq!(sweep.net_zatoshis + sweep.fee_zatoshis, sweep.gross_zatoshis);
+        assert_eq!(
+            sweep.net_zatoshis + sweep.fee_zatoshis,
+            sweep.gross_zatoshis
+        );
         // donation is strictly less than the amount being sent
         assert!(sweep.donation_zatoshis < sweep.net_zatoshis);
     }
@@ -2227,7 +2263,9 @@ mod tests {
         // predicate is what gates both execution steps so they skip such dust
         // exactly as `build_sweep_proposal` does (instead of erroring the sweep).
         assert!(!balance_covers_sweep_fee(0));
-        assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1));
+        assert!(!balance_covers_sweep_fee(
+            MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1
+        ));
         assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS)); // == floor: fee eats it all
         assert!(balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS + 1));
     }
@@ -2350,12 +2388,8 @@ mod tests {
     #[test]
     fn donation_fallback_ok_none_returns_max() {
         // Fell back → donation-free proposal AND zero actual donation.
-        let got = super::donation_proposal_or_fallback::<&str>(
-            Ok(None),
-            "donation-free-max",
-            5_000,
-            0,
-        );
+        let got =
+            super::donation_proposal_or_fallback::<&str>(Ok(None), "donation-free-max", 5_000, 0);
         assert_eq!(got, ("donation-free-max", 0));
     }
 
@@ -2366,7 +2400,9 @@ mod tests {
         // entire sweep — see PR #66 review (Kristi, 2026-05-28). The actual
         // donation is reported as 0 so the outcome doesn't over-count.
         let got = super::donation_proposal_or_fallback::<&str>(
-            Err(ZeckError::TransactionBuild("synthetic regression".to_owned())),
+            Err(ZeckError::TransactionBuild(
+                "synthetic regression".to_owned(),
+            )),
             "donation-free-max",
             5_000,
             42,
@@ -2457,8 +2493,10 @@ mod tests {
         // of net in the estimate).
         for s in &sweeps {
             assert_eq!(s.net_zatoshis + s.fee_zatoshis, s.gross_zatoshis);
-            assert!(s.donation_zatoshis < s.net_zatoshis,
-                "donation must remain strictly below net so user receives positive remainder");
+            assert!(
+                s.donation_zatoshis < s.net_zatoshis,
+                "donation must remain strictly below net so user receives positive remainder"
+            );
         }
     }
 

@@ -6,7 +6,7 @@ use std::sync::{
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use rustls::crypto::ring::default_provider;
-use secrecy::{ExposeSecret, SecretVec};
+use secrecy::SecretVec;
 use tokio::sync::Mutex;
 use tonic::{
     body::Body as TonicBody,
@@ -38,7 +38,8 @@ use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 use crate::{
     derivation::{
-        derive_accounts, legacy_transparent_account_key, legacy_transparent_pubkey, mnemonic_seed,
+        derive_accounts_from_seed, legacy_transparent_account_key_from_seed,
+        legacy_transparent_pubkey,
     },
     error::{ZeckError, ZeckResult},
     lightwalletd::{
@@ -391,13 +392,28 @@ async fn run_recovery_scan_inner(
     {
         let mut guard = state.lock().await;
         guard.progress.phase = ScanPhase::ValidatingSeed;
-        guard.progress.message = Some("Validating BIP-39 seed phrase.".to_owned());
+        guard.progress.message = Some(format!(
+            "Validating keys from {}.",
+            config.key_source.describe()
+        ));
     }
 
-    let seed = mnemonic_seed(&config.seed_phrase)?;
+    // Every account slot this scanner walks is HD-derived, so a key source
+    // with no seed (a zcashd flat-key `wallet.dat`) has nothing for it to
+    // enumerate. Refuse explicitly rather than silently scanning zero
+    // accounts and reporting "no funds found", which is the failure mode a
+    // recovery user would most easily mistake for an answer.
+    let seed = config.key_source.wallet_seed()?.ok_or_else(|| {
+        ZeckError::InvalidConfig(format!(
+            "{} holds standalone keys with no HD seed. Argos can extract those keys but \
+             cannot yet scan or spend them; only wallets with a recoverable seed phrase \
+             can be scanned.",
+            config.key_source.describe()
+        ))
+    })?;
     let workspace = RecoveryWorkspace::from_runtime(&config)?;
-    workspace.initialize(config.network, seed.expose_secret())?;
-    let transparent_account = legacy_transparent_account_key(&config.seed_phrase, config.network)?;
+    workspace.initialize(config.network, &seed)?;
+    let transparent_account = legacy_transparent_account_key_from_seed(config.network, &seed)?;
 
     // Sidecar v1: written once we have a workspace on disk and before any
     // long-running probe/sync work. `target_height` is unknown until the
@@ -432,7 +448,7 @@ async fn run_recovery_scan_inner(
     let mut target_accounts = initial_batch_size(&config, max_accounts);
     let mut gap_extension_pass = 0u32;
     let network = consensus_network(config.network);
-    let initial_accounts = derive_accounts(&config.seed_phrase, config.network, target_accounts)?;
+    let initial_accounts = derive_accounts_from_seed(&seed, config.network, target_accounts)?;
 
     {
         let mut guard = state.lock().await;
@@ -512,8 +528,7 @@ async fn run_recovery_scan_inner(
             ));
         }
 
-        let derived_accounts =
-            derive_accounts(&config.seed_phrase, config.network, target_accounts)?;
+        let derived_accounts = derive_accounts_from_seed(&seed, config.network, target_accounts)?;
         initialize_accounts(&state, &derived_accounts).await;
 
         // Fast transparent-only probe over the newly-added slice for this
@@ -541,7 +556,7 @@ async fn run_recovery_scan_inner(
         import_accounts(
             &workspace,
             config.network,
-            seed.expose_secret(),
+            &seed,
             &account_birthday,
             &transparent_account,
             &derived_accounts[usize::try_from(imported_accounts)
@@ -1739,7 +1754,11 @@ async fn check_cancelled(state: &SharedScanTaskState) -> ZeckResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use secrecy::SecretString;
+
+    use crate::key_source::SeedKeySource;
 
     use super::{
         append_new_discoveries, build_account_status, describe_gap_extension,
@@ -1810,10 +1829,10 @@ mod tests {
 
     fn config(num_accounts: Option<u32>) -> RuntimeScanConfig {
         RuntimeScanConfig {
-            seed_phrase: SecretString::new(
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
                     .to_owned(),
-            ),
+            ))),
             birthday: 419_200,
             num_accounts,
             gap_limit: 20,
@@ -2326,6 +2345,7 @@ mod tests {
         use super::super::{import_accounts, MemoryBlockCache, ScanTaskState};
         use crate::{
             derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
+            key_source::SeedKeySource,
             models::{RuntimeScanConfig, ScanHandle, ZeckNetwork},
             workspace::{consensus_network, RecoveryWorkspace},
         };
@@ -2335,9 +2355,58 @@ mod tests {
                                   abandon abandon abandon abandon abandon abandon \
                                   abandon abandon abandon abandon abandon art";
 
+        fn test_seed_phrase() -> SecretString {
+            SecretString::new(TEST_SEED.to_owned())
+        }
+
+        /// A zcashd `wallet.dat` holds flat, individually-stored keys with
+        /// no HD seed behind them. The scanner walks HD-derived account
+        /// slots, so it has nothing to enumerate for such a source — and
+        /// the dangerous outcome is not an error but a *successful* scan
+        /// that finds nothing, which a user recovering real funds would
+        /// read as "my money is gone".
+        ///
+        /// Pinned here because the refusal is the only thing standing
+        /// between that user and a false negative. It fires before any
+        /// network or filesystem work, so this test needs neither.
+        #[tokio::test]
+        async fn a_seedless_key_source_is_refused_rather_than_scanned_as_empty() {
+            use crate::key_source::{ImportedKeySource, KeySource};
+            use argos_wallet_import::keys::{Provenance, TransparentKey};
+            use secrecy::Secret;
+
+            let mut keys = argos_wallet_import::ImportedKeys::default();
+            keys.transparent.push(TransparentKey {
+                secret: Secret::new([0x42; 32]),
+                provenance: Provenance::Standalone,
+            });
+            let source = ImportedKeySource::new(keys);
+            // Non-vacuous: if this source ever grows a seed, the assertion
+            // below would pass for the wrong reason.
+            assert!(
+                source.wallet_seed().expect("wallet_seed").is_none(),
+                "fixture must be genuinely seedless or this test proves nothing"
+            );
+
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let mut config = test_config(tempdir.path().to_owned());
+            config.key_source = Arc::new(source);
+
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let err = super::super::run_recovery_scan_inner(state, config)
+                .await
+                .expect_err("a seedless key source must not scan successfully");
+
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("no HD seed"),
+                "the refusal must say why, got: {rendered}"
+            );
+        }
+
         fn test_config(data_dir: std::path::PathBuf) -> RuntimeScanConfig {
             RuntimeScanConfig {
-                seed_phrase: SecretString::new(TEST_SEED.to_owned()),
+                key_source: Arc::new(SeedKeySource::new(test_seed_phrase())),
                 birthday: 419_200,
                 num_accounts: Some(2),
                 gap_limit: 5,
@@ -2363,15 +2432,15 @@ mod tests {
             let tempdir = tempfile::tempdir().expect("temp dir");
             let config = test_config(tempdir.path().to_owned());
             let workspace = RecoveryWorkspace::from_runtime(&config).expect("workspace");
-            let seed = mnemonic_seed(&config.seed_phrase).expect("seed");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
             workspace
                 .initialize(config.network, seed.expose_secret())
                 .expect("workspace.initialize");
             let transparent_account =
-                legacy_transparent_account_key(&config.seed_phrase, config.network)
+                legacy_transparent_account_key(&test_seed_phrase(), config.network)
                     .expect("transparent account key");
             let accounts =
-                derive_accounts(&config.seed_phrase, config.network, 2).expect("accounts");
+                derive_accounts(&test_seed_phrase(), config.network, 2).expect("accounts");
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
 
             import_accounts(
@@ -2401,12 +2470,12 @@ mod tests {
         async fn resume_reuses_same_workspace_and_does_not_duplicate_accounts() {
             let tempdir = tempfile::tempdir().expect("temp dir");
             let config = test_config(tempdir.path().to_owned());
-            let seed = mnemonic_seed(&config.seed_phrase).expect("seed");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
             let transparent_account =
-                legacy_transparent_account_key(&config.seed_phrase, config.network)
+                legacy_transparent_account_key(&test_seed_phrase(), config.network)
                     .expect("transparent account key");
             let accounts =
-                derive_accounts(&config.seed_phrase, config.network, 2).expect("accounts");
+                derive_accounts(&test_seed_phrase(), config.network, 2).expect("accounts");
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
 
             // ── First scan pass: import 2 accounts then simulate abort ──────────
@@ -2521,12 +2590,12 @@ mod tests {
         async fn scan_advances_cursor_and_resume_skips_already_scanned_blocks() {
             let tempdir = tempfile::tempdir().expect("temp dir");
             let config = test_config(tempdir.path().to_owned());
-            let seed = mnemonic_seed(&config.seed_phrase).expect("seed");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
             let transparent_account =
-                legacy_transparent_account_key(&config.seed_phrase, config.network)
+                legacy_transparent_account_key(&test_seed_phrase(), config.network)
                     .expect("transparent account key");
             let accounts =
-                derive_accounts(&config.seed_phrase, config.network, 1).expect("accounts");
+                derive_accounts(&test_seed_phrase(), config.network, 1).expect("accounts");
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
 
             let network = consensus_network(config.network);
@@ -2917,7 +2986,11 @@ mod tests {
             tokio::task::yield_now().await;
 
             assert!(
-                watchdog.await.expect("watchdog task did not panic").to_string().contains("scan stalled"),
+                watchdog
+                    .await
+                    .expect("watchdog task did not panic")
+                    .to_string()
+                    .contains("scan stalled"),
                 "watchdog must still trip at the extended budget"
             );
         }
@@ -2942,7 +3015,10 @@ mod tests {
             .await;
             tokio::task::yield_now().await;
 
-            let msg = watchdog.await.expect("watchdog task did not panic").to_string();
+            let msg = watchdog
+                .await
+                .expect("watchdog task did not panic")
+                .to_string();
             assert!(msg.contains("scan stalled"), "got: {msg}");
             for lie in [
                 "h2 protocol error",
@@ -3065,19 +3141,13 @@ mod tests {
         fn resets_when_height_advanced_since_last_failure() {
             // 9 consecutive stalls, then the sync advanced before the next
             // failure — the intervening stall recovered, so the budget resets.
-            assert_eq!(
-                retry_budget_after_failure(9, Some(1_000), Some(1_500)),
-                0
-            );
+            assert_eq!(retry_budget_after_failure(9, Some(1_000), Some(1_500)), 0);
         }
 
         #[test]
         fn preserves_budget_when_stuck_at_same_height() {
             // No forward progress between the two failures — budget carries.
-            assert_eq!(
-                retry_budget_after_failure(5, Some(1_000), Some(1_000)),
-                5
-            );
+            assert_eq!(retry_budget_after_failure(5, Some(1_000), Some(1_000)), 5);
         }
 
         #[test]

@@ -20,6 +20,11 @@ pub use donation::{
     DONATION_MEMO_TAG, MAX_DONOR_EMAIL_BYTES, MIN_DONATION_ZATOSHIS,
 };
 pub use error::{ZeckError, ZeckResult};
+pub use key_source::{ImportedKeySource, KeySource, KeySourceFingerprint, SeedKeySource};
+
+/// Re-exported so front-ends can read a wallet file without taking a
+/// direct dependency on the parser crate.
+pub use argos_wallet_import;
 pub use models::*;
 pub use service::RecoveryService;
 pub use tos::{
