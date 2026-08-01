@@ -22,7 +22,6 @@ use zcash_client_backend::data_api::{
 use zcash_client_sqlite::{util::SystemClock, AccountUuid, WalletDb};
 use zcash_keys::keys::{sapling::ExtendedSpendingKey, UnifiedFullViewingKey};
 use zcash_keys::encoding::AddressCodec;
-use zcash_protocol::consensus::Network;
 use zcash_transparent::address::TransparentAddress;
 
 use crate::{
@@ -111,11 +110,15 @@ pub fn imported_transparent_keys(
 }
 
 /// Encode a transparent address for display on `network`.
+///
+/// Goes through `consensus_network` rather than matching on `ZeckNetwork`
+/// directly so that a regtest harness — which installs its own parameters
+/// process-wide — gets regtest's Base58 prefix. Matching here would emit a
+/// testnet-prefixed address that the regtest node rejects and that
+/// lightwalletd would never match a UTXO against. Identical to the direct
+/// match for mainnet and testnet.
 pub fn encode_transparent_address(address: &TransparentAddress, network: ZeckNetwork) -> String {
-    match network {
-        ZeckNetwork::Mainnet => address.encode(&Network::MainNetwork),
-        ZeckNetwork::Testnet => address.encode(&Network::TestNetwork),
-    }
+    address.encode(&crate::workspace::consensus_network(network))
 }
 
 /// An imported wallet account, as registered in the wallet database.

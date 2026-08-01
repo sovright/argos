@@ -256,6 +256,16 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
         .map(|_| zcash_primitives::transaction::fees::transparent::InputSize::STANDARD_P2PKH)
         .collect::<Vec<_>>();
 
+    // A Sapling bundle pads its outputs to `MIN_SHIELDED_OUTPUTS` for
+    // privacy, so the single output we add is billed as more than one. Ask
+    // the bundle type rather than assuming: this is the same call the
+    // builder's own `get_fee` makes, so the two cannot drift. Getting it
+    // wrong underpays the fee and the node rejects the transaction after
+    // the user has been told what it would cost.
+    let sapling_outputs = sapling::builder::BundleType::DEFAULT
+        .num_outputs(0, 1)
+        .map_err(|err| ZeckError::Internal(format!("sizing the Sapling bundle: {err}")))?;
+
     let fee = FeeRule::standard()
         .fee_required(
             params,
@@ -264,7 +274,7 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
             // No transparent outputs: the single output is shielded.
             std::iter::empty(),
             0,
-            1,
+            sapling_outputs,
             0,
             0,
         )

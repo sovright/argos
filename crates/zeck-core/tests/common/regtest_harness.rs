@@ -109,3 +109,52 @@ impl RegtestHarness {
         ARGOS_TEST_SEED
     }
 }
+
+/// Zebra's JSON-RPC endpoint for the harness chain.
+pub const ENV_ZEBRA_RPC_URL: &str = "ARGOS_REGTEST_ZEBRA_RPC_URL";
+
+/// Minimal JSON-RPC call against Zebra.
+///
+/// Hand-rolled over TCP for the same reason the funder helper is: the test
+/// tree carries no HTTP client dependency, and Zebra runs with cookie auth
+/// disabled (see `zebrad-regtest.toml`), so no credentials are needed.
+pub async fn zebra_rpc(method: &str, params: serde_json::Value) -> serde_json::Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let url = env::var(ENV_ZEBRA_RPC_URL)
+        .unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+    let host_port = url.strip_prefix("http://").unwrap_or(&url).to_owned();
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+    });
+    let payload = serde_json::to_vec(&body).expect("serializable");
+
+    let mut stream = tokio::net::TcpStream::connect(&host_port)
+        .await
+        .unwrap_or_else(|err| panic!("connecting to zebra at {host_port}: {err}"));
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("headers");
+    stream.write_all(&payload).await.expect("body");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("response");
+    let text = String::from_utf8_lossy(&raw);
+    let json_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    let parsed: serde_json::Value = serde_json::from_str(text[json_start..].trim())
+        .unwrap_or_else(|err| panic!("zebra {method} returned unparseable body: {err}\n{text}"));
+
+    if let Some(error) = parsed.get("error") {
+        if !error.is_null() {
+            panic!("zebra {method} failed: {error}");
+        }
+    }
+    parsed
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| panic!("zebra {method} returned no result: {parsed}"))
+}

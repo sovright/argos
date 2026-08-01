@@ -43,7 +43,23 @@
 //!     [--blocks <n>]           # coinbase blocks paid to the seed (default 4)
 //!     [--maturity-blocks <n>]  # blocks mined afterwards (default 100)
 //!     [--print-address-only]   # derive and print, mine nothing
+//!     [--t-addr <address>]     # fund this transparent address instead of
+//!                              # the seed's shielded one
 //! ```
+//!
+//! ## Why `--t-addr` exists despite the section above
+//!
+//! The shielded-coinbase reasoning above is about `zcash_client_sqlite`'s
+//! UTXO selection, which needs to know an output is coinbase and cannot.
+//! Transparent-only recovery (`argos_core::transparent_recovery`) never
+//! touches the wallet database — it reads `GetAddressUtxos` and drives the
+//! transaction builder directly — so that limitation does not apply to it,
+//! and it needs a funded transparent address to test against.
+//!
+//! A consensus rule does still apply: a transaction spending transparent
+//! coinbase must have no transparent outputs. A transparent-only sweep is
+//! N transparent inputs to exactly one Sapling output with no change, so it
+//! satisfies that by construction.
 //!
 //! The seed to fund is read from `ARGOS_REGTEST_FUND_SEED`.
 //!
@@ -98,6 +114,9 @@ struct Args {
     blocks: u32,
     maturity_blocks: u32,
     print_address_only: bool,
+    /// When set, mine coinbase to this transparent address instead of the
+    /// seed's shielded one.
+    t_addr: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -105,6 +124,7 @@ fn parse_args() -> Args {
     let mut blocks = DEFAULT_FUNDING_BLOCKS;
     let mut maturity_blocks = COINBASE_MATURITY;
     let mut print_address_only = false;
+    let mut t_addr = None;
 
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -119,6 +139,7 @@ fn parse_args() -> Args {
                 maturity_blocks = value().parse().expect("--maturity-blocks must be a u32")
             }
             "--print-address-only" => print_address_only = true,
+            "--t-addr" => t_addr = Some(value()),
             other => panic!("unrecognized argument {other}"),
         }
     }
@@ -128,6 +149,7 @@ fn parse_args() -> Args {
         blocks,
         maturity_blocks,
         print_address_only,
+        t_addr,
     }
 }
 
@@ -230,7 +252,14 @@ async fn main() -> ExitCode {
     set_regtest_consensus_params(regtest_local_network())
         .expect("installing regtest consensus parameters");
 
-    let address = regtest_encoded_sapling_address(&seed);
+    // `--t-addr` is taken verbatim: it comes from a test that derived it
+    // from a raw key under regtest parameters, so re-encoding it here would
+    // only risk disagreeing with the address the test will query
+    // lightwalletd for.
+    let address = match &args.t_addr {
+        Some(t_addr) => t_addr.clone(),
+        None => regtest_encoded_sapling_address(&seed),
+    };
     emit(&Event::FundAddress { address: &address });
 
     if args.print_address_only {

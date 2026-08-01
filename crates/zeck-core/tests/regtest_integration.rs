@@ -2522,3 +2522,166 @@ async fn fund_test_seed_with_shielded_coinbase() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Transparent-only recovery, end to end against a real chain.
+///
+/// This is the only test that proves `build_sweep_transaction` produces a
+/// transaction the network actually accepts. Everything else about the
+/// transparent path — fee arithmetic, value conservation, dust refusal — is
+/// unit-tested, but a transaction that balances arithmetically can still be
+/// rejected for a wrong branch ID, a malformed script, or a bad signature.
+/// Only a node can tell us that.
+///
+/// The wallet here is transparent-only *by construction*: a single raw
+/// secp256k1 key, exactly what a zcashd `wallet.dat` yields. It never gets a
+/// wallet-database account, because it cannot have one.
+///
+/// Note the funds are coinbase. Zcash forbids a transaction spending
+/// transparent coinbase from having any transparent output, and a
+/// transparent-only sweep is N inputs to one Sapling output with no change —
+/// so it satisfies that by construction. That makes this the *stricter*
+/// consensus case: an ordinary UTXO differs only in being easier to spend.
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
+#[cfg(feature = "argos-network")]
+async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
+    use argos_core::imported::{encode_transparent_address, ImportedTransparentKey};
+    use argos_core::lightwalletd::connect_lightwalletd_endpoints_with_retry;
+    use argos_core::transparent_recovery::{
+        build_sweep_transaction, fetch_transparent_utxos, plan_sweep, sapling_receiver, summarize,
+    };
+    use argos_core::workspace::consensus_network;
+    use argos_core::{derive_accounts, ZeckNetwork};
+    use common::regtest_harness::zebra_rpc;
+    use secrecy::SecretString;
+    use zcash_client_backend::proto::service::RawTransaction;
+    use zcash_proofs::prover::LocalTxProver;
+    use zcash_protocol::consensus::BlockHeight;
+    use zcash_transparent::address::TransparentAddress;
+
+    // Installs regtest consensus parameters process-wide; every encoding and
+    // branch-ID derivation below depends on them.
+    let harness = RegtestHarness::require();
+
+    // A wallet that is a single imported key and nothing else — no seed, no
+    // shielded key, no account. Deterministic so a re-run funds the same
+    // address rather than stranding value at a fresh one each time.
+    let secret = secp256k1::SecretKey::from_slice(&[0x11u8; 32]).expect("valid scalar");
+    let secp = secp256k1::Secp256k1::signing_only();
+    let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let address = TransparentAddress::from_pubkey(&pubkey);
+    let keys = vec![ImportedTransparentKey { secret, address }];
+    let encoded = encode_transparent_address(&address, ZeckNetwork::Testnet);
+
+    // Fund inside the test rather than relying on setup.sh: the sweep spends
+    // everything it finds, so a second run would otherwise find nothing.
+    zebra_rpc("generatetoaddress", serde_json::json!([1, encoded])).await;
+    // Coinbase maturity.
+    zebra_rpc("generate", serde_json::json!([100])).await;
+
+    let (mut client, _endpoint) =
+        connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)
+            .await
+            .expect("connecting to the harness lightwalletd");
+
+    let utxos = fetch_transparent_utxos(&mut client, &keys, ZeckNetwork::Testnet)
+        .await
+        .expect("fetching UTXOs");
+    assert!(
+        !utxos.is_empty(),
+        "the funded address must have spendable UTXOs; if this is empty the \
+         address encoding or the funding call is wrong, not the sweep"
+    );
+
+    let report = summarize(&utxos, keys.len(), 0, ZeckNetwork::Testnet);
+    assert!(
+        report.total_zatoshis > 0,
+        "a funded wallet must report a non-zero balance"
+    );
+
+    // Target the next block, as a wallet broadcasting now would.
+    let tip = zebra_rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .expect("getblockcount returns a number");
+    let target_height = BlockHeight::from_u32(u32::try_from(tip).expect("height fits u32") + 1);
+    let params = consensus_network(ZeckNetwork::Testnet);
+
+    let plan = plan_sweep(&params, target_height, &utxos)
+        .expect("planning must succeed for a funded wallet")
+        .expect("a funded wallet must produce a plan");
+    assert_eq!(
+        plan.output_zatoshis + plan.fee_zatoshis,
+        plan.total_input_zatoshis
+    );
+
+    // Destination: a unified address from the harness seed. It must be
+    // unified, not a bare Sapling address — Argos's destination policy
+    // rejects non-UA destinations, and `sapling_receiver` deliberately goes
+    // through that same check rather than around it. Testnet-encoded like
+    // every other destination in this suite; the encoding is a display
+    // concern and the builder consumes the raw receiver.
+    let accounts = derive_accounts(
+        &SecretString::new(harness.test_seed().to_owned()),
+        ZeckNetwork::Testnet,
+        1,
+    )
+    .expect("deriving a destination");
+    let recipient = sapling_receiver(&accounts[0].unified_address, ZeckNetwork::Testnet)
+        .expect("the seed's unified address must expose a Sapling receiver");
+
+    let prover = LocalTxProver::bundled();
+    let tx = build_sweep_transaction(
+        &params,
+        target_height,
+        &utxos,
+        &keys,
+        &plan,
+        recipient,
+        &prover,
+        &prover,
+    )
+    .expect("building the sweep transaction");
+
+    let mut raw = Vec::new();
+    tx.write(&mut raw).expect("serializing the transaction");
+
+    // The assertion that matters: the node accepts it. A wrong branch ID, a
+    // malformed script, or a bad signature all fail here and nowhere earlier.
+    let response = client
+        .send_transaction(RawTransaction {
+            data: raw,
+            height: 0,
+        })
+        .await
+        .expect("send_transaction RPC")
+        .into_inner();
+    assert_eq!(
+        response.error_code, 0,
+        "the node rejected the sweep transaction: {}",
+        response.error_message
+    );
+
+    // Mine it and confirm it actually landed, rather than trusting mempool
+    // acceptance alone.
+    zebra_rpc("generate", serde_json::json!([1])).await;
+    let txid = tx.txid().to_string();
+    let mined = zebra_rpc("getrawtransaction", serde_json::json!([txid, 1])).await;
+    assert!(
+        mined.get("height").and_then(|h| h.as_u64()).is_some(),
+        "the swept transaction must be mined into a block, got: {mined}"
+    );
+
+    // And the wallet is now empty: the sweep moved everything.
+    let after = fetch_transparent_utxos(&mut client, &keys, ZeckNetwork::Testnet)
+        .await
+        .expect("re-fetching UTXOs");
+    let after_total: u64 = after
+        .iter()
+        .fold(0u64, |acc, u| acc.saturating_add(u64::from(u.txout.value())));
+    assert_eq!(
+        after_total, 0,
+        "every UTXO must have been swept; {} zatoshis remain",
+        after_total
+    );
+}
