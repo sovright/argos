@@ -6,6 +6,9 @@ Argos is a Zcash wallet recovery tool for ZecWallet Lite seeds. It has three com
 - `crates/zeck-core` — shared Rust library (derivation, scanning, sweeping); package name `argos-core`
 - `crates/zeck-cli` — command-line interface; package name `argos-cli`, binary name `argos`
 - `gui/` — Tauri v2 desktop app (static HTML/JS frontend + Rust backend); package name `argos-gui`
+- `crates/argos-wallet-import` — read-only legacy wallet file parser
+  (zcashd `wallet.dat` via a hand-rolled Berkeley DB 6.2 reader, and
+  ZecWallet Lite); package name `argos-wallet-import`
 
 ## Key Technical Facts
 
@@ -41,6 +44,38 @@ Best-effort on scan completion. Platform dispatch in `notify_user` (Tauri) and `
 - Mainnet: `https://zec.rocks:443`, `https://na.zec.rocks:443`
 - Testnet: `https://testnet.zec.rocks:443`
 - Always include `https://` prefix — bare `host:port` fails TLS
+
+### Wallet file import
+Hand-rolled BDB 6.2 parsing rather than shelling out to `db_dump` as
+Zallet and `zewif-zcashd` do — an external binary in a signed desktop app
+is worse for the threat model, and the ZeWIF repos carry no SPDX licence.
+
+`czkey` (encrypted Sprout spending keys) is decrypted here and nowhere
+else in the ecosystem: Zallet drops Sprout keys during migration and
+`zewif-zcashd` returns an explicit error for them. Its tests
+(`crates/argos-wallet-import/tests/sprout_key_is_genuine.rs` and
+`transparent_key_is_genuine.rs` re-derive each recovered key and check it
+against the address it was stored under) are therefore the only
+specification that exists — do not weaken them.
+
+Golden fixtures come from a pinned `zcashd:v6.20.0` regtest chain with
+Canopy held inactive, which is the only condition under which zcashd will
+still run `GenerateNewSproutZKey`. No fixture holds funded Sprout notes —
+zcashd refuses all inbound Sprout transfers regardless of Canopy height —
+so the note/witness preservation path is validated structurally, not
+against a real note. See `tests/regtest/fixtures/README.md`.
+
+Every ZecWallet Lite test fixture is a hand-built byte stream; there is no
+real-world ZWL wallet file fixture. Treat ZWL parsing claims accordingly.
+
+`argos-wallet-import` has no dependency on `argos-core` (the reverse is
+true: `argos-core` depends on it), no network access, and no filesystem
+writes — it is the only component that consumes an attacker-supplied
+binary file. Key provenance is unified behind the `KeySource` trait in
+`crates/zeck-core/src/key_source.rs` (`SeedKeySource` /
+`ImportedKeySource`); as of this writing the CLI does not yet expose a
+`--wallet-file` flag wiring into it — check `crates/zeck-cli/src/main.rs`
+before documenting or relying on wallet-file import from the CLI.
 
 ### Test seed (BIP-39 test vector, no real funds)
 `abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art`

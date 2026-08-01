@@ -43,7 +43,7 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
 - Broadcasted transactions are polled for confirmation during a bounded wait window. If they are still unmined at the end of that window, Argos reports them as pending instead of pretending they confirmed.
-- Sprout recovery is still out of scope for seed-only flows because ZecWallet Lite did not derive Sprout keys from the HD seed.
+- Sprout recovery from a seed phrase is still out of scope because ZecWallet Lite did not derive Sprout keys from the HD seed. Argos can now recover Sprout spending keys directly from a zcashd `wallet.dat`, but spending recovered Sprout funds is not yet implemented — extracting the key does not yet mean the funds can be moved.
 - The GUI defaults to auto gap-limit mode and can switch to an explicit account count when the user wants an exact scan depth.
 - The desktop complete screen can save a plain-text recovery report inside the persisted workspace.
 
