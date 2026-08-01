@@ -21,10 +21,13 @@ use zcash_client_backend::data_api::{
 };
 use zcash_client_sqlite::{util::SystemClock, AccountUuid, WalletDb};
 use zcash_keys::keys::{sapling::ExtendedSpendingKey, UnifiedFullViewingKey};
+use zcash_keys::encoding::AddressCodec;
+use zcash_protocol::consensus::Network;
 use zcash_transparent::address::TransparentAddress;
 
 use crate::{
     error::{ZeckError, ZeckResult},
+    models::ZeckNetwork,
     workspace::ArgosParams,
 };
 
@@ -60,6 +63,59 @@ pub fn sapling_ufvk(extsk: &ExtendedSpendingKey) -> ZeckResult<UnifiedFullViewin
     })?;
     UnifiedFullViewingKey::parse(&ufvk)
         .map_err(|err| ZeckError::Import(format!("parsing the assembled UFVK failed: {err}")))
+}
+
+/// A transparent key recovered from a wallet file, resolved to the address
+/// it controls.
+///
+/// Pairing them is what makes the rest of the transparent path possible:
+/// lightwalletd is queried by address, and the builder signs by key, so
+/// every step needs both halves together.
+pub struct ImportedTransparentKey {
+    pub secret: secp256k1::SecretKey,
+    pub address: TransparentAddress,
+}
+
+impl std::fmt::Debug for ImportedTransparentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The address is public; the secret is not, and this type exists
+        // precisely to carry one next to the other.
+        f.debug_struct("ImportedTransparentKey")
+            .field("secret", &"<redacted>")
+            .field("address", &self.address)
+            .finish()
+    }
+}
+
+/// Resolve every transparent key in a wallet file to its address.
+///
+/// Order follows the file, and duplicates are preserved: two records
+/// yielding the same address is a fact about the wallet worth surfacing
+/// rather than silently collapsing.
+pub fn imported_transparent_keys(
+    keys: &ImportedKeys,
+) -> ZeckResult<Vec<ImportedTransparentKey>> {
+    let secp = secp256k1::Secp256k1::signing_only();
+    keys.transparent
+        .iter()
+        .map(|key| {
+            let secret = secp256k1::SecretKey::from_slice(key.secret.expose_secret())
+                .map_err(|err| ZeckError::Import(format!("malformed transparent key: {err}")))?;
+            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+            Ok(ImportedTransparentKey {
+                secret,
+                address: TransparentAddress::from_pubkey(&pubkey),
+            })
+        })
+        .collect()
+}
+
+/// Encode a transparent address for display on `network`.
+pub fn encode_transparent_address(address: &TransparentAddress, network: ZeckNetwork) -> String {
+    match network {
+        ZeckNetwork::Mainnet => address.encode(&Network::MainNetwork),
+        ZeckNetwork::Testnet => address.encode(&Network::TestNetwork),
+    }
 }
 
 /// An imported wallet account, as registered in the wallet database.
@@ -166,11 +222,9 @@ pub fn register_imported_accounts(
         .get_transparent_receivers(anchor.wallet_account_id, true, true)
         .map_err(|err| ZeckError::Wallet(format!("loading transparent receivers: {err}")))?;
 
-    for key in &keys.transparent {
-        let secret = secp256k1::SecretKey::from_slice(key.secret.expose_secret())
-            .map_err(|err| ZeckError::Import(format!("malformed transparent key: {err}")))?;
-        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
-        let address = TransparentAddress::from_pubkey(&pubkey);
+    for imported in imported_transparent_keys(keys)? {
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &imported.secret);
+        let address = imported.address;
 
         if !existing.contains_key(&address) {
             wallet_db
@@ -256,6 +310,94 @@ mod tests {
             ufvk.transparent().is_none(),
             "an imported Sapling key must not claim a transparent component"
         );
+    }
+
+    /// The addresses printed by `inspect-wallet` are the only thing a
+    /// user with a transparent-only wallet can act on unaided — they take
+    /// them to a block explorer. A wrong address sends them looking at
+    /// somebody else's funds, so the derivation is pinned against the
+    /// same ground truth the parser tests use: the address zcashd itself
+    /// stored the key under.
+    #[test]
+    fn a_recovered_transparent_key_resolves_to_the_address_zcashd_stored_it_under() {
+        use argos_wallet_import::bdb;
+        use argos_wallet_import::zcashd::records::parse_record_key;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+        );
+        let bytes = std::fs::read(path).expect("golden fixture must exist");
+        let keys =
+            argos_wallet_import::import_wallet_file(&bytes, None).expect("fixture must import");
+        let resolved = imported_transparent_keys(&keys).expect("keys must resolve");
+
+        // Ground truth: every "key" record's remainder is the serialized
+        // pubkey the wallet filed that secret under.
+        let records = bdb::walk(&bytes).expect("fixture must walk");
+        let mut stored: std::collections::HashSet<TransparentAddress> =
+            std::collections::HashSet::new();
+        for (raw_key, _) in &records {
+            let Some(rec) = parse_record_key(raw_key) else {
+                continue;
+            };
+            if rec.record_type != "key" {
+                continue;
+            }
+            // CompactSize-prefixed pubkey.
+            let Some((len, off)) = argos_wallet_import::zcashd::records::compact_size(&rec.rest)
+            else {
+                continue;
+            };
+            let end = off + len as usize;
+            let Some(pubkey_bytes) = rec.rest.get(off..end) else {
+                continue;
+            };
+            if let Ok(pubkey) = secp256k1::PublicKey::from_slice(pubkey_bytes) {
+                stored.insert(TransparentAddress::from_pubkey(&pubkey));
+            }
+        }
+
+        assert!(
+            !stored.is_empty(),
+            "the fixture must contain transparent key records, or this proves nothing"
+        );
+        for imported in &resolved {
+            assert!(
+                stored.contains(&imported.address),
+                "derived address {:?} was not stored in the wallet",
+                imported.address
+            );
+        }
+        assert_eq!(
+            resolved.len(),
+            keys.transparent.len(),
+            "every recovered key must resolve to an address"
+        );
+    }
+
+    #[test]
+    fn an_encoded_mainnet_address_looks_like_a_t_address() {
+        let keys = {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+            );
+            let bytes = std::fs::read(path).expect("fixture");
+            argos_wallet_import::import_wallet_file(&bytes, None).expect("import")
+        };
+        let resolved = imported_transparent_keys(&keys).expect("resolve");
+        let encoded =
+            encode_transparent_address(&resolved[0].address, crate::models::ZeckNetwork::Mainnet);
+        assert!(
+            encoded.starts_with("t1"),
+            "a mainnet P2PKH address must start with t1, got: {encoded}"
+        );
+        // Testnet must differ, or the network parameter is being ignored
+        // and every address we print for a testnet wallet is wrong.
+        let testnet =
+            encode_transparent_address(&resolved[0].address, crate::models::ZeckNetwork::Testnet);
+        assert_ne!(encoded, testnet, "network must affect the encoding");
     }
 
     #[test]

@@ -12,7 +12,9 @@ use std::{
 use anyhow::{bail, Context, Result};
 use argos_core::{
     argos_wallet_import::{self, ImportedKeys},
-    derive_accounts, detect_birthday, estimate_birthday_from_date, validate_destination_address,
+    derive_accounts, detect_birthday, estimate_birthday_from_date,
+    imported::{encode_transparent_address, imported_transparent_keys},
+    validate_destination_address,
     ImportedKeySource, KeySource, RecoveryService, ScanConfig, ScanDiscovery, ScanHandle,
     ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
 };
@@ -195,7 +197,7 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
 /// This is the only useful thing it can do with a zcashd `wallet.dat`
 /// today, so it must be honest about the difference between "found a
 /// key" and "can move the funds".
-fn print_wallet_inspection(keys: &ImportedKeys) {
+fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     println!("━━━ Recovered key material ━━━");
     println!("  Transparent keys  {}", keys.transparent.len());
     println!("  Sapling keys      {}", keys.sapling.len());
@@ -210,6 +212,26 @@ fn print_wallet_inspection(keys: &ImportedKeys) {
         }
     );
     println!();
+
+    // Printing the addresses, not just a count, is the difference between
+    // a user being able to check their own balance in a block explorer and
+    // being told a number they can do nothing with.
+    match imported_transparent_keys(keys) {
+        Ok(resolved) if !resolved.is_empty() => {
+            println!("Transparent addresses:");
+            for key in &resolved {
+                println!("  {}", encode_transparent_address(&key.address, network));
+            }
+            println!();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            // Never silent: a key we cannot resolve is a key the user
+            // still holds and must know about.
+            println!("Could not resolve some transparent keys to addresses: {err}");
+            println!();
+        }
+    }
 
     if !keys.sprout.is_empty() {
         println!("Sprout addresses (funds here are identified, not yet recoverable):");
@@ -356,7 +378,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::InspectWallet => {
             let source = imported.expect("--wallet-file is required and was checked above");
-            print_wallet_inspection(source.keys());
+            print_wallet_inspection(source.keys(), network);
         }
 
         Commands::ShowKeys => {
