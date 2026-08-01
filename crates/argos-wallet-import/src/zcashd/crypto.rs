@@ -6,7 +6,7 @@
 //! Every individual key record is encrypted under that master key.
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, Secret, SecretString, Zeroize};
 use sha2::{Digest, Sha512};
 
 use crate::{
@@ -110,6 +110,14 @@ pub fn derive_master_key(
     }
 
     // Iterated SHA-512 over passphrase||salt, then re-hashing the digest.
+    //
+    // Everything derived below is as sensitive as the passphrase itself:
+    // `buf` *is* the key-encryption key and IV concatenated, and `ct`
+    // becomes the plaintext master key in place. All three are scrubbed on
+    // every exit path — including the error paths, which is why the fallible
+    // steps are wrapped in a closure rather than returning with `?` directly.
+    // `Zeroize` for `[u8; N]` and `Vec<u8>` is a volatile write the optimizer
+    // may not elide; a plain assignment would be dead-store-eliminated.
     let mut buf = [0u8; 64];
     let mut hasher = Sha512::new();
     hasher.update(passphrase.expose_secret().as_bytes());
@@ -122,24 +130,36 @@ pub fn derive_master_key(
         buf.copy_from_slice(&h.finalize());
     }
 
-    let mut kek = [0u8; 32];
-    let mut iv = [0u8; 16];
-    kek.copy_from_slice(buf.get(0..32).ok_or(ImportError::WrongPassphrase)?);
-    iv.copy_from_slice(buf.get(32..48).ok_or(ImportError::WrongPassphrase)?);
-
     let mut ct = mkey.encrypted_key.clone();
-    let plain = Aes256CbcDec::new(&kek.into(), &iv.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut ct)
-        // Bad PKCS#7 padding is overwhelmingly a wrong passphrase, and
-        // that is the actionable message for the user.
-        .map_err(|_| ImportError::WrongPassphrase)?;
+    let result = (|| {
+        let mut kek = [0u8; 32];
+        let mut iv = [0u8; 16];
+        kek.copy_from_slice(buf.get(0..32).ok_or(ImportError::WrongPassphrase)?);
+        iv.copy_from_slice(buf.get(32..48).ok_or(ImportError::WrongPassphrase)?);
 
-    let master: [u8; 32] = plain
-        .get(..32)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(ImportError::WrongPassphrase)?;
+        let decrypted = Aes256CbcDec::new(&kek.into(), &iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut ct)
+            // Bad PKCS#7 padding is overwhelmingly a wrong passphrase, and
+            // that is the actionable message for the user.
+            .map_err(|_| ImportError::WrongPassphrase);
 
-    Ok(MasterKey(Secret::new(master)))
+        // `kek`/`iv` were consumed by value into the cipher above, so these
+        // are the copies left behind on this stack frame.
+        kek.zeroize();
+        iv.zeroize();
+
+        let master: [u8; 32] = decrypted?
+            .get(..32)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ImportError::WrongPassphrase)?;
+
+        Ok(MasterKey(Secret::new(master)))
+    })();
+
+    buf.zeroize();
+    ct.zeroize();
+
+    result
 }
 
 #[cfg(test)]

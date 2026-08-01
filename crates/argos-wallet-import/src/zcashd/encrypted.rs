@@ -19,7 +19,7 @@
 //! for them, so this is the only implementation that exists.
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-use secrecy::Secret;
+use secrecy::{Secret, Zeroize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -68,13 +68,26 @@ fn sapling_fvfp_iv(fvk: &[u8]) -> [u8; 16] {
     iv_from_digest(&d)
 }
 
+/// Decrypt one record under the wallet master key.
+///
+/// Two scratch buffers here hold key material for the length of the call:
+/// `key`, a stack copy of the master key that unlocks every record in the
+/// wallet, and `buf`, which `decrypt_padded_mut` turns into the plaintext
+/// spending key in place. Both are scrubbed before returning, on the
+/// failure path as well as the success path. The returned `Vec` is the
+/// caller's to protect — callers wrap it in a `Secret`.
+///
+/// The IV is not secret: it is derived from a public record identifier.
 fn decrypt(master: &MasterKey, iv: [u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
     let mut buf = ciphertext.to_vec();
-    let key: [u8; 32] = *master.expose_secret();
+    let mut key: [u8; 32] = *master.expose_secret();
     let plain = Aes256CbcDec::new(&key.into(), &iv.into())
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .ok()?;
-    Some(plain.to_vec())
+        .ok()
+        .map(<[u8]>::to_vec);
+    key.zeroize();
+    buf.zeroize();
+    plain
 }
 
 fn read_length_prefixed(value: &[u8]) -> Option<(&[u8], usize)> {

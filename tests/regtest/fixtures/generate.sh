@@ -96,10 +96,22 @@ EOF
   # explicitly — otherwise it keeps holding the RPC port and the next
   # gen_wallet call's zcash-cli talks to the wrong node.
   zcash-cli -datadir="$datadir" stop >/dev/null 2>&1 || true
+  stopped=no
   for i in $(seq 1 30); do
-    zcash-cli -datadir="$datadir" getblockcount >/dev/null 2>&1 || break
+    if ! zcash-cli -datadir="$datadir" getblockcount >/dev/null 2>&1; then
+      stopped=yes
+      break
+    fi
     sleep 1
   done
+  # Copying a wallet.dat out from under a live zcashd yields a file with a
+  # torn BDB page or a stale record set — which looks like a parser bug
+  # later, not a fixture bug. Fail here instead of shipping one.
+  if [ "$stopped" != yes ]; then
+    echo "FATAL: zcashd for $name did not stop within 30s; refusing to copy a" >&2
+    echo "wallet.dat that is still being written." >&2
+    exit 1
+  fi
   sleep 1
 
   cp "$datadir/regtest/wallet.dat" "$OUT/$name.dat"

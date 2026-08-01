@@ -107,6 +107,7 @@ services:
   # Run with: docker compose --profile fixtures up zcashd-fixtures
   zcashd-fixtures:
     profiles: ["fixtures"]
+    container_name: argos-zcashd-fixtures
     image: electriccoinco/zcashd:v6.20.0
     volumes:
       - ./fixtures/out:/fixtures
