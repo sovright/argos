@@ -22,6 +22,34 @@ Argos now includes the major recovery phases end to end:
 - Real shielding/sweep transaction construction and broadcast through `lightwalletd`
 - lightwalletd endpoint fallback, using comma-separated server URLs tried in order
 - Progress metadata for elapsed time and ETA, plus GUI discovery notifications and recovery-report export
+- Legacy wallet file import (`--wallet-file`): zcashd `wallet.dat` and ZecWallet Lite, including encrypted wallets
+
+## Recovering from a wallet file
+
+Instead of a seed phrase, Argos can read keys directly out of a legacy
+wallet file. The file is opened read-only and never modified. If it is
+encrypted you are prompted for the passphrase — there is deliberately no
+flag for it, so it cannot end up in shell history or in `ps` output.
+
+```
+argos --wallet-file /path/to/wallet.dat inspect-wallet
+```
+
+`inspect-wallet` is entirely local: no network, nothing written to disk.
+It reports how many transparent, Sapling, and Sprout keys were recovered,
+lists Sprout addresses, and names every record it could not read.
+
+**What you can do with the result depends on the wallet:**
+
+| Wallet | Scan and sweep? |
+|---|---|
+| ZecWallet Lite | **Yes.** Decryption recovers the BIP-39 mnemonic, so the wallet re-enters the normal HD recovery path. Add `--wallet-file` to `scan` or `sweep`. |
+| zcashd `wallet.dat` | **Not yet.** Keys are stored individually with no HD seed behind them, and Argos has no standalone-key scan or spend path. `inspect-wallet` works; `scan` refuses. |
+
+That refusal is deliberate. Argos will not scan a zcashd wallet, find
+nothing because it had no accounts to look at, and report an empty result
+— which is indistinguishable from "your funds are gone" to the person who
+most needs the answer.
 
 ## Security audit
 

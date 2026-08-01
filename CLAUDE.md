@@ -73,9 +73,29 @@ true: `argos-core` depends on it), no network access, and no filesystem
 writes — it is the only component that consumes an attacker-supplied
 binary file. Key provenance is unified behind the `KeySource` trait in
 `crates/zeck-core/src/key_source.rs` (`SeedKeySource` /
-`ImportedKeySource`); as of this writing the CLI does not yet expose a
-`--wallet-file` flag wiring into it — check `crates/zeck-cli/src/main.rs`
-before documenting or relying on wallet-file import from the CLI.
+`ImportedKeySource`). `RuntimeScanConfig` carries an `Arc<dyn KeySource>`;
+`RecoveryService::start_scan_from_key_source` is the general entry point
+and `start_scan` is a seed-phrase wrapper over it.
+
+**What import can and cannot do.** A decrypted ZecWallet Lite wallet
+recovers a BIP-39 mnemonic, so it re-enters the ordinary HD pipeline and
+scans and sweeps exactly like a typed seed phrase. A zcashd `wallet.dat`
+holds flat, individually-stored keys with no HD seed; the scanner
+enumerates HD-derived account slots, so it has nothing to walk. That case
+is **refused explicitly** rather than scanning zero accounts — a
+successful-but-empty scan is the failure mode a user recovering real funds
+would most easily mistake for an answer. Making those keys spendable needs
+a standalone-key scan/spend path that does not exist yet; a standalone
+Sapling `extsk` in particular cannot form a `UnifiedSpendingKey`, which is
+what `SpendingKeys` requires.
+
+CLI: `--wallet-file <PATH>` (conflicts with `--seed-file`) plus an
+`inspect-wallet` subcommand that reports recovered key counts, Sprout
+addresses, and unread-record diagnostics with no network access. The
+passphrase is prompt-only — never a flag, so it cannot reach shell history
+or `ps` (T-S6). Wired in `crates/zeck-cli/src/main.rs`; covered by
+`crates/zeck-cli/tests/wallet_file_cli.rs`, which runs the real binary
+against the golden fixtures.
 
 ### Test seed (BIP-39 test vector, no real funds)
 `abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art`

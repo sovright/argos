@@ -333,6 +333,41 @@ mod tests {
         );
     }
 
+    /// The whole reason a decrypted ZecWallet Lite wallet is scannable is
+    /// that its recovered mnemonic re-enters the ordinary HD pipeline. If
+    /// the seed it yields ever diverged from what the same phrase typed by
+    /// hand yields, an import would scan a *different wallet* than the one
+    /// the user restored — and would report "no funds" for a wallet that
+    /// has them. Pin the equality directly rather than trusting that both
+    /// paths happen to call the same helper.
+    #[test]
+    fn an_imported_mnemonic_derives_the_same_seed_as_typing_that_phrase() {
+        let typed = SeedKeySource::new(SecretString::new(SEED.to_owned()));
+        let imported = ImportedKeySource::new(argos_wallet_import::ImportedKeys {
+            mnemonic: Some(SecretString::new(SEED.to_owned())),
+            ..Default::default()
+        });
+
+        let typed_seed = typed
+            .wallet_seed()
+            .unwrap()
+            .expect("seed source has a seed");
+        let imported_seed = imported
+            .wallet_seed()
+            .unwrap()
+            .expect("a recovered mnemonic must yield a seed");
+        assert_eq!(typed_seed, imported_seed);
+
+        // The workspaces must still be distinct: a user who imports a
+        // wallet file and a user who types its phrase are doing different
+        // things, and conflating their workspaces would let one resume
+        // into the other's partial state.
+        assert_ne!(
+            typed.workspace_path_component().unwrap(),
+            imported.workspace_path_component().unwrap()
+        );
+    }
+
     #[test]
     fn a_zcashd_flat_key_import_still_has_no_wallet_seed() {
         use argos_wallet_import::keys::{Provenance, TransparentKey};

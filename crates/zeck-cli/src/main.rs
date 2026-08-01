@@ -5,14 +5,16 @@ use std::{
     fs,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
 use argos_core::{
+    argos_wallet_import::{self, ImportedKeys},
     derive_accounts, detect_birthday, estimate_birthday_from_date, validate_destination_address,
-    RecoveryService, ScanConfig, ScanDiscovery, ScanHandle, ScanPhase, SweepProposal, SweepRequest,
-    ZeckNetwork,
+    ImportedKeySource, KeySource, RecoveryService, ScanConfig, ScanDiscovery, ScanHandle,
+    ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
@@ -34,6 +36,14 @@ struct Cli {
     /// chmod 600 (owner read/write only) on Unix.
     #[arg(long)]
     seed_file: Option<PathBuf>,
+
+    /// Path to a legacy wallet file to recover keys from: a zcashd
+    /// `wallet.dat` or a ZecWallet Lite wallet. Read-only — Argos never
+    /// writes to this file. If the wallet is encrypted you are prompted
+    /// for its passphrase; there is deliberately no flag for it, so it
+    /// cannot land in shell history or `ps` output.
+    #[arg(long, conflicts_with = "seed_file")]
+    wallet_file: Option<PathBuf>,
 
     /// Directory for wallet database and block cache.
     #[arg(long, default_value = "./argos_data")]
@@ -105,6 +115,10 @@ enum Commands {
     /// Derive and display all account keys and addresses (no network needed).
     ShowKeys,
 
+    /// Report what Argos can read out of --wallet-file. Purely local: no
+    /// network, and nothing is written anywhere.
+    InspectWallet,
+
     /// Scan the blockchain and report balances for all derived accounts.
     Scan,
 
@@ -144,6 +158,93 @@ fn command_uses_birthday_inputs(command: &Commands) -> bool {
     matches!(command, Commands::Scan | Commands::Sweep { .. })
 }
 
+/// Read a legacy wallet file into key material.
+///
+/// The passphrase is prompted for, never taken as a flag: a flag would
+/// land in shell history and in `ps` output for every user on the box
+/// (T-S6 in the threat model). We attempt an unencrypted read first so an
+/// unencrypted wallet is never asked for a passphrase it does not have.
+fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read wallet file {}", path.display()))?;
+
+    match argos_wallet_import::import_wallet_file(&bytes, None) {
+        Ok(keys) => Ok(keys),
+        // The parser reports a locked wallet and a wrong passphrase with
+        // the same variant. Here it can only mean "locked", because we
+        // supplied no passphrase to be wrong.
+        Err(argos_wallet_import::ImportError::WrongPassphrase) => {
+            eprintln!("This wallet is encrypted.");
+            let passphrase = Password::new()
+                .with_prompt("Enter the wallet passphrase")
+                .allow_empty_password(false)
+                .interact()
+                .context("failed to read wallet passphrase from terminal")?;
+            let passphrase = SecretString::new(passphrase);
+            argos_wallet_import::import_wallet_file(&bytes, Some(&passphrase))
+                .with_context(|| format!("failed to import wallet file {}", path.display()))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to import wallet file {}", path.display()))
+        }
+    }
+}
+
+/// Everything Argos recovered, printed without any network access.
+///
+/// This is the only useful thing it can do with a zcashd `wallet.dat`
+/// today, so it must be honest about the difference between "found a
+/// key" and "can move the funds".
+fn print_wallet_inspection(keys: &ImportedKeys) {
+    println!("━━━ Recovered key material ━━━");
+    println!("  Transparent keys  {}", keys.transparent.len());
+    println!("  Sapling keys      {}", keys.sapling.len());
+    println!("  Sprout keys       {}", keys.sprout.len());
+    println!("  Sprout notes      {}", keys.sprout_notes.len());
+    println!(
+        "  Seed phrase       {}",
+        if keys.mnemonic.is_some() {
+            "recovered"
+        } else {
+            "none (keys are stored individually, not HD-derived)"
+        }
+    );
+    println!();
+
+    if !keys.sprout.is_empty() {
+        println!("Sprout addresses (funds here are identified, not yet recoverable):");
+        for key in &keys.sprout {
+            let hex: String = key.address.iter().map(|b| format!("{b:02x}")).collect();
+            println!("  {hex}");
+        }
+        println!();
+    }
+
+    // Never summarized away: an unread record means key material that
+    // still exists only in the original file, and the user is the only
+    // one who can act on that.
+    if keys.diagnostics.is_empty() {
+        println!("Every record in this file was read.");
+    } else {
+        println!("{} record(s) could not be read:", keys.diagnostics.len());
+        for diagnostic in &keys.diagnostics {
+            println!("  {diagnostic}");
+        }
+        println!();
+        println!("Keep the original wallet file. Anything listed above exists only there.");
+    }
+    println!();
+
+    if keys.mnemonic.is_some() {
+        println!("Next: run `argos scan --wallet-file <path>` to check these keys for funds.");
+    } else {
+        println!(
+            "Scanning and sweeping need an HD seed, which this wallet does not have. \
+             Argos can extract these keys but cannot yet move funds held by them."
+        );
+    }
+}
+
 async fn resolve_birthday(
     cli: &Cli,
     seed_phrase: &SecretString,
@@ -178,10 +279,62 @@ async fn main() -> Result<()> {
 
     let network: ZeckNetwork = cli.network.into();
 
-    let seed_phrase = load_seed_phrase(cli.seed_file.clone())?;
+    // `key_source` is what the scanner and sweeper use. `seed_phrase` is
+    // the same key material in the one form two local-only paths still
+    // need it in — birthday auto-detection and `show-keys` — and is
+    // absent for a wallet file with no recoverable mnemonic.
+    let (key_source, seed_phrase, imported): (
+        Arc<dyn KeySource>,
+        Option<SecretString>,
+        Option<Arc<ImportedKeySource>>,
+    ) = match &cli.wallet_file {
+        Some(path) => {
+            let keys = load_wallet_file(path)?;
+            let phrase = keys.mnemonic.clone();
+            // `inspect-wallet` prints a fuller version of this below, so
+            // don't say it twice.
+            if !matches!(cli.command, Commands::InspectWallet) {
+                eprintln!(
+                    "Imported {} key(s) from {}.",
+                    keys.total_keys(),
+                    path.display()
+                );
+                if !keys.diagnostics.is_empty() {
+                    eprintln!(
+                        "{} record(s) could not be read — run `argos inspect-wallet \
+                         --wallet-file {}` to see them.",
+                        keys.diagnostics.len(),
+                        path.display()
+                    );
+                }
+            }
+            let source = Arc::new(ImportedKeySource::new(keys));
+            (source.clone(), phrase, Some(source))
+        }
+        None => {
+            // Bail before prompting: an interactive seed prompt for a
+            // command that only reads a wallet file is pure confusion.
+            if matches!(cli.command, Commands::InspectWallet) {
+                bail!("inspect-wallet needs --wallet-file");
+            }
+            let phrase = load_seed_phrase(cli.seed_file.clone())?;
+            (
+                Arc::new(SeedKeySource::new(phrase.clone())),
+                Some(phrase),
+                None,
+            )
+        }
+    };
 
     let birthday = if command_uses_birthday_inputs(&cli.command) {
-        Some(resolve_birthday(&cli, &seed_phrase, network).await?)
+        let phrase = seed_phrase.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no recoverable seed phrase, so there are no HD accounts to scan. \
+                 Use `argos inspect-wallet --wallet-file <path>` to see what was recovered.",
+                key_source.describe()
+            )
+        })?;
+        Some(resolve_birthday(&cli, phrase, network).await?)
     } else {
         None
     };
@@ -201,8 +354,20 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::InspectWallet => {
+            let source = imported.expect("--wallet-file is required and was checked above");
+            print_wallet_inspection(source.keys());
+        }
+
         Commands::ShowKeys => {
-            let accounts = derive_accounts(&seed_phrase, network, account_count)?;
+            let phrase = seed_phrase.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no recoverable seed phrase, so there are no HD accounts to \
+                     show. Use `argos inspect-wallet --wallet-file <path>` instead.",
+                    key_source.describe()
+                )
+            })?;
+            let accounts = derive_accounts(phrase, network, account_count)?;
             for account in accounts {
                 println!("━━━ Account {} ━━━", account.index);
                 println!("  Unified address     {}", account.unified_address);
@@ -225,7 +390,7 @@ async fn main() -> Result<()> {
             let birthday = birthday.expect("scan command requires birthday");
             let service = RecoveryService::new();
             let handle = service
-                .start_scan(
+                .start_scan_from_key_source(
                     ScanConfig {
                         birthday,
                         num_accounts: cli.num_accounts,
@@ -235,7 +400,7 @@ async fn main() -> Result<()> {
                         network,
                         label: String::new(),
                     },
-                    seed_phrase,
+                    key_source.clone(),
                 )
                 .await?;
 
@@ -276,7 +441,7 @@ async fn main() -> Result<()> {
 
             let service = RecoveryService::new();
             let handle = service
-                .start_scan(
+                .start_scan_from_key_source(
                     ScanConfig {
                         birthday,
                         num_accounts: cli.num_accounts,
@@ -286,7 +451,7 @@ async fn main() -> Result<()> {
                         network,
                         label: String::new(),
                     },
-                    seed_phrase,
+                    key_source.clone(),
                 )
                 .await?;
 

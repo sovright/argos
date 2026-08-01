@@ -43,8 +43,8 @@ use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, S
 use crate::{
     address::validate_destination_address,
     derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
-    key_source::{KeySource, SeedKeySource},
     error::{ZeckError, ZeckResult},
+    key_source::{KeySource, SeedKeySource},
     lightwalletd::{
         connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
         validated_lightwalletd_endpoints,
