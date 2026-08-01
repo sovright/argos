@@ -18,6 +18,7 @@
 //! answer to "what can I recover" and the wrong answer to "what did this
 //! wallet ever hold". Callers must not present it as the latter.
 
+use sapling_crypto as sapling;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, GetAddressUtxosArg,
 };
@@ -287,6 +288,179 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
     }))
 }
 
+/// Extract the Sapling receiver from a destination address.
+///
+/// The sweep pays into a Sapling output: a bundle with outputs but no
+/// spends needs only an empty-tree anchor, whereas Orchard additionally
+/// requires `orchard_anchor` / `ironwood_anchor` / bundle-type wiring under
+/// NU6.3. Sapling is the conservative choice, and every UA that carries a
+/// Sapling receiver — the common case — is reachable.
+pub fn sapling_receiver(
+    destination: &str,
+    network: ZeckNetwork,
+) -> ZeckResult<sapling::PaymentAddress> {
+    use zcash_address::{unified::Container, ConversionError, TryFromAddress, ZcashAddress};
+
+    struct SaplingOnly(Option<sapling::PaymentAddress>);
+
+    impl TryFromAddress for SaplingOnly {
+        type Error = &'static str;
+
+        fn try_from_sapling(
+            _net: zcash_protocol::consensus::NetworkType,
+            data: [u8; 43],
+        ) -> Result<Self, ConversionError<Self::Error>> {
+            Ok(SaplingOnly(sapling::PaymentAddress::from_bytes(&data)))
+        }
+
+        fn try_from_unified(
+            _net: zcash_protocol::consensus::NetworkType,
+            data: zcash_address::unified::Address,
+        ) -> Result<Self, ConversionError<Self::Error>> {
+            for receiver in data.items() {
+                if let zcash_address::unified::Receiver::Sapling(bytes) = receiver {
+                    return Ok(SaplingOnly(sapling::PaymentAddress::from_bytes(&bytes)));
+                }
+            }
+            Ok(SaplingOnly(None))
+        }
+    }
+
+    let parsed = ZcashAddress::try_from_encoded(destination)
+        .map_err(|err| ZeckError::InvalidAddress(format!("could not decode destination: {err}")))?;
+
+    // Reject a destination for the wrong network before anything is signed.
+    crate::address::validate_destination_address(destination, network)?;
+
+    let SaplingOnly(receiver) = parsed
+        .convert::<SaplingOnly>()
+        .map_err(|err| ZeckError::InvalidAddress(format!("unsupported destination: {err}")))?;
+
+    receiver.ok_or_else(|| {
+        ZeckError::InvalidAddress(
+            "this destination has no Sapling receiver. Transparent-only wallet recovery \
+             pays into the Sapling pool, so the destination must expose a Sapling \
+             receiver; most unified addresses do. Use a different destination address."
+                .to_owned(),
+        )
+    })
+}
+
+/// Build and sign a sweep of every supplied UTXO into one Sapling output.
+///
+/// Does not broadcast: the caller decides that, so a dry run and a real
+/// sweep share this code and can only diverge in whether they transmit.
+#[allow(clippy::too_many_arguments)]
+pub fn build_sweep_transaction<P, SP, OP>(
+    params: &P,
+    target_height: zcash_protocol::consensus::BlockHeight,
+    utxos: &[TransparentUtxo],
+    keys: &[ImportedTransparentKey],
+    plan: &TransparentSweepPlan,
+    recipient: sapling::PaymentAddress,
+    spend_prover: &SP,
+    output_prover: &OP,
+) -> ZeckResult<zcash_primitives::transaction::Transaction>
+where
+    P: zcash_protocol::consensus::Parameters,
+    SP: sapling::prover::SpendProver,
+    OP: sapling::prover::OutputProver,
+{
+    use rand_core::OsRng;
+    use zcash_primitives::transaction::{
+        builder::{BuildConfig, Builder, BundlePadding},
+        fees::zip317::FeeRule,
+    };
+    use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
+    use zcash_transparent::builder::TransparentSigningSet;
+
+    // No shielded spends, so the anchor is never checked against anything;
+    // an empty tree is the correct value rather than a placeholder.
+    let mut builder = Builder::new(
+        params,
+        target_height,
+        BuildConfig::Standard {
+            sapling_anchor: Some(sapling::Anchor::empty_tree()),
+            orchard_anchor: None,
+            ironwood_anchor: None,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        },
+    );
+
+    // Index keys by address so each input is matched to the key that
+    // actually controls it. Looking up by address rather than by position
+    // is what keeps this correct when a wallet holds several UTXOs on one
+    // address, or addresses with no UTXOs at all.
+    let mut signing_set = TransparentSigningSet::new();
+    let mut pubkey_for_address = std::collections::HashMap::new();
+    for key in keys {
+        let pubkey = signing_set.add_key(key.secret);
+        pubkey_for_address.insert(key.address, pubkey);
+    }
+
+    for utxo in utxos {
+        let pubkey = pubkey_for_address.get(&utxo.address).ok_or_else(|| {
+            ZeckError::Internal(format!(
+                "no spending key for UTXO on address {:?}; refusing to build a transaction \
+                 that cannot be signed",
+                utxo.address
+            ))
+        })?;
+        builder
+            .add_transparent_p2pkh_input(*pubkey, utxo.outpoint.clone(), utxo.txout.clone())
+            .map_err(|err| ZeckError::Wallet(format!("adding transparent input: {err:?}")))?;
+    }
+
+    let output_value = Zatoshis::from_u64(plan.output_zatoshis)
+        .map_err(|_| ZeckError::Internal("planned output value is out of range".to_owned()))?;
+    builder
+        .add_sapling_output::<zcash_primitives::transaction::fees::zip317::FeeError>(
+            // No outgoing viewing key: nothing in this wallet should be
+            // able to decrypt the output afterwards, and there is no
+            // account here whose OVK would be meaningful.
+            None,
+            recipient,
+            output_value,
+            MemoBytes::empty(),
+        )
+        .map_err(|err| ZeckError::Wallet(format!("adding the Sapling output: {err:?}")))?;
+
+    let fee_rule = FeeRule::standard();
+
+    // The planner and the builder must agree on the fee. They compute it
+    // from the same rule over the same bundle shape, so a mismatch means a
+    // bug in one of them — and the user would silently overpay or have the
+    // transaction rejected. Check rather than assume.
+    let builder_fee = builder
+        .get_fee(&fee_rule)
+        .map_err(|err| ZeckError::Wallet(format!("recomputing the fee failed: {err:?}")))?;
+    if u64::from(builder_fee) != plan.fee_zatoshis {
+        return Err(ZeckError::Internal(format!(
+            "planned fee {} does not match the builder's fee {}; refusing to sign",
+            plan.fee_zatoshis,
+            u64::from(builder_fee)
+        )));
+    }
+
+    let result = builder
+        .build(
+            &signing_set,
+            // No shielded spends: no Sapling or Orchard spend authority
+            // is required, which is exactly why a transparent-only wallet
+            // needs no account.
+            &[],
+            &[],
+            OsRng,
+            spend_prover,
+            output_prover,
+            &fee_rule,
+        )
+        .map_err(|err| ZeckError::Wallet(format!("building the sweep transaction: {err:?}")))?;
+
+    Ok(result.transaction().clone())
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::*;
@@ -448,5 +622,46 @@ mod sweep_tests {
             rendered.contains("real but not"),
             "the refusal must confirm the funds exist, got: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+    use crate::models::ZeckNetwork;
+
+    /// A UA with no Sapling receiver must be refused *before* anything is
+    /// signed, with an error the user can act on — not fail deep inside
+    /// the builder with a type error.
+    #[test]
+    fn a_transparent_only_destination_is_refused_with_guidance() {
+        // A bare t-address: valid, but it has no Sapling receiver.
+        let err = sapling_receiver(
+            "t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm",
+            ZeckNetwork::Mainnet,
+        )
+        .expect_err("a transparent destination has no Sapling receiver");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("Sapling") || rendered.contains("destination"),
+            "the refusal must name the problem, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn garbage_is_rejected_rather_than_parsed_into_something() {
+        assert!(sapling_receiver("not-an-address", ZeckNetwork::Mainnet).is_err());
+    }
+
+    /// A mainnet destination must not be accepted for a testnet sweep.
+    /// Getting this wrong sends real funds to an address that cannot be
+    /// spent on the network they were broadcast to.
+    #[test]
+    fn a_mainnet_destination_is_refused_on_testnet() {
+        assert!(sapling_receiver(
+            "t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm",
+            ZeckNetwork::Testnet
+        )
+        .is_err());
     }
 }

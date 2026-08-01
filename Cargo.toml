@@ -22,6 +22,10 @@ crypto_secretbox = "0.1.1"
 dialoguer = "0.12.0"
 indicatif = "0.18.2"
 orchard = "0.15"
+# Already in the tree, pinned by the librustzcash stack; promoted to a direct
+# dependency (as `orchard` already is) so transparent-only recovery can name
+# Sapling payment addresses, anchors, and provers. Adds no new package.
+sapling-crypto = { version = "0.7", default-features = false }
 prost = "0.14.3"
 rand_core = "0.6.4"
 rusqlite = "0.37.0"

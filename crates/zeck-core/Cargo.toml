@@ -30,6 +30,7 @@ orchard.workspace = true
 prost.workspace = true
 rand_core.workspace = true
 rusqlite.workspace = true
+sapling-crypto.workspace = true
 rustls.workspace = true
 secp256k1.workspace = true
 secrecy.workspace = true
