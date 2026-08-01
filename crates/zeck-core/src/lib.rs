@@ -10,6 +10,7 @@ pub mod models;
 pub mod scan;
 pub mod service;
 pub mod tos;
+pub mod transparent_recovery;
 pub mod workspace;
 
 pub use address::validate_destination_address;
