@@ -57,6 +57,28 @@ impl RegtestHarness {
                  See tests/regtest/README.md.",
             )
         });
+        // Install regtest activation heights before the caller derives a
+        // branch ID, builds a transaction, or opens a workspace.
+        //
+        // This lives here rather than in individual tests because
+        // `REGTEST_PARAMS` is a process-wide `OnceLock` and cargo runs a
+        // test binary's tests as threads in one process. When only one test
+        // installed the parameters, whether any *other* test saw them
+        // depended on thread scheduling: a sweep could be signed for a
+        // pre-NU5 branch and rejected by the node, or a scan could resolve
+        // the wrong activation heights, entirely at random
+        // (sovright/argos#186).
+        //
+        // Every regtest test calls `require()`, so installing here makes it
+        // deterministic and impossible to forget in a new test. The
+        // underlying setter is idempotent for an equal value, so repeated
+        // calls across tests are fine.
+        #[cfg(feature = "argos-network")]
+        argos_core::workspace::set_regtest_consensus_params(
+            argos_core::workspace::regtest_local_network(),
+        )
+        .expect("installing regtest consensus parameters");
+
         let funded_t_addr = env::var(ENV_TEST_T_ADDR).ok();
         Self {
             lightwalletd_url,

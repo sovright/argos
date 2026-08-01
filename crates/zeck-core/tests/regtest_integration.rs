@@ -83,7 +83,9 @@ async fn complete_scan_against_test_seed(
     // path is a hash of (network, seed, birthday, scope); identical args
     // to `start_scan` produce the same root.
     let runtime = RuntimeScanConfig {
-        seed_phrase: SecretString::new(harness.test_seed().to_owned()),
+        key_source: std::sync::Arc::new(argos_core::SeedKeySource::new(SecretString::new(
+            harness.test_seed().to_owned(),
+        ))),
         // The Argos network activates Sapling at height 1; setting a tiny
         // birthday keeps the scan fast on regtest. zcashd-regtest tops out
         // at ~200 blocks after setup.sh runs, so the scan is sub-second.
@@ -104,8 +106,12 @@ async fn complete_scan_against_test_seed(
     // and propose_sweep doesn't care if source == destination — using a
     // derived address from the same seed avoids needing a separately-funded
     // second wallet in the harness.
-    let accounts = derive_accounts(&runtime.seed_phrase, runtime.network, 2)
-        .expect("derive_accounts for destination UA");
+    let accounts = derive_accounts(
+        &SecretString::new(harness.test_seed().to_owned()),
+        runtime.network,
+        2,
+    )
+    .expect("derive_accounts for destination UA");
     let destination_ua = accounts[1].unified_address.clone();
 
     let scan_config = ScanConfig {
@@ -243,7 +249,9 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
     let fixture_dir = tempfile::tempdir().expect("temp data dir for fixture scan");
     let fixture_seed = harness.test_seed().to_owned();
     let runtime = argos_core::RuntimeScanConfig {
-        seed_phrase: SecretString::new(fixture_seed.clone()),
+        key_source: std::sync::Arc::new(argos_core::SeedKeySource::new(SecretString::new(
+            fixture_seed.clone(),
+        ))),
         birthday: 1,
         num_accounts: Some(2),
         gap_limit: 5,
@@ -2343,16 +2351,12 @@ fn regtest_encoded_unified_address(seed: &str) -> String {
 #[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
 #[cfg(feature = "argos-network")]
 async fn post_ironwood_sweep_is_accepted_by_the_node() {
-    use argos_core::workspace::{regtest_local_network, set_regtest_consensus_params};
     use argos_core::{RecoveryService, ScanConfig, ScanPhase, SweepRequest, ZeckNetwork};
 
+    // `require()` installs the regtest activation heights for the whole
+    // process; without them this sweep would be signed for a pre-NU5 branch
+    // and rejected by the node, which is the regression under test.
     let harness = RegtestHarness::require();
-
-    // Install regtest activation heights before anything derives a branch ID.
-    // Without this the sweep below is signed for a pre-NU5 branch and the node
-    // rejects it — which is precisely the regression under test.
-    set_regtest_consensus_params(regtest_local_network())
-        .expect("installing regtest consensus parameters");
 
     // Fund inside the test rather than relying on setup.sh having run. The
     // sweep spends everything it finds, so a second run would otherwise find
