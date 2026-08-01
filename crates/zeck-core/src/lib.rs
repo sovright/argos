@@ -3,6 +3,7 @@ pub mod birthday;
 pub mod derivation;
 pub mod donation;
 pub mod error;
+pub mod imported;
 pub mod key_source;
 pub mod lightwalletd;
 pub mod models;
