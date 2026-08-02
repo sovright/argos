@@ -19,16 +19,16 @@
 //! wallet ever hold". Callers must not present it as the latter.
 
 use sapling_crypto as sapling;
+use tonic::transport::Channel;
+use tracing::warn;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, GetAddressUtxosArg,
 };
+use zcash_protocol::value::Zatoshis;
 use zcash_transparent::{
     address::TransparentAddress,
     bundle::{OutPoint, TxOut},
 };
-use zcash_protocol::value::Zatoshis;
-use tonic::transport::Channel;
-use tracing::warn;
 
 use crate::{
     error::{ZeckError, ZeckResult},
@@ -117,9 +117,10 @@ pub async fn fetch_transparent_utxos(
 
             // A negative value is a misbehaving server. Coercing it to
             // zero would hide that; skipping it loudly does not.
-            let value = match u64::try_from(entry.value_zat).ok().and_then(|v| {
-                Zatoshis::from_u64(v).ok()
-            }) {
+            let value = match u64::try_from(entry.value_zat)
+                .ok()
+                .and_then(|v| Zatoshis::from_u64(v).ok())
+            {
                 Some(v) => v,
                 None => {
                     warn!(
@@ -190,11 +191,13 @@ pub fn summarize(
 
     let mut funded: Vec<TransparentAddressBalance> = sums
         .into_iter()
-        .map(|(address, (zatoshis, utxo_count))| TransparentAddressBalance {
-            address: encode_transparent_address(&address, network),
-            zatoshis,
-            utxo_count,
-        })
+        .map(
+            |(address, (zatoshis, utxo_count))| TransparentAddressBalance {
+                address: encode_transparent_address(&address, network),
+                zatoshis,
+                utxo_count,
+            },
+        )
         .collect();
     // Deterministic order: value first so the user sees what matters, then
     // address so the output is stable across runs for the same wallet.
@@ -211,7 +214,6 @@ pub fn summarize(
         chain_tip_height,
     }
 }
-
 
 /// A costed transparent sweep, before anything is signed or broadcast.
 ///
@@ -245,9 +247,9 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
         return Ok(None);
     }
 
-    let total: u64 = utxos
-        .iter()
-        .fold(0u64, |acc, u| acc.saturating_add(u64::from(u.txout.value())));
+    let total: u64 = utxos.iter().fold(0u64, |acc, u| {
+        acc.saturating_add(u64::from(u.txout.value()))
+    });
 
     // Every input is P2PKH — these keys came from `key`/`ckey` records,
     // which store pubkeys, not scripts.
@@ -471,6 +473,121 @@ where
     Ok(result.transaction().clone())
 }
 
+/// Outcome of a completed transparent-only sweep.
+#[derive(Debug, Clone)]
+pub struct TransparentSweepOutcome {
+    pub txid: String,
+    pub plan: TransparentSweepPlan,
+    pub destination: String,
+}
+
+/// Connect, validate the endpoint against `network`, and report what the
+/// imported transparent keys can spend.
+pub async fn scan_transparent_only(
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+) -> ZeckResult<TransparentScanReport> {
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+
+    let chain_tip = u32::try_from(info.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+    Ok(summarize(&utxos, keys.len(), chain_tip, network))
+}
+
+/// Sweep every spendable transparent UTXO into one shielded output at
+/// `destination`.
+///
+/// `max_fee_zatoshis` is checked before anything is signed, so a fee the
+/// caller considers unacceptable costs nothing.
+///
+/// Broadcasts. Returns once lightwalletd has accepted the transaction into
+/// the mempool — acceptance is not confirmation, and the caller must say so.
+pub async fn sweep_transparent_only(
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+    destination: &str,
+    max_fee_zatoshis: Option<u64>,
+) -> ZeckResult<Option<TransparentSweepOutcome>> {
+    use zcash_client_backend::proto::service::RawTransaction;
+    use zcash_proofs::prover::LocalTxProver;
+    use zcash_protocol::consensus::BlockHeight;
+
+    // Resolve the destination before touching the network: a bad address
+    // should fail instantly, not after a scan.
+    let recipient = sapling_receiver(destination, network)?;
+
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+
+    let chain_tip = u32::try_from(info.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+
+    let params = crate::workspace::consensus_network(network);
+    let target_height = BlockHeight::from_u32(chain_tip.saturating_add(1));
+
+    let Some(plan) = plan_sweep(&params, target_height, &utxos)? else {
+        return Ok(None);
+    };
+
+    if let Some(max_fee) = max_fee_zatoshis {
+        if plan.fee_zatoshis > max_fee {
+            return Err(ZeckError::InvalidConfig(format!(
+                "the sweep needs a {} zatoshi fee for {} input(s), above the {max_fee} \
+                 zatoshi limit. Nothing was signed or broadcast.",
+                plan.fee_zatoshis, plan.input_count
+            )));
+        }
+    }
+
+    let prover = LocalTxProver::bundled();
+    let tx = build_sweep_transaction(
+        &params,
+        target_height,
+        &utxos,
+        keys,
+        &plan,
+        recipient,
+        &prover,
+        &prover,
+    )?;
+
+    let mut raw = Vec::new();
+    tx.write(&mut raw)
+        .map_err(|err| ZeckError::TransactionBuild(format!("serializing the sweep: {err}")))?;
+
+    let response = client
+        .send_transaction(RawTransaction {
+            data: raw,
+            height: 0,
+        })
+        .await
+        .map_err(|err| ZeckError::Broadcast(err.to_string()))?
+        .into_inner();
+    if response.error_code != 0 {
+        let reason = if response.error_message.is_empty() {
+            format!("error code {}", response.error_code)
+        } else {
+            response.error_message.clone()
+        };
+        return Err(ZeckError::Broadcast(format!(
+            "the node rejected the sweep transaction: {reason}"
+        )));
+    }
+
+    Ok(Some(TransparentSweepOutcome {
+        txid: tx.txid().to_string(),
+        plan,
+        destination: destination.to_owned(),
+    }))
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::*;
@@ -572,10 +689,7 @@ mod sweep_tests {
     fn the_plan_conserves_value_exactly() {
         // inputs = fee + output, with no remainder. A sweep that silently
         // dropped a few zatoshis would be burning the user's money.
-        let utxos = vec![
-            utxo(addr(1), 500_000, 0xAA),
-            utxo(addr(2), 250_000, 0xBB),
-        ];
+        let utxos = vec![utxo(addr(1), 500_000, 0xAA), utxo(addr(2), 250_000, 0xBB)];
         let plan = plan_sweep(&MAIN_NETWORK, height(), &utxos)
             .expect("planning should succeed")
             .expect("a funded wallet must produce a plan");
@@ -595,16 +709,10 @@ mod sweep_tests {
         // the transaction would be underpaid and rejected — after the user
         // was told it would succeed.
         let few = vec![utxo(addr(1), 10_000_000, 0xAA)];
-        let many: Vec<_> = (0u8..40)
-            .map(|i| utxo(addr(i), 10_000_000, i))
-            .collect();
+        let many: Vec<_> = (0u8..40).map(|i| utxo(addr(i), 10_000_000, i)).collect();
 
-        let small = plan_sweep(&MAIN_NETWORK, height(), &few)
-            .unwrap()
-            .unwrap();
-        let large = plan_sweep(&MAIN_NETWORK, height(), &many)
-            .unwrap()
-            .unwrap();
+        let small = plan_sweep(&MAIN_NETWORK, height(), &few).unwrap().unwrap();
+        let large = plan_sweep(&MAIN_NETWORK, height(), &many).unwrap().unwrap();
 
         assert!(
             large.fee_zatoshis > small.fee_zatoshis,
@@ -646,11 +754,8 @@ mod destination_tests {
     #[test]
     fn a_transparent_only_destination_is_refused_with_guidance() {
         // A bare t-address: valid, but it has no Sapling receiver.
-        let err = sapling_receiver(
-            "t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm",
-            ZeckNetwork::Mainnet,
-        )
-        .expect_err("a transparent destination has no Sapling receiver");
+        let err = sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Mainnet)
+            .expect_err("a transparent destination has no Sapling receiver");
         let rendered = err.to_string();
         assert!(
             rendered.contains("Sapling") || rendered.contains("destination"),
@@ -668,10 +773,8 @@ mod destination_tests {
     /// spent on the network they were broadcast to.
     #[test]
     fn a_mainnet_destination_is_refused_on_testnet() {
-        assert!(sapling_receiver(
-            "t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm",
-            ZeckNetwork::Testnet
-        )
-        .is_err());
+        assert!(
+            sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Testnet).is_err()
+        );
     }
 }

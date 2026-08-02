@@ -14,9 +14,9 @@ use argos_core::{
     argos_wallet_import::{self, ImportedKeys},
     derive_accounts, detect_birthday, estimate_birthday_from_date,
     imported::{encode_transparent_address, imported_transparent_keys},
-    validate_destination_address,
-    ImportedKeySource, KeySource, RecoveryService, ScanConfig, ScanDiscovery, ScanHandle,
-    ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
+    transparent_recovery::{scan_transparent_only, sweep_transparent_only, TransparentScanReport},
+    validate_destination_address, ImportedKeySource, KeySource, RecoveryService, ScanConfig,
+    ScanDiscovery, ScanHandle, ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
@@ -192,6 +192,148 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
     }
 }
 
+/// Sweep a transparent-only wallet, with the same guard rails the HD sweep
+/// has: a dry run that signs nothing, an explicit confirmation for an
+/// irreversible action, and a fee ceiling checked before signing.
+async fn run_transparent_sweep(
+    keys: &[argos_core::imported::ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+    destination: &str,
+    max_fee: Option<u64>,
+    dry_run: bool,
+    confirm_sweep: bool,
+) -> Result<()> {
+    // Report before deciding, so a dry run and a real sweep show the user
+    // the same numbers.
+    let report = scan_transparent_only(keys, network, lightwalletd_url).await?;
+    print_transparent_report(&report);
+
+    if report.total_zatoshis == 0 {
+        println!();
+        println!("Nothing to sweep.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Destination: {destination}");
+    println!("All transparent funds above would be swept into a single shielded (Sapling) output.");
+
+    if dry_run {
+        println!();
+        println!("╔══════════════════════════════════════╗");
+        println!("║  DRY RUN — no funds will be moved    ║");
+        println!("╚══════════════════════════════════════╝");
+        println!();
+        println!("Re-run with --confirm-sweep to broadcast.");
+        return Ok(());
+    }
+
+    if !confirm_sweep {
+        bail!(
+            "refusing to broadcast without --confirm-sweep. Re-run with --dry-run to preview, \
+             or --confirm-sweep to move the funds. This is irreversible."
+        );
+    }
+
+    let outcome = sweep_transparent_only(keys, network, lightwalletd_url, destination, max_fee)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("there was nothing to sweep"))?;
+
+    println!();
+    println!("━━━ Sweep broadcast ━━━");
+    println!("  Transaction  {}", outcome.txid);
+    println!("  Inputs       {}", outcome.plan.input_count);
+    println!("  Fee          {}", format_zec(outcome.plan.fee_zatoshis));
+    println!(
+        "  Sent         {}",
+        format_zec(outcome.plan.output_zatoshis)
+    );
+    println!("  Destination  {}", outcome.destination);
+    println!();
+    // Mempool acceptance is not confirmation, and a recovery user reading
+    // "broadcast" as "done" may delete the wallet file that still holds the
+    // only copy of these keys.
+    println!(
+        "The network accepted this transaction into its mempool. That is not the same as \
+         it being mined. Check the transaction id above in a block explorer before treating \
+         the funds as moved, and keep the original wallet file until you have."
+    );
+
+    Ok(())
+}
+
+/// Whether this wallet must go down the transparent-only path: keys we can
+/// use, but no HD seed to build accounts from.
+fn is_transparent_only(keys: &ImportedKeys) -> bool {
+    keys.mnemonic.is_none() && !keys.transparent.is_empty()
+}
+
+/// Warn — unmissably — when a transparent-only recovery is leaving other
+/// pools behind.
+///
+/// This is the project's partial-recovery rule applied to a whole pool:
+/// covering what we can must never imply we covered everything. A user who
+/// reads "0.5 ZEC recovered" without knowing their Sapling notes were never
+/// looked at has been actively misled about where their money is.
+fn warn_about_uncovered_pools(keys: &ImportedKeys) {
+    if keys.sapling.is_empty() && keys.sprout.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("  ⚠ THIS COVERS TRANSPARENT FUNDS ONLY");
+    if !keys.sapling.is_empty() {
+        eprintln!(
+            "    {} Sapling key(s) in this wallet are NOT scanned or swept here.",
+            keys.sapling.len()
+        );
+    }
+    if !keys.sprout.is_empty() {
+        eprintln!(
+            "    {} Sprout key(s) in this wallet are NOT scanned or swept here.",
+            keys.sprout.len()
+        );
+    }
+    eprintln!("    Any balance reported below excludes those pools entirely.");
+    eprintln!("    Keep the original wallet file: those keys exist only there.");
+    eprintln!();
+}
+
+fn print_transparent_report(report: &TransparentScanReport) {
+    println!();
+    println!("━━━ Transparent balances ━━━");
+    println!("  Addresses checked   {}", report.addresses_checked);
+    println!("  Funded addresses    {}", report.funded.len());
+    println!(
+        "  Total               {}",
+        format_zec(report.total_zatoshis)
+    );
+    if report.chain_tip_height > 0 {
+        println!("  Chain tip           {}", report.chain_tip_height);
+    }
+    println!();
+
+    if report.funded.is_empty() {
+        println!("No spendable transparent funds were found at these addresses.");
+        println!();
+        println!(
+            "Note: this reports what is spendable now, not what the wallet ever held. \
+             A wallet that was funded and later emptied reports zero here."
+        );
+        return;
+    }
+
+    for balance in &report.funded {
+        println!(
+            "  {}  {}  ({} UTXO{})",
+            balance.address,
+            format_zec(balance.zatoshis),
+            balance.utxo_count,
+            if balance.utxo_count == 1 { "" } else { "s" }
+        );
+    }
+}
+
 /// Everything Argos recovered, printed without any network access.
 ///
 /// This is the only useful thing it can do with a zcashd `wallet.dat`
@@ -347,6 +489,47 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    // A wallet with no HD seed cannot be scanned as accounts, but its
+    // transparent keys can still be recovered directly — no account model
+    // is involved. Dispatch before the birthday gate, which only makes
+    // sense for an HD scan.
+    if let Some(source) = imported.as_ref() {
+        let keys = source.keys();
+        if is_transparent_only(keys) {
+            match &cli.command {
+                Commands::Scan => {
+                    warn_about_uncovered_pools(keys);
+                    let resolved = imported_transparent_keys(keys)?;
+                    let report =
+                        scan_transparent_only(&resolved, network, &cli.lightwalletd_url).await?;
+                    print_transparent_report(&report);
+                    return Ok(());
+                }
+                Commands::Sweep {
+                    destination,
+                    max_fee,
+                    dry_run,
+                    confirm_sweep,
+                    ..
+                } => {
+                    warn_about_uncovered_pools(keys);
+                    let resolved = imported_transparent_keys(keys)?;
+                    return run_transparent_sweep(
+                        &resolved,
+                        network,
+                        &cli.lightwalletd_url,
+                        destination,
+                        *max_fee,
+                        *dry_run,
+                        *confirm_sweep,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
+    }
 
     let birthday = if command_uses_birthday_inputs(&cli.command) {
         let phrase = seed_phrase.as_ref().ok_or_else(|| {

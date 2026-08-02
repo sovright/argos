@@ -77,35 +77,42 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     );
 }
 
+/// A seedless wallet with transparent keys is *scanned*, not refused.
+///
+/// This previously asserted a refusal, which was correct when transparent
+/// recovery did not exist: scanning such a wallet through the HD path would
+/// have walked zero accounts and reported "no funds" for a wallet that may
+/// hold real money. That danger has not gone away — it has moved. The
+/// requirement is unchanged and the mechanism is new: the scan must either
+/// refuse, or report real transparent numbers *and* name every pool it did
+/// not cover. What it must never do is report an empty wallet with no
+/// caveat.
+///
+/// Uses an unroutable endpoint so this stays offline; the transparent-only
+/// banner is printed before any network call, and it is emitted on no other
+/// code path, so seeing it proves which branch was taken.
 #[test]
-fn scanning_a_seedless_wallet_refuses_instead_of_reporting_no_funds() {
-    let tempdir = std::env::temp_dir().join(format!("argos-cli-test-{}", std::process::id()));
+fn a_seedless_wallet_with_transparent_keys_is_scanned_not_refused() {
     let path = fixture(SPROUT_PLAINTEXT);
-
     let out = argos(&[
         "--wallet-file",
         path.to_str().expect("fixture path is UTF-8"),
         "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
         "--data-dir",
-        tempdir.to_str().expect("temp path is UTF-8"),
+        &scratch_dir("seedless"),
         "scan",
     ]);
-    let _ = std::fs::remove_dir_all(&tempdir);
 
-    // The dangerous outcome is exit 0 with an empty result, which reads as
-    // "your wallet is empty" for a wallet that may hold real funds.
-    assert!(
-        !out.status.success(),
-        "scanning a seedless wallet must fail rather than report an empty wallet"
-    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no recoverable seed phrase"),
-        "the refusal must explain itself, got:\n{stderr}"
+        stderr.contains("TRANSPARENT FUNDS ONLY"),
+        "the transparent-only path must have been taken, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("inspect-wallet"),
-        "the refusal must point at the command that does work, got:\n{stderr}"
+        !stderr.contains("no recoverable seed phrase"),
+        "a wallet with transparent keys must no longer be refused outright, got:\n{stderr}"
     );
 }
 
@@ -142,4 +149,87 @@ fn a_file_that_is_not_a_wallet_is_rejected_by_name() {
         stderr.contains("not a recognized Zcash wallet file"),
         "expected the format-sniff rejection, got:\n{stderr}"
     );
+}
+
+/// A zcashd wallet that also holds Sapling keys is only *partly* covered by
+/// transparent-only recovery. The user must be told that unmissably: a
+/// balance reported without that caveat is an active lie about where their
+/// money is.
+///
+/// Runs offline — the warning is printed before any network call, so this
+/// asserts it without needing a chain.
+#[test]
+fn a_wallet_with_shielded_keys_warns_that_they_are_not_covered() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    // Point at an unroutable endpoint: the scan will fail, but the warning
+    // is emitted first and that is what is under test.
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("warn"),
+        "scan",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("TRANSPARENT FUNDS ONLY"),
+        "the transparent-only caveat must be unmissable, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Sapling key(s) in this wallet are NOT scanned"),
+        "it must name the pool being skipped, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Sprout key(s) in this wallet are NOT scanned"),
+        "the fixture has a Sprout key too; it must be named, got:\n{stderr}"
+    );
+}
+
+/// Sweeping is irreversible, so it must refuse to broadcast without an
+/// explicit confirmation — the same rule the seed sweep follows.
+#[test]
+fn a_transparent_sweep_refuses_to_broadcast_without_confirmation() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("confirm"),
+        "sweep",
+        "--destination",
+        "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf",
+        "--max-fee",
+        "0.001",
+    ]);
+
+    assert!(
+        !out.status.success(),
+        "an unconfirmed sweep must not succeed"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // It must fail for a safety reason or before reaching the network —
+    // never by silently broadcasting.
+    assert!(
+        !combined.contains("Sweep broadcast"),
+        "nothing may be broadcast without --confirm-sweep, got:\n{combined}"
+    );
+}
+
+fn scratch_dir(tag: &str) -> String {
+    std::env::temp_dir()
+        .join(format!("argos-cli-{tag}-{}", std::process::id()))
+        .to_str()
+        .expect("temp path is UTF-8")
+        .to_owned()
 }

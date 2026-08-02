@@ -20,8 +20,8 @@ use zcash_client_backend::data_api::{
     Account as _, AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
 };
 use zcash_client_sqlite::{util::SystemClock, AccountUuid, WalletDb};
-use zcash_keys::keys::{sapling::ExtendedSpendingKey, UnifiedFullViewingKey};
 use zcash_keys::encoding::AddressCodec;
+use zcash_keys::keys::{sapling::ExtendedSpendingKey, UnifiedFullViewingKey};
 use zcash_transparent::address::TransparentAddress;
 
 use crate::{
@@ -91,9 +91,7 @@ impl std::fmt::Debug for ImportedTransparentKey {
 /// Order follows the file, and duplicates are preserved: two records
 /// yielding the same address is a fact about the wallet worth surfacing
 /// rather than silently collapsing.
-pub fn imported_transparent_keys(
-    keys: &ImportedKeys,
-) -> ZeckResult<Vec<ImportedTransparentKey>> {
+pub fn imported_transparent_keys(keys: &ImportedKeys) -> ZeckResult<Vec<ImportedTransparentKey>> {
     let secp = secp256k1::Secp256k1::signing_only();
     keys.transparent
         .iter()
