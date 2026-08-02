@@ -26,6 +26,12 @@ orchard = "0.15"
 # dependency (as `orchard` already is) so transparent-only recovery can name
 # Sapling payment addresses, anchors, and provers. Adds no new package.
 sapling-crypto = { version = "0.7", default-features = false }
+# Already in the tree via zcash_client_backend; promoted to a direct dependency
+# so the imported-key sweep can drive the PCZT roles. Spending a standalone
+# Sapling key is impossible through `SpendingKeys`, which takes its Sapling
+# authority solely from a `UnifiedSpendingKey`; the PCZT signer accepts a raw
+# spend authorizing key. Adds no new package.
+pczt = { version = "0.9.1", default-features = false, features = ["prover", "signer", "tx-extractor", "io-finalizer", "spend-finalizer", "sapling", "orchard", "transparent"] }
 prost = "0.14.3"
 rand_core = "0.6.4"
 rusqlite = "0.37.0"
@@ -59,7 +65,7 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 # upstream cannot silently change what we ship; revisit both pins when 0.24.0 /
 # 0.22.0 go final.
 zcash_address = "0.13"
-zcash_client_backend = { version = "=0.24.0-rc.4", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "sync", "transparent-inputs", "transparent-key-import"] }
+zcash_client_backend = { version = "=0.24.0-rc.4", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt", "sync", "transparent-inputs", "transparent-key-import"] }
 zcash_client_sqlite = { version = "=0.22.0-rc.4", default-features = false, features = ["orchard", "transparent-inputs", "transparent-key-import"] }
 zcash_keys = { version = "0.16", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
 zcash_primitives = "0.30"

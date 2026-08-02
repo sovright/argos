@@ -27,6 +27,7 @@ async-trait.workspace = true
 bip0039.workspace = true
 keepawake.workspace = true
 orchard.workspace = true
+pczt.workspace = true
 prost.workspace = true
 rand_core.workspace = true
 rusqlite.workspace = true
