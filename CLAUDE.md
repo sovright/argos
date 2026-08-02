@@ -93,12 +93,22 @@ database. Proven end to end against a real node by
 container (zcash/librustzcash#2582) — which is why bypassing the model is
 the fix rather than a shortcut.
 
-**Sapling import is registered but not yet wired.**
-`imported::register_imported_accounts` creates accounts via
-`import_account_ufvk` with `AccountPurpose::Spending { derivation: None }`
-and is tested against a seedless wallet DB, but no scan path calls it, so
-imported Sapling funds are still invisible. A wallet holding Sapling or
-Sprout keys therefore prints an explicit uncovered-pool warning.
+**Imported Sapling is scanned** via `run_imported_scan` in `scan.rs`.
+`imported::register_imported_accounts` creates one account per Sapling key
+(`import_account_ufvk` with `AccountPurpose::Spending { derivation: None }`)
+and attaches the transparent keys to the first account as standalone
+receivers, so a single sync covers both pools. Deliberately not the HD
+loop: an imported key set is fixed and fully known once parsed, so there
+are no slots to enumerate and no gap to extend.
+
+**Spending imported Sapling is still not implemented.** Balances are
+visible; moving them needs the PCZT path below. Sprout remains
+identified-only, and the CLI says so before showing any balance.
+
+Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
+keys takes the imported-account path; one with only transparent keys takes
+`transparent_recovery`, because ZIP-316 gives it no UFVK to anchor an
+account to.
 
 Spending imported Sapling does **not** need an upstream change: PCZT is
 account-id driven and `Signer::sign_sapling` takes a raw `ask`. Only the

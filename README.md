@@ -44,7 +44,7 @@ lists Sprout addresses, and names every record it could not read.
 | Wallet | Scan and sweep? |
 |---|---|
 | ZecWallet Lite | **Yes.** Decryption recovers the BIP-39 mnemonic, so the wallet re-enters the normal HD recovery path. Add `--wallet-file` to `scan` or `sweep`. |
-| zcashd `wallet.dat` | **Transparent funds: yes.** Transparent keys are scanned and can be swept into a shielded output without any HD seed. **Sapling: not yet** — the keys are recovered and reported, but not scanned or spent. **Sprout: identified only.** A wallet holding shielded keys prints an explicit warning naming each pool the sweep does not cover. |
+| zcashd `wallet.dat` | **Transparent: scan + sweep.** **Sapling: scan only** — balances are found and reported, but moving them is not yet implemented. **Sprout: identified only.** Whatever a run does not cover is named explicitly before any balance is shown. |
 
 Partial coverage is always stated, never implied away. Argos will not
 report a balance that silently excludes a pool it never looked at — "0.5
