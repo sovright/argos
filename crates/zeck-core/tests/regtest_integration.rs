@@ -2685,3 +2685,94 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
         after_total
     );
 }
+
+/// An imported zcashd wallet is scanned as real wallet-database accounts.
+///
+/// The unit tests prove `register_imported_accounts` writes the right rows;
+/// only a chain proves the scanner then *uses* them — that a Sapling
+/// account with no ZIP-32 derivation actually syncs, and that the
+/// transparent keys hanging off it as standalone receivers are picked up
+/// in the same pass rather than needing the separate transparent path.
+///
+/// The fixture wallet holds no funds on this chain, so the assertion is
+/// about the scan completing over real accounts, not about a balance. A
+/// scan that silently found zero accounts would look identical in the
+/// total but differ here: the account count and the terminal phase.
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
+#[cfg(feature = "argos-network")]
+async fn an_imported_zcashd_wallet_scans_as_wallet_accounts() {
+    use argos_core::{ImportedKeySource, RecoveryService, ScanConfig, ScanPhase, ZeckNetwork};
+
+    let harness = RegtestHarness::require();
+
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+    );
+    let bytes = std::fs::read(fixture).expect("golden fixture must exist");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("the plaintext fixture must import");
+    let sapling_keys = keys.sapling.len();
+    assert!(
+        sapling_keys > 0 && !keys.transparent.is_empty(),
+        "the fixture must hold both Sapling and transparent keys or this proves nothing"
+    );
+    // The property under test only exists for a wallet with no seed.
+    assert!(
+        keys.mnemonic.is_none(),
+        "the fixture must be seedless or this exercises the HD path instead"
+    );
+
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: 1,
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: String::new(),
+            },
+            std::sync::Arc::new(ImportedKeySource::new(keys)),
+        )
+        .await
+        .expect("starting an imported scan");
+
+    let progress = loop {
+        let progress = service
+            .get_scan_progress(&handle)
+            .await
+            .expect("scan progress should be readable");
+        if progress.phase.is_terminal() {
+            break progress;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+
+    assert_eq!(
+        progress.phase,
+        ScanPhase::Complete,
+        "an imported scan must complete, got {:?}: {:?}",
+        progress.phase,
+        progress.error
+    );
+    assert_eq!(
+        progress.accounts.len(),
+        sapling_keys,
+        "every imported Sapling key must appear as a scanned account"
+    );
+    // The account must be a real one, not a placeholder: a scanned account
+    // reports a usable address.
+    assert!(
+        !progress.accounts[0].sapling_address.is_empty(),
+        "an imported account must report its Sapling address"
+    );
+    assert!(
+        !progress.accounts[0].transparent_receive_address.is_empty(),
+        "the imported transparent keys must be attached to the account"
+    );
+}

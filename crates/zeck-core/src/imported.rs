@@ -21,12 +21,12 @@ use zcash_client_backend::data_api::{
 };
 use zcash_client_sqlite::{util::SystemClock, AccountUuid, WalletDb};
 use zcash_keys::encoding::AddressCodec;
-use zcash_keys::keys::{sapling::ExtendedSpendingKey, UnifiedFullViewingKey};
+use zcash_keys::keys::{sapling::ExtendedSpendingKey, UnifiedAddressRequest, UnifiedFullViewingKey};
 use zcash_transparent::address::TransparentAddress;
 
 use crate::{
     error::{ZeckError, ZeckResult},
-    models::ZeckNetwork,
+    models::{DerivedAccount, ZeckNetwork},
     workspace::ArgosParams,
 };
 
@@ -63,6 +63,57 @@ pub fn sapling_ufvk(extsk: &ExtendedSpendingKey) -> ZeckResult<UnifiedFullViewin
     UnifiedFullViewingKey::parse(&ufvk)
         .map_err(|err| ZeckError::Import(format!("parsing the assembled UFVK failed: {err}")))
 }
+
+/// Display metadata for an imported account, shaped like the HD scanner's
+/// `DerivedAccount` so the whole progress and reporting pipeline works on
+/// imported wallets without change.
+///
+/// The path fields say "imported" rather than carrying a ZIP-32 path,
+/// because there is none: these keys were stored individually. Showing a
+/// plausible-looking path would invite someone to re-derive the key from a
+/// seed that does not exist.
+pub fn imported_account_display(
+    index: u32,
+    extsk: &ExtendedSpendingKey,
+    transparent: Option<&TransparentAddress>,
+    network: ZeckNetwork,
+) -> ZeckResult<DerivedAccount> {
+    let params = crate::workspace::consensus_network(network);
+    let (_, sapling_address) = extsk
+        .to_diversifiable_full_viewing_key()
+        .default_address();
+
+    let ufvk = sapling_ufvk(extsk)?;
+    let unified_address = ufvk
+        .default_address(UnifiedAddressRequest::AllAvailableKeys)
+        .map_err(|err| ZeckError::Import(format!("deriving a unified address: {err}")))?
+        .0
+        .encode(&params);
+
+    let transparent_encoded = transparent
+        .map(|addr| encode_transparent_address(addr, network))
+        .unwrap_or_default();
+
+    Ok(DerivedAccount {
+        index,
+        sapling_path: IMPORTED_PATH.to_owned(),
+        orchard_path: NO_ORCHARD.to_owned(),
+        transparent_receive_path: IMPORTED_PATH.to_owned(),
+        transparent_change_path: IMPORTED_PATH.to_owned(),
+        sapling_address: sapling_address.encode(&params),
+        unified_address,
+        // The same address in both slots: an imported wallet has no
+        // external/internal scope distinction, and leaving one blank would
+        // read as "we did not look there".
+        transparent_receive_address: transparent_encoded.clone(),
+        transparent_change_address: transparent_encoded,
+    })
+}
+
+/// Shown where an HD account would show a derivation path.
+const IMPORTED_PATH: &str = "imported (no derivation path)";
+/// A zcashd wallet predates Orchard, so an imported account never has one.
+const NO_ORCHARD: &str = "n/a (imported wallet has no Orchard key)";
 
 /// A transparent key recovered from a wallet file, resolved to the address
 /// it controls.

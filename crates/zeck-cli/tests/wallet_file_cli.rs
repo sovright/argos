@@ -77,22 +77,24 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     );
 }
 
-/// A seedless wallet with transparent keys is *scanned*, not refused.
+/// A seedless wallet is *scanned*, not refused.
 ///
-/// This previously asserted a refusal, which was correct when transparent
-/// recovery did not exist: scanning such a wallet through the HD path would
-/// have walked zero accounts and reported "no funds" for a wallet that may
-/// hold real money. That danger has not gone away — it has moved. The
-/// requirement is unchanged and the mechanism is new: the scan must either
-/// refuse, or report real transparent numbers *and* name every pool it did
-/// not cover. What it must never do is report an empty wallet with no
-/// caveat.
+/// This has now been re-pointed twice, and the reason is worth recording.
+/// It first asserted an outright refusal, which was correct when neither
+/// recovery path existed: scanning through the HD path would have walked
+/// zero accounts and reported "no funds" for a wallet that may hold real
+/// money. It then asserted the transparent-only path. It now asserts the
+/// imported-account path, because a wallet with Sapling keys can be given
+/// a wallet-database account that carries its transparent keys too.
 ///
-/// Uses an unroutable endpoint so this stays offline; the transparent-only
-/// banner is printed before any network call, and it is emitted on no other
-/// code path, so seeing it proves which branch was taken.
+/// The requirement has never changed: a seedless wallet must never be
+/// reported as empty without saying what was not looked at. Only the
+/// mechanism keeps improving.
+///
+/// Uses an unroutable endpoint so this stays offline; the coverage banner
+/// is printed before any network call.
 #[test]
-fn a_seedless_wallet_with_transparent_keys_is_scanned_not_refused() {
+fn a_seedless_wallet_is_scanned_not_refused() {
     let path = fixture(SPROUT_PLAINTEXT);
     let out = argos(&[
         "--wallet-file",
@@ -107,12 +109,18 @@ fn a_seedless_wallet_with_transparent_keys_is_scanned_not_refused() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("TRANSPARENT FUNDS ONLY"),
-        "the transparent-only path must have been taken, got:\n{stderr}"
+        !stderr.contains("no recoverable seed phrase"),
+        "a wallet with importable keys must no longer be refused outright, got:\n{stderr}"
     );
     assert!(
-        !stderr.contains("no recoverable seed phrase"),
-        "a wallet with transparent keys must no longer be refused outright, got:\n{stderr}"
+        !stderr.contains("no HD accounts to scan"),
+        "the HD-only refusal must not fire for an importable wallet, got:\n{stderr}"
+    );
+    // It got as far as the network, which is the only thing that should
+    // stop it here.
+    assert!(
+        stderr.contains("lightwalletd") || stderr.contains("probe"),
+        "expected the scan to reach the network and fail there, got:\n{stderr}"
     );
 }
 
@@ -151,18 +159,17 @@ fn a_file_that_is_not_a_wallet_is_rejected_by_name() {
     );
 }
 
-/// A zcashd wallet that also holds Sapling keys is only *partly* covered by
-/// transparent-only recovery. The user must be told that unmissably: a
-/// balance reported without that caveat is an active lie about where their
-/// money is.
+/// Sprout is the one pool nothing covers, and the user must be told.
 ///
-/// Runs offline — the warning is printed before any network call, so this
-/// asserts it without needing a chain.
+/// The stronger half of this test is the negative: Sapling must *not* be
+/// listed as uncovered. A zcashd wallet's Sapling keys are registered as a
+/// wallet-database account and scanned alongside its transparent keys, so
+/// listing Sapling here would mean the routing regressed to the
+/// transparent-only path and Sapling funds had silently stopped being
+/// scanned.
 #[test]
-fn a_wallet_with_shielded_keys_warns_that_they_are_not_covered() {
+fn a_wallet_with_sprout_keys_says_sprout_is_not_covered() {
     let path = fixture(SPROUT_PLAINTEXT);
-    // Point at an unroutable endpoint: the scan will fail, but the warning
-    // is emitted first and that is what is under test.
     let out = argos(&[
         "--wallet-file",
         path.to_str().expect("fixture path is UTF-8"),
@@ -176,16 +183,21 @@ fn a_wallet_with_shielded_keys_warns_that_they_are_not_covered() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("TRANSPARENT FUNDS ONLY"),
-        "the transparent-only caveat must be unmissable, got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Sapling key(s) in this wallet are NOT scanned"),
-        "it must name the pool being skipped, got:\n{stderr}"
+        stderr.contains("SPROUT FUNDS ARE NOT COVERED"),
+        "the Sprout caveat must be unmissable, got:\n{stderr}"
     );
     assert!(
         stderr.contains("Sprout key(s) in this wallet are NOT scanned"),
-        "the fixture has a Sprout key too; it must be named, got:\n{stderr}"
+        "it must name the pool and its key count, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Sapling key(s) in this wallet are NOT scanned"),
+        "Sapling is scanned via the imported account path; listing it as uncovered means \
+         the routing regressed to transparent-only, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Keep the original wallet file"),
+        "the user must be told not to discard the only copy of those keys, got:\n{stderr}"
     );
 }
 

@@ -55,6 +55,16 @@ pub trait KeySource: Send + Sync {
     /// Short human-readable description for logs and the resume UI.
     /// Must never contain secret material.
     fn describe(&self) -> String;
+
+    /// The raw imported key set, when this source came from a wallet file.
+    ///
+    /// The scanner needs the individual keys — not just a seed — to
+    /// register imported accounts, and a seed-derived source has none.
+    /// Defaults to `None` so a new `KeySource` implementation is treated
+    /// as seed-like unless it says otherwise.
+    fn imported_keys(&self) -> Option<&ImportedKeys> {
+        None
+    }
 }
 
 /// Today's behaviour: keys derived from a BIP-39 mnemonic.
@@ -184,6 +194,10 @@ impl KeySource for ImportedKeySource {
         // fingerprint, which `SeedKeySource::workspace_path_component`
         // returns unprefixed.
         Ok(format!("imported-{}", self.fingerprint()?.to_hex()))
+    }
+
+    fn imported_keys(&self) -> Option<&ImportedKeys> {
+        Some(&self.keys)
     }
 
     fn describe(&self) -> String {

@@ -263,29 +263,47 @@ async fn run_transparent_sweep(
     Ok(())
 }
 
-/// Whether this wallet must go down the transparent-only path: keys we can
-/// use, but no HD seed to build accounts from.
+/// Whether this wallet must go down the transparent-only path.
+///
+/// Only when it has *no* Sapling keys. A wallet with Sapling keys can be
+/// given a wallet-database account, and that account carries the
+/// transparent keys as standalone receivers — so the shielded scan covers
+/// both pools in one pass. Routing such a wallet here instead would report
+/// its transparent balance while silently ignoring its Sapling notes.
 fn is_transparent_only(keys: &ImportedKeys) -> bool {
-    keys.mnemonic.is_none() && !keys.transparent.is_empty()
+    keys.mnemonic.is_none() && keys.sapling.is_empty() && !keys.transparent.is_empty()
 }
 
-/// Warn — unmissably — when a transparent-only recovery is leaving other
-/// pools behind.
+/// Warn — unmissably — about every pool this recovery will not cover.
 ///
-/// This is the project's partial-recovery rule applied to a whole pool:
+/// This is the project's partial-recovery rule applied to whole pools:
 /// covering what we can must never imply we covered everything. A user who
-/// reads "0.5 ZEC recovered" without knowing their Sapling notes were never
-/// looked at has been actively misled about where their money is.
-fn warn_about_uncovered_pools(keys: &ImportedKeys) {
-    if keys.sapling.is_empty() && keys.sprout.is_empty() {
+/// reads "0.5 ZEC recovered" without knowing a pool was never looked at has
+/// been actively misled about where their money is — and may discard the
+/// wallet file holding the only copy of those keys.
+///
+/// `covers_shielded` distinguishes the two import paths: the transparent-only
+/// path reaches exactly one pool, while the imported-account path scans
+/// Sapling and transparent together and leaves only Sprout behind.
+fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
+    let uncovered_sapling = if covers_shielded {
+        0
+    } else {
+        keys.sapling.len()
+    };
+    if uncovered_sapling == 0 && keys.sprout.is_empty() {
         return;
     }
+
     eprintln!();
-    eprintln!("  ⚠ THIS COVERS TRANSPARENT FUNDS ONLY");
-    if !keys.sapling.is_empty() {
+    if covers_shielded {
+        eprintln!("  ⚠ SPROUT FUNDS ARE NOT COVERED");
+    } else {
+        eprintln!("  ⚠ THIS COVERS TRANSPARENT FUNDS ONLY");
+    }
+    if uncovered_sapling > 0 {
         eprintln!(
-            "    {} Sapling key(s) in this wallet are NOT scanned or swept here.",
-            keys.sapling.len()
+            "    {uncovered_sapling} Sapling key(s) in this wallet are NOT scanned or swept here."
         );
     }
     if !keys.sprout.is_empty() {
@@ -409,12 +427,25 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     }
 }
 
+/// Resolve the birthday height for a scan.
+///
+/// `seed_phrase` is `None` for a wallet file with no recoverable mnemonic.
+/// Only auto-detection needs one — it probes on-chain history for
+/// HD-derived addresses — so the other two routes stay available to an
+/// imported wallet rather than blocking it on a seed it does not have.
 async fn resolve_birthday(
     cli: &Cli,
-    seed_phrase: &SecretString,
+    seed_phrase: Option<&SecretString>,
     network: ZeckNetwork,
 ) -> Result<u32> {
     if cli.birthday_auto_detect {
+        let seed_phrase = seed_phrase.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--birthday-auto-detect probes on-chain history for HD-derived addresses, \
+                 which a wallet file without a recoverable seed phrase does not have. \
+                 Pass --birthday <height> or --birthday-date <YYYY-MM-DD> instead."
+            )
+        })?;
         eprintln!("Auto-detecting wallet birthday from on-chain history…");
         let result = detect_birthday(seed_phrase, network, &cli.lightwalletd_url, |msg| {
             eprintln!("  {msg}")
@@ -499,7 +530,7 @@ async fn main() -> Result<()> {
         if is_transparent_only(keys) {
             match &cli.command {
                 Commands::Scan => {
-                    warn_about_uncovered_pools(keys);
+                    warn_about_uncovered_pools(keys, false);
                     let resolved = imported_transparent_keys(keys)?;
                     let report =
                         scan_transparent_only(&resolved, network, &cli.lightwalletd_url).await?;
@@ -513,7 +544,7 @@ async fn main() -> Result<()> {
                     confirm_sweep,
                     ..
                 } => {
-                    warn_about_uncovered_pools(keys);
+                    warn_about_uncovered_pools(keys, false);
                     let resolved = imported_transparent_keys(keys)?;
                     return run_transparent_sweep(
                         &resolved,
@@ -528,18 +559,18 @@ async fn main() -> Result<()> {
                 }
                 _ => {}
             }
+        } else if keys.mnemonic.is_none()
+            && matches!(cli.command, Commands::Scan | Commands::Sweep { .. })
+        {
+            // Imported-account path: Sapling and transparent are scanned
+            // together, so only Sprout is left uncovered — but it still
+            // must be said before any balance appears.
+            warn_about_uncovered_pools(keys, true);
         }
     }
 
     let birthday = if command_uses_birthday_inputs(&cli.command) {
-        let phrase = seed_phrase.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} has no recoverable seed phrase, so there are no HD accounts to scan. \
-                 Use `argos inspect-wallet --wallet-file <path>` to see what was recovered.",
-                key_source.describe()
-            )
-        })?;
-        Some(resolve_birthday(&cli, phrase, network).await?)
+        Some(resolve_birthday(&cli, seed_phrase.as_ref(), network).await?)
     } else {
         None
     };

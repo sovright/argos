@@ -398,19 +398,34 @@ async fn run_recovery_scan_inner(
         ));
     }
 
-    // Every account slot this scanner walks is HD-derived, so a key source
-    // with no seed (a zcashd flat-key `wallet.dat`) has nothing for it to
-    // enumerate. Refuse explicitly rather than silently scanning zero
-    // accounts and reporting "no funds found", which is the failure mode a
-    // recovery user would most easily mistake for an answer.
-    let seed = config.key_source.wallet_seed()?.ok_or_else(|| {
-        ZeckError::InvalidConfig(format!(
-            "{} holds standalone keys with no HD seed. Argos can extract those keys but \
-             cannot yet scan or spend them; only wallets with a recoverable seed phrase \
-             can be scanned.",
-            config.key_source.describe()
-        ))
-    })?;
+    // Every account slot the HD scanner walks is derived from a seed. A
+    // key source without one is scanned by `run_imported_scan` instead,
+    // which registers the wallet file's own keys as accounts.
+    //
+    // A source with neither a seed nor importable keys is refused rather
+    // than scanned as zero accounts: a successful-but-empty scan is the
+    // failure mode a user recovering real funds would most easily mistake
+    // for an answer.
+    let seed = match config.key_source.wallet_seed()? {
+        Some(seed) => seed,
+        None => {
+            let keys = config.key_source.imported_keys().ok_or_else(|| {
+                ZeckError::InvalidConfig(format!(
+                    "{} has no HD seed and no importable keys, so there is nothing to scan.",
+                    config.key_source.describe()
+                ))
+            })?;
+            if keys.sapling.is_empty() {
+                return Err(ZeckError::InvalidConfig(format!(
+                    "{} has no Sapling keys and no HD seed, so it cannot be given a wallet \
+                     account (ZIP 316 forbids a transparent-only unified viewing key). Its \
+                     transparent funds are recoverable through the transparent-only path.",
+                    config.key_source.describe()
+                )));
+            }
+            return run_imported_scan(state, &config, keys).await;
+        }
+    };
     let workspace = RecoveryWorkspace::from_runtime(&config)?;
     workspace.initialize(config.network, &seed)?;
     let transparent_account = legacy_transparent_account_key_from_seed(config.network, &seed)?;
@@ -627,6 +642,18 @@ async fn run_recovery_scan_inner(
         target_accounts = new_target;
     }
 
+    finish_scan(&state, &workspace).await
+}
+
+/// Publish the terminal state of a completed scan.
+///
+/// Shared by the HD and imported paths so the two cannot drift on what a
+/// finished scan looks like — the summary, the total, and the sidecar flip
+/// that stops the resume list from re-offering this workspace.
+async fn finish_scan(
+    state: &SharedScanTaskState,
+    workspace: &RecoveryWorkspace,
+) -> ZeckResult<()> {
     let (workspace_dir, total_zatoshis) = {
         let guard = state.lock().await;
         let total = guard
@@ -751,6 +778,238 @@ fn build_account_preview(account: &DerivedAccount) -> AccountBalancePreview {
         has_activity: false,
         status: "Derived locally. Waiting for wallet workspace sync.".to_owned(),
     }
+}
+
+/// Scan a wallet file whose keys have no HD seed behind them.
+///
+/// Deliberately not the HD loop: there are no account slots to enumerate
+/// and no gap to extend. The key set is fixed and fully known the moment
+/// the file is parsed, so every account is registered once and the chain
+/// is scanned once.
+///
+/// Transparent keys are covered here too, without a second pass: they are
+/// attached to the first account as standalone receivers, so
+/// `zcash_client_sqlite` scans them alongside the shielded notes.
+async fn run_imported_scan(
+    state: SharedScanTaskState,
+    config: &RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+) -> ZeckResult<()> {
+    use crate::imported::{
+        imported_account_display, imported_transparent_keys, register_imported_accounts,
+    };
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::DerivingKeys;
+        guard.progress.message = Some(format!(
+            "Preparing {} imported Sapling account(s) and {} transparent key(s).",
+            keys.sapling.len(),
+            keys.transparent.len()
+        ));
+    }
+
+    let workspace = RecoveryWorkspace::from_runtime(config)?;
+    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
+    {
+        let mut guard = state.lock().await;
+        guard.workspace = Some(workspace.clone());
+    }
+
+    let session_label = if config.label.trim().is_empty() {
+        "(unlabeled scan)".to_owned()
+    } else {
+        config.label.clone()
+    };
+    if let Err(err) = write_session_metadata(
+        workspace.root(),
+        &SessionMetadata::new_in_progress(
+            session_label.clone(),
+            config.network,
+            config.birthday,
+            None,
+            now_epoch_seconds(),
+        ),
+    ) {
+        warn!("failed to write initial session sidecar (continuing): {err}");
+    }
+
+    let network = consensus_network(config.network);
+    let configured_endpoints = describe_lightwalletd_endpoints(&config.lightwalletd_url);
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ProbingLightwalletd;
+        guard.progress.message =
+            Some(format!("Connecting to {configured_endpoints} and checking chain metadata."));
+    }
+
+    let _ = default_provider().install_default();
+    let (mut client, endpoint, response) =
+        probe_valid_lightwalletd_endpoints(&config.lightwalletd_url, config.network).await?;
+    let chain_tip_height = u32::try_from(response.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    let probe: LightwalletdProbe = build_probe(endpoint, &response);
+    let sapling_floor = u32::try_from(response.sapling_activation_height)
+        .unwrap_or(419_201)
+        .saturating_add(1);
+    let effective_birthday = config.birthday.max(sapling_floor).min(chain_tip_height);
+    let birthday_treestate = client
+        .get_tree_state(BlockId {
+            height: u64::from(effective_birthday.saturating_sub(1)),
+            hash: vec![],
+        })
+        .await
+        .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+        .into_inner();
+    let account_birthday = AccountBirthday::from_treestate(
+        birthday_treestate,
+        Some(BlockHeight::from_u32(chain_tip_height)),
+    )
+    .map_err(|_| ZeckError::Wallet("constructing account birthday from treestate".to_owned()))?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.server = Some(probe);
+        guard.progress.blocks_total = block_delta(chain_tip_height, effective_birthday);
+    }
+    if let Err(err) = write_session_metadata(
+        workspace.root(),
+        &SessionMetadata::new_in_progress(
+            session_label,
+            config.network,
+            config.birthday,
+            Some(chain_tip_height),
+            now_epoch_seconds(),
+        ),
+    ) {
+        warn!("failed to update session sidecar with target height (continuing): {err}");
+    }
+
+    check_cancelled(&state).await?;
+
+    // Register accounts, then describe them for the progress UI. Both are
+    // driven off the same returned list, so what is scanned and what is
+    // displayed cannot disagree.
+    let registered = {
+        let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), network)?;
+        register_imported_accounts(&mut wallet_db, keys, &account_birthday)?
+    };
+    let resolved_transparent = imported_transparent_keys(keys)?;
+
+    let mut displays = Vec::with_capacity(registered.len());
+    let mut tracked = Vec::with_capacity(registered.len());
+    for (position, account) in registered.iter().enumerate() {
+        let index = u32::try_from(position)
+            .map_err(|_| ZeckError::Internal("imported account index overflowed u32".to_owned()))?;
+        let Some(extsk) = account.sapling_extsk.as_ref() else {
+            continue;
+        };
+        let display = imported_account_display(
+            index,
+            extsk,
+            account.transparent_addresses.first(),
+            config.network,
+        )?;
+        displays.push(display.clone());
+        tracked.push(TrackedAccount {
+            wallet_account_id: account.wallet_account_id,
+            derived: display,
+            transparent_receivers: account.transparent_addresses.clone(),
+        });
+    }
+
+    initialize_accounts(&state, &displays).await;
+    {
+        let mut guard = state.lock().await;
+        guard.tracked_accounts.extend(tracked);
+    }
+
+    // Fast transparent answer before the shielded sync, exactly as the HD
+    // path does — an imported wallet's transparent balance should not wait
+    // on a full chain scan.
+    if !resolved_transparent.is_empty() {
+        if let Err(err) =
+            run_imported_transparent_probe(&state, &mut client, &resolved_transparent, config)
+                .await
+        {
+            warn!("transparent quick probe failed (continuing with shielded scan): {err}");
+        }
+    }
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningShielded;
+        guard.progress.message = Some(format!(
+            "Syncing compact blocks for {} imported account(s).",
+            displays.len()
+        ));
+    }
+
+    let poller = ProgressPoller::start(
+        workspace.clone(),
+        config.network,
+        state.clone(),
+        effective_birthday,
+    );
+    let sync_result = run_wallet_sync_with_retry(
+        &workspace,
+        &network,
+        config.network,
+        &mut client,
+        &config.lightwalletd_url,
+        &state,
+    )
+    .await;
+    poller.stop().await;
+    sync_result?;
+    refresh_scan_progress(&state, &workspace, config.network, effective_birthday).await?;
+
+    finish_scan(&state, &workspace).await
+}
+
+/// Preliminary transparent balances for an imported wallet.
+///
+/// Separate from `run_transparent_quick_probe`, which keys results by HD
+/// account index. Every imported transparent key hangs off account 0, so
+/// this folds the whole set into that one account.
+async fn run_imported_transparent_probe(
+    state: &SharedScanTaskState,
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    keys: &[crate::imported::ImportedTransparentKey],
+    config: &RuntimeScanConfig,
+) -> ZeckResult<()> {
+    use crate::transparent_recovery::fetch_transparent_utxos;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningTransparent;
+        guard.progress.message = Some(format!(
+            "Quick-checking {} imported transparent address(es)…",
+            keys.len()
+        ));
+    }
+
+    let utxos = fetch_transparent_utxos(client, keys, config.network).await?;
+    if utxos.is_empty() {
+        return Ok(());
+    }
+
+    let total = utxos
+        .iter()
+        .fold(0u64, |acc, u| acc.saturating_add(u64::from(u.txout.value())));
+    let count = u32::try_from(utxos.len()).unwrap_or(u32::MAX);
+
+    let mut guard = state.lock().await;
+    if let Some(account) = guard.progress.accounts.first_mut() {
+        account.transparent_zatoshis = total;
+        account.transparent_utxo_count = count;
+        account.total_zatoshis = account
+            .total_zatoshis
+            .max(total.saturating_add(account.sapling_zatoshis))
+            .max(total);
+        account.has_activity = account.has_activity || total > 0;
+    }
+    Ok(())
 }
 
 async fn import_accounts(
