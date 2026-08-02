@@ -44,12 +44,19 @@ lists Sprout addresses, and names every record it could not read.
 | Wallet | Scan and sweep? |
 |---|---|
 | ZecWallet Lite | **Yes.** Decryption recovers the BIP-39 mnemonic, so the wallet re-enters the normal HD recovery path. Add `--wallet-file` to `scan` or `sweep`. |
-| zcashd `wallet.dat` | **Not yet.** Keys are stored individually with no HD seed behind them, and Argos has no standalone-key scan or spend path. `inspect-wallet` works; `scan` refuses. |
+| zcashd `wallet.dat` | **Transparent funds: yes.** Transparent keys are scanned and can be swept into a shielded output without any HD seed. **Sapling: not yet** — the keys are recovered and reported, but not scanned or spent. **Sprout: identified only.** A wallet holding shielded keys prints an explicit warning naming each pool the sweep does not cover. |
 
-That refusal is deliberate. Argos will not scan a zcashd wallet, find
-nothing because it had no accounts to look at, and report an empty result
-— which is indistinguishable from "your funds are gone" to the person who
-most needs the answer.
+Partial coverage is always stated, never implied away. Argos will not
+report a balance that silently excludes a pool it never looked at — "0.5
+ZEC recovered" reads as complete to the person who most needs the answer,
+so every uncovered pool is named, with a reminder to keep the original
+wallet file.
+
+Transparent recovery does not use the wallet-database account model at
+all. That model exists to serve shielded scanning; transparent funds need
+only `GetAddressUtxos` and the transaction builder. This matters because a
+transparent-only wallet *cannot* have an account: ZIP-316 forbids a
+unified viewing key containing only transparent items.
 
 ## Security audit
 

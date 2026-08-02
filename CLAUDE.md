@@ -81,13 +81,36 @@ and `start_scan` is a seed-phrase wrapper over it.
 recovers a BIP-39 mnemonic, so it re-enters the ordinary HD pipeline and
 scans and sweeps exactly like a typed seed phrase. A zcashd `wallet.dat`
 holds flat, individually-stored keys with no HD seed; the scanner
-enumerates HD-derived account slots, so it has nothing to walk. That case
-is **refused explicitly** rather than scanning zero accounts — a
-successful-but-empty scan is the failure mode a user recovering real funds
-would most easily mistake for an answer. Making those keys spendable needs
-a standalone-key scan/spend path that does not exist yet; a standalone
-Sapling `extsk` in particular cannot form a `UnifiedSpendingKey`, which is
-what `SpendingKeys` requires.
+enumerates HD-derived account slots, so it has nothing to walk.
+
+**Transparent keys are handled outside that model entirely**
+(`crates/zeck-core/src/transparent_recovery.rs`): `GetAddressUtxos` plus a
+directly-driven `zcash_primitives` builder, no account and no wallet
+database. Proven end to end against a real node by
+`transparent_only_wallet_sweeps_to_a_shielded_destination` in
+`crates/zeck-core/tests/regtest_integration.rs`. A transparent-only wallet
+*cannot* have an account — ZIP-316 forbids a transparent-only unified
+container (zcash/librustzcash#2582) — which is why bypassing the model is
+the fix rather than a shortcut.
+
+**Sapling import is registered but not yet wired.**
+`imported::register_imported_accounts` creates accounts via
+`import_account_ufvk` with `AccountPurpose::Spending { derivation: None }`
+and is tested against a seedless wallet DB, but no scan path calls it, so
+imported Sapling funds are still invisible. A wallet holding Sapling or
+Sprout keys therefore prints an explicit uncovered-pool warning.
+
+Spending imported Sapling does **not** need an upstream change: PCZT is
+account-id driven and `Signer::sign_sapling` takes a raw `ask`. Only the
+convenience API (`SpendingKeys` / `create_proposed_transactions`) cannot
+express it, because it resolves the account from a `UnifiedSpendingKey`'s
+UFVK and takes Sapling authority solely from that key.
+
+Two fee traps, both caught by tests rather than reasoning: a Sapling
+bundle pads outputs to `MIN_SHIELDED_OUTPUTS`, so one output is billed as
+two — always ask `BundleType::num_outputs` rather than assuming; and
+`encode_transparent_address` must go through `consensus_network`, or it
+emits testnet-prefixed addresses under regtest.
 
 CLI: `--wallet-file <PATH>` (conflicts with `--seed-file`) plus an
 `inspect-wallet` subcommand that reports recovered key counts, Sprout
