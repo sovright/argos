@@ -115,6 +115,47 @@ ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
     --blocks "$FUND_BLOCKS" \
     || die "funding failed"
 
+# ── Fund the imported-wallet tests ─────────────────────────────────────────
+#
+# These spend from the golden wallet.dat fixture, so they need that exact
+# file's addresses funded — no other address leaves them anything to find.
+#
+# Funding MUST happen here, before the ZIP 212 mining below. The regtest
+# block subsidy halves every ~150 blocks and is worthless past about height
+# 6,000, while ZIP 212 enforcement does not begin until 32,257. Mining first
+# and funding afterwards produces coinbase worth nothing, which surfaces as
+# "a funded wallet must report a non-zero balance" — a funding failure that
+# reads like a scanning bug.
+log "funding the imported-wallet fixture addresses ..."
+FIXTURE_JSON="$("$FUNDER" --zebra-rpc-url "$ZEBRA_RPC_URL" --print-fixture-addresses)" \
+    || die "could not read the fixture addresses"
+FIXTURE_SAPLING="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"sapling":"\([^"]*\)".*/\1/')"
+FIXTURE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"transparent":"\([^"]*\)".*/\1/')"
+[ -n "$FIXTURE_SAPLING" ] || die "could not parse the fixture Sapling address"
+[ -n "$FIXTURE_TRANSPARENT" ] || die "could not parse the fixture transparent address"
+
+for addr in "$FIXTURE_SAPLING" "$FIXTURE_TRANSPARENT"; do
+    ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
+        --zebra-rpc-url "$ZEBRA_RPC_URL" \
+        --address "$addr" \
+        --blocks "$FUND_BLOCKS" \
+        || die "funding $addr failed"
+done
+
+# ── Mine past the ZIP 212 grace period ─────────────────────────────────────
+#
+# PCZT construction requires ZIP 212 to be fully enforced for outputs, which
+# only begins ZIP212_GRACE_PERIOD (32,256) blocks after Canopy activation.
+# Regtest activates Canopy at height 1, so nothing built through the PCZT
+# roles works below height 32,257 — see README.md.
+ZIP212_HEIGHT=32400
+log "mining to height $ZIP212_HEIGHT for ZIP 212 enforcement (needed by the PCZT tests) ..."
+while :; do
+    height="$(zrpc getblockcount | sed -e 's/.*"result":\([0-9]*\).*/\1/')"
+    [ "$height" -ge "$ZIP212_HEIGHT" ] && break
+    zrpc generate '[500]' >/dev/null 2>&1 || sleep 2
+done
+
 HEIGHT="$(zrpc getblockcount | sed -e 's/.*"result":\([0-9]*\).*/\1/')"
 readonly HEIGHT
 log "done — chain height $HEIGHT"

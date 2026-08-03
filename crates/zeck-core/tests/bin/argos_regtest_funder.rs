@@ -43,8 +43,10 @@
 //!     [--blocks <n>]           # coinbase blocks paid to the seed (default 4)
 //!     [--maturity-blocks <n>]  # blocks mined afterwards (default 100)
 //!     [--print-address-only]   # derive and print, mine nothing
-//!     [--t-addr <address>]     # fund this transparent address instead of
-//!                              # the seed's shielded one
+//!     [--address <addr>]       # fund this address instead of the seed's
+//!                              # shielded one (--t-addr is a legacy alias)
+//!     [--print-fixture-addresses]  # print the golden wallet fixture's
+//!                              # Sapling and transparent addresses, then exit
 //! ```
 //!
 //! ## Why `--t-addr` exists despite the section above
@@ -98,6 +100,9 @@ const DEFAULT_FUNDING_BLOCKS: u32 = 4;
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event<'a> {
     FundAddress { address: &'a str },
+    /// The golden wallet fixture's addresses, so setup.sh can fund the
+    /// imported-wallet tests without duplicating the derivation.
+    FixtureAddresses { sapling: String, transparent: String },
     Mined { blocks: u32, height: u64 },
     Funded { blocks_to_seed: u32, height: u64 },
 }
@@ -114,9 +119,55 @@ struct Args {
     blocks: u32,
     maturity_blocks: u32,
     print_address_only: bool,
-    /// When set, mine coinbase to this transparent address instead of the
-    /// seed's shielded one.
+    /// When set, mine coinbase to this address instead of the seed's
+    /// shielded one. Any address Zebra accepts as a miner address.
     t_addr: Option<String>,
+    /// Print the golden wallet fixture's addresses and exit.
+    print_fixture_addresses: bool,
+}
+
+/// Emit the golden wallet fixture's addresses.
+///
+/// They come from the fixture rather than being generated, because the
+/// imported-wallet tests import that exact file — funding any other
+/// address would leave them looking at an empty wallet.
+fn print_fixture_addresses() {
+    use argos_core::imported::{encode_transparent_address, imported_transparent_keys,
+        parse_sapling_extsk};
+    use secrecy::ExposeSecret;
+    use zcash_keys::encoding::AddressCodec;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+    );
+    let bytes = std::fs::read(path).expect("golden fixture must exist");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("golden fixture must import");
+
+    let extsk = parse_sapling_extsk(
+        keys.sapling
+            .first()
+            .expect("fixture must hold a Sapling key")
+            .extsk
+            .expose_secret(),
+    )
+    .expect("the fixture Sapling key must parse");
+    let (_, payment_address) = extsk.to_diversifiable_full_viewing_key().default_address();
+
+    let transparent = imported_transparent_keys(&keys).expect("transparent keys must resolve");
+    let params = consensus_network(ZeckNetwork::Testnet);
+
+    emit(&Event::FixtureAddresses {
+        sapling: payment_address.encode(&params),
+        transparent: encode_transparent_address(
+            &transparent
+                .first()
+                .expect("fixture must hold a transparent key")
+                .address,
+            ZeckNetwork::Testnet,
+        ),
+    });
 }
 
 fn parse_args() -> Args {
@@ -125,6 +176,7 @@ fn parse_args() -> Args {
     let mut maturity_blocks = COINBASE_MATURITY;
     let mut print_address_only = false;
     let mut t_addr = None;
+    let mut print_fixture_addresses = false;
 
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -139,7 +191,8 @@ fn parse_args() -> Args {
                 maturity_blocks = value().parse().expect("--maturity-blocks must be a u32")
             }
             "--print-address-only" => print_address_only = true,
-            "--t-addr" => t_addr = Some(value()),
+            "--address" | "--t-addr" => t_addr = Some(value()),
+            "--print-fixture-addresses" => print_fixture_addresses = true,
             other => panic!("unrecognized argument {other}"),
         }
     }
@@ -150,6 +203,7 @@ fn parse_args() -> Args {
         maturity_blocks,
         print_address_only,
         t_addr,
+        print_fixture_addresses,
     }
 }
 
@@ -241,16 +295,24 @@ fn regtest_encoded_sapling_address(seed: &SecretString) -> String {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = parse_args();
-    let seed = SecretString::new(
-        std::env::var("ARGOS_REGTEST_FUND_SEED")
-            .expect("ARGOS_REGTEST_FUND_SEED must be set to the mnemonic to fund"),
-    );
+    // Printing fixture addresses needs no seed — it reads the golden
+    // wallet file — so it must not be gated behind the seed requirement.
+    let seed_env = std::env::var("ARGOS_REGTEST_FUND_SEED");
 
     // Must precede any address encoding: `consensus_network` only reports
     // regtest once these are installed, and without them the derived address
     // carries the testnet HRP that Zebra rejects.
     set_regtest_consensus_params(regtest_local_network())
         .expect("installing regtest consensus parameters");
+
+    if args.print_fixture_addresses {
+        print_fixture_addresses();
+        return ExitCode::SUCCESS;
+    }
+
+    let seed = SecretString::new(
+        seed_env.expect("ARGOS_REGTEST_FUND_SEED must be set to the mnemonic to fund"),
+    );
 
     // `--t-addr` is taken verbatim: it comes from a test that derived it
     // from a raw key under regtest parameters, so re-encoding it here would
