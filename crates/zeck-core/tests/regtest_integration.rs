@@ -2923,6 +2923,20 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
 
     // Fund it with shielded coinbase, then mine past maturity. Under ZIP 213
     // a coinbase paid to a shielded address is an ordinary note.
+    //
+    // The birthday is taken from just before funding rather than from
+    // height 1. This chain must be tens of thousands of blocks tall for
+    // PCZT's ZIP 212 requirement (see tests/regtest/README.md), so scanning
+    // from genesis would make this test's runtime a function of how long
+    // the harness has been mining rather than of the work under test.
+    let birthday = u32::try_from(
+        zebra_rpc("getblockcount", serde_json::json!([]))
+            .await
+            .as_u64()
+            .expect("getblockcount returns a number"),
+    )
+    .expect("height fits u32");
+
     let (_, payment_address) = extsk.to_diversifiable_full_viewing_key().default_address();
     let encoded = payment_address.encode(&params);
     zebra_rpc("generatetoaddress", serde_json::json!([1, encoded])).await;
@@ -2993,7 +3007,7 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
         use zcash_client_backend::data_api::AccountBirthday;
         AccountBirthday::from_parts(
             ChainState::empty(
-                zcash_protocol::consensus::BlockHeight::from_u32(1),
+                zcash_protocol::consensus::BlockHeight::from_u32(birthday),
                 zcash_primitives::block::BlockHash([0u8; 32]),
             ),
             None,
