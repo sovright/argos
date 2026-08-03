@@ -11,8 +11,8 @@ use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
     validate_destination_address, validate_mnemonic_words, verify_seed_for_workspace,
-    BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle,
-    SweepOutcome, SweepProposal, SweepRequest, ZeckNetwork,
+    BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle, SweepOutcome,
+    SweepProposal, SweepRequest, ZeckNetwork,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,154 @@ pub async fn validate_address(
     network: ZeckNetwork,
 ) -> Result<argos_core::AddressInfo, String> {
     validate_destination_address(&address, network).map_err(|err| err.to_string())
+}
+
+/// What Argos found in a legacy wallet file, with nothing secret in it.
+///
+/// Deliberately counts rather than keys: this crosses the IPC boundary to
+/// the webview, and the frontend has no use for key material. Mirrors what
+/// `argos inspect-wallet` prints.
+#[derive(Serialize)]
+pub struct WalletFileSummary {
+    pub path: String,
+    pub transparent_keys: usize,
+    pub sapling_keys: usize,
+    pub sprout_keys: usize,
+    /// Sprout addresses, which are public and are the only way a user can
+    /// tell which funds Argos can identify but not yet move.
+    pub sprout_addresses: Vec<String>,
+    /// True when the file yielded a BIP-39 mnemonic, which means it re-enters
+    /// the ordinary HD pipeline and scans and sweeps like a typed seed.
+    pub has_mnemonic: bool,
+    /// True when the file has no Sapling keys, so recovery goes down the
+    /// transparent-only path (ZIP-316 gives it no UFVK to anchor an account).
+    pub transparent_only: bool,
+    /// Records the parser could not read. Surfaced because a wallet that
+    /// silently drops records looks identical to one that had nothing.
+    pub diagnostics: Vec<String>,
+    /// True when the file is encrypted and the supplied passphrase (or its
+    /// absence) could not open it.
+    pub needs_passphrase: bool,
+}
+
+/// Read a legacy wallet file and report what is in it. No network, and
+/// nothing is written anywhere.
+///
+/// The passphrase crosses the IPC boundary as a `SecretString`, the same
+/// treatment the seed phrase gets (audit Issue A). That is a real exposure
+/// and is recorded in docs/THREAT_MODEL.md as T-S6: a compromised webview
+/// sees it. The CLI avoids the question entirely by prompting on a terminal;
+/// a GUI has no equivalent, so the choice is this or no GUI import at all.
+#[tauri::command]
+pub async fn inspect_wallet_file(
+    path: String,
+    passphrase: Option<SecretString>,
+) -> Result<WalletFileSummary, String> {
+    let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
+    let keys =
+        match argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref()) {
+            Ok(keys) => keys,
+            // An encrypted wallet with a missing or wrong passphrase is an
+            // ordinary user situation, not a failure to show raw. Matched on the
+            // typed variant rather than the message text, so rewording the error
+            // cannot silently turn "ask for the passphrase" into "give up".
+            Err(argos_core::argos_wallet_import::ImportError::WrongPassphrase) => {
+                return Ok(WalletFileSummary {
+                    path,
+                    transparent_keys: 0,
+                    sapling_keys: 0,
+                    sprout_keys: 0,
+                    sprout_addresses: Vec::new(),
+                    has_mnemonic: false,
+                    transparent_only: false,
+                    diagnostics: Vec::new(),
+                    needs_passphrase: true,
+                });
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+
+    Ok(WalletFileSummary {
+        path,
+        transparent_keys: keys.transparent.len(),
+        sapling_keys: keys.sapling.len(),
+        sprout_keys: keys.sprout.len(),
+        // Hex, matching `argos inspect-wallet`. A Sprout address is 64 raw
+        // bytes with no text encoding of its own, and showing it is what
+        // lets a user look their own funds up independently.
+        sprout_addresses: keys
+            .sprout
+            .iter()
+            .map(|k| k.address.iter().map(|b| format!("{b:02x}")).collect())
+            .collect(),
+        has_mnemonic: keys.mnemonic.is_some(),
+        transparent_only: keys.sapling.is_empty() && !keys.transparent.is_empty(),
+        diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
+        needs_passphrase: false,
+    })
+}
+
+// No `Debug`/`Serialize`/`Clone`, for the same reason as `ScanConfigInput`:
+// this carries a wallet passphrase.
+#[derive(Deserialize)]
+pub struct WalletFileScanInput {
+    pub path: String,
+    pub passphrase: Option<SecretString>,
+    pub birthday: u32,
+    pub num_accounts: Option<u32>,
+    pub gap_limit: u32,
+    pub lightwalletd_url: String,
+    pub data_dir: String,
+    pub network: ZeckNetwork,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Scan a legacy wallet file's keys.
+///
+/// Routing lives in the core service, not here: a wallet that yields a
+/// mnemonic goes down the ordinary HD path, and one that does not is scanned
+/// as imported accounts. The GUI only has to hand over the key source, which
+/// is why this is a thin wrapper over `start_scan_from_key_source`.
+#[tauri::command]
+pub async fn start_scan_from_wallet_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: WalletFileScanInput,
+) -> Result<ScanHandle, String> {
+    use std::sync::Arc;
+
+    ensure_tos_accepted(&app)?;
+
+    let bytes =
+        fs::read(&config.path).map_err(|err| format!("could not read {}: {err}", config.path))?;
+    let keys =
+        argos_core::argos_wallet_import::import_wallet_file(&bytes, config.passphrase.as_ref())
+            .map_err(|err| err.to_string())?;
+
+    let key_source: Arc<dyn argos_core::KeySource> =
+        Arc::new(argos_core::ImportedKeySource::new(keys));
+
+    let handle = state
+        .service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: config.birthday,
+                num_accounts: config.num_accounts,
+                gap_limit: config.gap_limit,
+                lightwalletd_url: config.lightwalletd_url,
+                data_dir: PathBuf::from(config.data_dir),
+                network: config.network,
+                label: config.label.unwrap_or_default(),
+            },
+            key_source,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+
+    spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
+
+    Ok(handle)
 }
 
 #[tauri::command]
@@ -945,7 +1093,10 @@ mod tests {
         super::write_private_report(&path, b"fresh").expect("write report");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "a reused report file must be re-tightened to 0o600");
+        assert_eq!(
+            mode, 0o600,
+            "a reused report file must be re-tightened to 0o600"
+        );
         assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -958,8 +1109,12 @@ mod tests {
             assert!(is_allowed_external_url(url), "{url} should be allowed");
         }
         // Exfiltration and look-alike attempts are rejected (exact match, not prefix/substring).
-        assert!(!is_allowed_external_url("https://evil.example/?s=secret-seed"));
-        assert!(!is_allowed_external_url("https://sovright.com.evil.example/"));
+        assert!(!is_allowed_external_url(
+            "https://evil.example/?s=secret-seed"
+        ));
+        assert!(!is_allowed_external_url(
+            "https://sovright.com.evil.example/"
+        ));
         assert!(!is_allowed_external_url("https://sovright.com/extra"));
         assert!(!is_allowed_external_url("file:///etc/passwd"));
         assert!(!is_allowed_external_url("javascript:alert(1)"));
@@ -971,11 +1126,9 @@ mod tests {
     // D). This catches a maintainer adding a link without updating the allowlist.
     #[test]
     fn every_html_external_link_is_allowlisted() {
-        let html = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../src/index.html"
-        ))
-        .expect("read index.html");
+        let html =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/index.html"))
+                .expect("read index.html");
         for (idx, _) in html.match_indices("href=\"") {
             let rest = &html[idx + 6..];
             let end = rest.find('"').expect("closing quote");

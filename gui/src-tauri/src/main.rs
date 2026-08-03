@@ -2,9 +2,9 @@
 
 mod commands;
 
+use argos_core::RecoveryService;
 use commands::AppState;
 use tauri::Manager;
-use argos_core::RecoveryService;
 
 fn main() {
     // Surface argos-core diagnostics to stderr (visible in `npm run dev`).
@@ -26,6 +26,8 @@ fn main() {
             commands::validate_seed,
             commands::validate_address,
             commands::start_scan,
+            commands::inspect_wallet_file,
+            commands::start_scan_from_wallet_file,
             commands::get_scan_progress,
             commands::cancel_scan,
             commands::propose_sweep,

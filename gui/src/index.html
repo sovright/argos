@@ -236,9 +236,7 @@
           </div>
           <div class="actions">
             <button class="primary" data-next="seed">I have my 24-word seed phrase</button>
-            <a class="secondary-link" href="https://github.com/zingolabs/zexcavator" target="_blank"
-              >I have a .dat file</a
-            >
+            <button class="secondary" data-next="wallet-file">I have a wallet file</button>
           </div>
           <p class="audit-notice">Independently audited by <a href="https://leastauthority.com" target="_blank" rel="noopener">Least Authority</a>.</p>
 
@@ -249,6 +247,59 @@
               brand-new scan above.
             </p>
             <ul id="resume-sessions" class="session-list"></ul>
+          </div>
+        </section>
+
+        <section class="screen" data-step="wallet-file">
+          <p class="eyebrow">Step 2</p>
+          <h2>Open a wallet file</h2>
+          <p class="lead">
+            A zcashd <code>wallet.dat</code> or a ZecWallet Lite wallet. Argos only reads it — the
+            file is never modified, and nothing is sent anywhere.
+          </p>
+
+          <div id="wallet-drop" class="drop-zone">
+            <p><strong>Drag the wallet file here</strong></p>
+            <p class="muted">or paste its full path below</p>
+          </div>
+
+          <label class="field">
+            <span>Wallet file path</span>
+            <input id="wallet-path" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+
+          <label class="field" id="wallet-passphrase-field" hidden>
+            <span>Wallet passphrase</span>
+            <input id="wallet-passphrase" type="password" autocomplete="off" />
+            <small>
+              This wallet is encrypted. The passphrase is used to decrypt it in memory and is never
+              written to disk.
+            </small>
+          </label>
+
+          <div class="inline-actions">
+            <button class="ghost" id="wallet-open">Open wallet file</button>
+          </div>
+          <p id="wallet-status" class="status-line"></p>
+
+          <div id="wallet-summary" class="report-card" hidden>
+            <h3>What Argos found</h3>
+            <ul id="wallet-summary-list" class="session-list"></ul>
+            <div id="wallet-sprout-warning" class="guide-warning" hidden>
+              <strong>Sprout funds cannot be moved yet.</strong>
+              Argos can identify them, but sweeping Sprout is not implemented. Keep this wallet
+              file: those keys exist only there.
+            </div>
+            <div id="wallet-diagnostics" class="guide-warning" hidden>
+              <strong>Some records could not be read.</strong>
+              <ul id="wallet-diagnostics-list"></ul>
+              Any key material in those records still exists only in the original file.
+            </div>
+          </div>
+
+          <div class="actions split">
+            <button class="secondary" data-prev="welcome">Back</button>
+            <button class="primary" data-next="config" id="wallet-next" disabled>Continue</button>
           </div>
         </section>
 

@@ -539,6 +539,32 @@ button:disabled {
   overflow: auto;
 }
 
+/* Wallet-file drop target. Dashed rather than solid to read as "put
+   something here" instead of "this is a panel". */
+.drop-zone {
+  background: var(--panel-strong);
+  border: 2px dashed var(--line);
+  border-radius: 22px;
+  padding: 28px 18px;
+  text-align: center;
+  margin-bottom: 16px;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.drop-zone p {
+  margin: 4px 0;
+}
+
+.drop-zone .muted {
+  opacity: 0.7;
+  font-size: 0.9em;
+}
+
+.drop-zone.drop-active {
+  border-color: var(--accent);
+  background: var(--panel);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

@@ -231,8 +231,13 @@ function escapeHtml(text) {
 const steps = ["welcome", "seed", "config", "scan", "sweep", "complete"];
 let furthestStep = 0; // tracks how far the user has reached
 
+// `wallet-file` is an alternative to `seed`, not a step after it: a user
+// arrives with either a seed phrase or a wallet file, never both. It shares
+// the seed step's position so the sidebar indicator still tracks progress.
+const STEP_ALIASES = { "wallet-file": "seed" };
+
 function goTo(step) {
-  const stepIdx = steps.indexOf(step);
+  const stepIdx = steps.indexOf(STEP_ALIASES[step] ?? step);
   if (stepIdx > furthestStep) furthestStep = stepIdx;
 
   document.querySelectorAll(".screen").forEach((s) => s.classList.remove("active"));
@@ -341,6 +346,150 @@ async function clearOsClipboard(statusEl) {
 }
 
 $("seed-clear-clipboard")?.addEventListener("click", () => clearOsClipboard("seed-status"));
+
+// ─── Step 2 (alternative): Wallet file ────────────────────────────────────────
+
+// Set once a wallet file has been opened successfully. Its presence is what
+// routes the scan down the imported-key path instead of the seed path.
+//
+// The passphrase is held here for the same reason the seed is passed to
+// `start_scan`: the backend needs it again to re-read the file when the scan
+// actually starts. It is cleared as soon as the scan is under way.
+let walletFile = null;
+
+function renderWalletSummary(summary) {
+  const list = $("wallet-summary-list");
+  list.innerHTML = "";
+  const rows = [
+    ["Transparent keys", summary.transparent_keys],
+    ["Sapling keys", summary.sapling_keys],
+    ["Sprout keys", summary.sprout_keys],
+    [
+      "Seed phrase",
+      summary.has_mnemonic
+        ? "recovered — this wallet scans like a typed seed phrase"
+        : "none (keys are stored individually, not HD-derived)",
+    ],
+  ];
+  for (const [label, value] of rows) {
+    const li = document.createElement("li");
+    li.textContent = `${label}: ${value}`;
+    list.appendChild(li);
+  }
+
+  // Sprout is identified-only. Saying so before any balance appears is the
+  // point: a user who sees a number and no warning will assume it is sweepable.
+  const sproutWarning = $("wallet-sprout-warning");
+  sproutWarning.hidden = summary.sprout_keys === 0;
+  if (summary.sprout_keys > 0 && summary.sprout_addresses.length > 0) {
+    const addrs = document.createElement("ul");
+    for (const addr of summary.sprout_addresses) {
+      const li = document.createElement("li");
+      li.textContent = addr;
+      addrs.appendChild(li);
+    }
+    sproutWarning.appendChild(addrs);
+  }
+
+  const diagnostics = $("wallet-diagnostics");
+  const diagList = $("wallet-diagnostics-list");
+  diagList.innerHTML = "";
+  diagnostics.hidden = summary.diagnostics.length === 0;
+  for (const entry of summary.diagnostics) {
+    const li = document.createElement("li");
+    li.textContent = entry;
+    diagList.appendChild(li);
+  }
+
+  $("wallet-summary").hidden = false;
+}
+
+async function openWalletFile() {
+  const path = $("wallet-path").value.trim();
+  if (!path) {
+    setStatus("wallet-status", "Choose a wallet file first.", "error");
+    return;
+  }
+  const passphraseInput = $("wallet-passphrase");
+  const passphrase = passphraseInput.value ? passphraseInput.value : null;
+
+  setStatus("wallet-status", "Reading wallet file…", "");
+  $("wallet-open").disabled = true;
+  try {
+    const summary = await invoke("inspect_wallet_file", { path, passphrase });
+
+    if (summary.needs_passphrase) {
+      $("wallet-passphrase-field").hidden = false;
+      $("wallet-summary").hidden = true;
+      $("wallet-next").disabled = true;
+      walletFile = null;
+      setStatus(
+        "wallet-status",
+        passphrase
+          ? "✗ That passphrase did not open this wallet."
+          : "This wallet is encrypted — enter its passphrase.",
+        passphrase ? "error" : "",
+      );
+      return;
+    }
+
+    if (summary.transparent_keys + summary.sapling_keys + summary.sprout_keys === 0) {
+      walletFile = null;
+      $("wallet-next").disabled = true;
+      setStatus("wallet-status", "✗ No keys could be recovered from this file.", "error");
+      return;
+    }
+
+    renderWalletSummary(summary);
+    walletFile = { path, passphrase, summary };
+    $("wallet-next").disabled = false;
+    setStatus("wallet-status", "✓ Wallet file read.", "success");
+  } catch (err) {
+    walletFile = null;
+    $("wallet-next").disabled = true;
+    $("wallet-summary").hidden = true;
+    setStatus("wallet-status", `✗ ${err}`, "error");
+  } finally {
+    $("wallet-open").disabled = false;
+  }
+}
+
+$("wallet-open")?.addEventListener("click", openWalletFile);
+$("wallet-path")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
+});
+$("wallet-passphrase")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
+});
+
+// Drag-and-drop, using Tauri's core webview event rather than an HTML5 drop
+// handler: only the native event carries a real filesystem path. A browser
+// `File` has none, and Argos needs the path so the backend reads the file
+// itself instead of the wallet crossing the IPC boundary as bytes.
+//
+// A native file picker would be friendlier still, but that needs
+// tauri-plugin-dialog — a new dependency, so not added here unprompted.
+(async () => {
+  try {
+    const { listen } = window.__TAURI__.event;
+    const dropZone = $("wallet-drop");
+    await listen("tauri://drag-enter", () => dropZone?.classList.add("drop-active"));
+    await listen("tauri://drag-leave", () => dropZone?.classList.remove("drop-active"));
+    await listen("tauri://drag-drop", (event) => {
+      dropZone?.classList.remove("drop-active");
+      const paths = event.payload?.paths ?? [];
+      if (paths.length === 0) return;
+      // Only act while the wallet screen is showing, so a stray drop
+      // elsewhere in the app cannot silently swap the selected file.
+      const screen = document.querySelector('.screen[data-step="wallet-file"]');
+      if (!screen?.classList.contains("active")) return;
+      $("wallet-path").value = paths[0];
+      openWalletFile();
+    });
+  } catch (_) {
+    // No drag-drop available: the path field still works.
+  }
+})();
 
 // ─── Step 3: Configuration ────────────────────────────────────────────────────
 
@@ -551,8 +700,14 @@ $("destination-input").addEventListener("keydown", (e) => {
 });
 
 $("start-scan").addEventListener("click", async () => {
-  if (!seedInput.value.trim()) {
-    setStatus("config-status", "Seed phrase is required — go back and enter it.", "error");
+  // Either a seed phrase or a wallet file, never both — they are alternative
+  // routes to the same scan.
+  if (!walletFile && !seedInput.value.trim()) {
+    setStatus(
+      "config-status",
+      "A seed phrase or a wallet file is required — go back and provide one.",
+      "error",
+    );
     return;
   }
 
@@ -617,8 +772,27 @@ $("start-scan").addEventListener("click", async () => {
   $("start-scan").disabled = true;
 
   try {
-    const handle = await invoke("start_scan", { config });
+    let handle;
+    if (walletFile) {
+      // Routing between the HD path and the imported-account path lives in
+      // the core service, not here: it depends on whether the file yielded a
+      // mnemonic, which only the backend knows. The GUI just hands over the
+      // file and the passphrase.
+      const { seed: _unused, ...rest } = config;
+      handle = await invoke("start_scan_from_wallet_file", {
+        config: { ...rest, path: walletFile.path, passphrase: walletFile.passphrase },
+      });
+    } else {
+      handle = await invoke("start_scan", { config });
+    }
     state.scanHandle = handle;
+    // Drop the wallet passphrase now that the backend holds the decrypted
+    // keys (threat model T-S2). Only on success: the passphrase field lives
+    // on the wallet screen, so clearing it after a failure would strand a
+    // user who retries from the config screen with no way to re-enter it.
+    if (walletFile) walletFile.passphrase = null;
+    const passphraseInput = $("wallet-passphrase");
+    if (passphraseInput) passphraseInput.value = "";
     goTo("scan");
     await startProgressListeners();
   } catch (err) {
