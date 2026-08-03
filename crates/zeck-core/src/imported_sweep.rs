@@ -151,10 +151,58 @@ where
         })?
         .finish();
 
-    let pczt = Prover::new(pczt)
-        .create_sapling_proofs(prover, prover)
-        .map_err(|err| ZeckError::TransactionBuild(format!("proving the Sapling bundle: {err:?}")))?
-        .finish();
+    // The proposal spends only Sapling, but the PCZT still carries padded
+    // Orchard and Ironwood bundles — `BundlePadding::DEFAULT` fills them
+    // with dummy actions, and on a chain past NU6.3 the Ironwood bundle
+    // exists too. Every bundle present needs a proof or the extractor
+    // fails with `MissingProof`, so ask the Prover what it needs rather
+    // than assuming a Sapling-only spend implies a Sapling-only proof.
+    let mut prover_role = Prover::new(pczt);
+    if prover_role.requires_sapling_proofs() {
+        prover_role = prover_role.create_sapling_proofs(prover, prover).map_err(|err| {
+            ZeckError::TransactionBuild(format!("proving the Sapling bundle: {err:?}"))
+        })?;
+    }
+    let needs_orchard = prover_role.requires_orchard_proof();
+    let needs_ironwood = prover_role.requires_ironwood_proof();
+
+    // The Orchard and Ironwood bundles use different circuit versions, but
+    // `TransactionExtractor` verifies both against a single Orchard
+    // verifying key. A transaction carrying both would therefore need one
+    // key to verify two circuits, which is not possible — refuse rather
+    // than pick one and produce a transaction that fails verification for
+    // a reason the caller cannot see. A Sapling-only proposal should never
+    // produce both.
+    if needs_orchard && needs_ironwood {
+        return Err(ZeckError::TransactionBuild(
+            "this sweep produced both an Orchard and an Ironwood bundle, which the PCZT \
+             extractor cannot verify with a single verifying key"
+                .to_owned(),
+        ));
+    }
+
+    let circuit_version = if needs_ironwood {
+        Some(orchard::circuit::OrchardCircuitVersion::PostNu6_3)
+    } else if needs_orchard {
+        Some(orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2)
+    } else {
+        None
+    };
+
+    if let Some(version) = circuit_version {
+        // Building this is expensive, so only when a bundle needs it.
+        let orchard_pk = orchard::circuit::ProvingKey::build(version);
+        prover_role = if needs_ironwood {
+            prover_role.create_ironwood_proof(&orchard_pk).map_err(|err| {
+                ZeckError::TransactionBuild(format!("proving the Ironwood bundle: {err:?}"))
+            })?
+        } else {
+            prover_role.create_orchard_proof(&orchard_pk).map_err(|err| {
+                ZeckError::TransactionBuild(format!("proving the Orchard bundle: {err:?}"))
+            })?
+        };
+    }
+    let pczt = prover_role.finish();
 
     // Count before `Signer::new` consumes the PCZT.
     let spend_count = pczt.sapling().spends().len();
@@ -169,8 +217,13 @@ where
     }
     let pczt = signer.finish();
 
+    // Must match the circuit the proof above was made with.
+    let orchard_vk = orchard::circuit::VerifyingKey::build(
+        circuit_version.unwrap_or(orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2),
+    );
     TransactionExtractor::new(pczt)
         .with_sapling(&spend_vk, &output_vk)
+        .with_orchard(&orchard_vk)
         .extract()
         .map_err(|err| {
             ZeckError::TransactionBuild(format!("extracting the signed transaction: {err:?}"))
