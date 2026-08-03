@@ -377,6 +377,17 @@ impl RecoveryService {
             )));
         }
 
+        // An imported wallet with no HD seed cannot go through the sweep
+        // below, which derives a UnifiedSpendingKey per account. Route it
+        // here rather than in a front-end so the CLI and the GUI cannot
+        // diverge on which key sources are spendable — the branch belongs
+        // wherever `execute_sweep` is the shared surface.
+        if session.runtime.key_source.wallet_seed()?.is_none() {
+            if let Some(keys) = session.runtime.key_source.imported_keys() {
+                return sweep_imported_session(&session.runtime, keys, &request).await;
+            }
+        }
+
         let _ = build_sweep_proposal(
             &progress,
             request.clone(),
@@ -1938,6 +1949,72 @@ fn estimate_remaining_seconds(progress: &ScanProgress, elapsed_seconds: u64) -> 
             .checked_div(progress.blocks_scanned)
             .unwrap_or(0),
     )
+}
+
+/// Adapt an imported-wallet sweep to the shared `SweepOutcome`.
+///
+/// An imported wallet moves its two pools in two transactions, so both are
+/// reported as separate entries. A pool that held nothing appears as a
+/// skipped account rather than being omitted: a pool silently missing from
+/// the report is indistinguishable from one that was never attempted.
+async fn sweep_imported_session(
+    runtime: &RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+    request: &SweepRequest,
+) -> ZeckResult<SweepOutcome> {
+    let outcome = crate::imported_sweep::sweep_imported_wallet(
+        runtime,
+        keys,
+        &request.destination,
+        request.max_fee_zatoshis,
+    )
+    .await?;
+
+    let mut transactions = Vec::new();
+    let mut skipped_accounts = Vec::new();
+
+    match outcome.sapling_txid {
+        Some(txid) => transactions.push(TxBroadcastResult {
+            source_account: 0,
+            txid: Some(txid),
+            status: "broadcast".to_owned(),
+            detail: "Sapling notes from the imported wallet".to_owned(),
+            confirmed_height: None,
+        }),
+        None => skipped_accounts.push(SkippedSweepAccount {
+            account_index: 0,
+            reason: "the imported wallet holds no spendable Sapling notes".to_owned(),
+            gross_zatoshis: 0,
+        }),
+    }
+
+    match outcome.transparent_txid {
+        Some(txid) => transactions.push(TxBroadcastResult {
+            source_account: 0,
+            txid: Some(txid),
+            status: "broadcast".to_owned(),
+            detail: format!(
+                "transparent UTXOs from the imported wallet ({} zatoshis, {} fee)",
+                outcome.transparent_zatoshis, outcome.transparent_fee_zatoshis
+            ),
+            confirmed_height: None,
+        }),
+        None => skipped_accounts.push(SkippedSweepAccount {
+            account_index: 0,
+            reason: "the imported wallet holds no spendable transparent funds".to_owned(),
+            gross_zatoshis: 0,
+        }),
+    }
+
+    Ok(SweepOutcome {
+        transactions,
+        skipped_accounts,
+        // Donations are not split out of an imported sweep: the Sapling
+        // path builds a single-step send-max proposal, which has no room
+        // for a second output.
+        total_donation_zatoshis: 0,
+        error: None,
+    })
 }
 
 #[cfg(test)]
