@@ -2545,7 +2545,6 @@ async fn fund_test_seed_with_shielded_coinbase() {
 #[tokio::test]
 #[cfg(feature = "argos-network")]
 async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
-    use argos_core::imported::{encode_transparent_address, ImportedTransparentKey};
     use argos_core::lightwalletd::connect_lightwalletd_endpoints_with_retry;
     use argos_core::transparent_recovery::{
         build_sweep_transaction, fetch_transparent_utxos, plan_sweep, sapling_receiver, summarize,
@@ -2557,27 +2556,31 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
     use zcash_client_backend::proto::service::RawTransaction;
     use zcash_proofs::prover::LocalTxProver;
     use zcash_protocol::consensus::BlockHeight;
-    use zcash_transparent::address::TransparentAddress;
 
     // Installs regtest consensus parameters process-wide; every encoding and
     // branch-ID derivation below depends on them.
     let harness = RegtestHarness::require();
 
-    // A wallet that is a single imported key and nothing else — no seed, no
-    // shielded key, no account. Deterministic so a re-run funds the same
-    // address rather than stranding value at a fresh one each time.
-    let secret = secp256k1::SecretKey::from_slice(&[0x11u8; 32]).expect("valid scalar");
-    let secp = secp256k1::Secp256k1::signing_only();
-    let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
-    let address = TransparentAddress::from_pubkey(&pubkey);
-    let keys = vec![ImportedTransparentKey { secret, address }];
-    let encoded = encode_transparent_address(&address, ZeckNetwork::Testnet);
-
-    // Fund inside the test rather than relying on setup.sh: the sweep spends
-    // everything it finds, so a second run would otherwise find nothing.
-    zebra_rpc("generatetoaddress", serde_json::json!([1, encoded])).await;
-    // Coinbase maturity.
-    zebra_rpc("generate", serde_json::json!([100])).await;
+    // The golden fixture's first transparent key. It must be *this* key
+    // rather than a locally-generated one: `setup.sh` funds the fixture's
+    // addresses, and the regtest block subsidy is worthless by the height
+    // this test runs at, so an address setup did not fund cannot be funded
+    // now. Using a different key silently yields zero-value coinbase and
+    // fails as "a funded wallet must report a non-zero balance".
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+    );
+    let bytes = std::fs::read(fixture).expect("golden fixture must exist");
+    let imported = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("fixture must import");
+    let resolved =
+        argos_core::imported::imported_transparent_keys(&imported).expect("keys must resolve");
+    let first = resolved
+        .into_iter()
+        .next()
+        .expect("fixture must hold a transparent key");
+    let keys = vec![first];
 
     let (mut client, _endpoint) =
         connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)

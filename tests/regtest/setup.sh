@@ -156,6 +156,27 @@ while :; do
     zrpc generate '[500]' >/dev/null 2>&1 || sleep 2
 done
 
+# ── Clear Zebra's gossip backlog ───────────────────────────────────────────
+#
+# Zebra queues each mined block for gossip to its peers. A regtest node is
+# isolated, so nothing drains that queue, and tens of thousands of blocks
+# fill it. Every later `generate` then fails with "failed to send mined
+# block to gossip task: no available capacity" — while still accepting the
+# block, so the height advances and only the RPC reports failure. Tests that
+# fund themselves die on that error immediately after a successful setup.
+#
+# A restart empties the queue. Do it here so the harness is handed over in a
+# usable state rather than failing on the user's first test run.
+log "restarting Zebra to clear the gossip queue left by bulk mining ..."
+docker restart "$ZEBRA_CONTAINER" >/dev/null 2>&1 \
+    || die "could not restart $ZEBRA_CONTAINER"
+for _ in $(seq 1 60); do
+    zrpc getblockcount 2>/dev/null | grep -q result && break
+    sleep 2
+done
+zrpc getblockcount 2>/dev/null | grep -q result \
+    || die "Zebra did not come back after the restart"
+
 HEIGHT="$(zrpc getblockcount | sed -e 's/.*"result":\([0-9]*\).*/\1/')"
 readonly HEIGHT
 log "done — chain height $HEIGHT"
