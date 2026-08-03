@@ -79,6 +79,12 @@
 use std::io::Write;
 use std::process::ExitCode;
 
+// A `[[bin]]` target cannot `use` the integration tests' `common` module, so
+// pull in just the shared key definition by path. Keeping one definition is
+// the point: the funder and the test must agree on the address.
+#[path = "../common/standalone_transparent.rs"]
+mod standalone_transparent;
+
 use argos_core::{
     workspace::{consensus_network, regtest_local_network, set_regtest_consensus_params},
     ZeckNetwork,
@@ -99,12 +105,28 @@ const DEFAULT_FUNDING_BLOCKS: u32 = 4;
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event<'a> {
-    FundAddress { address: &'a str },
+    FundAddress {
+        address: &'a str,
+    },
     /// The golden wallet fixture's addresses, so setup.sh can fund the
     /// imported-wallet tests without duplicating the derivation.
-    FixtureAddresses { sapling: String, transparent: String },
-    Mined { blocks: u32, height: u64 },
-    Funded { blocks_to_seed: u32, height: u64 },
+    ///
+    /// `standalone_transparent` is not from the fixture: it belongs to the
+    /// transparent-only test, which needs an address the imported sweep
+    /// will not drain. See `tests/common/standalone_transparent.rs`.
+    FixtureAddresses {
+        sapling: String,
+        transparent: String,
+        standalone_transparent: String,
+    },
+    Mined {
+        blocks: u32,
+        height: u64,
+    },
+    Funded {
+        blocks_to_seed: u32,
+        height: u64,
+    },
 }
 
 fn emit(event: &Event<'_>) {
@@ -132,8 +154,9 @@ struct Args {
 /// imported-wallet tests import that exact file — funding any other
 /// address would leave them looking at an empty wallet.
 fn print_fixture_addresses() {
-    use argos_core::imported::{encode_transparent_address, imported_transparent_keys,
-        parse_sapling_extsk};
+    use argos_core::imported::{
+        encode_transparent_address, imported_transparent_keys, parse_sapling_extsk,
+    };
     use secrecy::ExposeSecret;
     use zcash_keys::encoding::AddressCodec;
 
@@ -165,6 +188,10 @@ fn print_fixture_addresses() {
                 .first()
                 .expect("fixture must hold a transparent key")
                 .address,
+            ZeckNetwork::Testnet,
+        ),
+        standalone_transparent: encode_transparent_address(
+            &standalone_transparent::standalone_transparent_key().address,
             ZeckNetwork::Testnet,
         ),
     });

@@ -130,11 +130,17 @@ log "funding the imported-wallet fixture addresses ..."
 FIXTURE_JSON="$("$FUNDER" --zebra-rpc-url "$ZEBRA_RPC_URL" --print-fixture-addresses)" \
     || die "could not read the fixture addresses"
 FIXTURE_SAPLING="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"sapling":"\([^"]*\)".*/\1/')"
-FIXTURE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"transparent":"\([^"]*\)".*/\1/')"
+FIXTURE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"transparent":"\([^"]*\)",.*/\1/')"
+STANDALONE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" \
+    | sed -e 's/.*"standalone_transparent":"\([^"]*\)".*/\1/')"
 [ -n "$FIXTURE_SAPLING" ] || die "could not parse the fixture Sapling address"
 [ -n "$FIXTURE_TRANSPARENT" ] || die "could not parse the fixture transparent address"
+[ -n "$STANDALONE_TRANSPARENT" ] || die "could not parse the standalone transparent address"
 
-for addr in "$FIXTURE_SAPLING" "$FIXTURE_TRANSPARENT"; do
+# The standalone address is funded separately from the fixture's because the
+# imported sweep drains every fixture address, transparent included. The
+# transparent-only test needs funds no other test can spend.
+for addr in "$FIXTURE_SAPLING" "$FIXTURE_TRANSPARENT" "$STANDALONE_TRANSPARENT"; do
     ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
         --zebra-rpc-url "$ZEBRA_RPC_URL" \
         --address "$addr" \

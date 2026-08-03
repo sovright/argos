@@ -2561,26 +2561,15 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
     // branch-ID derivation below depends on them.
     let harness = RegtestHarness::require();
 
-    // The golden fixture's first transparent key. It must be *this* key
-    // rather than a locally-generated one: `setup.sh` funds the fixture's
-    // addresses, and the regtest block subsidy is worthless by the height
-    // this test runs at, so an address setup did not fund cannot be funded
-    // now. Using a different key silently yields zero-value coinbase and
-    // fails as "a funded wallet must report a non-zero balance".
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
-    );
-    let bytes = std::fs::read(fixture).expect("golden fixture must exist");
-    let imported = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
-        .expect("fixture must import");
-    let resolved =
-        argos_core::imported::imported_transparent_keys(&imported).expect("keys must resolve");
-    let first = resolved
-        .into_iter()
-        .next()
-        .expect("fixture must hold a transparent key");
-    let keys = vec![first];
+    // A key this test owns outright, funded by `setup.sh` at a height where
+    // the regtest subsidy is still worth something. It deliberately does not
+    // come from the golden fixture: the imported-Sapling test sweeps that
+    // wallet through `execute_sweep`, which drains its transparent UTXOs too,
+    // so a fixture key would be empty whenever this test ran second. It is
+    // also the more faithful fixture for a transparent-*only* wallet, which
+    // the Sapling-bearing golden file is not. See
+    // `tests/common/standalone_transparent.rs`.
+    let keys = vec![common::standalone_transparent::standalone_transparent_key()];
 
     let (mut client, _endpoint) =
         connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)
