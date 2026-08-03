@@ -454,6 +454,23 @@ async function openWalletFile() {
   }
 }
 
+// The picker itself runs in Rust — the webview holds no `dialog:`
+// permission, so this cannot open anything but a single file chooser.
+$("wallet-browse")?.addEventListener("click", async () => {
+  try {
+    const path = await invoke("pick_wallet_file");
+    // Cancelling is not an error, and must not clear a file already chosen.
+    if (!path) return;
+    $("wallet-path").value = path;
+    // A freshly chosen file is not the one the old passphrase belongs to.
+    $("wallet-passphrase").value = "";
+    $("wallet-passphrase-field").hidden = true;
+    await openWalletFile();
+  } catch (err) {
+    setStatus("wallet-status", `✗ ${err}`, "error");
+  }
+});
+
 $("wallet-open")?.addEventListener("click", openWalletFile);
 $("wallet-path")?.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
@@ -484,6 +501,10 @@ $("wallet-passphrase")?.addEventListener("keydown", (e) => {
       const screen = document.querySelector('.screen[data-step="wallet-file"]');
       if (!screen?.classList.contains("active")) return;
       $("wallet-path").value = paths[0];
+      // As with the picker: a new file is not the one the old passphrase
+      // belongs to.
+      $("wallet-passphrase").value = "";
+      $("wallet-passphrase-field").hidden = true;
       openWalletFile();
     });
   } catch (_) {

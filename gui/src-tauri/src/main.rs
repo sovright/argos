@@ -19,6 +19,12 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Native file picker for the wallet-file screen. Driven entirely
+        // from Rust via the `pick_wallet_file` command, the same way the
+        // opener plugin is: the capability file grants the webview no
+        // `dialog:` permission, so JavaScript cannot open a dialog of its
+        // own choosing, and the only reachable surface is picking one file.
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             service: RecoveryService::new(),
         })
@@ -26,6 +32,7 @@ fn main() {
             commands::validate_seed,
             commands::validate_address,
             commands::start_scan,
+            commands::pick_wallet_file,
             commands::inspect_wallet_file,
             commands::start_scan_from_wallet_file,
             commands::get_scan_progress,

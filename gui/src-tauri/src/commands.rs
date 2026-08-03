@@ -103,6 +103,41 @@ pub struct WalletFileSummary {
     pub needs_passphrase: bool,
 }
 
+/// Show a native file picker and return the chosen wallet file's path.
+///
+/// Lives in Rust rather than being called from JavaScript, matching how the
+/// opener plugin is used here: the capability file grants the webview no
+/// `dialog:` permission, so the frontend cannot open a dialog of its own
+/// choosing. Returns `None` when the user cancels, which is not an error.
+///
+/// Only the path crosses back. Argos reads the file in the backend, so a
+/// wallet's bytes never transit the webview.
+#[tauri::command]
+pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Open a Zcash wallet file")
+        // zcashd writes `wallet.dat`; ZecWallet Lite writes files with
+        // assorted names, so an "any file" option has to stay reachable or
+        // the picker would hide wallets it can actually read.
+        .add_filter("Wallet files", &["dat"])
+        .add_filter("All files", &["*"])
+        .pick_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+
+    let picked = rx
+        .await
+        .map_err(|_| "the file picker closed unexpectedly".to_owned())?;
+
+    Ok(picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
 /// Read a legacy wallet file and report what is in it. No network, and
 /// nothing is written anywhere.
 ///

@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 tauri-plugin-opener.workspace = true
+tauri-plugin-dialog.workspace = true
 tokio.workspace = true
 # Surface argos-core diagnostics (scan reconnects, donation decisions/fallbacks)
 # to the dev console / stderr. Both are already workspace dependencies.
