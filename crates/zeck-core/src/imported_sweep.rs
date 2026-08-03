@@ -229,3 +229,151 @@ where
             ZeckError::TransactionBuild(format!("extracting the signed transaction: {err:?}"))
         })
 }
+
+/// What an imported-wallet sweep moved.
+///
+/// Both pools are reported separately and either may be `None`. A wallet
+/// can hold Sapling notes, transparent UTXOs, both, or (after a previous
+/// sweep) neither, and collapsing that into one number would hide a pool
+/// that silently moved nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ImportedSweepOutcome {
+    pub sapling_txid: Option<String>,
+    pub sapling_zatoshis: u64,
+    pub transparent_txid: Option<String>,
+    pub transparent_zatoshis: u64,
+    pub transparent_fee_zatoshis: u64,
+}
+
+/// Sweep everything an imported wallet holds to `destination`.
+///
+/// Two transactions, not one: the Sapling notes go through the PCZT path,
+/// and the transparent UTXOs through `transparent_recovery`, which drives
+/// the builder directly. They cannot be combined —
+/// `create_pczt_from_proposal` accepts only single-step proposals and a
+/// two-pool sweep is two steps.
+///
+/// A pool with nothing in it is skipped rather than failing the sweep, and
+/// a failure in one pool does not discard the other's result: the caller is
+/// told what did move. The workspace must already have been scanned, or the
+/// wallet database holds no notes to spend.
+pub async fn sweep_imported_wallet(
+    runtime: &crate::models::RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+    destination: &str,
+    max_fee_zatoshis: Option<u64>,
+) -> ZeckResult<ImportedSweepOutcome> {
+    use crate::imported::{
+        imported_transparent_keys, parse_sapling_extsk, register_imported_accounts,
+    };
+    use crate::workspace::{consensus_network, open_wallet_db, RecoveryWorkspace};
+    use secrecy::ExposeSecret;
+    use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday};
+    use zcash_client_backend::proto::service::RawTransaction;
+    use zcash_proofs::prover::LocalTxProver;
+
+    let mut outcome = ImportedSweepOutcome::default();
+    let params = consensus_network(runtime.network);
+    let workspace = RecoveryWorkspace::from_runtime(runtime)?;
+
+    // Sapling first: it is usually where the value is, and a failure here
+    // should not stop the transparent sweep from being attempted.
+    if let Some(first_sapling) = keys.sapling.first() {
+        let extsk = parse_sapling_extsk(first_sapling.extsk.expose_secret())?;
+
+        let account_id = {
+            let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
+            // Re-registration is idempotent and returns the accounts the
+            // scan already created.
+            let birthday = AccountBirthday::from_parts(
+                ChainState::empty(
+                    zcash_protocol::consensus::BlockHeight::from_u32(runtime.birthday),
+                    zcash_primitives::block::BlockHash([0u8; 32]),
+                ),
+                None,
+            );
+            register_imported_accounts(&mut wallet_db, keys, &birthday)?
+                .first()
+                .map(|account| account.wallet_account_id)
+                .ok_or_else(|| {
+                    ZeckError::Internal("no imported account to sweep from".to_owned())
+                })?
+        };
+
+        let recipient = ZcashAddress::try_from_encoded(destination).map_err(|err| {
+            ZeckError::InvalidAddress(format!("could not decode destination: {err}"))
+        })?;
+
+        let prover = LocalTxProver::bundled();
+        let built = {
+            let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
+            build_imported_sapling_sweep(
+                &mut wallet_db,
+                &params,
+                account_id,
+                &extsk,
+                &recipient,
+                &prover,
+            )
+        };
+
+        match built {
+            Ok(tx) => {
+                let mut raw = Vec::new();
+                tx.write(&mut raw).map_err(|err| {
+                    ZeckError::TransactionBuild(format!("serializing the Sapling sweep: {err}"))
+                })?;
+                let (mut client, _endpoint) =
+                    crate::lightwalletd::connect_lightwalletd_endpoints_with_retry(
+                        &runtime.lightwalletd_url,
+                        None,
+                    )
+                    .await?;
+                let response = client
+                    .send_transaction(RawTransaction {
+                        data: raw,
+                        height: 0,
+                    })
+                    .await
+                    .map_err(|err| ZeckError::Broadcast(err.to_string()))?
+                    .into_inner();
+                if response.error_code != 0 {
+                    return Err(ZeckError::Broadcast(format!(
+                        "the node rejected the Sapling sweep: {}",
+                        response.error_message
+                    )));
+                }
+                outcome.sapling_txid = Some(tx.txid().to_string());
+            }
+            Err(err) => {
+                // "Nothing selectable" is the ordinary shape of an account
+                // whose Sapling pool is empty or all dust; it must not
+                // abort the transparent sweep below.
+                let message = err.to_string();
+                if !message.contains("InsufficientFunds") && !message.contains("insufficient") {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    // Transparent, through the path that needs no account at all.
+    let transparent = imported_transparent_keys(keys)?;
+    if !transparent.is_empty() {
+        if let Some(swept) = crate::transparent_recovery::sweep_transparent_only(
+            &transparent,
+            runtime.network,
+            &runtime.lightwalletd_url,
+            destination,
+            max_fee_zatoshis,
+        )
+        .await?
+        {
+            outcome.transparent_txid = Some(swept.txid);
+            outcome.transparent_zatoshis = swept.plan.output_zatoshis;
+            outcome.transparent_fee_zatoshis = swept.plan.fee_zatoshis;
+        }
+    }
+
+    Ok(outcome)
+}

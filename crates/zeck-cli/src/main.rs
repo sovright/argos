@@ -192,6 +192,101 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
     }
 }
 
+
+/// Sweep an imported wallet, whose two pools are moved by separate paths
+/// and therefore in separate transactions.
+///
+/// Reports each pool independently. Collapsing them into one number would
+/// hide a pool that silently moved nothing, which for a recovery user is
+/// the difference between "my funds are safe" and "half my funds are still
+/// in a file I am about to delete".
+#[allow(clippy::too_many_arguments)]
+async fn run_imported_sweep(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    // Taken field by field rather than as `&Cli`: the enclosing match has
+    // already partially moved the command's fields out of it.
+    wallet_file: &Path,
+    num_accounts: Option<u32>,
+    gap_limit: u32,
+    lightwalletd_url: &str,
+    data_dir: &Path,
+    birthday: Option<u32>,
+    destination: &str,
+    max_fee: Option<u64>,
+    dry_run: bool,
+    confirm_sweep: bool,
+) -> Result<()> {
+    warn_about_uncovered_pools(keys, true);
+
+    if dry_run {
+        println!();
+        println!("A dry run cannot preview an imported-wallet sweep in detail: the Sapling");
+        println!("fee is only known once the transaction is built, and building it requires");
+        println!("the spending key. The balances above are what would be swept.");
+        println!();
+        println!("Re-run with --confirm-sweep to broadcast.");
+        return Ok(());
+    }
+
+    if !confirm_sweep {
+        bail!(
+            "refusing to broadcast without --confirm-sweep. Re-run with --dry-run to see what \
+             would be swept, or --confirm-sweep to move the funds. This is irreversible."
+        );
+    }
+
+    let runtime = argos_core::RuntimeScanConfig {
+        key_source: Arc::new(ImportedKeySource::new(
+            argos_wallet_import::import_wallet_file(&std::fs::read(wallet_file)?, None)
+            .map_err(|err| anyhow::anyhow!("re-reading the wallet file: {err}"))?,
+        )),
+        birthday: birthday.ok_or_else(|| anyhow::anyhow!("sweep requires a birthday"))?,
+        num_accounts,
+        gap_limit,
+        lightwalletd_url: lightwalletd_url.to_owned(),
+        data_dir: data_dir.to_owned(),
+        network,
+        label: String::new(),
+    };
+
+    let outcome =
+        argos_core::imported_sweep::sweep_imported_wallet(&runtime, keys, destination, max_fee)
+            .await?;
+
+    println!();
+    println!("━━━ Imported wallet sweep ━━━");
+    match &outcome.sapling_txid {
+        Some(txid) => println!("  Sapling      {txid}"),
+        None => println!("  Sapling      nothing spendable"),
+    }
+    match &outcome.transparent_txid {
+        Some(txid) => {
+            println!("  Transparent  {txid}");
+            println!(
+                "    sent {}, fee {}",
+                format_zec(outcome.transparent_zatoshis),
+                format_zec(outcome.transparent_fee_zatoshis)
+            );
+        }
+        None => println!("  Transparent  nothing spendable"),
+    }
+    println!("  Destination  {destination}");
+    println!();
+
+    if outcome.sapling_txid.is_none() && outcome.transparent_txid.is_none() {
+        println!("Nothing was broadcast: this wallet holds no spendable funds.");
+        return Ok(());
+    }
+
+    println!(
+        "The network accepted the transaction(s) above into its mempool. That is not the \
+         same as being mined. Check each transaction id in a block explorer before treating \
+         the funds as moved, and keep the original wallet file until you have."
+    );
+    Ok(())
+}
+
 /// Sweep a transparent-only wallet, with the same guard rails the HD sweep
 /// has: a dry run that signs nothing, an explicit confirmation for an
 /// irreversible action, and a fee ceiling checked before signing.
@@ -646,6 +741,8 @@ async fn main() -> Result<()> {
             if progress.phase == ScanPhase::Cancelled {
                 std::process::exit(130);
             }
+
+
             if progress.phase == ScanPhase::Error {
                 bail!("recovery scan failed");
             }
@@ -697,6 +794,33 @@ async fn main() -> Result<()> {
             if progress.phase == ScanPhase::Cancelled {
                 std::process::exit(130);
             }
+
+            // An imported wallet with no seed cannot go through the
+            // service's sweep, which derives a UnifiedSpendingKey. Its two
+            // pools are swept by separate paths — see
+            // `argos_core::imported_sweep`.
+            if let Some(source) = imported.as_ref() {
+                if source.keys().mnemonic.is_none() && progress.phase == ScanPhase::Complete {
+                    return run_imported_sweep(
+                        source.keys(),
+                        network,
+                        cli.wallet_file
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("--wallet-file is required here"))?,
+                        cli.num_accounts,
+                        cli.gap_limit,
+                        &cli.lightwalletd_url,
+                        &cli.data_dir,
+                        Some(birthday),
+                        &destination,
+                        max_fee,
+                        dry_run,
+                        confirm_sweep,
+                    )
+                    .await;
+                }
+            }
+
             if progress.phase == ScanPhase::Error {
                 bail!("recovery scan failed");
             }
