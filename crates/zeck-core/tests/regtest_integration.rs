@@ -2869,3 +2869,209 @@ async fn an_imported_zcashd_wallet_scans_as_wallet_accounts() {
         "the imported transparent keys must be attached to the account"
     );
 }
+
+/// Spending an imported Sapling key, end to end against a real node.
+///
+/// This is the assertion the whole PCZT detour exists for. A standalone
+/// `sapzkey` cannot be spent through `SpendingKeys`, which takes its
+/// Sapling authority solely from a `UnifiedSpendingKey`; the claim is that
+/// the PCZT roles can. Nothing short of a node accepting the transaction
+/// proves that — a PCZT can be assembled, proved, and signed and still be
+/// rejected for a wrong sighash, a missing proof generation key, or a
+/// signature over the wrong bundle.
+///
+/// The wallet here is seedless by construction: one Sapling key, imported,
+/// registered with no ZIP-32 derivation.
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
+#[cfg(feature = "argos-network")]
+async fn an_imported_sapling_key_can_be_spent_via_pczt() {
+    use argos_core::imported::{parse_sapling_extsk, register_imported_accounts, sapling_ufvk};
+    use argos_core::imported_sweep::build_imported_sapling_sweep;
+    use argos_core::lightwalletd::connect_lightwalletd_endpoints_with_retry;
+    use argos_core::workspace::{consensus_network, open_wallet_db_for_tests, RecoveryWorkspace};
+    use argos_core::{ImportedKeySource, RecoveryService, ScanConfig, ScanPhase, ZeckNetwork};
+    use common::regtest_harness::zebra_rpc;
+    use secrecy::ExposeSecret;
+    use zcash_client_backend::proto::service::RawTransaction;
+    use zcash_keys::encoding::AddressCodec;
+    use zcash_proofs::prover::LocalTxProver;
+
+    let harness = RegtestHarness::require();
+    let params = consensus_network(ZeckNetwork::Testnet);
+
+    // A real Sapling key our own parser recovered from a wallet zcashd wrote.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+    );
+    let bytes = std::fs::read(fixture).expect("golden fixture must exist");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("fixture must import");
+    assert!(
+        keys.mnemonic.is_none(),
+        "the fixture must be seedless or this exercises the HD path"
+    );
+    let extsk = parse_sapling_extsk(
+        keys.sapling
+            .first()
+            .expect("fixture must hold a Sapling key")
+            .extsk
+            .expose_secret(),
+    )
+    .expect("the recovered key must parse");
+
+    // Fund it with shielded coinbase, then mine past maturity. Under ZIP 213
+    // a coinbase paid to a shielded address is an ordinary note.
+    let (_, payment_address) = extsk.to_diversifiable_full_viewing_key().default_address();
+    let encoded = payment_address.encode(&params);
+    zebra_rpc("generatetoaddress", serde_json::json!([1, encoded])).await;
+    zebra_rpc("generate", serde_json::json!([100])).await;
+
+    // Scan so the wallet database learns the note and its witness.
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let config = ScanConfig {
+        birthday: 1,
+        num_accounts: Some(1),
+        gap_limit: 1,
+        lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        data_dir: data_dir.path().to_owned(),
+        network: ZeckNetwork::Testnet,
+        label: String::new(),
+    };
+    // `ImportedKeys` is deliberately not `Clone` — it holds spending keys —
+    // so re-parse the fixture for the second consumer instead.
+    let source = std::sync::Arc::new(ImportedKeySource::new(
+        argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+            .expect("fixture must import"),
+    ));
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(config.clone(), source.clone())
+        .await
+        .expect("starting the imported scan");
+    let progress = loop {
+        let progress = service
+            .get_scan_progress(&handle)
+            .await
+            .expect("progress readable");
+        if progress.phase.is_terminal() {
+            break progress;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    assert_eq!(
+        progress.phase,
+        ScanPhase::Complete,
+        "the scan must complete: {:?}",
+        progress.error
+    );
+    assert!(
+        progress.accounts[0].sapling_zatoshis > 0,
+        "the funded Sapling note must be visible before it can be spent; got {:?}",
+        progress.accounts[0]
+    );
+
+    // Re-open the workspace the scan populated and sweep it.
+    let runtime = argos_core::RuntimeScanConfig {
+        key_source: source.clone(),
+        birthday: config.birthday,
+        num_accounts: config.num_accounts,
+        gap_limit: config.gap_limit,
+        lightwalletd_url: config.lightwalletd_url.clone(),
+        data_dir: config.data_dir.clone(),
+        network: config.network,
+        label: String::new(),
+    };
+    let workspace = RecoveryWorkspace::from_runtime(&runtime).expect("workspace");
+    let mut wallet_db =
+        open_wallet_db_for_tests(workspace.wallet_db_path(), params).expect("wallet db");
+
+    // The account id the scan registered — re-registering is idempotent.
+    let birthday_for_lookup = {
+        use zcash_client_backend::data_api::chain::ChainState;
+        use zcash_client_backend::data_api::AccountBirthday;
+        AccountBirthday::from_parts(
+            ChainState::empty(
+                zcash_protocol::consensus::BlockHeight::from_u32(1),
+                zcash_primitives::block::BlockHash([0u8; 32]),
+            ),
+            None,
+        )
+    };
+    let accounts = register_imported_accounts(&mut wallet_db, &keys, &birthday_for_lookup)
+        .expect("re-registration must reuse the scanned accounts");
+    let account_id = accounts[0].wallet_account_id;
+    // Guard the assumption above: a fresh account would have no notes and
+    // the sweep would fail for an unrelated reason.
+    assert!(
+        sapling_ufvk(&extsk).is_ok(),
+        "the imported key must still produce the UFVK the account was created from"
+    );
+
+    // `derive_accounts` encodes under testnet, but regtest parameters are
+    // active, so the proposal would reject the address for the wrong
+    // network. The receiver is identical — only the HRP differs — so decode
+    // under testnet and re-encode under regtest. This is the same dance
+    // `argos_regtest_funder::regtest_encoded_sapling_address` does, and the
+    // cause of the suite's other pre-existing failures (sovright/argos#186).
+    let testnet_ua = argos_core::derive_accounts(
+        &secrecy::SecretString::new(harness.test_seed().to_owned()),
+        ZeckNetwork::Testnet,
+        1,
+    )
+    .expect("destination")[0]
+        .unified_address
+        .clone();
+    let regtest_ua = zcash_keys::address::Address::decode(
+        &zcash_protocol::consensus::Network::TestNetwork,
+        &testnet_ua,
+    )
+    .expect("the derived UA must decode under testnet")
+    .encode(&params);
+    let destination = zcash_address::ZcashAddress::try_from_encoded(&regtest_ua)
+        .expect("destination must decode");
+
+    let prover = LocalTxProver::bundled();
+    let tx = build_imported_sapling_sweep(
+        &mut wallet_db,
+        &params,
+        account_id,
+        &extsk,
+        &destination,
+        &prover,
+    )
+    .expect("building the imported Sapling sweep");
+
+    let mut raw = Vec::new();
+    tx.write(&mut raw).expect("serializing");
+
+    let (mut client, _endpoint) =
+        connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)
+            .await
+            .expect("connecting to lightwalletd");
+    let response = client
+        .send_transaction(RawTransaction {
+            data: raw,
+            height: 0,
+        })
+        .await
+        .expect("send_transaction RPC")
+        .into_inner();
+    assert_eq!(
+        response.error_code, 0,
+        "the node rejected the imported Sapling sweep: {}",
+        response.error_message
+    );
+
+    zebra_rpc("generate", serde_json::json!([1])).await;
+    let mined = zebra_rpc(
+        "getrawtransaction",
+        serde_json::json!([tx.txid().to_string(), 1]),
+    )
+    .await;
+    assert!(
+        mined.get("height").and_then(|h| h.as_u64()).is_some(),
+        "the sweep must be mined, got: {mined}"
+    );
+}

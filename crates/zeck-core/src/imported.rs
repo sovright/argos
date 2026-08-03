@@ -31,7 +31,7 @@ use crate::{
 };
 
 /// The concrete wallet database Argos opens everywhere.
-type ArgosWalletDb = WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>;
+pub type ArgosWalletDb = WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>;
 
 /// Serialized length of a Sapling extended spending key.
 const EXTSK_LEN: usize = 169;

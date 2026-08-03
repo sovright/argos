@@ -172,6 +172,38 @@ Each integration test prints a `[regtest]` header noting the harness URL it
 connected to, so a mid-test failure is easy to attribute to the stack vs to
 Argos logic.
 
+## The chain must be past the ZIP 212 grace period for PCZT tests
+
+`an_imported_sapling_key_can_be_spent_via_pczt` builds its transaction
+through the PCZT roles, and PCZT construction **requires ZIP 212 to be
+fully enforced for outputs**. Enforcement is not simply "Canopy is active":
+`zip212_enforcement` returns a *grace period* for the first
+`ZIP212_GRACE_PERIOD` (32,256) blocks after Canopy activation, and the PCZT
+builder rejects anything short of full enforcement with:
+
+    PCZTs require that ZIP 212 is enforced for outputs
+
+The regtest chain activates every upgrade at height 1, so the grace period
+runs to height 32,257. A freshly-booted harness sits at a few hundred
+blocks and is therefore *inside* the grace period, and this test fails for
+a reason that has nothing to do with the code under test.
+
+Mine past it once — the `zebrad-data` volume persists, so this is a
+one-time cost per volume:
+
+    # ~6 blocks/sec, so roughly 80 minutes from a fresh chain
+    while [ "$(zebra_rpc getblockcount)" -lt 32400 ]; do
+        zebra_rpc generate 500
+    done
+
+Nothing else in the suite needs this: the ordinary transaction builder
+accepts the grace period, so the seed-based sweep tests pass on a short
+chain. Only the PCZT path is affected.
+
+**Do not** "fix" a ZIP 212 failure by relaxing the check or switching the
+imported sweep off PCZT. PCZT is the only route that can spend a standalone
+Sapling key at all — see `crates/zeck-core/src/imported_sweep.rs`.
+
 ## Teardown
 
 ```bash

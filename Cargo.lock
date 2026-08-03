@@ -7616,6 +7616,7 @@ dependencies = [
  "schemerz-rusqlite",
  "secp256k1",
  "secrecy",
+ "serde",
  "shardtree",
  "static_assertions",
  "subtle",
