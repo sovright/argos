@@ -59,7 +59,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use argos_core::{
-    derive_accounts, workspace::RecoveryWorkspace, RecoveryService, RuntimeScanConfig, ScanConfig,
+    workspace::RecoveryWorkspace, RecoveryService, RuntimeScanConfig, ScanConfig,
     ScanHandle, ScanPhase, SweepRequest, ZeckNetwork,
 };
 use secrecy::SecretString;
@@ -128,13 +128,7 @@ async fn complete_scan_against_test_seed(
     // and propose_sweep doesn't care if source == destination — using a
     // derived address from the same seed avoids needing a separately-funded
     // second wallet in the harness.
-    let accounts = derive_accounts(
-        &SecretString::new(harness.test_seed().to_owned()),
-        runtime.network,
-        2,
-    )
-    .expect("derive_accounts for destination UA");
-    let destination_ua = accounts[1].unified_address.clone();
+    let destination_ua = regtest_encoded_unified_address_at(harness.test_seed(), 1);
 
     let scan_config = ScanConfig {
         birthday: runtime.birthday,
@@ -1747,10 +1741,7 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     // (Both account 0 and account 1 are sources; account 2 is the
     // destination, which keeps the sweep deterministic regardless of which
     // source account is processed first.)
-    let seed = SecretString::new(harness.test_seed().to_owned());
-    let accounts = derive_accounts(&seed, ZeckNetwork::Testnet, 3)
-        .expect("derive 3 accounts to choose a sweep destination outside the funded set");
-    let destination_ua = accounts[2].unified_address.clone();
+    let destination_ua = regtest_encoded_unified_address_at(harness.test_seed(), 2);
 
     let crash_dir = tempfile::tempdir().expect("crash tempdir");
 
@@ -2169,13 +2160,7 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
 
     // A regtest donation recipient, distinct from the sweep destination, so the
     // donation-split path runs against a decodable testnet UA.
-    let accounts = derive_accounts(
-        &SecretString::new(harness.test_seed().to_owned()),
-        ZeckNetwork::Testnet,
-        3,
-    )
-    .expect("derive_accounts for donation UA");
-    let donation_ua = accounts[2].unified_address.clone();
+    let donation_ua = regtest_encoded_unified_address_at(harness.test_seed(), 2);
     assert_ne!(
         donation_ua, fixture.destination_ua,
         "donation recipient must differ from the sweep destination"
@@ -2340,10 +2325,7 @@ async fn argos_sweep_helper_smoke() {
     // Derive account-1's UA from the test seed — same trick the workspace
     // tests use to get a syntactically-valid UA without needing a second
     // funded seed in the harness.
-    let seed = SecretString::new(harness.test_seed().to_owned());
-    let accounts = derive_accounts(&seed, ZeckNetwork::Testnet, 2)
-        .expect("derive_accounts for sweep destination");
-    let destination_ua = accounts[1].unified_address.clone();
+    let destination_ua = regtest_encoded_unified_address_at(harness.test_seed(), 1);
 
     let mut handle = HelperSpawn::new(
         env!("CARGO_BIN_EXE_argos-sweep-helper"),
@@ -2426,19 +2408,28 @@ async fn argos_sweep_helper_smoke() {
 /// identical, only the HRP differs.
 #[cfg(feature = "argos-network")]
 fn regtest_encoded_unified_address(seed: &str) -> String {
+    regtest_encoded_unified_address_at(seed, 0)
+}
+
+/// As above, for a destination account other than the first.
+///
+/// Several tests deliberately sweep to an account *outside* the funded set,
+/// so they need a specific index rather than always account 0.
+#[cfg(feature = "argos-network")]
+fn regtest_encoded_unified_address_at(seed: &str, index: usize) -> String {
     use argos_core::workspace::consensus_network;
     use zcash_keys::address::Address;
 
     let accounts = argos_core::derive_accounts(
         &secrecy::SecretString::new(seed.to_owned()),
         argos_core::ZeckNetwork::Testnet,
-        1,
+        u32::try_from(index + 1).expect("account index fits u32"),
     )
     .expect("deriving destination accounts");
 
     let address = Address::decode(
         &zcash_protocol::consensus::Network::TestNetwork,
-        &accounts[0].unified_address,
+        &accounts[index].unified_address,
     )
     .expect("argos produced an undecodable unified address");
 
