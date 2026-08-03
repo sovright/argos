@@ -1411,20 +1411,40 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
     let pre_balance: u64 = pre.accounts.iter().map(|a| a.total_zatoshis).sum();
     eprintln!("[regtest] pre-reorg: tip={pre_tip}, balance={pre_balance}");
 
+    // Driven through Zebra's RPC rather than `zcash_cli`. The harness ran
+    // zcashd when this test was written; the migration to Zebra left the
+    // helper pointing at a container that no longer exists, so the test had
+    // been failing on `No such container: argos-zcashd-regtest` rather than
+    // on anything it asserts (part of #186).
+    //
+    // Zebra does implement `invalidateblock` and `reconsiderblock`. The one
+    // constraint that matters here is that it can only invalidate a block in
+    // the *non-finalized* chain, which is why the reorg depth stays small.
     let invalidate_height = pre_tip.saturating_sub(5);
-    let invalidate_hash = zcashd_cli(&["getblockhash", &invalidate_height.to_string()]);
-    eprintln!(
-        "[regtest] invalidating block @ height {invalidate_height} (hash {invalidate_hash})",
-    );
-    let _ = zcashd_cli(&["invalidateblock", &invalidate_hash]);
-    let _ = zcashd_cli(&["generate", "10"]);
+    let invalidate_hash = common::regtest_harness::zebra_rpc(
+        "getblockhash",
+        serde_json::json!([invalidate_height]),
+    )
+    .await
+    .as_str()
+    .expect("getblockhash returns a hash string")
+    .to_owned();
+    eprintln!("[regtest] invalidating block @ height {invalidate_height} (hash {invalidate_hash})",);
+    let _ = common::regtest_harness::zebra_rpc(
+        "invalidateblock",
+        serde_json::json!([invalidate_hash]),
+    )
+    .await;
+    let _ = common::regtest_harness::zebra_rpc("generate", serde_json::json!([10])).await;
 
     // Let lightwalletd's polling loop observe the new tip.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let new_chain_tip: u64 = zcashd_cli(&["getblockcount"])
-        .parse()
-        .expect("[regtest] parse getblockcount output");
+    let new_chain_tip: u64 =
+        common::regtest_harness::zebra_rpc("getblockcount", serde_json::json!([]))
+            .await
+            .as_u64()
+            .expect("getblockcount returns a number");
     assert!(
         new_chain_tip > pre_tip,
         "[regtest] post-reorg chain tip must exceed pre-reorg tip; got new={new_chain_tip}, pre={pre_tip}"
@@ -1500,59 +1520,6 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
     eprintln!("[regtest] reorg detected and rescanned successfully");
 }
 
-/// Execute a zcash-cli command against the harness's zcashd-regtest container
-/// and return stdout (trimmed). Used by R-S26 to drive chain manipulation
-/// (invalidateblock, generate, getblockhash) via RPC.
-///
-/// Defaults to `docker exec` against the well-known container name from
-/// `tests/regtest/docker-compose.yml`. Bare-metal contributors (those
-/// running zcashd locally rather than via the docker harness) override the
-/// wrapper command line via:
-///
-///     ARGOS_REGTEST_ZCASH_CLI="zcash-cli -conf=/path/to/zcash.conf"
-///
-/// The override is parsed by whitespace-splitting and so cannot contain
-/// args with embedded spaces — sufficient for typical zcash-cli usage.
-///
-/// Panics rather than returning Result because every failure here is a
-/// hard test-setup error (docker missing, container down, zcash-cli
-/// returning non-zero) — the C2 tests are already `#[ignore]`'d so the
-/// panic only surfaces under `cargo test --ignored`.
-/// NOTE: stale since the Zebra migration. The default below shells into
-/// `argos-zcashd-regtest`, a container the harness no longer starts, so every
-/// caller of this helper fails until it is ported. Its only caller is the
-/// reorg test, which is stale for a second reason anyway — it expects a
-/// transparent-funded seed, and funding is now shielded coinbase (see
-/// tests/regtest/README.md). Porting means talking JSON-RPC to Zebra instead
-/// of `zcash-cli`; note Zebra does not implement `invalidateblock`, so the
-/// reorg has to be produced differently.
-fn zcashd_cli(args: &[&str]) -> String {
-    let wrapper = std::env::var("ARGOS_REGTEST_ZCASH_CLI").unwrap_or_else(|_| {
-        "docker exec argos-zcashd-regtest zcash-cli -conf=/srv/zcashd/.zcash/zcash.conf".to_owned()
-    });
-    let parts: Vec<&str> = wrapper.split_whitespace().collect();
-    let (program, base_args) = parts
-        .split_first()
-        .expect("[regtest] ARGOS_REGTEST_ZCASH_CLI must not be empty");
-    let output = std::process::Command::new(program)
-        .args(base_args)
-        .args(args)
-        .output()
-        .unwrap_or_else(|err| {
-            panic!("[regtest] failed to spawn `{program}` for zcash-cli: {err}")
-        });
-    if !output.status.success() {
-        panic!(
-            "[regtest] zcash-cli {args:?} failed: status={:?}, stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-    String::from_utf8(output.stdout)
-        .expect("[regtest] zcash-cli stdout was not valid UTF-8")
-        .trim()
-        .to_owned()
-}
 
 // ─── R-S27: Crash mid-scan resume ───────────────────────────────────────────
 //
