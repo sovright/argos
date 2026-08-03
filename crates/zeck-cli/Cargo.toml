@@ -18,6 +18,18 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 argos-core = { path = "../zeck-core" }
 
+[features]
+# `argos-network` — test-only passthrough to the core feature of the same
+# name, so the regtest integration tests can drive the real `argos` binary
+# against a private chain.
+#
+# Never enabled for a released build. Without it, `REGTEST_PARAMS` is
+# compiled out of argos-core entirely, so a shipped `argos` has no code path
+# that can retarget consensus parameters — which is what stops a hostile
+# mainnet lightwalletd from claiming to be `regtest` to bypass network
+# validation. Enabling it by default would forfeit that.
+argos-network = ["argos-core/argos-network"]
+
 [[bin]]
 name = "argos"
 path = "src/main.rs"

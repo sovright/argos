@@ -192,7 +192,6 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
     }
 }
 
-
 /// Sweep a transparent-only wallet, with the same guard rails the HD sweep
 /// has: a dry run that signs nothing, an explicit confirmation for an
 /// irreversible action, and a fee ceiling checked before signing.
@@ -462,10 +461,41 @@ async fn resolve_birthday(
     }
 }
 
+/// Point this process at the harness's private regtest chain.
+///
+/// Compiled out unless the crate is built with `argos-network`, which a
+/// released build never is. That gate — not this env var — is what stops a
+/// shipped `argos` from being talked onto foreign consensus parameters: with
+/// the feature off, `set_regtest_consensus_params` does not exist to call.
+///
+/// The env var exists so that even a feature-enabled test binary only
+/// retargets when the harness explicitly asks it to.
+#[cfg(feature = "argos-network")]
+fn install_regtest_params_if_requested() -> Result<()> {
+    if std::env::var_os("ARGOS_REGTEST_CONSENSUS").is_none() {
+        return Ok(());
+    }
+    argos_core::workspace::set_regtest_consensus_params(
+        argos_core::workspace::regtest_local_network(),
+    )?;
+    tracing::warn!(
+        "regtest consensus parameters installed via ARGOS_REGTEST_CONSENSUS; \
+         this build is not a release build"
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "argos-network"))]
+fn install_regtest_params_if_requested() -> Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose)?;
+
+    install_regtest_params_if_requested()?;
 
     // Gate the network/funds-moving commands on Terms of Service acceptance.
     // `show-keys` is purely local key derivation and is intentionally ungated.
@@ -647,7 +677,6 @@ async fn main() -> Result<()> {
             if progress.phase == ScanPhase::Cancelled {
                 std::process::exit(130);
             }
-
 
             if progress.phase == ScanPhase::Error {
                 bail!("recovery scan failed");
