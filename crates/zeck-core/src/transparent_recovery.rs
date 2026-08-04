@@ -748,18 +748,66 @@ mod destination_tests {
     use super::*;
     use crate::models::ZeckNetwork;
 
-    /// A UA with no Sapling receiver must be refused *before* anything is
-    /// signed, with an error the user can act on — not fail deep inside
-    /// the builder with a type error.
+    // A real mainnet UA (Orchard + Sapling) from the BIP-39 all-"abandon"
+    // vector — no funds. Shared by the tests below.
+    const UA_ORCHARD_SAPLING: &str = "u1nvgt6yr35mhc9wdf4wckvl38476vqy96dx3cwkfdwy4jet9300l5v8l2yg27ql7w9qwm0lf8kncnj9nus4mgete06j3cu3mhrqvstg6swvdya6xgzwhh6a9xxdhxkavvvmztqeuaurjtqfk3dzetuzgnu0zjvmdpe8ehvj53sy6yhzxj";
+
+    /// The high-stakes case: a mainnet destination on a testnet sweep must be
+    /// refused *specifically* as WrongNetwork, not merely as "not an error".
+    /// Getting this wrong broadcasts real funds to an address that cannot be
+    /// spent on the network they were sent to. Uses a real unified address so
+    /// the refusal is proven to come from the network check — not, as with a
+    /// bare t-address, from the earlier "must be unified" gate.
     #[test]
-    fn a_transparent_only_destination_is_refused_with_guidance() {
-        // A bare t-address: valid, but it has no Sapling receiver.
-        let err = sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Mainnet)
-            .expect_err("a transparent destination has no Sapling receiver");
-        let rendered = err.to_string();
+    fn a_mainnet_ua_is_refused_on_testnet_as_wrong_network() {
+        let err = sapling_receiver(UA_ORCHARD_SAPLING, ZeckNetwork::Testnet)
+            .expect_err("a mainnet UA must not be accepted for a testnet sweep");
+        match err {
+            ZeckError::WrongNetwork { expected, actual } => {
+                assert_eq!(expected, "testnet");
+                assert_eq!(actual, "mainnet");
+            }
+            other => panic!("expected WrongNetwork, got {other:?}"),
+        }
+    }
+
+    /// The actual "no Sapling receiver" guidance path. It is reachable only by
+    /// a UA that clears the unified + network gates but carries no Sapling
+    /// receiver — an Orchard-only UA (a transparent-only UA is forbidden by
+    /// ZIP-316, so this is the case that can occur in the wild). Built by
+    /// stripping the Sapling receiver off the real UA above so the test needs
+    /// no seed derivation.
+    #[test]
+    fn a_ua_without_a_sapling_receiver_is_refused_with_guidance() {
+        use zcash_address::unified::{Address as UnifiedAddress, Container, Encoding, Receiver};
+        use zcash_protocol::consensus::NetworkType;
+
+        let (net, ua) = UnifiedAddress::decode(UA_ORCHARD_SAPLING).expect("test UA decodes");
+        assert_eq!(net, NetworkType::Main);
+
+        let orchard_only: Vec<Receiver> = ua
+            .items()
+            .into_iter()
+            .filter(|r| matches!(r, Receiver::Orchard(_)))
+            .collect();
+        assert_eq!(
+            orchard_only.len(),
+            1,
+            "the source UA must carry exactly one Orchard receiver"
+        );
+        let encoded = UnifiedAddress::try_from_items(orchard_only)
+            .expect("an Orchard-only UA is valid under ZIP-316")
+            .encode(&NetworkType::Main);
+
+        let err = sapling_receiver(&encoded, ZeckNetwork::Mainnet)
+            .expect_err("a UA with no Sapling receiver cannot receive the sweep");
         assert!(
-            rendered.contains("Sapling") || rendered.contains("destination"),
-            "the refusal must name the problem, got: {rendered}"
+            matches!(err, ZeckError::InvalidAddress(_)),
+            "expected actionable InvalidAddress guidance, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Sapling receiver"),
+            "the refusal must name the missing Sapling receiver, got: {err}"
         );
     }
 
@@ -768,13 +816,14 @@ mod destination_tests {
         assert!(sapling_receiver("not-an-address", ZeckNetwork::Mainnet).is_err());
     }
 
-    /// A mainnet destination must not be accepted for a testnet sweep.
-    /// Getting this wrong sends real funds to an address that cannot be
-    /// spent on the network they were broadcast to.
+    /// A bare transparent destination is refused at the unified-address gate,
+    /// before any Sapling-receiver logic runs. This is the behavior the old
+    /// `a_transparent_only_destination_is_refused_with_guidance` actually
+    /// tested; named accordingly so it isn't mistaken for guidance coverage.
     #[test]
-    fn a_mainnet_destination_is_refused_on_testnet() {
-        assert!(
-            sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Testnet).is_err()
-        );
+    fn a_bare_transparent_destination_is_refused_as_non_unified() {
+        let err = sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Mainnet)
+            .expect_err("a bare t-address is not a unified address");
+        assert!(matches!(err, ZeckError::DestinationMustBeUnified), "got {err:?}");
     }
 }
