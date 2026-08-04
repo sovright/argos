@@ -47,6 +47,7 @@
 //!                              # shielded one (--t-addr is a legacy alias)
 //!     [--print-fixture-addresses]  # print the golden wallet fixture's
 //!                              # Sapling and transparent addresses, then exit
+//!     [--account <n>]          # HD account of the seed to pay (default 0)
 //! ```
 //!
 //! ## Why `--t-addr` exists despite the section above
@@ -146,6 +147,11 @@ struct Args {
     t_addr: Option<String>,
     /// Print the golden wallet fixture's addresses and exit.
     print_fixture_addresses: bool,
+    /// Which HD account of the funded seed to pay. R-S29 needs two funded
+    /// accounts so a crash between two sweep broadcasts is observable: with
+    /// one account there is only ever one broadcast, and the property the
+    /// test asserts cannot exist.
+    account: u32,
 }
 
 /// Emit the golden wallet fixture's addresses.
@@ -204,6 +210,7 @@ fn parse_args() -> Args {
     let mut print_address_only = false;
     let mut t_addr = None;
     let mut print_fixture_addresses = false;
+    let mut account: u32 = 0;
 
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -220,6 +227,11 @@ fn parse_args() -> Args {
             "--print-address-only" => print_address_only = true,
             "--address" | "--t-addr" => t_addr = Some(value()),
             "--print-fixture-addresses" => print_fixture_addresses = true,
+            "--account" => {
+                account = value()
+                    .parse()
+                    .expect("--account must be a u32 HD account index");
+            }
             other => panic!("unrecognized argument {other}"),
         }
     }
@@ -231,6 +243,7 @@ fn parse_args() -> Args {
         print_address_only,
         t_addr,
         print_fixture_addresses,
+        account,
     }
 }
 
@@ -303,12 +316,15 @@ async fn block_count(url: &str) -> u64 {
 /// rejects the testnet HRP outright. The underlying receiver is identical;
 /// only the human-readable prefix differs, so decode under testnet and
 /// re-encode under regtest.
-fn regtest_encoded_sapling_address(seed: &SecretString) -> String {
+fn regtest_encoded_sapling_address(seed: &SecretString, account: u32) -> String {
     use zcash_keys::address::Address;
 
-    let accounts = argos_core::derive_accounts(seed, ZeckNetwork::Testnet, 1)
+    let count = account
+        .checked_add(1)
+        .expect("account index must leave room for a count");
+    let accounts = argos_core::derive_accounts(seed, ZeckNetwork::Testnet, count)
         .unwrap_or_else(|err| panic!("deriving accounts for the seed to fund: {err}"));
-    let testnet_encoded = &accounts[0].sapling_address;
+    let testnet_encoded = &accounts[account as usize].sapling_address;
 
     let address = Address::decode(
         &zcash_protocol::consensus::Network::TestNetwork,
@@ -347,7 +363,7 @@ async fn main() -> ExitCode {
     // lightwalletd for.
     let address = match &args.t_addr {
         Some(t_addr) => t_addr.clone(),
-        None => regtest_encoded_sapling_address(&seed),
+        None => regtest_encoded_sapling_address(&seed, args.account),
     };
     emit(&Event::FundAddress { address: &address });
 

@@ -5,9 +5,11 @@
 # Argos test seed so the C2 integration tests have a known-funded wallet to
 # recover, and mines past coinbase maturity so those funds are spendable.
 #
-# Exits non-zero on any failure. Re-running is safe: it tops the seed up with
-# additional notes rather than resetting anything. For a clean chain, run
-# `docker compose down -v` first.
+# Exits non-zero on any failure. Re-running tops the seed up with additional
+# notes rather than resetting anything — but note that on an already-mined
+# chain those notes are worth nothing, because the regtest subsidy has decayed
+# by then. Recovering a chain whose addresses have been swept means
+# `docker compose down -v` and a full rebuild.
 #
 # ── What changed, and why ──────────────────────────────────────────────────
 #
@@ -115,6 +117,18 @@ ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
     --blocks "$FUND_BLOCKS" \
     || die "funding failed"
 
+# Account 1 as well as account 0. R-S29 kills a sweep between two account
+# broadcasts and asserts the resumed run produces exactly one; with a single
+# funded account there is only ever one broadcast and the property it tests
+# cannot exist. The test refuses to run without this rather than assert
+# something meaningless, which is why it needs the export printed at the end.
+log "funding account 1 of the test seed (needed by R-S29) ..."
+ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
+    --zebra-rpc-url "$ZEBRA_RPC_URL" \
+    --account 1 \
+    --blocks "$FUND_BLOCKS" \
+    || die "funding account 1 failed"
+
 # ── Fund the imported-wallet tests ─────────────────────────────────────────
 #
 # These spend from the golden wallet.dat fixture, so they need that exact
@@ -126,6 +140,9 @@ ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
 # and funding afterwards produces coinbase worth nothing, which surfaces as
 # "a funded wallet must report a non-zero balance" — a funding failure that
 # reads like a scanning bug.
+#
+# This is not fixable from Zebra's config: `pre_blossom_halving_interval` is
+# ignored on Regtest. See the comment in zebrad-regtest.toml.
 log "funding the imported-wallet fixture addresses ..."
 FIXTURE_JSON="$("$FUNDER" --zebra-rpc-url "$ZEBRA_RPC_URL" --print-fixture-addresses)" \
     || die "could not read the fixture addresses"
@@ -189,4 +206,7 @@ log "done — chain height $HEIGHT"
 log ""
 log "Next:"
 log "    export ARGOS_REGTEST_LIGHTWALLETD_URL=http://localhost:9067"
+# R-S29 reads this as a gate: its value is not used, its presence signals
+# that account 1 was funded by a setup.sh new enough to do so.
+log "    export ARGOS_REGTEST_TEST_T_ADDR_1=funded"
 log "    cargo test -p argos-core --features argos-network -- --ignored"
