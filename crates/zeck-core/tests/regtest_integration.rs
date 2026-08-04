@@ -1773,6 +1773,23 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     );
     eprintln!("[regtest] R-S29: SIGKILLed first run during pause between broadcasts");
 
+    // Mine the first run's broadcast into the chain before resuming.
+    //
+    // The test's premise is that the resumed run finds the already-swept
+    // account empty and so produces exactly one broadcast. That requires the
+    // killed run's transaction to be *confirmed*: a scan reads compact
+    // blocks, so an unconfirmed transaction sitting in the mempool is
+    // invisible to it. Without this the resumed run re-selects the same notes
+    // and the node rejects the rebroadcast — "another transaction in the
+    // mempool has already spent some of its inputs" — which is the mempool
+    // refusing a double spend, not Argos avoiding one.
+    //
+    // The original comment on this test assumed the tx "was included in the
+    // chain by the harness's miner". Nothing mines on this harness, so that
+    // step has to be explicit.
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     // ─── Resume run: same --data-dir, expect exactly 1 broadcast ──────────
     let resume_handle = HelperSpawn::new(
         env!("CARGO_BIN_EXE_argos-sweep-helper"),
@@ -2090,6 +2107,15 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
 #[tokio::test]
 async fn sweep_places_a_donation_output_when_rate_is_set() {
     let harness = RegtestHarness::require();
+
+    // Confirm anything an earlier sweep test left unconfirmed before scanning.
+    // These tests share the test seed's accounts and run in one process, so a
+    // previous sweep's transaction can still be sitting in the mempool; this
+    // scan would then not see those notes as spent, build a conflicting
+    // transaction, and be rejected on broadcast.
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     let temp_data_dir = tempfile::tempdir().expect("tempdir for donation sweep");
     let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-donate").await;
 
