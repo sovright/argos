@@ -5,11 +5,12 @@
 # Argos test seed so the C2 integration tests have a known-funded wallet to
 # recover, and mines past coinbase maturity so those funds are spendable.
 #
-# Exits non-zero on any failure. Re-running tops the seed up with additional
-# notes rather than resetting anything — but note that on an already-mined
-# chain those notes are worth nothing, because the regtest subsidy has decayed
-# by then. Recovering a chain whose addresses have been swept means
-# `docker compose down -v` and a full rebuild.
+# Exits non-zero on any failure. Re-running is the supported way to recover a
+# chain whose funded addresses have been swept by a test run: it pays every
+# test address again from the treasury. Only the treasury itself is funded
+# with coinbase, and only near genesis, because that is the one window where
+# the regtest subsidy is worth anything. For a genuinely clean chain, run
+# `docker compose down -v` first.
 #
 # ── What changed, and why ──────────────────────────────────────────────────
 #
@@ -45,6 +46,10 @@
 #                              Each block is one spendable note, so >1 makes a
 #                              sweep select across notes.
 #   REGTEST_FUND_SEED          Mnemonic to fund (default: the Argos test seed).
+#   REGTEST_TREASURY_SEED      Mnemonic that funds everything else by transfer.
+#   REGTEST_TREASURY_BLOCKS    Coinbase blocks paid to the treasury (default 30).
+#   REGTEST_FUND_ZATOSHIS      Paid to each test address per run (default 12.5 ZEC).
+#   REGTEST_LIGHTWALLETD_URL   lightwalletd endpoint used by transfer funding.
 
 set -euo pipefail
 
@@ -92,6 +97,22 @@ command -v cargo  >/dev/null 2>&1 || die "cargo not found on PATH"
 
 docker ps --format '{{.Names}}' | grep -qx "$ZEBRA_CONTAINER" \
     || die "container $ZEBRA_CONTAINER is not running — run 'docker compose up -d' first"
+
+# ── Clear any gossip backlog from a previous run ───────────────────────────
+#
+# Zebra queues every mined block for gossip to peers. A regtest node has none,
+# so nothing drains that queue and bulk mining fills it; afterwards every
+# `generate` fails with "no available capacity" while still accepting the
+# block. A restart is the only way to clear it.
+#
+# This runs at the *start*, not just after the mining below, because
+# re-running this script is now the supported way to top up a chain whose
+# addresses have been swept. Without it, any interrupted run leaves a
+# saturated queue that makes the next run fail at its first funding call —
+# with an error about gossip capacity that says nothing about funding.
+log "restarting Zebra to clear any gossip backlog from a previous run ..."
+docker restart "$ZEBRA_CONTAINER" >/dev/null 2>&1 \
+    || die "could not restart $ZEBRA_CONTAINER"
 
 # ── Wait for RPC readiness ─────────────────────────────────────────────────
 
