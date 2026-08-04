@@ -1796,7 +1796,8 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
         .expect("resume sweep-helper must run to completion");
     assert!(
         resume_status.success(),
-        "[regtest] R-S29: resume run did not exit cleanly: {resume_status:?}"
+        "[regtest] R-S29: resume run did not exit cleanly: {resume_status:?}; \
+         events: {resume_events:?}"
     );
 
     let resume_broadcasts: Vec<u32> = resume_events
@@ -2287,7 +2288,11 @@ async fn argos_sweep_helper_smoke() {
     .await
     .expect("spawn argos-sweep-helper");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    // 600s, not 240s. setup.sh now funds accounts 0 and 1 (R-S29 cannot
+    // exist otherwise), so this sweeps two accounts and builds two Sapling
+    // proofs instead of one. Proving dominates, and these tests run against
+    // an unoptimised debug build.
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
     let broadcast_count = handle
         .wait_for(deadline, |events| {
             events.iter().find_map(|e| match e {
@@ -2296,10 +2301,11 @@ async fn argos_sweep_helper_smoke() {
             })
         })
         .await
-        .expect("sweep-helper must reach SweepComplete within 240s");
+        .expect("sweep-helper must reach SweepComplete within 600s");
 
-    // setup.sh as-of this PR funds only account 0, so we expect exactly one
-    // broadcast. The R-S29 PR will extend setup.sh to fund 2 accounts.
+    // Lower bound rather than an exact count: how many accounts setup.sh
+    // funds is the harness's business, not this test's. R-S29 is the test
+    // that depends on the count being exactly two.
     assert!(
         broadcast_count >= 1,
         "[regtest] sweep-helper smoke: expected at least one broadcast"
