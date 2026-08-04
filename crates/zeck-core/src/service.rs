@@ -321,6 +321,32 @@ impl RecoveryService {
                 progress.phase
             )));
         }
+
+        // Confirm the workspace this proposal describes is still there and
+        // still readable, before quoting a number derived from it.
+        //
+        // The balances below come from the in-memory scan state, not from
+        // disk, so without this check a deleted or permission-stripped
+        // workspace produces a confident, fully-priced proposal — and the
+        // proposal's own warning tells the user it came from the persisted
+        // wallet. Executing it would then fail, after the user has already
+        // been shown an amount. For a recovery tool a confidently wrong
+        // balance is a worse failure than a clean error.
+        //
+        // `from_runtime` only computes paths; it creates nothing, so this
+        // cannot mask a missing workspace by recreating it.
+        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
+        open_wallet_db(
+            workspace.wallet_db_path(),
+            consensus_network(session.runtime.network),
+        )
+        .map_err(|err| {
+            ZeckError::Wallet(format!(
+                "the recovery workspace backing this scan is no longer readable, so its \
+                 balances cannot be trusted: {err}"
+            ))
+        })?;
+
         build_sweep_proposal(
             &progress,
             request,
@@ -643,7 +669,7 @@ fn build_sweep_proposal(
     }
 
     let warning = if net_received_zatoshis > 0 {
-        "This dry-run proposal uses the authoritative scan balances from the persisted wallet workspace. Argos estimates any required shielding first, then a final sweep to the destination Unified Address."
+        "This dry-run proposal uses the balances from the completed scan, checked against the recovery workspace on disk. Argos estimates any required shielding first, then a final sweep to the destination Unified Address."
             .to_owned()
     } else if !skipped_accounts.is_empty() {
         "Balances were detected, but every discovered account was skipped because the ZIP 317 fee floor would consume the recoverable value."
