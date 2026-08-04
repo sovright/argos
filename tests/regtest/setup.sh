@@ -56,6 +56,19 @@ readonly FUND_BLOCKS="${REGTEST_FUND_BLOCKS:-4}"
 readonly ARGOS_TEST_SEED="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 readonly FUND_SEED="${REGTEST_FUND_SEED:-$ARGOS_TEST_SEED}"
 
+# The treasury. A separate seed from the one under test, deliberately: sweep
+# tests drain the wallets they test, and a treasury that could be drained
+# would defeat the point of having one. Another BIP-39 test vector, no real
+# funds anywhere.
+readonly TREASURY_SEED="${REGTEST_TREASURY_SEED:-zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote}"
+# Coinbase blocks paid to the treasury near genesis. At ~6.25 ZEC each this is
+# far more than the suite spends, which is the intent: topping the treasury up
+# later is impossible, so it is filled once with plenty of headroom.
+readonly TREASURY_BLOCKS="${REGTEST_TREASURY_BLOCKS:-30}"
+# Paid to each test address per run. 12.5 ZEC.
+readonly FUND_ZATOSHIS="${REGTEST_FUND_ZATOSHIS:-1250000000}"
+readonly LIGHTWALLETD_URL="${REGTEST_LIGHTWALLETD_URL:-http://localhost:9067}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly REPO_ROOT
 
@@ -109,61 +122,25 @@ FUNDER="$REPO_ROOT/target/debug/argos-regtest-funder"
 readonly FUNDER
 [ -x "$FUNDER" ] || die "funder binary missing at $FUNDER"
 
-# ── Fund ───────────────────────────────────────────────────────────────────
-
-log "funding the test seed with $FUND_BLOCKS shielded coinbase block(s), then mining to maturity ..."
-ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
+# ── Fund the treasury ──────────────────────────────────────────────────────
+#
+# Only the treasury is paid with coinbase, and only here, near genesis. The
+# regtest subsidy halves every ~150 blocks and is worth nothing past about
+# height 6,000, so this is the one window in which mining pays anything.
+#
+# Everything else is funded from the treasury by ordinary shielded transfer
+# after the mining below, because a transfer does not care what the subsidy is
+# doing. That is what makes this script re-runnable: a suite run that drains a
+# swept address is recovered by running setup.sh again, not by rebuilding the
+# chain from genesis.
+#
+# (Zebra cannot fix the subsidy from config — `pre_blossom_halving_interval`
+# is accepted on Regtest and ignored. See zebrad-regtest.toml.)
+log "funding the treasury with $TREASURY_BLOCKS shielded coinbase block(s) ..."
+ARGOS_REGTEST_FUND_SEED="$TREASURY_SEED" "$FUNDER" \
     --zebra-rpc-url "$ZEBRA_RPC_URL" \
-    --blocks "$FUND_BLOCKS" \
-    || die "funding failed"
-
-# Account 1 as well as account 0. R-S29 kills a sweep between two account
-# broadcasts and asserts the resumed run produces exactly one; with a single
-# funded account there is only ever one broadcast and the property it tests
-# cannot exist. The test refuses to run without this rather than assert
-# something meaningless, which is why it needs the export printed at the end.
-log "funding account 1 of the test seed (needed by R-S29) ..."
-ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
-    --zebra-rpc-url "$ZEBRA_RPC_URL" \
-    --account 1 \
-    --blocks "$FUND_BLOCKS" \
-    || die "funding account 1 failed"
-
-# ── Fund the imported-wallet tests ─────────────────────────────────────────
-#
-# These spend from the golden wallet.dat fixture, so they need that exact
-# file's addresses funded — no other address leaves them anything to find.
-#
-# Funding MUST happen here, before the ZIP 212 mining below. The regtest
-# block subsidy halves every ~150 blocks and is worthless past about height
-# 6,000, while ZIP 212 enforcement does not begin until 32,257. Mining first
-# and funding afterwards produces coinbase worth nothing, which surfaces as
-# "a funded wallet must report a non-zero balance" — a funding failure that
-# reads like a scanning bug.
-#
-# This is not fixable from Zebra's config: `pre_blossom_halving_interval` is
-# ignored on Regtest. See the comment in zebrad-regtest.toml.
-log "funding the imported-wallet fixture addresses ..."
-FIXTURE_JSON="$("$FUNDER" --zebra-rpc-url "$ZEBRA_RPC_URL" --print-fixture-addresses)" \
-    || die "could not read the fixture addresses"
-FIXTURE_SAPLING="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"sapling":"\([^"]*\)".*/\1/')"
-FIXTURE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"transparent":"\([^"]*\)",.*/\1/')"
-STANDALONE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" \
-    | sed -e 's/.*"standalone_transparent":"\([^"]*\)".*/\1/')"
-[ -n "$FIXTURE_SAPLING" ] || die "could not parse the fixture Sapling address"
-[ -n "$FIXTURE_TRANSPARENT" ] || die "could not parse the fixture transparent address"
-[ -n "$STANDALONE_TRANSPARENT" ] || die "could not parse the standalone transparent address"
-
-# The standalone address is funded separately from the fixture's because the
-# imported sweep drains every fixture address, transparent included. The
-# transparent-only test needs funds no other test can spend.
-for addr in "$FIXTURE_SAPLING" "$FIXTURE_TRANSPARENT" "$STANDALONE_TRANSPARENT"; do
-    ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
-        --zebra-rpc-url "$ZEBRA_RPC_URL" \
-        --address "$addr" \
-        --blocks "$FUND_BLOCKS" \
-        || die "funding $addr failed"
-done
+    --blocks "$TREASURY_BLOCKS" \
+    || die "funding the treasury failed"
 
 # ── Mine past the ZIP 212 grace period ─────────────────────────────────────
 #
@@ -199,6 +176,52 @@ for _ in $(seq 1 60); do
 done
 zrpc getblockcount 2>/dev/null | grep -q result \
     || die "Zebra did not come back after the restart"
+
+# ── Fund every test address from the treasury ──────────────────────────────
+#
+# One transaction for all of them. Funding them one at a time would need a
+# mined block and a treasury rescan between each, so the next payment could
+# see the previous one's change note — minutes per address against a
+# 32,000-block chain.
+log "deriving the addresses to fund ..."
+FIXTURE_JSON="$("$FUNDER" --zebra-rpc-url "$ZEBRA_RPC_URL" --print-fixture-addresses)" \
+    || die "could not read the fixture addresses"
+FIXTURE_SAPLING="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"sapling":"\([^"]*\)".*/\1/')"
+FIXTURE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" | sed -e 's/.*"transparent":"\([^"]*\)",.*/\1/')"
+STANDALONE_TRANSPARENT="$(printf '%s' "$FIXTURE_JSON" \
+    | sed -e 's/.*"standalone_transparent":"\([^"]*\)".*/\1/')"
+[ -n "$FIXTURE_SAPLING" ] || die "could not parse the fixture Sapling address"
+[ -n "$FIXTURE_TRANSPARENT" ] || die "could not parse the fixture transparent address"
+[ -n "$STANDALONE_TRANSPARENT" ] || die "could not parse the standalone transparent address"
+
+seed_address() {
+    ARGOS_REGTEST_FUND_SEED="$FUND_SEED" "$FUNDER" \
+        --zebra-rpc-url "$ZEBRA_RPC_URL" \
+        --account "$1" --print-address-only \
+        | sed -e 's/.*"address":"\([^"]*\)".*/\1/'
+}
+# Account 1 as well as account 0: R-S29 kills a sweep between two per-account
+# broadcasts and asserts the resumed run produces exactly one. With a single
+# funded account there is only ever one broadcast and the property cannot exist.
+SEED_ACCOUNT_0="$(seed_address 0)"
+SEED_ACCOUNT_1="$(seed_address 1)"
+[ -n "$SEED_ACCOUNT_0" ] || die "could not derive the test seed's account 0 address"
+[ -n "$SEED_ACCOUNT_1" ] || die "could not derive the test seed's account 1 address"
+
+log "funding every test address from the treasury in one transaction ..."
+ARGOS_REGTEST_FUND_SEED="$TREASURY_SEED" "$FUNDER" \
+    --zebra-rpc-url "$ZEBRA_RPC_URL" \
+    --lightwalletd-url "$LIGHTWALLETD_URL" \
+    --transfer "$SEED_ACCOUNT_0:$FUND_ZATOSHIS" \
+    --transfer "$SEED_ACCOUNT_1:$FUND_ZATOSHIS" \
+    --transfer "$FIXTURE_SAPLING:$FUND_ZATOSHIS" \
+    --transfer "$FIXTURE_TRANSPARENT:$FUND_ZATOSHIS" \
+    --transfer "$STANDALONE_TRANSPARENT:$FUND_ZATOSHIS" \
+    || die "treasury funding transfer failed"
+
+# Confirm the funding transaction. Transfers are ordinary transactions, so
+# they need one block, not the 100 a coinbase output needs.
+zrpc generate '[2]' >/dev/null 2>&1 || true
 
 HEIGHT="$(zrpc getblockcount | sed -e 's/.*"result":\([0-9]*\).*/\1/')"
 readonly HEIGHT

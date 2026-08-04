@@ -48,6 +48,10 @@
 //!     [--print-fixture-addresses]  # print the golden wallet fixture's
 //!                              # Sapling and transparent addresses, then exit
 //!     [--account <n>]          # HD account of the seed to pay (default 0)
+//!     [--transfer <addr>:<n>]  # pay <addr> n zatoshis from the treasury seed
+//!                              # instead of mining coinbase; works at any
+//!                              # height; repeatable, one transaction
+//!     [--lightwalletd-url <u>] # transfer mode only (default localhost:9067)
 //! ```
 //!
 //! ## Why `--t-addr` exists despite the section above
@@ -124,6 +128,13 @@ enum Event<'a> {
         blocks: u32,
         height: u64,
     },
+    /// A treasury payment, which works at any chain height.
+    Transferred {
+        payments: usize,
+        zatoshis: u64,
+        txid: &'a str,
+        treasury_remaining_zatoshis: u64,
+    },
     Funded {
         blocks_to_seed: u32,
         height: u64,
@@ -147,6 +158,14 @@ struct Args {
     t_addr: Option<String>,
     /// Print the golden wallet fixture's addresses and exit.
     print_fixture_addresses: bool,
+    /// `--transfer <addr>:<zatoshis>`, repeatable. Pays from the treasury
+    /// instead of mining coinbase, so it works at any height. All pairs go
+    /// into a single transaction — see `regtest_funding`.
+    transfers: Vec<(String, u64)>,
+    /// lightwalletd endpoint, used only by transfer mode: the treasury has to
+    /// be scanned and the payment broadcast, neither of which Zebra's RPC
+    /// does for a wallet.
+    lightwalletd_url: String,
     /// Which HD account of the funded seed to pay. R-S29 needs two funded
     /// accounts so a crash between two sweep broadcasts is observable: with
     /// one account there is only ever one broadcast, and the property the
@@ -210,6 +229,8 @@ fn parse_args() -> Args {
     let mut print_address_only = false;
     let mut t_addr = None;
     let mut print_fixture_addresses = false;
+    let mut transfers: Vec<(String, u64)> = Vec::new();
+    let mut lightwalletd_url = String::from("http://localhost:9067");
     let mut account: u32 = 0;
 
     let mut argv = std::env::args().skip(1);
@@ -227,6 +248,17 @@ fn parse_args() -> Args {
             "--print-address-only" => print_address_only = true,
             "--address" | "--t-addr" => t_addr = Some(value()),
             "--print-fixture-addresses" => print_fixture_addresses = true,
+            "--transfer" => {
+                let raw = value();
+                let (addr, amount) = raw
+                    .rsplit_once(':')
+                    .expect("--transfer takes <address>:<zatoshis>");
+                transfers.push((
+                    addr.to_owned(),
+                    amount.parse().expect("--transfer amount must be a u64"),
+                ));
+            }
+            "--lightwalletd-url" => lightwalletd_url = value(),
             "--account" => {
                 account = value()
                     .parse()
@@ -244,6 +276,8 @@ fn parse_args() -> Args {
         t_addr,
         print_fixture_addresses,
         account,
+        transfers,
+        lightwalletd_url,
     }
 }
 
@@ -356,6 +390,36 @@ async fn main() -> ExitCode {
     let seed = SecretString::new(
         seed_env.expect("ARGOS_REGTEST_FUND_SEED must be set to the mnemonic to fund"),
     );
+
+    // Transfer mode. Unlike every branch below it, this one does not mine:
+    // it spends existing treasury notes, which is the whole point — coinbase
+    // is worthless at the heights the ZIP 212 tests force the chain to.
+    if !args.transfers.is_empty() {
+        let data_dir = std::env::temp_dir().join("argos-regtest-treasury");
+        match argos_core::regtest_funding::transfer_from_treasury(
+            &seed,
+            &args.transfers,
+            &args.lightwalletd_url,
+            data_dir,
+            ZeckNetwork::Testnet,
+        )
+        .await
+        {
+            Ok(transfer) => {
+                emit(&Event::Transferred {
+                    payments: args.transfers.len(),
+                    zatoshis: args.transfers.iter().map(|(_, z)| z).sum(),
+                    txid: &transfer.txid,
+                    treasury_remaining_zatoshis: transfer.remaining_zatoshis,
+                });
+                return ExitCode::SUCCESS;
+            }
+            Err(err) => {
+                eprintln!("[funder] treasury transfer failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     // `--t-addr` is taken verbatim: it comes from a test that derived it
     // from a raw key under regtest parameters, so re-encoding it here would
