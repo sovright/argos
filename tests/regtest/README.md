@@ -61,26 +61,70 @@ cd tests/regtest
 docker compose up -d
 
 # Wait for the healthcheck to pass and run the funding script.
-# This mines 200 blocks (clears coinbase maturity) and sends 5 ZEC each to
-# accounts 0 and 1 of the Argos test seed's transparent addresses (2 funded
-# accounts by default — R-S29 requires multiple per-account broadcasts).
-# Override the account count with REGTEST_FUND_ACCOUNTS=N. Idempotent —
-# safe to re-run.
+# Fills the treasury with coinbase near genesis, mines to the ZIP 212
+# enforcement height, then pays every test address from the treasury in one
+# transaction. Takes roughly an hour on first run, most of it mining.
+#
+# Re-run it whenever the suite has drained the funded addresses — that is the
+# supported way to recover a chain, and it does not require rebuilding.
 ./setup.sh
 ```
 
-Then export the endpoint the integration tests read:
+Then export what the integration tests read. `setup.sh` prints both:
 
 ```bash
 export ARGOS_REGTEST_LIGHTWALLETD_URL=http://localhost:9067
+export ARGOS_REGTEST_TEST_T_ADDR_1=funded
+```
+
+Run the suite single-threaded. Funding shares one treasury workspace and
+SQLite permits one writer, so parallel tests that fund themselves collide
+with `database is locked`:
+
+```bash
+cargo test -p argos-core --features argos-network -- --ignored --test-threads=1
 ```
 
 ### How funding works, and what it means for the tests
 
 Zebra has **no wallet** — no `sendtoaddress`, no `getnewaddress` — so the old
-`zcash-cli sendtoaddress` funding is gone. `setup.sh` instead runs the
-`argos-regtest-funder` helper, which mines **shielded** coinbase (ZIP 213)
-directly to the test seed.
+`zcash-cli sendtoaddress` funding is gone. `setup.sh` runs the
+`argos-regtest-funder` helper instead.
+
+**Only the treasury is paid with coinbase, and only near genesis.** Everything
+else is funded by an ordinary shielded transfer *from* the treasury, at
+whatever height the chain has reached.
+
+That split exists because two requirements do not overlap in time:
+
+| Requirement | Constraint |
+|---|---|
+| PCZT construction needs ZIP 212 fully enforced | height > 32,257 |
+| Regtest coinbase pays anything | height < ~6,000 (subsidy halves every ~150 blocks) |
+
+Coinbase funding therefore only works near genesis, which used to mean every
+address was funded exactly once and could never be refilled. A sweep test
+drains its address, so the suite could not be run twice against one chain: the
+second run reported empty wallets that looked like defects. A transfer does not
+care what the subsidy is doing, so the treasury can pay any address at any
+height.
+
+Do **not** try to fix the subsidy with `pre_blossom_halving_interval` in
+`zebrad-regtest.toml`. Zebra accepts the key on Regtest and ignores it —
+`Parameters::new_regtest` hardcodes the interval. Measured against the pinned
+v6.2.3 with it set to 1,000,000: 6.25 ZEC at height 1, 5.96e-6 at 6,000, 0.0
+at 32,400, identical to the default.
+
+**The treasury cannot be topped up.** Its own funding is coinbase, so whatever
+`REGTEST_TREASURY_BLOCKS` buys at genesis (200 blocks ≈ 1,250 ZEC) is all it
+will ever hold. That is roughly twenty `setup.sh` runs. When it runs dry the
+error is `Insufficient balance ... including fee`, which reads like a wallet
+bug and is really an exhausted faucet; rebuild the chain with
+`docker compose down -v`.
+
+A test that needs funds should call `common::regtest_harness::fund_test_account`
+rather than rely on what `setup.sh` left, since sweep tests drain shared
+accounts and test order would otherwise decide which of them has money.
 
 Transparent coinbase cannot be used, and the reason is worth knowing before
 writing a test against this harness. Spending transparent coinbase requires
@@ -91,7 +135,7 @@ index, so `tx_index` is NULL in the wallet database and every output is
 conservatively treated as non-coinbase. A shielding proposal then fails with
 `Insufficient balance (have 0)` while the wallet visibly holds hundreds of ZEC.
 
-**So the test seed holds shielded funds, not transparent UTXOs.** Tests written
+**The test seed holds shielded funds, not transparent UTXOs.** Tests written
 against `ARGOS_REGTEST_TEST_T_ADDR` and a funded t-address will not find one.
 There is no lightwalletd-only route to non-coinbase transparent funds on a
 fresh chain; producing them would need a second, non-coinbase transaction from
@@ -136,9 +180,10 @@ docker compose down -v        # -v wipes the named volumes too
 ```
 
 Without `-v`, the named volumes (`zebrad-data`, `lwd-data`) persist between
-runs, so the chain state survives a `down`/`up`. The setup script is
-idempotent against an existing chain, so you only need `-v` if you want a
-fresh chain (e.g. to exercise a clean-slate test).
+runs, so the chain state survives a `down`/`up`. Re-running `setup.sh` against
+an existing chain tops every test address back up from the treasury, so a
+drained chain does not need `-v` — reach for it when the treasury itself is
+exhausted, or when you want a genuinely clean slate.
 
 ## What this harness is not
 
@@ -148,6 +193,11 @@ fresh chain (e.g. to exercise a clean-slate test).
   `crates/zeck-core/tests/regtest_integration.rs` will need additional
   scaffolding before their bodies can be implemented; the harness here just
   provides the baseline "two healthy services + a funded seed" foundation.
+  (The network-resilience tests do now run against `FakeLightwalletd`, an
+  in-process gRPC proxy — see `crates/zeck-core/tests/common/`. Note its proto
+  is a *subset* of upstream: an RPC missing there is not a compile error, it is
+  an `UNIMPLEMENTED` at runtime that fails a scan during setup. When upgrading
+  `zcash_client_backend`, diff its `sync.rs` against that service definition.)
 - **It is not for cross-platform verification.** docker-compose runs
   Linux containers regardless of host. macOS users still get the right
   test outcome but the in-container OS is Linux.

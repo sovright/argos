@@ -66,10 +66,16 @@ readonly FUND_SEED="${REGTEST_FUND_SEED:-$ARGOS_TEST_SEED}"
 # would defeat the point of having one. Another BIP-39 test vector, no real
 # funds anywhere.
 readonly TREASURY_SEED="${REGTEST_TREASURY_SEED:-zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote}"
-# Coinbase blocks paid to the treasury near genesis. At ~6.25 ZEC each this is
-# far more than the suite spends, which is the intent: topping the treasury up
-# later is impossible, so it is filled once with plenty of headroom.
-readonly TREASURY_BLOCKS="${REGTEST_TREASURY_BLOCKS:-30}"
+# Coinbase blocks paid to the treasury near genesis, at ~6.25 ZEC each.
+#
+# 200, not 30. The treasury cannot be topped up — its own funding is coinbase,
+# and the subsidy is worthless past ~height 6,000 — so whatever it gets here
+# is all it will ever have. Each setup.sh run spends FUND_ZATOSHIS per address
+# (62.5 ZEC across five), and tests that fund themselves draw on it too. At 30
+# blocks it held ~187 ZEC and ran dry after a couple of runs, failing with
+# "Insufficient balance (have 5624870000, need 6250055000 including fee)" --
+# a message that reads like a wallet bug rather than an exhausted faucet.
+readonly TREASURY_BLOCKS="${REGTEST_TREASURY_BLOCKS:-200}"
 # Paid to each test address per run. 12.5 ZEC.
 readonly FUND_ZATOSHIS="${REGTEST_FUND_ZATOSHIS:-1250000000}"
 readonly LIGHTWALLETD_URL="${REGTEST_LIGHTWALLETD_URL:-http://localhost:9067}"
@@ -157,6 +163,26 @@ readonly FUNDER
 #
 # (Zebra cannot fix the subsidy from config — `pre_blossom_halving_interval`
 # is accepted on Regtest and ignored. See zebrad-regtest.toml.)
+# Drop any treasury workspace left by a previous chain.
+#
+# The workspace lives outside the docker volumes, so `docker compose down -v`
+# wipes the chain and leaves the wallet database behind. That database then
+# believes it is synced to a height the new chain has not reached, and the
+# next scan asks lightwalletd for a block that does not exist yet:
+#
+#   GetBlock: block 32711 is newer than the latest block
+#
+# which reads like a lightwalletd fault rather than a stale wallet.
+#
+# Removing it costs a full rescan on the next funding call. Within a single
+# chain the workspace still persists between calls, so only the first funding
+# after a rebuild pays that.
+TREASURY_WORKSPACE="${TMPDIR:-/tmp}/argos-regtest-treasury"
+if [ -d "$TREASURY_WORKSPACE" ]; then
+    log "removing the treasury workspace left by a previous chain ..."
+    rm -rf "$TREASURY_WORKSPACE"
+fi
+
 log "funding the treasury with $TREASURY_BLOCKS shielded coinbase block(s) ..."
 ARGOS_REGTEST_FUND_SEED="$TREASURY_SEED" "$FUNDER" \
     --zebra-rpc-url "$ZEBRA_RPC_URL" \
@@ -228,6 +254,21 @@ SEED_ACCOUNT_0="$(seed_address 0)"
 SEED_ACCOUNT_1="$(seed_address 1)"
 [ -n "$SEED_ACCOUNT_0" ] || die "could not derive the test seed's account 0 address"
 [ -n "$SEED_ACCOUNT_1" ] || die "could not derive the test seed's account 1 address"
+
+# Record the height funding starts at, so tests can scan from here instead of
+# from genesis.
+#
+# This is only meaningful because funding moved off coinbase: the treasury
+# pays test addresses at whatever height the chain has reached, so the funds
+# sit near the tip and the 32,000 blocks below them are empty. Scanning from
+# height 1 re-read all of them on every test.
+FUNDING_HEIGHT="$(zrpc getblockcount | sed -e 's/.*"result":\([0-9]*\).*/\1/')"
+# One block of slack: a payment lands at FUNDING_HEIGHT+1 or later, and a
+# birthday equal to the funding height is already safe. The margin covers
+# off-by-one differences between "current tip" and "the block this confirms in".
+FUNDING_BIRTHDAY=$((FUNDING_HEIGHT > 1 ? FUNDING_HEIGHT - 1 : 1))
+printf '%s\n' "$FUNDING_BIRTHDAY" > "${TMPDIR:-/tmp}/argos-regtest-funding-height"
+log "tests will scan from height $FUNDING_BIRTHDAY rather than genesis"
 
 log "funding every test address from the treasury in one transaction ..."
 ARGOS_REGTEST_FUND_SEED="$TREASURY_SEED" "$FUNDER" \

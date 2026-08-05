@@ -104,10 +104,14 @@ async fn complete_scan_against_test_seed(
         key_source: std::sync::Arc::new(argos_core::SeedKeySource::new(SecretString::new(
             harness.test_seed().to_owned(),
         ))),
-        // The Argos network activates Sapling at height 1; setting a tiny
-        // birthday keeps the scan fast on regtest. zcashd-regtest tops out
-        // at ~200 blocks after setup.sh runs, so the scan is sub-second.
-        birthday: 1,
+        // Scan from where funding happened, not from genesis. The harness
+        // mines past 32,257 for ZIP 212, and the treasury pays test addresses
+        // after that, so everything worth finding sits near the tip and the
+        // blocks below it are empty. This used to read `birthday: 1` with a
+        // note that the chain "tops out at ~200 blocks" — true when funding
+        // was coinbase near genesis, and the single biggest cost in the suite
+        // once it stopped being.
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -270,7 +274,7 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
         key_source: std::sync::Arc::new(argos_core::SeedKeySource::new(SecretString::new(
             fixture_seed.clone(),
         ))),
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -415,7 +419,7 @@ async fn hostile_compact_block_rejected_cleanly() {
     let faulted_dir = tempfile::tempdir().expect("temp data dir for faulted scan");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -654,7 +658,7 @@ async fn bandwidth_throttled_scan_does_not_flag_false_stall() {
     let dir = tempfile::tempdir().expect("temp data dir for faulted scan");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -739,7 +743,7 @@ async fn hung_stream_surfaces_err_within_bounded_time() {
     let dir = tempfile::tempdir().expect("temp data dir for hung-stream scan");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -872,7 +876,7 @@ async fn dns_drift_retry_succeeds_against_replacement_backend() {
     let dir = tempfile::tempdir().expect("temp data dir");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: proxy.url.clone(),
@@ -944,7 +948,7 @@ async fn captive_portal_shim_surfaces_clean_error() {
     // ScanConfig directly. The scan attempt will fail at the GetLightdInfo
     // probe step inside start_scan, surfaced as an Err.
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: shim.url.clone(),
@@ -1085,7 +1089,7 @@ async fn asymmetric_loss_recovers_via_watchdog_and_retry() {
     let dir = tempfile::tempdir().expect("temp data dir");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: proxy.url.clone(),
@@ -1453,7 +1457,7 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
 
     // Second scan against the same workspace forces sync's reorg path.
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -1557,7 +1561,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", baseline_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-baseline")
@@ -1598,7 +1602,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", resume_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-crash")
@@ -1636,7 +1640,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", resume_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-crash") // same label keeps the workspace key identical
@@ -1707,6 +1711,13 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
 
     let harness = RegtestHarness::require();
 
+    // Both accounts, funded here rather than assumed. R-S29 sweeps two
+    // accounts and asserts the resumed run produces exactly one broadcast, so
+    // both must hold funds when it starts — which an earlier sweep test would
+    // otherwise have taken.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
+    common::regtest_harness::fund_test_account(1, 1_250_000_000).await;
+
     // Multi-account funding gate: PR B's setup.sh exports
     // ARGOS_REGTEST_TEST_T_ADDR_1 when account 1 was funded. If a
     // contributor is running against an older setup.sh, fail with a
@@ -1738,7 +1749,7 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--data-dir", crash_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua.clone())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
     .arg_value("--num-accounts", "3") // 0, 1 funded; 2 is the destination
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs29-crash")
@@ -1758,10 +1769,34 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
         .await
         .expect("sweep-helper must emit SweepStarting within 180s");
 
-    // Give the first broadcast time to land in the wallet DB. 8s comfortably
-    // exceeds typical regtest broadcast latency (<1s) and is well inside
-    // the helper's 30s pause window.
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Wait for the first sweep transaction to reach the node's mempool, then
+    // kill. The mempool is the only real-time signal available.
+    //
+    // Two earlier approaches failed in opposite directions. A fixed 8s after
+    // `SweepStarting` fired *before* any broadcast, because building the first
+    // Sapling proof in a debug build takes longer than that — nothing had been
+    // swept, the resumed run swept both accounts, and the failure ("got 2
+    // broadcasts") looked like a double-spend defect. Waiting for the helper's
+    // own `Broadcast` event fires *after* the sweep finishes entirely: those
+    // are emitted from the returned `SweepOutcome`, not as each broadcast
+    // happens, so the helper had already exited and there was nothing to kill.
+    //
+    // `getrawmempool` turns non-empty the moment the first transaction is
+    // accepted, which is exactly the start of the helper's pause window.
+    let mempool_deadline = std::time::Instant::now() + Duration::from_secs(900);
+    loop {
+        let mempool =
+            common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+        if mempool.as_array().map(|a| a.len()).unwrap_or(0) > 0 {
+            eprintln!("[regtest] R-S29: first sweep transaction is in the mempool");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < mempool_deadline,
+            "[regtest] R-S29: no sweep transaction reached the mempool within 900s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     let kill_status = crash_handle
         .sigkill_and_wait()
@@ -1798,7 +1833,7 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--data-dir", crash_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua)
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
     .arg_value("--num-accounts", "3")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs29-crash") // identical workspace key
@@ -1874,7 +1909,7 @@ async fn two_instances_same_workspace_cancels_first() {
     let temp_data_dir = tempfile::tempdir().expect("tempdir");
 
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -2108,13 +2143,13 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
 async fn sweep_places_a_donation_output_when_rate_is_set() {
     let harness = RegtestHarness::require();
 
-    // Confirm anything an earlier sweep test left unconfirmed before scanning.
-    // These tests share the test seed's accounts and run in one process, so a
-    // previous sweep's transaction can still be sitting in the mempool; this
-    // scan would then not see those notes as spent, build a conflicting
-    // transaction, and be rejected on broadcast.
-    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Fund this test rather than inheriting whatever an earlier sweep left.
+    // These tests share the test seed's accounts and drain them, so which one
+    // had funds used to depend on the order cargo happened to run them in.
+    // Funding also mines a block, clearing any pending sweep from an earlier
+    // test — a scan cannot see an unconfirmed spend, so without that this scan
+    // would build a conflicting transaction and be rejected on broadcast.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
 
     let temp_data_dir = tempfile::tempdir().expect("tempdir for donation sweep");
     let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-donate").await;
@@ -2234,7 +2269,7 @@ async fn argos_scan_helper_smoke() {
     )
     .arg_value("--data-dir", temp.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "smoke")
@@ -2304,7 +2339,7 @@ async fn argos_sweep_helper_smoke() {
     .arg_value("--data-dir", temp.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua)
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "smoke-sweep")
@@ -2420,7 +2455,7 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
     let handle = service
         .start_scan(
             ScanConfig {
-                birthday: 1,
+                birthday: common::regtest_harness::funding_birthday(),
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -2771,7 +2806,7 @@ async fn an_imported_zcashd_wallet_scans_as_wallet_accounts() {
     let handle = service
         .start_scan_from_key_source(
             ScanConfig {
-                birthday: 1,
+                birthday: common::regtest_harness::funding_birthday(),
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: harness.lightwalletd_url().to_owned(),

@@ -81,6 +81,14 @@ pub struct TreasuryTransfer {
 /// `fully_scanned_height`, so the first funding call on a chain pays the full
 /// scan cost and subsequent ones are cheap. A fresh directory each time would
 /// make every top-up rescan the whole chain.
+///
+/// The cost of that persistence: the workspace outlives the chain. It sits
+/// outside the docker volumes, so `docker compose down -v` wipes the chain and
+/// leaves the wallet believing it is synced past the new chain's tip. The next
+/// scan then asks for a block that does not exist yet and fails with
+/// "block N is newer than the latest block", which looks like a lightwalletd
+/// fault. `setup.sh` removes the directory when it rebuilds; a caller passing
+/// its own `data_dir` across chains has to do the same.
 pub async fn transfer_from_treasury(
     treasury_seed: &SecretString,
     payments: &[(String, u64)],

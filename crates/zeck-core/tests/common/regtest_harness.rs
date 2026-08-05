@@ -158,3 +158,100 @@ pub async fn zebra_rpc(method: &str, params: serde_json::Value) -> serde_json::V
         .cloned()
         .unwrap_or_else(|| panic!("zebra {method} returned no result: {parsed}"))
 }
+
+/// The treasury mnemonic, matching `tests/regtest/setup.sh`.
+///
+/// A different seed from [`ARGOS_TEST_SEED`] on purpose: sweep tests drain
+/// the wallets they test, and a treasury that could be drained would defeat
+/// the point of having one. Another BIP-39 test vector, no real funds.
+pub const ARGOS_TREASURY_SEED: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote";
+
+/// Pay `zatoshis` from the treasury to the test seed's `account`, and mine it.
+///
+/// Sweep tests share the test seed and drain it, so which of them has funds
+/// used to depend on the order `cargo test` happened to run them in — the
+/// donation sweep failed with "sweep should have broadcast at least one
+/// transaction" purely because an earlier test had swept the account first.
+/// A test that needs funds should say so rather than inherit them.
+///
+/// This is only possible because funding no longer depends on coinbase: the
+/// regtest subsidy is worthless by the heights ZIP 212 forces this harness
+/// to, so before transfer-based funding there was nothing to top up from.
+/// See `argos_core::regtest_funding`.
+pub async fn fund_test_account(account: u32, zatoshis: u64) {
+    use tokio::process::Command;
+
+    let funder = env!("CARGO_BIN_EXE_argos-regtest-funder");
+    let lightwalletd = env::var(ENV_LIGHTWALLETD_URL)
+        .expect("ARGOS_REGTEST_LIGHTWALLETD_URL must be set to fund a test account");
+    let zebra_rpc_url =
+        env::var(ENV_ZEBRA_RPC_URL).unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+
+    // Derive the destination from the seed under test, not the treasury.
+    let derived = Command::new(funder)
+        .args(["--zebra-rpc-url", &zebra_rpc_url])
+        .args(["--account", &account.to_string()])
+        .arg("--print-address-only")
+        .env("ARGOS_REGTEST_FUND_SEED", ARGOS_TEST_SEED)
+        .output()
+        .await
+        .expect("running the funder to derive a test address");
+    let stdout = String::from_utf8_lossy(&derived.stdout);
+    let address = stdout
+        .split("\"address\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| {
+            panic!("[regtest] could not parse a funding address from: {stdout}")
+        })
+        .to_owned();
+
+    let funded = Command::new(funder)
+        .args(["--zebra-rpc-url", &zebra_rpc_url])
+        .args(["--lightwalletd-url", &lightwalletd])
+        .args(["--transfer", &format!("{address}:{zatoshis}")])
+        .env("ARGOS_REGTEST_FUND_SEED", ARGOS_TREASURY_SEED)
+        .output()
+        .await
+        .expect("running the funder to pay a test address");
+    // A "database is locked" here almost always means something else is
+    // funding at the same time — a `setup.sh` still running, or tests without
+    // `--test-threads=1`. Every funding call shares one treasury workspace,
+    // and SQLite permits one writer. Say so, because the raw error points at
+    // the wallet database and not at the concurrency that caused it.
+    let stderr = String::from_utf8_lossy(&funded.stderr);
+    assert!(
+        funded.status.success(),
+        "[regtest] treasury funding of account {account} failed: {stderr}{}",
+        if stderr.contains("database is locked") {
+            "\n[regtest] the treasury workspace is held by another process —              check for a running setup.sh or a concurrent test, and re-run              with --test-threads=1"
+        } else {
+            ""
+        }
+    );
+
+    // Confirm it: a scan reads compact blocks, so an unmined payment is
+    // invisible to the test that just asked for it.
+    zebra_rpc("generate", serde_json::json!([1])).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+}
+
+/// The birthday a test should scan the funded seed from.
+///
+/// `setup.sh` records the height it started funding at; everything the suite
+/// spends was paid at or after it. Scanning from there instead of from genesis
+/// is the difference between reading a few hundred blocks and reading the
+/// ~32,000 empty ones below them — the harness has to mine that far for ZIP
+/// 212, and before funding moved off coinbase the money was down at the
+/// bottom, so height 1 was the only correct answer.
+///
+/// Falls back to 1 when the file is absent, which is both correct and slow:
+/// an older `setup.sh`, or a chain funded some other way, still scans.
+pub fn funding_birthday() -> u32 {
+    let path = env::temp_dir().join("argos-regtest-funding-height");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|height| *height > 0)
+        .unwrap_or(1)
+}
