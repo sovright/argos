@@ -61,11 +61,19 @@ readonly FUND_BLOCKS="${REGTEST_FUND_BLOCKS:-4}"
 readonly ARGOS_TEST_SEED="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 readonly FUND_SEED="${REGTEST_FUND_SEED:-$ARGOS_TEST_SEED}"
 
-# The treasury. A separate seed from the one under test, deliberately: sweep
-# tests drain the wallets they test, and a treasury that could be drained
-# would defeat the point of having one. Another BIP-39 test vector, no real
-# funds anywhere.
-readonly TREASURY_SEED="${REGTEST_TREASURY_SEED:-zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote}"
+# The treasury. A third seed, distinct from BOTH the seed under test and the
+# miner's, and each for its own reason.
+#
+# Not the test seed: sweep tests drain the wallets they test, and a treasury
+# that could be drained defeats the point of having one.
+#
+# Not the miner seed (the all-zoo/vote vector in zebrad-regtest.toml): its
+# account-0 transparent address IS `miner_address`, so every mined block pays
+# coinbase to it. A treasury on that seed accumulates one transparent output
+# per block -- 33,022 of them on a 34,000-block chain -- and every funding
+# scan walks all of them. Measured at 1h44m per funding call, which was the
+# overwhelming majority of the suite's runtime.
+readonly TREASURY_SEED="${REGTEST_TREASURY_SEED:-legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title}"
 # Coinbase blocks paid to the treasury near genesis, at ~6.25 ZEC each.
 #
 # 200, not 30. The treasury cannot be topped up — its own funding is coinbase,
@@ -178,10 +186,19 @@ readonly FUNDER
 # chain the workspace still persists between calls, so only the first funding
 # after a rebuild pays that.
 TREASURY_WORKSPACE="${TMPDIR:-/tmp}/argos-regtest-treasury"
-if [ -d "$TREASURY_WORKSPACE" ]; then
+TREASURY_CHAIN_MARKER="$TREASURY_WORKSPACE.chain"
+# Identify the chain by its block-1 hash. A rebuilt chain gets a new one; a
+# chain that merely grew keeps it.
+CHAIN_ID="$(zrpc getblockhash '[1]' | sed -e 's/.*"result":"\([^"]*\)".*/\1/')"
+if [ -d "$TREASURY_WORKSPACE" ] \
+   && [ "$(cat "$TREASURY_CHAIN_MARKER" 2>/dev/null)" != "$CHAIN_ID" ]; then
+    # Only when the chain underneath it changed. Wiping unconditionally --
+    # which this did at first -- makes every top-up rescan from genesis,
+    # turning a routine re-run into several minutes of scanning for nothing.
     log "removing the treasury workspace left by a previous chain ..."
     rm -rf "$TREASURY_WORKSPACE"
 fi
+printf '%s\n' "$CHAIN_ID" > "$TREASURY_CHAIN_MARKER"
 
 log "funding the treasury with $TREASURY_BLOCKS shielded coinbase block(s) ..."
 ARGOS_REGTEST_FUND_SEED="$TREASURY_SEED" "$FUNDER" \

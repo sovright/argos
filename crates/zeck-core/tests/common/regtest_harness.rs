@@ -161,10 +161,12 @@ pub async fn zebra_rpc(method: &str, params: serde_json::Value) -> serde_json::V
 
 /// The treasury mnemonic, matching `tests/regtest/setup.sh`.
 ///
-/// A different seed from [`ARGOS_TEST_SEED`] on purpose: sweep tests drain
-/// the wallets they test, and a treasury that could be drained would defeat
-/// the point of having one. Another BIP-39 test vector, no real funds.
-pub const ARGOS_TREASURY_SEED: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote";
+/// Distinct from [`ARGOS_TEST_SEED`] because sweep tests drain what they
+/// test, and distinct from the miner seed (all-zoo/vote, in
+/// `zebrad-regtest.toml`) because that seed's account-0 transparent address
+/// *is* `miner_address` — a treasury on it collects one transparent output
+/// per mined block, and every funding scan then walks all of them.
+pub const ARGOS_TREASURY_SEED: &str = "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title";
 
 /// Pay `zatoshis` from the treasury to the test seed's `account`, and mine it.
 ///

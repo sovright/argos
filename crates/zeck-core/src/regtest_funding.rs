@@ -111,14 +111,39 @@ pub async fn transfer_from_treasury(
         label: "regtest-treasury".to_owned(),
     };
 
+    // Phase timings on stderr. Funding dominated the regtest suite -- two
+    // tests calling this were 97% of a 5-hour run -- and the only way to tell
+    // a slow scan from slow proving is to measure both.
+    let started = std::time::Instant::now();
+    macro_rules! phase {
+        ($name:expr) => {
+            eprintln!("[funder] {} at {:.1}s", $name, started.elapsed().as_secs_f64())
+        };
+    }
+
     // Scan through the ordinary service so account import, workspace keying
     // and sync stay in one place rather than being reimplemented here.
+    phase!("scan: start");
     let service = RecoveryService::new();
     let handle = service
         .start_scan(config.clone(), treasury_seed.clone())
         .await?;
+    let mut last_phase: Option<ScanPhase> = None;
     loop {
         let progress = service.get_scan_progress(&handle).await?;
+        // Which phase the time goes to. A fully-scanned workspace still spent
+        // 1h44m here with two blocks pending, so the cost is not block
+        // fetching and the phase boundary is the only way to see where it is.
+        if last_phase != Some(progress.phase) {
+            eprintln!(
+                "[funder] phase {:?} at {:.1}s (synced_to {:?}, blocks {})",
+                progress.phase,
+                started.elapsed().as_secs_f64(),
+                progress.synced_to_height,
+                progress.blocks_scanned,
+            );
+            last_phase = Some(progress.phase);
+        }
         match progress.phase {
             ScanPhase::Complete => break,
             ScanPhase::Error => {
@@ -133,6 +158,8 @@ pub async fn transfer_from_treasury(
             _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
         }
     }
+
+    phase!("scan: complete");
 
     let runtime = RuntimeScanConfig {
         key_source: Arc::new(SeedKeySource::new(treasury_seed.clone())),
@@ -216,7 +243,9 @@ pub async fn transfer_from_treasury(
     )
     .map_err(|err| ZeckError::TransactionBuild(format!("proposing the funding transfer: {err}")))?;
 
+    phase!("proposal: built");
     let prover = LocalTxProver::bundled();
+    phase!("prover: loaded");
     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
         &mut wallet_db,
         &params,
@@ -233,6 +262,7 @@ pub async fn transfer_from_treasury(
 
     let txid = *txids.first();
 
+    phase!("transaction: built");
     let (mut client, _endpoint) =
         crate::lightwalletd::connect_lightwalletd_endpoints(lightwalletd_url, None).await?;
     let tx = wallet_db
@@ -257,6 +287,8 @@ pub async fn transfer_from_treasury(
             response.error_message
         )));
     }
+
+    phase!("broadcast: done");
 
     let remaining = wallet_db
         .get_wallet_summary(ConfirmationsPolicy::MIN)
