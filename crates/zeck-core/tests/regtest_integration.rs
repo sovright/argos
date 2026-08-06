@@ -405,10 +405,15 @@ async fn hostile_compact_block_rejected_cleanly() {
     drop(baseline);
     drop(baseline_dir);
 
-    // Pick a height inside the funded range. Setup.sh funds the test seed
-    // around block ~100; injecting at block 5 is safely past Sapling
-    // activation (height 1) and well before any wallet-relevant block.
-    let hostile_height: u64 = 5;
+    // Inject inside the range this scan actually covers.
+    //
+    // This used to be a hardcoded height 5, with a note that "setup.sh funds
+    // the test seed around block ~100". Both stopped being true: funding moved
+    // to transfers near the tip, and scans start from `funding_birthday()`, so
+    // a block at height 5 is never fetched and the fault is never seen — the
+    // scan completes cleanly and the test fails claiming the hostile chain was
+    // accepted.
+    let hostile_height: u64 = u64::from(common::regtest_harness::funding_birthday()) + 2;
     let fake = common::fake_lightwalletd::FakeLightwalletd::builder()
         .upstream(harness.lightwalletd_url().to_owned())
         .inject_hostile_block_at_height(hostile_height)
@@ -1553,6 +1558,14 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
 
     let harness = RegtestHarness::require();
 
+    // This test scans from genesis rather than from `funding_birthday()`, and
+    // deliberately so: its whole purpose is to SIGKILL a scan *in progress*.
+    // Starting near the tip leaves only a handful of blocks, the scan finishes
+    // before the kill lands, and the test fails with "subprocess should have
+    // died from SIGKILL, but exited cleanly". A long scan is the fixture here,
+    // not an accident.
+    let scan_birthday = "1";
+
     // ─── Baseline: uninterrupted scan, capture total_zatoshis ──────────────
     let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
     let baseline_handle = HelperSpawn::new(
@@ -1561,7 +1574,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", baseline_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
+    .arg_value("--birthday", scan_birthday)
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-baseline")
@@ -1591,9 +1604,9 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     //
     // The threshold is well past the first batch boundary in librustzcash's
     // default batch size (~100 blocks), so the kill lands inside one of the
-    // mid-scan windows R-S27 is meant to exercise. Regtest setup.sh tops the
-    // chain at ~200 blocks; 50 leaves comfortable headroom on either side.
+    // mid-scan windows R-S27 is meant to exercise.
     const SCAN_KILL_AT: u64 = 50;
+
 
     let resume_dir = tempfile::tempdir().expect("resume tempdir");
     let mut crash_handle = HelperSpawn::new(
@@ -1602,7 +1615,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", resume_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
+    .arg_value("--birthday", scan_birthday)
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-crash")
@@ -1640,7 +1653,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", resume_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
+    .arg_value("--birthday", scan_birthday)
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-crash") // same label keeps the workspace key identical
