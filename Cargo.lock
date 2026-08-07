@@ -146,6 +146,7 @@ dependencies = [
  "anyhow",
  "argos-wallet-import",
  "async-trait",
+ "base64 0.22.1",
  "bellman",
  "bip0039",
  "blake2b_simd",

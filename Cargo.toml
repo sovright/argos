@@ -31,6 +31,7 @@ bls12_381 = "0.8"
 # Named only for script::Code when hand-assembling a V4 transparent bundle;
 # already in the tree via zcash_transparent.
 zcash_script = "0.4.3"
+base64 = "0.22"
 cbc = { version = "0.1.2", features = ["alloc"] }
 clap = { version = "4.5.53", features = ["derive"] }
 crypto_secretbox = "0.1.1"

@@ -644,6 +644,91 @@ pub fn build_and_sign_v4_shielding(
     })
 }
 
+/// Assemble a V4 transaction that spends a Sprout note into a Sapling
+/// output, and sign it.
+///
+/// This is the migration Argos actually needs: value leaves the Sprout pool
+/// through `vpub_new` into the transparent value pool, and a Sapling output
+/// in the same transaction consumes it. Sprout cannot pay Sapling directly —
+/// a JoinSplit's outputs are Sprout notes — so the transparent value pool is
+/// the only bridge, and it must be crossed inside one transaction or the
+/// value is simply spent to fees.
+///
+/// Three signatures have to agree on one sighash, and none can commit to the
+/// others: the Sapling binding signature, the JoinSplit signature, and (if
+/// present) transparent input signatures. The sighash is therefore taken over
+/// the transaction with the Sapling bundle proven-but-unsigned and
+/// `joinsplit_sig` zeroed, exactly as zcashd does.
+pub fn build_and_sign_v4_sprout_to_sapling(
+    consensus_branch_id: BranchId,
+    expiry_height: BlockHeight,
+    joinsplits: Vec<sprout_tx::JsDescription>,
+    sapling_unauthed: sapling_crypto::builder::UnauthorizedBundle<zcash_protocol::value::ZatBalance>,
+    prover: &zcash_proofs::prover::LocalTxProver,
+    key: &JoinSplitSigningKey,
+    mut rng: impl rand_core::RngCore + rand_core::CryptoRng + Clone,
+) -> ZeckResult<Transaction> {
+    if joinsplits.is_empty() {
+        return Err(ZeckError::TransactionBuild(
+            "a Sprout spend needs at least one JoinSplit".to_owned(),
+        ));
+    }
+
+    let sprout_bundle = |sig: [u8; 64]| sprout_tx::Bundle {
+        joinsplits: joinsplits.clone(),
+        joinsplit_pubkey: key.verification_key(),
+        joinsplit_sig: sig,
+    };
+
+    // Prove first: the sighash covers the proofs, and only the signatures
+    // are excluded from it.
+    let sapling_proven =
+        sapling_unauthed.create_proofs(prover, prover, &mut rng, ());
+
+    // The sighash is taken with the Sapling bundle proven but unsigned: its
+    // binding signature is over this same digest, so it cannot be inside it.
+    // `Unauthorized` is the marker for exactly this state: Sapling proven
+    // but unsigned. Its own docs note it carries the Sapling proofs because
+    // v4 transactions commit to them in the digest — which is why proving
+    // has to happen before the sighash rather than after.
+    let unsigned = TransactionData::<zcash_primitives::transaction::Unauthorized>::from_parts(
+        TxVersion::V4,
+        consensus_branch_id,
+        0,
+        expiry_height,
+        None,
+        Some(sprout_bundle([0u8; 64])),
+        Some(sapling_proven.clone()),
+        None,
+    );
+    let sighash = v4_signature_hash(&unsigned, &SignableInput::Shielded);
+    let mut sighash_bytes = [0u8; 32];
+    sighash_bytes.copy_from_slice(sighash.as_bytes());
+
+    // No Sapling spends, so no spend authorizing keys — only the binding
+    // signature, which `apply_signatures` produces from the value balance.
+    let sapling = sapling_proven
+        .apply_signatures(rng, sighash_bytes, &[])
+        .map_err(|err| {
+            ZeckError::TransactionBuild(format!("signing the Sapling bundle: {err:?}"))
+        })?;
+
+    let signed = TransactionData::<Authorized>::from_parts(
+        TxVersion::V4,
+        consensus_branch_id,
+        0,
+        expiry_height,
+        None,
+        Some(sprout_bundle(key.sign(&sighash_bytes))),
+        Some(sapling),
+        None,
+    );
+
+    signed.freeze().map_err(|err| {
+        ZeckError::TransactionBuild(format!("freezing the Sprout-to-Sapling transaction: {err}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

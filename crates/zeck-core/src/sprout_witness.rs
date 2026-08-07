@@ -508,6 +508,24 @@ fn parse_witness(c: &mut Cursor<'_>) -> Option<IncrementalWitness> {
     })
 }
 
+impl IncrementalMerkleTree {
+    /// Parse a serialized `IncrementalMerkleTree`.
+    ///
+    /// This is the same structure zcashd returns from `z_gettreestate` as
+    /// `sprout.commitments.finalState`, which makes it the way to learn what
+    /// the chain's Sprout tree contained before a note was added — and
+    /// therefore the note's real position. Assuming an empty tree instead
+    /// yields an anchor no node recognises: `bad-txns-sprout-unknown-anchor`.
+    pub fn parse(bytes: &[u8]) -> Result<Self, WitnessError> {
+        let mut c = Cursor::new(bytes);
+        let tree = parse_tree(&mut c).ok_or(WitnessError::Malformed)?;
+        if c.pos != bytes.len() {
+            return Err(WitnessError::TrailingBytes(bytes.len() - c.pos));
+        }
+        Ok(tree)
+    }
+}
+
 impl IncrementalWitness {
     /// Parse the witness blob `argos-wallet-import` preserved for a note.
     ///

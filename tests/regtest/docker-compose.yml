@@ -97,6 +97,38 @@ services:
       - "--data-dir=/var/lib/lightwalletd"
       - "--log-file=/dev/stdout"
 
+  # The Sprout chain. NOT part of the default stack.
+  #
+  # Exists because ZIP 211 disabled adding value to the Sprout pool from
+  # Canopy onward, and the main harness activates Canopy at height 1 — so no
+  # Sprout note can be created there, and the spend path has nothing to spend.
+  #
+  # zcashd rather than Zebra, for two reasons found the hard way:
+  #
+  #   * Zebra refuses to mine below Canopy at all — "Zebra does not support
+  #     generating pre-Canopy block templates" — so a late-Canopy Zebra chain
+  #     cannot be built even one block high.
+  #   * zcashd has `sendtoaddress`, so a transparent output can be paid to a
+  #     key we hold without mining coinbase to it.
+  #
+  # The tradeoff is that zcashd cannot activate Ironwood, so this chain
+  # exercises Sprout under pre-Canopy rules rather than post-Ironwood ones.
+  # That is the right tradeoff: JoinSplit validation is unchanged by the later
+  # upgrades, and the alternative is not testing the spend path at all.
+  #
+  # Run with: docker compose --profile sprout up -d zcashd-sprout
+  zcashd-sprout:
+    profiles: ["sprout"]
+    image: electriccoinco/zcashd:v6.20.0
+    container_name: argos-zcashd-sprout
+    restart: "no"
+    ports:
+      - "127.0.0.1:18242:18232"
+    volumes:
+      - zcashd-sprout-data:/srv/zcashd/.zcash
+      - ./zcashd-sprout.conf:/srv/zcashd/.zcash/zcash.conf:ro
+    entrypoint: ["zcashd", "-conf=/srv/zcashd/.zcash/zcash.conf", "-datadir=/srv/zcashd/.zcash", "-printtoconsole"]
+
   # Fixture generation only. NOT part of the regtest stack.
   #
   # zcashd is EOL and cannot activate Ironwood (NU6.3), so it is useless
@@ -117,3 +149,4 @@ services:
 volumes:
   zebrad-data:
   lwd-data:
+  zcashd-sprout-data:
