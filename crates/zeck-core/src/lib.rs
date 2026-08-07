@@ -30,6 +30,9 @@ pub mod sprout_recovery;
 // Direct p2p access. Sprout notes are invisible to lightwalletd -- compact
 // blocks carry no JoinSplits -- so finding one needs full blocks.
 pub mod p2p;
+// What a Sprout scan costs in time, bandwidth and disk, and the wording
+// that tells the user -- shared so the CLI and GUI cannot drift apart.
+pub mod sprout_scan_cost;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;

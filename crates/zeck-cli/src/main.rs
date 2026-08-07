@@ -14,6 +14,9 @@ use argos_core::{
     argos_wallet_import::{self, ImportedKeys},
     derive_accounts, detect_birthday, estimate_birthday_from_date,
     imported::{encode_transparent_address, imported_transparent_keys},
+    p2p::wire::P2pNetwork,
+    sprout_recovery::recover_spendable_sprout_notes,
+    sprout_scan_cost::SproutScanCost,
     transparent_recovery::{scan_transparent_only, sweep_transparent_only, TransparentScanReport},
     validate_destination_address, ImportedKeySource, KeySource, RecoveryService, ScanConfig,
     ScanDiscovery, ScanHandle, ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
@@ -311,10 +314,63 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
             "    {} Sprout key(s) in this wallet are NOT scanned or swept here.",
             keys.sprout.len()
         );
+        eprintln!("    Sprout is recovered separately — run `inspect-wallet` to see what");
+        eprintln!("    this file holds for them, and what recovering them would cost.");
     }
     eprintln!("    Any balance reported below excludes those pools entirely.");
     eprintln!("    Keep the original wallet file: those keys exist only there.");
     eprintln!();
+}
+
+/// Tell the user what a Sprout scan actually costs, before they start one.
+///
+/// A Sprout scan cannot use lightwalletd — compact blocks carry no
+/// JoinSplits — so it pulls full blocks from the p2p network for the whole
+/// pre-Canopy chain. Letting that begin without warning would misrepresent a
+/// multi-hour, multi-gigabyte job as an ordinary scan.
+fn print_sprout_scan_cost_warning() {
+    let cost = SproutScanCost::for_network(P2pNetwork::Mainnet);
+    eprintln!("  ⚠ RECOVERING THESE NOTES REQUIRES A FULL-BLOCK SCAN");
+    for line in cost.warning_lines() {
+        if line.is_empty() {
+            eprintln!();
+            continue;
+        }
+        // The shared text is unwrapped so the GUI can reflow it; a terminal
+        // cannot, and an unwrapped paragraph is exactly the kind of wall of
+        // text people skip past.
+        for wrapped in wrap_text(&line, 72) {
+            eprintln!("    {wrapped}");
+        }
+    }
+    eprintln!();
+}
+
+/// Greedy word wrap.
+///
+/// A line that already fits is returned verbatim rather than re-joined:
+/// the warning's two-column rows align with runs of spaces, and splitting
+/// on whitespace would silently collapse them.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.chars().count() <= width {
+        return vec![text.to_owned()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 fn print_transparent_report(report: &TransparentScanReport) {
@@ -394,12 +450,43 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     }
 
     if !keys.sprout.is_empty() {
-        println!("Sprout addresses (funds here are identified, not yet recoverable):");
+        println!("Sprout addresses:");
         for key in &keys.sprout {
             let hex: String = key.address.iter().map(|b| format!("{b:02x}")).collect();
             println!("  {hex}");
         }
         println!();
+
+        // Whether these are recoverable depends entirely on what else the
+        // wallet file holds, so say which case this file is in rather than
+        // making a blanket claim. Spending a Sprout note needs its value,
+        // rho and r, which live only in the JoinSplit ciphertext, plus a
+        // witness. A wallet with both needs no network at all; a wallet
+        // with neither needs the full-block scan, which is a different
+        // proposition entirely and is quoted as such.
+        let recovered = recover_spendable_sprout_notes(keys);
+        if recovered.notes.is_empty() {
+            println!("  No spendable Sprout notes were recovered from this file.");
+            if !recovered.issues.is_empty() {
+                println!("  Why:");
+                for issue in recovered.issues.iter().take(5) {
+                    println!("    - {issue}");
+                }
+                if recovered.issues.len() > 5 {
+                    println!("    ... and {} more", recovered.issues.len() - 5);
+                }
+            }
+            println!();
+            print_sprout_scan_cost_warning();
+        } else {
+            println!(
+                "  {} spendable Sprout note(s), {} total.",
+                recovered.notes.len(),
+                format_zec(recovered.total_value())
+            );
+            println!("  These were recovered from this file alone — no scan needed.");
+            println!();
+        }
     }
 
     // Never summarized away: an unread record means key material that

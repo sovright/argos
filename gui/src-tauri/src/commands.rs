@@ -87,8 +87,24 @@ pub struct WalletFileSummary {
     pub sapling_keys: usize,
     pub sprout_keys: usize,
     /// Sprout addresses, which are public and are the only way a user can
-    /// tell which funds Argos can identify but not yet move.
+    /// tell which funds this file holds for the Sprout pool.
     pub sprout_addresses: Vec<String>,
+    /// Sprout notes recovered from this file alone, and their total value.
+    ///
+    /// This is the whole difference between "your funds are right here" and
+    /// "this needs a multi-hour full-block scan", so it is computed here
+    /// rather than left for the frontend to infer from key counts. A wallet
+    /// can hold Sprout keys and still recover nothing, if the note
+    /// ciphertexts or cached witnesses are absent.
+    pub sprout_spendable_notes: usize,
+    pub sprout_spendable_zatoshis: u64,
+    /// Why notes could not be recovered, when none were. Shown rather than
+    /// summarised away: "no notes" and "notes that failed to decrypt" call
+    /// for very different next steps.
+    pub sprout_issues: Vec<String>,
+    /// What a full-block Sprout scan would cost, in the user's terms.
+    /// Rendered from `argos-core` so the GUI and CLI cannot drift.
+    pub sprout_scan_warning: Vec<String>,
     /// True when the file yielded a BIP-39 mnemonic, which means it re-enters
     /// the ordinary HD pipeline and scans and sweeps like a typed seed.
     pub has_mnemonic: bool,
@@ -166,6 +182,10 @@ pub async fn inspect_wallet_file(
                     sapling_keys: 0,
                     sprout_keys: 0,
                     sprout_addresses: Vec::new(),
+                    sprout_spendable_notes: 0,
+                    sprout_spendable_zatoshis: 0,
+                    sprout_issues: Vec::new(),
+                    sprout_scan_warning: Vec::new(),
                     has_mnemonic: false,
                     transparent_only: false,
                     diagnostics: Vec::new(),
@@ -174,6 +194,13 @@ pub async fn inspect_wallet_file(
             }
             Err(err) => return Err(err.to_string()),
         };
+
+    // Decrypting the note ciphertexts is what distinguishes a wallet whose
+    // Sprout funds are recoverable right now from one that would need the
+    // full-block scan. Doing it here keeps that judgement out of the
+    // frontend, which can only see counts.
+    let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
+    let needs_scan = !keys.sprout.is_empty() && recovered.notes.is_empty();
 
     Ok(WalletFileSummary {
         path,
@@ -188,6 +215,17 @@ pub async fn inspect_wallet_file(
             .iter()
             .map(|k| k.address.iter().map(|b| format!("{b:02x}")).collect())
             .collect(),
+        sprout_spendable_notes: recovered.notes.len(),
+        sprout_spendable_zatoshis: recovered.total_value(),
+        sprout_issues: recovered.issues.iter().map(|i| i.to_string()).collect(),
+        sprout_scan_warning: if needs_scan {
+            argos_core::sprout_scan_cost::SproutScanCost::for_network(
+                argos_core::p2p::wire::P2pNetwork::Mainnet,
+            )
+            .warning_lines()
+        } else {
+            Vec::new()
+        },
         has_mnemonic: keys.mnemonic.is_some(),
         transparent_only: keys.sapling.is_empty() && !keys.transparent.is_empty(),
         diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),

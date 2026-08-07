@@ -377,18 +377,65 @@ function renderWalletSummary(summary) {
     list.appendChild(li);
   }
 
-  // Sprout is identified-only. Saying so before any balance appears is the
-  // point: a user who sees a number and no warning will assume it is sweepable.
+  // Sprout splits into two very different situations, and conflating them
+  // is what misleads people. If the wallet file yielded spendable notes,
+  // the funds are already in hand and no scan is needed. If it did not, the
+  // only route is a full-block scan that costs hours and tens of gigabytes
+  // -- which the user must be told before starting, not during.
   const sproutWarning = $("wallet-sprout-warning");
+  const sproutHeadline = $("wallet-sprout-headline");
+  const sproutDetail = $("wallet-sprout-detail");
+  const sproutScanCost = $("wallet-sprout-scan-cost");
   sproutWarning.hidden = summary.sprout_keys === 0;
-  if (summary.sprout_keys > 0 && summary.sprout_addresses.length > 0) {
-    const addrs = document.createElement("ul");
-    for (const addr of summary.sprout_addresses) {
-      const li = document.createElement("li");
-      li.textContent = addr;
-      addrs.appendChild(li);
+  sproutScanCost.hidden = true;
+  sproutScanCost.innerHTML = "";
+  sproutDetail.innerHTML = "";
+
+  if (summary.sprout_keys > 0) {
+    const recoverable = summary.sprout_spendable_notes > 0;
+    if (recoverable) {
+      sproutHeadline.textContent = "Sprout funds were recovered from this file.";
+      sproutDetail.textContent =
+        ` ${summary.sprout_spendable_notes} note(s), ` +
+        `${fmt(summary.sprout_spendable_zatoshis)}. No scan is needed — the ` +
+        `note data was in the wallet file itself.`;
+    } else {
+      sproutHeadline.textContent = "Sprout funds need a full-block scan.";
+      sproutDetail.textContent =
+        " This file holds Sprout keys, but not the note data needed to spend" +
+        " them. Keep the original file: these keys exist only there.";
+
+      for (const issue of (summary.sprout_issues || []).slice(0, 5)) {
+        const p = document.createElement("p");
+        p.className = "muted";
+        p.textContent = issue;
+        sproutScanCost.appendChild(p);
+      }
+      // Rendered from the same argos-core text the CLI prints, so the two
+      // cannot tell the user different things.
+      for (const line of summary.sprout_scan_warning || []) {
+        const p = document.createElement("p");
+        if (line === "") {
+          p.innerHTML = "&nbsp;";
+        } else {
+          p.textContent = line;
+        }
+        sproutScanCost.appendChild(p);
+      }
+      sproutScanCost.hidden = sproutScanCost.childElementCount === 0;
     }
-    sproutWarning.appendChild(addrs);
+
+    // Rebuilt each time rather than appended to: reopening a wallet file
+    // used to stack a fresh copy of the address list under the old one.
+    if (summary.sprout_addresses.length > 0) {
+      const addrs = document.createElement("ul");
+      for (const addr of summary.sprout_addresses) {
+        const li = document.createElement("li");
+        li.textContent = addr;
+        addrs.appendChild(li);
+      }
+      sproutDetail.appendChild(addrs);
+    }
   }
 
   const diagnostics = $("wallet-diagnostics");
