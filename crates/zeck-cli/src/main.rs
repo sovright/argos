@@ -157,6 +157,33 @@ enum Commands {
         #[arg(long)]
         confirm_sweep: bool,
     },
+
+    /// Move Sprout funds out of a legacy wallet file to a Sapling address.
+    ///
+    /// Separate from `sweep` because Sprout recovery shares nothing with the
+    /// HD pipeline: the notes come from the wallet file rather than from a
+    /// scan, and the transaction is assembled by hand because
+    /// `zcash_primitives`' builder refuses Sprout outright.
+    SweepSprout {
+        /// Destination Sapling address. Not a Unified Address: the value
+        /// leaves Sprout through the transparent pool and must be consumed
+        /// by a Sapling output in the same transaction.
+        #[arg(long)]
+        destination: String,
+
+        /// Path to sprout-groth16.params (~725 MB). Defaults to
+        /// $ARGOS_SPROUT_PARAMS, then ~/.zcash-params.
+        #[arg(long)]
+        sprout_params: Option<PathBuf>,
+
+        /// Show what would be swept without building or broadcasting.
+        #[arg(long, conflicts_with = "confirm_sweep")]
+        dry_run: bool,
+
+        /// Confirm you understand this is irreversible and broadcast.
+        #[arg(long)]
+        confirm_sweep: bool,
+    },
 }
 
 fn command_uses_birthday_inputs(command: &Commands) -> bool {
@@ -320,6 +347,81 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
     eprintln!("    Any balance reported below excludes those pools entirely.");
     eprintln!("    Keep the original wallet file: those keys exist only there.");
     eprintln!();
+}
+
+/// Recover Sprout notes from a wallet file and move them to Sapling.
+///
+/// Thin by design: address parsing, branch-id selection, proving and
+/// broadcast all live in `argos-core`, because the GUI needs exactly the
+/// same sequence and a second copy here would drift from it.
+async fn sweep_sprout(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+    destination: &str,
+    sprout_params: Option<PathBuf>,
+    dry_run: bool,
+    confirm_sweep: bool,
+) -> Result<()> {
+    let recovered = recover_spendable_sprout_notes(keys);
+
+    if recovered.notes.is_empty() {
+        eprintln!("No spendable Sprout notes could be recovered from this wallet file.");
+        if !recovered.issues.is_empty() {
+            eprintln!("Why:");
+            for issue in recovered.issues.iter().take(10) {
+                eprintln!("  - {issue}");
+            }
+        }
+        eprintln!();
+        print_sprout_scan_cost_warning();
+        anyhow::bail!("nothing to sweep from this file");
+    }
+
+    let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes)?;
+    println!();
+    println!("\u{2501}\u{2501}\u{2501} Sprout sweep \u{2501}\u{2501}\u{2501}");
+    println!("  Notes              {}", plan.notes);
+    println!("  Gross              {}", format_zec(plan.gross_zatoshis));
+    println!("  Fee                {}", format_zec(plan.fee_zatoshis));
+    println!("  Net to destination {}", format_zec(plan.net_zatoshis));
+    println!("  Destination        {destination}");
+    println!();
+
+    if dry_run {
+        println!("Dry run: nothing was built or broadcast.");
+        return Ok(());
+    }
+    if !confirm_sweep {
+        anyhow::bail!(
+            "this moves funds irreversibly. Re-run with --confirm-sweep to broadcast, \
+             or --dry-run to preview."
+        );
+    }
+
+    let params_path = sprout_params.unwrap_or_else(argos_core::sprout_sweep::default_params_path);
+    eprintln!(
+        "Loading Sprout proving parameters from {} (725 MB; verified by digest)",
+        params_path.display()
+    );
+
+    let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
+        &recovered.notes,
+        network,
+        lightwalletd_url,
+        destination,
+        &params_path,
+        [0u8; 512],
+        |msg| eprintln!("  {msg}"),
+    )
+    .await?;
+
+    println!();
+    for sent in &outcome.sent {
+        println!("  swept {} \u{2014} {}", format_zec(sent.value_swept), sent.txid);
+    }
+    println!("Swept {} to {destination}", format_zec(outcome.total_swept));
+    Ok(())
 }
 
 /// Tell the user what a Sprout scan actually costs, before they start one.
@@ -711,6 +813,30 @@ async fn main() -> Result<()> {
         Commands::InspectWallet => {
             let source = imported.expect("--wallet-file is required and was checked above");
             print_wallet_inspection(source.keys(), network);
+        }
+
+        Commands::SweepSprout {
+            destination,
+            sprout_params,
+            dry_run,
+            confirm_sweep,
+        } => {
+            let source = imported.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sweep-sprout recovers notes from a legacy wallet file; pass \
+                     --wallet-file <path>"
+                )
+            })?;
+            sweep_sprout(
+                source.keys(),
+                network,
+                &cli.lightwalletd_url,
+                &destination,
+                sprout_params,
+                dry_run,
+                confirm_sweep,
+            )
+            .await?;
         }
 
         Commands::ShowKeys => {
