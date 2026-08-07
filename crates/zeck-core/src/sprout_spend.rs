@@ -327,10 +327,19 @@ pub fn build_and_sign_v4(
 /// not the proving key, so this reads the file directly.
 ///
 /// The file is ~725 MB and is not bundled with Argos — `LocalTxProver::bundled`
-/// covers Sapling only. `zcash_proofs::download_sprout_parameters` fetches it
-/// and verifies a pinned BLAKE2b hash; the size is checked here first because
-/// a truncated download otherwise surfaces as an opaque deserialization
-/// failure several minutes in.
+/// covers Sapling only.
+///
+/// The size is checked first, because a truncated download otherwise surfaces
+/// as an opaque deserialization failure minutes in. The BLAKE2b-512 digest is
+/// then verified against the value pinned in `zcash_proofs`, streaming as the
+/// parameters are read so the 725 MB is only traversed once.
+///
+/// That verification is not optional. Parsing uses `checked = false`, which
+/// skips the point-validity pass — several minutes of work — and is only
+/// defensible because the bytes are authenticated first. An earlier version
+/// of this function asserted in a comment that the hash "was verified on
+/// download" while doing no such check, which is precisely the kind of
+/// assumption that survives review by being written down.
 pub fn load_sprout_proving_key(path: &std::path::Path) -> ZeckResult<Parameters<Bls12>> {
     let metadata = std::fs::metadata(path).map_err(|err| {
         ZeckError::InvalidConfig(format!(
@@ -350,15 +359,72 @@ pub fn load_sprout_proving_key(path: &std::path::Path) -> ZeckResult<Parameters<
         .map_err(|err| ZeckError::InvalidConfig(format!("opening the Sprout proving key: {err}")))?;
     // 1 MiB buffer: the file is large and read sequentially.
     let reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+    let mut reader = HashingReader::new(reader);
+
     // `checked = false` skips the point-validity pass, which costs minutes.
-    // Safe here only because the file's hash was verified on download.
-    Parameters::<Bls12>::read(reader, false).map_err(|err| {
+    // Defensible only because the digest is verified below.
+    let params = Parameters::<Bls12>::read(&mut reader, false).map_err(|err| {
         ZeckError::InvalidConfig(format!("parsing the Sprout proving key: {err}"))
-    })
+    })?;
+
+    // Drain whatever the parser did not consume before finalizing: the
+    // digest is over the whole file, and `Parameters::read` stops as soon as
+    // it has what it needs. Hashing only the consumed prefix produces a
+    // mismatch against a perfectly good file — which is what happened the
+    // first time this check was added. zcash_proofs drains the same way.
+    std::io::copy(&mut reader, &mut std::io::sink()).map_err(|err| {
+        ZeckError::InvalidConfig(format!("reading the Sprout proving key to its end: {err}"))
+    })?;
+
+    let digest = reader.finalize();
+    if digest.as_bytes() != SPROUT_HASH {
+        return Err(ZeckError::InvalidConfig(format!(
+            "the Sprout proving key at {} does not match the expected digest.              Refusing to prove with unauthenticated parameters.",
+            path.display()
+        )));
+    }
+    Ok(params)
 }
 
 /// The expected size of `sprout-groth16.params`, from `zcash_proofs`.
 pub const SPROUT_BYTES: u64 = 725_523_612;
+
+/// The BLAKE2b-512 digest of `sprout-groth16.params`, from `zcash_proofs`.
+/// Kept as bytes so the comparison cannot be fooled by hex casing.
+const SPROUT_HASH: [u8; 64] = [
+    0xe9, 0xb2, 0x38, 0x41, 0x1b, 0xd6, 0xc0, 0xec, 0x47, 0x91, 0xe9, 0xd0, 0x42, 0x45, 0xec, 0x35,
+    0x0c, 0x9c, 0x57, 0x44, 0xf5, 0x61, 0x0d, 0xfc, 0xce, 0x43, 0x65, 0xd5, 0xca, 0x49, 0xdf, 0xef,
+    0xd5, 0x05, 0x4e, 0x37, 0x18, 0x42, 0xb3, 0xf8, 0x8f, 0xa1, 0xb9, 0xd7, 0xe8, 0xe0, 0x75, 0x24,
+    0x9b, 0x3e, 0xba, 0xbd, 0x16, 0x7f, 0xa8, 0xb0, 0xf3, 0x16, 0x12, 0x92, 0xd3, 0x6c, 0x18, 0x0a,
+];
+
+/// Streams the file through BLAKE2b while it is being parsed, so the 725 MB
+/// is read once rather than twice.
+struct HashingReader<R> {
+    inner: R,
+    state: blake2b_simd::State,
+}
+
+impl<R: std::io::Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: blake2b_simd::State::new(),
+        }
+    }
+
+    fn finalize(self) -> blake2b_simd::Hash {
+        self.state.finalize()
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.state.update(&buf[..n]);
+        Ok(n)
+    }
+}
 
 /// Load the Sprout verifying key from the same parameter file.
 ///
