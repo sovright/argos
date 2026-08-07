@@ -568,8 +568,14 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     if !keys.sprout.is_empty() {
         println!("Sprout addresses:");
         for key in &keys.sprout {
-            let hex: String = key.address.iter().map(|b| format!("{b:02x}")).collect();
-            println!("  {hex}");
+            // Encoded, not hex: a user has to be able to match this against a
+            // paper backup or a block explorer, and 64 bytes of hex matches
+            // nothing they have ever seen.
+            let addr = argos_core::sprout_key::encode_sprout_address(
+                &argos_core::sprout::SproutPaymentAddress::from_bytes(key.address),
+                network,
+            );
+            println!("  {addr}");
         }
         println!();
 
