@@ -105,17 +105,12 @@ fn a_recovered_sprout_key_produces_a_signed_v4_transaction() {
             witness_path: path.to_vec(),
         },
     ];
+    // One address object, so the committed and encrypted halves cannot
+    // describe different owners.
+    let recipient = sprout::SproutPaymentAddress::from_spending_key(&a_sk);
     let outputs = [
-        sprout_spend::JoinSplitOutput {
-            a_pk,
-            pk_enc: sprout::pk_enc(&a_sk),
-            value: 0,
-        },
-        sprout_spend::JoinSplitOutput {
-            a_pk,
-            pk_enc: sprout::pk_enc(&a_sk),
-            value: 0,
-        },
+        sprout_spend::JoinSplitOutput { recipient, value: 0 },
+        sprout_spend::JoinSplitOutput { recipient, value: 0 },
     ];
 
     let fields = sprout_spend::compute_joinsplit_fields(
@@ -126,6 +121,7 @@ fn a_recovered_sprout_key_produces_a_signed_v4_transaction() {
         anchor,
         &key.verification_key(),
         [0x44; 32],
+        [0x66; 32],
         [0x55; 32],
     )
     .expect("compute the JoinSplit fields");

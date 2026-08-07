@@ -234,22 +234,29 @@ pub fn prf_nf(a_sk: &[u8; 32], rho: &[u8; 32]) -> [u8; 32] {
 }
 
 /// `PRF^pk_{a_sk}(i, hSig)`, per §5.4.2 — the MAC binding an input to the
-/// JoinSplit that spends it. Tag `0000` with the input index in bit 2.
+/// JoinSplit that spends it.
+///
+/// The circuit packs the tag as four leading bits `[a, b, c, d]` and calls
+/// this with `(false, nonce, false, false)`, so the index sits in bit `b` =
+/// `0x40`, not the low tag bit. Putting it at `0x10` matches for index 0 and
+/// silently diverges for index 1 — the proof then fails verification with no
+/// indication of which field was wrong.
 pub fn prf_pk(a_sk: &[u8; 32], input_index: usize, h_sig: &[u8; 32]) -> [u8; 32] {
     assert!(input_index < 2, "a JoinSplit has exactly two inputs");
     let mut block = [0u8; 64];
     block[..32].copy_from_slice(a_sk);
     block[0] &= 0x0F;
-    block[0] |= 0b0000_0000;
     if input_index == 1 {
-        block[0] |= 0b0001_0000;
+        block[0] |= 0b0100_0000;
     }
     block[32..].copy_from_slice(h_sig);
     sha256_compress(&block)
 }
 
 /// `PRF^rho_{phi}(i, hSig)`, per §5.4.2 — derives an output note's `rho`.
-/// Tag `0010`, with the output index in bit 2.
+///
+/// `(false, nonce, true, false)` in the circuit: tag bit `c` = `0x20`, index
+/// in bit `b` = `0x40`.
 pub fn prf_rho(phi: &[u8; 32], output_index: usize, h_sig: &[u8; 32]) -> [u8; 32] {
     assert!(output_index < 2, "a JoinSplit has exactly two outputs");
     let mut block = [0u8; 64];
@@ -257,7 +264,7 @@ pub fn prf_rho(phi: &[u8; 32], output_index: usize, h_sig: &[u8; 32]) -> [u8; 32
     block[0] &= 0x0F;
     block[0] |= 0b0010_0000;
     if output_index == 1 {
-        block[0] |= 0b0001_0000;
+        block[0] |= 0b0100_0000;
     }
     block[32..].copy_from_slice(h_sig);
     sha256_compress(&block)
@@ -334,6 +341,67 @@ impl SproutNotePlaintext {
         out.extend_from_slice(&self.rho);
         out.extend_from_slice(&self.r);
         out.extend_from_slice(&self.memo);
+        out
+    }
+}
+
+/// A Sprout payment address: `a_pk || pk_enc`, exactly as zcashd keys its
+/// wallet records.
+///
+/// This type exists so the two halves cannot be supplied separately. A
+/// JoinSplit output commits to `a_pk` but encrypts to `pk_enc`; if those
+/// describe different parties, the recipient can read the note but cannot
+/// derive a spending key for the committed `a_pk`, and the committed owner
+/// cannot read `rho` and `r` at all. The note is then permanently
+/// unspendable — an irreversible loss of whatever it holds, with nothing at
+/// broadcast time to indicate it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SproutPaymentAddress {
+    a_pk: [u8; 32],
+    pk_enc: [u8; 32],
+}
+
+impl core::fmt::Debug for SproutPaymentAddress {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Both halves are public, but printing them invites copying one
+        // without the other, which is the mistake this type prevents.
+        write!(f, "SproutPaymentAddress(<64 bytes>)")
+    }
+}
+
+impl SproutPaymentAddress {
+    /// The 64 bytes a Sprout record is keyed by.
+    pub fn from_bytes(bytes: [u8; 64]) -> Self {
+        let mut a_pk = [0u8; 32];
+        let mut pk_enc = [0u8; 32];
+        a_pk.copy_from_slice(&bytes[..32]);
+        pk_enc.copy_from_slice(&bytes[32..]);
+        Self { a_pk, pk_enc }
+    }
+
+    /// Derive the address a spending key controls.
+    ///
+    /// Preferred over `from_bytes` when the key is in hand: both halves come
+    /// from the same `a_sk`, so they cannot disagree.
+    pub fn from_spending_key(a_sk: &[u8; 32]) -> Self {
+        Self {
+            a_pk: a_pk(a_sk),
+            pk_enc: pk_enc(a_sk),
+        }
+    }
+
+    pub fn a_pk(&self) -> &[u8; 32] {
+        &self.a_pk
+    }
+
+    pub fn pk_enc(&self) -> &[u8; 32] {
+        &self.pk_enc
+    }
+
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&self.a_pk);
+        out[32..].copy_from_slice(&self.pk_enc);
         out
     }
 }
@@ -566,6 +634,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An address built from a spending key must round-trip through its
+    /// byte form, since that is how it arrives from a wallet record.
+    #[test]
+    fn an_address_round_trips_through_its_bytes() {
+        let a_sk = [3u8; 32];
+        let addr = SproutPaymentAddress::from_spending_key(&a_sk);
+        assert_eq!(addr.a_pk(), &a_pk(&a_sk));
+        assert_eq!(addr.pk_enc(), &pk_enc(&a_sk));
+        assert_eq!(
+            SproutPaymentAddress::from_bytes(addr.to_bytes()),
+            addr,
+            "the 64-byte form is what wallet records are keyed by"
+        );
     }
 
     #[test]

@@ -47,7 +47,7 @@ use zcash_transparent::bundle as transparent;
 use crate::error::{ZeckError, ZeckResult};
 use crate::sprout::{
     encrypt_note, epk_for, h_sig, note_commitment, prf_nf, prf_pk, prf_rho, SproutNotePlaintext,
-    NOTE_CIPHERTEXT_LEN,
+    SproutPaymentAddress, NOTE_CIPHERTEXT_LEN,
 };
 use crate::sprout_witness::WITNESS_PATH_SIZE;
 
@@ -72,9 +72,13 @@ pub struct JoinSplitInput {
 /// Sprout can only pay Sprout. Reaching Sapling means routing value through
 /// the transparent value pool with `vpub_new`, then having a Sapling output
 /// in the same transaction consume it.
+///
+/// The recipient is a whole `SproutPaymentAddress` rather than a separate
+/// `a_pk` and `pk_enc`. Taking them separately allowed a caller to commit to
+/// one party and encrypt to another, which makes the output permanently
+/// unspendable with nothing at broadcast time to show for it.
 pub struct JoinSplitOutput {
-    pub a_pk: [u8; 32],
-    pub pk_enc: [u8; 32],
+    pub recipient: SproutPaymentAddress,
     pub value: u64,
 }
 
@@ -101,10 +105,21 @@ pub struct JoinSplitFields {
 
 /// Compute every field of a JoinSplit except the proof.
 ///
-/// `phi` and `esk` are supplied rather than sampled internally so tests can
-/// be deterministic. Production callers must pass fresh randomness: reusing
-/// `esk` reuses an AEAD key under a fixed nonce, and reusing `phi` repeats
-/// output `rho` values, which makes nullifiers collide.
+/// `phi`, `random_seed` and `esk` are supplied rather than sampled internally
+/// so tests can be deterministic. Production callers must pass fresh
+/// randomness for each.
+///
+/// **`phi` and `random_seed` must be independent.** `random_seed` is a
+/// *public* JoinSplit field; `phi` is a *private* circuit witness. zcashd
+/// samples them separately (`random_uint252` and `random_uint256`). Setting
+/// `random_seed = phi` — which this originally did — publishes `phi`, and
+/// since every output's `rho` is `PRF^rho_phi(i, hSig)`, that makes all
+/// output `rho` values publicly computable. Combined with deriving `r` from
+/// `phi`, it would make the commitment randomness public too, letting anyone
+/// test candidate `a_pk` values against the commitments.
+///
+/// Only the low 252 bits of `phi` are used: the circuit takes it as a
+/// 252-bit witness, and `PRF^rho` overwrites the top four bits with its tag.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_joinsplit_fields(
     inputs: &[JoinSplitInput; JS_INPUTS],
@@ -114,6 +129,7 @@ pub fn compute_joinsplit_fields(
     anchor: [u8; 32],
     joinsplit_pubkey: &[u8; 32],
     phi: [u8; 32],
+    random_seed: [u8; 32],
     esk: [u8; 32],
 ) -> ZeckResult<JoinSplitFields> {
     // Nullifiers first: hSig commits to them.
@@ -122,7 +138,8 @@ pub fn compute_joinsplit_fields(
         prf_nf(&inputs[1].a_sk, &inputs[1].note.rho),
     ];
 
-    let h_sig = h_sig(&phi, &nullifiers, joinsplit_pubkey);
+    // hSig is computed over the *public* random_seed, not over phi.
+    let h_sig = h_sig(&random_seed, &nullifiers, joinsplit_pubkey);
 
     let macs = [
         prf_pk(&inputs[0].a_sk, 0, &h_sig),
@@ -139,7 +156,8 @@ pub fn compute_joinsplit_fields(
         // index so that a caller cannot accidentally reuse one across
         // outputs; the spec permits any randomness here.
         let r = prf_rho(&phi, i, &nullifiers[i]);
-        commitments[i] = note_commitment(&outputs[i].a_pk, outputs[i].value, &rho, &r);
+        commitments[i] =
+            note_commitment(outputs[i].recipient.a_pk(), outputs[i].value, &rho, &r);
 
         let note = SproutNotePlaintext {
             value: outputs[i].value,
@@ -147,7 +165,8 @@ pub fn compute_joinsplit_fields(
             r,
             memo: [0u8; 512],
         };
-        ciphertexts[i] = encrypt_note(&esk, &outputs[i].pk_enc, &h_sig, i as u8, &note.to_bytes())
+        ciphertexts[i] =
+            encrypt_note(&esk, outputs[i].recipient.pk_enc(), &h_sig, i as u8, &note.to_bytes())
             .map_err(|err| {
                 ZeckError::TransactionBuild(format!("encrypting a Sprout output: {err}"))
             })?;
@@ -160,7 +179,7 @@ pub fn compute_joinsplit_fields(
         nullifiers,
         commitments,
         ephemeral_key: epk_for(&esk),
-        random_seed: phi,
+        random_seed,
         macs,
         ciphertexts,
         h_sig,
@@ -341,6 +360,18 @@ pub fn load_sprout_proving_key(path: &std::path::Path) -> ZeckResult<Parameters<
 /// The expected size of `sprout-groth16.params`, from `zcash_proofs`.
 pub const SPROUT_BYTES: u64 = 725_523_612;
 
+/// Load the Sprout verifying key from the same parameter file.
+///
+/// Consensus verifies JoinSplits with this; checking our own proof against
+/// it is the only way to know the circuit accepts what we assembled, short
+/// of a node doing it.
+pub fn load_sprout_verifying_key(
+    path: &std::path::Path,
+) -> ZeckResult<bellman::groth16::PreparedVerifyingKey<Bls12>> {
+    let params = load_sprout_proving_key(path)?;
+    Ok(bellman::groth16::prepare_verifying_key(&params.vk))
+}
+
 /// Prove a JoinSplit.
 ///
 /// Thin by design: everything expensive to get right is already computed in
@@ -377,10 +408,10 @@ pub fn prove_joinsplit(
         inputs[1].note.rho,
         inputs[1].note.r,
         &auth[1],
-        outputs[0].a_pk,
+        *outputs[0].recipient.a_pk(),
         outputs[0].value,
         prf_rho(&fields.phi, 0, &fields.nullifiers[0]),
-        outputs[1].a_pk,
+        *outputs[1].recipient.a_pk(),
         outputs[1].value,
         prf_rho(&fields.phi, 1, &fields.nullifiers[1]),
         fields.vpub_old,
@@ -398,7 +429,7 @@ pub fn prove_joinsplit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sprout::{a_pk, pk_enc};
+    use crate::sprout::a_pk;
 
     fn dummy_input(a_sk: [u8; 32], value: u64, rho: [u8; 32]) -> JoinSplitInput {
         JoinSplitInput {
@@ -420,17 +451,10 @@ mod tests {
             dummy_input([3u8; 32], 50_000, [21u8; 32]),
             dummy_input([3u8; 32], 0, [22u8; 32]),
         ];
+        let addr = SproutPaymentAddress::from_spending_key(&recipient);
         let outputs = [
-            JoinSplitOutput {
-                a_pk: a_pk(&recipient),
-                pk_enc: pk_enc(&recipient),
-                value: 0,
-            },
-            JoinSplitOutput {
-                a_pk: a_pk(&recipient),
-                pk_enc: pk_enc(&recipient),
-                value: 0,
-            },
+            JoinSplitOutput { recipient: addr, value: 0 },
+            JoinSplitOutput { recipient: addr, value: 0 },
         ];
         compute_joinsplit_fields(
             &inputs,
@@ -440,6 +464,7 @@ mod tests {
             [7u8; 32],
             &key.verification_key(),
             [11u8; 32],
+            [12u8; 32],
             [13u8; 32],
         )
         .expect("fields")
@@ -482,17 +507,10 @@ mod tests {
             dummy_input([3u8; 32], 50_000, [21u8; 32]),
             dummy_input([3u8; 32], 0, [22u8; 32]),
         ];
+        let addr = SproutPaymentAddress::from_spending_key(&recipient);
         let outputs = [
-            JoinSplitOutput {
-                a_pk: a_pk(&recipient),
-                pk_enc: pk_enc(&recipient),
-                value: 0,
-            },
-            JoinSplitOutput {
-                a_pk: a_pk(&recipient),
-                pk_enc: pk_enc(&recipient),
-                value: 0,
-            },
+            JoinSplitOutput { recipient: addr, value: 0 },
+            JoinSplitOutput { recipient: addr, value: 0 },
         ];
         let b = compute_joinsplit_fields(
             &inputs,
@@ -502,6 +520,7 @@ mod tests {
             [7u8; 32],
             &other.verification_key(),
             [11u8; 32],
+            [12u8; 32],
             [13u8; 32],
         )
         .expect("fields");
