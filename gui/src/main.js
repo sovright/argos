@@ -390,6 +390,11 @@ function renderWalletSummary(summary) {
   sproutScanCost.hidden = true;
   sproutScanCost.innerHTML = "";
   sproutDetail.innerHTML = "";
+  // Reset every time: reopening a different wallet file must never leave the
+  // previous one's sweep panel, plan or results on screen.
+  $("wallet-sprout-sweep").hidden = true;
+  $("sprout-sweep-results").innerHTML = "";
+  setStatus("sprout-sweep-status", "", "");
 
   if (summary.sprout_keys > 0) {
     const recoverable = summary.sprout_spendable_notes > 0;
@@ -399,6 +404,7 @@ function renderWalletSummary(summary) {
         ` ${summary.sprout_spendable_notes} note(s), ` +
         `${fmt(summary.sprout_spendable_zatoshis)}. No scan is needed — the ` +
         `note data was in the wallet file itself.`;
+      showSproutSweep();
     } else {
       sproutHeadline.textContent = "Sprout funds need a full-block scan.";
       sproutDetail.textContent =
@@ -449,6 +455,99 @@ function renderWalletSummary(summary) {
   }
 
   $("wallet-summary").hidden = false;
+}
+
+// ─── Sprout sweep ───────────────────────────────────────────────────────────
+// Distinct from the ordinary sweep in every respect: the notes come from the
+// wallet file rather than a scan, the destination must be Sapling-capable,
+// and proving takes minutes per note against a 725 MB parameter file.
+
+async function showSproutSweep() {
+  const panel = $("wallet-sprout-sweep");
+  panel.hidden = false;
+
+  try {
+    const preview = await invoke("preview_sprout_sweep", {
+      path: walletFile.path,
+      passphrase: walletFile.passphrase,
+    });
+
+    $("sprout-sweep-plan").textContent =
+      `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
+      `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.`;
+
+    // Said before the user commits, not discovered halfway through: without
+    // the parameters the sweep cannot start at all.
+    if (preview.params_present) {
+      $("sprout-sweep-params").textContent = "";
+      $("sprout-sweep-run").disabled = false;
+    } else {
+      $("sprout-sweep-params").textContent =
+        `Sprout proving parameters are missing. Download the 725 MB file to ` +
+        `${preview.params_path} before sweeping:  ` +
+        `curl -o ${preview.params_path} https://download.z.cash/downloads/sprout-groth16.params`;
+      $("sprout-sweep-run").disabled = true;
+    }
+  } catch (err) {
+    $("sprout-sweep-plan").textContent = "";
+    setStatus("sprout-sweep-status", `✗ ${err}`, "error");
+    $("sprout-sweep-run").disabled = true;
+  }
+}
+
+async function runSproutSweep() {
+  const destination = $("sprout-destination").value.trim();
+  if (!destination) {
+    setStatus("sprout-sweep-status", "Enter a destination address first.", "error");
+    return;
+  }
+  if (!walletFile) {
+    setStatus("sprout-sweep-status", "Open a wallet file first.", "error");
+    return;
+  }
+
+  const button = $("sprout-sweep-run");
+  button.disabled = true;
+  $("sprout-sweep-results").innerHTML = "";
+  setStatus(
+    "sprout-sweep-status",
+    "Proving… this takes a few minutes per note and cannot be interrupted safely.",
+    "",
+  );
+
+  try {
+    const report = await invoke("execute_sprout_sweep", {
+      path: walletFile.path,
+      passphrase: walletFile.passphrase,
+      destination,
+      lightwalletdUrl: $("lightwalletd-url").value.trim(),
+      network: $("network-select").value,
+    });
+
+    const list = $("sprout-sweep-results");
+    for (const sent of report.sent) {
+      const li = document.createElement("li");
+      li.textContent = `${fmt(sent.value_swept)} — ${sent.txid}`;
+      list.appendChild(li);
+    }
+    // Skipped notes are shown, not summarised away: a user seeing less than
+    // expected needs to know which notes stayed behind and why.
+    for (const reason of report.skipped ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = `not swept — ${reason}`;
+      list.appendChild(li);
+    }
+
+    setStatus(
+      "sprout-sweep-status",
+      `✓ Swept ${fmt(report.total_swept)} to ${destination}.`,
+      "success",
+    );
+  } catch (err) {
+    setStatus("sprout-sweep-status", `✗ ${err}`, "error");
+    button.disabled = false;
+  }
 }
 
 async function openWalletFile() {
@@ -556,6 +655,20 @@ $("wallet-passphrase")?.addEventListener("keydown", (e) => {
     });
   } catch (_) {
     // No drag-drop available: the path field still works.
+  }
+})();
+
+$("sprout-sweep-run").addEventListener("click", runSproutSweep);
+
+// Proving runs for minutes per note with nothing else on screen, and a
+// silent multi-minute window is indistinguishable from a hang.
+(async () => {
+  try {
+    await listen("sprout-sweep-progress", (event) => {
+      setStatus("sprout-sweep-status", `${event.payload}…`, "");
+    });
+  } catch (_) {
+    // No event channel: the final result still reports.
   }
 })();
 

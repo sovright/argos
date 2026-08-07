@@ -291,6 +291,34 @@
               <strong id="wallet-sprout-headline"></strong>
               <span id="wallet-sprout-detail"></span>
               <div id="wallet-sprout-scan-cost" hidden></div>
+
+              <!-- Only shown when the wallet file itself yielded spendable
+                   notes. Sprout value must land on a Sapling receiver: it
+                   leaves the pool through the transparent pool and has to be
+                   consumed by a Sapling output in the same transaction. -->
+              <div id="wallet-sprout-sweep" hidden>
+                <hr />
+                <p><strong>Move these funds now</strong></p>
+                <p class="muted">
+                  No scan is needed — the note data is in this file. The destination must
+                  have a Sapling receiver.
+                </p>
+                <label for="sprout-destination">Destination address</label>
+                <input
+                  id="sprout-destination"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="zs1… or a Unified Address with a Sapling receiver"
+                />
+                <p id="sprout-sweep-plan" class="muted"></p>
+                <p id="sprout-sweep-params" class="muted"></p>
+                <button id="sprout-sweep-run" type="button" disabled>
+                  Sweep Sprout funds
+                </button>
+                <p id="sprout-sweep-status" class="status-line"></p>
+                <ul id="sprout-sweep-results" class="session-list"></ul>
+              </div>
             </div>
             <div id="wallet-diagnostics" class="guide-warning" hidden>
               <strong>Some records could not be read.</strong>

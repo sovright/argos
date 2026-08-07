@@ -469,6 +469,132 @@ pub async fn execute_sweep(
     Ok(outcome)
 }
 
+/// What a Sprout sweep would move, before anything is built.
+#[derive(Serialize)]
+pub struct SproutSweepPreview {
+    pub notes: usize,
+    pub gross_zatoshis: u64,
+    pub fee_zatoshis: u64,
+    pub net_zatoshis: u64,
+    /// Whether the Sprout proving parameters are already present. The GUI
+    /// needs this before the user commits: without them the sweep cannot
+    /// start, and a 725 MB download is not something to discover halfway
+    /// through a recovery.
+    pub params_present: bool,
+    pub params_path: String,
+}
+
+/// Preview a Sprout sweep.
+///
+/// The wallet file is re-read rather than kept in memory between calls:
+/// holding decrypted Sprout spending keys in the backend for the lifetime
+/// of the app would widen the window in which they can be captured, for no
+/// benefit beyond skipping a file read.
+#[tauri::command]
+pub async fn preview_sprout_sweep(
+    app: AppHandle,
+    path: String,
+    passphrase: Option<SecretString>,
+) -> Result<SproutSweepPreview, String> {
+    ensure_tos_accepted(&app)?;
+
+    let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
+        .map_err(|err| err.to_string())?;
+
+    let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
+    let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
+
+    let params_path = argos_core::sprout_sweep::default_params_path();
+    Ok(SproutSweepPreview {
+        notes: plan.notes,
+        gross_zatoshis: plan.gross_zatoshis,
+        fee_zatoshis: plan.fee_zatoshis,
+        net_zatoshis: plan.net_zatoshis,
+        params_present: params_path.exists(),
+        params_path: params_path.display().to_string(),
+    })
+}
+
+/// One broadcast Sprout sweep, for the frontend.
+#[derive(Serialize)]
+pub struct SproutSweepResult {
+    pub txid: String,
+    pub value_swept: u64,
+}
+
+#[derive(Serialize)]
+pub struct SproutSweepReport {
+    pub sent: Vec<SproutSweepResult>,
+    pub total_swept: u64,
+    /// Notes that did not move, and why. Surfaced rather than summarised:
+    /// a user seeing less than expected needs to know which notes stayed
+    /// behind.
+    pub skipped: Vec<String>,
+}
+
+/// Prove and broadcast a Sprout sweep.
+///
+/// Progress is emitted as `sprout-sweep-progress` events because proving
+/// takes minutes per note, and a silent multi-minute window is
+/// indistinguishable from a hang.
+#[tauri::command]
+pub async fn execute_sprout_sweep(
+    app: AppHandle,
+    path: String,
+    passphrase: Option<SecretString>,
+    destination: String,
+    lightwalletd_url: String,
+    network: String,
+) -> Result<SproutSweepReport, String> {
+    ensure_tos_accepted(&app)?;
+
+    let network = match network.as_str() {
+        "testnet" => argos_core::ZeckNetwork::Testnet,
+        _ => argos_core::ZeckNetwork::Mainnet,
+    };
+
+    let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
+        .map_err(|err| err.to_string())?;
+
+    let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
+    if recovered.notes.is_empty() {
+        return Err(
+            "no spendable Sprout notes could be recovered from this wallet file".to_owned(),
+        );
+    }
+
+    let params_path = argos_core::sprout_sweep::default_params_path();
+    let emitter = app.clone();
+    let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
+        &recovered.notes,
+        network,
+        &lightwalletd_url,
+        &destination,
+        &params_path,
+        [0u8; 512],
+        move |msg| {
+            let _ = emitter.emit("sprout-sweep-progress", msg);
+        },
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    Ok(SproutSweepReport {
+        sent: outcome
+            .sent
+            .into_iter()
+            .map(|s| SproutSweepResult {
+                txid: s.txid,
+                value_swept: s.value_swept,
+            })
+            .collect(),
+        total_swept: outcome.total_swept,
+        skipped: outcome.skipped,
+    })
+}
+
 #[tauri::command]
 pub fn default_data_dir(app: AppHandle) -> Result<String, String> {
     let base = app

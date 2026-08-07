@@ -43,6 +43,8 @@ fn main() {
             commands::detect_birthday,
             commands::save_recovery_report,
             commands::delete_workspace,
+            commands::preview_sprout_sweep,
+            commands::execute_sprout_sweep,
             commands::default_data_dir,
             commands::notify_user,
             commands::list_incomplete_sessions,
