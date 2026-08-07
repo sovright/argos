@@ -27,6 +27,9 @@ pub mod sprout_spend;
 // Joins a wallet's note records to the JoinSplit ciphertexts that carry
 // their plaintexts, which is the only place value/rho/r exist.
 pub mod sprout_recovery;
+// Finds Sprout notes by rebuilding the commitment tree from full blocks,
+// for a wallet that has a spending key and no note metadata at all.
+pub mod sprout_scan;
 // Direct p2p access. Sprout notes are invisible to lightwalletd -- compact
 // blocks carry no JoinSplits -- so finding one needs full blocks.
 pub mod p2p;
