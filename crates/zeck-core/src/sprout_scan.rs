@@ -82,6 +82,22 @@ pub struct SproutScanProgress {
     pub joinsplits_seen: u64,
     pub commitments_appended: u64,
     pub notes_found: usize,
+    /// Height of the last block fed in, so a resumed scan knows what to ask
+    /// for next.
+    pub last_height: u32,
+}
+
+/// Where the block walk had reached.
+///
+/// Without this a checkpoint restores a correct tree and has no idea which
+/// block comes next — the tree cannot be advanced from an unknown position,
+/// so "resume" would mean rescanning from genesis and re-appending
+/// everything into a tree that already contains it. Stored as a hash, not
+/// just a height, because the hash is what `getheaders` takes as a locator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanCursor {
+    pub last_block_hash: [u8; 32],
+    pub last_height: u32,
 }
 
 /// Scans blocks for notes belonging to a set of Sprout spending keys.
@@ -92,6 +108,7 @@ pub struct SproutScanner {
     /// Every nullifier seen, to tell a live note from a spent one.
     spent: HashSet<[u8; 32]>,
     progress: SproutScanProgress,
+    cursor: ScanCursor,
 }
 
 impl SproutScanner {
@@ -108,7 +125,13 @@ impl SproutScanner {
             pending: Vec::new(),
             spent: HashSet::new(),
             progress: SproutScanProgress::default(),
+            cursor: ScanCursor::default(),
         }
+    }
+
+    /// Where the walk has reached. `None` before any block is fed.
+    pub fn cursor(&self) -> Option<ScanCursor> {
+        (self.progress.blocks_scanned > 0).then_some(self.cursor)
     }
 
     pub fn progress(&self) -> SproutScanProgress {
@@ -125,10 +148,28 @@ impl SproutScanner {
 
     /// Feed one block's JoinSplits, in consensus order.
     pub fn scan_block(&mut self, joinsplits: &[SproutJoinSplit]) -> Result<(), WitnessError> {
+        self.scan_block_at(joinsplits, [0u8; 32], 0)
+    }
+
+    /// Feed one block's JoinSplits, recording which block it was.
+    ///
+    /// The hash and height are what make a checkpoint resumable; a scan that
+    /// does not record them can restore its tree but not continue the walk.
+    pub fn scan_block_at(
+        &mut self,
+        joinsplits: &[SproutJoinSplit],
+        block_hash: [u8; 32],
+        height: u32,
+    ) -> Result<(), WitnessError> {
         for js in joinsplits {
             self.scan_joinsplit(js)?;
         }
         self.progress.blocks_scanned += 1;
+        self.progress.last_height = height;
+        self.cursor = ScanCursor {
+            last_block_hash: block_hash,
+            last_height: height,
+        };
         Ok(())
     }
 
@@ -401,6 +442,9 @@ impl SproutScanner {
         put_u64(&mut out, self.progress.joinsplits_seen);
         put_u64(&mut out, self.progress.commitments_appended);
         put_u64(&mut out, self.progress.notes_found as u64);
+        put_u64(&mut out, u64::from(self.progress.last_height));
+        out.extend_from_slice(&self.cursor.last_block_hash);
+        put_u64(&mut out, u64::from(self.cursor.last_height));
 
         SproutScanCheckpoint { bytes: out }
     }
@@ -482,6 +526,13 @@ impl SproutScanner {
             commitments_appended: r.u64().ok_or(CheckpointError::Corrupt)?,
             notes_found: usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
                 .map_err(|_| CheckpointError::Corrupt)?,
+            last_height: u32::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+                .map_err(|_| CheckpointError::Corrupt)?,
+        };
+        let cursor = ScanCursor {
+            last_block_hash: r.array32().ok_or(CheckpointError::Corrupt)?,
+            last_height: u32::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+                .map_err(|_| CheckpointError::Corrupt)?,
         };
 
         if r.pos != r.bytes.len() {
@@ -494,6 +545,7 @@ impl SproutScanner {
             pending,
             spent,
             progress,
+            cursor,
         })
     }
 }
@@ -882,6 +934,35 @@ mod tests {
             ),
             "trailing bytes mean the layout is not what we think it is"
         );
+    }
+
+    /// The defect this cursor exists to fix: without it a checkpoint
+    /// restores a correct tree and has no idea which block comes next, so
+    /// resuming would mean rescanning from genesis into a tree that already
+    /// contains everything.
+    #[test]
+    fn the_block_cursor_survives_a_checkpoint() {
+        let a_sk = [0x42u8; 32];
+        let (js, _) = joinsplit_paying(&a_sk, 1_000, 0, 50);
+
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        assert_eq!(scanner.cursor(), None, "no cursor before any block");
+
+        scanner
+            .scan_block_at(&[js], [0xAB; 32], 12_345)
+            .expect("scan");
+
+        let cursor = scanner.cursor().expect("a scanned block sets the cursor");
+        assert_eq!(cursor.last_block_hash, [0xAB; 32]);
+        assert_eq!(cursor.last_height, 12_345);
+
+        let resumed = SproutScanner::resume(&scanner.checkpoint()).expect("resume");
+        assert_eq!(
+            resumed.cursor(),
+            Some(cursor),
+            "the walk position must survive, or the scan cannot continue"
+        );
+        assert_eq!(resumed.progress().last_height, 12_345);
     }
 
     #[test]
