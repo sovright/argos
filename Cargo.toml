@@ -16,6 +16,10 @@ anyhow = "1.0.100"
 async-trait = "0.1.89"
 bip0039 = "0.14.0"
 blake2b_simd = "1.0.4"
+# Curve25519 scalar multiplication for Sprout note decryption (the key
+# agreement in protocol §5.5). No other crate in the tree provides it.
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = "0.10.1"
 cbc = { version = "0.1.2", features = ["alloc"] }
 clap = { version = "4.5.53", features = ["derive"] }
 crypto_secretbox = "0.1.1"

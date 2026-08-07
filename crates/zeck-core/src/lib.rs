@@ -14,6 +14,9 @@ pub mod models;
 pub mod regtest_funding;
 pub mod scan;
 pub mod service;
+// Sprout key derivation and note decryption. Needed to spend a Sprout note:
+// the proving circuit wants value/rho/r, and the wallet stores none of them.
+pub mod sprout;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
