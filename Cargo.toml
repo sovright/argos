@@ -20,6 +20,14 @@ blake2b_simd = "1.0.4"
 # agreement in protocol §5.5). No other crate in the tree provides it.
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets"] }
 chacha20poly1305 = "0.10.1"
+# JoinSplit signatures. ed25519-zebra rather than ed25519-dalek: Zcash
+# consensus requires ZIP 215 verification semantics, which this implements and
+# which the two libraries disagree about on edge-case signatures.
+ed25519-zebra = "4.0.3"
+# Named only to load the Sprout Groth16 proving key; both already arrive via
+# zcash_proofs, which exposes the verifying key but not the proving key.
+bellman = "0.14"
+bls12_381 = "0.8"
 cbc = { version = "0.1.2", features = ["alloc"] }
 clap = { version = "4.5.53", features = ["derive"] }
 crypto_secretbox = "0.1.1"

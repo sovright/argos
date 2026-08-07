@@ -407,6 +407,14 @@ pub enum SproutNoteError {
     LeadByte(u8),
 }
 
+impl PartialEq for SproutNotePlaintext {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+            && self.rho == other.rho
+            && self.r == other.r
+            && self.memo[..] == other.memo[..]
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,11 +579,4 @@ mod tests {
     }
 }
 
-impl PartialEq for SproutNotePlaintext {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-            && self.rho == other.rho
-            && self.r == other.r
-            && self.memo[..] == other.memo[..]
-    }
-}
+

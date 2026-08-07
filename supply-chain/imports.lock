@@ -533,6 +533,15 @@ criteria = "safe-to-deploy"
 version = "2.0.0"
 notes = "Fork of the original `adler` crate, zero unsfae code, works in `no_std`, does what it says on th tin."
 
+[[audits.bytecode-alliance.audits.allocator-api2]]
+who = "Chris Fallin <chris@cfallin.org>"
+criteria = "safe-to-deploy"
+delta = "0.2.18 -> 0.2.20"
+notes = """
+The changes appear to be reasonable updates from Rust's stdlib imported into
+`allocator-api2`'s copy of this code.
+"""
+
 [[audits.bytecode-alliance.audits.anyhow]]
 who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
@@ -591,6 +600,12 @@ who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.3 -> 0.3.0"
 notes = "Nothing out of the ordinary, virtually no unsafe code."
+
+[[audits.bytecode-alliance.audits.der]]
+who = "Chris Fallin <chris@cfallin.org>"
+criteria = "safe-to-deploy"
+version = "0.7.10"
+notes = "No unsafe code aside from transmutes for transparent newtypes."
 
 [[audits.bytecode-alliance.audits.embedded-io]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -770,6 +785,12 @@ who = "Chris Fallin <chris@cfallin.org>"
 criteria = "safe-to-deploy"
 version = "2.2.1"
 notes = "forbid-unsafe crate with straightforward imports."
+
+[[audits.bytecode-alliance.audits.pem-rfc7468]]
+who = "Chris Fallin <chris@cfallin.org>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Only `unsafe` around a `from_utf8_unchecked`, and no IO."
 
 [[audits.bytecode-alliance.audits.percent-encoding]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -2164,6 +2185,18 @@ aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-ch
 who = "Erich Gubler <erichdongubler@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "2.0.0 -> 2.0.1"
+aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.allocator-api2]]
+who = "Nicolas Silva <nical@fastmail.com>"
+criteria = "safe-to-deploy"
+version = "0.2.18"
+aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.allocator-api2]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+delta = "0.2.20 -> 0.2.21"
 aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.anyhow]]

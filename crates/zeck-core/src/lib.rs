@@ -21,6 +21,9 @@ pub mod sprout;
 // JoinSplit prover parses. Needed because a cached wallet witness is the only
 // path source available without a full node.
 pub mod sprout_witness;
+// JoinSplit assembly and the V4 transaction carrying it. zcash_primitives'
+// builder refuses Sprout, so this goes through the public low-level surfaces.
+pub mod sprout_spend;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;

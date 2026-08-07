@@ -1756,7 +1756,7 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--destination-ua", destination_ua.clone())
     .arg_value(
         "--birthday",
-        &common::regtest_harness::funding_birthday().to_string(),
+        common::regtest_harness::funding_birthday().to_string(),
     )
     // Two accounts, not three. Account 2 supplies the destination address but
     // must NOT be scanned: it belongs to the same seed, so tracking it makes
@@ -1849,7 +1849,7 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--destination-ua", destination_ua)
     .arg_value(
         "--birthday",
-        &common::regtest_harness::funding_birthday().to_string(),
+        common::regtest_harness::funding_birthday().to_string(),
     )
     // Must match the crash run: a different account count is a different
     // workspace, and the resume would start from scratch instead of resuming.
@@ -2296,7 +2296,7 @@ async fn argos_scan_helper_smoke() {
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value(
         "--birthday",
-        &common::regtest_harness::funding_birthday().to_string(),
+        common::regtest_harness::funding_birthday().to_string(),
     )
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
@@ -2374,7 +2374,7 @@ async fn argos_sweep_helper_smoke() {
     .arg_value("--destination-ua", destination_ua)
     .arg_value(
         "--birthday",
-        &common::regtest_harness::funding_birthday().to_string(),
+        common::regtest_harness::funding_birthday().to_string(),
     )
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")

@@ -190,8 +190,6 @@ pub async fn derive_test_address(account: u32) -> String {
     use tokio::process::Command;
 
     let funder = env!("CARGO_BIN_EXE_argos-regtest-funder");
-    let lightwalletd = env::var(ENV_LIGHTWALLETD_URL)
-        .expect("ARGOS_REGTEST_LIGHTWALLETD_URL must be set to fund a test account");
     let zebra_rpc_url =
         env::var(ENV_ZEBRA_RPC_URL).unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
 
