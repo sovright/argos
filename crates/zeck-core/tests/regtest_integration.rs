@@ -2219,6 +2219,16 @@ async fn fake_lightwalletd_smoke() {
     };
     use argos_core::models::ZeckNetwork;
 
+    // Needed even though this test talks to a fixture rather than the
+    // harness: `validate_lightwalletd_network` only relaxes the Sapling-height
+    // check when `regtest_consensus_params_installed()` is true, and
+    // `require()` is what installs them. Without this the test passes only
+    // when some *other* test in the same process happened to install them
+    // first, and fails on its own with the original #186 error — "server
+    // Sapling activation height 1 does not match expected 280000 for
+    // testnet". Latent for as long as it was only ever run in a full suite.
+    let _harness = RegtestHarness::require();
+
     let fake = common::fake_lightwalletd::FakeLightwalletd::builder()
         .chain_name("regtest")
         .sapling_activation_height(1)
