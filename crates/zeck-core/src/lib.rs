@@ -17,6 +17,10 @@ pub mod service;
 // Sprout key derivation and note decryption. Needed to spend a Sprout note:
 // the proving circuit wants value/rho/r, and the wallet stores none of them.
 pub mod sprout;
+// The Sprout commitment tree, and the 966-byte authentication path the
+// JoinSplit prover parses. Needed because a cached wallet witness is the only
+// path source available without a full node.
+pub mod sprout_witness;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
