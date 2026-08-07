@@ -2338,6 +2338,12 @@ async fn argos_sweep_helper_smoke() {
     use common::subprocess_driver::{HelperEvent, HelperSpawn};
 
     let harness = RegtestHarness::require();
+
+    // Fund what this is about to sweep. Every sweep test drains the accounts
+    // it touches, so a test that does not ask for funds gets whatever the
+    // ones before it happened to leave — which is to say, nothing.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
+
     let temp = tempfile::tempdir().expect("temp data dir for sweep-helper smoke");
 
     // Derive account-1's UA from the test seed — same trick the workspace
@@ -2465,12 +2471,16 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
     // and rejected by the node, which is the regression under test.
     let harness = RegtestHarness::require();
 
-    // Fund inside the test rather than relying on setup.sh having run. The
+    // Fund from the treasury rather than relying on setup.sh having run. The
     // sweep spends everything it finds, so a second run would otherwise find
     // an empty wallet — or worse, collide with the first run's transaction
-    // still sitting in the mempool. Topping up here keeps the test
-    // independently re-runnable against a long-lived chain.
-    fund_test_seed_with_shielded_coinbase().await;
+    // still sitting in the mempool.
+    //
+    // This used to mine shielded coinbase. That pays nothing here: the
+    // harness sits past height 32,257 for ZIP 212 and the regtest subsidy is
+    // worthless by ~6,000, so the test funded itself with zero and failed as
+    // though the sweep were broken.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
 
     let data_dir = tempfile::tempdir().expect("temp data dir");
     let service = RecoveryService::new();
@@ -2604,32 +2614,6 @@ async fn zebra_generate(url: &str, blocks: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Mine shielded coinbase to the Argos test seed and then past maturity, by
-/// running the same `argos-regtest-funder` helper `setup.sh` uses. Keeping the
-/// funding in one place means the test and the documented setup path cannot
-/// drift apart.
-#[cfg(feature = "argos-network")]
-async fn fund_test_seed_with_shielded_coinbase() {
-    let zebra_rpc_url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
-
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_argos-regtest-funder"))
-        .env("ARGOS_REGTEST_FUND_SEED", RegtestHarness::require().test_seed())
-        .arg("--zebra-rpc-url")
-        .arg(&zebra_rpc_url)
-        .arg("--blocks")
-        .arg("2")
-        .output()
-        .await
-        .expect("spawning argos-regtest-funder");
-
-    assert!(
-        output.status.success(),
-        "funding the test seed failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 /// Transparent-only recovery, end to end against a real chain.
 ///
 /// This is the only test that proves `build_sweep_transaction` produces a
@@ -2677,6 +2661,16 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
     // the Sapling-bearing golden file is not. See
     // `tests/common/standalone_transparent.rs`.
     let keys = vec![common::standalone_transparent::standalone_transparent_key()];
+
+    // Top this key up from the treasury. It is not an HD account of the test
+    // seed, so `fund_test_account` cannot reach it — hence `fund_address`.
+    // Without this the test inherits whatever setup.sh last left, and any
+    // earlier sweep run against the same chain leaves it empty.
+    common::regtest_harness::fund_address(
+        &argos_core::imported::encode_transparent_address(&keys[0].address, ZeckNetwork::Testnet),
+        1_250_000_000,
+    )
+    .await;
 
     let (mut client, _endpoint) =
         connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)

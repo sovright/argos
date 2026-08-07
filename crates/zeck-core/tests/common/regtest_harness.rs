@@ -181,6 +181,12 @@ pub const ARGOS_TREASURY_SEED: &str = "legal winner thank year wave sausage wort
 /// to, so before transfer-based funding there was nothing to top up from.
 /// See `argos_core::regtest_funding`.
 pub async fn fund_test_account(account: u32, zatoshis: u64) {
+    let address = derive_test_address(account).await;
+    fund_address(&address, zatoshis).await;
+}
+
+/// Derive one of the test seed's account addresses via the funder.
+pub async fn derive_test_address(account: u32) -> String {
     use tokio::process::Command;
 
     let funder = env!("CARGO_BIN_EXE_argos-regtest-funder");
@@ -208,6 +214,23 @@ pub async fn fund_test_account(account: u32, zatoshis: u64) {
         })
         .to_owned();
 
+    address
+}
+
+/// Pay any address from the treasury, and mine the payment.
+///
+/// The primitive behind [`fund_test_account`]. Exposed separately because not
+/// everything the suite funds is an HD account of the test seed — the
+/// transparent-only sweep spends a standalone key that no account owns.
+pub async fn fund_address(address: &str, zatoshis: u64) {
+    use tokio::process::Command;
+
+    let funder = env!("CARGO_BIN_EXE_argos-regtest-funder");
+    let lightwalletd = env::var(ENV_LIGHTWALLETD_URL)
+        .expect("ARGOS_REGTEST_LIGHTWALLETD_URL must be set to fund an address");
+    let zebra_rpc_url =
+        env::var(ENV_ZEBRA_RPC_URL).unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+
     let funded = Command::new(funder)
         .args(["--zebra-rpc-url", &zebra_rpc_url])
         .args(["--lightwalletd-url", &lightwalletd])
@@ -224,7 +247,7 @@ pub async fn fund_test_account(account: u32, zatoshis: u64) {
     let stderr = String::from_utf8_lossy(&funded.stderr);
     assert!(
         funded.status.success(),
-        "[regtest] treasury funding of account {account} failed: {stderr}{}",
+        "[regtest] treasury funding of {address} failed: {stderr}{}",
         if stderr.contains("database is locked") {
             "\n[regtest] the treasury workspace is held by another process —              check for a running setup.sh or a concurrent test, and re-run              with --test-threads=1"
         } else {
