@@ -474,6 +474,63 @@ fn parse_tree(c: &mut Cursor<'_>) -> Option<IncrementalMerkleTree> {
     })
 }
 
+/// Write a CompactSize, matching what `Cursor::compact_size` reads.
+fn write_compact_size(out: &mut Vec<u8>, value: u64) {
+    match value {
+        0..=0xFC => out.push(value as u8),
+        0xFD..=0xFFFF => {
+            out.push(0xFD);
+            out.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        0x1_0000..=0xFFFF_FFFF => {
+            out.push(0xFE);
+            out.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        _ => {
+            out.push(0xFF);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+fn write_optional_node(out: &mut Vec<u8>, node: &Option<Node>) {
+    match node {
+        None => out.push(0),
+        Some(n) => {
+            out.push(1);
+            out.extend_from_slice(n);
+        }
+    }
+}
+
+fn write_tree(out: &mut Vec<u8>, tree: &IncrementalMerkleTree) {
+    write_optional_node(out, &tree.left);
+    write_optional_node(out, &tree.right);
+    write_compact_size(out, tree.parents.len() as u64);
+    for parent in &tree.parents {
+        write_optional_node(out, parent);
+    }
+}
+
+fn write_witness(out: &mut Vec<u8>, witness: &IncrementalWitness) {
+    write_tree(out, &witness.tree);
+    write_compact_size(out, witness.filled.len() as u64);
+    for node in &witness.filled {
+        // Bare nodes, not optionals — mirroring `parse_witness`.
+        out.extend_from_slice(node);
+    }
+    match &witness.cursor {
+        None => out.push(0),
+        Some(cursor) => {
+            out.push(1);
+            write_tree(out, cursor);
+        }
+    }
+    // `cursor_depth` is deliberately not written: zcashd recomputes it on
+    // deserialization, and `parse_witness` does the same. Writing it would
+    // create a field that could disagree with the tree it is derived from.
+}
+
 fn parse_witness(c: &mut Cursor<'_>) -> Option<IncrementalWitness> {
     let tree = parse_tree(c)?;
 
@@ -524,6 +581,18 @@ impl IncrementalMerkleTree {
         }
         Ok(tree)
     }
+
+    /// Serialize in the same encoding [`Self::parse`] reads.
+    ///
+    /// Deliberately the zcashd format rather than a private one: it is the
+    /// encoding `z_gettreestate` publishes, so a tree written here can be
+    /// compared byte-for-byte against a node, and anything written here can
+    /// be read back by a parser that has already been checked against one.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_tree(&mut out, self);
+        out
+    }
 }
 
 impl IncrementalWitness {
@@ -540,6 +609,31 @@ impl IncrementalWitness {
     /// not become a wrong-but-plausible Merkle path — that would produce a
     /// proof for a tree that never existed, which fails at consensus and
     /// wastes a 725 MB proving run to find out.
+    /// Serialize one witness, in the same encoding `parse_cached` reads for
+    /// each list entry.
+    ///
+    /// Used to checkpoint a scan: a scan that runs for hours must be able to
+    /// stop and resume, and an in-flight witness is the part of that state
+    /// that cannot be recomputed without re-reading every block before it.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_witness(&mut out, self);
+        out
+    }
+
+    /// Parse a single witness, as written by [`Self::to_bytes`].
+    ///
+    /// Distinct from [`Self::parse_cached`], which reads zcashd's
+    /// `std::list<SproutWitness>` blob with its trailing height.
+    pub fn parse_one(bytes: &[u8]) -> Result<Self, WitnessError> {
+        let mut c = Cursor::new(bytes);
+        let witness = parse_witness(&mut c).ok_or(WitnessError::Malformed)?;
+        if c.pos != bytes.len() {
+            return Err(WitnessError::TrailingBytes(bytes.len() - c.pos));
+        }
+        Ok(witness)
+    }
+
     pub fn parse_cached(blob: &[u8]) -> Result<Self, WitnessError> {
         let mut c = Cursor::new(blob);
         let count = c.compact_size().ok_or(WitnessError::Malformed)?;

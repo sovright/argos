@@ -276,6 +276,228 @@ impl SproutScanResult {
     }
 }
 
+/// A scan's full state, enough to resume exactly where it stopped.
+///
+/// The commitment tree is the reason this exists. It is not derivable from
+/// anything cheaper: reconstructing it means re-reading every block from
+/// genesis, which is the multi-hour, multi-gigabyte cost the whole scan is
+/// trying not to repeat. In-flight witnesses are the same — a witness only
+/// advances by seeing every subsequent commitment, so a lost witness cannot
+/// be rebuilt without another full pass.
+///
+/// Nullifiers are kept too. A note found early may be spent by a JoinSplit
+/// that has not been reached yet, so dropping the set across a resume would
+/// report spent notes as spendable.
+///
+/// The format is a length-prefixed concatenation with a version byte, in the
+/// same CompactSize style as everything else here. Deliberately not JSON: it
+/// holds spending keys and note plaintexts, and a text format invites being
+/// pasted into a bug report.
+pub struct SproutScanCheckpoint {
+    bytes: Vec<u8>,
+}
+
+/// Bumped when the layout changes, so a stale file is refused rather than
+/// misread into a wrong tree — which would produce worthless witnesses with
+/// no visible error.
+const CHECKPOINT_VERSION: u8 = 1;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("this checkpoint was written by a different version of Argos and cannot be resumed")]
+    WrongVersion,
+    #[error("the checkpoint file is corrupt or truncated")]
+    Corrupt,
+    #[error(transparent)]
+    Witness(#[from] WitnessError),
+}
+
+impl SproutScanCheckpoint {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+}
+
+/// Minimal writer/reader for the checkpoint encoding.
+mod codec {
+    pub fn put_u64(out: &mut Vec<u8>, v: u64) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+        put_u64(out, b.len() as u64);
+        out.extend_from_slice(b);
+    }
+    pub struct Reader<'a> {
+        pub bytes: &'a [u8],
+        pub pos: usize,
+    }
+    impl<'a> Reader<'a> {
+        pub fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, pos: 0 }
+        }
+        pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let end = self.pos.checked_add(n)?;
+            let s = self.bytes.get(self.pos..end)?;
+            self.pos = end;
+            Some(s)
+        }
+        pub fn u64(&mut self) -> Option<u64> {
+            Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        }
+        pub fn bytes(&mut self) -> Option<&'a [u8]> {
+            let n = usize::try_from(self.u64()?).ok()?;
+            self.take(n)
+        }
+        pub fn array32(&mut self) -> Option<[u8; 32]> {
+            self.take(32)?.try_into().ok()
+        }
+    }
+}
+
+impl SproutScanner {
+    /// Capture everything needed to resume.
+    pub fn checkpoint(&self) -> SproutScanCheckpoint {
+        use codec::{put_bytes, put_u64};
+
+        let mut out = vec![CHECKPOINT_VERSION];
+
+        put_bytes(&mut out, &self.tree.to_bytes());
+
+        put_u64(&mut out, self.keys.len() as u64);
+        for key in &self.keys {
+            out.extend_from_slice(&key.a_sk);
+        }
+
+        put_u64(&mut out, self.pending.len() as u64);
+        for p in &self.pending {
+            out.extend_from_slice(&p.a_sk);
+            put_u64(&mut out, p.note.value);
+            out.extend_from_slice(&p.note.rho);
+            out.extend_from_slice(&p.note.r);
+            put_bytes(&mut out, &p.note.memo);
+            out.extend_from_slice(&p.commitment);
+            out.extend_from_slice(&p.nullifier);
+            out.extend_from_slice(&p.outpoint.txid);
+            put_u64(&mut out, p.outpoint.js_index);
+            out.push(p.outpoint.output_index);
+            put_bytes(&mut out, &p.witness.to_bytes());
+        }
+
+        put_u64(&mut out, self.spent.len() as u64);
+        // Sorted, so the same scan state always produces the same bytes: a
+        // checkpoint that differed run to run would be impossible to compare
+        // when diagnosing a resume bug.
+        let mut spent: Vec<_> = self.spent.iter().collect();
+        spent.sort_unstable();
+        for nf in spent {
+            out.extend_from_slice(nf);
+        }
+
+        put_u64(&mut out, self.progress.blocks_scanned);
+        put_u64(&mut out, self.progress.joinsplits_seen);
+        put_u64(&mut out, self.progress.commitments_appended);
+        put_u64(&mut out, self.progress.notes_found as u64);
+
+        SproutScanCheckpoint { bytes: out }
+    }
+
+    /// Rebuild a scanner from a checkpoint.
+    pub fn resume(checkpoint: &SproutScanCheckpoint) -> Result<Self, CheckpointError> {
+        let mut r = codec::Reader::new(checkpoint.as_bytes());
+
+        match r.take(1).and_then(|v| v.first().copied()) {
+            Some(CHECKPOINT_VERSION) => {}
+            Some(_) => return Err(CheckpointError::WrongVersion),
+            None => return Err(CheckpointError::Corrupt),
+        }
+
+        let tree = IncrementalMerkleTree::parse(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
+
+        let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
+        let mut keys = Vec::new();
+        for _ in 0..key_count {
+            let a_sk = r.array32().ok_or(CheckpointError::Corrupt)?;
+            keys.push(ScanKey {
+                a_sk,
+                address: SproutPaymentAddress::from_spending_key(&a_sk),
+            });
+        }
+
+        let pending_count = r.u64().ok_or(CheckpointError::Corrupt)?;
+        let mut pending = Vec::new();
+        for _ in 0..pending_count {
+            let a_sk = r.array32().ok_or(CheckpointError::Corrupt)?;
+            let value = r.u64().ok_or(CheckpointError::Corrupt)?;
+            let rho = r.array32().ok_or(CheckpointError::Corrupt)?;
+            let note_r = r.array32().ok_or(CheckpointError::Corrupt)?;
+            let memo: [u8; 512] = r
+                .bytes()
+                .ok_or(CheckpointError::Corrupt)?
+                .try_into()
+                .map_err(|_| CheckpointError::Corrupt)?;
+            let commitment = r.array32().ok_or(CheckpointError::Corrupt)?;
+            let nullifier = r.array32().ok_or(CheckpointError::Corrupt)?;
+            let txid = r.array32().ok_or(CheckpointError::Corrupt)?;
+            let js_index = r.u64().ok_or(CheckpointError::Corrupt)?;
+            let output_index = *r
+                .take(1)
+                .and_then(|b| b.first())
+                .ok_or(CheckpointError::Corrupt)?;
+            let witness =
+                IncrementalWitness::parse_one(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
+
+            pending.push(PendingNote {
+                note: crate::sprout::SproutNotePlaintext {
+                    value,
+                    rho,
+                    r: note_r,
+                    memo,
+                },
+                a_sk,
+                address: SproutPaymentAddress::from_spending_key(&a_sk),
+                commitment,
+                outpoint: JsOutPoint {
+                    txid,
+                    js_index,
+                    output_index,
+                },
+                nullifier,
+                witness,
+            });
+        }
+
+        let spent_count = r.u64().ok_or(CheckpointError::Corrupt)?;
+        let mut spent = HashSet::new();
+        for _ in 0..spent_count {
+            spent.insert(r.array32().ok_or(CheckpointError::Corrupt)?);
+        }
+
+        let progress = SproutScanProgress {
+            blocks_scanned: r.u64().ok_or(CheckpointError::Corrupt)?,
+            joinsplits_seen: r.u64().ok_or(CheckpointError::Corrupt)?,
+            commitments_appended: r.u64().ok_or(CheckpointError::Corrupt)?,
+            notes_found: usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+                .map_err(|_| CheckpointError::Corrupt)?,
+        };
+
+        if r.pos != r.bytes.len() {
+            return Err(CheckpointError::Corrupt);
+        }
+
+        Ok(Self {
+            keys,
+            tree,
+            pending,
+            spent,
+            progress,
+        })
+    }
+}
+
 /// Group JoinSplits by transaction, preserving order.
 ///
 /// Only used for reporting; the scan itself consumes them in sequence.
@@ -490,6 +712,176 @@ mod tests {
 
         assert_eq!(result.notes.len(), 2);
         assert_eq!(result.total_value(), 300);
+    }
+
+    /// The property the whole feature rests on: stopping and resuming must
+    /// produce exactly what an uninterrupted scan would. Anything less and
+    /// the warning's promise that progress is saved is false.
+    #[test]
+    fn a_resumed_scan_matches_an_uninterrupted_one() {
+        let a_sk = [0x42u8; 32];
+        let (first, _) = joinsplit_paying(&a_sk, 1_000, 0, 20);
+        let (second, _) = joinsplit_paying(&[0x99u8; 32], 500, 1, 21);
+        let (third, _) = joinsplit_paying(&a_sk, 2_500, 1, 22);
+
+        // Straight through.
+        let mut whole = SproutScanner::new(&[a_sk]);
+        whole
+            .scan_block(&[first.clone(), second.clone()])
+            .expect("scan");
+        whole.scan_block(std::slice::from_ref(&third)).expect("scan");
+        let expected_anchor = whole.anchor();
+        let expected = whole.finish().expect("finish");
+
+        // Interrupted after the first block, resumed for the second.
+        let mut part = SproutScanner::new(&[a_sk]);
+        part.scan_block(&[first, second]).expect("scan");
+        let checkpoint = part.checkpoint();
+        drop(part);
+
+        let mut resumed = SproutScanner::resume(&checkpoint).expect("resume");
+        resumed.scan_block(&[third]).expect("scan");
+        let resumed_anchor = resumed.anchor();
+        let actual = resumed.finish().expect("finish");
+
+        assert_eq!(
+            resumed_anchor, expected_anchor,
+            "the commitment tree must survive a resume exactly; a different anchor \
+             means every witness from here on is worthless"
+        );
+        assert_eq!(actual.notes.len(), expected.notes.len());
+        assert_eq!(actual.total_value(), expected.total_value());
+        assert_eq!(actual.total_value(), 3_500);
+
+        // The witnesses must match too, not merely the count: a witness that
+        // stopped advancing across the resume still encodes, and fails only
+        // at broadcast.
+        for (a, b) in actual.notes.iter().zip(expected.notes.iter()) {
+            assert_eq!(a.witness, b.witness, "witnesses must survive the resume");
+            assert_eq!(a.commitment, b.commitment);
+        }
+    }
+
+    /// A note found before the checkpoint, spent after it. The nullifier set
+    /// has to cross the resume or the note is reported as spendable.
+    #[test]
+    fn a_note_spent_after_the_checkpoint_is_still_detected() {
+        let a_sk = [0x42u8; 32];
+        let (js, nullifier) = joinsplit_paying(&a_sk, 4_000, 0, 23);
+
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block(&[js]).expect("scan");
+        let checkpoint = scanner.checkpoint();
+
+        let mut resumed = SproutScanner::resume(&checkpoint).expect("resume");
+        let (mut spender, _) = joinsplit_paying(&[0x77u8; 32], 10, 0, 24);
+        spender.nullifiers[0] = nullifier;
+        resumed.scan_block(&[spender]).expect("scan");
+        let result = resumed.finish().expect("finish");
+
+        assert!(
+            result.notes.is_empty(),
+            "the note was spent after the checkpoint and must not be offered"
+        );
+        assert_eq!(result.spent_notes, 1);
+    }
+
+    /// The converse: a nullifier seen *before* the checkpoint must still be
+    /// remembered afterwards, or a note found later is wrongly offered.
+    #[test]
+    fn nullifiers_seen_before_the_checkpoint_survive_it() {
+        let a_sk = [0x42u8; 32];
+        let (js, nullifier) = joinsplit_paying(&a_sk, 4_000, 0, 25);
+
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        let (mut spender, _) = joinsplit_paying(&[0x77u8; 32], 10, 0, 26);
+        spender.nullifiers[0] = nullifier;
+        // Spend seen first, then the note itself — the checkpoint falls
+        // between them.
+        scanner.scan_block(&[spender]).expect("scan");
+        let checkpoint = scanner.checkpoint();
+
+        let mut resumed = SproutScanner::resume(&checkpoint).expect("resume");
+        resumed.scan_block(&[js]).expect("scan");
+        let result = resumed.finish().expect("finish");
+
+        assert!(result.notes.is_empty());
+        assert_eq!(result.spent_notes, 1);
+    }
+
+    #[test]
+    fn a_checkpoint_round_trips_with_no_notes_found() {
+        let mut scanner = SproutScanner::new(&[[0x42u8; 32]]);
+        let (js, _) = joinsplit_paying(&[0x99u8; 32], 1, 0, 27);
+        scanner.scan_block(&[js]).expect("scan");
+        let anchor = scanner.anchor();
+
+        let resumed =
+            SproutScanner::resume(&scanner.checkpoint()).expect("an empty result must resume");
+        assert_eq!(resumed.anchor(), anchor);
+        assert_eq!(resumed.progress(), scanner.progress());
+    }
+
+    /// Checkpointing the same state twice must give identical bytes, or
+    /// diagnosing a resume bug by comparing files is impossible. The
+    /// nullifier set is a HashSet, whose iteration order is not stable.
+    #[test]
+    fn checkpoints_are_deterministic() {
+        let a_sk = [0x42u8; 32];
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        for seed in 30..40 {
+            let (js, _) = joinsplit_paying(&a_sk, 100, 0, seed);
+            scanner.scan_block(&[js]).expect("scan");
+        }
+        assert_eq!(
+            scanner.checkpoint().as_bytes(),
+            scanner.checkpoint().as_bytes(),
+            "the nullifier set is unordered and must be sorted before writing"
+        );
+    }
+
+    /// A checkpoint from a future layout must be refused. Misreading one
+    /// would yield a wrong tree with no visible error, and worthless
+    /// witnesses that only fail at broadcast.
+    #[test]
+    fn a_checkpoint_from_another_version_is_refused() {
+        let scanner = SproutScanner::new(&[[0x42u8; 32]]);
+        let mut bytes = scanner.checkpoint().as_bytes().to_vec();
+        bytes[0] = CHECKPOINT_VERSION.wrapping_add(1);
+
+        assert!(matches!(
+            SproutScanner::resume(&SproutScanCheckpoint::from_bytes(bytes)),
+            Err(CheckpointError::WrongVersion)
+        ));
+    }
+
+    /// Truncation must be caught rather than silently producing a shorter
+    /// tree, and so must trailing junk.
+    #[test]
+    fn a_corrupt_checkpoint_is_refused() {
+        let a_sk = [0x42u8; 32];
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        let (js, _) = joinsplit_paying(&a_sk, 100, 0, 41);
+        scanner.scan_block(&[js]).expect("scan");
+        let full = scanner.checkpoint().as_bytes().to_vec();
+
+        for cut in [1, full.len() / 2, full.len() - 1] {
+            assert!(
+                SproutScanner::resume(&SproutScanCheckpoint::from_bytes(full[..cut].to_vec()))
+                    .is_err(),
+                "a checkpoint truncated to {cut} bytes must be refused"
+            );
+        }
+
+        let mut extra = full;
+        extra.push(0x00);
+        assert!(
+            matches!(
+                SproutScanner::resume(&SproutScanCheckpoint::from_bytes(extra)),
+                Err(CheckpointError::Corrupt)
+            ),
+            "trailing bytes mean the layout is not what we think it is"
+        );
     }
 
     #[test]
