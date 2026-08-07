@@ -124,6 +124,11 @@ services:
     restart: "no"
     ports:
       - "127.0.0.1:18242:18232"
+      # The p2p port, so the Sprout scanner can be tested against a real
+      # node speaking the real wire protocol. Sprout notes are invisible to
+      # lightwalletd, so p2p is the only way to find them and the only way
+      # to check the framing against something that did not come from us.
+      - "127.0.0.1:18344:18344"
     volumes:
       - zcashd-sprout-data:/srv/zcashd/.zcash
       - ./zcashd-sprout.conf:/srv/zcashd/.zcash/zcash.conf:ro
