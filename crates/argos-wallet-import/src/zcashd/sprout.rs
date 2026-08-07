@@ -391,6 +391,25 @@ fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) ->
 /// whether the witnesses are usable. A `tx` record that cannot be walked
 /// is silently skipped — it must never abort recovery of notes from
 /// records that parse cleanly.
+/// Parse a serialized `JSDescription` into its public fields.
+///
+/// A `JSDescription` has one serialization, whether it arrives in a wallet
+/// record or in a block off the network, so the block scanner reuses this
+/// reader rather than growing a second copy that could drift from it.
+///
+/// The caller supplies `txid` and `js_index` because neither is inside the
+/// description itself, and `joinsplit_pubkey` is left zero for the caller to
+/// fill: it is serialized once per transaction, after the whole vector.
+pub fn parse_js_description(
+    bytes: &[u8],
+    use_groth: bool,
+    txid: [u8; 32],
+    js_index: u64,
+) -> Option<SproutJoinSplit> {
+    let mut cursor = Cursor::new(bytes);
+    read_joinsplit(&mut cursor, use_groth, txid, js_index)
+}
+
 pub fn collect_sprout_notes(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {

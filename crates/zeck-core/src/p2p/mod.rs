@@ -22,6 +22,7 @@
 //! is closed and never grows, which is what makes a from-genesis historical
 //! sweep tractable here where it would not be for Sapling or Orchard.
 
+pub mod block;
 pub mod peer;
 pub mod pool;
 pub mod wire;

@@ -157,3 +157,80 @@ async fn an_unreachable_node_reports_a_refusal_not_a_crash() {
         "the failure should name a connection refusal, got: {text}"
     );
 }
+
+/// Extract JoinSplits from real blocks, off the wire, on a chain that
+/// actually contains them.
+///
+/// This is the whole read path at once: p2p framing, block header walk,
+/// upstream transaction parsing, and the `write`/re-read round trip that
+/// recovers `ephemeral_key` and `ciphertexts` — the two fields
+/// `zcash_primitives` exposes no accessor for. Every earlier test in this
+/// file runs on blocks with no JoinSplits, so none of them exercise it.
+///
+/// The `sprout` chain is the only one that can carry Sprout notes: ZIP 211
+/// forbids funding the pool from Canopy onward, and that chain holds Canopy
+/// inactive.
+#[tokio::test]
+#[ignore = "needs the regtest sprout node; see the module docs"]
+async fn joinsplits_are_recovered_from_real_blocks() {
+    use argos_core::p2p::block::joinsplits_in_block;
+    use zcash_protocol::consensus::BranchId;
+
+    let mut peer = Peer::connect(NODE, P2pNetwork::Regtest)
+        .await
+        .expect("handshake");
+
+    // Walk the whole chain, pulling every block and scanning it.
+    let mut locator = [0u8; 32];
+    let mut found = Vec::new();
+    let mut blocks_seen = 0usize;
+
+    loop {
+        let headers = peer.get_headers(&[locator]).await.expect("getheaders");
+        if headers.is_empty() {
+            break;
+        }
+        let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
+        locator = *hashes.last().expect("non-empty");
+
+        for block in peer.get_blocks(&hashes).await.expect("getdata") {
+            blocks_seen += 1;
+            let js = joinsplits_in_block(&block, BranchId::Canopy)
+                .expect("a real block from a real node must parse");
+            found.extend(js);
+        }
+    }
+
+    println!("scanned {blocks_seen} blocks, found {} JoinSplits", found.len());
+    assert!(
+        !found.is_empty(),
+        "the sprout chain holds JoinSplit transactions; none were found, so the \
+         extraction path is not working"
+    );
+
+    for js in &found {
+        // The fields with no upstream accessor are the reason this round
+        // trip exists; if the re-read were misaligned they would be zero.
+        assert_ne!(
+            js.ephemeral_key, [0u8; 32],
+            "ephemeral_key must be recovered, not left zero"
+        );
+        assert_ne!(
+            js.joinsplit_pubkey, [0u8; 32],
+            "the per-transaction pubkey must be backfilled"
+        );
+        for ct in &js.ciphertexts {
+            assert_eq!(ct.len(), 601, "a Sprout note ciphertext is 601 bytes");
+            assert!(
+                ct.iter().any(|b| *b != 0),
+                "a real ciphertext is not all zeros"
+            );
+        }
+        // A JoinSplit always publishes two commitments, and at least one
+        // must be a real note.
+        assert!(
+            js.commitments.iter().any(|c| *c != [0u8; 32]),
+            "a real JoinSplit commits to at least one note"
+        );
+    }
+}
