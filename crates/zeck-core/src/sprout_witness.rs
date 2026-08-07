@@ -67,6 +67,38 @@ fn empty_roots() -> [Node; TREE_DEPTH + 1] {
     roots
 }
 
+/// The root of a completely empty Sprout tree.
+///
+/// On a chain that has never held a Sprout note this is the only anchor
+/// consensus will accept, and it is what a shielding JoinSplit — one whose
+/// inputs are all zero-value dummies — must reference.
+pub fn empty_tree_root() -> [u8; 32] {
+    empty_roots()[TREE_DEPTH]
+}
+
+/// A structurally valid authentication path for a zero-value dummy input.
+///
+/// The circuit skips the Merkle check for zero-value inputs, so the siblings
+/// are irrelevant — but `create_proof` still *parses* the buffer for every
+/// input and asserts on its framing, so an all-zeroes array panics with
+/// `assertion failed: left: 0, right: 29` rather than being ignored. The
+/// siblings here are the empty roots, which is what a path into an empty
+/// tree would contain anyway.
+pub fn dummy_path() -> [u8; WITNESS_PATH_SIZE] {
+    let empty = empty_roots();
+    let mut out = [0u8; WITNESS_PATH_SIZE];
+    out[0] = TREE_DEPTH as u8;
+    let mut at = 1;
+    // Root-first, matching `encode_for_prover`.
+    for depth in (0..TREE_DEPTH).rev() {
+        out[at] = 32;
+        out[at + 1..at + 33].copy_from_slice(&empty[depth]);
+        at += 33;
+    }
+    // Position 0; the trailing eight bytes stay zero.
+    out
+}
+
 /// Supplies the "uncle" hashes a partial tree is missing, falling back to
 /// empty roots once the witness's own cached uncles run out.
 struct PathFiller {
@@ -770,6 +802,18 @@ mod tests {
     #[test]
     fn an_absurd_count_is_rejected() {
         assert!(IncrementalWitness::parse_cached(&[0xFE, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+    }
+
+    /// A dummy path must satisfy create_proof's framing assertions, which
+    /// an all-zeroes buffer does not — it panics inside the prover.
+    #[test]
+    fn a_dummy_path_is_well_framed() {
+        let path = dummy_path();
+        assert_eq!(path[0], TREE_DEPTH as u8);
+        for i in 0..TREE_DEPTH {
+            assert_eq!(path[1 + i * 33], 32, "each sibling is length-prefixed");
+        }
+        assert_eq!(&path[WITNESS_PATH_SIZE - 8..], &[0u8; 8], "position 0");
     }
 
     #[test]

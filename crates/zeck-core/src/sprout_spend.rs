@@ -492,6 +492,158 @@ pub fn prove_joinsplit(
     Ok(bytes)
 }
 
+/// One transparent input funding a JoinSplit's `vpub_old`.
+pub struct TransparentFunding {
+    pub txid: [u8; 32],
+    pub index: u32,
+    pub value: u64,
+    /// The `scriptPubKey` being spent, which is also the `scriptCode` for a
+    /// P2PKH sighash.
+    pub script_pubkey: Vec<u8>,
+    pub secret: secp256k1::SecretKey,
+}
+
+/// Assemble a V4 transaction with transparent inputs feeding a JoinSplit,
+/// and sign everything.
+///
+/// This is how value *enters* the Sprout pool, and the only route to a real
+/// Sprout note on a chain that has never had one: a JoinSplit's zero-value
+/// inputs skip the circuit's Merkle check, so no prior note or witness is
+/// needed. It is how Sprout was funded before any Sprout note existed.
+///
+/// `zcash_primitives`' builder cannot express this — it emits no Sprout
+/// bundle — so the transparent inputs are signed by hand here, the same way
+/// the JoinSplit is.
+///
+/// No transparent outputs are produced: everything not claimed by
+/// `vpub_old` is the fee. That also keeps the transaction valid if an input
+/// ever happens to be coinbase, since consensus forbids a transaction
+/// spending transparent coinbase from having transparent outputs.
+pub fn build_and_sign_v4_shielding(
+    consensus_branch_id: BranchId,
+    expiry_height: BlockHeight,
+    funding: &[TransparentFunding],
+    joinsplits: Vec<sprout_tx::JsDescription>,
+    key: &JoinSplitSigningKey,
+) -> ZeckResult<Transaction> {
+    use zcash_transparent::address::Script;
+    use zcash_transparent::bundle::{Authorized as TAuthorized, OutPoint, TxIn};
+    use zcash_transparent::sighash::SighashType;
+
+    if funding.is_empty() {
+        return Err(ZeckError::TransactionBuild(
+            "a shielding transaction needs at least one transparent input".to_owned(),
+        ));
+    }
+
+    let secp = secp256k1::Secp256k1::new();
+
+    // Pass one: an unsigned bundle, so the sighash has the right shape. Each
+    // script_sig is empty; the sighash for a given input substitutes that
+    // input's script_code anyway.
+    let build_bundle = |sigs: &[Vec<u8>]| zcash_transparent::bundle::Bundle::<TAuthorized> {
+        vin: funding
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                TxIn::from_parts(
+                    OutPoint::new(f.txid, f.index),
+                    Script(zcash_script::script::Code(sigs.get(i).cloned().unwrap_or_default())),
+                    0xFFFF_FFFF,
+                )
+            })
+            .collect(),
+        vout: Vec::new(),
+        authorization: TAuthorized,
+    };
+
+    let sprout_bundle = |sig: [u8; 64]| sprout_tx::Bundle {
+        joinsplits: joinsplits.clone(),
+        joinsplit_pubkey: key.verification_key(),
+        joinsplit_sig: sig,
+    };
+
+    let empty: Vec<Vec<u8>> = Vec::new();
+    let unsigned = TransactionData::<Authorized>::from_parts(
+        TxVersion::V4,
+        consensus_branch_id,
+        0,
+        expiry_height,
+        Some(build_bundle(&empty)),
+        Some(sprout_bundle([0u8; 64])),
+        None,
+        None,
+    );
+
+    // Sign each transparent input over its own sighash.
+    let mut script_sigs = Vec::with_capacity(funding.len());
+    for (i, f) in funding.iter().enumerate() {
+        let script = Script(zcash_script::script::Code(f.script_pubkey.clone()));
+        let value = zcash_protocol::value::Zatoshis::from_u64(f.value).map_err(|err| {
+            ZeckError::TransactionBuild(format!("input {i} value out of range: {err}"))
+        })?;
+        let signable = zcash_transparent::sighash::SignableInput::from_parts(
+            unsigned
+                .transparent_bundle()
+                .expect("we just supplied a transparent bundle"),
+            SighashType::ALL,
+            i,
+            &script,
+            &script,
+            value,
+        )
+        .map_err(|err| ZeckError::TransactionBuild(format!("signable input {i}: {err:?}")))?;
+
+        let sighash = v4_signature_hash(&unsigned, &SignableInput::Transparent(signable));
+        let msg = secp256k1::Message::from_digest_slice(sighash.as_bytes())
+            .map_err(|err| ZeckError::TransactionBuild(format!("sighash {i}: {err}")))?;
+        let sig = secp.sign_ecdsa(&msg, &f.secret);
+
+        // scriptSig = PUSH(der||SIGHASH_ALL) PUSH(pubkey)
+        let mut der = sig.serialize_der().to_vec();
+        der.push(SighashType::ALL.encode());
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &f.secret).serialize();
+
+        let mut script_sig = Vec::with_capacity(der.len() + pubkey.len() + 2);
+        script_sig.push(der.len() as u8);
+        script_sig.extend_from_slice(&der);
+        script_sig.push(pubkey.len() as u8);
+        script_sig.extend_from_slice(&pubkey);
+        script_sigs.push(script_sig);
+    }
+
+    // Pass two: the JoinSplit signature, over the transaction with the
+    // transparent inputs now signed and joinsplit_sig still zeroed.
+    let with_scripts = TransactionData::<Authorized>::from_parts(
+        TxVersion::V4,
+        consensus_branch_id,
+        0,
+        expiry_height,
+        Some(build_bundle(&script_sigs)),
+        Some(sprout_bundle([0u8; 64])),
+        None,
+        None,
+    );
+    let js_sighash = v4_signature_hash(&with_scripts, &SignableInput::Shielded);
+    let mut js_bytes = [0u8; 32];
+    js_bytes.copy_from_slice(js_sighash.as_bytes());
+
+    let signed = TransactionData::<Authorized>::from_parts(
+        TxVersion::V4,
+        consensus_branch_id,
+        0,
+        expiry_height,
+        Some(build_bundle(&script_sigs)),
+        Some(sprout_bundle(key.sign(&js_bytes))),
+        None,
+        None,
+    );
+
+    signed.freeze().map_err(|err| {
+        ZeckError::TransactionBuild(format!("freezing the shielding transaction: {err}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
