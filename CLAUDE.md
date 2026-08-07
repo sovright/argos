@@ -102,8 +102,28 @@ loop: an imported key set is fixed and fully known once parsed, so there
 are no slots to enumerate and no gap to extend.
 
 **Spending imported Sapling is still not implemented.** Balances are
-visible; moving them needs the PCZT path below. Sprout remains
-identified-only, and the CLI says so before showing any balance.
+visible; moving them needs the PCZT path below.
+
+**Sprout is recoverable, and Argos's scope for it ends at Sapling.** This
+is a decision, not a gap. A JoinSplit exists only in a v4 transaction and
+Orchard actions only in v5 (`zcash_primitives`' `read_v5` hardcodes
+`sprout_bundle: None`), so Sprout cannot reach Orchard in one transaction.
+Doing the second hop inside Argos would mean holding an intermediate
+spending key of its own — so instead the sweep pays the Sapling receiver of
+the address the user supplied, under their keys, and the Orchard hop is
+theirs. Argos never custodies value, and a crash mid-flow strands nothing.
+Do not "finish the chain" by adding a carrier key; the wording in
+`sprout_sweep::SPROUT_LANDS_IN_SAPLING` exists to explain this and is
+tested for naming the real constraint.
+
+Two paths reach a Sprout note. A `wallet.dat` that zcashd ever synced
+carries a cached witness, and consensus accepts the historical anchor it
+produces — proven in `sprout_stale_anchor`, where a spend against a root
+the chain had already passed was accepted and mined. That path needs no
+scan and is what `sweep-sprout` uses. A wallet holding only a bare `zkey`
+needs the full-block scan (`sprout_scan` + `p2p`), which is built and
+consensus-validated but **not wired to any command**, and whose checkpoint
+does not yet store a block locator, so it cannot actually resume.
 
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
