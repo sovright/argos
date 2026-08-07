@@ -23,4 +23,5 @@
 //! sweep tractable here where it would not be for Sapling or Orchard.
 
 pub mod peer;
+pub mod pool;
 pub mod wire;

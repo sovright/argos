@@ -117,3 +117,43 @@ async fn genesis_hash(_peer: &mut Peer) -> [u8; 32] {
     // no RPC round trip.
     [0u8; 32]
 }
+
+/// The peer pool, against a node we control.
+///
+/// Deliberately not tested against mainnet. Public seed nodes refuse the
+/// overwhelming majority of inbound connections — measured at 38 of 38 across
+/// repeated runs, with an identical close whether or not a `version` message
+/// is sent, which places the refusal before the protocol rather than in it.
+/// A test that depends on catching a free slot on a public node would be
+/// flaky by construction, and polling for one hard enough to be reliable
+/// would itself be abusive.
+#[tokio::test]
+#[ignore = "needs the regtest sprout node; see the module docs"]
+async fn the_pool_connects_to_an_explicitly_supplied_node() {
+    use argos_core::p2p::pool::connect_to_any;
+
+    let peer = connect_to_any(P2pNetwork::Regtest, &[NODE.to_owned()], 1)
+        .await
+        .expect("an explicitly supplied node must be used without any DNS seed");
+
+    assert!(peer.peer_height > 0);
+}
+
+/// A supplied address that is not listening must fail with the diagnosis
+/// that says so, rather than a bare connection error.
+#[tokio::test]
+#[ignore = "needs no node, but grouped with the other p2p checks"]
+async fn an_unreachable_node_reports_a_refusal_not_a_crash() {
+    use argos_core::p2p::pool::connect_to_any;
+
+    // Port 1 on loopback: nothing listens there.
+    let err = connect_to_any(P2pNetwork::Regtest, &["127.0.0.1:1".to_owned()], 1)
+        .await
+        .expect_err("nothing listens on port 1");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("refused"),
+        "the failure should name a connection refusal, got: {text}"
+    );
+}

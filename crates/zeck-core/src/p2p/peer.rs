@@ -64,11 +64,31 @@ pub enum PeerError {
 }
 
 /// A connected, handshaken peer.
+///
+/// `Debug` reports the peer's address and height only. The socket itself is
+/// not useful in a log line, and the address is what identifies which peer a
+/// scan is talking to.
 pub struct Peer {
     stream: TcpStream,
     network: P2pNetwork,
     /// The peer's advertised chain height, from its `version`.
     pub peer_height: u32,
+}
+
+impl std::fmt::Debug for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Peer")
+            .field(
+                "addr",
+                &self
+                    .stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "<disconnected>".to_owned()),
+            )
+            .field("peer_height", &self.peer_height)
+            .finish()
+    }
 }
 
 impl Peer {
