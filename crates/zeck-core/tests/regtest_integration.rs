@@ -59,8 +59,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use argos_core::{
-    workspace::RecoveryWorkspace, RecoveryService, RuntimeScanConfig, ScanConfig,
-    ScanHandle, ScanPhase, SweepRequest, ZeckNetwork,
+    workspace::RecoveryWorkspace, RecoveryService, RuntimeScanConfig, ScanConfig, ScanHandle,
+    ScanPhase, SweepRequest, ZeckNetwork,
 };
 use secrecy::SecretString;
 
@@ -239,8 +239,7 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
     // Baseline: run a scan against the bare harness so we know what
     // `synced_to_height` and which discoveries the chain ought to produce.
     let baseline_dir = tempfile::tempdir().expect("temp data dir for baseline scan");
-    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn8-baseline")
-        .await;
+    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn8-baseline").await;
     let baseline_progress = baseline
         .service
         .get_scan_progress(&baseline.handle)
@@ -388,8 +387,7 @@ async fn hostile_compact_block_rejected_cleanly() {
 
     // Baseline first (same pattern as R-N8) so we have a target.
     let baseline_dir = tempfile::tempdir().expect("temp data dir for baseline scan");
-    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn9-baseline")
-        .await;
+    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn9-baseline").await;
     let baseline_progress = baseline
         .service
         .get_scan_progress(&baseline.handle)
@@ -440,9 +438,9 @@ async fn hostile_compact_block_rejected_cleanly() {
             .expect("get_scan_progress");
         match progress.phase {
             ScanPhase::Error => break progress,
-            ScanPhase::Complete => panic!(
-                "[regtest] R-N9: scan must NOT complete cleanly against a hostile chain"
-            ),
+            ScanPhase::Complete => {
+                panic!("[regtest] R-N9: scan must NOT complete cleanly against a hostile chain")
+            }
             ScanPhase::Cancelled => panic!("[regtest] R-N9: scan unexpectedly cancelled"),
             _ => {
                 if std::time::Instant::now() > deadline {
@@ -482,8 +480,7 @@ async fn hostile_compact_block_rejected_cleanly() {
     // Uses a fresh workspace so we're testing "no global state pollution",
     // not resume.
     let recovery_dir = tempfile::tempdir().expect("temp data dir for recovery scan");
-    let recovery = complete_scan_against_test_seed(&harness, &recovery_dir, "rn9-recovery")
-        .await;
+    let recovery = complete_scan_against_test_seed(&harness, &recovery_dir, "rn9-recovery").await;
     let recovery_progress = recovery
         .service
         .get_scan_progress(&recovery.handle)
@@ -589,7 +586,9 @@ async fn sustained_high_latency_scan_completes() {
         let p = service.get_scan_progress(&handle).await.expect("progress");
         match p.phase {
             ScanPhase::Complete => break p,
-            ScanPhase::Error => panic!("[regtest] R-N13: scan errored under latency: {:?}", p.error),
+            ScanPhase::Error => {
+                panic!("[regtest] R-N13: scan errored under latency: {:?}", p.error)
+            }
             ScanPhase::Cancelled => panic!("[regtest] R-N13: scan cancelled"),
             _ => {
                 if std::time::Instant::now() > deadline {
@@ -682,11 +681,16 @@ async fn bandwidth_throttled_scan_does_not_flag_false_stall() {
         }
         match p.phase {
             ScanPhase::Complete => break p,
-            ScanPhase::Error => panic!("[regtest] R-N14: scan errored under throttle: {:?}", p.error),
+            ScanPhase::Error => panic!(
+                "[regtest] R-N14: scan errored under throttle: {:?}",
+                p.error
+            ),
             ScanPhase::Cancelled => panic!("[regtest] R-N14: scan cancelled"),
             _ => {
                 if std::time::Instant::now() > deadline {
-                    panic!("[regtest] R-N14: scan did not complete within 240s under 32 KB/s throttle");
+                    panic!(
+                        "[regtest] R-N14: scan did not complete within 240s under 32 KB/s throttle"
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -961,8 +965,11 @@ async fn captive_portal_shim_surfaces_clean_error() {
     // start_scan returns Err immediately for the captive-portal case (the
     // probe fails synchronously). Older Argos paths may instead transition
     // to phase = Error post-start; tolerate both.
-    let start_outcome =
-        tokio::time::timeout(Duration::from_secs(30), service.start_scan(scan_config, seed)).await;
+    let start_outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        service.start_scan(scan_config, seed),
+    )
+    .await;
 
     match start_outcome {
         Err(_) => panic!(
@@ -1186,9 +1193,7 @@ async fn all_endpoints_unreachable_surfaces_clean_error() {
          no silent infinite retry permitted",
     );
 
-    let err = outcome.expect_err(
-        "[regtest] all-unreachable list must surface Err, not Ok",
-    );
+    let err = outcome.expect_err("[regtest] all-unreachable list must surface Err, not Ok");
 
     let msg = err.to_string();
     assert!(
@@ -1343,12 +1348,10 @@ async fn multi_endpoint_fallback_respects_configured_order() {
     // ── Property 2: `preferred` reorders the list. ──────────────────────
     // Same combined URL — harness still appears second — but the preferred
     // argument names it explicitly, which must reorder it to the front.
-    let (_client, established) = argos_core::lightwalletd::connect_lightwalletd_endpoints(
-        &combined,
-        Some(&harness_url),
-    )
-    .await
-    .expect("connect with preferred=harness must succeed on the first attempt");
+    let (_client, established) =
+        argos_core::lightwalletd::connect_lightwalletd_endpoints(&combined, Some(&harness_url))
+            .await
+            .expect("connect with preferred=harness must succeed on the first attempt");
     assert_eq!(
         established, harness_url,
         "[regtest] preferred reordering should have surfaced harness first; got {established}"
@@ -1424,20 +1427,16 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
     // constraint that matters here is that it can only invalidate a block in
     // the *non-finalized* chain, which is why the reorg depth stays small.
     let invalidate_height = pre_tip.saturating_sub(5);
-    let invalidate_hash = common::regtest_harness::zebra_rpc(
-        "getblockhash",
-        serde_json::json!([invalidate_height]),
-    )
-    .await
-    .as_str()
-    .expect("getblockhash returns a hash string")
-    .to_owned();
+    let invalidate_hash =
+        common::regtest_harness::zebra_rpc("getblockhash", serde_json::json!([invalidate_height]))
+            .await
+            .as_str()
+            .expect("getblockhash returns a hash string")
+            .to_owned();
     eprintln!("[regtest] invalidating block @ height {invalidate_height} (hash {invalidate_hash})",);
-    let _ = common::regtest_harness::zebra_rpc(
-        "invalidateblock",
-        serde_json::json!([invalidate_hash]),
-    )
-    .await;
+    let _ =
+        common::regtest_harness::zebra_rpc("invalidateblock", serde_json::json!([invalidate_hash]))
+            .await;
     let _ = common::regtest_harness::zebra_rpc("generate", serde_json::json!([10])).await;
 
     // Let lightwalletd's polling loop observe the new tip.
@@ -1506,7 +1505,11 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
     let post_tip = final_progress
         .synced_to_height
         .expect("[regtest] post-reorg scan must populate synced_to_height");
-    let post_balance: u64 = final_progress.accounts.iter().map(|a| a.total_zatoshis).sum();
+    let post_balance: u64 = final_progress
+        .accounts
+        .iter()
+        .map(|a| a.total_zatoshis)
+        .sum();
     eprintln!("[regtest] post-reorg: tip={post_tip}, balance={post_balance}");
 
     assert!(
@@ -1522,7 +1525,6 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
 
     eprintln!("[regtest] reorg detected and rescanned successfully");
 }
-
 
 // ─── R-S27: Crash mid-scan resume ───────────────────────────────────────────
 //
@@ -1600,7 +1602,6 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     // default batch size (~100 blocks), so the kill lands inside one of the
     // mid-scan windows R-S27 is meant to exercise.
     const SCAN_KILL_AT: u64 = 50;
-
 
     let resume_dir = tempfile::tempdir().expect("resume tempdir");
     let mut crash_handle = HelperSpawn::new(
@@ -1753,7 +1754,10 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--data-dir", crash_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua.clone())
-    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
+    .arg_value(
+        "--birthday",
+        &common::regtest_harness::funding_birthday().to_string(),
+    )
     // Two accounts, not three. Account 2 supplies the destination address but
     // must NOT be scanned: it belongs to the same seed, so tracking it makes
     // the destination part of the wallet being swept. The first run sweeps
@@ -1843,7 +1847,10 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--data-dir", crash_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua)
-    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
+    .arg_value(
+        "--birthday",
+        &common::regtest_harness::funding_birthday().to_string(),
+    )
     // Must match the crash run: a different account count is a different
     // workspace, and the resume would start from scratch instead of resuming.
     .arg_value("--num-accounts", "2")
@@ -2063,10 +2070,12 @@ async fn workspace_deleted_between_scan_and_sweep_surfaces_clean_error() {
         donor_email: None,
     };
 
-    let result = fixture.service.propose_sweep(&fixture.handle, request).await;
-    let err = result.expect_err(
-        "propose_sweep against a deleted workspace must return Err, not Ok",
-    );
+    let result = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await;
+    let err =
+        result.expect_err("propose_sweep against a deleted workspace must return Err, not Ok");
 
     // Don't pin the error variant — the wallet-DB / cache-DB / sidecar-JSON
     // layers all touch the workspace and any of them surfacing the missing
@@ -2111,10 +2120,7 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
     struct RestorePerms<'a>(&'a std::path::Path);
     impl Drop for RestorePerms<'_> {
         fn drop(&mut self) {
-            let _ = std::fs::set_permissions(
-                self.0,
-                std::fs::Permissions::from_mode(0o700),
-            );
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
         }
     }
     let _restore = RestorePerms(&fixture.workspace_root);
@@ -2127,10 +2133,12 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
         donor_email: None,
     };
 
-    let result = fixture.service.propose_sweep(&fixture.handle, request).await;
-    let err = result.expect_err(
-        "propose_sweep against a workspace with stripped permissions must return Err",
-    );
+    let result = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await;
+    let err = result
+        .expect_err("propose_sweep against a workspace with stripped permissions must return Err");
 
     eprintln!("[regtest] propose_sweep failed as expected after chmod 0o000: {err}");
 }
@@ -2182,7 +2190,10 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         donation_rate: Some(0.10),
         donor_email: None,
     };
-    let outcome = fixture.service.execute_sweep(&fixture.handle, request).await;
+    let outcome = fixture
+        .service
+        .execute_sweep(&fixture.handle, request)
+        .await;
 
     // Always clear the override, even on assertion failure below.
     std::env::remove_var("ARGOS_TEST_DONATION_ADDRESS");
@@ -2222,9 +2233,7 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
 #[ignore = "fixture smoke test; run with --ignored --features argos-network"]
 #[tokio::test]
 async fn fake_lightwalletd_smoke() {
-    use argos_core::lightwalletd::{
-        probe_lightwalletd_endpoints, validate_lightwalletd_network,
-    };
+    use argos_core::lightwalletd::{probe_lightwalletd_endpoints, validate_lightwalletd_network};
     use argos_core::models::ZeckNetwork;
 
     // Needed even though this test talks to a fixture rather than the
@@ -2285,7 +2294,10 @@ async fn argos_scan_helper_smoke() {
     )
     .arg_value("--data-dir", temp.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
+    .arg_value(
+        "--birthday",
+        &common::regtest_harness::funding_birthday().to_string(),
+    )
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "smoke")
@@ -2312,10 +2324,12 @@ async fn argos_scan_helper_smoke() {
     // Confirm the helper observed a transition through ScanningShielded —
     // proves the stdout schema covers phase transitions, not just final
     // events.
-    let saw_shielded = handle.events().iter().any(|e| matches!(
-        e,
-        HelperEvent::Phase { phase } if phase == "scanning_shielded"
-    ));
+    let saw_shielded = handle.events().iter().any(|e| {
+        matches!(
+            e,
+            HelperEvent::Phase { phase } if phase == "scanning_shielded"
+        )
+    });
     assert!(
         saw_shielded,
         "[regtest] scan-helper smoke: expected a `scanning_shielded` phase event"
@@ -2358,7 +2372,10 @@ async fn argos_sweep_helper_smoke() {
     .arg_value("--data-dir", temp.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua)
-    .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
+    .arg_value(
+        "--birthday",
+        &common::regtest_harness::funding_birthday().to_string(),
+    )
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "smoke-sweep")
@@ -2594,10 +2611,11 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
 async fn zebra_generate(url: &str, blocks: u32) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let host_port = url.strip_prefix("http://").unwrap_or(url).trim_end_matches('/');
-    let payload = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{blocks}]}}"#
-    );
+    let host_port = url
+        .strip_prefix("http://")
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{blocks}]}}"#);
     let mut stream = tokio::net::TcpStream::connect(host_port).await?;
     stream
         .write_all(
@@ -2640,11 +2658,11 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
     use argos_core::transparent_recovery::{
         build_sweep_transaction, fetch_transparent_utxos, plan_sweep, sapling_receiver, summarize,
     };
-    use zcash_client_backend::proto::service::RawTransaction;
     use argos_core::workspace::consensus_network;
     use argos_core::{derive_accounts, ZeckNetwork};
     use common::regtest_harness::zebra_rpc;
     use secrecy::SecretString;
+    use zcash_client_backend::proto::service::RawTransaction;
     use zcash_proofs::prover::LocalTxProver;
     use zcash_protocol::consensus::BlockHeight;
 
@@ -2769,9 +2787,9 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
     let after = fetch_transparent_utxos(&mut client, &keys, ZeckNetwork::Testnet)
         .await
         .expect("re-fetching UTXOs");
-    let after_total: u64 = after
-        .iter()
-        .fold(0u64, |acc, u| acc.saturating_add(u64::from(u.txout.value())));
+    let after_total: u64 = after.iter().fold(0u64, |acc, u| {
+        acc.saturating_add(u64::from(u.txout.value()))
+    });
     assert_eq!(
         after_total, 0,
         "every UTXO must have been swept; {} zatoshis remain",
