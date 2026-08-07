@@ -120,10 +120,18 @@ Two paths reach a Sprout note. A `wallet.dat` that zcashd ever synced
 carries a cached witness, and consensus accepts the historical anchor it
 produces — proven in `sprout_stale_anchor`, where a spend against a root
 the chain had already passed was accepted and mined. That path needs no
-scan and is what `sweep-sprout` uses. A wallet holding only a bare `zkey`
-needs the full-block scan (`sprout_scan` + `p2p`), which is built and
-consensus-validated but **not wired to any command**, and whose checkpoint
-does not yet store a block locator, so it cannot actually resume.
+scan and is what `sweep-sprout` uses. A wallet whose keys were imported
+without a rescan has no note data, and only the full-block scan can find
+its notes -- Sprout notes are discoverable solely by trial-decrypting every
+JoinSplit, and no Sprout address index exists anywhere. That scan
+(`sprout_scan` + `p2p`) is built and consensus-validated but **not wired to
+any command**, and its checkpoint does not store a block locator, so it
+cannot yet resume.
+
+**Argos takes a `wallet.dat` and nothing else.** Not a bare `zkey`, not a
+txid, not a node URL. A targeted lookup keyed on the paying transaction
+would be far cheaper than the scan, but it needs a txid the user has no way
+to know, so it is not a route. Assume the wallet file is all they have.
 
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
