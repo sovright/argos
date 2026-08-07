@@ -23,8 +23,13 @@ pub mod sprout;
 pub mod sprout_witness;
 // JoinSplit assembly and the V4 transaction carrying it. zcash_primitives'
 // builder refuses Sprout, so this goes through the public low-level surfaces.
-pub mod sprout_recovery;
 pub mod sprout_spend;
+// Joins a wallet's note records to the JoinSplit ciphertexts that carry
+// their plaintexts, which is the only place value/rho/r exist.
+pub mod sprout_recovery;
+// Direct p2p access. Sprout notes are invisible to lightwalletd -- compact
+// blocks carry no JoinSplits -- so finding one needs full blocks.
+pub mod p2p;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
