@@ -27,9 +27,24 @@ use super::wire::{
     encode_version, verify_payload, BlockHeader, Header, P2pNetwork, WireError, MAX_PAYLOAD_LEN,
 };
 
-/// Protocol version to advertise. 170_100 is comfortably past every
-/// Sprout-era activation, so peers serve the full historical range.
-const PROTOCOL_VERSION: u32 = 170_100;
+/// Protocol version to advertise.
+///
+/// This is a *floor set by peers*, not a capability claim about us. ZIP 253
+/// requires nodes compatible with an upgrade to advertise at least that
+/// upgrade's `MIN_NETWORK_PROTOCOL_VERSION`, and peers disconnect anything
+/// below it before the handshake completes — silently, with no message.
+///
+/// 170_160 is the NU6.3 (Ironwood) minimum for mainnet. Advertising the
+/// Sprout-era-sufficient 170_100 instead is rejected by every current node:
+/// confirmed directly from a peer's own metrics, which recorded
+/// `remote_version="170100" min_version="170160"` against this client's user
+/// agent. The failure looks identical to a network problem, so it must be
+/// diagnosed from the far side.
+///
+/// Raise this when the network's minimum rises. Nothing here depends on the
+/// value beyond being accepted — the blocks this scanner reads are two
+/// decades of consensus older than any of it.
+const PROTOCOL_VERSION: u32 = 170_160;
 
 /// Presented to peers. Honest about what this is: an unusual client asking
 /// for very old blocks should not look like it is pretending to be zcashd.
@@ -40,6 +55,13 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for the TCP connection itself.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many blocks to name in one `getdata`.
+///
+/// Peers do not answer a request for a whole 160-hash header page, so this
+/// stays well under it. Small enough to be served reliably, large enough
+/// that a million-block sweep is not a million round trips.
+const GETDATA_BATCH: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
@@ -249,20 +271,21 @@ impl Peer {
 
     /// Fetch full blocks by hash, returning their raw bytes.
     ///
-    /// Blocks come back as separate `block` messages in an unspecified
-    /// order, so they are matched to the request rather than assumed to
-    /// arrive in sequence.
+    /// Requested in small batches. A single `getdata` naming a whole
+    /// `getheaders` page is accepted and then simply not answered —
+    /// measured against a real node, where one block returns instantly and
+    /// 160 produce nothing before the read timeout. That failure is
+    /// indistinguishable from a dead connection, so the cap lives here
+    /// rather than waiting for a caller to hit it part-way through a scan
+    /// of a million blocks.
     pub async fn get_blocks(&mut self, hashes: &[[u8; 32]]) -> Result<Vec<Vec<u8>>, PeerError> {
-        if hashes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let payload = encode_getdata_blocks(hashes);
-        self.send("getdata", &payload).await?;
-
         let mut blocks = Vec::with_capacity(hashes.len());
-        for _ in 0..hashes.len() {
-            blocks.push(self.recv_until("block").await?);
+        for chunk in hashes.chunks(GETDATA_BATCH) {
+            let payload = encode_getdata_blocks(chunk);
+            self.send("getdata", &payload).await?;
+            for _ in 0..chunk.len() {
+                blocks.push(self.recv_until("block").await?);
+            }
         }
         Ok(blocks)
     }

@@ -51,6 +51,24 @@ const TESTNET_SEEDS: &[&str] = &[
 /// hammering the network.
 const CONCURRENT_ATTEMPTS: usize = 12;
 
+/// How long a peer remembers us after an inbound connection.
+///
+/// Zebra accepts one inbound connection per source IP per
+/// `MIN_PEER_RECONNECTION_DELAY` (59+20+20+20 seconds) and silently drops
+/// anything sooner — before the handshake, with no message. Reconnecting to
+/// the same peer inside this window is therefore guaranteed to fail, and
+/// fails identically to every other refusal, so a retry loop that ignores it
+/// looks exactly like a broken client.
+///
+/// Consequences, both load-bearing for a scan that runs for hours:
+/// a dropped connection should be replaced by a *different* peer rather than
+/// retried, and the connection that is working must be kept alive rather
+/// than reopened per request.
+/// Public because a long-running scan needs it: on losing its peer it must
+/// either move to a different one or wait this long, and there is no way to
+/// discover that from the failure itself.
+pub const PEER_RECONNECT_DELAY: Duration = Duration::from_secs(119);
+
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error(
@@ -174,6 +192,10 @@ pub async fn connect_to_any(
     let mut refused = 0;
     let mut other = 0;
 
+    // Each round takes a *fresh* slice of candidates rather than retrying the
+    // ones that just refused: a peer that refused seconds ago will refuse for
+    // the next two minutes regardless of why, so re-dialling it wastes the
+    // round.
     for round in 0..max_rounds.max(1) {
         let start = round * CONCURRENT_ATTEMPTS;
         let Some(batch) = candidates.get(start..) else {
@@ -243,6 +265,14 @@ mod tests {
             err.contains("retrying"),
             "a capacity refusal is routine and the user should be told to retry"
         );
+    }
+
+    /// The reconnect delay must match Zebra's, or a scan that loses its
+    /// connection retries into a guaranteed refusal and looks broken.
+    #[test]
+    fn the_reconnect_delay_matches_zebras_window() {
+        // MIN_PEER_RECONNECTION_DELAY = 59 + 20 + 20 + 20 seconds.
+        assert_eq!(PEER_RECONNECT_DELAY.as_secs(), 119);
     }
 
     #[test]
