@@ -220,6 +220,124 @@ pub fn decrypt_note(
     SproutNotePlaintext::parse(&plaintext)
 }
 
+/// `PRF^nf_{a_sk}(rho)`, per §5.4.2 — the nullifier that marks a note spent.
+///
+/// Tag `1110`, unlike `PRF^addr`'s `1100`. The tags are what stop one PRF's
+/// output being a valid value for another.
+pub fn prf_nf(a_sk: &[u8; 32], rho: &[u8; 32]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(a_sk);
+    block[0] &= 0x0F;
+    block[0] |= 0b1110_0000;
+    block[32..].copy_from_slice(rho);
+    sha256_compress(&block)
+}
+
+/// `PRF^pk_{a_sk}(i, hSig)`, per §5.4.2 — the MAC binding an input to the
+/// JoinSplit that spends it. Tag `0000` with the input index in bit 2.
+pub fn prf_pk(a_sk: &[u8; 32], input_index: usize, h_sig: &[u8; 32]) -> [u8; 32] {
+    assert!(input_index < 2, "a JoinSplit has exactly two inputs");
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(a_sk);
+    block[0] &= 0x0F;
+    block[0] |= 0b0000_0000;
+    if input_index == 1 {
+        block[0] |= 0b0001_0000;
+    }
+    block[32..].copy_from_slice(h_sig);
+    sha256_compress(&block)
+}
+
+/// `PRF^rho_{phi}(i, hSig)`, per §5.4.2 — derives an output note's `rho`.
+/// Tag `0010`, with the output index in bit 2.
+pub fn prf_rho(phi: &[u8; 32], output_index: usize, h_sig: &[u8; 32]) -> [u8; 32] {
+    assert!(output_index < 2, "a JoinSplit has exactly two outputs");
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(phi);
+    block[0] &= 0x0F;
+    block[0] |= 0b0010_0000;
+    if output_index == 1 {
+        block[0] |= 0b0001_0000;
+    }
+    block[32..].copy_from_slice(h_sig);
+    sha256_compress(&block)
+}
+
+/// The Sprout note commitment, per §5.4.8.1:
+/// `SHA256Compress(0xB0 || a_pk || v || rho || r)`, taken over two blocks.
+pub fn note_commitment(a_pk: &[u8; 32], value: u64, rho: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
+    // The input is 8 + 256 + 64 + 256 + 256 = 840 bits, which spans two
+    // compression blocks with the standard padding zcashd applies.
+    let mut input = Vec::with_capacity(105);
+    input.push(0xB0);
+    input.extend_from_slice(a_pk);
+    input.extend_from_slice(&value.to_le_bytes());
+    input.extend_from_slice(rho);
+    input.extend_from_slice(r);
+
+    // SHA256 of the 105-byte input, using the full hash (padding included),
+    // which is what §5.4.8.1 specifies for NoteCommit^Sprout.
+    use sha2::{Digest, Sha256};
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(&input));
+    out
+}
+
+/// Encrypt a note plaintext to a recipient's `pk_enc`.
+///
+/// Needed for JoinSplit *outputs*: a JoinSplit always has two, and both must
+/// carry ciphertexts even when one is a zero-value dummy.
+///
+/// `esk` is the ephemeral secret; the caller supplies it so a test can make
+/// the operation deterministic. Production callers must pass fresh
+/// randomness — reusing an `esk` across JoinSplits reuses the AEAD key with
+/// a fixed nonce, which loses confidentiality of both notes.
+pub fn encrypt_note(
+    esk: &[u8; 32],
+    pk_enc: &[u8; 32],
+    h_sig: &[u8; 32],
+    output_index: u8,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, SproutNoteError> {
+    if plaintext.len() != NOTE_PLAINTEXT_LEN {
+        return Err(SproutNoteError::PlaintextLength(plaintext.len()));
+    }
+    let secret = x25519_dalek::StaticSecret::from(*esk);
+    let epk = x25519_dalek::PublicKey::from(&secret);
+    let dhsecret = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*pk_enc));
+    let key = kdf_sprout(dhsecret.as_bytes(), epk.as_bytes(), pk_enc, h_sig, output_index);
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher
+        .encrypt(
+            Nonce::from_slice(&[0u8; 12]),
+            Payload {
+                msg: plaintext,
+                aad: &[],
+            },
+        )
+        .map_err(|_| SproutNoteError::NotForThisKey)
+}
+
+/// The ephemeral public key for a given ephemeral secret.
+pub fn epk_for(esk: &[u8; 32]) -> [u8; 32] {
+    let secret = x25519_dalek::StaticSecret::from(*esk);
+    *x25519_dalek::PublicKey::from(&secret).as_bytes()
+}
+
+impl SproutNotePlaintext {
+    /// Serialize to the 585-byte body that gets encrypted.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(NOTE_PLAINTEXT_LEN);
+        out.push(NOTE_PLAINTEXT_LEAD_BYTE);
+        out.extend_from_slice(&self.value.to_le_bytes());
+        out.extend_from_slice(&self.rho);
+        out.extend_from_slice(&self.r);
+        out.extend_from_slice(&self.memo);
+        out
+    }
+}
+
 /// A decrypted Sprout note.
 ///
 /// `value`, `rho` and `r` are exactly the three per-input fields
@@ -249,8 +367,10 @@ impl core::fmt::Debug for SproutNotePlaintext {
 impl SproutNotePlaintext {
     /// Parse the 585-byte plaintext body.
     ///
-    /// `value` is big-endian here, unlike almost everything else in the
-    /// Zcash serialization format.
+    /// `value` is little-endian: zcashd serializes it through the ordinary
+    /// Bitcoin-style `READWRITE`, and `SproutNote::cm()` writes it with
+    /// `convertIntToVectorLE`. Reading it big-endian yields a wildly wrong
+    /// value that still parses, and a note commitment that matches nothing.
     pub fn parse(bytes: &[u8]) -> Result<Self, SproutNoteError> {
         if bytes.len() != NOTE_PLAINTEXT_LEN {
             return Err(SproutNoteError::PlaintextLength(bytes.len()));
@@ -267,7 +387,7 @@ impl SproutNotePlaintext {
         let mut memo = [0u8; 512];
         memo.copy_from_slice(&bytes[73..]);
         Ok(Self {
-            value: u64::from_be_bytes(value),
+            value: u64::from_le_bytes(value),
             rho,
             r,
             memo,
@@ -326,7 +446,7 @@ mod tests {
     #[test]
     fn a_note_plaintext_round_trips() {
         let mut bytes = vec![0u8; NOTE_PLAINTEXT_LEN];
-        bytes[1..9].copy_from_slice(&1_234_567_890u64.to_be_bytes());
+        bytes[1..9].copy_from_slice(&1_234_567_890u64.to_le_bytes());
         bytes[9..41].copy_from_slice(&[7u8; 32]);
         bytes[41..73].copy_from_slice(&[9u8; 32]);
         let note = SproutNotePlaintext::parse(&bytes).expect("well-formed plaintext");
@@ -338,6 +458,108 @@ mod tests {
     /// A verified AEAD tag with an unexpected leading byte means we decrypted
     /// something that is not a Sprout note. Reporting it beats returning a
     /// note with a garbage value.
+    /// Encrypt to a key, then decrypt with the spending key that owns it.
+    /// This is the only end-to-end check available: no fixture holds a
+    /// funded Sprout note, so there is no real ciphertext to decrypt.
+    ///
+    /// It does catch the wiring errors that matter — a wrong output index in
+    /// the KDF, a mismatched `pk_enc`, or an AEAD misuse — because all of
+    /// those break the tag rather than producing a wrong plaintext.
+    #[test]
+    fn a_note_round_trips_through_encryption() {
+        let a_sk = [3u8; 32];
+        let esk = [5u8; 32];
+        let h_sig = [7u8; 32];
+        let note = SproutNotePlaintext {
+            value: 42_000,
+            rho: [11u8; 32],
+            r: [13u8; 32],
+            memo: [0u8; 512],
+        };
+
+        for output_index in 0..2u8 {
+            let ct = encrypt_note(
+                &esk,
+                &pk_enc(&a_sk),
+                &h_sig,
+                output_index,
+                &note.to_bytes(),
+            )
+            .expect("encrypt");
+            assert_eq!(ct.len(), NOTE_CIPHERTEXT_LEN);
+
+            let got = decrypt_note(&a_sk, &epk_for(&esk), &ct, &h_sig, output_index)
+                .expect("the owner must be able to decrypt");
+            assert_eq!(got, note);
+        }
+    }
+
+    /// The output index is part of the KDF personalization, so a ciphertext
+    /// for output 0 must not decrypt as output 1. If this passes, both
+    /// outputs of a JoinSplit share a key.
+    #[test]
+    fn the_output_index_is_bound_into_the_key() {
+        let a_sk = [3u8; 32];
+        let esk = [5u8; 32];
+        let h_sig = [7u8; 32];
+        let note = SproutNotePlaintext {
+            value: 1,
+            rho: [0u8; 32],
+            r: [0u8; 32],
+            memo: [0u8; 512],
+        };
+        let ct = encrypt_note(&esk, &pk_enc(&a_sk), &h_sig, 0, &note.to_bytes()).expect("encrypt");
+        assert_eq!(
+            decrypt_note(&a_sk, &epk_for(&esk), &ct, &h_sig, 1).unwrap_err(),
+            SproutNoteError::NotForThisKey
+        );
+    }
+
+    /// A note encrypted to someone else must not decrypt, even with a
+    /// well-formed ciphertext and the right hSig.
+    #[test]
+    fn another_partys_note_does_not_decrypt() {
+        let mine = [3u8; 32];
+        let theirs = [4u8; 32];
+        let esk = [5u8; 32];
+        let h_sig = [7u8; 32];
+        let note = SproutNotePlaintext {
+            value: 1,
+            rho: [0u8; 32],
+            r: [0u8; 32],
+            memo: [0u8; 512],
+        };
+        let ct = encrypt_note(&esk, &pk_enc(&theirs), &h_sig, 0, &note.to_bytes()).expect("encrypt");
+        assert_eq!(
+            decrypt_note(&mine, &epk_for(&esk), &ct, &h_sig, 0).unwrap_err(),
+            SproutNoteError::NotForThisKey
+        );
+    }
+
+    /// Every Sprout PRF differs only by its domain tag. If two collide, one
+    /// PRF's output is a valid value for another.
+    #[test]
+    fn the_prf_domain_tags_are_distinct() {
+        let k = [5u8; 32];
+        let x = [6u8; 32];
+        let outputs = [
+            prf_addr(&k, 0),
+            prf_addr(&k, 1),
+            prf_nf(&k, &x),
+            prf_pk(&k, 0, &x),
+            prf_pk(&k, 1, &x),
+            prf_rho(&k, 0, &x),
+            prf_rho(&k, 1, &x),
+        ];
+        for (i, a) in outputs.iter().enumerate() {
+            for (j, b) in outputs.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "PRF outputs {i} and {j} collide");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_bad_lead_byte_is_rejected() {
         let mut bytes = vec![0u8; NOTE_PLAINTEXT_LEN];
