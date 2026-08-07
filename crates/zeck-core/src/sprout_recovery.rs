@@ -1,0 +1,417 @@
+//! Recover spendable Sprout notes from an imported zcashd wallet.
+//!
+//! # Why this step exists
+//!
+//! A Sprout note is spendable only if its `value`, `rho` and `r` are known,
+//! and zcashd's wallet stores none of them. `CSproutNoteData` — the record
+//! this crate's importer preserves as [`SproutNoteData`] — holds an address,
+//! an optional nullifier, and a cached witness. Nothing more.
+//!
+//! Those three values live in the JoinSplit's note ciphertext, on-chain and
+//! in the clear as far as the wallet file is concerned, readable only with
+//! the Sprout spending key. So recovery is a join across three things the
+//! importer produces separately:
+//!
+//!   1. [`SproutNoteData::outpoint`] says which JoinSplit output the note is,
+//!   2. [`SproutJoinSplit`] carries that output's ciphertext and the public
+//!      material `hSig` is computed from,
+//!   3. [`SproutKey`] supplies the `a_sk` that decrypts it.
+//!
+//! # Trust posture
+//!
+//! Every input here came out of an attacker-supplied binary file, so no
+//! single note's failure may abort the others: a note that will not decrypt,
+//! or decrypts to something inconsistent, is reported and skipped. That is
+//! the same partial-recovery principle the importer follows.
+//!
+//! The consistency check is not optional. `decrypt_note` authenticates the
+//! ciphertext, but authentication alone does not establish that the
+//! recovered plaintext is the note the commitment tree actually committed
+//! to. Re-deriving the commitment from `(a_pk, value, rho, r)` and comparing
+//! it against the JoinSplit's own `commitments[n]` is what makes a note
+//! genuinely spendable rather than merely well-formed — a note that fails it
+//! would produce a proof the network rejects, and the failure would surface
+//! at broadcast with the fee already spent.
+
+use std::collections::HashMap;
+
+use argos_wallet_import::keys::{ImportedKeys, JsOutPoint, SproutJoinSplit};
+use secrecy::ExposeSecret;
+
+use crate::sprout::{self, SproutNotePlaintext, SproutPaymentAddress};
+
+/// Hex for diagnostics. Inline rather than a dependency: this is the only
+/// place in the crate that needs it, and it is four lines.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A Sprout note with everything needed to spend it.
+pub struct SpendableSproutNote {
+    pub note: SproutNotePlaintext,
+    /// The spending key that unlocks it.
+    pub a_sk: [u8; 32],
+    pub address: SproutPaymentAddress,
+    /// The note commitment, re-derived and checked against the JoinSplit's.
+    pub commitment: [u8; 32],
+    /// The cached witness blob, verbatim from the wallet. Interpreted by
+    /// `sprout_witness`, not here.
+    pub witness: Vec<u8>,
+    pub outpoint: JsOutPoint,
+}
+
+impl core::fmt::Debug for SpendableSproutNote {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `a_sk` and the note's `r`/`rho` are spending material.
+        f.debug_struct("SpendableSproutNote")
+            .field("outpoint", &self.outpoint)
+            .field("value", &self.note.value)
+            .field("commitment", &hex(&self.commitment))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why one note could not be recovered. Reported rather than returned as an
+/// error, so one bad note never hides the good ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SproutRecoveryIssue {
+    /// The note's outpoint names a JoinSplit that is not in the wallet.
+    /// Normal for a wallet holding note metadata whose transaction was
+    /// pruned, and fatal only for that note.
+    MissingJoinSplit { outpoint: JsOutPoint },
+    /// No spending key in the wallet matches the note's address. Expected
+    /// for watch-only entries.
+    NoSpendingKey { outpoint: JsOutPoint },
+    /// `output_index` was not 0 or 1. A JoinSplit has exactly two outputs.
+    OutputIndexOutOfRange { outpoint: JsOutPoint, index: u8 },
+    /// The ciphertext did not authenticate under this key.
+    Undecryptable {
+        outpoint: JsOutPoint,
+        reason: String,
+    },
+    /// It decrypted, but the recovered note does not reproduce the
+    /// commitment the JoinSplit published. Proving from it would produce a
+    /// transaction the network rejects.
+    CommitmentMismatch {
+        outpoint: JsOutPoint,
+        expected: [u8; 32],
+        derived: [u8; 32],
+    },
+}
+
+impl std::fmt::Display for SproutRecoveryIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let op = |o: &JsOutPoint| format!("{}:{}:{}", hex(&o.txid), o.js_index, o.output_index);
+        match self {
+            Self::MissingJoinSplit { outpoint } => write!(
+                f,
+                "note {}: the wallet has no JoinSplit for this outpoint",
+                op(outpoint)
+            ),
+            Self::NoSpendingKey { outpoint } => write!(
+                f,
+                "note {}: no Sprout spending key in this wallet matches its address",
+                op(outpoint)
+            ),
+            Self::OutputIndexOutOfRange { outpoint, index } => write!(
+                f,
+                "note {}: output index {index} is out of range (a JoinSplit has 2 outputs)",
+                op(outpoint)
+            ),
+            Self::Undecryptable { outpoint, reason } => {
+                write!(f, "note {}: could not decrypt ({reason})", op(outpoint))
+            }
+            Self::CommitmentMismatch {
+                outpoint,
+                expected,
+                derived,
+            } => write!(
+                f,
+                "note {}: decrypted, but its commitment does not match the chain \
+                 (expected {}, derived {}) — it is not spendable",
+                op(outpoint),
+                hex(expected),
+                hex(derived)
+            ),
+        }
+    }
+}
+
+/// The outcome of scanning a wallet for spendable Sprout notes.
+#[derive(Debug, Default)]
+pub struct SproutRecovery {
+    pub notes: Vec<SpendableSproutNote>,
+    pub issues: Vec<SproutRecoveryIssue>,
+}
+
+impl SproutRecovery {
+    pub fn total_value(&self) -> u64 {
+        self.notes.iter().map(|n| n.note.value).sum()
+    }
+}
+
+/// Decrypt every Sprout note the wallet holds a spending key for.
+///
+/// Never fails as a whole: notes that cannot be recovered are reported in
+/// `issues`.
+pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
+    let by_outpoint: HashMap<([u8; 32], u64), &SproutJoinSplit> = keys
+        .sprout_joinsplits
+        .iter()
+        .map(|js| ((js.txid, js.js_index), js))
+        .collect();
+
+    // Keyed by the full 64-byte address, never by `a_pk` alone: a_pk and
+    // pk_enc must come from the same key, and matching on half of the
+    // address would let a wallet holding two keys pair the wrong halves.
+    let keys_by_address: HashMap<[u8; 64], &[u8; 32]> = keys
+        .sprout
+        .iter()
+        .map(|k| (k.address, k.a_sk.expose_secret()))
+        .collect();
+
+    let mut out = SproutRecovery::default();
+
+    for note_data in &keys.sprout_notes {
+        let outpoint = note_data.outpoint;
+
+        let Some(js) = by_outpoint.get(&(outpoint.txid, outpoint.js_index)) else {
+            out.issues
+                .push(SproutRecoveryIssue::MissingJoinSplit { outpoint });
+            continue;
+        };
+
+        let index = outpoint.output_index;
+        let Some(ciphertext) = js.ciphertexts.get(index as usize) else {
+            out.issues
+                .push(SproutRecoveryIssue::OutputIndexOutOfRange { outpoint, index });
+            continue;
+        };
+
+        let Some(a_sk) = keys_by_address.get(&note_data.address) else {
+            out.issues
+                .push(SproutRecoveryIssue::NoSpendingKey { outpoint });
+            continue;
+        };
+
+        let h_sig = sprout::h_sig(&js.random_seed, &js.nullifiers, &js.joinsplit_pubkey);
+        let note = match sprout::decrypt_note(a_sk, &js.ephemeral_key, ciphertext, &h_sig, index) {
+            Ok(note) => note,
+            Err(err) => {
+                out.issues.push(SproutRecoveryIssue::Undecryptable {
+                    outpoint,
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+        };
+
+        // Derive the address from the key rather than trusting the 64 bytes
+        // stored beside the note: the commitment check below is only
+        // meaningful if `a_pk` provably belongs to the key we are about to
+        // spend with.
+        let address = SproutPaymentAddress::from_spending_key(a_sk);
+        let derived = sprout::note_commitment(address.a_pk(), note.value, &note.rho, &note.r);
+        let expected = js.commitments[index as usize];
+        if derived != expected {
+            out.issues.push(SproutRecoveryIssue::CommitmentMismatch {
+                outpoint,
+                expected,
+                derived,
+            });
+            continue;
+        }
+
+        out.notes.push(SpendableSproutNote {
+            note,
+            a_sk: **a_sk,
+            address,
+            commitment: derived,
+            witness: note_data.witness.clone(),
+            outpoint,
+        });
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use argos_wallet_import::keys::{Provenance, SproutKey, SproutNoteData};
+    use secrecy::Secret;
+
+    /// Build a wallet holding one real, self-consistent Sprout note: the
+    /// ciphertext is produced by the encryption path, so decryption here is
+    /// checked against a genuine encryption rather than a canned blob.
+    fn wallet_with_one_note(value: u64) -> (ImportedKeys, [u8; 32]) {
+        let a_sk = [0x42u8; 32];
+        let address = SproutPaymentAddress::from_spending_key(&a_sk);
+        let rho = [0x11u8; 32];
+        let r = [0x22u8; 32];
+        let random_seed = [0x33u8; 32];
+        let nullifiers = [[0x44u8; 32], [0x55u8; 32]];
+        let joinsplit_pubkey = [0x66u8; 32];
+        let esk = [0x77u8; 32];
+
+        let h_sig = sprout::h_sig(&random_seed, &nullifiers, &joinsplit_pubkey);
+        let note = SproutNotePlaintext {
+            value,
+            rho,
+            r,
+            memo: [0u8; 512],
+        };
+        let ciphertext = sprout::encrypt_note(&esk, address.pk_enc(), &h_sig, 0, &note.to_bytes())
+            .expect("encryption must succeed");
+        // `epk` is the public half of `esk`, exactly as the encryption path
+        // derives it; the JoinSplit publishes it so the recipient can
+        // reconstruct the shared secret.
+        let epk = *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(esk)).as_bytes();
+
+        let commitment = sprout::note_commitment(address.a_pk(), value, &rho, &r);
+
+        let txid = [0x99u8; 32];
+        let outpoint = JsOutPoint {
+            txid,
+            js_index: 0,
+            output_index: 0,
+        };
+
+        let mut keys = ImportedKeys::default();
+        keys.sprout.push(SproutKey {
+            a_sk: Secret::new(a_sk),
+            address: address.to_bytes(),
+            provenance: Provenance::Standalone,
+        });
+        keys.sprout_joinsplits.push(SproutJoinSplit {
+            txid,
+            js_index: 0,
+            anchor: [0u8; 32],
+            nullifiers,
+            commitments: [commitment, [0u8; 32]],
+            ephemeral_key: epk,
+            random_seed,
+            joinsplit_pubkey,
+            ciphertexts: [ciphertext, vec![0u8; 601]],
+        });
+        keys.sprout_notes.push(SproutNoteData {
+            address: address.to_bytes(),
+            nullifier: None,
+            witness: vec![0xAB; 8],
+            outpoint,
+        });
+
+        (keys, a_sk)
+    }
+
+    #[test]
+    fn recovers_a_notes_value_rho_and_r_from_its_ciphertext() {
+        let (keys, a_sk) = wallet_with_one_note(123_456_789);
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(
+            recovered.issues.is_empty(),
+            "unexpected issues: {:?}",
+            recovered.issues
+        );
+        assert_eq!(recovered.notes.len(), 1);
+
+        let note = &recovered.notes[0];
+        assert_eq!(note.note.value, 123_456_789);
+        assert_eq!(note.note.rho, [0x11u8; 32]);
+        assert_eq!(note.note.r, [0x22u8; 32]);
+        assert_eq!(note.a_sk, a_sk);
+        assert_eq!(note.witness, vec![0xAB; 8]);
+        assert_eq!(recovered.total_value(), 123_456_789);
+    }
+
+    /// The check that separates "decrypts" from "spendable". A note whose
+    /// commitment does not match the chain must never reach the builder.
+    #[test]
+    fn a_note_whose_commitment_disagrees_is_rejected_not_returned() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        keys.sprout_joinsplits[0].commitments[0] = [0xFF; 32];
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(
+            recovered.notes.is_empty(),
+            "it must not be offered as spendable"
+        );
+        assert!(matches!(
+            recovered.issues.as_slice(),
+            [SproutRecoveryIssue::CommitmentMismatch { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_note_with_no_matching_key_is_reported_not_dropped_silently() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        keys.sprout.clear();
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(recovered.notes.is_empty());
+        assert!(matches!(
+            recovered.issues.as_slice(),
+            [SproutRecoveryIssue::NoSpendingKey { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_note_whose_joinsplit_is_absent_is_reported() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        keys.sprout_joinsplits.clear();
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(recovered.notes.is_empty());
+        assert!(matches!(
+            recovered.issues.as_slice(),
+            [SproutRecoveryIssue::MissingJoinSplit { .. }]
+        ));
+    }
+
+    /// The wrong key must fail to authenticate rather than yield garbage
+    /// that then fails the commitment check — the two failures are
+    /// different bugs and should not be confused.
+    #[test]
+    fn the_wrong_spending_key_fails_to_decrypt() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        let wrong = [0x01u8; 32];
+        // Keep the address the note is filed under, so the join still
+        // matches and only the key is wrong.
+        keys.sprout[0] = SproutKey {
+            a_sk: Secret::new(wrong),
+            address: keys.sprout_notes[0].address,
+            provenance: Provenance::Standalone,
+        };
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(recovered.notes.is_empty());
+        assert!(
+            matches!(
+                recovered.issues.as_slice(),
+                [SproutRecoveryIssue::Undecryptable { .. }]
+            ),
+            "expected an authentication failure, got {:?}",
+            recovered.issues
+        );
+    }
+
+    /// One unrecoverable note must not suppress a recoverable one.
+    #[test]
+    fn a_bad_note_does_not_hide_a_good_one() {
+        let (mut keys, _) = wallet_with_one_note(5_000);
+        let mut orphan = keys.sprout_notes[0].clone();
+        orphan.outpoint.js_index = 99; // no such JoinSplit
+        keys.sprout_notes.push(orphan);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert_eq!(recovered.notes.len(), 1, "the good note still comes back");
+        assert_eq!(recovered.total_value(), 5_000);
+        assert_eq!(recovered.issues.len(), 1);
+    }
+}

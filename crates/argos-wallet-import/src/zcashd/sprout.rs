@@ -33,7 +33,7 @@
 //! skipped, per the partial-recovery principle, rather than guessed at.
 
 use crate::{
-    keys::{ImportedKeys, SproutNoteData},
+    keys::{ImportedKeys, JsOutPoint, SproutJoinSplit, SproutNoteData},
     zcashd::records::{compact_size, parse_record_key},
 };
 
@@ -58,8 +58,14 @@ const NOTE_CIPHERTEXT_LEN: usize = 601;
 /// two ciphertexts: vpub_old(8) + vpub_new(8) + anchor(32) +
 /// nullifiers(2*32) + commitments(2*32) + ephemeralKey(32) +
 /// randomSeed(32) + macs(2*32).
+///
+/// Only the length cross-check needs this now that `read_joinsplit` reads
+/// the fields individually — but it is exactly the independent oracle that
+/// reader wants, so it is kept and asserted against rather than deleted.
+#[cfg(test)]
 const JSDESCRIPTION_BASE_LEN: usize = 304;
 
+#[cfg(test)]
 fn joinsplit_desc_len(use_groth: bool) -> usize {
     let proof_len = if use_groth {
         GROTH_PROOF_LEN
@@ -124,7 +130,55 @@ fn skip_tx_out(c: &mut Cursor) -> Option<()> {
 ///
 /// Only versions 1-4 are understood; anything else (in particular NU5's
 /// v5 encoding) returns `None`.
-fn skip_transaction_body(c: &mut Cursor) -> Option<()> {
+/// Read one `JSDescription`'s public fields, in `JSDescription::SerializationOp`
+/// order (`zcash/zcash` `src/primitives/transaction.h`):
+/// `vpub_old`, `vpub_new`, `anchor`, `nullifiers`, `commitments`,
+/// `ephemeralKey`, `randomSeed`, `macs`, `proof`, `ciphertexts`.
+///
+/// `joinsplit_pubkey` is filled in by the caller: it is serialized once per
+/// transaction, after the whole vector.
+fn read_joinsplit(
+    c: &mut Cursor,
+    use_groth: bool,
+    txid: [u8; 32],
+    js_index: u64,
+) -> Option<SproutJoinSplit> {
+    c.skip(8)?; // vpub_old
+    c.skip(8)?; // vpub_new
+    let anchor: [u8; 32] = c.take(32)?.try_into().ok()?;
+    let nullifiers = [c.take(32)?.try_into().ok()?, c.take(32)?.try_into().ok()?];
+    let commitments = [c.take(32)?.try_into().ok()?, c.take(32)?.try_into().ok()?];
+    let ephemeral_key: [u8; 32] = c.take(32)?.try_into().ok()?;
+    let random_seed: [u8; 32] = c.take(32)?.try_into().ok()?;
+    c.skip(64)?; // macs: recovery re-proves, so the originals are never checked
+    c.skip(if use_groth {
+        GROTH_PROOF_LEN
+    } else {
+        PHGR_PROOF_LEN
+    })?;
+    let ciphertexts = [
+        c.take(NOTE_CIPHERTEXT_LEN)?.to_vec(),
+        c.take(NOTE_CIPHERTEXT_LEN)?.to_vec(),
+    ];
+
+    Some(SproutJoinSplit {
+        txid,
+        js_index,
+        anchor,
+        nullifiers,
+        commitments,
+        ephemeral_key,
+        random_seed,
+        joinsplit_pubkey: [0u8; 32],
+        ciphertexts,
+    })
+}
+
+fn skip_transaction_body(
+    c: &mut Cursor,
+    txid: [u8; 32],
+    joinsplits: &mut Vec<SproutJoinSplit>,
+) -> Option<()> {
     let header = u32::from_le_bytes(c.take(4)?.try_into().ok()?);
     let overwintered = header & 0x8000_0000 != 0;
     let version = header & 0x7fff_ffff;
@@ -164,9 +218,17 @@ fn skip_transaction_body(c: &mut Cursor) -> Option<()> {
         let n_js = usize::try_from(c.compact_size()?).ok()?;
         if n_js > 0 {
             let use_groth = overwintered && version >= SAPLING_TX_VERSION;
-            let js_len = joinsplit_desc_len(use_groth);
-            c.skip(n_js.checked_mul(js_len)?)?;
-            c.skip(32)?; // joinSplitPubKey
+            let first = joinsplits.len();
+            for js_index in 0..n_js {
+                let js = read_joinsplit(c, use_groth, txid, js_index as u64)?;
+                joinsplits.push(js);
+            }
+            // Serialized once for the whole vector, after it. Backfilled
+            // onto each JoinSplit read above because `hSig` needs it.
+            let joinsplit_pubkey: [u8; 32] = c.take(32)?.try_into().ok()?;
+            for js in joinsplits.get_mut(first..)? {
+                js.joinsplit_pubkey = joinsplit_pubkey;
+            }
             c.skip(64)?; // joinSplitSig
         }
     }
@@ -251,9 +313,14 @@ fn skip_witness_list(c: &mut Cursor) -> Option<()> {
 /// `out`. `None` means the record could not be walked structurally
 /// (truncated, or an unsupported transaction version) — the caller treats
 /// that as "skip this record", never as fatal.
-fn extract_sprout_notes(value: &[u8], out: &mut ImportedKeys) -> Option<()> {
+fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) -> Option<()> {
     let mut c = Cursor::new(value);
-    skip_transaction_body(&mut c)?;
+
+    // Staged rather than pushed straight into `out`: a record that turns
+    // out to be unwalkable partway through must contribute nothing, and
+    // the walk can still fail after the JoinSplits have been read.
+    let mut joinsplits = Vec::new();
+    skip_transaction_body(&mut c, txid, &mut joinsplits)?;
     skip_merkle_tx_tail(&mut c)?;
 
     // vUnused (formerly vtxPrev): always empty in every wallet this crate
@@ -273,12 +340,15 @@ fn extract_sprout_notes(value: &[u8], out: &mut ImportedKeys) -> Option<()> {
 
     let n_notes = c.compact_size()?; // mapSproutNoteData
     for _ in 0..n_notes {
-        // JSOutPoint: hash(32) + js: uint64_t(8) + n: uint8_t(1). Not
-        // needed to identify the note for preservation purposes; the
-        // note's own address is enough.
-        c.skip(32)?;
-        c.skip(8)?;
-        c.skip(1)?;
+        // JSOutPoint: hash(32) + js: uint64_t(8) + n: uint8_t(1). The
+        // hash here is the note's own transaction, which for a `tx` record
+        // is the record key's txid; it is read from the outpoint rather
+        // than assumed, since a misparse upstream would show up as a
+        // mismatch instead of silently pairing a note with the wrong
+        // ciphertext.
+        let op_txid: [u8; 32] = c.take(32)?.try_into().ok()?;
+        let js_index = u64::from_le_bytes(c.take(8)?.try_into().ok()?);
+        let output_index = *c.take(1)?.first()?;
 
         let address: [u8; 64] = c.take(64)?.try_into().ok()?;
         let nullifier = read_optional_hash(&mut c)?;
@@ -302,9 +372,16 @@ fn extract_sprout_notes(value: &[u8], out: &mut ImportedKeys) -> Option<()> {
                 address,
                 nullifier,
                 witness,
+                outpoint: JsOutPoint {
+                    txid: op_txid,
+                    js_index,
+                    output_index,
+                },
             });
         }
     }
+
+    out.sprout_joinsplits.append(&mut joinsplits);
     Some(())
 }
 
@@ -322,7 +399,11 @@ pub fn collect_sprout_notes(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys
         if rec.record_type != "tx" {
             continue;
         }
-        let _ = extract_sprout_notes(value, out);
+        // The `tx` record key is "tx" || txid (uint256).
+        let Ok(txid) = <[u8; 32]>::try_from(rec.rest.as_slice()) else {
+            continue;
+        };
+        let _ = extract_sprout_notes(value, txid, out);
     }
 }
 
@@ -367,8 +448,10 @@ mod tests {
                 continue;
             }
             tx_count += 1;
+            let txid = <[u8; 32]>::try_from(rec.rest.as_slice())
+                .expect("a tx record key is \"tx\" || txid");
             assert!(
-                extract_sprout_notes(value, &mut out).is_some(),
+                extract_sprout_notes(value, txid, &mut out).is_some(),
                 "a real tx record failed to parse structurally"
             );
         }
@@ -446,6 +529,7 @@ mod tests {
 
         let mut key = vec![2u8];
         key.extend_from_slice(b"tx");
+        key.extend_from_slice(&[0x11; 32]); // txid, as every real key carries
 
         let mut out = ImportedKeys::default();
         collect_sprout_notes(&[(key, value)], &mut out);
@@ -511,6 +595,7 @@ mod tests {
 
         let mut key = vec![2u8];
         key.extend_from_slice(b"tx");
+        key.extend_from_slice(&[0x22; 32]); // txid, as every real key carries
 
         let mut out = ImportedKeys::default();
         collect_sprout_notes(&[(key, value)], &mut out);
@@ -530,6 +615,206 @@ mod tests {
         let mut out = ImportedKeys::default();
         collect_sprout_notes(&pairs, &mut out);
         // No panic, no fatal error. Diagnostics may or may not be added.
+        assert!(out.sprout_notes.is_empty());
+    }
+
+    /// Build one `JSDescription`'s bytes with every field set to a
+    /// distinguishable pattern, so a reader that transposes two fields or
+    /// drifts by a few bytes fails loudly rather than plausibly.
+    fn js_description_bytes(use_groth: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u64.to_le_bytes()); // vpub_old
+        v.extend_from_slice(&0u64.to_le_bytes()); // vpub_new
+        v.extend_from_slice(&[0xA1; 32]); // anchor
+        v.extend_from_slice(&[0xB1; 32]); // nullifiers[0]
+        v.extend_from_slice(&[0xB2; 32]); // nullifiers[1]
+        v.extend_from_slice(&[0xC1; 32]); // commitments[0]
+        v.extend_from_slice(&[0xC2; 32]); // commitments[1]
+        v.extend_from_slice(&[0xD1; 32]); // ephemeralKey
+        v.extend_from_slice(&[0xE1; 32]); // randomSeed
+        v.extend_from_slice(&[0xF1; 32]); // macs[0]
+        v.extend_from_slice(&[0xF2; 32]); // macs[1]
+        v.extend_from_slice(&vec![
+            0x5A;
+            if use_groth {
+                GROTH_PROOF_LEN
+            } else {
+                PHGR_PROOF_LEN
+            }
+        ]);
+        v.extend_from_slice(&[0x01; NOTE_CIPHERTEXT_LEN]); // ciphertexts[0]
+        v.extend_from_slice(&[0x02; NOTE_CIPHERTEXT_LEN]); // ciphertexts[1]
+        v
+    }
+
+    /// `read_joinsplit` reads fields one at a time; `joinsplit_desc_len`
+    /// computes the total independently. If the reader ever drifts — a
+    /// field added, dropped, or mis-sized — these two disagree. That makes
+    /// the old arithmetic an oracle for the new reader rather than dead
+    /// code.
+    #[test]
+    fn reading_a_joinsplit_consumes_exactly_the_computed_length() {
+        for use_groth in [true, false] {
+            let bytes = js_description_bytes(use_groth);
+            assert_eq!(
+                bytes.len(),
+                joinsplit_desc_len(use_groth),
+                "the hand-built JSDescription must match the computed length"
+            );
+            assert_eq!(
+                JSDESCRIPTION_BASE_LEN
+                    + if use_groth {
+                        GROTH_PROOF_LEN
+                    } else {
+                        PHGR_PROOF_LEN
+                    }
+                    + 2 * NOTE_CIPHERTEXT_LEN,
+                joinsplit_desc_len(use_groth),
+            );
+
+            let mut c = Cursor::new(&bytes);
+            let js = read_joinsplit(&mut c, use_groth, [0x11; 32], 0)
+                .expect("a well-formed JSDescription must read");
+            assert_eq!(
+                c.pos,
+                joinsplit_desc_len(use_groth),
+                "read_joinsplit must consume the whole description, no more and no less"
+            );
+
+            // Field-by-field, so a transposition cannot hide behind a
+            // correct total length.
+            assert_eq!(js.anchor, [0xA1; 32]);
+            assert_eq!(js.nullifiers, [[0xB1; 32], [0xB2; 32]]);
+            assert_eq!(js.commitments, [[0xC1; 32], [0xC2; 32]]);
+            assert_eq!(js.ephemeral_key, [0xD1; 32]);
+            assert_eq!(js.random_seed, [0xE1; 32]);
+            assert_eq!(js.ciphertexts[0], vec![0x01; NOTE_CIPHERTEXT_LEN]);
+            assert_eq!(js.ciphertexts[1], vec![0x02; NOTE_CIPHERTEXT_LEN]);
+        }
+    }
+
+    /// A truncated JSDescription must yield `None`, not a partial struct:
+    /// this walks attacker-supplied bytes.
+    #[test]
+    fn a_truncated_joinsplit_is_rejected() {
+        let bytes = js_description_bytes(true);
+        for cut in [0, 100, bytes.len() - 1] {
+            let mut c = Cursor::new(&bytes[..cut]);
+            assert!(
+                read_joinsplit(&mut c, true, [0x11; 32], 0).is_none(),
+                "a JSDescription truncated to {cut} bytes must be rejected"
+            );
+        }
+    }
+
+    /// The end-to-end capture: a v4 transaction carrying two JoinSplits and
+    /// a note pointing at the second output of the second one. Checks the
+    /// two things the spend path depends on — that `joinSplitPubKey` (which
+    /// is serialized once, after the vector) lands on every JoinSplit, and
+    /// that the note's `JSOutPoint` survives to address them.
+    #[test]
+    fn captures_joinsplits_and_links_a_note_to_its_output() {
+        let mut value = Vec::new();
+        value.extend_from_slice(&0x8000_0004u32.to_le_bytes()); // overwintered, v4
+        value.extend_from_slice(&[0x89, 0xBB, 0x09, 0x00]); // version group id
+        value.push(0x00); // n_vin
+        value.push(0x00); // n_vout
+        value.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        value.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
+        value.extend_from_slice(&0i64.to_le_bytes()); // valueBalanceSapling
+        value.push(0x00); // n_spend
+        value.push(0x00); // n_out — no Sapling actions, so no bindingSig
+
+        value.push(0x02); // n_js = 2
+        value.extend_from_slice(&js_description_bytes(true));
+        value.extend_from_slice(&js_description_bytes(true));
+        value.extend_from_slice(&[0x7E; 32]); // joinSplitPubKey
+        value.extend_from_slice(&[0x7F; 64]); // joinSplitSig
+
+        value.extend_from_slice(&[0xAA; 32]); // hashBlock
+        value.push(0x00); // vMerkleBranch
+        value.extend_from_slice(&0i32.to_le_bytes()); // nIndex
+        value.push(0x00); // vUnused
+        value.push(0x00); // mapValue
+
+        value.push(0x01); // mapSproutNoteData count = 1
+        value.extend_from_slice(&[0x33; 32]); // JSOutPoint.hash
+        value.extend_from_slice(&1u64.to_le_bytes()); // JSOutPoint.js = 1
+        value.push(0x01); // JSOutPoint.n = 1
+        value.extend_from_slice(&[0x77; 64]); // address
+        value.push(0x00); // nullifier: None
+        value.push(0x00); // witnesses: empty list
+        value.extend_from_slice(&0i32.to_le_bytes()); // witnessHeight
+
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+        key.extend_from_slice(&[0x33; 32]);
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[(key, value)], &mut out);
+
+        assert_eq!(out.sprout_joinsplits.len(), 2, "both JoinSplits captured");
+        for (i, js) in out.sprout_joinsplits.iter().enumerate() {
+            assert_eq!(js.txid, [0x33; 32]);
+            assert_eq!(js.js_index, i as u64);
+            assert_eq!(
+                js.joinsplit_pubkey, [0x7E; 32],
+                "the per-transaction pubkey must be backfilled onto every JoinSplit"
+            );
+            assert_eq!(js.ciphertexts[1], vec![0x02; NOTE_CIPHERTEXT_LEN]);
+        }
+
+        assert_eq!(out.sprout_notes.len(), 1);
+        let note = &out.sprout_notes[0];
+        assert_eq!(note.outpoint.txid, [0x33; 32]);
+        assert_eq!(note.outpoint.js_index, 1);
+        assert_eq!(note.outpoint.output_index, 1);
+
+        // The link the spend path actually walks: outpoint -> JoinSplit ->
+        // the ciphertext holding this note's plaintext.
+        let js = out
+            .sprout_joinsplits
+            .iter()
+            .find(|j| j.txid == note.outpoint.txid && j.js_index == note.outpoint.js_index)
+            .expect("the note's outpoint must address a captured JoinSplit");
+        assert_eq!(
+            js.ciphertexts[note.outpoint.output_index as usize],
+            vec![0x02; NOTE_CIPHERTEXT_LEN]
+        );
+    }
+
+    /// A record whose walk fails after the JoinSplits have been read must
+    /// contribute nothing at all — not the JoinSplits it managed to read
+    /// before hitting the truncation.
+    #[test]
+    fn a_record_that_fails_late_contributes_no_joinsplits() {
+        let mut value = Vec::new();
+        value.extend_from_slice(&0x8000_0004u32.to_le_bytes());
+        value.extend_from_slice(&[0x89, 0xBB, 0x09, 0x00]);
+        value.push(0x00); // n_vin
+        value.push(0x00); // n_vout
+        value.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        value.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
+        value.extend_from_slice(&0i64.to_le_bytes()); // valueBalanceSapling
+        value.push(0x00);
+        value.push(0x00);
+        value.push(0x01); // n_js = 1
+        value.extend_from_slice(&js_description_bytes(true));
+        value.extend_from_slice(&[0x7E; 32]);
+        value.extend_from_slice(&[0x7F; 64]);
+        // Truncated here: the CMerkleTx tail never arrives.
+
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+        key.extend_from_slice(&[0x44; 32]);
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[(key, value)], &mut out);
+
+        assert!(
+            out.sprout_joinsplits.is_empty(),
+            "a record that fails to walk must not leave JoinSplits behind"
+        );
         assert!(out.sprout_notes.is_empty());
     }
 }

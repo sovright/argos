@@ -82,6 +82,49 @@ pub struct SproutNoteData {
     pub nullifier: Option<[u8; 32]>,
     /// Opaque serialized witness. Not interpreted in sub-spec 1.
     pub witness: Vec<u8>,
+    /// Which JoinSplit output this note came out of.
+    ///
+    /// Preserved because it is the only link from a note to the ciphertext
+    /// that carries its plaintext. The note records hold `value`, `rho` and
+    /// `r` nowhere; those live in the JoinSplit's `ciphertexts[n]`, and
+    /// nothing else in the wallet says which output of which JoinSplit a
+    /// given note came from.
+    pub outpoint: JsOutPoint,
+}
+
+/// zcashd's `JSOutPoint`: the transaction, the JoinSplit within it, and the
+/// output within that JoinSplit (always 0 or 1 — `ZC_NUM_JS_OUTPUTS` is 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsOutPoint {
+    pub txid: [u8; 32],
+    pub js_index: u64,
+    pub output_index: u8,
+}
+
+/// The public fields of one `JSDescription`, captured from a `tx` record.
+///
+/// Everything here is public consensus data — it is on-chain in the clear.
+/// The note plaintexts inside `ciphertexts` are not readable without a
+/// Sprout spending key, so this struct is not secret-bearing and keeps the
+/// ordinary derives.
+///
+/// `proof` and `macs` are deliberately not captured: recovery re-proves
+/// from scratch and never re-checks the original proof.
+#[derive(Debug, Clone)]
+pub struct SproutJoinSplit {
+    pub txid: [u8; 32],
+    pub js_index: u64,
+    pub anchor: [u8; 32],
+    pub nullifiers: [[u8; 32]; 2],
+    pub commitments: [[u8; 32]; 2],
+    pub ephemeral_key: [u8; 32],
+    pub random_seed: [u8; 32],
+    /// Per-transaction, not per-JoinSplit, but copied onto each one because
+    /// `hSig` needs it alongside this JoinSplit's own `random_seed` and
+    /// nullifiers, and carrying it here keeps that computation local.
+    pub joinsplit_pubkey: [u8; 32],
+    /// The two note ciphertexts, `ZC_NOTECIPHERTEXT_SIZE` (601) bytes each.
+    pub ciphertexts: [Vec<u8>; 2],
 }
 
 /// No `Debug`/`Clone` derive: it holds `Vec<TransparentKey>` etc., which
@@ -93,6 +136,10 @@ pub struct ImportedKeys {
     pub sapling: Vec<SaplingKey>,
     pub sprout: Vec<SproutKey>,
     pub sprout_notes: Vec<SproutNoteData>,
+    /// Every JoinSplit in every `tx` record the wallet holds, indexed by
+    /// `SproutNoteData::outpoint`. Kept flat rather than nested under the
+    /// notes because one JoinSplit's `hSig` covers both of its outputs.
+    pub sprout_joinsplits: Vec<SproutJoinSplit>,
     /// A recovered BIP-39 mnemonic, when the source wallet held a seed
     /// rather than (or in addition to) flat key material — currently only
     /// ZWL, whose HD keys are re-derived from this seed rather than stored
