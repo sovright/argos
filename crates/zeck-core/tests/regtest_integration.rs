@@ -1754,7 +1754,13 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua.clone())
     .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
-    .arg_value("--num-accounts", "3") // 0, 1 funded; 2 is the destination
+    // Two accounts, not three. Account 2 supplies the destination address but
+    // must NOT be scanned: it belongs to the same seed, so tracking it makes
+    // the destination part of the wallet being swept. The first run sweeps
+    // account 0 into account 2; the resumed run then finds account 2 holding
+    // those funds and sweeps it as well, producing two broadcasts where the
+    // test asserts one — "got 2 broadcasts from accounts [1, 2]".
+    .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs29-crash")
     .arg_value("--pause-millis-between-broadcasts", "30000")
@@ -1838,7 +1844,9 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua)
     .arg_value("--birthday", &common::regtest_harness::funding_birthday().to_string())
-    .arg_value("--num-accounts", "3")
+    // Must match the crash run: a different account count is a different
+    // workspace, and the resume would start from scratch instead of resuming.
+    .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs29-crash") // identical workspace key
     .arg_value("--pause-millis-between-broadcasts", "0")
