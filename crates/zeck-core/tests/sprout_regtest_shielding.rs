@@ -23,6 +23,9 @@
 
 #![cfg(feature = "argos-network")]
 
+// This test uses a small part of the shared harness; the rest is used by
+// other integration tests that compile the same module.
+#[allow(dead_code)]
 mod common;
 
 use argos_core::{sprout, sprout_spend, sprout_witness, ZeckNetwork};
@@ -79,9 +82,9 @@ async fn a_shielding_joinsplit_is_accepted_by_the_node() {
     // One UTXO is enough, and keeps the transaction small.
     let utxo = utxos
         .iter()
-        .find(|u| u64::from(u.txout.value) > FEE)
+        .find(|u| u64::from(u.txout.value()) > FEE)
         .expect("a UTXO larger than the fee");
-    let shielded_value = u64::from(utxo.txout.value) - FEE;
+    let shielded_value = u64::from(utxo.txout.value()) - FEE;
 
     // The note this JoinSplit creates, paid to the golden fixture's Sprout
     // address so a later spend test can use the real recovered key.
@@ -161,8 +164,8 @@ async fn a_shielding_joinsplit_is_accepted_by_the_node() {
         &[sprout_spend::TransparentFunding {
             txid: *utxo.outpoint.txid().as_ref(),
             index: utxo.outpoint.n(),
-            value: u64::from(utxo.txout.value),
-            script_pubkey: utxo.txout.script_pubkey.0 .0.clone(),
+            value: u64::from(utxo.txout.value()),
+            script_pubkey: utxo.txout.script_pubkey().0 .0.clone(),
             secret: key.secret,
         }],
         vec![js],
