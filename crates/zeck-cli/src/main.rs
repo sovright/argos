@@ -387,6 +387,13 @@ async fn sweep_sprout(
     println!("  Net to destination {}", format_zec(plan.net_zatoshis));
     println!("  Destination        {destination}");
     println!();
+    // Said before the confirmation, not after the broadcast: someone who
+    // pastes a Unified Address expects the funds in its best pool, and for
+    // Sprout that is never Orchard.
+    for line in wrap_text(argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING, 76) {
+        println!("  {line}");
+    }
+    println!();
 
     if dry_run {
         println!("Dry run: nothing was built or broadcast.");
@@ -421,6 +428,13 @@ async fn sweep_sprout(
         println!("  swept {} \u{2014} {}", format_zec(sent.value_swept), sent.txid);
     }
     println!("Swept {} to {destination}", format_zec(outcome.total_swept));
+    if outcome.destination_kind
+        == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified)
+    {
+        println!();
+        println!("These funds are in the Sapling receiver of that unified address.");
+        println!("To finish moving them to Orchard, shield them from your own wallet.");
+    }
     Ok(())
 }
 

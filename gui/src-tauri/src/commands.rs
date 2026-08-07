@@ -482,6 +482,10 @@ pub struct SproutSweepPreview {
     /// through a recovery.
     pub params_present: bool,
     pub params_path: String,
+    /// Why the funds land in Sapling and not Orchard. Shown before the user
+    /// commits, because pasting a unified address reasonably creates the
+    /// opposite expectation.
+    pub lands_in_sapling: String,
 }
 
 /// Preview a Sprout sweep.
@@ -513,6 +517,7 @@ pub async fn preview_sprout_sweep(
         net_zatoshis: plan.net_zatoshis,
         params_present: params_path.exists(),
         params_path: params_path.display().to_string(),
+        lands_in_sapling: argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING.to_owned(),
     })
 }
 
@@ -527,6 +532,9 @@ pub struct SproutSweepResult {
 pub struct SproutSweepReport {
     pub sent: Vec<SproutSweepResult>,
     pub total_swept: u64,
+    /// True when the destination was a unified address, so the funds landed
+    /// in its Sapling receiver and a further hop is needed for Orchard.
+    pub landed_in_unified_sapling: bool,
     /// Notes that did not move, and why. Surfaced rather than summarised:
     /// a user seeing less than expected needs to know which notes stayed
     /// behind.
@@ -591,6 +599,8 @@ pub async fn execute_sprout_sweep(
             })
             .collect(),
         total_swept: outcome.total_swept,
+        landed_in_unified_sapling: outcome.destination_kind
+            == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
     })
 }

@@ -476,6 +476,11 @@ async function showSproutSweep() {
       `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
       `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.`;
 
+    // Stated before the user commits. Pasting a unified address reasonably
+    // creates the expectation that funds land in its best pool, and for
+    // Sprout that can never be Orchard.
+    $("sprout-sweep-pool").textContent = preview.lands_in_sapling;
+
     // Said before the user commits, not discovered halfway through: without
     // the parameters the sweep cannot start at all.
     if (preview.params_present) {
@@ -544,6 +549,13 @@ async function runSproutSweep() {
       `✓ Swept ${fmt(report.total_swept)} to ${destination}.`,
       "success",
     );
+    if (report.landed_in_unified_sapling) {
+      const li = document.createElement("li");
+      li.textContent =
+        "These funds are in the Sapling receiver of that unified address. " +
+        "To finish moving them to Orchard, shield them from within your own wallet.";
+      list.appendChild(li);
+    }
   } catch (err) {
     setStatus("sprout-sweep-status", `✗ ${err}`, "error");
     button.disabled = false;

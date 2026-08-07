@@ -279,11 +279,44 @@ pub struct SentSweep {
 pub struct SproutSweepOutcome {
     pub sent: Vec<SentSweep>,
     pub total_swept: u64,
+    /// Which receiver the value landed in. Carried back so the surfaces can
+    /// tell the user the funds are in the Sapling pool, and that reaching
+    /// Orchard is a further hop from their own wallet.
+    pub destination_kind: Option<DestinationKind>,
     /// Notes that were skipped, and why. Reported rather than dropped: a
     /// user who sees a smaller total than expected needs to know which notes
     /// did not move.
     pub skipped: Vec<String>,
 }
+
+/// Which receiver a destination resolved to.
+///
+/// Reported so the surfaces can tell the user where the funds will actually
+/// land. Someone who pastes a Unified Address reasonably expects the value to
+/// arrive in its best pool; for a Sprout sweep it always arrives in the
+/// Sapling one, and that must be said rather than discovered on a block
+/// explorer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationKind {
+    /// A bare `zs1…` Sapling address.
+    BareSapling,
+    /// The Sapling receiver of a Unified Address.
+    SaplingReceiverOfUnified,
+}
+
+/// Why a Sprout sweep cannot land in Orchard, in the user's terms.
+///
+/// Not an implementation limit and not worth hedging about: Sprout
+/// JoinSplits exist only in v4 transactions and Orchard actions only in v5,
+/// so no single transaction can hold both. Reaching Orchard is necessarily a
+/// second transaction, and since Argos never holds the intermediate key, that
+/// second hop belongs to the user's own wallet.
+pub const SPROUT_LANDS_IN_SAPLING: &str =
+    "Sprout funds can only be moved into the Sapling pool. A Sprout JoinSplit \
+     exists only in a version 4 transaction and Orchard only in version 5, so \
+     no single transaction can reach Orchard. The funds arrive in the Sapling \
+     receiver of the address you gave, under your own keys — to finish moving \
+     them to Orchard, shield them from within your own wallet afterwards.";
 
 /// Parse a destination that can receive Sapling value.
 ///
@@ -296,6 +329,15 @@ pub fn parse_sapling_destination(
     destination: &str,
     network: crate::ZeckNetwork,
 ) -> ZeckResult<sapling_crypto::PaymentAddress> {
+    parse_sapling_destination_kind(destination, network).map(|(addr, _)| addr)
+}
+
+/// As [`parse_sapling_destination`], but also reporting which receiver was
+/// used.
+pub fn parse_sapling_destination_kind(
+    destination: &str,
+    network: crate::ZeckNetwork,
+) -> ZeckResult<(sapling_crypto::PaymentAddress, DestinationKind)> {
     use zcash_address::{
         unified::{Container, Receiver},
         ConversionError, TryFromAddress, ZcashAddress,
@@ -306,7 +348,7 @@ pub fn parse_sapling_destination(
         ZeckError::InvalidAddress(format!("{destination} is not a Zcash address: {err}"))
     })?;
 
-    struct Found(Option<sapling_crypto::PaymentAddress>);
+    struct Found(Option<(sapling_crypto::PaymentAddress, DestinationKind)>);
     impl TryFromAddress for Found {
         type Error = &'static str;
 
@@ -314,7 +356,10 @@ pub fn parse_sapling_destination(
             _net: NetworkType,
             data: [u8; 43],
         ) -> Result<Self, ConversionError<Self::Error>> {
-            Ok(Found(sapling_crypto::PaymentAddress::from_bytes(&data)))
+            Ok(Found(
+                sapling_crypto::PaymentAddress::from_bytes(&data)
+                    .map(|a| (a, DestinationKind::BareSapling)),
+            ))
         }
 
         fn try_from_unified(
@@ -323,7 +368,10 @@ pub fn parse_sapling_destination(
         ) -> Result<Self, ConversionError<Self::Error>> {
             for receiver in ua.items() {
                 if let Receiver::Sapling(data) = receiver {
-                    return Ok(Found(sapling_crypto::PaymentAddress::from_bytes(&data)));
+                    return Ok(Found(
+                        sapling_crypto::PaymentAddress::from_bytes(&data)
+                            .map(|a| (a, DestinationKind::SaplingReceiverOfUnified)),
+                    ));
                 }
             }
             Ok(Found(None))
@@ -376,7 +424,7 @@ pub async fn sweep_sprout_notes(
 ) -> ZeckResult<SproutSweepOutcome> {
     use zcash_client_backend::proto::service::{ChainSpec, RawTransaction};
 
-    let sapling_dest = parse_sapling_destination(destination, network)?;
+    let (sapling_dest, destination_kind) = parse_sapling_destination_kind(destination, network)?;
     let proving_key = load_params(params_path)?;
     let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
 
@@ -391,7 +439,10 @@ pub async fn sweep_sprout_notes(
         .height as u32;
     let branch_id = branch_id_for_height(network, tip);
 
-    let mut outcome = SproutSweepOutcome::default();
+    let mut outcome = SproutSweepOutcome {
+        destination_kind: Some(destination_kind),
+        ..Default::default()
+    };
 
     for (index, note) in notes.iter().enumerate() {
         if note.note.value <= SPROUT_SWEEP_FEE {
@@ -544,6 +595,48 @@ mod tests {
     fn a_note_worth_exactly_the_fee_is_not_swept() {
         assert!(plan_sweep(&[note(SPROUT_SWEEP_FEE)]).is_err());
         assert!(plan_sweep(&[note(SPROUT_SWEEP_FEE + 1)]).is_ok());
+    }
+
+    /// The explanation must name the actual constraint, not gesture at one.
+    /// A user who pastes a unified address and gets Sapling deserves to know
+    /// it is a transaction-version limit and that a second hop is theirs.
+    #[test]
+    fn the_pool_explanation_names_the_constraint_and_the_next_step() {
+        let text = SPROUT_LANDS_IN_SAPLING;
+        assert!(text.contains("Sapling"));
+        assert!(text.contains("Orchard"));
+        assert!(
+            text.contains("version 4") && text.contains("version 5"),
+            "the reason is a transaction-version constraint and should say so"
+        );
+        assert!(
+            text.contains("your own"),
+            "the second hop belongs to the user's wallet and must be stated"
+        );
+    }
+
+    /// A bare Sapling address and a unified address must be told apart, or
+    /// the surfaces cannot explain where the funds landed.
+    #[test]
+    fn the_destination_kind_distinguishes_bare_sapling_from_unified() {
+        assert_ne!(
+            DestinationKind::BareSapling,
+            DestinationKind::SaplingReceiverOfUnified
+        );
+    }
+
+    /// Orchard-only and transparent destinations must be refused with the
+    /// reason, since sending there would strand the value in the transparent
+    /// pool for whoever mines next.
+    #[test]
+    fn a_destination_with_no_sapling_receiver_is_refused_with_the_reason() {
+        for addr in ["t1KYSNmvWjRDpTgxKfXvhY1ZqDkPFAoxfEc", "not-an-address"] {
+            let err = match parse_sapling_destination(addr, crate::ZeckNetwork::Mainnet) {
+                Ok(_) => panic!("{addr} must not be accepted"),
+                Err(e) => e.to_string(),
+            };
+            assert!(!err.is_empty(), "a refusal must carry a reason");
+        }
     }
 
     #[test]
