@@ -54,9 +54,16 @@ pub struct SpendableSproutNote {
     pub address: SproutPaymentAddress,
     /// The note commitment, re-derived and checked against the JoinSplit's.
     pub commitment: [u8; 32],
-    /// The cached witness blob, verbatim from the wallet. Interpreted by
-    /// `sprout_witness`, not here.
-    pub witness: Vec<u8>,
+    /// The commitment tree root this note's witness authenticates against.
+    ///
+    /// Resolved here rather than carried as a raw blob. A wallet supplies a
+    /// cached zcashd witness and a scan builds one from the chain; those are
+    /// different encodings, and a single `witness: Vec<u8>` field meant the
+    /// sweeper had to guess which it held — it guessed "wallet", so scanned
+    /// notes could be found and never spent.
+    pub anchor: [u8; 32],
+    /// The 966-byte authentication path the JoinSplit prover parses.
+    pub witness_path: Vec<u8>,
     pub outpoint: JsOutPoint,
 }
 
@@ -67,6 +74,7 @@ impl core::fmt::Debug for SpendableSproutNote {
             .field("outpoint", &self.outpoint)
             .field("value", &self.note.value)
             .field("commitment", &hex(&self.commitment))
+            .field("anchor", &hex(&self.anchor))
             .finish_non_exhaustive()
     }
 }
@@ -84,6 +92,10 @@ pub enum SproutRecoveryIssue {
     NoSpendingKey { outpoint: JsOutPoint },
     /// `output_index` was not 0 or 1. A JoinSplit has exactly two outputs.
     OutputIndexOutOfRange { outpoint: JsOutPoint, index: u8 },
+    /// The note decrypted, but its cached witness could not be read, so its
+    /// position in the commitment tree is unknown and it cannot be spent
+    /// without a rescan.
+    UnreadableWitness { outpoint: JsOutPoint, reason: String },
     /// The ciphertext did not authenticate under this key.
     Undecryptable {
         outpoint: JsOutPoint,
@@ -116,6 +128,12 @@ impl std::fmt::Display for SproutRecoveryIssue {
             Self::OutputIndexOutOfRange { outpoint, index } => write!(
                 f,
                 "note {}: output index {index} is out of range (a JoinSplit has 2 outputs)",
+                op(outpoint)
+            ),
+            Self::UnreadableWitness { outpoint, reason } => write!(
+                f,
+                "note {}: decrypted, but its cached witness could not be read ({reason}); \
+                 it cannot be spent without a full-block rescan",
                 op(outpoint)
             ),
             Self::Undecryptable { outpoint, reason } => {
@@ -222,12 +240,39 @@ pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
             continue;
         }
 
+        // Resolved now, not at sweep time: a witness that cannot be read
+        // makes the note unspendable, and saying so during recovery is far
+        // better than after a 725 MB proving run.
+        let witness = match crate::sprout_witness::IncrementalWitness::parse_cached(
+            &note_data.witness,
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                out.issues.push(SproutRecoveryIssue::UnreadableWitness {
+                    outpoint,
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let witness_path = match witness.encode_for_prover() {
+            Ok(path) => path.to_vec(),
+            Err(err) => {
+                out.issues.push(SproutRecoveryIssue::UnreadableWitness {
+                    outpoint,
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+        };
+
         out.notes.push(SpendableSproutNote {
             note,
             a_sk: **a_sk,
             address,
             commitment: derived,
-            witness: note_data.witness.clone(),
+            anchor: witness.root(),
+            witness_path,
             outpoint,
         });
     }
@@ -294,10 +339,21 @@ mod tests {
             joinsplit_pubkey,
             ciphertexts: [ciphertext, vec![0u8; 601]],
         });
+        // A real cached witness blob, in zcashd's shape: a
+        // `std::list<SproutWitness>` followed by `witnessHeight`. Recovery
+        // parses this now rather than passing it along, so a placeholder
+        // would no longer exercise the path.
+        let mut tree = crate::sprout_witness::IncrementalMerkleTree::default();
+        tree.append(commitment).expect("append the note");
+        let witness = crate::sprout_witness::IncrementalWitness::from_tree(tree);
+        let mut blob = vec![0x01u8]; // one witness in the list
+        blob.extend_from_slice(&witness.to_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes()); // witnessHeight
+
         keys.sprout_notes.push(SproutNoteData {
             address: address.to_bytes(),
             nullifier: None,
-            witness: vec![0xAB; 8],
+            witness: blob,
             outpoint,
         });
 
@@ -321,7 +377,7 @@ mod tests {
         assert_eq!(note.note.rho, [0x11u8; 32]);
         assert_eq!(note.note.r, [0x22u8; 32]);
         assert_eq!(note.a_sk, a_sk);
-        assert_eq!(note.witness, vec![0xAB; 8]);
+        assert_eq!(note.witness_path.len(), crate::sprout_witness::WITNESS_PATH_SIZE);
         assert_eq!(recovered.total_value(), 123_456_789);
     }
 

@@ -285,7 +285,8 @@ impl SproutScanner {
                 a_sk: pending.a_sk,
                 address: pending.address,
                 commitment: pending.commitment,
-                witness: pending.witness.encode_for_prover()?.to_vec(),
+                anchor: pending.witness.root(),
+                witness_path: pending.witness.encode_for_prover()?.to_vec(),
                 outpoint: pending.outpoint,
             });
         }
@@ -743,7 +744,7 @@ mod tests {
         let result = scanner.finish().expect("finish");
 
         assert_eq!(
-            result.notes[0].witness.len(),
+            result.notes[0].witness_path.len(),
             crate::sprout_witness::WITNESS_PATH_SIZE,
             "the witness must be the prover's encoding"
         );
@@ -809,7 +810,11 @@ mod tests {
         // stopped advancing across the resume still encodes, and fails only
         // at broadcast.
         for (a, b) in actual.notes.iter().zip(expected.notes.iter()) {
-            assert_eq!(a.witness, b.witness, "witnesses must survive the resume");
+            assert_eq!(
+                a.witness_path, b.witness_path,
+                "witnesses must survive the resume"
+            );
+            assert_eq!(a.anchor, b.anchor, "anchors must survive the resume");
             assert_eq!(a.commitment, b.commitment);
         }
     }

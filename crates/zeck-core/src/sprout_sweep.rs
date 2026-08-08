@@ -152,21 +152,12 @@ pub fn build_sweep_for_note(
     }
     let to_sapling = note.note.value - SPROUT_SWEEP_FEE;
 
-    // The cached blob is zcashd's `std::list<SproutWitness>`; the newest
-    // entry is the one nearest the wallet's last sync.
-    let witness =
-        sprout_witness::IncrementalWitness::parse_cached(&note.witness).map_err(|err| {
-            ZeckError::TransactionBuild(format!(
-                "this note's cached witness could not be read ({err}). Without it the note's \
-             position in the commitment tree is unknown and it cannot be spent without a \
-             full-block rescan."
-            ))
-        })?;
-    let anchor = witness.root();
-    let witness_path = witness
-        .encode_for_prover()
-        .map_err(|err| ZeckError::TransactionBuild(format!("encoding the witness path: {err}")))?
-        .to_vec();
+    // The anchor and path were resolved when the note was recovered, from
+    // whichever source it came from — a wallet's cached witness or a scan
+    // that rebuilt one. Both produce the same two values here, so the
+    // sweeper no longer has to know which.
+    let anchor = note.anchor;
+    let witness_path = note.witness_path.clone();
 
     let signing_key = sprout_spend::JoinSplitSigningKey::from_bytes(random_bytes(&mut rng));
 
@@ -544,7 +535,8 @@ mod tests {
             a_sk,
             address,
             commitment: sprout::note_commitment(address.a_pk(), value, &rho, &r),
-            witness: Vec::new(),
+            anchor: [0u8; 32],
+            witness_path: vec![0u8; crate::sprout_witness::WITNESS_PATH_SIZE],
             outpoint: JsOutPoint {
                 txid: [0u8; 32],
                 js_index: 0,
