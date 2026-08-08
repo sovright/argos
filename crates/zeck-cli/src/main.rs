@@ -50,6 +50,15 @@ struct Cli {
     #[arg(long, conflicts_with = "seed_file")]
     wallet_file: Option<PathBuf>,
 
+    /// File holding a raw Sprout spending key (`SK…` mainnet / `ST…`
+    /// testnet), one per line, for a key with no wallet file behind it.
+    ///
+    /// A file rather than a flag, for the same reason the wallet passphrase
+    /// is prompt-only: a spending key passed as an argument lands in shell
+    /// history and in `ps` output for every user on the box (T-S6).
+    #[arg(long)]
+    sprout_key_file: Option<PathBuf>,
+
     /// Directory for wallet database and block cache.
     #[arg(long, default_value = "./argos_data")]
     data_dir: PathBuf,
@@ -154,6 +163,34 @@ enum Commands {
         dry_run: bool,
 
         /// Confirm you understand this is irreversible and broadcast the sweep.
+        #[arg(long)]
+        confirm_sweep: bool,
+    },
+
+    /// Find Sprout notes for a raw spending key by scanning the chain.
+    ///
+    /// For keys with no wallet file behind them — a paper backup, or a
+    /// `z_exportkey` string. There is no cheaper route: Sprout notes are
+    /// discoverable only by trial-decrypting every JoinSplit, and no Sprout
+    /// address index exists anywhere. Expect hours and tens of gigabytes.
+    ///
+    /// A `wallet.dat` almost never needs this — its cached witnesses make
+    /// `sweep-sprout` work with no scan at all.
+    ScanSprout {
+        /// Destination Sapling address to sweep to once the scan finishes.
+        /// Omit to scan and report without moving anything.
+        #[arg(long)]
+        destination: Option<String>,
+
+        /// A peer to use instead of the DNS seeds, as `host:port`. Repeatable.
+        #[arg(long)]
+        peer: Vec<String>,
+
+        /// Path to sprout-groth16.params. Only needed when sweeping.
+        #[arg(long)]
+        sprout_params: Option<PathBuf>,
+
+        /// Confirm you understand the sweep is irreversible and broadcast it.
         #[arg(long)]
         confirm_sweep: bool,
     },
@@ -438,6 +475,170 @@ async fn sweep_sprout(
     Ok(())
 }
 
+
+/// Gather the spending keys a Sprout scan should look for.
+///
+/// Either from a key file or from a wallet whose own note data was missing.
+/// Both are accepted at once, because a user may hold a `wallet.dat` *and*
+/// a paper key for an address that wallet never rescanned.
+fn collect_sprout_scan_keys(
+    key_file: Option<&Path>,
+    wallet: Option<&ImportedKeys>,
+    network: ZeckNetwork,
+) -> Result<Vec<[u8; 32]>> {
+    use secrecy::ExposeSecret;
+
+    let mut keys: Vec<[u8; 32]> = Vec::new();
+
+    if let Some(path) = key_file {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            // Blank lines and `#` comments, so a user can annotate which key
+            // came from which backup without the file being rejected.
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let key = argos_core::sprout_key::decode_sprout_spending_key(line, network)
+                .with_context(|| format!("line {} of {}", index + 1, path.display()))?;
+            keys.push(key);
+        }
+    }
+
+    if let Some(wallet) = wallet {
+        for key in &wallet.sprout {
+            keys.push(*key.a_sk.expose_secret());
+        }
+    }
+
+    // A wallet listing the same address twice, or a key file repeating one,
+    // would otherwise trial-decrypt every ciphertext twice for no gain.
+    keys.sort_unstable();
+    keys.dedup();
+
+    if keys.is_empty() {
+        anyhow::bail!(
+            "no Sprout spending keys to scan for. Pass --sprout-key-file with one \
+             SK…/ST… key per line, or --wallet-file for a wallet holding Sprout keys."
+        );
+    }
+    Ok(keys)
+}
+
+/// Scan the chain for a set of Sprout keys, then optionally sweep what it finds.
+#[allow(clippy::too_many_arguments)]
+async fn scan_sprout(
+    keys: &[[u8; 32]],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+    data_dir: &Path,
+    peers: &[String],
+    destination: Option<&str>,
+    sprout_params: Option<PathBuf>,
+    confirm_sweep: bool,
+) -> Result<()> {
+    let p2p_network = match network {
+        ZeckNetwork::Mainnet => P2pNetwork::Mainnet,
+        ZeckNetwork::Testnet => P2pNetwork::Testnet,
+    };
+
+    // The destination is validated before the scan, not after. Discovering
+    // that an address has no Sapling receiver at the end of a six-hour scan
+    // would be the worst possible time to find out.
+    if let Some(dest) = destination {
+        argos_core::sprout_sweep::parse_sapling_destination(dest, network)?;
+    }
+
+    println!();
+    for key in keys {
+        let addr = argos_core::sprout_key::encode_sprout_address(
+            &argos_core::sprout::SproutPaymentAddress::from_spending_key(key),
+            network,
+        );
+        println!("  scanning for {addr}");
+    }
+    println!();
+    print_sprout_scan_cost_warning();
+
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
+    eprintln!("Progress is saved to {}", checkpoint.display());
+    eprintln!("Interrupt with Ctrl-C at any time and re-run to resume.");
+    eprintln!();
+
+    let started = std::time::Instant::now();
+    let mut last_report = std::time::Instant::now();
+    let result = argos_core::sprout_scan_run::run_sprout_scan(
+        keys,
+        p2p_network,
+        peers,
+        &checkpoint,
+        |tick| {
+            // Rate-limited: a tick per batch would scroll a six-hour scan
+            // off the screen and tell the user nothing extra.
+            if last_report.elapsed().as_secs() >= 5 {
+                last_report = std::time::Instant::now();
+                let pct = (f64::from(tick.height) / f64::from(tick.target.max(1))) * 100.0;
+                eprintln!(
+                    "  {:>7}/{} ({pct:.1}%)  {} JoinSplits  {} note(s)  {}",
+                    tick.height,
+                    tick.target,
+                    tick.joinsplits_seen,
+                    tick.notes_found,
+                    fmt_elapsed(started.elapsed()),
+                );
+            }
+        },
+    )
+    .await?;
+
+    println!();
+    println!("━━━ Sprout scan complete ━━━");
+    println!("  Blocks scanned    {}", result.progress.blocks_scanned);
+    println!("  JoinSplits seen   {}", result.progress.joinsplits_seen);
+    println!("  Notes found       {}", result.notes.len());
+    println!("  Already spent     {}", result.spent_notes);
+    println!("  Total             {}", format_zec(result.total_value()));
+    println!();
+
+    if result.notes.is_empty() {
+        println!("No unspent Sprout notes were found for these keys.");
+        return Ok(());
+    }
+
+    let Some(destination) = destination else {
+        println!("Re-run with --destination <zs1…> --confirm-sweep to move these funds.");
+        return Ok(());
+    };
+    if !confirm_sweep {
+        println!("Re-run with --confirm-sweep to broadcast the sweep.");
+        return Ok(());
+    }
+
+    let params_path = sprout_params.unwrap_or_else(argos_core::sprout_sweep::default_params_path);
+    let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
+        &result.notes,
+        network,
+        lightwalletd_url,
+        destination,
+        &params_path,
+        [0u8; 512],
+        |msg| eprintln!("  {msg}"),
+    )
+    .await?;
+
+    for sent in &outcome.sent {
+        println!("  swept {} — {}", format_zec(sent.value_swept), sent.txid);
+    }
+    println!("Swept {} to {destination}", format_zec(outcome.total_swept));
+    Ok(())
+}
+
+fn fmt_elapsed(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
 /// Tell the user what a Sprout scan actually costs, before they start one.
 ///
 /// A Sprout scan cannot use lightwalletd — compact blocks carry no
@@ -714,6 +915,40 @@ async fn main() -> Result<()> {
 
     let network: ZeckNetwork = cli.network.into();
 
+    // `scan-sprout` is dispatched here, before key-source resolution, because
+    // it needs no HD seed: its keys come from a key file or from a wallet
+    // file's Sprout records. Falling through would prompt for a seed phrase
+    // the user does not have and cannot supply.
+    if let Commands::ScanSprout {
+        destination,
+        peer,
+        sprout_params,
+        confirm_sweep,
+    } = &cli.command
+    {
+        ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
+        let wallet_keys = match &cli.wallet_file {
+            Some(path) => Some(load_wallet_file(path)?),
+            None => None,
+        };
+        let keys = collect_sprout_scan_keys(
+            cli.sprout_key_file.as_deref(),
+            wallet_keys.as_ref(),
+            network,
+        )?;
+        return scan_sprout(
+            &keys,
+            network,
+            &cli.lightwalletd_url,
+            &cli.data_dir,
+            peer,
+            destination.as_deref(),
+            sprout_params.clone(),
+            *confirm_sweep,
+        )
+        .await;
+    }
+
     // `key_source` is what the scanner and sweeper use. `seed_phrase` is
     // the same key material in the one form two local-only paths still
     // need it in — birthday auto-detection and `show-keys` — and is
@@ -834,6 +1069,10 @@ async fn main() -> Result<()> {
             let source = imported.expect("--wallet-file is required and was checked above");
             print_wallet_inspection(source.keys(), network);
         }
+
+        // Dispatched above, before key-source resolution, so that it never
+        // prompts for a seed phrase it does not need.
+        Commands::ScanSprout { .. } => unreachable!("scan-sprout returns earlier"),
 
         Commands::SweepSprout {
             destination,
