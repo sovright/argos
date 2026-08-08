@@ -605,6 +605,110 @@ pub async fn execute_sprout_sweep(
     })
 }
 
+
+/// A Sprout scan's outcome, for the frontend.
+#[derive(Serialize)]
+pub struct SproutScanReport {
+    pub blocks_scanned: u64,
+    pub joinsplits_seen: u64,
+    pub notes_found: usize,
+    pub spent_notes: usize,
+    pub total_zatoshis: u64,
+}
+
+/// Check a raw Sprout spending key and report the address it controls.
+///
+/// Separate from the scan so a typo is caught in a second rather than six
+/// hours in. The address is returned so the user can confirm Argos is about
+/// to look for the one they meant.
+#[tauri::command]
+pub async fn check_sprout_key(key: String, network: String) -> Result<String, String> {
+    let network = network_from(&network);
+    let a_sk = argos_core::sprout_key::decode_sprout_spending_key(key.trim(), network)
+        .map_err(|err| err.to_string())?;
+    Ok(argos_core::sprout_key::encode_sprout_address(
+        &argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk),
+        network,
+    ))
+}
+
+/// Scan the chain for notes belonging to raw Sprout spending keys.
+///
+/// Runs for hours, so progress arrives as `sprout-scan-progress` events and
+/// the scan checkpoints as it goes — closing the app and reopening resumes
+/// rather than restarting.
+#[tauri::command]
+pub async fn start_sprout_scan(
+    app: AppHandle,
+    keys: Vec<String>,
+    network: String,
+    data_dir: String,
+    peers: Vec<String>,
+) -> Result<SproutScanReport, String> {
+    ensure_tos_accepted(&app)?;
+    let network = network_from(&network);
+
+    let mut decoded: Vec<[u8; 32]> = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        decoded.push(
+            argos_core::sprout_key::decode_sprout_spending_key(key, network)
+                .map_err(|err| format!("key {}: {err}", index + 1))?,
+        );
+    }
+    decoded.sort_unstable();
+    decoded.dedup();
+    if decoded.is_empty() {
+        return Err("no Sprout spending keys were supplied".to_owned());
+    }
+
+    let p2p = match network {
+        argos_core::ZeckNetwork::Mainnet => argos_core::p2p::wire::P2pNetwork::Mainnet,
+        argos_core::ZeckNetwork::Testnet => argos_core::p2p::wire::P2pNetwork::Testnet,
+    };
+    let dir = PathBuf::from(data_dir);
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
+
+    let emitter = app.clone();
+    let result = argos_core::sprout_scan_run::run_sprout_scan(
+        &decoded,
+        p2p,
+        &peers,
+        &checkpoint,
+        move |tick| {
+            let _ = emitter.emit(
+                "sprout-scan-progress",
+                serde_json::json!({
+                    "height": tick.height,
+                    "target": tick.target,
+                    "notesFound": tick.notes_found,
+                    "joinsplitsSeen": tick.joinsplits_seen,
+                }),
+            );
+        },
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    Ok(SproutScanReport {
+        blocks_scanned: result.progress.blocks_scanned,
+        joinsplits_seen: result.progress.joinsplits_seen,
+        notes_found: result.notes.len(),
+        spent_notes: result.spent_notes,
+        total_zatoshis: result.total_value(),
+    })
+}
+
+fn network_from(name: &str) -> argos_core::ZeckNetwork {
+    match name {
+        "testnet" => argos_core::ZeckNetwork::Testnet,
+        _ => argos_core::ZeckNetwork::Mainnet,
+    }
+}
+
 #[tauri::command]
 pub fn default_data_dir(app: AppHandle) -> Result<String, String> {
     let base = app

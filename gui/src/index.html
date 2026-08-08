@@ -292,6 +292,24 @@
               <span id="wallet-sprout-detail"></span>
               <div id="wallet-sprout-scan-cost" hidden></div>
 
+              <!-- Shown only when the wallet file yielded no spendable notes,
+                   which is the one case a scan can help with. Also accepts a
+                   raw key, for a user who has no wallet file at all. -->
+              <div id="sprout-scan-panel" hidden>
+                <hr />
+                <p><strong>Scan the chain for these notes</strong></p>
+                <label for="sprout-scan-keys">
+                  Sprout spending keys (one per line, <code>SK…</code> or <code>ST…</code>)
+                </label>
+                <textarea id="sprout-scan-keys" rows="3" spellcheck="false"
+                  placeholder="Leave blank to use the keys in the wallet file"></textarea>
+                <button id="sprout-scan-check" type="button">Check keys</button>
+                <ul id="sprout-scan-addresses" class="session-list"></ul>
+                <button id="sprout-scan-run" type="button">Start scan</button>
+                <p id="sprout-scan-status" class="status-line"></p>
+                <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
+              </div>
+
               <!-- Only shown when the wallet file itself yielded spendable
                    notes. Sprout value must land on a Sapling receiver: it
                    leaves the pool through the transparent pool and has to be

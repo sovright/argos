@@ -393,6 +393,9 @@ function renderWalletSummary(summary) {
   // Reset every time: reopening a different wallet file must never leave the
   // previous one's sweep panel, plan or results on screen.
   $("wallet-sprout-sweep").hidden = true;
+  $("sprout-scan-panel").hidden = true;
+  $("sprout-scan-addresses").innerHTML = "";
+  setStatus("sprout-scan-status", "", "");
   $("sprout-sweep-results").innerHTML = "";
   setStatus("sprout-sweep-status", "", "");
 
@@ -429,6 +432,7 @@ function renderWalletSummary(summary) {
         sproutScanCost.appendChild(p);
       }
       sproutScanCost.hidden = sproutScanCost.childElementCount === 0;
+      $("sprout-scan-panel").hidden = false;
     }
 
     // Rebuilt each time rather than appended to: reopening a wallet file
@@ -678,6 +682,95 @@ $("sprout-sweep-run").addEventListener("click", runSproutSweep);
   try {
     await listen("sprout-sweep-progress", (event) => {
       setStatus("sprout-sweep-status", `${event.payload}…`, "");
+    });
+  } catch (_) {
+    // No event channel: the final result still reports.
+  }
+})();
+
+
+// ─── Sprout scan ────────────────────────────────────────────────────────────
+// The fallback for a wallet whose note data is missing, and the only route
+// for a raw key with no wallet file. Hours, so it checkpoints and resumes.
+
+function sproutScanKeys() {
+  return $("sprout-scan-keys").value.split("\n").map((k) => k.trim()).filter(Boolean);
+}
+
+async function checkSproutKeys() {
+  const list = $("sprout-scan-addresses");
+  list.innerHTML = "";
+  const keys = sproutScanKeys();
+  if (!keys.length) {
+    setStatus("sprout-scan-status", "The wallet file's own Sprout keys will be used.", "");
+    return;
+  }
+  // Checked before the scan, not six hours into it.
+  for (const [i, key] of keys.entries()) {
+    try {
+      const addr = await invoke("check_sprout_key", { key, network: $("network-select").value });
+      const li = document.createElement("li");
+      li.textContent = addr;
+      list.appendChild(li);
+    } catch (err) {
+      setStatus("sprout-scan-status", `✗ key ${i + 1}: ${err}`, "error");
+      return;
+    }
+  }
+  setStatus("sprout-scan-status", `${keys.length} key(s) look valid.`, "success");
+}
+
+async function runSproutScan() {
+  const keys = sproutScanKeys();
+  if (!keys.length) {
+    setStatus("sprout-scan-status", "Enter at least one Sprout spending key.", "error");
+    return;
+  }
+
+  const button = $("sprout-scan-run");
+  button.disabled = true;
+  $("sprout-scan-bar").hidden = false;
+  setStatus("sprout-scan-status", "Connecting to the Zcash network…", "");
+
+  try {
+    const report = await invoke("start_sprout_scan", {
+      keys,
+      network: $("network-select").value,
+      dataDir: $("data-dir").value.trim(),
+      peers: [],
+    });
+    $("sprout-scan-bar").hidden = true;
+    setStatus(
+      "sprout-scan-status",
+      report.notes_found > 0
+        ? `✓ Found ${report.notes_found} note(s), ${fmt(report.total_zatoshis)}. ` +
+          `${report.spent_notes} already spent.`
+        : `Scan complete. No unspent Sprout notes were found for these keys.`,
+      report.notes_found > 0 ? "success" : "",
+    );
+  } catch (err) {
+    $("sprout-scan-bar").hidden = true;
+    // Interrupting is safe and expected: the scan checkpoints as it goes.
+    setStatus("sprout-scan-status", `✗ ${err}`, "error");
+  }
+  button.disabled = false;
+}
+
+$("sprout-scan-check").addEventListener("click", checkSproutKeys);
+$("sprout-scan-run").addEventListener("click", runSproutScan);
+
+(async () => {
+  try {
+    await listen("sprout-scan-progress", (event) => {
+      const p = event.payload;
+      const pct = p.target ? (p.height / p.target) * 100 : 0;
+      $("sprout-scan-bar").value = pct;
+      setStatus(
+        "sprout-scan-status",
+        `Scanning ${p.height.toLocaleString()} / ${p.target.toLocaleString()} ` +
+          `(${pct.toFixed(1)}%) — ${p.notesFound} note(s) found. Safe to stop; progress is saved.`,
+        "",
+      );
     });
   } catch (_) {
     // No event channel: the final result still reports.
