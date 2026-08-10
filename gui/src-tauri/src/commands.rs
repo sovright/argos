@@ -551,6 +551,9 @@ pub struct SproutSweepReport {
     /// a user seeing less than expected needs to know which notes stayed
     /// behind.
     pub skipped: Vec<String>,
+    /// Set when the sweep stopped partway. `sent` still lists what was
+    /// broadcast before it did — those funds have moved.
+    pub error: Option<String>,
 }
 
 /// Prove and broadcast a Sprout sweep.
@@ -614,6 +617,7 @@ pub async fn execute_sprout_sweep(
         landed_in_unified_sapling: outcome.destination_kind
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
+        error: outcome.error,
     })
 }
 
@@ -644,6 +648,55 @@ pub async fn check_sprout_key(key: String, network: String) -> Result<String, St
     ))
 }
 
+/// Gather the spending keys a scan should look for.
+///
+/// From the wallet file, from typed `SK…`/`ST…` keys, or both — a user may
+/// hold a wallet whose keys were never rescanned *and* a paper key for an
+/// address it never knew about. Mirrors `collect_sprout_scan_keys` in the
+/// CLI, including the dedup: a repeated key trial-decrypts every ciphertext
+/// twice for nothing.
+fn collect_scan_keys(
+    path: Option<&str>,
+    passphrase: Option<&SecretString>,
+    typed: &[String],
+    network: argos_core::ZeckNetwork,
+) -> Result<Vec<[u8; 32]>, String> {
+    use secrecy::ExposeSecret;
+
+    let mut keys: Vec<[u8; 32]> = Vec::new();
+
+    for (index, key) in typed.iter().enumerate() {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        keys.push(
+            argos_core::sprout_key::decode_sprout_spending_key(key, network)
+                .map_err(|err| format!("key {}: {err}", index + 1))?,
+        );
+    }
+
+    if let Some(path) = path {
+        let bytes = fs::read(path).map_err(|err| format!("could not read {path}: {err}"))?;
+        let wallet = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
+            .map_err(|err| err.to_string())?;
+        for key in &wallet.sprout {
+            keys.push(*key.a_sk.expose_secret());
+        }
+    }
+
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return Err(
+            "no Sprout spending keys to scan for. Open a wallet file holding Sprout keys, \
+             or paste one or more SK…/ST… keys."
+                .to_owned(),
+        );
+    }
+    Ok(keys)
+}
+
 /// Scan the chain for notes belonging to raw Sprout spending keys.
 ///
 /// Runs for hours, so progress arrives as `sprout-scan-progress` events and
@@ -653,6 +706,8 @@ pub async fn check_sprout_key(key: String, network: String) -> Result<String, St
 pub async fn start_sprout_scan(
     app: AppHandle,
     keys: Vec<String>,
+    path: Option<String>,
+    passphrase: Option<SecretString>,
     network: String,
     data_dir: String,
     peers: Vec<String>,
@@ -660,22 +715,11 @@ pub async fn start_sprout_scan(
     ensure_tos_accepted(&app)?;
     let network = network_from(&network);
 
-    let mut decoded: Vec<[u8; 32]> = Vec::new();
-    for (index, key) in keys.iter().enumerate() {
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        decoded.push(
-            argos_core::sprout_key::decode_sprout_spending_key(key, network)
-                .map_err(|err| format!("key {}: {err}", index + 1))?,
-        );
-    }
-    decoded.sort_unstable();
-    decoded.dedup();
-    if decoded.is_empty() {
-        return Err("no Sprout spending keys were supplied".to_owned());
-    }
+    // The panel offers to use the wallet file's own keys; it now actually
+    // can. Previously this took typed keys only, so the one user it exists
+    // for — a wallet holding Sprout keys but no note data — was told to
+    // leave the box blank and then refused, with no way to see the keys.
+    let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
 
     let p2p = match network {
         argos_core::ZeckNetwork::Mainnet => argos_core::p2p::wire::P2pNetwork::Mainnet,
@@ -711,6 +755,109 @@ pub async fn start_sprout_scan(
         notes_found: result.notes.len(),
         spent_notes: result.spent_notes,
         total_zatoshis: result.total_value(),
+    })
+}
+
+/// Sweep the notes a scan found.
+///
+/// Resuming a finished scan is instant — the checkpoint's cursor is already
+/// at the target, so `run_sprout_scan` skips its loop and goes straight to
+/// producing the notes. That is what makes this cheap enough to be a button
+/// rather than another six hours.
+///
+/// Without it, a scan that found funds after six hours was a dead end: the
+/// wallet-file sweep re-reads the file and cannot see scan-found notes, so
+/// the user was shown money and given nothing to click.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_sprout_from_scan(
+    app: AppHandle,
+    keys: Vec<String>,
+    path: Option<String>,
+    passphrase: Option<SecretString>,
+    destination: String,
+    network: String,
+    data_dir: String,
+    lightwalletd_url: String,
+    peers: Vec<String>,
+) -> Result<SproutSweepReport, String> {
+    ensure_tos_accepted(&app)?;
+    let net = network_from(&network);
+    let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, net)?;
+
+    // Validated before anything else: an address with no Sapling receiver
+    // should fail here, not after the notes are re-derived.
+    argos_core::sprout_sweep::parse_sapling_destination(&destination, net)
+        .map_err(|err| err.to_string())?;
+
+    let p2p = match net {
+        argos_core::ZeckNetwork::Mainnet => argos_core::p2p::wire::P2pNetwork::Mainnet,
+        argos_core::ZeckNetwork::Testnet => argos_core::p2p::wire::P2pNetwork::Testnet,
+    };
+    let dir = PathBuf::from(data_dir);
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
+    if !checkpoint.exists() {
+        return Err(
+            "no saved scan was found for these keys. Run the scan first — its results are              what this sweeps."
+                .to_owned(),
+        );
+    }
+
+    let emitter = app.clone();
+    let result = argos_core::sprout_scan_run::run_sprout_scan(
+        &decoded,
+        p2p,
+        &peers,
+        &checkpoint,
+        move |tick| {
+            let _ = emitter.emit(
+                "sprout-scan-progress",
+                serde_json::json!({
+                    "height": tick.height,
+                    "target": tick.target,
+                    "notesFound": tick.notes_found,
+                    "joinsplitsSeen": tick.joinsplits_seen,
+                }),
+            );
+        },
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    if result.notes.is_empty() {
+        return Err("the saved scan found no unspent Sprout notes to sweep".to_owned());
+    }
+
+    let params_path = argos_core::sprout_sweep::default_params_path();
+    let emitter = app.clone();
+    let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
+        &result.notes,
+        net,
+        &lightwalletd_url,
+        &destination,
+        &params_path,
+        [0u8; 512],
+        move |msg| {
+            let _ = emitter.emit("sprout-sweep-progress", msg);
+        },
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    Ok(SproutSweepReport {
+        sent: outcome
+            .sent
+            .into_iter()
+            .map(|s| SproutSweepResult {
+                txid: s.txid,
+                value_swept: s.value_swept,
+            })
+            .collect(),
+        total_swept: outcome.total_swept,
+        landed_in_unified_sapling: outcome.destination_kind
+            == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
+        skipped: outcome.skipped,
+        error: outcome.error,
     })
 }
 

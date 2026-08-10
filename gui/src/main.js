@@ -394,6 +394,8 @@ function renderWalletSummary(summary) {
   // previous one's sweep panel, plan or results on screen.
   $("wallet-sprout-sweep").hidden = true;
   $("sprout-scan-panel").hidden = true;
+  $("sprout-scan-sweep").hidden = true;
+  $("sprout-scan-sweep-results").innerHTML = "";
   $("sprout-scan-addresses").innerHTML = "";
   setStatus("sprout-scan-status", "", "");
   $("sprout-sweep-results").innerHTML = "";
@@ -754,7 +756,13 @@ async function checkSproutKeys() {
   list.innerHTML = "";
   const keys = sproutScanKeys();
   if (!keys.length) {
-    setStatus("sprout-scan-status", "The wallet file's own Sprout keys will be used.", "");
+    setStatus(
+      "sprout-scan-status",
+      walletFile
+        ? "The Sprout keys in your wallet file will be used."
+        : "Paste a Sprout key, or open a wallet file that holds some.",
+      "",
+    );
     return;
   }
   // Checked before the scan, not six hours into it.
@@ -774,8 +782,12 @@ async function checkSproutKeys() {
 
 async function runSproutScan() {
   const keys = sproutScanKeys();
-  if (!keys.length) {
-    setStatus("sprout-scan-status", "Enter at least one Sprout spending key.", "error");
+  if (!keys.length && !walletFile) {
+    setStatus(
+      "sprout-scan-status",
+      "Paste at least one Sprout spending key, or open a wallet file that holds some.",
+      "error",
+    );
     return;
   }
 
@@ -787,6 +799,10 @@ async function runSproutScan() {
   try {
     const report = await invoke("start_sprout_scan", {
       keys,
+      // The wallet file's own Sprout keys are merged in by the backend, so
+      // leaving the box blank genuinely works now.
+      path: walletFile ? walletFile.path : null,
+      passphrase: walletFile ? walletFile.passphrase : null,
       network: $("network-select").value,
       dataDir: $("data-dir").value.trim(),
       peers: [],
@@ -800,6 +816,8 @@ async function runSproutScan() {
         : `Scan complete. No unspent Sprout notes were found for these keys.`,
       report.notes_found > 0 ? "success" : "",
     );
+    // Found money needs somewhere to go.
+    $("sprout-scan-sweep").hidden = report.notes_found === 0;
   } catch (err) {
     $("sprout-scan-bar").hidden = true;
     // Interrupting is safe and expected: the scan checkpoints as it goes.
@@ -808,6 +826,93 @@ async function runSproutScan() {
   button.disabled = false;
 }
 
+/// Sweep what the scan found.
+///
+/// Resuming a finished scan is instant — the checkpoint is already at the
+/// target — so this is a button rather than another six hours.
+async function runSproutScanSweep() {
+  const destination = $("sprout-scan-destination").value.trim();
+  if (!destination) {
+    setStatus("sprout-scan-status", "Enter a destination address first.", "error");
+    return;
+  }
+  if (!$("sprout-scan-confirm").checked) {
+    setStatus(
+      "sprout-scan-status",
+      "Tick the box to confirm this moves funds irreversibly.",
+      "error",
+    );
+    return;
+  }
+
+  const button = $("sprout-scan-sweep-run");
+  button.disabled = true;
+  const list = $("sprout-scan-sweep-results");
+  list.innerHTML = "";
+  setStatus(
+    "sprout-scan-status",
+    "Proving… a few minutes per note. Do not close the app.",
+    "",
+  );
+
+  try {
+    const report = await invoke("sweep_sprout_from_scan", {
+      keys: sproutScanKeys(),
+      path: walletFile ? walletFile.path : null,
+      passphrase: walletFile ? walletFile.passphrase : null,
+      destination,
+      network: $("network-select").value,
+      dataDir: $("data-dir").value.trim(),
+      lightwalletdUrl: $("lightwalletd-url").value.trim(),
+      peers: [],
+    });
+
+    for (const sent of report.sent) {
+      const li = document.createElement("li");
+      li.textContent = `${fmt(sent.value_swept)} — ${sent.txid}`;
+      list.appendChild(li);
+    }
+    for (const reason of report.skipped ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = `not swept — ${reason}`;
+      list.appendChild(li);
+    }
+    if (report.landed_in_unified_sapling) {
+      const li = document.createElement("li");
+      li.textContent =
+        "These funds are in the Sapling receiver of that unified address. " +
+        "To finish moving them to Orchard, shield them from within your own wallet.";
+      list.appendChild(li);
+    }
+
+    if (report.error) {
+      // The transactions listed above are already broadcast. Saying "failed"
+      // without them would send someone hunting for funds that have moved.
+      const li = document.createElement("li");
+      li.textContent =
+        `The sweep stopped: ${report.error} ` +
+        (report.sent.length
+          ? `The ${report.sent.length} transaction(s) above were already broadcast and cannot be undone.`
+          : "");
+      list.appendChild(li);
+      setStatus("sprout-scan-status", "✗ The sweep did not finish.", "error");
+    } else {
+      setStatus(
+        "sprout-scan-status",
+        `✓ Swept ${fmt(report.total_swept)} to ${destination}.`,
+        "success",
+      );
+      uncoveredSproutKeys = 0;
+      renderSproutUncoveredBanners();
+    }
+  } catch (err) {
+    setStatus("sprout-scan-status", `✗ ${err}`, "error");
+  }
+  button.disabled = false;
+}
+
+$("sprout-scan-sweep-run").addEventListener("click", runSproutScanSweep);
 $("sprout-scan-check").addEventListener("click", checkSproutKeys);
 $("sprout-scan-run").addEventListener("click", runSproutScan);
 

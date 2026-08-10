@@ -45,6 +45,7 @@ fn main() {
             commands::delete_workspace,
             commands::check_sprout_key,
             commands::start_sprout_scan,
+            commands::sweep_sprout_from_scan,
             commands::preview_sprout_sweep,
             commands::execute_sprout_sweep,
             commands::default_data_dir,

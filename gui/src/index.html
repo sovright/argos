@@ -302,12 +302,35 @@
                   Sprout spending keys (one per line, <code>SK…</code> or <code>ST…</code>)
                 </label>
                 <textarea id="sprout-scan-keys" rows="3" spellcheck="false"
-                  placeholder="Leave blank to use the keys in the wallet file"></textarea>
+                  placeholder="Leave blank to use the Sprout keys already in your wallet file"></textarea>
                 <button id="sprout-scan-check" type="button">Check keys</button>
                 <ul id="sprout-scan-addresses" class="session-list"></ul>
                 <button id="sprout-scan-run" type="button">Start scan</button>
                 <p id="sprout-scan-status" class="status-line"></p>
                 <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
+
+                <!-- Revealed only once a scan has actually found notes. A
+                     scan that finds money and offers nothing to click is
+                     six hours spent to be shown funds you still cannot
+                     reach. -->
+                <div id="sprout-scan-sweep" hidden>
+                  <hr />
+                  <p><strong>Move the funds this scan found</strong></p>
+                  <label for="sprout-scan-destination">Destination address</label>
+                  <input
+                    id="sprout-scan-destination"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="zs1… or a Unified Address with a Sapling receiver"
+                  />
+                  <label class="checkbox-row">
+                    <input type="checkbox" id="sprout-scan-confirm" />
+                    I understand this moves funds and cannot be undone.
+                  </label>
+                  <button id="sprout-scan-sweep-run" type="button">Sweep found funds</button>
+                  <ul id="sprout-scan-sweep-results" class="session-list"></ul>
+                </div>
               </div>
 
               <!-- Only shown when the wallet file itself yielded spendable
