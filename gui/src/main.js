@@ -553,6 +553,14 @@ async function runSproutSweep() {
       `✓ Swept ${fmt(report.total_swept)} to ${destination}.`,
       "success",
     );
+    // Those funds have moved, so the later screens should stop warning
+    // about them. Left standing it would become noise, and a warning people
+    // learn to ignore is worse than none — but only clear it when the sweep
+    // actually finished, since a partial one leaves notes behind.
+    if (!report.error) {
+      uncoveredSproutKeys = 0;
+      renderSproutUncoveredBanners();
+    }
     if (report.landed_in_unified_sapling) {
       const li = document.createElement("li");
       li.textContent =
@@ -563,6 +571,43 @@ async function runSproutSweep() {
   } catch (err) {
     setStatus("sprout-sweep-status", `✗ ${err}`, "error");
     button.disabled = false;
+  }
+}
+
+/// Sprout keys a scan and sweep will not cover, remembered across screens.
+///
+/// The scan totals, the sweep review and the completion screen all report
+/// only the pools the HD/imported pipeline reaches. A wallet file's Sprout
+/// keys are not among them. The CLI prints a loud banner at exactly these
+/// moments; the GUI said nothing, so a user could read a Sprout-excluding
+/// total as their entire balance — and then use the Delete workspace button
+/// sitting on that same screen, discarding the only copy of the keys.
+let uncoveredSproutKeys = 0;
+
+function noteUncoveredSproutKeys(summary) {
+  // Only counts as uncovered if the file's own notes were not already
+  // recovered and swept from the Sprout panel.
+  uncoveredSproutKeys = summary.sprout_keys || 0;
+  renderSproutUncoveredBanners();
+}
+
+function renderSproutUncoveredBanners() {
+  const text =
+    uncoveredSproutKeys > 0
+      ? `This total does not include Sprout funds. Your wallet file holds ` +
+        `${uncoveredSproutKeys} Sprout key(s), which this scan and sweep do not ` +
+        `cover. Keep the original wallet file — it is the only copy of those keys. ` +
+        `Open it on the wallet screen to recover Sprout funds separately.`
+      : "";
+  for (const id of [
+    "scan-sprout-uncovered",
+    "complete-sprout-uncovered",
+    "delete-sprout-uncovered",
+  ]) {
+    const el = $(id);
+    if (!el) continue;
+    el.textContent = text;
+    el.hidden = uncoveredSproutKeys === 0;
   }
 }
 
@@ -608,6 +653,9 @@ async function openWalletFile() {
 
     renderWalletSummary(summary);
     walletFile = { path, passphrase, summary };
+    // Carried forward so every later screen can say what the totals leave
+    // out. Recorded at open time because the summary is not in scope later.
+    noteUncoveredSproutKeys(summary);
     $("wallet-next").disabled = false;
     setStatus("wallet-status", "✓ Wallet file read.", "success");
   } catch (err) {

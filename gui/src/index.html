@@ -562,6 +562,12 @@
           <p id="scan-message" class="status-line"></p>
           <div class="report-card scan-summary-card">
             <p id="scan-totals" class="status-line">Grand total: 0.00000000 ZEC across 0 accounts.</p>
+            <!-- The total above counts only the pools this scan covers. A
+                 wallet file's Sprout keys are not among them, and the CLI
+                 says so loudly at this exact moment; the GUI used to stay
+                 silent, so a user could read a Sprout-excluding total as
+                 their whole balance. -->
+            <div id="scan-sprout-uncovered" class="guide-warning" hidden></div>
             <p id="scan-workspace" class="status-line">Workspace: not initialized</p>
           </div>
           <div class="table-card">
@@ -666,6 +672,10 @@
           <p class="eyebrow">Step 6</p>
           <h2>Recovery complete</h2>
           <p class="lead" id="complete-summary">Transactions broadcast successfully.</p>
+          <!-- Repeated here deliberately: this screen is where the "Delete
+               workspace" button lives, and the wallet file is the only copy
+               of any Sprout key it holds. -->
+          <div id="complete-sprout-uncovered" class="guide-warning" hidden></div>
           <div id="complete-txids" class="complete-txids"></div>
           <p id="complete-donation" hidden></p>
           <div class="report-card" id="complete-skipped"></div>
@@ -705,6 +715,7 @@
               until the cells are overwritten or TRIM'd. For high-value seeds, consider
               encrypting the volume Argos writes to.
             </p>
+            <div id="delete-sprout-uncovered" class="guide-warning" hidden></div>
             <div class="inline-actions">
               <button class="danger" id="delete-workspace">Delete workspace…</button>
               <p id="delete-workspace-status" class="status-line"></p>
