@@ -24,6 +24,26 @@
 //! or decrypts to something inconsistent, is reported and skipped. That is
 //! the same partial-recovery principle the importer follows.
 //!
+//! # What the commitment check does and does not prove
+//!
+//! It proves the recovered plaintext is the note *this JoinSplit record
+//! committed to*. It does **not** prove the JoinSplit is on-chain. Every
+//! field used — the txid, the commitments, the ciphertext, the cached
+//! witness — comes from the wallet file, and nothing here recomputes a
+//! transaction id or consults an authenticated view of the chain.
+//!
+//! So a crafted `wallet.dat` can carry a fabricated note, a matching
+//! fabricated JoinSplit under the outpoint it names, and a witness built
+//! over that commitment, and this function will report it as spendable with
+//! an attacker-chosen value. Consensus catches it — the anchor is not a root
+//! any node recognises, so the sweep is rejected and no funds move — but the
+//! user is shown a balance that does not exist until they try to spend it.
+//!
+//! Closing this needs chain provenance: the note's anchor checked against a
+//! real Sprout root, which requires a node, or the full-block scan, which
+//! derives everything from the chain and is immune to it. Treat a balance
+//! reported from a wallet file alone as the file's claim, not a fact.
+//!
 //! The consistency check is not optional. `decrypt_note` authenticates the
 //! ciphertext, but authentication alone does not establish that the
 //! recovered plaintext is the note the commitment tree actually committed

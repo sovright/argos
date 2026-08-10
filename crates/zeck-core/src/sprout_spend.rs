@@ -152,9 +152,19 @@ pub fn compute_joinsplit_fields(
     let mut ciphertexts: [Vec<u8>; JS_OUTPUTS] = [Vec::new(), Vec::new()];
     for i in 0..JS_OUTPUTS {
         let rho = prf_rho(&phi, i, &h_sig);
-        // The output note's commitment randomness. Derived from phi and the
-        // index so that a caller cannot accidentally reuse one across
-        // outputs; the spec permits any randomness here.
+        // The output note's commitment randomness.
+        //
+        // A deliberate deviation, recorded rather than hidden: §4.7.1 calls
+        // for `rcm` sampled independently and uniformly, and this derives it
+        // as PRF^rho_phi(i, nullifier_i) instead — the same PRF key and
+        // domain used for rho, differing only in the second input. The
+        // circuit accepts it (`create_proof` treats rcm as an unconstrained
+        // 256-bit witness), and since phi is freshly random per JoinSplit
+        // the result is computationally pseudorandom, so no practical attack
+        // follows. It is still not the specified sampling procedure, and a
+        // reviewer comparing against the spec will notice. Changing it
+        // changes every commitment this produces, so it wants its own
+        // consensus test rather than a drive-by edit.
         let r = prf_rho(&phi, i, &nullifiers[i]);
         commitments[i] =
             note_commitment(outputs[i].recipient.a_pk(), outputs[i].value, &rho, &r);
