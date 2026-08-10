@@ -124,14 +124,26 @@ scan and is what `sweep-sprout` uses. A wallet whose keys were imported
 without a rescan has no note data, and only the full-block scan can find
 its notes -- Sprout notes are discoverable solely by trial-decrypting every
 JoinSplit, and no Sprout address index exists anywhere. That scan
-(`sprout_scan` + `p2p`) is built and consensus-validated but **not wired to
-any command**, and its checkpoint does not store a block locator, so it
-cannot yet resume.
+(`sprout_scan` + `p2p`) is wired into both surfaces — `argos scan-sprout`
+and the GUI's scan panel — checkpoints to disk, and resumes from a stored
+block cursor. Its tree is validated against zcashd's own root, and it has
+been driven end to end on regtest: given only a spending key it finds a
+planted note and derives a witness anchoring to the chain's root.
 
-**Argos takes a `wallet.dat` and nothing else.** Not a bare `zkey`, not a
-txid, not a node URL. A targeted lookup keyed on the paying transaction
-would be far cheaper than the scan, but it needs a txid the user has no way
-to know, so it is not a route. Assume the wallet file is all they have.
+**Argos takes a `wallet.dat` or a raw `zkey`, and nothing else.** Not a
+txid, not a node URL. `sprout_key` decodes zcashd's `SK…`/`ST…` form, and
+`--sprout-key-file` (a file, never a flag — a spending key in argv lands in
+shell history and `ps`) feeds the scan. A targeted lookup keyed on the
+paying transaction would be far cheaper than the scan, but it needs a txid
+the user has no way to know, so it is not a route.
+
+**A balance reported from a wallet file alone is the file's claim, not a
+fact.** `sprout_recovery` proves a note is internally self-consistent, not
+that its JoinSplit is on-chain — everything it checks comes from the file.
+A crafted `wallet.dat` can therefore show a phantom balance; consensus
+rejects the sweep, so no funds move, but the number is not trustworthy
+until then. The full-block scan derives everything from the chain and is
+immune.
 
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes

@@ -148,13 +148,34 @@ mod tests {
     /// least a coinbase — but it must be reported, not panicked on.
     #[test]
     fn a_truncated_block_is_rejected() {
-        for len in [0, 10, HEADER_FIXED_LEN, HEADER_FIXED_LEN + 1] {
+        // Shorter than the fixed header: neither function can do anything.
+        for len in [0, 10, HEADER_FIXED_LEN] {
             let block = vec![0u8; len];
             assert!(
-                joinsplits_in_block(&block, BranchId::Nu5).is_err() || block_hash(&block).is_err(),
-                "a {len}-byte block must not parse"
+                joinsplits_in_block(&block, BranchId::Nu5).is_err(),
+                "a {len}-byte block must not yield joinsplits"
+            );
+            assert!(
+                block_hash(&block).is_err(),
+                "a {len}-byte block must not yield a hash"
             );
         }
+
+        // Exactly the header plus an empty solution length. This *is* a
+        // structurally complete header, so hashing it succeeds — the two
+        // functions have different contracts, which an earlier `a || b`
+        // assertion hid. What must still fail is reading transactions,
+        // because there is no transaction count.
+        let mut header_only = vec![0u8; HEADER_FIXED_LEN];
+        header_only.push(0x00);
+        assert!(
+            block_hash(&header_only).is_ok(),
+            "a complete header hashes even with no body after it"
+        );
+        assert!(
+            joinsplits_in_block(&header_only, BranchId::Nu5).is_err(),
+            "a block with no transaction count must not parse"
+        );
     }
 
     /// A peer can claim any transaction count; it must not size anything.

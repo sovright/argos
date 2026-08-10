@@ -437,13 +437,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preserves_note_data_from_the_golden_sprout_wallet() {
+    fn parsing_the_golden_wallet_fabricates_no_notes() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
         let pairs = crate::bdb::walk(&bytes).unwrap();
         let mut out = ImportedKeys::default();
         collect_sprout_notes(&pairs, &mut out);
-        // A freshly generated wallet may hold no notes; the contract is
-        // that parsing does not fail and does not fabricate entries.
+        // zcashd files no Sprout note records at all — it does not detect
+        // inbound Sprout notes, which `wallet_dat_sprout_end_to_end` pins
+        // against a live node. So the loop below iterates zero times, and
+        // the real assertion is the emptiness: this test proves parsing
+        // does not *invent* notes, not that it preserves them. It was named
+        // "preserves_note_data" while proving nothing of the sort.
+        assert!(
+            out.sprout_notes.is_empty(),
+            "the golden wallet holds no Sprout note records"
+        );
         for n in &out.sprout_notes {
             assert_ne!(n.address, [0u8; 64]);
         }

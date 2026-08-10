@@ -19,10 +19,13 @@
 //! `argos-wallet-import`'s `sprout_key_is_genuine`.
 //!
 //! The mainnet pair cannot be measured here — generating a Sprout address
-//! requires a Canopy-inactive chain, and mainnet passed Canopy in 2020. It is
-//! instead pinned by the rendering it must produce: a 32-byte payload under
-//! the key prefix has to encode to `SK…`, and a 64-byte payload under the
-//! address prefix to `zc…`. Those tests fail if either constant is wrong.
+//! requires a Canopy-inactive chain, and mainnet passed Canopy in 2020 — so
+//! it is pinned by full golden strings instead. An earlier version checked
+//! only the leading `SK…`/`zc…` and claimed that caught a wrong constant; it
+//! did not, since `ab37` still renders `SKzk`. The golden strings detect
+//! drift but cannot detect an original mistake: mainnet decoding has no
+//! oracle in this repo, and a wrong constant there would reject every real
+//! user's key as malformed.
 
 use crate::{
     error::{ZeckError, ZeckResult},
@@ -272,25 +275,32 @@ mod tests {
         );
     }
 
-    /// Mainnet cannot be measured — generating a Sprout address needs a
-    /// Canopy-inactive chain and mainnet passed Canopy in 2020 — so the
-    /// constants are pinned by the rendering they must produce. Both fail if
-    /// either version byte is wrong.
+    /// Mainnet cannot be measured against a node — generating a Sprout
+    /// address needs a Canopy-inactive chain, and mainnet passed Canopy in
+    /// 2020 — so these are full golden strings rather than a prefix check.
+    ///
+    /// An earlier version asserted only that the output starts `SK…`/`zc…`
+    /// and claimed that "fails if either version byte is wrong". That was
+    /// false: `ab37` renders `SKzk` and `ab30` renders `SKm8`, so a wrong
+    /// low nibble sailed through. A wrong mainnet constant would reject
+    /// every real user's key as "malformed or checksum mismatch" — on the
+    /// one network that matters, with no oracle to catch it.
+    ///
+    /// These literals are still self-derived; they detect drift, not an
+    /// original mistake. The constants themselves come from zcashd's
+    /// `base58Prefixes[ZCSPENDING_KEY]` / `[ZCPAYMENT_ADDRESS]`.
     #[test]
-    fn mainnet_prefixes_render_as_sk_and_zc() {
-        let key = encode_sprout_spending_key(&[0x01; 32], ZeckNetwork::Mainnet);
-        assert!(
-            key.starts_with("SK"),
-            "a mainnet Sprout spending key renders as SK…, got {key}"
+    fn mainnet_encodings_match_their_golden_strings() {
+        assert_eq!(
+            encode_sprout_spending_key(&[0x01; 32], ZeckNetwork::Mainnet),
+            "SKxoQmUuSM7CLZziRRaAbP5dEjp7dy4BhDT978YCLfMgM8DTXMXo"
         );
-
-        let addr = encode_sprout_address(
-            &SproutPaymentAddress::from_bytes([0x01; 64]),
-            ZeckNetwork::Mainnet,
-        );
-        assert!(
-            addr.starts_with("zc"),
-            "a mainnet Sprout address renders as zc…, got {addr}"
+        assert_eq!(
+            encode_sprout_address(
+                &SproutPaymentAddress::from_bytes([0x01; 64]),
+                ZeckNetwork::Mainnet,
+            ),
+            "zc8MhWrZAX5jCyXjuRHxLb2aHy2SdvxvTCpR2nM2QyvrgGfWuRc51z5t8PdVHVz4ACDSFPLmAJ8Zd2qyyM5msVyf2J7sSuv"
         );
     }
 

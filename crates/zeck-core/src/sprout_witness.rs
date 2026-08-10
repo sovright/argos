@@ -866,10 +866,38 @@ mod tests {
     /// the newest anchor it has.
     #[test]
     fn the_first_witness_in_the_list_is_taken() {
-        let witness = sample_witness();
-        let blob = serialize_blob(&witness, 3);
+        // Three *different* witnesses. Serializing the same one three times
+        // — as this test used to — passes whichever entry is picked, so it
+        // asserted nothing about the behaviour it is named for. Which entry
+        // is taken decides whether a sweep anchors to the freshest root the
+        // wallet recorded or a stale one.
+        let mut tree = IncrementalMerkleTree::default();
+        tree.append([0x01; 32]).expect("append");
+        let newest = IncrementalWitness::from_tree(tree.clone());
+
+        let mut older = newest.clone();
+        older.append([0x02; 32]).expect("advance");
+        let mut oldest = older.clone();
+        oldest.append([0x03; 32]).expect("advance");
+
+        assert_ne!(newest.root(), older.root());
+        assert_ne!(older.root(), oldest.root());
+
+        // zcashd stores the list most-recent-first.
+        let mut blob = vec![0x03u8];
+        for w in [&newest, &older, &oldest] {
+            blob.extend_from_slice(&w.to_bytes());
+        }
+        blob.extend_from_slice(&0i32.to_le_bytes());
+
         let parsed = IncrementalWitness::parse_cached(&blob).expect("parse");
-        assert_eq!(parsed.root(), witness.root());
+        assert_eq!(
+            parsed.root(),
+            newest.root(),
+            "the first entry is the newest and is the one to use"
+        );
+        assert_ne!(parsed.root(), older.root());
+        assert_ne!(parsed.root(), oldest.root());
     }
 
     /// The blob comes from a file the user was handed. Malformed input must

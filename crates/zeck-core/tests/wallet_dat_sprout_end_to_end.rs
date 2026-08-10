@@ -1,23 +1,28 @@
-//! A funded Sprout note, taken from a real `wallet.dat` all the way to a
-//! broadcast sweep.
+//! Whether a funded `wallet.dat` fixture can be manufactured at all.
+//!
+//! It cannot, and this records the evidence. The file is named for the
+//! question, not for the sweep it was originally written to perform — an
+//! earlier version was called `a_funded_wallet_dat_sweeps_from_file_to_
+//! broadcast` while asserting the exact opposite, so anyone reading
+//! `cargo test --list` would have concluded the file-to-broadcast seam was
+//! closed. It is not, and by this test's own finding it cannot be closed
+//! with a synthetic wallet.
 //!
 //! Every stage of this has been validated on its own — decryption, tree
 //! reconstruction, stale anchors, the spend itself — but the seam from
 //! *file* to *broadcast* never had. That seam is what a real user walks.
 //!
-//! # Why no fixture could do this before
+//! # What was expected, and what happened
 //!
 //! `CLAUDE.md` has recorded since sub-spec 1 that no fixture holds a funded
-//! Sprout note. That was true when the only chains available had Canopy
-//! active: ZIP 211 closes the pool, so nothing can be paid into it. The
-//! late-Canopy `sprout` chain removes that constraint, and enabling
-//! `z_getnewaddress` on it means zcashd can hold a Sprout address of its
-//! own — so it can be paid, and it will file the note and its witness into
-//! `wallet.dat` exactly as a real wallet did years ago.
+//! Sprout note, on the grounds that ZIP 211 closes the pool from Canopy
+//! onward. The late-Canopy `sprout` chain was expected to lift that: the
+//! pool stays open, and `z_getnewaddress` lets zcashd hold a Sprout address
+//! of its own, so it can be paid.
 //!
-//! The first assertion here is therefore load-bearing in its own right: it
-//! establishes that zcashd *does* record an inbound Sprout note built by
-//! someone else, which nothing in this repo had ever demonstrated.
+//! It can be paid — consensus mines the transaction — and zcashd still
+//! files no note record and no JoinSplit for it. The expectation was wrong
+//! and the original note was right.
 //!
 //!     cd tests/regtest && docker compose --profile sprout up -d zcashd-sprout
 //!     cargo test -p argos-core --test wallet_dat_sprout_end_to_end -- --ignored --nocapture
@@ -96,7 +101,7 @@ fn params_path() -> std::path::PathBuf {
 
 #[tokio::test]
 #[ignore = "requires the sprout profile and sprout-groth16.params; see the module docs"]
-async fn a_funded_wallet_dat_sweeps_from_file_to_broadcast() {
+async fn zcashd_records_no_inbound_sprout_note_so_no_funded_fixture_exists() {
     let params = params_path();
     assert!(
         params.exists(),
