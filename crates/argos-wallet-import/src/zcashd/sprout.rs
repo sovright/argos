@@ -316,10 +316,15 @@ fn skip_witness_list(c: &mut Cursor) -> Option<()> {
 fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) -> Option<()> {
     let mut c = Cursor::new(value);
 
-    // Staged rather than pushed straight into `out`: a record that turns
-    // out to be unwalkable partway through must contribute nothing, and
-    // the walk can still fail after the JoinSplits have been read.
+    // Both staged rather than pushed straight into `out`: a record that
+    // turns out to be unwalkable partway through must contribute nothing.
+    // The walk can fail after the JoinSplits have been read, and again
+    // partway through the note list, so neither may be committed early —
+    // an aborted record that had already contributed notes would surface
+    // them with no JoinSplit holding their ciphertext, which is exactly
+    // the plausible-but-wrong output this parser exists to avoid.
     let mut joinsplits = Vec::new();
+    let mut notes = Vec::new();
     skip_transaction_body(&mut c, txid, &mut joinsplits)?;
     skip_merkle_tx_tail(&mut c)?;
 
@@ -368,7 +373,7 @@ fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) ->
         let witness = c.bytes.get(witness_start..witness_end)?.to_vec();
 
         if address != [0u8; 64] {
-            out.sprout_notes.push(SproutNoteData {
+            notes.push(SproutNoteData {
                 address,
                 nullifier,
                 witness,
@@ -381,6 +386,7 @@ fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) ->
         }
     }
 
+    out.sprout_notes.append(&mut notes);
     out.sprout_joinsplits.append(&mut joinsplits);
     Some(())
 }

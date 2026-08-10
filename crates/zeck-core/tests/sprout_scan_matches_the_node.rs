@@ -109,11 +109,13 @@ async fn the_rebuilt_tree_matches_the_nodes_sprout_root() {
         let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
         locator = *hashes.last().expect("non-empty");
 
-        for block in peer.get_blocks(&hashes).await.expect("getdata") {
+        let fetched = peer.get_blocks(&hashes).await.expect("getdata");
+        for hash in &hashes {
+            let block = fetched.get(hash).expect("every requested block must come back");
             // Canopy is inactive on this chain, so every transaction that
             // can hold a JoinSplit parses under a pre-Canopy branch id.
             let joinsplits =
-                joinsplits_in_block(&block, BranchId::Canopy).expect("a real block must parse");
+                joinsplits_in_block(block, BranchId::Canopy).expect("a real block must parse");
             scanner.scan_block(&joinsplits).expect("scan");
             scanned += 1;
             if scanned >= height {

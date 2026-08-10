@@ -94,7 +94,10 @@ async fn headers_and_blocks_come_back_from_a_real_node() {
         .expect("getdata must return blocks");
 
     assert_eq!(blocks.len(), wanted.len());
-    for block in &blocks {
+    for hash in &wanted {
+        let block = blocks
+            .get(hash)
+            .expect("every requested block must come back, keyed by its own hash");
         // A Zcash block header is 140 bytes plus its solution; anything
         // shorter is not a block.
         assert!(
@@ -106,7 +109,7 @@ async fn headers_and_blocks_come_back_from_a_real_node() {
     println!(
         "fetched {} blocks, {} bytes total",
         blocks.len(),
-        blocks.iter().map(|b| b.len()).sum::<usize>()
+        blocks.values().map(|b| b.len()).sum::<usize>()
     );
 }
 
@@ -193,9 +196,11 @@ async fn joinsplits_are_recovered_from_real_blocks() {
         let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
         locator = *hashes.last().expect("non-empty");
 
-        for block in peer.get_blocks(&hashes).await.expect("getdata") {
+        let fetched = peer.get_blocks(&hashes).await.expect("getdata");
+        for hash in &hashes {
+            let block = fetched.get(hash).expect("every requested block must come back");
             blocks_seen += 1;
-            let js = joinsplits_in_block(&block, BranchId::Canopy)
+            let js = joinsplits_in_block(block, BranchId::Canopy)
                 .expect("a real block from a real node must parse");
             found.extend(js);
         }

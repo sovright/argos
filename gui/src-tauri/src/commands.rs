@@ -166,7 +166,12 @@ pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> 
 pub async fn inspect_wallet_file(
     path: String,
     passphrase: Option<SecretString>,
+    network: Option<String>,
 ) -> Result<WalletFileSummary, String> {
+    // Needed to encode Sprout addresses in the form the user can actually
+    // match against a backup. Optional so an older frontend still works,
+    // defaulting to mainnet as everything else here does.
+    let network_name = network.unwrap_or_else(|| "mainnet".to_owned());
     let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
     let keys =
         match argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref()) {
@@ -207,13 +212,20 @@ pub async fn inspect_wallet_file(
         transparent_keys: keys.transparent.len(),
         sapling_keys: keys.sapling.len(),
         sprout_keys: keys.sprout.len(),
-        // Hex, matching `argos inspect-wallet`. A Sprout address is 64 raw
-        // bytes with no text encoding of its own, and showing it is what
-        // lets a user look their own funds up independently.
+        // Encoded `zc…`/`zt…`, matching the CLI. Hex was shown here before
+        // and matched nothing a user has ever seen — not a paper backup, not
+        // a block explorer — while the CLI encoded properly, so the same
+        // address appeared in two irreconcilable forms across the two
+        // surfaces this project claims cannot drift.
         sprout_addresses: keys
             .sprout
             .iter()
-            .map(|k| k.address.iter().map(|b| format!("{b:02x}")).collect())
+            .map(|k| {
+                argos_core::sprout_key::encode_sprout_address(
+                    &argos_core::sprout::SproutPaymentAddress::from_bytes(k.address),
+                    network_from(&network_name),
+                )
+            })
             .collect(),
         sprout_spendable_notes: recovered.notes.len(),
         sprout_spendable_zatoshis: recovered.total_value(),

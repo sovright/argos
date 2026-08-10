@@ -14,7 +14,10 @@
 //! surfaces as an error the caller can retry against a different host rather
 //! than as a stall.
 
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -269,7 +272,15 @@ impl Peer {
         Ok(decode_headers(&reply)?)
     }
 
-    /// Fetch full blocks by hash, returning their raw bytes.
+    /// Fetch full blocks, keyed by their own hash.
+    ///
+    /// Keyed rather than returned in order, because a peer may relay an
+    /// unsolicited `block` at any time — normal propagation, not an attack.
+    /// Pairing replies positionally with the request would then attribute
+    /// one block's contents to another's slot, which for a scan is both
+    /// catastrophic and invisible: every later commitment shifts and the
+    /// witnesses prove a tree that never existed. The hash is recomputed
+    /// from the bytes, so a peer cannot claim a block is one it is not.
     ///
     /// Requested in small batches. A single `getdata` naming a whole
     /// `getheaders` page is accepted and then simply not answered —
@@ -278,13 +289,41 @@ impl Peer {
     /// indistinguishable from a dead connection, so the cap lives here
     /// rather than waiting for a caller to hit it part-way through a scan
     /// of a million blocks.
-    pub async fn get_blocks(&mut self, hashes: &[[u8; 32]]) -> Result<Vec<Vec<u8>>, PeerError> {
-        let mut blocks = Vec::with_capacity(hashes.len());
+    pub async fn get_blocks(
+        &mut self,
+        hashes: &[[u8; 32]],
+    ) -> Result<HashMap<[u8; 32], Vec<u8>>, PeerError> {
+        let wanted: HashSet<[u8; 32]> = hashes.iter().copied().collect();
+        let mut blocks: HashMap<[u8; 32], Vec<u8>> = HashMap::with_capacity(hashes.len());
+
         for chunk in hashes.chunks(GETDATA_BATCH) {
-            let payload = encode_getdata_blocks(chunk);
-            self.send("getdata", &payload).await?;
-            for _ in 0..chunk.len() {
-                blocks.push(self.recv_until("block").await?);
+            self.send("getdata", &encode_getdata_blocks(chunk)).await?;
+
+            // Track what this chunk still owes rather than reading a fixed
+            // number of messages: counting an unsolicited block as a reply
+            // would leave one we asked for unread and desynchronise the
+            // stream for every later request.
+            let mut outstanding = chunk.iter().filter(|h| !blocks.contains_key(*h)).count();
+            let mut budget = outstanding * 4 + 8;
+
+            while outstanding > 0 {
+                if budget == 0 {
+                    return Err(PeerError::Timeout {
+                        what: "the blocks this peer was asked for".to_owned(),
+                    });
+                }
+                budget -= 1;
+
+                let bytes = self.recv_until("block").await?;
+                let Ok(hash) = super::block::block_hash(&bytes) else {
+                    continue;
+                };
+                if !wanted.contains(&hash) {
+                    continue; // unsolicited relay; not ours to use
+                }
+                if blocks.insert(hash, bytes).is_none() && chunk.contains(&hash) {
+                    outstanding -= 1;
+                }
             }
         }
         Ok(blocks)

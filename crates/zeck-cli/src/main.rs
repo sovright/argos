@@ -227,6 +227,22 @@ fn command_uses_birthday_inputs(command: &Commands) -> bool {
     matches!(command, Commands::Scan | Commands::Sweep { .. })
 }
 
+/// Commands that reach the network or move funds, and so require the Terms
+/// of Service to have been accepted.
+///
+/// Separate from the birthday check: `sweep-sprout` needs no birthday but
+/// does broadcast irreversibly, and was previously ungated for exactly that
+/// reason.
+fn command_requires_tos(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Scan
+            | Commands::Sweep { .. }
+            | Commands::SweepSprout { .. }
+            | Commands::ScanSprout { .. }
+    )
+}
+
 /// Read a legacy wallet file into key material.
 ///
 /// The passphrase is prompted for, never taken as a flag: a flag would
@@ -411,7 +427,7 @@ async fn sweep_sprout(
             }
         }
         eprintln!();
-        print_sprout_scan_cost_warning();
+        print_sprout_scan_cost_warning(network);
         anyhow::bail!("nothing to sweep from this file");
     }
 
@@ -464,6 +480,7 @@ async fn sweep_sprout(
     for sent in &outcome.sent {
         println!("  swept {} \u{2014} {}", format_zec(sent.value_swept), sent.txid);
     }
+    report_sprout_skips_and_errors(&outcome);
     println!("Swept {} to {destination}", format_zec(outcome.total_swept));
     if outcome.destination_kind
         == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified)
@@ -559,7 +576,7 @@ async fn scan_sprout(
         println!("  scanning for {addr}");
     }
     println!();
-    print_sprout_scan_cost_warning();
+    print_sprout_scan_cost_warning(network);
 
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
     eprintln!("Progress is saved to {}", checkpoint.display());
@@ -608,10 +625,12 @@ async fn scan_sprout(
 
     let Some(destination) = destination else {
         println!("Re-run with --destination <zs1…> --confirm-sweep to move these funds.");
+        println!("The scan resumes from its saved progress — it will not download again.");
         return Ok(());
     };
     if !confirm_sweep {
         println!("Re-run with --confirm-sweep to broadcast the sweep.");
+        println!("The scan resumes from its saved progress — it will not download again.");
         return Ok(());
     }
 
@@ -630,8 +649,33 @@ async fn scan_sprout(
     for sent in &outcome.sent {
         println!("  swept {} — {}", format_zec(sent.value_swept), sent.txid);
     }
+    report_sprout_skips_and_errors(&outcome);
     println!("Swept {} to {destination}", format_zec(outcome.total_swept));
     Ok(())
+}
+
+/// Print notes that did not move, and any partial failure.
+///
+/// Both were previously dropped on the floor. A user seeing a smaller total
+/// than `inspect-wallet` quoted needs to know which notes stayed behind, and
+/// a user whose sweep stopped partway needs the txids of what already went —
+/// those funds have moved and are not coming back.
+fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSweepOutcome) {
+    for reason in &outcome.skipped {
+        println!("  not swept — {reason}");
+    }
+    if let Some(error) = &outcome.error {
+        println!();
+        eprintln!("  ⚠ THE SWEEP DID NOT FINISH");
+        eprintln!("    {error}");
+        if !outcome.sent.is_empty() {
+            eprintln!(
+                "    The {} transaction(s) listed above were already broadcast and cannot \
+                 be undone. Check them before re-running.",
+                outcome.sent.len()
+            );
+        }
+    }
 }
 
 fn fmt_elapsed(d: std::time::Duration) -> String {
@@ -645,9 +689,17 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 /// JoinSplits — so it pulls full blocks from the p2p network for the whole
 /// pre-Canopy chain. Letting that begin without warning would misrepresent a
 /// multi-hour, multi-gigabyte job as an ordinary scan.
-fn print_sprout_scan_cost_warning() {
-    let cost = SproutScanCost::for_network(P2pNetwork::Mainnet);
+fn print_sprout_scan_cost_warning(network: ZeckNetwork) {
+    // Follows the selected network: quoting mainnet's 1,046,400 blocks and
+    // 26 GB for a testnet scan is simply false.
+    let cost = SproutScanCost::for_network(match network {
+        ZeckNetwork::Mainnet => P2pNetwork::Mainnet,
+        ZeckNetwork::Testnet => P2pNetwork::Testnet,
+    });
     eprintln!("  ⚠ RECOVERING THESE NOTES REQUIRES A FULL-BLOCK SCAN");
+    eprintln!("    To start one:");
+    eprintln!("      argos scan-sprout --wallet-file <this file> --destination <zs1…>");
+    eprintln!();
     for line in cost.warning_lines() {
         if line.is_empty() {
             eprintln!();
@@ -800,7 +852,7 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
                 }
             }
             println!();
-            print_sprout_scan_cost_warning();
+            print_sprout_scan_cost_warning(network);
         } else {
             println!(
                 "  {} spendable Sprout note(s), {} total.",
@@ -808,6 +860,14 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
                 format_zec(recovered.total_value())
             );
             println!("  These were recovered from this file alone — no scan needed.");
+            println!();
+            // The literal next command. A user following a guide will not
+            // read --help, and a terminal state that names no next step is
+            // where people give up with their funds still stranded.
+            println!("  To move them:");
+            println!(
+                "    argos sweep-sprout --wallet-file <this file> \\\n      --destination <your zs1… or unified address> --confirm-sweep"
+            );
             println!();
         }
     }
@@ -909,7 +969,7 @@ async fn main() -> Result<()> {
 
     // Gate the network/funds-moving commands on Terms of Service acceptance.
     // `show-keys` is purely local key derivation and is intentionally ungated.
-    if command_uses_birthday_inputs(&cli.command) {
+    if command_requires_tos(&cli.command) {
         ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
     }
 

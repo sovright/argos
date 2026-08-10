@@ -578,7 +578,11 @@ async function openWalletFile() {
   setStatus("wallet-status", "Reading wallet file…", "");
   $("wallet-open").disabled = true;
   try {
-    const summary = await invoke("inspect_wallet_file", { path, passphrase });
+    const summary = await invoke("inspect_wallet_file", {
+      path,
+      passphrase,
+      network: $("network-select").value,
+    });
 
     if (summary.needs_passphrase) {
       $("wallet-passphrase-field").hidden = false;

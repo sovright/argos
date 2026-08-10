@@ -278,6 +278,16 @@ pub struct SproutSweepOutcome {
     /// user who sees a smaller total than expected needs to know which notes
     /// did not move.
     pub skipped: Vec<String>,
+    /// What went wrong, when something did.
+    ///
+    /// Carried in a successful-looking outcome rather than returned as an
+    /// error, because by the time a later note fails the earlier ones are
+    /// already broadcast and irreversible. Returning `Err` would discard
+    /// their txids, and a user whose funds have moved would be told nothing
+    /// moved — then re-run, re-prove for minutes, and hit double-spend
+    /// rejections that read as "my funds are gone". The HD sweep learned
+    /// this as audit Issue E; this path is the same shape.
+    pub error: Option<String>,
 }
 
 /// Which receiver a destination resolved to.
@@ -454,7 +464,7 @@ pub async fn sweep_sprout_notes(
         }
 
         progress(format!("proving note {} of {}", index + 1, notes.len()));
-        let built = build_sweep_for_note(
+        let built = match build_sweep_for_note(
             note,
             sapling_dest,
             branch_id,
@@ -463,25 +473,44 @@ pub async fn sweep_sprout_notes(
             &sapling_prover,
             memo,
             rand_core::OsRng,
-        )?;
+        ) {
+            Ok(built) => built,
+            Err(err) => {
+                outcome.error = Some(format!("note {index} could not be built: {err}"));
+                return Ok(outcome);
+            }
+        };
 
-        let response = client
+        let response = match client
             .send_transaction(RawTransaction {
                 data: built.raw,
                 height: 0,
             })
             .await
-            .map_err(|err| ZeckError::Broadcast(err.to_string()))?
-            .into_inner();
+        {
+            Ok(r) => r.into_inner(),
+            Err(err) => {
+                // A transport failure is not proof the node refused it: the
+                // transaction may already be in the mempool. Say so, rather
+                // than implying nothing happened.
+                outcome.error = Some(format!(
+                    "note {index} could not be confirmed as sent ({err}). It may or may \
+                     not have reached the network — check the destination before retrying, \
+                     because re-sweeping an accepted note is rejected as a double spend."
+                ));
+                return Ok(outcome);
+            }
+        };
         if response.error_code != 0 {
-            return Err(ZeckError::Broadcast(format!(
+            outcome.error = Some(format!(
                 "the node rejected the sweep of note {index}: {}",
                 if response.error_message.is_empty() {
                     format!("error code {}", response.error_code)
                 } else {
                     response.error_message
                 }
-            )));
+            ));
+            return Ok(outcome);
         }
 
         outcome.total_swept += built.value_swept;
