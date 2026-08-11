@@ -560,3 +560,109 @@ mod tests {
         }
     }
 }
+
+
+/// Known-good mainnet block hashes inside the Sprout range.
+///
+/// # Why this exists
+///
+/// The scanner takes its chain from one peer and does not verify proof of
+/// work or Equihash. Without a fixed point, a hostile peer can serve a
+/// self-consistent chain of cheap fabricated headers and have the scan walk
+/// it to completion — silently missing real notes, and missing real
+/// nullifiers so a spent note reads as spendable. That is the worst outcome
+/// this tool has.
+///
+/// A checkpoint makes fabrication pointless: the forged chain must reproduce
+/// these exact hashes at these exact heights, which requires the real work.
+/// It is not a substitute for full header validation, but it is the part
+/// that costs twenty lines instead of an hour of CPU per scan.
+///
+/// # Provenance
+///
+/// Read from a fully-synced mainnet Zebra node (chain height 3,444,596,
+/// `verificationprogress` 0.9999997) via `getblockhash`. The heights are the
+/// documented network-upgrade activations — Sapling, Blossom, Heartwood,
+/// Canopy — chosen so anyone can verify these against a public block
+/// explorer rather than trusting the node they came from, and so they are
+/// spread across the range a Sprout scan covers.
+///
+/// Written in the byte order block explorers and RPCs display, and reversed
+/// to wire order on use.
+const MAINNET_CHECKPOINTS: &[(u32, &str)] = &[
+    (
+        419_200,
+        "00000000025a57200d898ac7f21e26bf29028bbe96ec46e05b2c17cc9db9e4f3",
+    ),
+    (
+        653_600,
+        "00000000020bebb33c1b34b67a982a328ab212a206dacbe561a7cc94aab3e9bb",
+    ),
+    (
+        903_000,
+        "0000000000aad1c8698964a93c35ecf8b4d05e848de9e2fe7606067139be5643",
+    ),
+    (
+        1_046_400,
+        "00000000002038016f976744c369dce7419fca30e7171dfac703af5e5f7ad1d4",
+    ),
+];
+
+/// The expected block hash at `height`, in wire order, if one is pinned.
+///
+/// Returns `None` for heights with no checkpoint, and for every network but
+/// mainnet — regtest and testnet chains are disposable, and pinning a
+/// regtest hash would break the moment the chain is rebuilt.
+pub fn checkpoint_at(network: P2pNetwork, height: u32) -> Option<[u8; 32]> {
+    if !matches!(network, P2pNetwork::Mainnet) {
+        return None;
+    }
+    let display = MAINNET_CHECKPOINTS
+        .iter()
+        .find(|(h, _)| *h == height)
+        .map(|(_, hash)| *hash)?;
+
+    let mut bytes = [0u8; 32];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(display.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    // Explorers print these reversed relative to the wire.
+    bytes.reverse();
+    Some(bytes)
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoints_are_mainnet_only() {
+        assert!(checkpoint_at(P2pNetwork::Mainnet, 419_200).is_some());
+        assert!(checkpoint_at(P2pNetwork::Testnet, 419_200).is_none());
+        assert!(checkpoint_at(P2pNetwork::Regtest, 419_200).is_none());
+        assert!(checkpoint_at(P2pNetwork::Mainnet, 419_201).is_none());
+    }
+
+    /// Every checkpoint must sit inside the range a scan actually walks, or
+    /// it can never fire and provides no protection at all.
+    #[test]
+    fn every_checkpoint_is_within_the_sprout_scan_range() {
+        for (height, _) in MAINNET_CHECKPOINTS {
+            assert!(
+                *height <= P2pNetwork::Mainnet.sprout_scan_end(),
+                "checkpoint at {height} is past the scan's end and would never be checked"
+            );
+        }
+    }
+
+    /// Reversal is easy to get backwards, and a reversed checkpoint would
+    /// reject every honest peer instead of catching a hostile one.
+    #[test]
+    fn checkpoints_convert_to_wire_order() {
+        let wire = checkpoint_at(P2pNetwork::Mainnet, 1_046_400).expect("pinned");
+        // Displayed hashes are big-endian and Zcash PoW leaves leading
+        // zeros, so those bytes land at the *end* on the wire.
+        assert_eq!(&wire[28..], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(wire[0], 0xd4);
+    }
+}

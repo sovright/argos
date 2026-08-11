@@ -33,11 +33,17 @@
 //! decryption are all careful, but they are careful about whatever history
 //! they are handed.
 //!
-//! Closing this needs proof-of-work and Equihash validation on every header,
-//! plus ideally a hardcoded checkpoint hash somewhere in the Sprout range so
-//! a fabricated chain cannot even start. Until then a scan is only as
-//! trustworthy as the peer that served it, and `--peer` pointed at a node
-//! you control is the only configuration that is actually sound.
+//! Partially closed by checkpoints. Four known mainnet block hashes, at the
+//! network-upgrade activation heights, are verified as the walk passes them
+//! (see `p2p::wire::checkpoint_at`). A fabricated chain cannot reproduce
+//! them without doing the real work, so forgery now buys an attacker
+//! nothing past the first checkpoint at height 419,200.
+//!
+//! What remains unverified is everything *between* checkpoints, and the
+//! whole range on testnet, where nothing is pinned. Full coverage still
+//! wants proof-of-work and Equihash validation per header — `equihash` is
+//! already in the dependency tree — which costs real CPU across a million
+//! headers and is why it is not done here yet.
 //!
 //! The checkpoint file is likewise unauthenticated: it carries no MAC, and
 //! its `last_height` alone decides whether the scan is finished. Editing
@@ -272,6 +278,21 @@ pub async fn run_sprout_scan(
                 )));
             };
             height += 1;
+
+            // A pinned block must be the block we were handed. This is what
+            // makes a fabricated chain pointless: cheap forged headers link
+            // to each other fine, but they cannot reproduce a real mainnet
+            // hash at a real height without doing the work.
+            if let Some(expected) = crate::p2p::wire::checkpoint_at(network, height) {
+                if *hash != expected {
+                    return Err(ZeckError::Broadcast(format!(
+                        "the chain this peer served does not match Zcash at height \
+                         {height}. It is serving a different or fabricated chain, so the \
+                         scan stops rather than search it. Re-run to pick another peer, \
+                         or pass --peer with a node you trust."
+                    )));
+                }
+            }
 
             // The branch id only affects how the transaction parses, and
             // every Sprout-bearing transaction predates Canopy.
