@@ -342,10 +342,15 @@ impl RecoveryService {
         // been shown an amount. For a recovery tool a confidently wrong
         // balance is a worse failure than a clean error.
         //
-        // `from_runtime` only computes paths; it creates nothing, so this
-        // cannot mask a missing workspace by recreating it.
+        // `from_runtime` only computes paths; it creates nothing. But opening
+        // the database is not enough on its own: `open_wallet_db` uses
+        // `Connection::open`, which recreates an empty `wallet.sqlite` when the
+        // file has been deleted but its directory survives — masking the very
+        // loss this guards against. So require a readable wallet summary too; a
+        // missing or freshly-recreated database yields `None` here and fails
+        // loudly, matching what the execute path already demands.
         let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        open_wallet_db(
+        let wallet_db = open_wallet_db(
             workspace.wallet_db_path(),
             consensus_network(session.runtime.network),
         )
@@ -355,6 +360,21 @@ impl RecoveryService {
                  balances cannot be trusted: {err}"
             ))
         })?;
+        wallet_db
+            .get_wallet_summary(ConfirmationsPolicy::MIN)
+            .map_err(|err| {
+                ZeckError::Wallet(format!(
+                    "the recovery workspace backing this scan is no longer readable, so its \
+                     balances cannot be trusted: {err}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ZeckError::Wallet(
+                    "the recovery workspace backing this scan no longer contains a wallet, \
+                     so its balances cannot be trusted"
+                        .to_owned(),
+                )
+            })?;
 
         build_sweep_proposal(
             &progress,
