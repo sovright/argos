@@ -349,7 +349,16 @@ pub fn parse_sapling_destination_kind(
         ZeckError::InvalidAddress(format!("{destination} is not a Zcash address: {err}"))
     })?;
 
-    struct Found(Option<(sapling_crypto::PaymentAddress, DestinationKind)>);
+    /// Absent and malformed are different problems with different fixes,
+    /// and were reported identically before — the same defect raised in
+    /// review of #187 for the transparent path.
+    enum FoundReceiver {
+        Address(sapling_crypto::PaymentAddress, DestinationKind),
+        Malformed,
+        Absent,
+    }
+
+    struct Found(FoundReceiver);
     impl TryFromAddress for Found {
         type Error = &'static str;
 
@@ -359,7 +368,8 @@ pub fn parse_sapling_destination_kind(
         ) -> Result<Self, ConversionError<Self::Error>> {
             Ok(Found(
                 sapling_crypto::PaymentAddress::from_bytes(&data)
-                    .map(|a| (a, DestinationKind::BareSapling)),
+                    .map(|a| FoundReceiver::Address(a, DestinationKind::BareSapling))
+                    .unwrap_or(FoundReceiver::Malformed),
             ))
         }
 
@@ -371,11 +381,14 @@ pub fn parse_sapling_destination_kind(
                 if let Receiver::Sapling(data) = receiver {
                     return Ok(Found(
                         sapling_crypto::PaymentAddress::from_bytes(&data)
-                            .map(|a| (a, DestinationKind::SaplingReceiverOfUnified)),
+                            .map(|a| {
+                                FoundReceiver::Address(a, DestinationKind::SaplingReceiverOfUnified)
+                            })
+                            .unwrap_or(FoundReceiver::Malformed),
                     ));
                 }
             }
-            Ok(Found(None))
+            Ok(Found(FoundReceiver::Absent))
         }
     }
 
@@ -403,14 +416,20 @@ pub fn parse_sapling_destination_kind(
         )),
     })?;
 
-    found.0.ok_or_else(|| {
-        ZeckError::InvalidAddress(format!(
+    match found.0 {
+        FoundReceiver::Address(address, kind) => Ok((address, kind)),
+        FoundReceiver::Malformed => Err(ZeckError::MalformedReceiver(format!(
+            "{destination} carries a Sapling receiver whose bytes do not decode. The \
+             address is damaged rather than the wrong kind — re-copy it from your wallet \
+             rather than looking for a different one."
+        ))),
+        FoundReceiver::Absent => Err(ZeckError::InvalidAddress(format!(
             "{destination} has no Sapling receiver. Sprout value leaves the pool through \
              the transparent pool and must be consumed by a Sapling output in the same \
              transaction, so a transparent-only or Orchard-only destination cannot \
              receive it."
-        ))
-    })
+        ))),
+    }
 }
 
 /// The consensus branch in force at `height`.

@@ -255,7 +255,24 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
     // which store pubkeys, not scripts.
     let input_sizes = utxos
         .iter()
-        .map(|_| zcash_primitives::transaction::fees::transparent::InputSize::STANDARD_P2PKH)
+        .map(|utxo| {
+            // Every imported key is P2PKH, so every input is standard-sized.
+            // Asserted rather than assumed: if a non-P2PKH address ever
+            // reaches here the fee is computed for the wrong input size, and
+            // while `add_transparent_p2pkh_input` and the runtime fee guard
+            // would both catch it, they would catch it as a confusing
+            // downstream failure rather than a broken invariant. Raised in
+            // review of #187.
+            debug_assert!(
+                matches!(
+                    utxo.address,
+                    zcash_transparent::address::TransparentAddress::PublicKeyHash(_)
+                ),
+                "transparent recovery assumes P2PKH inputs; got {:?}",
+                utxo.address
+            );
+            zcash_primitives::transaction::fees::transparent::InputSize::STANDARD_P2PKH
+        })
         .collect::<Vec<_>>();
 
     // A Sapling bundle pads its outputs to `MIN_SHIELDED_OUTPUTS` for
@@ -284,7 +301,9 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
     let fee = u64::from(fee);
 
     let Some(output) = total.checked_sub(fee).filter(|out| *out > 0) else {
-        return Err(ZeckError::InvalidConfig(format!(
+        // An economic condition, not a misconfiguration: nothing the user
+        // could pass would change it. Raised in review of #187.
+        return Err(ZeckError::BelowDustThreshold(format!(
             "this wallet holds {total} zatoshis across {} output(s), which does not cover \
              the {fee} zatoshi network fee to move them. The funds are real but not \
              economically recoverable at the current fee.",
@@ -319,7 +338,17 @@ pub fn sapling_receiver(
     // #187. Left in place because the arm is required by the trait, but do
     // not "fix" the ordering to reach it — the unified-only rule is what
     // guarantees a destination the sweep can actually pay.
-    struct SaplingOnly(Option<sapling::PaymentAddress>);
+    /// `Found` distinguishes a receiver that is absent from one that is
+    /// present but does not decode — reported as the same thing before, so a
+    /// user with a corrupt unified address was told to find one with a
+    /// Sapling receiver, which theirs already had. Raised in review of #187.
+    enum Found {
+        Address(sapling::PaymentAddress),
+        Malformed,
+        Absent,
+    }
+
+    struct SaplingOnly(Found);
 
     impl TryFromAddress for SaplingOnly {
         type Error = &'static str;
@@ -328,7 +357,13 @@ pub fn sapling_receiver(
             _net: zcash_protocol::consensus::NetworkType,
             data: [u8; 43],
         ) -> Result<Self, ConversionError<Self::Error>> {
-            Ok(SaplingOnly(sapling::PaymentAddress::from_bytes(&data)))
+            // A present-but-undecodable receiver is not an absent one; see
+            // the `MalformedReceiver` handling below.
+            Ok(SaplingOnly(
+                sapling::PaymentAddress::from_bytes(&data)
+                    .map(Found::Address)
+                    .unwrap_or(Found::Malformed),
+            ))
         }
 
         fn try_from_unified(
@@ -337,10 +372,14 @@ pub fn sapling_receiver(
         ) -> Result<Self, ConversionError<Self::Error>> {
             for receiver in data.items() {
                 if let zcash_address::unified::Receiver::Sapling(bytes) = receiver {
-                    return Ok(SaplingOnly(sapling::PaymentAddress::from_bytes(&bytes)));
+                    return Ok(SaplingOnly(
+                        sapling::PaymentAddress::from_bytes(&bytes)
+                            .map(Found::Address)
+                            .unwrap_or(Found::Malformed),
+                    ));
                 }
             }
-            Ok(SaplingOnly(None))
+            Ok(SaplingOnly(Found::Absent))
         }
     }
 
@@ -354,14 +393,24 @@ pub fn sapling_receiver(
         .convert::<SaplingOnly>()
         .map_err(|err| ZeckError::InvalidAddress(format!("unsupported destination: {err}")))?;
 
-    receiver.ok_or_else(|| {
-        ZeckError::InvalidAddress(
+    match receiver {
+        Found::Address(address) => Ok(address),
+        // Present but undecodable. Telling this user to "use a different
+        // destination address" would send them hunting for a property their
+        // address already has; what they need is a clean copy of it.
+        Found::Malformed => Err(ZeckError::MalformedReceiver(
+            "this destination carries a Sapling receiver, but its bytes do not decode. \
+             The address is damaged rather than the wrong kind — re-copy it from your \
+             wallet rather than looking for a different one."
+                .to_owned(),
+        )),
+        Found::Absent => Err(ZeckError::InvalidAddress(
             "this destination has no Sapling receiver. Transparent-only wallet recovery \
              pays into the Sapling pool, so the destination must expose a Sapling \
              receiver; most unified addresses do. Use a different destination address."
                 .to_owned(),
-        )
-    })
+        )),
+    }
 }
 
 /// Build and sign a sweep of every supplied UTXO into one Sapling output.
@@ -786,6 +835,27 @@ mod destination_tests {
     /// Pinning the variant at least makes the test honest about which rule
     /// rejects a t-address. The mainnet-UA-on-testnet case still wants a
     /// real encoded UA fixture; see the note below.
+    /// The three refusals must be distinguishable by variant, not just by
+    /// prose. Callers and tests both matched on message text before, which
+    /// is how a t-address ended up asserted as a network failure.
+    #[test]
+    fn dust_is_an_economic_refusal_not_a_configuration_error() {
+        // A wallet worth less than its own fee is not misconfigured; no
+        // argument the user could pass would change the outcome.
+        let utxos = vec![tests_support::utxo(tests_support::addr(0x11), 1, 0xAA)];
+        match plan_sweep(
+            &zcash_protocol::consensus::MAIN_NETWORK,
+            zcash_protocol::consensus::BlockHeight::from_u32(2_500_000),
+            &utxos,
+        ) {
+            Ok(_) => panic!("a 1-zatoshi wallet cannot cover its fee"),
+            Err(err) => assert!(
+                matches!(err, ZeckError::BelowDustThreshold(_)),
+                "dust is an economic condition, not an InvalidConfig; got {err:?}"
+            ),
+        }
+    }
+
     #[test]
     fn a_transparent_destination_is_refused_for_not_being_unified() {
         let err = match sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Testnet)
