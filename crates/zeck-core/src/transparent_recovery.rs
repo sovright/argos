@@ -838,6 +838,54 @@ mod destination_tests {
     /// The three refusals must be distinguishable by variant, not just by
     /// prose. Callers and tests both matched on message text before, which
     /// is how a t-address ended up asserted as a network failure.
+    /// Build a real unified address, in-process, from a real Sapling
+    /// receiver.
+    ///
+    /// Constructed rather than pasted. Every hand-written address fixture in
+    /// this session turned out to be invalid — one `zs1…` that decoded to
+    /// nothing, one `t1…` that was not an address at all — and each one made
+    /// a test pass for the wrong reason. Deriving the receiver from a key
+    /// and letting `zcash_address` encode it means the fixture is valid by
+    /// construction, and the assertion below that it decodes proves it.
+    fn unified_address_for(network: zcash_protocol::consensus::NetworkType) -> String {
+        use zcash_address::unified::{Address, Encoding, Receiver};
+
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32]);
+        let (_, payment_address) = extsk.default_address();
+
+        let ua = Address::try_from_items(vec![Receiver::Sapling(payment_address.to_bytes())])
+            .expect("a Sapling-only unified address is valid under ZIP 316");
+        ua.encode(&network)
+    }
+
+    /// The case Kristi's review named and nothing covered: a mainnet
+    /// *unified* address used for a testnet sweep.
+    ///
+    /// The old test fed a bare t-address, which is rejected as non-unified
+    /// before any network logic runs, so the network check itself was never
+    /// reached. This one gets past that rule and asserts the network
+    /// variant specifically — sending real funds to an address that cannot
+    /// be spent on the chain they were broadcast to is the failure it
+    /// guards.
+    #[test]
+    fn a_mainnet_unified_address_is_refused_for_a_testnet_sweep() {
+        let mainnet_ua = unified_address_for(zcash_protocol::consensus::NetworkType::Main);
+
+        // It must genuinely be a usable mainnet destination, or the test
+        // below would pass for the wrong reason all over again.
+        sapling_receiver(&mainnet_ua, ZeckNetwork::Mainnet)
+            .expect("the fixture must be a valid mainnet destination");
+
+        let err = match sapling_receiver(&mainnet_ua, ZeckNetwork::Testnet) {
+            Ok(_) => panic!("a mainnet unified address must not be accepted on testnet"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ZeckError::WrongNetwork { .. }),
+            "expected the network check to fire, not the unified-only rule; got {err:?}"
+        );
+    }
+
     #[test]
     fn dust_is_an_economic_refusal_not_a_configuration_error() {
         // A wallet worth less than its own fee is not misconfigured; no
