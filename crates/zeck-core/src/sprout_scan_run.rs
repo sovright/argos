@@ -18,6 +18,33 @@
 //! - Peers refuse the overwhelming majority of inbound connections outright,
 //!   so finding one at all means racing many.
 //!
+//! # What this does not verify — read before trusting a scan
+//!
+//! The header chain is taken from one peer and is **not** validated as a
+//! chain: no proof of work, no Equihash solution check, no difficulty, and
+//! no checkpoint against a known block hash. A hostile peer can therefore
+//! answer with a self-consistent chain of cheap fabricated headers and
+//! matching bodies, and this loop will walk it to the target and report a
+//! completed scan. The consequences are the two worst outcomes available:
+//! real notes are silently missed, and real nullifiers are never seen, so a
+//! spent note can be reported spendable.
+//!
+//! Nothing downstream compensates. The commitment tree, witnesses and
+//! decryption are all careful, but they are careful about whatever history
+//! they are handed.
+//!
+//! Closing this needs proof-of-work and Equihash validation on every header,
+//! plus ideally a hardcoded checkpoint hash somewhere in the Sprout range so
+//! a fabricated chain cannot even start. Until then a scan is only as
+//! trustworthy as the peer that served it, and `--peer` pointed at a node
+//! you control is the only configuration that is actually sound.
+//!
+//! The checkpoint file is likewise unauthenticated: it carries no MAC, and
+//! its `last_height` alone decides whether the scan is finished. Editing
+//! that one field to the target makes a scan "complete" instantly. It is
+//! now checked against the requested key set and the network's range, which
+//! catches the accidental cases, but not a deliberately edited file.
+//!
 //! # Checkpointing
 //!
 //! The scan saves after every batch. The commitment tree is not derivable
@@ -101,13 +128,46 @@ pub async fn run_sprout_scan(
     let mut scanner = match std::fs::read(checkpoint_file) {
         Ok(bytes) => {
             let checkpoint = SproutScanCheckpoint::from_bytes(bytes);
-            SproutScanner::resume(&checkpoint).map_err(|err| {
+            let resumed = SproutScanner::resume(&checkpoint).map_err(|err| {
                 ZeckError::TransactionBuild(format!(
                     "the scan checkpoint at {} could not be read ({err}). Delete it to \
                      start a fresh scan, or restore a good copy — it holds hours of work.",
                     checkpoint_file.display()
                 ))
-            })?
+            })?;
+
+            // The checkpoint must be for *these* keys. The default path is
+            // fingerprinted by key set, but the path is a parameter, so a
+            // handed or misplaced file would otherwise be resumed silently:
+            // the scan would report results for whichever keys the file
+            // holds while the caller believed it scanned the ones it passed,
+            // hiding one wallet's funds and touching another's key material.
+            let mut wanted: Vec<[u8; 32]> = spending_keys.to_vec();
+            wanted.sort_unstable();
+            wanted.dedup();
+            if resumed.spending_keys() != wanted {
+                return Err(ZeckError::TransactionBuild(format!(
+                    "the scan checkpoint at {} was made for a different set of spending \
+                     keys. Resuming it would report that wallet's results as though they \
+                     were yours. Point --data-dir somewhere else, or delete the file.",
+                    checkpoint_file.display()
+                )));
+            }
+
+            // And for this network. A completed mainnet checkpoint carries a
+            // last_height past the testnet target, so resuming it under
+            // testnet would skip the loop entirely and hand back mainnet
+            // notes as a finished testnet scan.
+            if resumed.progress().last_height > target {
+                return Err(ZeckError::TransactionBuild(format!(
+                    "the scan checkpoint at {} reaches height {}, past this network's \
+                     Sprout range ({target}). It was almost certainly made on a different \
+                     network.",
+                    checkpoint_file.display(),
+                    resumed.progress().last_height
+                )));
+            }
+            resumed
         }
         Err(_) => SproutScanner::new(spending_keys),
     };
@@ -155,18 +215,34 @@ pub async fn run_sprout_scan(
             }
         };
 
-        // The peer must be continuing from where we asked. A peer that does
-        // not recognise the locator serves from genesis instead, which would
-        // re-append the whole prefix into a tree that already contains it —
-        // silently doubling every commitment and poisoning the checkpoint.
-        if height > 0 && headers[0].prev_hash != locator {
+        // The peer must be continuing from exactly where we asked, and the
+        // page must itself be a chain. A peer that does not recognise the
+        // locator serves from genesis, which would re-append the whole
+        // prefix into a tree that already contains it; a peer starting
+        // partway would skip the blocks before it. Either silently shifts
+        // every later commitment position.
+        //
+        // Checked at height 0 too, deliberately: genesis's own prev_hash is
+        // all zeros, which is exactly the starting locator, so this needs no
+        // special case. An earlier version guarded it with `height > 0` and
+        // thereby accepted a first page starting anywhere at all — a scan
+        // that skipped blocks 0..n and reported success.
+        let page_is_continuous = headers[0].prev_hash == locator
+            && headers.windows(2).all(|w| w[1].prev_hash == w[0].hash);
+        if !page_is_continuous {
             peer = connect_peer(network, extra_peers, &[]).await?;
-            continue;
-        }
-        // And the page itself must be a chain. A gap would shift every
-        // later position.
-        if headers.windows(2).any(|w| w[1].prev_hash != w[0].hash) {
-            peer = connect_peer(network, extra_peers, &[]).await?;
+            // Counted against the same budget as an empty reply: a peer
+            // that answers with an unusable page is no more useful than one
+            // that answers with nothing, and without this the scan switches
+            // peers forever rather than stopping with an explanation.
+            empty_replies += 1;
+            if empty_replies > MAX_EMPTY_REPLIES {
+                return Err(ZeckError::Broadcast(format!(
+                    "no peer would serve a usable chain of blocks from height {height}. \
+                     The scan is incomplete and its results would be wrong, so it stops \
+                     here. Progress is saved; re-run to continue."
+                )));
+            }
             continue;
         }
         empty_replies = 0;
@@ -251,6 +327,11 @@ fn save_checkpoint(scanner: &SproutScanner, path: &Path) -> ZeckResult<()> {
     // write cannot leave a half-written checkpoint where a good one was —
     // that would turn a recoverable pause into a restart from genesis.
     let tmp = path.with_extension("checkpoint.tmp");
+    // Removed first: `mode(0600)` applies only to files this call *creates*,
+    // so writing into a leftover 0644 temporary from an earlier version
+    // would put spend-capable bytes in a world-readable inode and then
+    // rename that inode into place.
+    let _ = std::fs::remove_file(&tmp);
     write_private(&tmp, scanner.checkpoint().as_bytes())?;
     std::fs::rename(&tmp, path).map_err(|err| {
         ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}"))

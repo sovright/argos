@@ -134,6 +134,16 @@ impl SproutScanner {
         (self.progress.blocks_scanned > 0).then_some(self.cursor)
     }
 
+    /// The keys this scanner is looking for, sorted.
+    ///
+    /// Exposed so a resumed checkpoint can be checked against the keys the
+    /// caller actually asked about; the file path alone does not prove it.
+    pub fn spending_keys(&self) -> Vec<[u8; 32]> {
+        let mut keys: Vec<[u8; 32]> = self.keys.iter().map(|k| k.a_sk).collect();
+        keys.sort_unstable();
+        keys
+    }
+
     pub fn progress(&self) -> SproutScanProgress {
         self.progress
     }

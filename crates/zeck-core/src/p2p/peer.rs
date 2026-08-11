@@ -66,6 +66,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// that a million-block sweep is not a million round trips.
 const GETDATA_BATCH: usize = 16;
 
+/// Ceiling on the block bytes held from one `get_blocks` call.
+///
+/// Requests are batched at 16, but every batch's bodies accumulate in one
+/// map until the whole page is fetched. A peer answering a maximum-size
+/// `headers` page (~14,700 minimal entries) with maximum-size blocks could
+/// drive that to tens of gigabytes resident before a single block is
+/// parsed. Real Sprout-era blocks average a few kilobytes, so this is far
+/// above anything honest and still bounds the hostile case.
+const MAX_BLOCKS_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
     #[error("connecting to {addr}: {source}")]
@@ -295,6 +305,7 @@ impl Peer {
     ) -> Result<HashMap<[u8; 32], Vec<u8>>, PeerError> {
         let wanted: HashSet<[u8; 32]> = hashes.iter().copied().collect();
         let mut blocks: HashMap<[u8; 32], Vec<u8>> = HashMap::with_capacity(hashes.len());
+        let mut held = 0usize;
 
         for chunk in hashes.chunks(GETDATA_BATCH) {
             self.send("getdata", &encode_getdata_blocks(chunk)).await?;
@@ -320,6 +331,16 @@ impl Peer {
                 };
                 if !wanted.contains(&hash) {
                     continue; // unsolicited relay; not ours to use
+                }
+                held += bytes.len();
+                if held > MAX_BLOCKS_BYTES {
+                    return Err(PeerError::Timeout {
+                        what: format!(
+                            "a reasonable amount of block data (this peer sent over {} MB \
+                             for one request)",
+                            held / 1_000_000
+                        ),
+                    });
                 }
                 if blocks.insert(hash, bytes).is_none() && chunk.contains(&hash) {
                     outstanding -= 1;
