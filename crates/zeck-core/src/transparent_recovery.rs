@@ -313,6 +313,12 @@ pub fn sapling_receiver(
 ) -> ZeckResult<sapling::PaymentAddress> {
     use zcash_address::{unified::Container, ConversionError, TryFromAddress, ZcashAddress};
 
+    // Note: the `try_from_sapling` arm below is unreachable through this
+    // function. `validate_destination_address` rejects every non-unified
+    // address first, so a bare `zs1…` never gets here. Raised in review of
+    // #187. Left in place because the arm is required by the trait, but do
+    // not "fix" the ordering to reach it — the unified-only rule is what
+    // guarantees a destination the sweep can actually pay.
     struct SaplingOnly(Option<sapling::PaymentAddress>);
 
     impl TryFromAddress for SaplingOnly {
@@ -768,13 +774,30 @@ mod destination_tests {
         assert!(sapling_receiver("not-an-address", ZeckNetwork::Mainnet).is_err());
     }
 
-    /// A mainnet destination must not be accepted for a testnet sweep.
-    /// Getting this wrong sends real funds to an address that cannot be
-    /// spent on the network they were broadcast to.
+    /// Asserts the *variant*, not merely that it errs.
+    ///
+    /// Raised in review of #187 and never addressed when that PR was folded
+    /// into #189: this fed a bare t-address and asserted `.is_err()`, which
+    /// passes on `DestinationMustBeUnified` — thrown before any network
+    /// logic runs. So the test named for a network mismatch never reached
+    /// the network check, and the genuinely dangerous case, a mainnet
+    /// *unified* address used on a testnet sweep, had no coverage at all.
+    ///
+    /// Pinning the variant at least makes the test honest about which rule
+    /// rejects a t-address. The mainnet-UA-on-testnet case still wants a
+    /// real encoded UA fixture; see the note below.
     #[test]
-    fn a_mainnet_destination_is_refused_on_testnet() {
+    fn a_transparent_destination_is_refused_for_not_being_unified() {
+        let err = match sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Testnet)
+        {
+            Ok(_) => panic!("a t-address must not be accepted as a sweep destination"),
+            Err(err) => err,
+        };
         assert!(
-            sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Testnet).is_err()
+            matches!(err, ZeckError::DestinationMustBeUnified),
+            "a t-address is refused for not being unified, not for anything about \
+             networks or receivers; got {err:?}"
         );
     }
+
 }

@@ -383,8 +383,24 @@ pub fn parse_sapling_destination_kind(
         crate::ZeckNetwork::Mainnet => NetworkType::Main,
         crate::ZeckNetwork::Testnet => NetworkType::Test,
     };
-    let found: Found = parsed.convert_if_network(want).map_err(|err| {
-        ZeckError::InvalidAddress(format!("{destination} is not valid on this network: {err}"))
+    // Two very different failures arrive here and must not share a message.
+    // A network mismatch means "you pasted a testnet address"; an
+    // unsupported kind means "this address can never receive Sprout value".
+    // Reporting a mainnet t-address as "not valid on this network" — which
+    // it was, until this was split — sends someone checking their network
+    // setting when the address itself is the problem.
+    let found: Found = parsed.convert_if_network(want).map_err(|err| match err {
+        ConversionError::IncorrectNetwork { expected, actual } => ZeckError::InvalidAddress(
+            format!(
+                "{destination} is a {actual:?} address, but this is a {expected:?} sweep. \
+                 Check the --network setting, or paste the address for this network."
+            ),
+        ),
+        other => ZeckError::InvalidAddress(format!(
+            "{destination} cannot receive Sprout funds ({other}). Sprout value leaves the \
+             pool through the transparent pool and must be consumed by a Sapling output \
+             in the same transaction, so the destination needs a Sapling receiver."
+        )),
     })?;
 
     found.0.ok_or_else(|| {
@@ -650,14 +666,38 @@ mod tests {
     /// reason, since sending there would strand the value in the transparent
     /// pool for whoever mines next.
     #[test]
-    fn a_destination_with_no_sapling_receiver_is_refused_with_the_reason() {
-        for addr in ["t1KYSNmvWjRDpTgxKfXvhY1ZqDkPFAoxfEc", "not-an-address"] {
-            let err = match parse_sapling_destination(addr, crate::ZeckNetwork::Mainnet) {
-                Ok(_) => panic!("{addr} must not be accepted"),
-                Err(e) => e.to_string(),
+    fn each_bad_destination_is_refused_for_its_own_reason() {
+        // This asserted `!err.is_empty()`, which every error message
+        // satisfies — the same defect raised in review of #187 and repeated
+        // here. A transparent address and a typo are different mistakes and
+        // the user has to be told which one they made.
+        // A real mainnet t-address. The fabricated one this used to carry
+        // was not a valid address at all, so it was rejected as unparseable
+        // rather than for lacking a Sapling receiver — and the old
+        // `!err.is_empty()` assertion accepted that without complaint.
+        let transparent = match parse_sapling_destination(
+            "t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm",
+            crate::ZeckNetwork::Mainnet,
+        ) {
+            Ok(_) => panic!("a transparent address cannot receive Sprout value"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            transparent.contains("Sapling receiver") && !transparent.contains("this network"),
+            "a mainnet t-address is valid on mainnet — it must be refused for what it \
+             cannot receive, not blamed on the network setting; got: {transparent}"
+        );
+
+        let garbage =
+            match parse_sapling_destination("not-an-address", crate::ZeckNetwork::Mainnet) {
+                Ok(_) => panic!("garbage is not an address"),
+                Err(err) => err.to_string(),
             };
-            assert!(!err.is_empty(), "a refusal must carry a reason");
-        }
+        assert!(
+            garbage.contains("not a Zcash address"),
+            "unparseable input must be named as such rather than reported as a missing \
+             receiver, which would send someone hunting for the wrong problem; got: {garbage}"
+        );
     }
 
     #[test]
