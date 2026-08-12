@@ -54,12 +54,33 @@
 //! because wrong byte offsets would reject every *honest* header while
 //! looking exactly like a hostile network.
 //!
-//! Two limits remain. The difficulty *adjustment* is not validated — a chain
-//! of individually valid but uniformly easy blocks would still pass, which
-//! is what the checkpoints exist to bound — and the mainnet Equihash
-//! parameters (200, 9) have only been exercised against regtest's (48, 5).
-//! The byte offsets, which are the part most likely to be wrong, are the
-//! part that has been checked.
+//! # Why the difficulty adjustment is deliberately not validated
+//!
+//! Four checks compose into a complete pin on mainnet, and the adjustment
+//! rule adds nothing on top of them:
+//!
+//! 1. the first page's `prev_hash` must equal the all-zero locator, so the
+//!    walk provably starts at genesis;
+//! 2. every header in a page links to its predecessor;
+//! 3. every page links to the previous page's last hash;
+//! 4. four checkpoint hashes must match at fixed heights.
+//!
+//! Together those pin both ends of every segment. Forging blocks between
+//! two checkpoints requires the forged chain's last `prev_hash` to equal the
+//! real block before the next checkpoint — which requires that real block,
+//! which requires its real work. No block from genesis to Canopy can be
+//! inserted, omitted or substituted without breaking a hash link to a
+//! pinned point.
+//!
+//! Implementing ZIP 208's averaging window and damping would therefore buy
+//! nothing here, while being easy to get subtly wrong — and a wrong
+//! difficulty rule rejects the *honest* chain, which is the failure mode
+//! this module works hardest to avoid. It would matter on testnet, where
+//! nothing is pinned; Sprout recovery there is not a real scenario.
+//!
+//! One limit does remain: the mainnet Equihash parameters (200, 9) have
+//! only been exercised against regtest's (48, 5). The byte offsets — the
+//! part most likely to be wrong — are checked against real headers.
 //!
 //! The checkpoint file is likewise unauthenticated: it carries no MAC, and
 //! its `last_height` alone decides whether the scan is finished. Editing
