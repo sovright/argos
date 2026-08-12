@@ -138,8 +138,17 @@ pub async fn resolve_seeds(network: P2pNetwork) -> Result<Vec<String>, PoolError
 
     // Appended, so they are only reached once the DNS-seeded peers have
     // been tried and refused.
+    //
+    // Skipping any the seeders already advertise. Now that these nodes are
+    // publicly reachable the DNS seeders have started returning them, and
+    // appending a second copy would spend two connection slots on one host
+    // in a batch sized for distinct peers.
     if matches!(network, P2pNetwork::Mainnet) {
-        resolved.extend(SOVRIGHT_MAINNET_NODES.iter().map(|s| (*s).to_owned()));
+        for node in SOVRIGHT_MAINNET_NODES {
+            if !resolved.iter().any(|s| s == node) {
+                resolved.push((*node).to_owned());
+            }
+        }
     }
 
     if resolved.is_empty() {
@@ -319,24 +328,41 @@ mod tests {
         );
     }
 
-    /// The fallback must be a fallback. Putting these first would
-    /// centralise every scan onto one operator by default, and would do it
-    /// silently.
+    /// The fallback must be a fallback, and must not be listed twice.
+    ///
+    /// An earlier version asserted no sovright node appeared before the tail
+    /// of the list. That is not ours to control: these nodes are publicly
+    /// reachable, so the DNS seeders now advertise them, and one arriving
+    /// mid-list through the seeders is the open network working rather than
+    /// a bug. What Argos controls is that it does not *prioritise* them and
+    /// does not add a duplicate — a second copy of one host would spend two
+    /// slots of a batch sized for distinct peers.
     #[tokio::test]
-    async fn sovright_nodes_come_after_the_dns_seeds() {
+    async fn sovright_nodes_are_appended_once_and_never_prioritised() {
         let Ok(seeds) = resolve_seeds(P2pNetwork::Mainnet).await else {
             // No DNS in this environment; nothing to order.
             return;
         };
-        let first_sovright = seeds
-            .iter()
-            .position(|s| SOVRIGHT_MAINNET_NODES.contains(&s.as_str()));
-        if let Some(at) = first_sovright {
-            assert!(
-                at >= seeds.len() - SOVRIGHT_MAINNET_NODES.len(),
-                "the operator's own nodes must sit at the end of the seed list"
+
+        for node in SOVRIGHT_MAINNET_NODES {
+            assert_eq!(
+                seeds.iter().filter(|s| *s == node).count(),
+                1,
+                "{node} must appear exactly once, however it was sourced"
             );
         }
+
+        // Any we appended ourselves sit at the very end; any the seeders
+        // supplied keep whatever position the seeders gave them.
+        let appended: Vec<&String> = seeds
+            .iter()
+            .rev()
+            .take_while(|s| SOVRIGHT_MAINNET_NODES.contains(&s.as_str()))
+            .collect();
+        assert!(
+            appended.len() <= SOVRIGHT_MAINNET_NODES.len(),
+            "nothing but the fallback may be appended after the seeded peers"
+        );
     }
 
     #[tokio::test]
