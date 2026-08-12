@@ -101,9 +101,20 @@ use std::path::{Path, PathBuf};
 use crate::{
     error::{ZeckError, ZeckResult},
     p2p::{block::joinsplits_in_block, peer::Peer, pool::connect_to_any, wire::P2pNetwork},
-    sprout_scan::{SproutScanCheckpoint, SproutScanResult, SproutScanner},
+    sprout_scan::{ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner},
 };
 use zcash_protocol::consensus::BranchId;
+
+/// The height of the first block a walk will scan.
+///
+/// Genesis (height 0) for a fresh scan — the all-zero locator makes the peer
+/// include genesis as the first header — or one past the last recorded block
+/// on resume. Pulled out of `run` so the genesis-is-height-0 invariant, which
+/// the checkpoints are keyed against, is unit-tested directly rather than only
+/// exercised by a full mainnet scan.
+fn first_scan_height(cursor: Option<ScanCursor>) -> u32 {
+    cursor.map_or(0, |c| c.last_height + 1)
+}
 
 /// How often to write a checkpoint, in blocks.
 ///
@@ -216,12 +227,16 @@ pub async fn run_sprout_scan(
         Err(_) => SproutScanner::new(spending_keys),
     };
 
-    let mut locator = scanner
-        .cursor()
-        .map(|c| c.last_block_hash)
-        // An all-zero locator asks the peer to start from genesis.
-        .unwrap_or([0u8; 32]);
-    let mut height = scanner.progress().last_height;
+    let cursor = scanner.cursor();
+    // An all-zero locator asks the peer to start from genesis.
+    let mut locator = cursor.map_or([0u8; 32], |c| c.last_block_hash);
+    // `height` is the height of the *next* block to scan, and the block being
+    // scanned is checkpointed and recorded at this value before it is
+    // incremented. A fresh scan begins at genesis (height 0): the all-zero
+    // locator makes the peer include genesis as `headers[0]`, so the first
+    // block scanned is height 0, not 1. A resumed scan continues one past the
+    // last block it recorded.
+    let mut height = first_scan_height(cursor);
     let mut since_checkpoint = 0u64;
     let mut empty_replies = 0u32;
 
@@ -329,17 +344,18 @@ pub async fn run_sprout_scan(
                 // A block we asked for never arrived; stop rather than skip
                 // it, because skipping shifts every later position.
                 return Err(ZeckError::Broadcast(format!(
-                    "a peer did not return the block after height {height}. The scan \
+                    "a peer did not return the block at height {height}. The scan \
                      cannot skip it without corrupting every later note, so it stops. \
                      Progress is saved; re-run to continue."
                 )));
             };
-            height += 1;
 
             // A pinned block must be the block we were handed. This is what
             // makes a fabricated chain pointless: cheap forged headers link
             // to each other fine, but they cannot reproduce a real mainnet
-            // hash at a real height without doing the work.
+            // hash at a real height without doing the work. Checked against
+            // this block's own height, before the counter advances — the
+            // checkpoints are keyed by true heights (genesis = 0).
             if let Some(expected) = crate::p2p::wire::checkpoint_at(network, height) {
                 if *hash != expected {
                     return Err(ZeckError::Broadcast(format!(
@@ -363,6 +379,7 @@ pub async fn run_sprout_scan(
                     ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
                 })?;
             since_checkpoint += 1;
+            height += 1;
         }
 
         locator = *hashes.last().expect("non-empty");
@@ -482,6 +499,27 @@ mod tests {
         assert_eq!(
             checkpoint_path(dir, &[[0x11; 32], [0x22; 32]]),
             checkpoint_path(dir, &[[0x22; 32], [0x11; 32]])
+        );
+    }
+
+    /// Genesis must map to height 0, not 1. The checkpoints are keyed by true
+    /// block heights, and the walk scans and checkpoints a block at `height`
+    /// before incrementing, so if a fresh walk started genesis at height 1 it
+    /// would shift every block by one and reject the honest chain at the first
+    /// checkpoint (419,200). A resumed walk must continue exactly one past the
+    /// block it last recorded, so a scan resumed just below a checkpoint lands
+    /// on it rather than skipping past it.
+    #[test]
+    fn a_fresh_walk_scans_genesis_as_height_zero() {
+        assert_eq!(first_scan_height(None), 0);
+
+        let just_below_the_first_checkpoint = ScanCursor {
+            last_block_hash: [0xAB; 32],
+            last_height: 419_199,
+        };
+        assert_eq!(
+            first_scan_height(Some(just_below_the_first_checkpoint)),
+            419_200
         );
     }
 
