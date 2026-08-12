@@ -78,9 +78,10 @@
 //! this module works hardest to avoid. It would matter on testnet, where
 //! nothing is pinned; Sprout recovery there is not a real scenario.
 //!
-//! One limit does remain: the mainnet Equihash parameters (200, 9) have
-//! only been exercised against regtest's (48, 5). The byte offsets — the
-//! part most likely to be wrong — are checked against real headers.
+//! Both parameter sets are now checked against headers this project did not
+//! construct: regtest's (48, 5) and mainnet's (200, 9), each with a
+//! deliberately corrupted solution required to fail, so neither pass can
+//! mean the verifier simply accepts everything.
 //!
 //! The checkpoint file is likewise unauthenticated: it carries no MAC, and
 //! its `last_height` alone decides whether the scan is finished. Editing
