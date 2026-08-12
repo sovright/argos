@@ -66,3 +66,37 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running Argos GUI");
 }
+
+
+#[cfg(test)]
+mod version_tests {
+    /// `tauri.conf.json` carries its own hardcoded version, and the sidebar
+    /// build display reads `CARGO_PKG_VERSION`. Nothing connected the two,
+    /// so they could drift and the app would report a version it was not.
+    /// Raised in review of #189.
+    ///
+    /// Pinned by a test rather than by generating one from the other: Tauri
+    /// reads its config at build time and does not accept a reference to
+    /// Cargo.toml, so the honest options are "generate the file" or "fail
+    /// loudly when they disagree". This is the second, and it fails at the
+    /// moment someone edits one of them.
+    #[test]
+    fn tauri_conf_version_matches_the_crate() {
+        let conf = include_str!("../tauri.conf.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(conf).expect("tauri.conf.json must be valid JSON");
+        let declared = parsed
+            .get("version")
+            .and_then(|v| v.as_str())
+            .expect("tauri.conf.json must declare a version");
+
+        assert_eq!(
+            declared,
+            env!("CARGO_PKG_VERSION"),
+            "tauri.conf.json says {declared} but the crate is {}. The sidebar reports \
+             CARGO_PKG_VERSION while the bundle is stamped from the config, so a user \
+             would see one version and have another installed.",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+}

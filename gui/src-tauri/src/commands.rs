@@ -204,6 +204,11 @@ pub async fn inspect_wallet_file(
     // Sprout funds are recoverable right now from one that would need the
     // full-block scan. Doing it here keeps that judgement out of the
     // frontend, which can only see counts.
+    // Dropped before anything is reported: a key that does not control its
+    // stored address must not be counted, shown, or spent with.
+    let mut keys = keys;
+    let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(&mut keys);
+
     let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
     let needs_scan = !keys.sprout.is_empty() && recovered.notes.is_empty();
 
@@ -229,7 +234,11 @@ pub async fn inspect_wallet_file(
             .collect(),
         sprout_spendable_notes: recovered.notes.len(),
         sprout_spendable_zatoshis: recovered.total_value(),
-        sprout_issues: recovered.issues.iter().map(|i| i.to_string()).collect(),
+        sprout_issues: forged
+            .iter()
+            .map(|f| f.to_string())
+            .chain(recovered.issues.iter().map(|i| i.to_string()))
+            .collect(),
         sprout_scan_warning: if needs_scan {
             argos_core::sprout_scan_cost::SproutScanCost::for_network(
                 argos_core::p2p::wire::P2pNetwork::Mainnet,

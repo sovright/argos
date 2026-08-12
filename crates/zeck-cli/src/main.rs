@@ -254,7 +254,10 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
         fs::read(path).with_context(|| format!("failed to read wallet file {}", path.display()))?;
 
     match argos_wallet_import::import_wallet_file(&bytes, None) {
-        Ok(keys) => Ok(keys),
+        Ok(mut keys) => {
+            report_forged_sprout_keys(&mut keys);
+            Ok(keys)
+        }
         // The parser reports a locked wallet and a wrong passphrase with
         // the same variant. Here it can only mean "locked", because we
         // supplied no passphrase to be wrong.
@@ -266,12 +269,29 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
                 .interact()
                 .context("failed to read wallet passphrase from terminal")?;
             let passphrase = SecretString::new(passphrase);
-            argos_wallet_import::import_wallet_file(&bytes, Some(&passphrase))
-                .with_context(|| format!("failed to import wallet file {}", path.display()))
+            let mut keys = argos_wallet_import::import_wallet_file(&bytes, Some(&passphrase))
+                .with_context(|| format!("failed to import wallet file {}", path.display()))?;
+            report_forged_sprout_keys(&mut keys);
+            Ok(keys)
         }
         Err(err) => {
             Err(err).with_context(|| format!("failed to import wallet file {}", path.display()))
         }
+    }
+}
+
+/// Drop any Sprout key that does not control its stored address, and say so.
+///
+/// Enforced at every entry point rather than only where a sweep happens: a
+/// key that fails this check would derive a wrong address, find no notes,
+/// and give the user no indication why — and if it did somehow match a
+/// note, spending with it would build a transaction for someone else's.
+fn report_forged_sprout_keys(keys: &mut ImportedKeys) {
+    for rejected in argos_core::sprout_recovery::reject_forged_sprout_keys(keys) {
+        eprintln!();
+        eprintln!("  ⚠ A SPROUT KEY IN THIS FILE IS NOT GENUINE");
+        eprintln!("    {rejected}");
+        eprintln!();
     }
 }
 

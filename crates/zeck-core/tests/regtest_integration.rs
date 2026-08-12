@@ -2084,6 +2084,61 @@ async fn workspace_deleted_between_scan_and_sweep_surfaces_clean_error() {
     eprintln!("[regtest] propose_sweep failed as expected after workspace deletion: {err}");
 }
 
+// ─── Only wallet.sqlite deleted, directory intact ──────────────────────────
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
+async fn deleting_only_the_wallet_db_surfaces_a_clean_error() {
+    // The hole the workspace check was written for, and the one the
+    // whole-directory tests above cannot reach.
+    //
+    // `open_wallet_db` goes through `Connection::open`, which defaults to
+    // READ_WRITE | CREATE. With the parent directory intact, deleting only
+    // `wallet.sqlite` means the open *succeeds* by silently recreating an
+    // empty database — so a check that merely opens it passes, and
+    // `propose_sweep` quotes the stale in-memory balance: exactly the
+    // confidently-wrong number the check exists to prevent. It also leaves
+    // a stray empty DB behind during a documented read-only quote.
+    //
+    // Raised in review of #189, where the fix (requiring a readable wallet
+    // summary, not just a successful open) landed without a test that
+    // reaches this specific state.
+
+    let harness = RegtestHarness::require();
+    let temp_data_dir = tempfile::tempdir().expect("tempdir for workspace");
+    let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-rw27").await;
+
+    // Find the wallet DB and remove only that file.
+    let wallet_db = fixture.workspace_root.join("wallet.sqlite");
+    assert!(
+        wallet_db.exists(),
+        "[regtest] expected a wallet.sqlite at {}",
+        wallet_db.display()
+    );
+    std::fs::remove_file(&wallet_db).expect("removing wallet.sqlite must succeed");
+    assert!(
+        fixture.workspace_root.exists(),
+        "[regtest] the workspace directory must remain — that is the whole point"
+    );
+
+    let request = SweepRequest {
+        destination: fixture.destination_ua.clone(),
+        memo: None,
+        max_fee_zatoshis: None,
+        donation_rate: None,
+        donor_email: None,
+    };
+
+    let result = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await;
+    let err = result.expect_err(
+        "propose_sweep must fail when wallet.sqlite is gone, even though the directory \
+         remains and SQLite will happily create an empty database in its place",
+    );
+    eprintln!("[regtest] propose_sweep failed as expected after wallet.sqlite deletion: {err}");
+}
+
 // ─── R-W26: Workspace permissions tampered ─────────────────────────────────
 #[cfg(unix)]
 #[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]

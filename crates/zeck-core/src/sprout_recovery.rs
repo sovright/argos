@@ -188,6 +188,61 @@ impl SproutRecovery {
     }
 }
 
+/// A key that does not control the address it was filed under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgedSproutKey {
+    /// The address the wallet record was keyed by.
+    pub stored_address: [u8; 64],
+    /// The address the secret actually controls.
+    pub derived_address: [u8; 64],
+}
+
+impl std::fmt::Display for ForgedSproutKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a Sprout key in this file does not control the address it is stored under              (stored {}, derived {}). It was skipped: spending with it would build a              transaction for someone else's note.",
+            hex(&self.stored_address),
+            hex(&self.derived_address)
+        )
+    }
+}
+
+/// Drop any Sprout key that does not control its own stored address.
+///
+/// zcashd files each Sprout key under the payment address it unlocks, and
+/// `a_pk` is derived from `a_sk`, so re-deriving closes the loop. Until now
+/// that check lived only in `argos-wallet-import`'s fixture tests — the
+/// property was asserted against eight known-good files and enforced
+/// nowhere, so a real wallet shaped slightly differently could import a
+/// wrong key and report success. Raised in review of #189.
+///
+/// It lives here rather than at the point of parse because deriving `a_pk`
+/// needs the Sprout PRF, and `argos-wallet-import` deliberately depends on
+/// nothing — putting it there would mean duplicating crypto or inverting the
+/// dependency.
+///
+/// Mismatches are skipped and reported rather than fatal, the same as every
+/// other defect in a file the user was handed.
+pub fn reject_forged_sprout_keys(keys: &mut ImportedKeys) -> Vec<ForgedSproutKey> {
+    use secrecy::ExposeSecret;
+
+    let mut rejected = Vec::new();
+    keys.sprout.retain(|key| {
+        let derived = SproutPaymentAddress::from_spending_key(key.a_sk.expose_secret()).to_bytes();
+        if derived == key.address {
+            true
+        } else {
+            rejected.push(ForgedSproutKey {
+                stored_address: key.address,
+                derived_address: derived,
+            });
+            false
+        }
+    });
+    rejected
+}
+
 /// Decrypt every Sprout note the wallet holds a spending key for.
 ///
 /// Never fails as a whole: notes that cannot be recovered are reported in
@@ -378,6 +433,41 @@ mod tests {
         });
 
         (keys, a_sk)
+    }
+
+    /// A key filed under an address it does not control must be dropped,
+    /// not used. Spending with it builds a transaction for someone else's
+    /// note, which is why this is enforced rather than only asserted
+    /// against fixtures.
+    #[test]
+    fn a_key_that_does_not_control_its_address_is_rejected() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        assert_eq!(keys.sprout.len(), 1);
+
+        // A genuine key, refiled under a different address — exactly what a
+        // corrupt or hostile wallet file looks like.
+        let someone_else = SproutPaymentAddress::from_spending_key(&[0x99u8; 32]).to_bytes();
+        keys.sprout[0].address = someone_else;
+
+        let rejected = reject_forged_sprout_keys(&mut keys);
+
+        assert_eq!(rejected.len(), 1, "the mismatch must be reported");
+        assert_eq!(rejected[0].stored_address, someone_else);
+        assert!(
+            keys.sprout.is_empty(),
+            "a key that does not control its address must not remain usable"
+        );
+        assert!(
+            rejected[0].to_string().contains("someone else's note"),
+            "the message must say what spending with it would do"
+        );
+    }
+
+    #[test]
+    fn genuine_keys_survive_the_check() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        assert!(reject_forged_sprout_keys(&mut keys).is_empty());
+        assert_eq!(keys.sprout.len(), 1, "a genuine key must not be dropped");
     }
 
     #[test]
