@@ -40,10 +40,16 @@
 //! nothing past the first checkpoint at height 419,200.
 //!
 //! What remains unverified is everything *between* checkpoints, and the
-//! whole range on testnet, where nothing is pinned. Full coverage still
-//! wants proof-of-work and Equihash validation per header — `equihash` is
-//! already in the dependency tree — which costs real CPU across a million
-//! headers and is why it is not done here yet.
+//! whole range on testnet, where nothing is pinned.
+//!
+//! `p2p::wire::verify_header_pow` closes that — Equihash plus the difficulty
+//! target — and is written and unit-tested, but is **deliberately not called
+//! here yet**. Its byte offsets and Equihash parameters have never been run
+//! against headers this project did not construct, and getting either wrong
+//! rejects every *honest* header while looking exactly like a hostile
+//! network. Wiring it in before that check would trade a real but bounded
+//! risk for an unbounded one. `real_headers_pass_proof_of_work_verification`
+//! is the test that settles it; run it, then enable the call.
 //!
 //! The checkpoint file is likewise unauthenticated: it carries no MAC, and
 //! its `last_height` alone decides whether the scan is finished. Editing

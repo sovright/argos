@@ -283,6 +283,12 @@ pub fn encode_getheaders(protocol_version: u32, locator: &[[u8; 32]], stop: [u8;
 pub struct BlockHeader {
     pub hash: [u8; 32],
     pub prev_hash: [u8; 32],
+    /// The serialized header, fixed part and Equihash solution together.
+    ///
+    /// Retained so proof of work can be verified. A header is only a header
+    /// because of the work behind it; without these bytes the scanner would
+    /// be trusting a peer's word that a chain exists.
+    pub raw: Vec<u8>,
 }
 
 /// Zcash block header length. Unlike Bitcoin's 80, Zcash carries
@@ -330,6 +336,7 @@ pub fn decode_headers(payload: &[u8]) -> Result<Vec<BlockHeader>, WireError> {
         out.push(BlockHeader {
             hash: sha256d(header_bytes),
             prev_hash,
+            raw: header_bytes.to_vec(),
         });
 
         // The trailing transaction count, always zero here.
@@ -664,5 +671,181 @@ mod checkpoint_tests {
         // zeros, so those bytes land at the *end* on the wire.
         assert_eq!(&wire[28..], &[0x00, 0x00, 0x00, 0x00]);
         assert_eq!(wire[0], 0xd4);
+    }
+}
+
+
+/// Equihash parameters, which differ by network.
+///
+/// Mainnet and testnet use (200, 9). Regtest uses (48, 5) so blocks can be
+/// mined instantly — verifying a regtest header with mainnet parameters
+/// fails on every block, which is why this is not a constant.
+const fn equihash_params(network: P2pNetwork) -> (u32, u32) {
+    match network {
+        P2pNetwork::Mainnet | P2pNetwork::Testnet => (200, 9),
+        P2pNetwork::Regtest => (48, 5),
+    }
+}
+
+/// Offsets within the fixed part of a Zcash block header.
+///
+/// version(4) ‖ prevHash(32) ‖ merkleRoot(32) ‖ blockCommitments(32) ‖
+/// time(4) ‖ bits(4) ‖ nonce(32) = 140 bytes, then the Equihash solution as
+/// a CompactSize-prefixed blob.
+const NBITS_OFFSET: usize = 104;
+const NONCE_OFFSET: usize = 108;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PowError {
+    #[error("the header is too short to carry proof of work")]
+    Truncated,
+    #[error("the Equihash solution is invalid")]
+    BadSolution,
+    #[error("the block hash does not meet the difficulty its header claims")]
+    InsufficientWork,
+    #[error("the header claims an impossible difficulty target")]
+    BadTarget,
+}
+
+/// Expand a compact `nBits` difficulty into a 256-bit target, little-endian
+/// to match hash byte order.
+///
+/// Rejects the degenerate encodings rather than clamping them: a header
+/// claiming a zero or overflowing target is not one to reason about.
+fn target_from_nbits(nbits: u32) -> Option<[u8; 32]> {
+    let exponent = (nbits >> 24) as usize;
+    let mantissa = nbits & 0x007f_ffff;
+    if mantissa == 0 || nbits & 0x0080_0000 != 0 || exponent > 34 {
+        return None;
+    }
+
+    let mut target = [0u8; 32];
+    // `exponent` counts bytes from the top of the mantissa, so the mantissa
+    // occupies bytes [exponent-3, exponent).
+    if exponent <= 3 {
+        let shifted = mantissa >> (8 * (3 - exponent));
+        target[..3].copy_from_slice(&shifted.to_le_bytes()[..3]);
+    } else {
+        let start = exponent - 3;
+        if start + 3 > 32 {
+            return None;
+        }
+        target[start..start + 3].copy_from_slice(&mantissa.to_le_bytes()[..3]);
+    }
+    Some(target)
+}
+
+/// Whether `hash` is numerically at or below `target`, both little-endian.
+fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        match hash[i].cmp(&target[i]) {
+            std::cmp::Ordering::Less => return true,
+            std::cmp::Ordering::Greater => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    true
+}
+
+/// Verify a header's proof of work.
+///
+/// Two checks, and both are needed. The Equihash solution proves the work
+/// was done; the difficulty target proves it was *enough* work. Equihash
+/// alone would let a peer serve a chain of genuinely-solved but trivially
+/// easy headers, which is nearly as cheap to fabricate as no work at all.
+///
+/// This does not validate the difficulty *adjustment* — that a header's
+/// claimed target is the one consensus would have required at that height.
+/// A chain of individually valid, uniformly easy blocks would still pass.
+/// The checkpoints in [`checkpoint_at`] are what bound that on mainnet.
+pub fn verify_header_pow(network: P2pNetwork, header: &BlockHeader) -> Result<(), PowError> {
+    let raw = &header.raw;
+    if raw.len() <= HEADER_FIXED_LEN {
+        return Err(PowError::Truncated);
+    }
+
+    let input = raw.get(..NONCE_OFFSET).ok_or(PowError::Truncated)?;
+    let nonce = raw
+        .get(NONCE_OFFSET..HEADER_FIXED_LEN)
+        .ok_or(PowError::Truncated)?;
+
+    let (solution_len, used) = read_compact_size(raw.get(HEADER_FIXED_LEN..).ok_or(PowError::Truncated)?)
+        .ok_or(PowError::Truncated)?;
+    let start = HEADER_FIXED_LEN + used;
+    let end = start
+        .checked_add(usize::try_from(solution_len).map_err(|_| PowError::Truncated)?)
+        .ok_or(PowError::Truncated)?;
+    let solution = raw.get(start..end).ok_or(PowError::Truncated)?;
+
+    let (n, k) = equihash_params(network);
+    equihash::is_valid_solution(n, k, input, nonce, solution)
+        .map_err(|_| PowError::BadSolution)?;
+
+    let nbits = u32::from_le_bytes(
+        raw.get(NBITS_OFFSET..NBITS_OFFSET + 4)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(PowError::Truncated)?,
+    );
+    let target = target_from_nbits(nbits).ok_or(PowError::BadTarget)?;
+    if !hash_meets_target(&header.hash, &target) {
+        return Err(PowError::InsufficientWork);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pow_tests {
+    use super::*;
+
+    #[test]
+    fn equihash_parameters_differ_on_regtest() {
+        assert_eq!(equihash_params(P2pNetwork::Mainnet), (200, 9));
+        assert_eq!(equihash_params(P2pNetwork::Testnet), (200, 9));
+        // Regtest mines instantly; mainnet parameters would reject every
+        // block on that chain.
+        assert_eq!(equihash_params(P2pNetwork::Regtest), (48, 5));
+    }
+
+    #[test]
+    fn a_truncated_header_carries_no_proof_of_work() {
+        let header = BlockHeader {
+            hash: [0u8; 32],
+            prev_hash: [0u8; 32],
+            raw: vec![0u8; HEADER_FIXED_LEN],
+        };
+        assert_eq!(
+            verify_header_pow(P2pNetwork::Mainnet, &header),
+            Err(PowError::Truncated)
+        );
+    }
+
+    /// Degenerate `nBits` encodings must be refused rather than clamped: a
+    /// zero target would make every hash "sufficient", and the negative bit
+    /// has no meaning for a difficulty.
+    #[test]
+    fn impossible_difficulty_targets_are_refused() {
+        assert!(target_from_nbits(0).is_none(), "zero mantissa");
+        assert!(target_from_nbits(0x00ff_ffff).is_none(), "zero mantissa");
+        assert!(target_from_nbits(0x0480_0000).is_none(), "negative bit set");
+        assert!(target_from_nbits(0xff00_0001).is_none(), "exponent too large");
+        assert!(target_from_nbits(0x1d00_ffff).is_some(), "an ordinary target");
+    }
+
+    /// The comparison is the whole point of the difficulty check, and it is
+    /// easy to get backwards — these are little-endian, so the significant
+    /// bytes are at the end.
+    #[test]
+    fn a_hash_above_its_target_is_rejected() {
+        let target = target_from_nbits(0x1d00_ffff).expect("valid target");
+
+        let mut at_limit = [0u8; 32];
+        at_limit.copy_from_slice(&target);
+        assert!(hash_meets_target(&at_limit, &target), "equal meets it");
+
+        let mut over = target;
+        over[31] = over[31].wrapping_add(1);
+        assert!(!hash_meets_target(&over, &target), "one over does not");
+
+        assert!(hash_meets_target(&[0u8; 32], &target), "zero always meets it");
     }
 }

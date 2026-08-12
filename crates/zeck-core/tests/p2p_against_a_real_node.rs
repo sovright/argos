@@ -239,3 +239,39 @@ async fn joinsplits_are_recovered_from_real_blocks() {
         );
     }
 }
+
+/// Proof-of-work verification, against headers a real node produced.
+///
+/// The unit tests cover the arithmetic and the rejection paths, but nothing
+/// they do can confirm the byte offsets are right — a wrong `nonce` or
+/// `solution` offset, or the wrong Equihash parameters, rejects *every*
+/// honest header, and the failure looks identical to a hostile peer. Only
+/// headers this code did not construct can tell the two apart.
+#[tokio::test]
+#[ignore = "needs the regtest sprout node; see the module docs"]
+async fn real_headers_pass_proof_of_work_verification() {
+    use argos_core::p2p::wire::verify_header_pow;
+
+    let mut peer = Peer::connect(NODE, P2pNetwork::Regtest)
+        .await
+        .expect("handshake");
+    let headers = peer.get_headers(&[[0u8; 32]]).await.expect("getheaders");
+    assert!(!headers.is_empty(), "the chain must return headers");
+
+    for (i, header) in headers.iter().enumerate() {
+        verify_header_pow(P2pNetwork::Regtest, header).unwrap_or_else(|err| {
+            panic!("header {i} from a real node failed proof-of-work checking: {err}")
+        });
+    }
+    println!("{} real headers passed Equihash and difficulty", headers.len());
+
+    // And a tampered header must fail, or the check above proves nothing.
+    let mut tampered = headers[0].clone();
+    let last = tampered.raw.len() - 1;
+    tampered.raw[last] ^= 0xFF;
+    assert!(
+        verify_header_pow(P2pNetwork::Regtest, &tampered).is_err(),
+        "a corrupted Equihash solution must be rejected"
+    );
+    println!("a tampered solution was rejected");
+}

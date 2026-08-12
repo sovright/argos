@@ -15,6 +15,9 @@ aes = "0.8.4"
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 bip0039 = "0.14.0"
+# Header proof-of-work verification for the Sprout scan. Already in the tree
+# via zcash_primitives; made direct so the scanner can call it.
+equihash = "0.3"
 blake2b_simd = "1.0.4"
 # Curve25519 scalar multiplication for Sprout note decryption (the key
 # agreement in protocol §5.5). No other crate in the tree provides it.
