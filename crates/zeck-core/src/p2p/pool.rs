@@ -38,6 +38,32 @@ const MAINNET_SEEDS: &[&str] = &[
     "dnsseed.str4d.xyz:8233",
 ];
 
+/// Public Zcash nodes operated by Sovright, tried after the DNS seeds.
+///
+/// # Why these exist
+///
+/// Measured against the mainnet DNS seeds, 38 of 38 peers refused a
+/// connection slot — that is the normal state of the public network, not an
+/// outage. A recovery tool that depends on catching a free slot works for
+/// operators and fails for everyone else, which inverts who it is for.
+///
+/// Tried *after* the DNS seeds, never instead of them: a user who can reach
+/// the open network should, and Argos should not quietly centralise onto one
+/// operator's infrastructure. These are the fallback for when the public
+/// network will not answer.
+///
+/// Trusting them is not required. Every header is checked for proof of work
+/// and the chain is pinned to known block hashes, so a seed peer cannot feed
+/// a fabricated history — it can only decline to serve. What these nodes see
+/// is which blocks a user requests, which is the ordinary privacy cost of
+/// any light-client-shaped query and is why they are not tried first.
+const SOVRIGHT_MAINNET_NODES: &[&str] = &[
+    "136.115.98.175:8233",
+    "34.80.219.125:8233",
+    "34.182.139.187:8233",
+    "34.91.248.94:8233",
+];
+
 const TESTNET_SEEDS: &[&str] = &[
     "testnet.seeder.zfnd.org:18233",
     "dnsseed.testnet.z.cash:18233",
@@ -108,14 +134,22 @@ pub async fn resolve_seeds(network: P2pNetwork) -> Result<Vec<String>, PoolError
         }
     }
 
-    if addrs.is_empty() {
+    let mut resolved: Vec<String> = addrs.into_iter().collect();
+
+    // Appended, so they are only reached once the DNS-seeded peers have
+    // been tried and refused.
+    if matches!(network, P2pNetwork::Mainnet) {
+        resolved.extend(SOVRIGHT_MAINNET_NODES.iter().map(|s| (*s).to_owned()));
+    }
+
+    if resolved.is_empty() {
         return Err(PoolError::NoSeedsResolved(if errors.is_empty() {
             "the seeds resolved to no addresses".to_owned()
         } else {
             errors.join("; ")
         }));
     }
-    Ok(addrs.into_iter().collect())
+    Ok(resolved)
 }
 
 /// Race a batch of candidates and return the first peer that completes a
@@ -283,6 +317,36 @@ mod tests {
             !err.contains("refused"),
             "a resolution failure must not be blamed on peers"
         );
+    }
+
+    /// The fallback must be a fallback. Putting these first would
+    /// centralise every scan onto one operator by default, and would do it
+    /// silently.
+    #[tokio::test]
+    async fn sovright_nodes_come_after_the_dns_seeds() {
+        let Ok(seeds) = resolve_seeds(P2pNetwork::Mainnet).await else {
+            // No DNS in this environment; nothing to order.
+            return;
+        };
+        let first_sovright = seeds
+            .iter()
+            .position(|s| SOVRIGHT_MAINNET_NODES.contains(&s.as_str()));
+        if let Some(at) = first_sovright {
+            assert!(
+                at >= seeds.len() - SOVRIGHT_MAINNET_NODES.len(),
+                "the operator's own nodes must sit at the end of the seed list"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn testnet_gets_no_operator_fallback() {
+        // Only mainnet nodes are run; seeding testnet with them would offer
+        // peers that cannot serve that chain.
+        let seeds = resolve_seeds(P2pNetwork::Testnet).await.unwrap_or_default();
+        for node in SOVRIGHT_MAINNET_NODES {
+            assert!(!seeds.contains(&(*node).to_owned()));
+        }
     }
 
     #[tokio::test]

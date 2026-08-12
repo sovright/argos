@@ -25,6 +25,35 @@ use argos_core::p2p::{peer::Peer, wire::{verify_header_pow, P2pNetwork}};
 
 const NODE: &str = "127.0.0.1:18233";
 
+/// The sovright zebra nodes' public p2p addresses.
+const SOVRIGHT_NODES: &[&str] = &[
+    "136.115.98.175:8233",
+    "34.80.219.125:8233",
+    "34.182.139.187:8233",
+    "34.91.248.94:8233",
+];
+
+/// Are the sovright nodes reachable as ordinary public peers?
+///
+/// If they are, an Argos user needs no tunnel and no node of their own:
+/// these can be seeded directly, which is the difference between a scan
+/// anyone can run and one only an operator can.
+#[tokio::test]
+#[ignore = "probes public infrastructure"]
+async fn sovright_nodes_are_reachable_without_a_tunnel() {
+    let mut reachable = 0;
+    for node in SOVRIGHT_NODES {
+        match Peer::connect(node, P2pNetwork::Mainnet).await {
+            Ok(p) => {
+                reachable += 1;
+                println!("OK   {node}  height {}", p.peer_height);
+            }
+            Err(err) => println!("FAIL {node}  {err}"),
+        }
+    }
+    println!("--- {reachable}/{} reachable", SOVRIGHT_NODES.len());
+}
+
 #[tokio::test]
 #[ignore = "needs a mainnet peer; see the module docs"]
 async fn real_mainnet_headers_pass_equihash_200_9() {
