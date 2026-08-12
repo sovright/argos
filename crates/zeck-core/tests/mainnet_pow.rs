@@ -89,3 +89,97 @@ async fn real_mainnet_headers_pass_equihash_200_9() {
     );
     println!("a tampered mainnet solution was rejected");
 }
+
+/// A bounded mainnet scan: the real read path, on the real chain.
+///
+/// Deliberately a few thousand blocks rather than the full 1,046,400. The
+/// full range costs hours and adds only one property a short run does not
+/// already establish — sustained multi-hour peer behaviour — which a single
+/// run would not establish reliably anyway, since peer availability varies
+/// by hour and by peer. Everything else the scan does, it does on block
+/// five hundred exactly as on block five hundred thousand.
+///
+/// What this does exercise, all against mainnet rather than regtest: real
+/// headers with real Equihash (200, 9), the difficulty check, block parsing
+/// of real transactions, JoinSplit extraction, and commitment-tree building.
+#[tokio::test]
+#[ignore = "needs a mainnet peer; see the module docs"]
+async fn a_bounded_mainnet_scan_reads_real_blocks() {
+    use argos_core::{p2p::block::joinsplits_in_block, sprout_scan::SproutScanner};
+    use zcash_protocol::consensus::BranchId;
+
+    const TARGET: usize = 3_000;
+
+    let mut peer = Peer::connect(NODE, P2pNetwork::Mainnet)
+        .await
+        .expect("a mainnet peer must accept us");
+
+    let mut scanner = SproutScanner::new(&[[0x42u8; 32]]);
+    let mut locator = [0u8; 32];
+    let mut height = 0u32;
+    let mut bytes = 0usize;
+    let started = std::time::Instant::now();
+
+    while (height as usize) < TARGET {
+        let headers = peer.get_headers(&[locator]).await.expect("getheaders");
+        if headers.is_empty() {
+            break;
+        }
+
+        // Every header carries its own proof of work — the check the scan
+        // itself now enforces.
+        for header in &headers {
+            verify_header_pow(P2pNetwork::Mainnet, header)
+                .expect("a real mainnet header must verify");
+        }
+
+        let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
+        locator = *hashes.last().expect("non-empty");
+        let fetched = peer.get_blocks(&hashes).await.expect("getdata");
+
+        for hash in &hashes {
+            if (height as usize) >= TARGET {
+                break;
+            }
+            let block = fetched.get(hash).expect("every requested block returns");
+            bytes += block.len();
+            height += 1;
+
+            let joinsplits = joinsplits_in_block(block, BranchId::Sprout)
+                .expect("a real mainnet block must parse");
+            scanner
+                .scan_block_at(&joinsplits, *hash, height)
+                .expect("scan");
+        }
+    }
+
+    let progress = scanner.progress();
+    let secs = started.elapsed().as_secs_f64();
+    println!(
+        "scanned {} mainnet blocks, {} JoinSplits, {} commitments, {} bytes in {:.1}s",
+        progress.blocks_scanned,
+        progress.joinsplits_seen,
+        progress.commitments_appended,
+        bytes,
+        secs
+    );
+    println!(
+        "  {:.0} blocks/s — the full Sprout range would take {:.1} hours",
+        progress.blocks_scanned as f64 / secs,
+        (1_046_400.0 / (progress.blocks_scanned as f64 / secs)) / 3600.0
+    );
+
+    assert!(
+        progress.blocks_scanned as usize >= TARGET,
+        "the scan must reach its bound; got {}",
+        progress.blocks_scanned
+    );
+    // Mainnet's first blocks predate any shielded activity, so finding no
+    // JoinSplits here is correct — the assertion is that real blocks parsed
+    // and the tree advanced in step with them.
+    assert_eq!(
+        progress.commitments_appended,
+        progress.joinsplits_seen * 2,
+        "each JoinSplit contributes exactly two commitments"
+    );
+}
