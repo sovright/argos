@@ -42,14 +42,24 @@
 //! What remains unverified is everything *between* checkpoints, and the
 //! whole range on testnet, where nothing is pinned.
 //!
-//! `p2p::wire::verify_header_pow` closes that — Equihash plus the difficulty
-//! target — and is written and unit-tested, but is **deliberately not called
-//! here yet**. Its byte offsets and Equihash parameters have never been run
-//! against headers this project did not construct, and getting either wrong
-//! rejects every *honest* header while looking exactly like a hostile
-//! network. Wiring it in before that check would trade a real but bounded
-//! risk for an unbounded one. `real_headers_pass_proof_of_work_verification`
-//! is the test that settles it; run it, then enable the call.
+//! Every header is now checked for proof of work
+//! (`p2p::wire::verify_header_pow`): the Equihash solution, and that the
+//! hash meets the difficulty the header claims. A peer must therefore do
+//! real work per header rather than linking cheap ones together, and the
+//! checkpoints bound where a forgery could start at all.
+//!
+//! Validated against headers this project did not construct — 160 real ones
+//! from a node, with a deliberately corrupted solution required to fail, so
+//! a pass cannot mean the checker accepts everything. That check matters
+//! because wrong byte offsets would reject every *honest* header while
+//! looking exactly like a hostile network.
+//!
+//! Two limits remain. The difficulty *adjustment* is not validated — a chain
+//! of individually valid but uniformly easy blocks would still pass, which
+//! is what the checkpoints exist to bound — and the mainnet Equihash
+//! parameters (200, 9) have only been exercised against regtest's (48, 5).
+//! The byte offsets, which are the part most likely to be wrong, are the
+//! part that has been checked.
 //!
 //! The checkpoint file is likewise unauthenticated: it carries no MAC, and
 //! its `last_height` alone decides whether the scan is finished. Editing
@@ -226,6 +236,25 @@ pub async fn run_sprout_scan(
                 continue;
             }
         };
+
+        // Every header must carry its own proof of work. With the
+        // checkpoints below bounding where a forgery can start, this bounds
+        // how cheaply one can be built in between: a peer must do real work
+        // per header, not merely link cheap ones together.
+        if headers
+            .iter()
+            .any(|h| crate::p2p::wire::verify_header_pow(network, h).is_err())
+        {
+            peer = connect_peer(network, extra_peers, &[]).await?;
+            empty_replies += 1;
+            if empty_replies > MAX_EMPTY_REPLIES {
+                return Err(ZeckError::Broadcast(format!(
+                    "no peer would serve headers with valid proof of work from height \
+                     {height}. The scan stops rather than walk a chain it cannot verify."
+                )));
+            }
+            continue;
+        }
 
         // The peer must be continuing from exactly where we asked, and the
         // page must itself be a chain. A peer that does not recognise the
