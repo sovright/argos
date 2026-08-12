@@ -183,3 +183,64 @@ async fn a_bounded_mainnet_scan_reads_real_blocks() {
         "each JoinSplit contributes exactly two commitments"
     );
 }
+
+
+/// Every checkpoint must match the real chain, checked directly.
+///
+/// A wrong checkpoint does not weaken security — it rejects the honest
+/// chain outright, aborting every mainnet scan at that height. That failure
+/// is invisible to a bounded scan (the earliest checkpoint is at 100,000)
+/// and to unit tests, which can only confirm the constants parse. Only the
+/// chain itself can say whether they are the right hashes.
+#[tokio::test]
+#[ignore = "needs a mainnet peer; see the module docs"]
+async fn every_mainnet_checkpoint_matches_the_real_chain() {
+    use argos_core::p2p::wire::checkpoint_at;
+
+    // Heights with pinned hashes, walked to over p2p and compared.
+    const PINNED: &[u32] = &[100_000, 200_000, 300_000, 419_200];
+
+    let mut peer = Peer::connect(NODE, P2pNetwork::Mainnet)
+        .await
+        .expect("a mainnet peer must accept us");
+
+    let mut locator = [0u8; 32];
+    let mut height: u32 = 0;
+    let mut checked = 0usize;
+    let last = *PINNED.last().expect("non-empty");
+
+    // `<=`, not `<`: the last pinned height must itself be processed. With
+    // `<` the loop exits just before reaching it, and the final checkpoint
+    // is silently never checked — which is exactly what this test caught in
+    // its own first version.
+    while height <= last {
+        let headers = peer.get_headers(&[locator]).await.expect("getheaders");
+        if headers.is_empty() {
+            break;
+        }
+        locator = headers.last().expect("non-empty").hash;
+
+        for header in &headers {
+            // `height` is the height of this header: genesis is 0.
+            if let Some(expected) = checkpoint_at(P2pNetwork::Mainnet, height) {
+                assert_eq!(
+                    header.hash, expected,
+                    "checkpoint at height {height} does not match the real chain — every                      mainnet scan would abort here"
+                );
+                checked += 1;
+                println!("  height {height} matches");
+            }
+            height += 1;
+            if height > last {
+                break;
+            }
+        }
+    }
+
+    assert_eq!(
+        checked,
+        PINNED.len(),
+        "every pinned height must have been reached and checked"
+    );
+    println!("all {checked} mainnet checkpoints match the chain");
+}

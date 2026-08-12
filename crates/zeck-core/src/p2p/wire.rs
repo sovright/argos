@@ -597,6 +597,21 @@ mod tests {
 /// Written in the byte order block explorers and RPCs display, and reversed
 /// to wire order on use.
 const MAINNET_CHECKPOINTS: &[(u32, &str)] = &[
+    // Below Sapling activation. A scan spends its first hours here, and
+    // without these the earliest quarter of the range had no fixed point at
+    // all — a forged chain could run unchallenged from genesis to 419,200.
+    (
+        100_000,
+        "000000001c5c82cd6baccfc0879e3830fd50d5ede17fa2c37a9a253c610eb285",
+    ),
+    (
+        200_000,
+        "000000000338ff96661e133375eaec87f539d4431d2f5dfd1d65b43920859b5b",
+    ),
+    (
+        300_000,
+        "00000000028a321cec9ac8c5e4ed1815fd2614f8e59b20d35b05d6231c15eaf9",
+    ),
     (
         419_200,
         "00000000025a57200d898ac7f21e26bf29028bbe96ec46e05b2c17cc9db9e4f3",
@@ -664,6 +679,35 @@ mod checkpoint_tests {
 
     /// Reversal is easy to get backwards, and a reversed checkpoint would
     /// reject every honest peer instead of catching a hostile one.
+    /// The block immediately before the first upgrade checkpoint, read from
+    /// the same node.
+    ///
+    /// Kept as a test fixture rather than a checkpoint: it is what a
+    /// height-off-by-one actually collides with. A walk that recorded
+    /// genesis as height 1 — which this scanner did until review caught it —
+    /// compares the 419,200 checkpoint against the block at 419,199, and
+    /// this is that block. The two differing is the whole reason the bug was
+    /// detectable at all.
+    const BLOCK_419_199: &str =
+        "00000000025c3b19eb08bbc0d74c0c5e798fcd58b38ecdcdda6b83e5c5945295";
+
+    #[test]
+    fn a_height_off_by_one_would_not_match_its_checkpoint() {
+        let expected = checkpoint_at(P2pNetwork::Mainnet, 419_200).expect("pinned");
+
+        let mut neighbour = [0u8; 32];
+        for (i, slot) in neighbour.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&BLOCK_419_199[i * 2..i * 2 + 2], 16).expect("hex");
+        }
+        neighbour.reverse();
+
+        assert_ne!(
+            expected, neighbour,
+            "the checkpoint must not match its neighbour, or an off-by-one in the walk \
+             would pass silently and the checkpoint would protect nothing"
+        );
+    }
+
     #[test]
     fn checkpoints_convert_to_wire_order() {
         let wire = checkpoint_at(P2pNetwork::Mainnet, 1_046_400).expect("pinned");
