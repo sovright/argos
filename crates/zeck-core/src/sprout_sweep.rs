@@ -237,6 +237,27 @@ pub fn build_sweep_for_note(
             ZeckError::TransactionBuild("the Sapling bundle has no output".to_owned())
         })?;
 
+    // Cross-check the fee against the transaction actually assembled,
+    // before signing. SPROUT_SWEEP_FEE is a constant derived from an
+    // expected shape; this asks the built bundle how many outputs it really
+    // has, which is what ZIP 317 charges for. The two can only agree by
+    // accident if the shape ever changes -- a second real output, a
+    // transparent leg, a different BundleType -- and the failure mode is
+    // silent: underpay and the node never relays it, overpay and the
+    // difference is burned. The transparent sweep guards this the same way
+    // via the builder's own get_fee, and this path had nothing.
+    let sapling_outputs = bundle.shielded_outputs().len() as u64;
+    let expected_actions = 2 + sapling_outputs.max(0);
+    let expected_fee = expected_actions * ZAT_PER_ACTION;
+    if expected_fee != SPROUT_SWEEP_FEE {
+        return Err(ZeckError::TransactionBuild(format!(
+            "this sweep would pay {SPROUT_SWEEP_FEE} zatoshi but the transaction as \
+             assembled needs {expected_fee} ({expected_actions} logical actions: one \
+             JoinSplit plus {sapling_outputs} Sapling output(s)). Refusing to sign rather \
+             than broadcast a transaction that would be rejected or overpay."
+        )));
+    }
+
     let tx = sprout_spend::build_and_sign_v4_sprout_to_sapling(
         branch_id,
         expiry_height,
@@ -615,8 +636,29 @@ mod tests {
     /// looks like a network problem rather than a fee problem.
     #[test]
     fn the_fee_accounts_for_saplings_padded_output() {
-        assert_eq!(SPROUT_SWEEP_FEE, 20_000);
-        assert_eq!(ACTIONS_PER_SWEEP, 4);
+        // This used to assert SPROUT_SWEEP_FEE == 20_000 and
+        // ACTIONS_PER_SWEEP == 4, both of which restate their own
+        // definitions and cannot fail. Raised in review of #189.
+        //
+        // What actually needs pinning is the padding: BundleType::DEFAULT
+        // raises a single requested output to MIN_SHIELDED_OUTPUTS, so one
+        // output is billed as two. Ask the bundle type rather than assume,
+        // which is what the constant's own doc says to do.
+        let padded = sapling_crypto::builder::BundleType::DEFAULT
+            .num_outputs(0, 1)
+            .expect("a one-output bundle is valid");
+        assert_eq!(
+            padded, 2,
+            "a single Sapling output is padded to MIN_SHIELDED_OUTPUTS and billed as two"
+        );
+
+        let actions = 2 + padded as u64;
+        assert_eq!(
+            actions * ZAT_PER_ACTION,
+            SPROUT_SWEEP_FEE,
+            "the constant must equal what ZIP 317 charges for the shape this sweep \
+             actually builds, not merely equal itself"
+        );
     }
 
     #[test]
