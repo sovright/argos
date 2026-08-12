@@ -247,7 +247,9 @@ pub fn build_sweep_for_note(
     // difference is burned. The transparent sweep guards this the same way
     // via the builder's own get_fee, and this path had nothing.
     let sapling_outputs = bundle.shielded_outputs().len() as u64;
-    let expected_actions = 2 + sapling_outputs.max(0);
+    // ZIP 317 charges max(spends, outputs) for the Sapling side; there are
+    // no Sapling spends in a Sprout sweep, so it is the output count.
+    let expected_actions = 2 + sapling_outputs;
     let expected_fee = expected_actions * ZAT_PER_ACTION;
     if expected_fee != SPROUT_SWEEP_FEE {
         return Err(ZeckError::TransactionBuild(format!(
