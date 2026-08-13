@@ -28,6 +28,22 @@ fn ensure_tos_accepted(app: &AppHandle) -> Result<(), String> {
     ensure_tos_accepted_for_base(&base)
 }
 
+/// Drop any Sprout key that does not control the address it was filed under,
+/// emitting a `sprout-forged-key` event for each so the frontend can surface
+/// it. Mirrors the CLI loader and the `inspect` command, so the GUI's
+/// scan/preview/sweep paths do not silently trial-decrypt against a forged
+/// key. A forged key finds no notes (and the downstream commitment check
+/// stops it from ever spending someone else's), but without this the user
+/// gets an unexplained empty result instead of the reason.
+fn drop_and_warn_forged_sprout_keys(
+    app: &AppHandle,
+    keys: &mut argos_core::argos_wallet_import::ImportedKeys,
+) {
+    for forged in argos_core::sprout_recovery::reject_forged_sprout_keys(keys) {
+        let _ = app.emit("sprout-forged-key", forged.to_string());
+    }
+}
+
 fn ensure_tos_accepted_for_base(base: &Path) -> Result<(), String> {
     if argos_core::is_tos_accepted(base) {
         Ok(())
@@ -288,9 +304,10 @@ pub async fn start_scan_from_wallet_file(
 
     let bytes =
         fs::read(&config.path).map_err(|err| format!("could not read {}: {err}", config.path))?;
-    let keys =
+    let mut keys =
         argos_core::argos_wallet_import::import_wallet_file(&bytes, config.passphrase.as_ref())
             .map_err(|err| err.to_string())?;
+    drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
     let key_source: Arc<dyn argos_core::KeySource> =
         Arc::new(argos_core::ImportedKeySource::new(keys));
@@ -524,8 +541,9 @@ pub async fn preview_sprout_sweep(
     ensure_tos_accepted(&app)?;
 
     let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
-    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
+    let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
         .map_err(|err| err.to_string())?;
+    drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
     let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
     let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
@@ -587,8 +605,9 @@ pub async fn execute_sprout_sweep(
     };
 
     let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
-    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
+    let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
         .map_err(|err| err.to_string())?;
+    drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
     let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
     if recovered.notes.is_empty() {
@@ -687,8 +706,13 @@ fn collect_scan_keys(
 
     if let Some(path) = path {
         let bytes = fs::read(path).map_err(|err| format!("could not read {path}: {err}"))?;
-        let wallet = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
+        let mut wallet = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
             .map_err(|err| err.to_string())?;
+        // Drop any Sprout key that does not control its stored address before
+        // it is trial-decrypted against — parity with the CLI loader and the
+        // sweep commands. No AppHandle here to warn on; the sweep/preview
+        // paths surface it, and a forged key would find nothing regardless.
+        let _ = argos_core::sprout_recovery::reject_forged_sprout_keys(&mut wallet);
         for key in &wallet.sprout {
             keys.push(*key.a_sk.expose_secret());
         }
