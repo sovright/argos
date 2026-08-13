@@ -216,6 +216,48 @@ impl From<argos_wallet_import::ImportError> for ZeckError {
     }
 }
 
+/// How a recovered key set must be scanned.
+///
+/// One definition, because there were three and they disagreed. The CLI
+/// required `mnemonic.is_none()`, the GUI omitted that clause, and the core
+/// refusal in `run_recovery_scan_inner` tested `sapling.is_empty()` alone —
+/// so a ZecWallet Lite wallet (mnemonic present, no standalone Sapling keys)
+/// classified as transparent-only in the GUI and as HD in the CLI, for the
+/// same file. Predicates that must agree do not stay agreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRoute {
+    /// A BIP-39 mnemonic is present, so the ordinary HD gap scan applies —
+    /// including a decrypted ZecWallet Lite wallet, which re-enters the
+    /// normal pipeline exactly like a typed seed phrase.
+    Hd,
+    /// Seedless with Sapling keys: one imported account per key, with the
+    /// transparent keys attached to the first as standalone receivers, so a
+    /// single sync covers both pools.
+    ImportedAccounts,
+    /// Seedless with transparent keys only. ZIP-316 forbids a
+    /// transparent-only unified container, so no account can be created and
+    /// the account model is bypassed entirely.
+    TransparentOnly,
+    /// Nothing recoverable. Refused rather than scanned as zero accounts: a
+    /// successful-but-empty scan is the failure mode a user recovering real
+    /// funds would most easily mistake for an answer.
+    Nothing,
+}
+
+/// Classify a key set. Order matters: the mnemonic wins, because a wallet
+/// that has one can derive everything else.
+pub fn classify_recovery_route(keys: &ImportedKeys) -> RecoveryRoute {
+    if keys.mnemonic.is_some() {
+        RecoveryRoute::Hd
+    } else if !keys.sapling.is_empty() {
+        RecoveryRoute::ImportedAccounts
+    } else if !keys.transparent.is_empty() {
+        RecoveryRoute::TransparentOnly
+    } else {
+        RecoveryRoute::Nothing
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

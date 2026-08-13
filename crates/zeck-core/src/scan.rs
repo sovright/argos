@@ -415,13 +415,28 @@ async fn run_recovery_scan_inner(
                     config.key_source.describe()
                 ))
             })?;
-            if keys.sapling.is_empty() {
-                return Err(ZeckError::InvalidConfig(format!(
-                    "{} has no Sapling keys and no HD seed, so it cannot be given a wallet \
-                     account (ZIP 316 forbids a transparent-only unified viewing key). Its \
-                     transparent funds are recoverable through the transparent-only path.",
-                    config.key_source.describe()
-                )));
+            // Routing lives here, in core, so both surfaces get the same
+            // answer for the same file. This branch used to refuse with a
+            // message naming the transparent-only path — which only the CLI
+            // implemented, at its own front end. The GUI handed the same
+            // wallet straight here and showed the user that refusal, telling
+            // them their recoverable funds were unrecoverable. A
+            // transparent-only `wallet.dat` is the most common legacy zcashd
+            // shape, so that was the default experience for it.
+            match crate::key_source::classify_recovery_route(keys) {
+                crate::key_source::RecoveryRoute::TransparentOnly => {
+                    return run_transparent_only_scan(state, &config, keys).await;
+                }
+                crate::key_source::RecoveryRoute::Nothing => {
+                    return Err(ZeckError::InvalidConfig(format!(
+                        "{} contains no transparent or Sapling keys, so there is nothing \
+                         to scan.",
+                        config.key_source.describe()
+                    )));
+                }
+                // A mnemonic would have produced a seed above, so `Hd` is
+                // unreachable here; `ImportedAccounts` falls through.
+                _ => {}
             }
             return run_imported_scan(state, &config, keys).await;
         }
@@ -650,10 +665,7 @@ async fn run_recovery_scan_inner(
 /// Shared by the HD and imported paths so the two cannot drift on what a
 /// finished scan looks like — the summary, the total, and the sidecar flip
 /// that stops the resume list from re-offering this workspace.
-async fn finish_scan(
-    state: &SharedScanTaskState,
-    workspace: &RecoveryWorkspace,
-) -> ZeckResult<()> {
+async fn finish_scan(state: &SharedScanTaskState, workspace: &RecoveryWorkspace) -> ZeckResult<()> {
     let (workspace_dir, total_zatoshis) = {
         let guard = state.lock().await;
         let total = guard
@@ -790,6 +802,100 @@ fn build_account_preview(account: &DerivedAccount) -> AccountBalancePreview {
 /// Transparent keys are covered here too, without a second pass: they are
 /// attached to the first account as standalone receivers, so
 /// `zcash_client_sqlite` scans them alongside the shielded notes.
+/// Scan a wallet that has transparent keys and nothing else.
+///
+/// No workspace sync and no wallet database: ZIP-316 forbids a
+/// transparent-only unified container, so there is no account to anchor and
+/// nothing for the shielded scanner to walk. `GetAddressUtxos` answers the
+/// whole question directly, which is also why this returns in seconds rather
+/// than hours.
+///
+/// Lives in core rather than in either front end so both get it. The CLI
+/// implemented this at its own dispatch and the GUI did not, so the same
+/// wallet file recovered funds in one surface and reported them unrecoverable
+/// in the other.
+async fn run_transparent_only_scan(
+    state: SharedScanTaskState,
+    config: &RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+) -> ZeckResult<()> {
+    let transparent = crate::imported::imported_transparent_keys(keys)?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningTransparent;
+        guard.progress.message = Some(format!(
+            "Checking {} transparent address(es). This wallet has no shielded keys, so no \
+             block scan is needed.",
+            transparent.len()
+        ));
+    }
+
+    let report = crate::transparent_recovery::scan_transparent_only(
+        &transparent,
+        config.network,
+        &config.lightwalletd_url,
+    )
+    .await?;
+
+    // A workspace is still created: `finish_scan` writes the session sidecar
+    // there, and a transparent-only scan should appear in the session list
+    // like any other.
+    let workspace = RecoveryWorkspace::from_runtime(config)?;
+    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.workspace = Some(workspace.clone());
+        guard.progress.synced_to_height = Some(u64::from(report.chain_tip_height));
+
+        // One preview row, because there is exactly one thing to report: this
+        // key set's transparent total. The shielded fields stay zero and the
+        // addresses stay empty rather than being filled with something
+        // plausible — a wallet with no Sapling key has no Sapling address, and
+        // inventing one would misrepresent what was searched.
+        guard.progress.accounts = vec![crate::models::AccountBalancePreview {
+            account_index: 0,
+            sapling_address: String::new(),
+            unified_address: String::new(),
+            transparent_receive_address: report
+                .funded
+                .first()
+                .map(|f| f.address.clone())
+                .unwrap_or_default(),
+            transparent_change_address: String::new(),
+            transparent_utxo_count: report
+                .funded
+                .iter()
+                .fold(0u32, |acc, f| acc.saturating_add(f.utxo_count)),
+            sapling_zatoshis: 0,
+            orchard_zatoshis: 0,
+            transparent_zatoshis: report.total_zatoshis,
+            total_zatoshis: report.total_zatoshis,
+            has_activity: report.total_zatoshis > 0,
+            status: format!(
+                "{} transparent address(es) checked, {} funded",
+                report.addresses_checked,
+                report.funded.len()
+            ),
+        }];
+
+        // Appended, never replaced: the pump loops in the CLI and Tauri emit
+        // only the tail of this vector on each tick.
+        for funded in &report.funded {
+            guard.progress.discoveries.push(crate::models::ScanDiscovery {
+                account_index: 0,
+                pool: crate::models::DiscoveryPool::Transparent,
+                zatoshis: funded.zatoshis,
+                at_block_height: u64::from(report.chain_tip_height),
+                address: funded.address.clone(),
+            });
+        }
+    }
+
+    finish_scan(&state, &workspace).await
+}
+
 async fn run_imported_scan(
     state: SharedScanTaskState,
     config: &RuntimeScanConfig,
@@ -839,8 +945,9 @@ async fn run_imported_scan(
     {
         let mut guard = state.lock().await;
         guard.progress.phase = ScanPhase::ProbingLightwalletd;
-        guard.progress.message =
-            Some(format!("Connecting to {configured_endpoints} and checking chain metadata."));
+        guard.progress.message = Some(format!(
+            "Connecting to {configured_endpoints} and checking chain metadata."
+        ));
     }
 
     let _ = default_provider().install_default();
@@ -929,8 +1036,7 @@ async fn run_imported_scan(
     // on a full chain scan.
     if !resolved_transparent.is_empty() {
         if let Err(err) =
-            run_imported_transparent_probe(&state, &mut client, &resolved_transparent, config)
-                .await
+            run_imported_transparent_probe(&state, &mut client, &resolved_transparent, config).await
         {
             warn!("transparent quick probe failed (continuing with shielded scan): {err}");
         }
@@ -994,9 +1100,9 @@ async fn run_imported_transparent_probe(
         return Ok(());
     }
 
-    let total = utxos
-        .iter()
-        .fold(0u64, |acc, u| acc.saturating_add(u64::from(u.txout.value())));
+    let total = utxos.iter().fold(0u64, |acc, u| {
+        acc.saturating_add(u64::from(u.txout.value()))
+    });
     let count = u32::try_from(utxos.len()).unwrap_or(u32::MAX);
 
     let mut guard = state.lock().await;
@@ -2631,14 +2737,11 @@ mod tests {
         #[tokio::test]
         async fn a_seedless_key_source_is_refused_rather_than_scanned_as_empty() {
             use crate::key_source::{ImportedKeySource, KeySource};
-            use argos_wallet_import::keys::{Provenance, TransparentKey};
-            use secrecy::Secret;
-
-            let mut keys = argos_wallet_import::ImportedKeys::default();
-            keys.transparent.push(TransparentKey {
-                secret: Secret::new([0x42; 32]),
-                provenance: Provenance::Standalone,
-            });
+            // Genuinely empty: no seed, no keys of any kind. A
+            // transparent-only wallet is *not* this case — it has a real
+            // recovery route (see the test below), and treating it as a
+            // refusal is the bug that dead-ended the GUI.
+            let keys = argos_wallet_import::ImportedKeys::default();
             let source = ImportedKeySource::new(keys);
             // Non-vacuous: if this source ever grows a seed, the assertion
             // below would pass for the wrong reason.
@@ -2654,13 +2757,60 @@ mod tests {
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
             let err = super::super::run_recovery_scan_inner(state, config)
                 .await
-                .expect_err("a seedless key source must not scan successfully");
+                .expect_err("a key source with nothing in it must not scan successfully");
 
             let rendered = err.to_string();
             assert!(
-                rendered.contains("no HD seed"),
+                rendered.contains("nothing to scan"),
                 "the refusal must say why, got: {rendered}"
             );
+        }
+
+        /// A transparent-only wallet must be routed, not refused.
+        ///
+        /// This is the most common legacy zcashd shape. Core used to refuse
+        /// it with a message naming a transparent-only path that only the CLI
+        /// implemented, at its own front end — so the GUI handed the same file
+        /// here and told the user their recoverable funds were unrecoverable.
+        ///
+        /// The scan itself needs a node, so what is pinned is the routing
+        /// decision: it must not come back as the `InvalidConfig` refusal.
+        /// Reaching the network and failing there is a pass — that is past the
+        /// point where the old code gave up.
+        #[tokio::test]
+        async fn a_transparent_only_wallet_is_routed_rather_than_refused() {
+            use argos_wallet_import::keys::{Provenance, TransparentKey};
+            use secrecy::Secret;
+
+            let mut keys = argos_wallet_import::ImportedKeys::default();
+            keys.transparent.push(TransparentKey {
+                secret: Secret::new([0x42; 32]),
+                provenance: Provenance::Standalone,
+            });
+            assert_eq!(
+                crate::key_source::classify_recovery_route(&keys),
+                crate::key_source::RecoveryRoute::TransparentOnly,
+                "fixture must classify as transparent-only or this test proves nothing"
+            );
+
+            let source = crate::key_source::ImportedKeySource::new(keys);
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let mut config = test_config(tempdir.path().to_owned());
+            config.key_source = Arc::new(source);
+            // Unroutable on purpose: the routing decision happens before any
+            // connection, so this fails at the network rather than at config.
+            config.lightwalletd_url = "https://127.0.0.1:1".to_owned();
+
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let result = super::super::run_recovery_scan_inner(state, config).await;
+
+            if let Err(err) = result {
+                assert!(
+                    !matches!(err, crate::error::ZeckError::InvalidConfig(_)),
+                    "a transparent-only wallet must be routed to the transparent path, \
+                     not refused as unscannable; got: {err}"
+                );
+            }
         }
 
         fn test_config(data_dir: std::path::PathBuf) -> RuntimeScanConfig {

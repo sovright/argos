@@ -374,7 +374,10 @@ async fn run_transparent_sweep(
 /// both pools in one pass. Routing such a wallet here instead would report
 /// its transparent balance while silently ignoring its Sapling notes.
 fn is_transparent_only(keys: &ImportedKeys) -> bool {
-    keys.mnemonic.is_none() && keys.sapling.is_empty() && !keys.transparent.is_empty()
+    // One shared classifier: this predicate, the GUI's, and core's refusal
+    // were three different definitions that had to agree and did not.
+    argos_core::key_source::classify_recovery_route(keys)
+        == argos_core::key_source::RecoveryRoute::TransparentOnly
 }
 
 /// Warn — unmissably — about every pool this recovery will not cover.

@@ -362,95 +362,45 @@ pub fn parse_sapling_destination_kind(
     destination: &str,
     network: crate::ZeckNetwork,
 ) -> ZeckResult<(sapling_crypto::PaymentAddress, DestinationKind)> {
-    use zcash_address::{
-        unified::{Container, Receiver},
-        ConversionError, TryFromAddress, ZcashAddress,
-    };
-    use zcash_protocol::consensus::NetworkType;
+    // Shares the receiver walk with `transparent_recovery` via
+    // `address::find_sapling_receiver`; the two used to carry ~85
+    // near-identical lines each and the same review finding had to be applied
+    // twice. The error vocabularies stay separate on purpose: this path
+    // explains *why* Sprout needs a Sapling output, which is the thing users
+    // get wrong, while the transparent path returns typed variants its tests
+    // match on. Merging those would have silently changed one of them.
+    use crate::address::{find_sapling_receiver, ReceiverLookupError, SaplingReceiver};
 
-    let parsed = ZcashAddress::try_from_encoded(destination).map_err(|err| {
-        ZeckError::InvalidAddress(format!("{destination} is not a Zcash address: {err}"))
-    })?;
-
-    /// Absent and malformed are different problems with different fixes,
-    /// and were reported identically before — the same defect raised in
-    /// review of #187 for the transparent path.
-    enum FoundReceiver {
-        Address(sapling_crypto::PaymentAddress, DestinationKind),
-        Malformed,
-        Absent,
-    }
-
-    struct Found(FoundReceiver);
-    impl TryFromAddress for Found {
-        type Error = &'static str;
-
-        fn try_from_sapling(
-            _net: NetworkType,
-            data: [u8; 43],
-        ) -> Result<Self, ConversionError<Self::Error>> {
-            Ok(Found(
-                sapling_crypto::PaymentAddress::from_bytes(&data)
-                    .map(|a| FoundReceiver::Address(a, DestinationKind::BareSapling))
-                    .unwrap_or(FoundReceiver::Malformed),
-            ))
-        }
-
-        fn try_from_unified(
-            _net: NetworkType,
-            ua: zcash_address::unified::Address,
-        ) -> Result<Self, ConversionError<Self::Error>> {
-            for receiver in ua.items() {
-                if let Receiver::Sapling(data) = receiver {
-                    return Ok(Found(
-                        sapling_crypto::PaymentAddress::from_bytes(&data)
-                            .map(|a| {
-                                FoundReceiver::Address(a, DestinationKind::SaplingReceiverOfUnified)
-                            })
-                            .unwrap_or(FoundReceiver::Malformed),
-                    ));
-                }
-            }
-            Ok(Found(FoundReceiver::Absent))
-        }
-    }
-
-    let want = match network {
-        crate::ZeckNetwork::Mainnet => NetworkType::Main,
-        crate::ZeckNetwork::Testnet => NetworkType::Test,
-    };
-    // Two very different failures arrive here and must not share a message.
-    // A network mismatch means "you pasted a testnet address"; an
-    // unsupported kind means "this address can never receive Sprout value".
-    // Reporting a mainnet t-address as "not valid on this network" — which
-    // it was, until this was split — sends someone checking their network
-    // setting when the address itself is the problem.
-    let found: Found = parsed.convert_if_network(want).map_err(|err| match err {
-        ConversionError::IncorrectNetwork { expected, actual } => {
-            ZeckError::InvalidAddress(format!(
-                "{destination} is a {actual:?} address, but this is a {expected:?} sweep. \
-                 Check the --network setting, or paste the address for this network."
-            ))
-        }
-        other => ZeckError::InvalidAddress(format!(
-            "{destination} cannot receive Sprout funds ({other}). Sprout value leaves the \
-             pool through the transparent pool and must be consumed by a Sapling output \
-             in the same transaction, so the destination needs a Sapling receiver."
+    match find_sapling_receiver(destination, network) {
+        Ok(SaplingReceiver::Found(address, from_unified)) => Ok((
+            address,
+            if from_unified {
+                DestinationKind::SaplingReceiverOfUnified
+            } else {
+                DestinationKind::BareSapling
+            },
         )),
-    })?;
-
-    match found.0 {
-        FoundReceiver::Address(address, kind) => Ok((address, kind)),
-        FoundReceiver::Malformed => Err(ZeckError::MalformedReceiver(format!(
+        Ok(SaplingReceiver::Malformed) => Err(ZeckError::MalformedReceiver(format!(
             "{destination} carries a Sapling receiver whose bytes do not decode. The \
              address is damaged rather than the wrong kind — re-copy it from your wallet \
              rather than looking for a different one."
         ))),
-        FoundReceiver::Absent => Err(ZeckError::InvalidAddress(format!(
-            "{destination} has no Sapling receiver. Sprout value leaves the pool through \
-             the transparent pool and must be consumed by a Sapling output in the same \
-             transaction, so a transparent-only or Orchard-only destination cannot \
-             receive it."
+        Ok(SaplingReceiver::Absent) | Err(ReceiverLookupError::Unsupported(_)) => {
+            Err(ZeckError::InvalidAddress(format!(
+                "{destination} has no Sapling receiver. Sprout value leaves the pool \
+                 through the transparent pool and must be consumed by a Sapling output in \
+                 the same transaction, so a transparent-only or Orchard-only destination \
+                 cannot receive it."
+            )))
+        }
+        Err(ReceiverLookupError::IncorrectNetwork { expected, actual }) => {
+            Err(ZeckError::InvalidAddress(format!(
+                "{destination} is a {actual} address, but this is a {expected} sweep. \
+                 Check the --network setting, or paste the address for this network."
+            )))
+        }
+        Err(ReceiverLookupError::NotAnAddress(err)) => Err(ZeckError::InvalidAddress(format!(
+            "{destination} is not a Zcash address: {err}"
         ))),
     }
 }

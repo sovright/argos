@@ -330,86 +330,30 @@ pub fn sapling_receiver(
     destination: &str,
     network: ZeckNetwork,
 ) -> ZeckResult<sapling::PaymentAddress> {
-    use zcash_address::{unified::Container, ConversionError, TryFromAddress, ZcashAddress};
+    // The receiver walk is shared with `sprout_sweep`; the error vocabulary
+    // is not. This path returns typed variants and its tests match on them,
+    // precisely so rewording a message cannot silently change behaviour.
+    use crate::address::{find_sapling_receiver, ReceiverLookupError, SaplingReceiver};
 
-    // Note: the `try_from_sapling` arm below is unreachable through this
-    // function. `validate_destination_address` rejects every non-unified
-    // address first, so a bare `zs1…` never gets here. Raised in review of
-    // #187. Left in place because the arm is required by the trait, but do
-    // not "fix" the ordering to reach it — the unified-only rule is what
-    // guarantees a destination the sweep can actually pay.
-    /// `Found` distinguishes a receiver that is absent from one that is
-    /// present but does not decode — reported as the same thing before, so a
-    /// user with a corrupt unified address was told to find one with a
-    /// Sapling receiver, which theirs already had. Raised in review of #187.
-    enum Found {
-        Address(sapling::PaymentAddress),
-        Malformed,
-        Absent,
-    }
-
-    struct SaplingOnly(Found);
-
-    impl TryFromAddress for SaplingOnly {
-        type Error = &'static str;
-
-        fn try_from_sapling(
-            _net: zcash_protocol::consensus::NetworkType,
-            data: [u8; 43],
-        ) -> Result<Self, ConversionError<Self::Error>> {
-            // A present-but-undecodable receiver is not an absent one; see
-            // the `MalformedReceiver` handling below.
-            Ok(SaplingOnly(
-                sapling::PaymentAddress::from_bytes(&data)
-                    .map(Found::Address)
-                    .unwrap_or(Found::Malformed),
-            ))
+    match find_sapling_receiver(destination, network) {
+        Ok(SaplingReceiver::Found(address, _)) => Ok(address),
+        Ok(SaplingReceiver::Malformed) => Err(ZeckError::MalformedReceiver(format!(
+            "{destination} carries a Sapling receiver whose bytes do not decode. The \
+             address is damaged rather than the wrong kind — re-copy it from your wallet \
+             rather than looking for a different one."
+        ))),
+        Ok(SaplingReceiver::Absent) => Err(ZeckError::UnsupportedDestination),
+        // A bare transparent address is refused for what it is, before any
+        // question of networks: no t-address can ever receive shielded value,
+        // so blaming the network setting would send the user to fix the one
+        // thing that is not wrong.
+        Err(ReceiverLookupError::Unsupported(_)) => Err(ZeckError::DestinationMustBeUnified),
+        Err(ReceiverLookupError::IncorrectNetwork { expected, actual }) => {
+            Err(ZeckError::WrongNetwork { expected, actual })
         }
-
-        fn try_from_unified(
-            _net: zcash_protocol::consensus::NetworkType,
-            data: zcash_address::unified::Address,
-        ) -> Result<Self, ConversionError<Self::Error>> {
-            for receiver in data.items() {
-                if let zcash_address::unified::Receiver::Sapling(bytes) = receiver {
-                    return Ok(SaplingOnly(
-                        sapling::PaymentAddress::from_bytes(&bytes)
-                            .map(Found::Address)
-                            .unwrap_or(Found::Malformed),
-                    ));
-                }
-            }
-            Ok(SaplingOnly(Found::Absent))
-        }
-    }
-
-    let parsed = ZcashAddress::try_from_encoded(destination)
-        .map_err(|err| ZeckError::InvalidAddress(format!("could not decode destination: {err}")))?;
-
-    // Reject a destination for the wrong network before anything is signed.
-    crate::address::validate_destination_address(destination, network)?;
-
-    let SaplingOnly(receiver) = parsed
-        .convert::<SaplingOnly>()
-        .map_err(|err| ZeckError::InvalidAddress(format!("unsupported destination: {err}")))?;
-
-    match receiver {
-        Found::Address(address) => Ok(address),
-        // Present but undecodable. Telling this user to "use a different
-        // destination address" would send them hunting for a property their
-        // address already has; what they need is a clean copy of it.
-        Found::Malformed => Err(ZeckError::MalformedReceiver(
-            "this destination carries a Sapling receiver, but its bytes do not decode. \
-             The address is damaged rather than the wrong kind — re-copy it from your \
-             wallet rather than looking for a different one."
-                .to_owned(),
-        )),
-        Found::Absent => Err(ZeckError::InvalidAddress(
-            "this destination has no Sapling receiver. Transparent-only wallet recovery \
-             pays into the Sapling pool, so the destination must expose a Sapling \
-             receiver; most unified addresses do. Use a different destination address."
-                .to_owned(),
-        )),
+        Err(ReceiverLookupError::NotAnAddress(err)) => Err(ZeckError::InvalidAddress(format!(
+            "{destination} is not a Zcash address: {err}"
+        ))),
     }
 }
 

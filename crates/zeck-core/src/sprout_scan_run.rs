@@ -229,7 +229,7 @@ pub async fn run_sprout_scan(
 
     let cursor = scanner.cursor();
     // An all-zero locator asks the peer to start from genesis.
-    let mut locator = cursor.map_or([0u8; 32], |c| c.last_block_hash);
+    let locator = cursor.map_or([0u8; 32], |c| c.last_block_hash);
     // `height` is the height of the *next* block to scan, and the block being
     // scanned is checkpointed and recorded at this value before it is
     // incremented. A fresh scan begins at genesis (height 0): the all-zero
@@ -238,101 +238,67 @@ pub async fn run_sprout_scan(
     // last block it recorded.
     let mut height = first_scan_height(cursor);
     let mut since_checkpoint = 0u64;
-    let mut empty_replies = 0u32;
 
     let mut peer = connect_peer(network, extra_peers, &[]).await?;
 
-    while height < target {
-        let headers = match peer.get_headers(&[locator]).await {
-            Ok(h) if !h.is_empty() => h,
-            // NOT a clean end of chain. `target` is a fixed pre-Canopy
-            // height every synced peer has, so an empty reply below it means
-            // this peer cannot serve us — under-synced, on another chain, or
-            // lying. Treating it as completion is the worst failure here: a
-            // tree truncated at a block boundary is a *genuine historical
-            // tree state*, so witnesses still verify and spend, but
-            // nullifiers published after the cut were never collected and a
-            // spent note gets offered as spendable.
-            Ok(_) => {
-                peer = connect_peer(network, extra_peers, &[]).await?;
-                empty_replies += 1;
-                if empty_replies > MAX_EMPTY_REPLIES {
-                    return Err(ZeckError::Broadcast(format!(
-                        "no peer would serve blocks past height {height} of {target}. The \
-                         scan is incomplete and its results would be wrong, so it stops \
-                         here rather than reporting a balance it cannot stand behind. \
-                         Progress is saved; re-run to continue."
-                    )));
+    // Fetching runs one page ahead of scanning.
+    //
+    // The loop used to be strictly serial: headers, then blocks, then parse
+    // and trial-decrypt, with the network idle for the whole CPU phase and
+    // the CPU idle for the whole download. On a scan measured in hours that
+    // wastes roughly half the wall clock.
+    //
+    // Only fetching and page *validation* move here. Height accounting,
+    // checkpoint comparison, tree appends and note discovery all stay in the
+    // consumer below, in the same order, so the invariant that every
+    // commitment is appended exactly once and in chain order is preserved by
+    // construction rather than by argument — this task cannot reorder or drop
+    // a page, because it only ever sends whole validated pages in sequence.
+    //
+    // Capacity 1: at most one page sits between fetch and scan, and
+    // `get_blocks` already bounds a page by `MAX_BLOCKS_BYTES`.
+    type Page = Vec<([u8; 32], Vec<u8>)>;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ZeckResult<Page>>(1);
+    let fetch_target = target;
+    let fetch_peers: Vec<String> = extra_peers.to_vec();
+    let fetch_task = tokio::spawn(async move {
+        let mut locator = locator;
+        let mut fetched = height;
+        let mut empty_replies = 0u32;
+        while fetched < fetch_target {
+            let page = fetch_one_page(
+                &mut peer,
+                &mut locator,
+                &mut empty_replies,
+                fetched,
+                fetch_target,
+                network,
+                &fetch_peers,
+            )
+            .await;
+            match page {
+                Ok(None) => continue,
+                Ok(Some(page)) => {
+                    fetched += page.len() as u32;
+                    if tx.send(Ok(page)).await.is_err() {
+                        return;
+                    }
                 }
-                continue;
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
             }
-            Err(_) => {
-                // Reconnecting to the same peer would be refused for the
-                // next two minutes regardless, so take a different one.
-                peer = connect_peer(network, extra_peers, &[]).await?;
-                continue;
-            }
-        };
-
-        // Every header must carry its own proof of work. With the
-        // checkpoints below bounding where a forgery can start, this bounds
-        // how cheaply one can be built in between: a peer must do real work
-        // per header, not merely link cheap ones together.
-        if headers
-            .iter()
-            .any(|h| crate::p2p::wire::verify_header_pow(network, h).is_err())
-        {
-            peer = connect_peer(network, extra_peers, &[]).await?;
-            empty_replies += 1;
-            if empty_replies > MAX_EMPTY_REPLIES {
-                return Err(ZeckError::Broadcast(format!(
-                    "no peer would serve headers with valid proof of work from height \
-                     {height}. The scan stops rather than walk a chain it cannot verify."
-                )));
-            }
-            continue;
         }
+    });
 
-        // The peer must be continuing from exactly where we asked, and the
-        // page must itself be a chain. A peer that does not recognise the
-        // locator serves from genesis, which would re-append the whole
-        // prefix into a tree that already contains it; a peer starting
-        // partway would skip the blocks before it. Either silently shifts
-        // every later commitment position.
-        //
-        // Checked at height 0 too, deliberately: genesis's own prev_hash is
-        // all zeros, which is exactly the starting locator, so this needs no
-        // special case. An earlier version guarded it with `height > 0` and
-        // thereby accepted a first page starting anywhere at all — a scan
-        // that skipped blocks 0..n and reported success.
-        let page_is_continuous = headers[0].prev_hash == locator
-            && headers.windows(2).all(|w| w[1].prev_hash == w[0].hash);
-        if !page_is_continuous {
-            peer = connect_peer(network, extra_peers, &[]).await?;
-            // Counted against the same budget as an empty reply: a peer
-            // that answers with an unusable page is no more useful than one
-            // that answers with nothing, and without this the scan switches
-            // peers forever rather than stopping with an explanation.
-            empty_replies += 1;
-            if empty_replies > MAX_EMPTY_REPLIES {
-                return Err(ZeckError::Broadcast(format!(
-                    "no peer would serve a usable chain of blocks from height {height}. \
-                     The scan is incomplete and its results would be wrong, so it stops \
-                     here. Progress is saved; re-run to continue."
-                )));
-            }
-            continue;
-        }
-        empty_replies = 0;
-
-        let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
-        let blocks = match peer.get_blocks(&hashes).await {
-            Ok(b) => b,
-            Err(_) => {
-                peer = connect_peer(network, extra_peers, &[]).await?;
-                continue;
-            }
+    while height < target {
+        let Some(page) = rx.recv().await else {
+            break;
         };
+        let page = page?;
+        let hashes: Vec<[u8; 32]> = page.iter().map(|(hash, _)| *hash).collect();
+        let blocks: std::collections::HashMap<[u8; 32], Vec<u8>> = page.into_iter().collect();
 
         // Consumed in header order, looked up by hash. The peer's reply
         // order is not trusted to mean anything.
@@ -382,8 +348,6 @@ pub async fn run_sprout_scan(
             height += 1;
         }
 
-        locator = *hashes.last().expect("non-empty");
-
         if since_checkpoint >= CHECKPOINT_EVERY {
             save_checkpoint(&scanner, checkpoint_file)?;
             since_checkpoint = 0;
@@ -398,11 +362,150 @@ pub async fn run_sprout_scan(
         });
     }
 
+    // The consumer may finish before the fetcher (target reached mid-page).
+    // Dropping the receiver already makes the next `send` fail and the task
+    // return, but abort it explicitly so a peer connection is not held open
+    // for however long the current request takes to time out.
+    fetch_task.abort();
+
     save_checkpoint(&scanner, checkpoint_file)?;
 
     scanner
         .finish()
         .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")))
+}
+
+/// Fetch and validate one page of blocks.
+///
+/// `Ok(None)` means "this peer was no good; a new one is connected, try
+/// again" — the caller loops. Every check that decides whether a page may be
+/// scanned at all lives here: proof of work, continuity with the locator, and
+/// the internal linkage of the page. What deliberately does *not* live here is
+/// anything positional — checkpoint comparison and the tree append stay with
+/// the scanner, keyed on the true height, so this function cannot affect where
+/// a commitment lands.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_one_page(
+    peer: &mut crate::p2p::peer::Peer,
+    locator: &mut [u8; 32],
+    empty_replies: &mut u32,
+    height: u32,
+    target: u32,
+    network: P2pNetwork,
+    extra_peers: &[String],
+) -> ZeckResult<Option<Vec<([u8; 32], Vec<u8>)>>> {
+    let headers = match peer.get_headers(&[*locator]).await {
+        Ok(h) if !h.is_empty() => h,
+        // NOT a clean end of chain. `target` is a fixed pre-Canopy height
+        // every synced peer has, so an empty reply below it means this peer
+        // cannot serve us — under-synced, on another chain, or lying.
+        // Treating it as completion is the worst failure here: a tree
+        // truncated at a block boundary is a *genuine historical tree state*,
+        // so witnesses still verify and spend, but nullifiers published after
+        // the cut were never collected and a spent note gets offered as
+        // spendable.
+        Ok(_) => {
+            *peer = connect_peer(network, extra_peers, &[]).await?;
+            *empty_replies += 1;
+            if *empty_replies > MAX_EMPTY_REPLIES {
+                return Err(ZeckError::Broadcast(format!(
+                    "no peer would serve blocks past height {height} of {target}. The \
+                     scan is incomplete and its results would be wrong, so it stops \
+                     here rather than reporting a balance it cannot stand behind. \
+                     Progress is saved; re-run to continue."
+                )));
+            }
+            return Ok(None);
+        }
+        Err(_) => {
+            // Reconnecting to the same peer would be refused for the next two
+            // minutes regardless, so take a different one.
+            *peer = connect_peer(network, extra_peers, &[]).await?;
+            return Ok(None);
+        }
+    };
+
+    // Every header must carry its own proof of work. With the checkpoints
+    // bounding where a forgery can start, this bounds how cheaply one can be
+    // built in between: a peer must do real work per header, not merely link
+    // cheap ones together.
+    if headers
+        .iter()
+        .any(|h| crate::p2p::wire::verify_header_pow(network, h).is_err())
+    {
+        *peer = connect_peer(network, extra_peers, &[]).await?;
+        *empty_replies += 1;
+        if *empty_replies > MAX_EMPTY_REPLIES {
+            return Err(ZeckError::Broadcast(format!(
+                "no peer would serve headers with valid proof of work from height \
+                 {height}. The scan stops rather than walk a chain it cannot verify."
+            )));
+        }
+        return Ok(None);
+    }
+
+    // The peer must be continuing from exactly where we asked, and the page
+    // must itself be a chain. A peer that does not recognise the locator
+    // serves from genesis, which would re-append the whole prefix into a tree
+    // that already contains it; a peer starting partway would skip the blocks
+    // before it. Either silently shifts every later commitment position.
+    //
+    // Checked at height 0 too, deliberately: genesis's own prev_hash is all
+    // zeros, which is exactly the starting locator, so this needs no special
+    // case. An earlier version guarded it with `height > 0` and thereby
+    // accepted a first page starting anywhere at all — a scan that skipped
+    // blocks 0..n and reported success.
+    let page_is_continuous = headers[0].prev_hash == *locator
+        && headers.windows(2).all(|w| w[1].prev_hash == w[0].hash);
+    if !page_is_continuous {
+        *peer = connect_peer(network, extra_peers, &[]).await?;
+        // Counted against the same budget as an empty reply: a peer that
+        // answers with an unusable page is no more useful than one that
+        // answers with nothing, and without this the scan switches peers
+        // forever rather than stopping with an explanation.
+        *empty_replies += 1;
+        if *empty_replies > MAX_EMPTY_REPLIES {
+            return Err(ZeckError::Broadcast(format!(
+                "no peer would serve a usable chain of blocks from height {height}. \
+                 The scan is incomplete and its results would be wrong, so it stops \
+                 here. Progress is saved; re-run to continue."
+            )));
+        }
+        return Ok(None);
+    }
+    *empty_replies = 0;
+
+    let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
+    let mut blocks = match peer.get_blocks(&hashes).await {
+        Ok(b) => b,
+        Err(_) => {
+            *peer = connect_peer(network, extra_peers, &[]).await?;
+            return Ok(None);
+        }
+    };
+
+    // Assembled in header order here, so the consumer receives the page
+    // already in chain order and never has to trust the peer's reply order.
+    //
+    // A missing block is a hard error, not a gap. Filtering it out would hand
+    // the consumer a shorter page that still looks well-formed, and every
+    // commitment after it would land at the wrong position — the scan would
+    // finish clean and the notes would be unspendable.
+    let mut page: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(hashes.len());
+    for (offset, hash) in hashes.iter().enumerate() {
+        let Some(block) = blocks.remove(hash) else {
+            return Err(ZeckError::Broadcast(format!(
+                "a peer did not return the block at height {}. The scan cannot skip it \
+                 without corrupting every later note, so it stops. Progress is saved; \
+                 re-run to continue.",
+                height + offset as u32
+            )));
+        };
+        page.push((*hash, block));
+    }
+
+    *locator = *hashes.last().expect("non-empty");
+    Ok(Some(page))
 }
 
 /// Write a checkpoint.

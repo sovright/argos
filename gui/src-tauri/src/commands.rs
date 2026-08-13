@@ -248,7 +248,8 @@ pub async fn inspect_wallet_file(
             Vec::new()
         },
         has_mnemonic: keys.mnemonic.is_some(),
-        transparent_only: keys.sapling.is_empty() && !keys.transparent.is_empty(),
+        transparent_only: argos_core::key_source::classify_recovery_route(&keys)
+            == argos_core::key_source::RecoveryRoute::TransparentOnly,
         diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
         needs_passphrase: false,
     })
