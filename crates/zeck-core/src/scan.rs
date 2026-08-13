@@ -802,100 +802,6 @@ fn build_account_preview(account: &DerivedAccount) -> AccountBalancePreview {
 /// Transparent keys are covered here too, without a second pass: they are
 /// attached to the first account as standalone receivers, so
 /// `zcash_client_sqlite` scans them alongside the shielded notes.
-/// Scan a wallet that has transparent keys and nothing else.
-///
-/// No workspace sync and no wallet database: ZIP-316 forbids a
-/// transparent-only unified container, so there is no account to anchor and
-/// nothing for the shielded scanner to walk. `GetAddressUtxos` answers the
-/// whole question directly, which is also why this returns in seconds rather
-/// than hours.
-///
-/// Lives in core rather than in either front end so both get it. The CLI
-/// implemented this at its own dispatch and the GUI did not, so the same
-/// wallet file recovered funds in one surface and reported them unrecoverable
-/// in the other.
-async fn run_transparent_only_scan(
-    state: SharedScanTaskState,
-    config: &RuntimeScanConfig,
-    keys: &argos_wallet_import::ImportedKeys,
-) -> ZeckResult<()> {
-    let transparent = crate::imported::imported_transparent_keys(keys)?;
-
-    {
-        let mut guard = state.lock().await;
-        guard.progress.phase = ScanPhase::ScanningTransparent;
-        guard.progress.message = Some(format!(
-            "Checking {} transparent address(es). This wallet has no shielded keys, so no \
-             block scan is needed.",
-            transparent.len()
-        ));
-    }
-
-    let report = crate::transparent_recovery::scan_transparent_only(
-        &transparent,
-        config.network,
-        &config.lightwalletd_url,
-    )
-    .await?;
-
-    // A workspace is still created: `finish_scan` writes the session sidecar
-    // there, and a transparent-only scan should appear in the session list
-    // like any other.
-    let workspace = RecoveryWorkspace::from_runtime(config)?;
-    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
-
-    {
-        let mut guard = state.lock().await;
-        guard.workspace = Some(workspace.clone());
-        guard.progress.synced_to_height = Some(u64::from(report.chain_tip_height));
-
-        // One preview row, because there is exactly one thing to report: this
-        // key set's transparent total. The shielded fields stay zero and the
-        // addresses stay empty rather than being filled with something
-        // plausible — a wallet with no Sapling key has no Sapling address, and
-        // inventing one would misrepresent what was searched.
-        guard.progress.accounts = vec![crate::models::AccountBalancePreview {
-            account_index: 0,
-            sapling_address: String::new(),
-            unified_address: String::new(),
-            transparent_receive_address: report
-                .funded
-                .first()
-                .map(|f| f.address.clone())
-                .unwrap_or_default(),
-            transparent_change_address: String::new(),
-            transparent_utxo_count: report
-                .funded
-                .iter()
-                .fold(0u32, |acc, f| acc.saturating_add(f.utxo_count)),
-            sapling_zatoshis: 0,
-            orchard_zatoshis: 0,
-            transparent_zatoshis: report.total_zatoshis,
-            total_zatoshis: report.total_zatoshis,
-            has_activity: report.total_zatoshis > 0,
-            status: format!(
-                "{} transparent address(es) checked, {} funded",
-                report.addresses_checked,
-                report.funded.len()
-            ),
-        }];
-
-        // Appended, never replaced: the pump loops in the CLI and Tauri emit
-        // only the tail of this vector on each tick.
-        for funded in &report.funded {
-            guard.progress.discoveries.push(crate::models::ScanDiscovery {
-                account_index: 0,
-                pool: crate::models::DiscoveryPool::Transparent,
-                zatoshis: funded.zatoshis,
-                at_block_height: u64::from(report.chain_tip_height),
-                address: funded.address.clone(),
-            });
-        }
-    }
-
-    finish_scan(&state, &workspace).await
-}
-
 async fn run_imported_scan(
     state: SharedScanTaskState,
     config: &RuntimeScanConfig,
@@ -1078,6 +984,100 @@ async fn run_imported_scan(
 /// Separate from `run_transparent_quick_probe`, which keys results by HD
 /// account index. Every imported transparent key hangs off account 0, so
 /// this folds the whole set into that one account.
+/// Scan a wallet that has transparent keys and nothing else.
+///
+/// No workspace sync and no wallet database: ZIP-316 forbids a
+/// transparent-only unified container, so there is no account to anchor and
+/// nothing for the shielded scanner to walk. `GetAddressUtxos` answers the
+/// whole question directly, which is also why this returns in seconds rather
+/// than hours.
+///
+/// Lives in core rather than in either front end so both get it. The CLI
+/// implemented this at its own dispatch and the GUI did not, so the same
+/// wallet file recovered funds in one surface and reported them unrecoverable
+/// in the other.
+async fn run_transparent_only_scan(
+    state: SharedScanTaskState,
+    config: &RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+) -> ZeckResult<()> {
+    let transparent = crate::imported::imported_transparent_keys(keys)?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningTransparent;
+        guard.progress.message = Some(format!(
+            "Checking {} transparent address(es). This wallet has no shielded keys, so no \
+             block scan is needed.",
+            transparent.len()
+        ));
+    }
+
+    let report = crate::transparent_recovery::scan_transparent_only(
+        &transparent,
+        config.network,
+        &config.lightwalletd_url,
+    )
+    .await?;
+
+    // A workspace is still created: `finish_scan` writes the session sidecar
+    // there, and a transparent-only scan should appear in the session list
+    // like any other.
+    let workspace = RecoveryWorkspace::from_runtime(config)?;
+    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.workspace = Some(workspace.clone());
+        guard.progress.synced_to_height = Some(u64::from(report.chain_tip_height));
+
+        // One preview row, because there is exactly one thing to report: this
+        // key set's transparent total. The shielded fields stay zero and the
+        // addresses stay empty rather than being filled with something
+        // plausible — a wallet with no Sapling key has no Sapling address, and
+        // inventing one would misrepresent what was searched.
+        guard.progress.accounts = vec![crate::models::AccountBalancePreview {
+            account_index: 0,
+            sapling_address: String::new(),
+            unified_address: String::new(),
+            transparent_receive_address: report
+                .funded
+                .first()
+                .map(|f| f.address.clone())
+                .unwrap_or_default(),
+            transparent_change_address: String::new(),
+            transparent_utxo_count: report
+                .funded
+                .iter()
+                .fold(0u32, |acc, f| acc.saturating_add(f.utxo_count)),
+            sapling_zatoshis: 0,
+            orchard_zatoshis: 0,
+            transparent_zatoshis: report.total_zatoshis,
+            total_zatoshis: report.total_zatoshis,
+            has_activity: report.total_zatoshis > 0,
+            status: format!(
+                "{} transparent address(es) checked, {} funded",
+                report.addresses_checked,
+                report.funded.len()
+            ),
+        }];
+
+        // Appended, never replaced: the pump loops in the CLI and Tauri emit
+        // only the tail of this vector on each tick.
+        for funded in &report.funded {
+            guard.progress.discoveries.push(crate::models::ScanDiscovery {
+                account_index: 0,
+                pool: crate::models::DiscoveryPool::Transparent,
+                zatoshis: funded.zatoshis,
+                at_block_height: u64::from(report.chain_tip_height),
+                address: funded.address.clone(),
+            });
+        }
+    }
+
+    finish_scan(&state, &workspace).await
+}
+
 async fn run_imported_transparent_probe(
     state: &SharedScanTaskState,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,

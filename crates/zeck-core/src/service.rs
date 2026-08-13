@@ -116,7 +116,7 @@ fn balance_covers_sweep_fee(zatoshis: u64) -> bool {
 /// because the underlying `zcash_client_backend` proposal error is a deep
 /// generic type with no stable typed variant to match here; a false match only
 /// downgrades a fatal abort to a skip (recorded), never the reverse.
-fn is_insufficient_funds_error(message: &str) -> bool {
+pub(crate) fn is_insufficient_funds_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("insufficient funds")
 }
 

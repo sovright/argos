@@ -310,24 +310,17 @@ pub async fn run_sprout_scan(
             break;
         };
         let page = page?;
-        let hashes: Vec<[u8; 32]> = page.iter().map(|(hash, _)| *hash).collect();
-        let blocks: std::collections::HashMap<[u8; 32], Vec<u8>> = page.into_iter().collect();
 
-        // Consumed in header order, looked up by hash. The peer's reply
-        // order is not trusted to mean anything.
-        for hash in &hashes {
+        // Already in header order, and already complete: `fetch_one_page`
+        // assembles the page in the order the headers came in and treats a
+        // missing block as a hard error, because a short page still looks
+        // well-formed and would land every later commitment at the wrong
+        // position. Re-deriving a hash list and a lookup map here only undid
+        // that work.
+        for (hash, block) in &page {
             if height >= target {
                 break;
             }
-            let Some(block) = blocks.get(hash) else {
-                // A block we asked for never arrived; stop rather than skip
-                // it, because skipping shifts every later position.
-                return Err(ZeckError::Broadcast(format!(
-                    "a peer did not return the block at height {height}. The scan \
-                     cannot skip it without corrupting every later note, so it stops. \
-                     Progress is saved; re-run to continue."
-                )));
-            };
 
             // A pinned block must be the block we were handed. This is what
             // makes a fabricated chain pointless: cheap forged headers link

@@ -250,9 +250,6 @@ pub struct ImportedSweepOutcome {
     /// Sapling key, each with its own notes, and each sweeps separately.
     /// Reporting only one would under-report what moved.
     pub sapling_txids: Vec<String>,
-    /// Accounts whose Sapling pool was empty or all dust. Counted so the
-    /// caller can distinguish "nothing to sweep" from "swept nothing".
-    pub sapling_accounts_with_nothing_to_sweep: usize,
     pub transparent_txid: Option<String>,
     pub transparent_zatoshis: u64,
     pub transparent_fee_zatoshis: u64,
@@ -295,21 +292,31 @@ pub async fn sweep_imported_wallet(
     // balance and moved one key's notes, with the shortfall reported nowhere.
     // A zcashd wallet accumulates a `sapzkey` record per `z_getnewaddress`,
     // so multiple keys is the ordinary case, not an exotic one.
-    let accounts = {
-        let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
-        // Re-registration is idempotent and returns the accounts the
-        // scan already created.
-        let birthday = AccountBirthday::from_parts(
-            ChainState::empty(
-                zcash_protocol::consensus::BlockHeight::from_u32(runtime.birthday),
-                zcash_primitives::block::BlockHash([0u8; 32]),
-            ),
-            None,
-        );
-        register_imported_accounts(&mut wallet_db, keys, &birthday)?
-    };
+    // Registration only happens on the route that has accounts. It must not
+    // be hoisted above this check: `register_imported_accounts` refuses a
+    // transparent-only key set outright (ZIP-316 gives it no UFVK to anchor
+    // to), so running it unconditionally aborts the whole sweep before
+    // reaching the transparent path below — which needs no account at all.
+    // The scan already routes on `classify_recovery_route`; this is the same
+    // decision on the sweep side.
+    if matches!(
+        crate::key_source::classify_recovery_route(keys),
+        crate::key_source::RecoveryRoute::ImportedAccounts
+    ) {
+        let accounts = {
+            let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
+            // Re-registration is idempotent and returns the accounts the
+            // scan already created.
+            let birthday = AccountBirthday::from_parts(
+                ChainState::empty(
+                    zcash_protocol::consensus::BlockHeight::from_u32(runtime.birthday),
+                    zcash_primitives::block::BlockHash([0u8; 32]),
+                ),
+                None,
+            );
+            register_imported_accounts(&mut wallet_db, keys, &birthday)?
+        };
 
-    if !keys.sapling.is_empty() {
         if accounts.is_empty() {
             return Err(ZeckError::Internal(
                 "no imported account to sweep from".to_owned(),
@@ -377,16 +384,12 @@ pub async fn sweep_imported_wallet(
                     // whose Sapling pool is empty or all dust; it must not
                     // abort the remaining accounts or the transparent sweep.
                     //
-                    // Lowercased before matching: the backend spells this
-                    // "Insufficient funds" in some variants, which a
-                    // case-sensitive `contains("insufficient")` misses — and a
-                    // miss here abandons every later account along with this
-                    // one.
-                    let message = err.to_string().to_ascii_lowercase();
-                    if !message.contains("insufficientfunds") && !message.contains("insufficient") {
+                    // One shared classifier, in `service`, which is the only
+                    // one with tests. The local copy here was a second, looser
+                    // definition of the same predicate.
+                    if !crate::service::is_insufficient_funds_error(&err.to_string()) {
                         return Err(err);
                     }
-                    outcome.sapling_accounts_with_nothing_to_sweep += 1;
                 }
             }
         }
@@ -411,4 +414,98 @@ pub async fn sweep_imported_wallet(
     }
 
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    /// A transparent-only wallet must reach the transparent sweep.
+    ///
+    /// `register_imported_accounts` refuses a transparent-only key set
+    /// outright — ZIP-316 gives it no UFVK to anchor an account to — so
+    /// calling it unconditionally aborts the entire sweep before the
+    /// transparent path, which needs no account at all. That is exactly what
+    /// happened when registration was hoisted out of the Sapling guard to fix
+    /// the multi-key bug: the scan could show a transparent balance the sweep
+    /// then refused to move, which is the scan/sweep asymmetry this work set
+    /// out to close, moved one step downstream.
+    ///
+    /// Pinned by routing rather than by outcome, because the sweep itself
+    /// needs a node. The endpoint is unroutable on purpose: failing at the
+    /// network proves the routing decision was made correctly first, since the
+    /// registration refusal happens before any connection is attempted.
+    #[tokio::test]
+    async fn a_transparent_only_wallet_is_not_refused_at_registration() {
+        use argos_wallet_import::keys::{Provenance, TransparentKey};
+        use secrecy::Secret;
+
+        let make_keys = || {
+            let mut keys = argos_wallet_import::ImportedKeys::default();
+            keys.transparent.push(TransparentKey {
+                secret: Secret::new([0x42; 32]),
+                provenance: Provenance::Standalone,
+            });
+            keys
+        };
+        let keys = make_keys();
+        assert_eq!(
+            crate::key_source::classify_recovery_route(&keys),
+            crate::key_source::RecoveryRoute::TransparentOnly,
+            "fixture must classify as transparent-only or this test proves nothing"
+        );
+
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let runtime = crate::models::RuntimeScanConfig {
+            key_source: std::sync::Arc::new(crate::key_source::ImportedKeySource::new(make_keys())),
+            birthday: 419_200,
+            num_accounts: Some(1),
+            gap_limit: 5,
+            lightwalletd_url: "https://127.0.0.1:1".to_owned(),
+            data_dir: tempdir.path().to_owned(),
+            network: crate::models::ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+
+        // A real destination, derived rather than typed. The first version of
+        // this test used a placeholder string, which the sweep rejects during
+        // address validation long before it reaches registration — so it
+        // passed even with the bug reintroduced. It has to get past the
+        // address gate to test anything at all.
+        let destination = {
+            use zcash_address::unified::{Address, Encoding, Receiver};
+            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32]);
+            let (_, payment_address) = extsk.default_address();
+            Address::try_from_items(vec![Receiver::Sapling(payment_address.to_bytes())])
+                .expect("a Sapling-only unified address is valid under ZIP 316")
+                .encode(&zcash_protocol::consensus::NetworkType::Main)
+        };
+
+        let err = sweep_imported_wallet(&runtime, &keys, &destination, None)
+            .await
+            .err()
+            .map(|err| err.to_string());
+
+        // Asserted positively, on the one signal that actually separates the
+        // two paths: routed correctly, the sweep reaches lightwalletd and
+        // fails on the unroutable endpoint. Taking the account path instead,
+        // it dies earlier trying to open a wallet database that a
+        // transparent-only sweep never creates.
+        //
+        // Two earlier versions of this assertion passed against the bug. The
+        // first used a placeholder destination, rejected during address
+        // validation before routing was reached. The second asserted the
+        // absence of the ZIP-316 refusal text — but the account path fails at
+        // `open_wallet_db` before registration is even called, so that string
+        // never appeared either way. A negative assertion is satisfied by
+        // every failure that is not the one named; only a positive one pins
+        // the path actually taken.
+        let rendered = err.expect("an unroutable endpoint must produce an error");
+        assert!(
+            rendered.contains("lightwalletd"),
+            "a transparent-only wallet must be routed to the transparent sweep, which \
+             reaches the network; an error from anywhere earlier means it took the \
+             account path and was refused before it got there. Got: {rendered}"
+        );
+    }
 }
