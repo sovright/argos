@@ -218,12 +218,21 @@ impl From<argos_wallet_import::ImportError> for ZeckError {
 
 /// How a recovered key set must be scanned.
 ///
-/// One definition, because there were three and they disagreed. The CLI
-/// required `mnemonic.is_none()`, the GUI omitted that clause, and the core
-/// refusal in `run_recovery_scan_inner` tested `sapling.is_empty()` alone —
-/// so a ZecWallet Lite wallet (mnemonic present, no standalone Sapling keys)
-/// classified as transparent-only in the GUI and as HD in the CLI, for the
-/// same file. Predicates that must agree do not stay agreeing.
+/// One definition of the *routing* decision, because there were three and
+/// they disagreed. The CLI required `mnemonic.is_none()`, the GUI omitted
+/// that clause, and the core refusal in `run_recovery_scan_inner` tested
+/// `sapling.is_empty()` alone — so a ZecWallet Lite wallet (mnemonic present,
+/// no standalone Sapling keys) classified as transparent-only in the GUI and
+/// as HD in the CLI, for the same file. Predicates that must agree do not
+/// stay agreeing.
+///
+/// What this does *not* yet cover, so the claim is not read wider than it is:
+/// `imported::register_imported_accounts` restates its own precondition
+/// (`sapling.is_empty()`) rather than asserting this enum, and the CLI still
+/// branches on `mnemonic.is_some()` in several places to decide what to tell
+/// the user. Those are messaging and precondition checks rather than route
+/// choices, but they are the same facts derived a second time, and the
+/// `inspect-wallet` copy is already out of date with what the scanner can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryRoute {
     /// A BIP-39 mnemonic is present, so the ordinary HD gap scan applies —

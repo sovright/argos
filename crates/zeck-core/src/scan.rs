@@ -415,14 +415,23 @@ async fn run_recovery_scan_inner(
                     config.key_source.describe()
                 ))
             })?;
-            // Routing lives here, in core, so both surfaces get the same
-            // answer for the same file. This branch used to refuse with a
-            // message naming the transparent-only path — which only the CLI
-            // implemented, at its own front end. The GUI handed the same
-            // wallet straight here and showed the user that refusal, telling
-            // them their recoverable funds were unrecoverable. A
-            // transparent-only `wallet.dat` is the most common legacy zcashd
-            // shape, so that was the default experience for it.
+            // This branch used to refuse with a message naming the
+            // transparent-only path — which only the CLI implemented, at its
+            // own front end. The GUI handed the same wallet straight here and
+            // showed the user that refusal, telling them their recoverable
+            // funds were unrecoverable. A transparent-only `wallet.dat` is the
+            // most common legacy zcashd shape, so that was the default
+            // experience for it.
+            //
+            // Scope, stated honestly: this fixes the GUI. The CLI still
+            // dispatches transparent-only at its own front end
+            // (`main.rs`, `is_transparent_only`) and returns through
+            // `print_transparent_report`, so it never reaches this match. The
+            // *predicate* is shared — both sides classify through
+            // `classify_recovery_route` — but the scan invocation is not, and
+            // the two produce different observable output. Routing the CLI
+            // through here would change what it prints, so it is a deliberate
+            // follow-up rather than something this branch quietly did.
             match crate::key_source::classify_recovery_route(keys) {
                 crate::key_source::RecoveryRoute::TransparentOnly => {
                     return run_transparent_only_scan(state, &config, keys).await;
@@ -992,10 +1001,11 @@ async fn run_imported_scan(
 /// whole question directly, which is also why this returns in seconds rather
 /// than hours.
 ///
-/// Lives in core rather than in either front end so both get it. The CLI
-/// implemented this at its own dispatch and the GUI did not, so the same
-/// wallet file recovered funds in one surface and reported them unrecoverable
-/// in the other.
+/// Reached by the GUI. The CLI has its own transparent-only dispatch in
+/// `main.rs` and does not call this — the two share `classify_recovery_route`
+/// but not the scan itself, so their output differs. Consolidating them means
+/// changing what the CLI prints, which is a separate change; until then this
+/// is one of two implementations, not the only one.
 async fn run_transparent_only_scan(
     state: SharedScanTaskState,
     config: &RuntimeScanConfig,

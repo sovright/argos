@@ -904,13 +904,51 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     }
     println!();
 
-    if keys.mnemonic.is_some() {
-        println!("Next: run `argos scan --wallet-file <path>` to check these keys for funds.");
-    } else {
+    // Driven by the classifier rather than by `mnemonic.is_some()`, which was
+    // telling every seedless wallet that Argos "cannot yet move funds held by
+    // them" — untrue for both remaining routes, and the same false
+    // unrecoverable claim that dead-ended the GUI. A `match` also means a new
+    // route forces this copy to be updated instead of silently falling into
+    // the wrong arm.
+    // Sprout is its own path and its own caveat, stated before the route
+    // advice so it cannot be lost in it. This used to ride on the blanket
+    // "seedless wallets cannot move funds" message, which meant the warning
+    // was only correct by accident — and disappeared the moment that message
+    // became accurate about Sapling and transparent funds.
+    if !keys.sprout.is_empty() {
         println!(
-            "Scanning and sweeping need an HD seed, which this wallet does not have. \
-             Argos can extract these keys but cannot yet move funds held by them."
+            "Sprout: `scan` and `sweep` do not move Sprout notes — those funds are not \
+             yet recoverable through them. Use `argos scan-sprout` / `argos sweep-sprout`, \
+             which need a full-block scan and land the value in the destination's Sapling \
+             receiver."
         );
+        println!();
+    }
+
+    match argos_core::key_source::classify_recovery_route(keys) {
+        argos_core::key_source::RecoveryRoute::Hd => {
+            println!("Next: run `argos scan --wallet-file <path>` to check these keys for funds.");
+        }
+        argos_core::key_source::RecoveryRoute::ImportedAccounts => {
+            println!(
+                "Next: run `argos scan --wallet-file <path>` to check these keys for funds. \
+                 This wallet has no HD seed, so its Sapling keys are scanned as imported \
+                 accounts; balances are visible and transparent funds can be swept."
+            );
+        }
+        argos_core::key_source::RecoveryRoute::TransparentOnly => {
+            println!(
+                "Next: run `argos scan --wallet-file <path>` to check these keys for funds. \
+                 This wallet holds only transparent keys, which are scanned and swept \
+                 directly — no HD seed is needed."
+            );
+        }
+        argos_core::key_source::RecoveryRoute::Nothing => {
+            println!(
+                "This wallet file contains no transparent or Sapling keys, so there is \
+                 nothing to scan."
+            );
+        }
     }
 }
 
