@@ -244,8 +244,15 @@ where
 /// that silently moved nothing.
 #[derive(Debug, Clone, Default)]
 pub struct ImportedSweepOutcome {
-    pub sapling_txid: Option<String>,
-    pub sapling_zatoshis: u64,
+    /// One transaction per Sapling account that had something to move.
+    ///
+    /// A `Vec`, not an `Option`: an imported wallet has one account per
+    /// Sapling key, each with its own notes, and each sweeps separately.
+    /// Reporting only one would under-report what moved.
+    pub sapling_txids: Vec<String>,
+    /// Accounts whose Sapling pool was empty or all dust. Counted so the
+    /// caller can distinguish "nothing to sweep" from "swept nothing".
+    pub sapling_accounts_with_nothing_to_sweep: usize,
     pub transparent_txid: Option<String>,
     pub transparent_zatoshis: u64,
     pub transparent_fee_zatoshis: u64,
@@ -269,11 +276,8 @@ pub async fn sweep_imported_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> ZeckResult<ImportedSweepOutcome> {
-    use crate::imported::{
-        imported_transparent_keys, parse_sapling_extsk, register_imported_accounts,
-    };
+    use crate::imported::{imported_transparent_keys, register_imported_accounts};
     use crate::workspace::{consensus_network, open_wallet_db, RecoveryWorkspace};
-    use secrecy::ExposeSecret;
     use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday};
     use zcash_client_backend::proto::service::RawTransaction;
     use zcash_proofs::prover::LocalTxProver;
@@ -284,85 +288,105 @@ pub async fn sweep_imported_wallet(
 
     // Sapling first: it is usually where the value is, and a failure here
     // should not stop the transparent sweep from being attempted.
-    if let Some(first_sapling) = keys.sapling.first() {
-        let extsk = parse_sapling_extsk(first_sapling.extsk.expose_secret())?;
+    //
+    // Every account, not just the first. `register_imported_accounts` creates
+    // one account per Sapling key and `run_imported_scan` reports a balance
+    // for each, so sweeping only `keys.sapling.first()` showed the user a full
+    // balance and moved one key's notes, with the shortfall reported nowhere.
+    // A zcashd wallet accumulates a `sapzkey` record per `z_getnewaddress`,
+    // so multiple keys is the ordinary case, not an exotic one.
+    let accounts = {
+        let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
+        // Re-registration is idempotent and returns the accounts the
+        // scan already created.
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(
+                zcash_protocol::consensus::BlockHeight::from_u32(runtime.birthday),
+                zcash_primitives::block::BlockHash([0u8; 32]),
+            ),
+            None,
+        );
+        register_imported_accounts(&mut wallet_db, keys, &birthday)?
+    };
 
-        let account_id = {
-            let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
-            // Re-registration is idempotent and returns the accounts the
-            // scan already created.
-            let birthday = AccountBirthday::from_parts(
-                ChainState::empty(
-                    zcash_protocol::consensus::BlockHeight::from_u32(runtime.birthday),
-                    zcash_primitives::block::BlockHash([0u8; 32]),
-                ),
-                None,
-            );
-            register_imported_accounts(&mut wallet_db, keys, &birthday)?
-                .first()
-                .map(|account| account.wallet_account_id)
-                .ok_or_else(|| {
-                    ZeckError::Internal("no imported account to sweep from".to_owned())
-                })?
-        };
+    if !keys.sapling.is_empty() {
+        if accounts.is_empty() {
+            return Err(ZeckError::Internal(
+                "no imported account to sweep from".to_owned(),
+            ));
+        }
 
         let recipient = ZcashAddress::try_from_encoded(destination).map_err(|err| {
             ZeckError::InvalidAddress(format!("could not decode destination: {err}"))
         })?;
 
+        // Loaded once for all accounts: the bundled Sapling parameters are
+        // ~725 MB, and loading them per key would dominate the sweep.
         let prover = LocalTxProver::bundled();
-        let built = {
-            let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
-            build_imported_sapling_sweep(
-                &mut wallet_db,
-                &params,
-                account_id,
-                &extsk,
-                &recipient,
-                &prover,
-            )
-        };
 
-        match built {
-            Ok(tx) => {
-                let mut raw = Vec::new();
-                tx.write(&mut raw).map_err(|err| {
-                    ZeckError::TransactionBuild(format!("serializing the Sapling sweep: {err}"))
-                })?;
-                let (mut client, _endpoint) =
-                    crate::lightwalletd::connect_lightwalletd_endpoints_with_retry(
-                        &runtime.lightwalletd_url,
-                        None,
-                    )
-                    .await?;
-                let response = client
-                    .send_transaction(RawTransaction {
-                        data: raw,
-                        height: 0,
-                    })
-                    .await
-                    .map_err(|err| ZeckError::Broadcast(err.to_string()))?
-                    .into_inner();
-                if response.error_code != 0 {
-                    return Err(ZeckError::Broadcast(format!(
-                        "the node rejected the Sapling sweep: {}",
-                        response.error_message
-                    )));
+        for account in &accounts {
+            // Every account created from a Sapling key carries its key; the
+            // `None` case is the transparent-anchor account, which has no
+            // Sapling notes of its own to move.
+            let Some(extsk) = account.sapling_extsk.as_ref() else {
+                continue;
+            };
+
+            let built = {
+                let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
+                build_imported_sapling_sweep(
+                    &mut wallet_db,
+                    &params,
+                    account.wallet_account_id,
+                    extsk,
+                    &recipient,
+                    &prover,
+                )
+            };
+
+            match built {
+                Ok(tx) => {
+                    let mut raw = Vec::new();
+                    tx.write(&mut raw).map_err(|err| {
+                        ZeckError::TransactionBuild(format!("serializing the Sapling sweep: {err}"))
+                    })?;
+                    let (mut client, _endpoint) =
+                        crate::lightwalletd::connect_lightwalletd_endpoints_with_retry(
+                            &runtime.lightwalletd_url,
+                            None,
+                        )
+                        .await?;
+                    let response = client
+                        .send_transaction(RawTransaction {
+                            data: raw,
+                            height: 0,
+                        })
+                        .await
+                        .map_err(|err| ZeckError::Broadcast(err.to_string()))?
+                        .into_inner();
+                    if response.error_code != 0 {
+                        return Err(ZeckError::Broadcast(format!(
+                            "the node rejected the Sapling sweep: {}",
+                            response.error_message
+                        )));
+                    }
+                    outcome.sapling_txids.push(tx.txid().to_string());
                 }
-                outcome.sapling_txid = Some(tx.txid().to_string());
-            }
-            Err(err) => {
-                // "Nothing selectable" is the ordinary shape of an account
-                // whose Sapling pool is empty or all dust; it must not
-                // abort the transparent sweep below.
-                // Lowercased before matching: the backend spells this
-                // "Insufficient funds" in some variants, which a
-                // case-sensitive `contains("insufficient")` misses — and a
-                // miss here abandons the transparent sweep below along with
-                // the Sapling one.
-                let message = err.to_string().to_ascii_lowercase();
-                if !message.contains("insufficientfunds") && !message.contains("insufficient") {
-                    return Err(err);
+                Err(err) => {
+                    // "Nothing selectable" is the ordinary shape of an account
+                    // whose Sapling pool is empty or all dust; it must not
+                    // abort the remaining accounts or the transparent sweep.
+                    //
+                    // Lowercased before matching: the backend spells this
+                    // "Insufficient funds" in some variants, which a
+                    // case-sensitive `contains("insufficient")` misses — and a
+                    // miss here abandons every later account along with this
+                    // one.
+                    let message = err.to_string().to_ascii_lowercase();
+                    if !message.contains("insufficientfunds") && !message.contains("insufficient") {
+                        return Err(err);
+                    }
+                    outcome.sapling_accounts_with_nothing_to_sweep += 1;
                 }
             }
         }

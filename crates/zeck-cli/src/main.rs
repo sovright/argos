@@ -575,10 +575,7 @@ async fn scan_sprout(
     sprout_params: Option<PathBuf>,
     confirm_sweep: bool,
 ) -> Result<()> {
-    let p2p_network = match network {
-        ZeckNetwork::Mainnet => P2pNetwork::Mainnet,
-        ZeckNetwork::Testnet => P2pNetwork::Testnet,
-    };
+    let p2p_network: P2pNetwork = network.into();
 
     // The destination is validated before the scan, not after. Discovering
     // that an address has no Sapling receiver at the end of a six-hour scan
@@ -712,10 +709,7 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 fn print_sprout_scan_cost_warning(network: ZeckNetwork) {
     // Follows the selected network: quoting mainnet's 1,046,400 blocks and
     // 26 GB for a testnet scan is simply false.
-    let cost = SproutScanCost::for_network(match network {
-        ZeckNetwork::Mainnet => P2pNetwork::Mainnet,
-        ZeckNetwork::Testnet => P2pNetwork::Testnet,
-    });
+    let cost = SproutScanCost::for_network(network.into());
     eprintln!("  ⚠ RECOVERING THESE NOTES REQUIRES A FULL-BLOCK SCAN");
     eprintln!("    To start one:");
     eprintln!("      argos scan-sprout --wallet-file <this file> --destination <zs1…>");

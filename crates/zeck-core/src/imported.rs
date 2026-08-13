@@ -592,6 +592,69 @@ mod db_tests {
         );
     }
 
+    /// Every Sapling key gets its own spendable account, not just the first.
+    ///
+    /// This is the precondition the imported sweep relies on. It used to
+    /// sweep `keys.sapling.first()` alone while the scan registered and
+    /// reported a balance for all of them, so a wallet with several
+    /// `sapzkey` records — routine for a long-lived zcashd wallet, one per
+    /// `z_getnewaddress` — displayed a full balance and moved only the
+    /// first key's notes, with the shortfall reported nowhere.
+    ///
+    /// The second key is a ZIP-32 child of the golden fixture's key rather
+    /// than hand-built bytes: registration deduplicates by UFVK, so two
+    /// copies of one key would collapse to a single account and this test
+    /// would pass without exercising anything. Parser fidelity is covered by
+    /// `a_recovered_sapling_key_parses_as_an_extended_spending_key`; what is
+    /// needed here is simply a second *distinct, valid* key.
+    #[test]
+    fn every_sapling_key_gets_its_own_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = seedless_wallet_db(dir.path());
+
+        let base = fixture_keys("sprout-plaintext.dat");
+        let first = parse_sapling_extsk(base.sapling[0].extsk.expose_secret())
+            .expect("the golden fixture's Sapling key must parse");
+        let second = first.derive_child(zip32::ChildIndex::hardened(7));
+        assert_ne!(
+            first.to_bytes(),
+            second.to_bytes(),
+            "the two keys must actually differ, or the dedup makes this vacuous"
+        );
+
+        let mut keys = base;
+        keys.sapling = vec![
+            argos_wallet_import::keys::SaplingKey {
+                extsk: secrecy::Secret::new(first.to_bytes().to_vec()),
+                provenance: keys.sapling[0].provenance,
+            },
+            argos_wallet_import::keys::SaplingKey {
+                extsk: secrecy::Secret::new(second.to_bytes().to_vec()),
+                provenance: keys.sapling[0].provenance,
+            },
+        ];
+
+        let accounts =
+            register_imported_accounts(&mut db, &keys, &birthday()).expect("registration");
+
+        assert_eq!(
+            accounts.len(),
+            2,
+            "one account per Sapling key, or the sweep cannot reach the later keys"
+        );
+        let spendable = accounts
+            .iter()
+            .filter(|a| a.sapling_extsk.is_some())
+            .count();
+        assert_eq!(
+            spendable, 2,
+            "every account must carry its spending key; the sweep skips those that do not"
+        );
+        let ids: std::collections::HashSet<_> =
+            accounts.iter().map(|a| a.wallet_account_id).collect();
+        assert_eq!(ids.len(), 2, "the accounts must be distinct");
+    }
+
     #[test]
     fn re_registering_the_same_wallet_reuses_its_accounts() {
         // The resume path re-runs registration on every scan start. If it

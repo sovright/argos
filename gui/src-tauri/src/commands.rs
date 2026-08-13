@@ -241,7 +241,7 @@ pub async fn inspect_wallet_file(
             .collect(),
         sprout_scan_warning: if needs_scan {
             argos_core::sprout_scan_cost::SproutScanCost::for_network(
-                argos_core::p2p::wire::P2pNetwork::Mainnet,
+                network_from(&network_name).into(),
             )
             .warning_lines()
         } else {
@@ -730,10 +730,7 @@ pub async fn start_sprout_scan(
     // leave the box blank and then refused, with no way to see the keys.
     let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
 
-    let p2p = match network {
-        argos_core::ZeckNetwork::Mainnet => argos_core::p2p::wire::P2pNetwork::Mainnet,
-        argos_core::ZeckNetwork::Testnet => argos_core::p2p::wire::P2pNetwork::Testnet,
-    };
+    let p2p: argos_core::p2p::wire::P2pNetwork = network.into();
     let dir = PathBuf::from(data_dir);
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
 
@@ -799,10 +796,7 @@ pub async fn sweep_sprout_from_scan(
     argos_core::sprout_sweep::parse_sapling_destination(&destination, net)
         .map_err(|err| err.to_string())?;
 
-    let p2p = match net {
-        argos_core::ZeckNetwork::Mainnet => argos_core::p2p::wire::P2pNetwork::Mainnet,
-        argos_core::ZeckNetwork::Testnet => argos_core::p2p::wire::P2pNetwork::Testnet,
-    };
+    let p2p: argos_core::p2p::wire::P2pNetwork = net.into();
     let dir = PathBuf::from(data_dir);
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
     if !checkpoint.exists() {

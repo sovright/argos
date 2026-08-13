@@ -47,6 +47,24 @@ pub enum P2pNetwork {
     Regtest,
 }
 
+/// The p2p network for a configured wallet network.
+///
+/// Exists so no call site hand-writes the match. Four of them did, and the
+/// fifth skipped the conversion entirely and passed `Mainnet` unconditionally
+/// — which quoted mainnet's block ceiling and transfer estimate to a testnet
+/// user. A missing conversion is what made that possible.
+///
+/// `ZeckNetwork` has no regtest variant (regtest is a build-time feature, not
+/// a runtime choice), so this is total and cannot silently lose a case.
+impl From<crate::ZeckNetwork> for P2pNetwork {
+    fn from(network: crate::ZeckNetwork) -> Self {
+        match network {
+            crate::ZeckNetwork::Mainnet => Self::Mainnet,
+            crate::ZeckNetwork::Testnet => Self::Testnet,
+        }
+    }
+}
+
 impl P2pNetwork {
     pub const fn magic(self) -> [u8; 4] {
         match self {
@@ -568,7 +586,6 @@ mod tests {
     }
 }
 
-
 /// Known-good mainnet block hashes inside the Sprout range.
 ///
 /// # Why this exists
@@ -688,8 +705,7 @@ mod checkpoint_tests {
     /// compares the 419,200 checkpoint against the block at 419,199, and
     /// this is that block. The two differing is the whole reason the bug was
     /// detectable at all.
-    const BLOCK_419_199: &str =
-        "00000000025c3b19eb08bbc0d74c0c5e798fcd58b38ecdcdda6b83e5c5945295";
+    const BLOCK_419_199: &str = "00000000025c3b19eb08bbc0d74c0c5e798fcd58b38ecdcdda6b83e5c5945295";
 
     #[test]
     fn a_height_off_by_one_would_not_match_its_checkpoint() {
@@ -717,7 +733,6 @@ mod checkpoint_tests {
         assert_eq!(wire[0], 0xd4);
     }
 }
-
 
 /// Equihash parameters, which differ by network.
 ///
@@ -813,8 +828,9 @@ pub fn verify_header_pow(network: P2pNetwork, header: &BlockHeader) -> Result<()
         .get(NONCE_OFFSET..HEADER_FIXED_LEN)
         .ok_or(PowError::Truncated)?;
 
-    let (solution_len, used) = read_compact_size(raw.get(HEADER_FIXED_LEN..).ok_or(PowError::Truncated)?)
-        .ok_or(PowError::Truncated)?;
+    let (solution_len, used) =
+        read_compact_size(raw.get(HEADER_FIXED_LEN..).ok_or(PowError::Truncated)?)
+            .ok_or(PowError::Truncated)?;
     let start = HEADER_FIXED_LEN + used;
     let end = start
         .checked_add(usize::try_from(solution_len).map_err(|_| PowError::Truncated)?)
@@ -822,8 +838,7 @@ pub fn verify_header_pow(network: P2pNetwork, header: &BlockHeader) -> Result<()
     let solution = raw.get(start..end).ok_or(PowError::Truncated)?;
 
     let (n, k) = equihash_params(network);
-    equihash::is_valid_solution(n, k, input, nonce, solution)
-        .map_err(|_| PowError::BadSolution)?;
+    equihash::is_valid_solution(n, k, input, nonce, solution).map_err(|_| PowError::BadSolution)?;
 
     let nbits = u32::from_le_bytes(
         raw.get(NBITS_OFFSET..NBITS_OFFSET + 4)
@@ -871,8 +886,14 @@ mod pow_tests {
         assert!(target_from_nbits(0).is_none(), "zero mantissa");
         assert!(target_from_nbits(0x00ff_ffff).is_none(), "zero mantissa");
         assert!(target_from_nbits(0x0480_0000).is_none(), "negative bit set");
-        assert!(target_from_nbits(0xff00_0001).is_none(), "exponent too large");
-        assert!(target_from_nbits(0x1d00_ffff).is_some(), "an ordinary target");
+        assert!(
+            target_from_nbits(0xff00_0001).is_none(),
+            "exponent too large"
+        );
+        assert!(
+            target_from_nbits(0x1d00_ffff).is_some(),
+            "an ordinary target"
+        );
     }
 
     /// The comparison is the whole point of the difficulty check, and it is
@@ -890,6 +911,9 @@ mod pow_tests {
         over[31] = over[31].wrapping_add(1);
         assert!(!hash_meets_target(&over, &target), "one over does not");
 
-        assert!(hash_meets_target(&[0u8; 32], &target), "zero always meets it");
+        assert!(
+            hash_meets_target(&[0u8; 32], &target),
+            "zero always meets it"
+        );
     }
 }

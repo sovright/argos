@@ -2019,19 +2019,23 @@ async fn sweep_imported_session(
     let mut transactions = Vec::new();
     let mut skipped_accounts = Vec::new();
 
-    match outcome.sapling_txid {
-        Some(txid) => transactions.push(TxBroadcastResult {
-            source_account: 0,
-            txid: Some(txid),
+    // One entry per Sapling account that moved, so a wallet holding several
+    // Sapling keys reports every transaction rather than only the first.
+    for (index, txid) in outcome.sapling_txids.iter().enumerate() {
+        transactions.push(TxBroadcastResult {
+            source_account: index as u32,
+            txid: Some(txid.clone()),
             status: "broadcast".to_owned(),
             detail: "Sapling notes from the imported wallet".to_owned(),
             confirmed_height: None,
-        }),
-        None => skipped_accounts.push(SkippedSweepAccount {
+        });
+    }
+    if outcome.sapling_txids.is_empty() {
+        skipped_accounts.push(SkippedSweepAccount {
             account_index: 0,
             reason: "the imported wallet holds no spendable Sapling notes".to_owned(),
             gross_zatoshis: 0,
-        }),
+        });
     }
 
     match outcome.transparent_txid {
