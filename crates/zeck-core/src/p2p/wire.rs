@@ -65,6 +65,35 @@ impl From<crate::ZeckNetwork> for P2pNetwork {
     }
 }
 
+/// Where a Sprout scan stops — see [`P2pNetwork::sprout_scan_bound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SproutScanBound {
+    /// Stop below this height (exclusive): Canopy activation.
+    UpTo(u32),
+    /// No fixed height; the chain tip ends the scan, and an empty reply from
+    /// a peer therefore means "done" rather than "this peer is lying".
+    ChainTip,
+}
+
+impl SproutScanBound {
+    /// The exclusive height the walk must not pass.
+    ///
+    /// `u32::MAX` for [`Self::ChainTip`], which is correct as a loop bound —
+    /// but only the loop may treat it that way. Anything deciding *policy*
+    /// must match on the variant instead.
+    pub const fn loop_limit(self) -> u32 {
+        match self {
+            Self::UpTo(height) => height,
+            Self::ChainTip => u32::MAX,
+        }
+    }
+
+    /// Whether reaching the end of the served chain is a normal ending.
+    pub const fn ends_at_chain_tip(self) -> bool {
+        matches!(self, Self::ChainTip)
+    }
+}
+
 impl P2pNetwork {
     pub const fn magic(self) -> [u8; 4] {
         match self {
@@ -74,16 +103,25 @@ impl P2pNetwork {
         }
     }
 
-    /// The height at which Canopy activates, and so the exclusive upper
-    /// bound of any Sprout scan: ZIP 211 forbids adding to the Sprout pool
-    /// from here on, so no Sprout note is ever created at or above it.
-    pub const fn sprout_scan_end(self) -> u32 {
+    /// Where a Sprout scan stops.
+    ///
+    /// Mainnet and testnet stop at Canopy activation: ZIP 211 forbids adding
+    /// to the Sprout pool from there on, so no Sprout note is ever created at
+    /// or above it. Regtest activates Canopy wherever its config says, so
+    /// there is no such height and the scan runs to the chain tip.
+    ///
+    /// Returned as a type rather than as `u32::MAX`. The sentinel decided
+    /// whether the "an empty reply means a lying or under-synced peer" rule
+    /// applied — the most safety-bearing check in the scan — via an integer
+    /// comparison three layers below where the decision belonged, so any
+    /// future `target` reaching `u32::MAX` by another route would have
+    /// silently disabled peer-honesty enforcement on mainnet. It also made
+    /// `SproutScanCost` quote `u32::MAX` blocks for regtest.
+    pub const fn sprout_scan_bound(self) -> SproutScanBound {
         match self {
-            Self::Mainnet => 1_046_400,
-            Self::Testnet => 1_028_500,
-            // Regtest activates whatever the config says; callers that need
-            // a real bound there pass it explicitly.
-            Self::Regtest => u32::MAX,
+            Self::Mainnet => SproutScanBound::UpTo(1_046_400),
+            Self::Testnet => SproutScanBound::UpTo(1_028_500),
+            Self::Regtest => SproutScanBound::ChainTip,
         }
     }
 }
@@ -567,8 +605,18 @@ mod tests {
     /// the scanner would either miss notes or run forever.
     #[test]
     fn the_sprout_scan_range_ends_at_canopy() {
-        assert_eq!(P2pNetwork::Mainnet.sprout_scan_end(), 1_046_400);
-        assert_eq!(P2pNetwork::Testnet.sprout_scan_end(), 1_028_500);
+        assert_eq!(
+            P2pNetwork::Mainnet.sprout_scan_bound(),
+            SproutScanBound::UpTo(1_046_400)
+        );
+        assert_eq!(
+            P2pNetwork::Testnet.sprout_scan_bound(),
+            SproutScanBound::UpTo(1_028_500)
+        );
+        // The variant, not the number, is what gates the peer-honesty rule.
+        assert!(!P2pNetwork::Mainnet.sprout_scan_bound().ends_at_chain_tip());
+        assert!(!P2pNetwork::Testnet.sprout_scan_bound().ends_at_chain_tip());
+        assert!(P2pNetwork::Regtest.sprout_scan_bound().ends_at_chain_tip());
     }
 
     #[test]
@@ -688,7 +736,7 @@ mod checkpoint_tests {
     fn every_checkpoint_is_within_the_sprout_scan_range() {
         for (height, _) in MAINNET_CHECKPOINTS {
             assert!(
-                *height <= P2pNetwork::Mainnet.sprout_scan_end(),
+                *height <= P2pNetwork::Mainnet.sprout_scan_bound().loop_limit(),
                 "checkpoint at {height} is past the scan's end and would never be checked"
             );
         }

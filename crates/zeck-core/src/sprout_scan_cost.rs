@@ -70,7 +70,13 @@ fn human_bytes(bytes: u64) -> String {
 
 impl SproutScanCost {
     pub fn for_network(network: P2pNetwork) -> Self {
-        let blocks = network.sprout_scan_end();
+        // `loop_limit` would be `u32::MAX` for a chain-tip scan, which as a
+        // cost estimate is meaningless — it quoted 4.3 billion blocks. There
+        // is no honest figure to give when the range is not known in advance.
+        let blocks = match network.sprout_scan_bound() {
+            crate::p2p::wire::SproutScanBound::UpTo(height) => height,
+            crate::p2p::wire::SproutScanBound::ChainTip => 0,
+        };
         Self {
             blocks,
             approx_download_bytes: u64::from(blocks) * APPROX_MEAN_BLOCK_BYTES,
