@@ -49,6 +49,30 @@ use crate::{
 struct ScanKey {
     a_sk: [u8; 32],
     address: SproutPaymentAddress,
+    /// `sk_enc(a_sk)` as an x25519 secret, kept so the per-JoinSplit
+    /// Diffie-Hellman agreement does not re-derive it on every attempt.
+    enc_secret: x25519_dalek::StaticSecret,
+}
+
+impl ScanKey {
+    fn new(a_sk: [u8; 32]) -> Self {
+        Self {
+            a_sk,
+            address: SproutPaymentAddress::from_spending_key(&a_sk),
+            enc_secret: x25519_dalek::StaticSecret::from(sprout::sk_enc(&a_sk)),
+        }
+    }
+
+    /// The agreement for one JoinSplit's ephemeral key.
+    ///
+    /// Depends only on `(sk_enc, epk)`, so it is the same for both outputs —
+    /// computed once per JoinSplit rather than once per output.
+    fn agree(&self, epk: &[u8; 32]) -> [u8; 32] {
+        *self
+            .enc_secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(*epk))
+            .as_bytes()
+    }
 }
 
 /// A note found mid-scan, whose witness is still being brought forward.
@@ -116,10 +140,7 @@ impl SproutScanner {
         Self {
             keys: spending_keys
                 .iter()
-                .map(|a_sk| ScanKey {
-                    a_sk: *a_sk,
-                    address: SproutPaymentAddress::from_spending_key(a_sk),
-                })
+                .map(|a_sk| ScanKey::new(*a_sk))
                 .collect(),
             tree: IncrementalMerkleTree::default(),
             pending: Vec::new(),
@@ -195,8 +216,17 @@ impl SproutScanner {
 
         let h_sig = sprout::h_sig(&js.random_seed, &js.nullifiers, &js.joinsplit_pubkey);
 
+        // One Diffie-Hellman per key for this JoinSplit, shared by both of its
+        // outputs. Trial decryption is the dominant cost of a full-chain scan,
+        // and the agreement is the expensive part of it.
+        let agreements: Vec<[u8; 32]> = self
+            .keys
+            .iter()
+            .map(|k| k.agree(&js.ephemeral_key))
+            .collect();
+
         for (index, commitment) in js.commitments.iter().enumerate() {
-            let found = self.try_decrypt(js, index, &h_sig, commitment);
+            let found = self.try_decrypt(js, index, &h_sig, commitment, &agreements);
 
             // Every commitment is appended, decryptable or not. Skipping
             // other people's notes would shift every later position.
@@ -239,13 +269,19 @@ impl SproutScanner {
         index: usize,
         h_sig: &[u8; 32],
         commitment: &[u8; 32],
+        agreements: &[[u8; 32]],
     ) -> Option<DecryptedNote> {
         let ciphertext = js.ciphertexts.get(index)?;
 
-        for key in &self.keys {
-            let Ok(note) =
-                sprout::decrypt_note(&key.a_sk, &js.ephemeral_key, ciphertext, h_sig, index as u8)
-            else {
+        for (key, dhsecret) in self.keys.iter().zip(agreements) {
+            let Ok(note) = sprout::decrypt_note_with_agreement(
+                dhsecret,
+                &js.ephemeral_key,
+                key.address.pk_enc(),
+                ciphertext,
+                h_sig,
+                index as u8,
+            ) else {
                 continue;
             };
 
@@ -476,10 +512,7 @@ impl SproutScanner {
         let mut keys = Vec::new();
         for _ in 0..key_count {
             let a_sk = r.array32().ok_or(CheckpointError::Corrupt)?;
-            keys.push(ScanKey {
-                a_sk,
-                address: SproutPaymentAddress::from_spending_key(&a_sk),
-            });
+            keys.push(ScanKey::new(a_sk));
         }
 
         let pending_count = r.u64().ok_or(CheckpointError::Corrupt)?;
@@ -792,7 +825,9 @@ mod tests {
         whole
             .scan_block(&[first.clone(), second.clone()])
             .expect("scan");
-        whole.scan_block(std::slice::from_ref(&third)).expect("scan");
+        whole
+            .scan_block(std::slice::from_ref(&third))
+            .expect("scan");
         let expected_anchor = whole.anchor();
         let expected = whole.finish().expect("finish");
 

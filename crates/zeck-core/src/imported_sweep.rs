@@ -38,9 +38,9 @@ use zcash_client_backend::{
     wallet::OvkPolicy,
 };
 use zcash_client_sqlite::AccountUuid;
-use zcash_proofs::prover::LocalTxProver;
 use zcash_keys::keys::sapling::ExtendedSpendingKey;
 use zcash_primitives::transaction::{builder::BundlePadding, Transaction};
+use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::ShieldedPool;
 
 use crate::error::{ZeckError, ZeckResult};
@@ -159,9 +159,11 @@ where
     // than assuming a Sapling-only spend implies a Sapling-only proof.
     let mut prover_role = Prover::new(pczt);
     if prover_role.requires_sapling_proofs() {
-        prover_role = prover_role.create_sapling_proofs(prover, prover).map_err(|err| {
-            ZeckError::TransactionBuild(format!("proving the Sapling bundle: {err:?}"))
-        })?;
+        prover_role = prover_role
+            .create_sapling_proofs(prover, prover)
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!("proving the Sapling bundle: {err:?}"))
+            })?;
     }
     let needs_orchard = prover_role.requires_orchard_proof();
     let needs_ironwood = prover_role.requires_ironwood_proof();
@@ -193,13 +195,17 @@ where
         // Building this is expensive, so only when a bundle needs it.
         let orchard_pk = orchard::circuit::ProvingKey::build(version);
         prover_role = if needs_ironwood {
-            prover_role.create_ironwood_proof(&orchard_pk).map_err(|err| {
-                ZeckError::TransactionBuild(format!("proving the Ironwood bundle: {err:?}"))
-            })?
+            prover_role
+                .create_ironwood_proof(&orchard_pk)
+                .map_err(|err| {
+                    ZeckError::TransactionBuild(format!("proving the Ironwood bundle: {err:?}"))
+                })?
         } else {
-            prover_role.create_orchard_proof(&orchard_pk).map_err(|err| {
-                ZeckError::TransactionBuild(format!("proving the Orchard bundle: {err:?}"))
-            })?
+            prover_role
+                .create_orchard_proof(&orchard_pk)
+                .map_err(|err| {
+                    ZeckError::TransactionBuild(format!("proving the Orchard bundle: {err:?}"))
+                })?
         };
     }
     let pczt = prover_role.finish();
@@ -349,8 +355,13 @@ pub async fn sweep_imported_wallet(
                 // "Nothing selectable" is the ordinary shape of an account
                 // whose Sapling pool is empty or all dust; it must not
                 // abort the transparent sweep below.
-                let message = err.to_string();
-                if !message.contains("InsufficientFunds") && !message.contains("insufficient") {
+                // Lowercased before matching: the backend spells this
+                // "Insufficient funds" in some variants, which a
+                // case-sensitive `contains("insufficient")` misses — and a
+                // miss here abandons the transparent sweep below along with
+                // the Sapling one.
+                let message = err.to_string().to_ascii_lowercase();
+                if !message.contains("insufficientfunds") && !message.contains("insufficient") {
                     return Err(err);
                 }
             }

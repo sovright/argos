@@ -66,7 +66,8 @@ fn a_recovered_sprout_key_produces_a_signed_v4_transaction() {
     // real siblings rather than only empty roots.
     let mut tree = sprout_witness::IncrementalMerkleTree::default();
     tree.append([0x01; 32]).expect("append");
-    tree.append(commitment).expect("append the note we will spend");
+    tree.append(commitment)
+        .expect("append the note we will spend");
     let mut witness = sprout_witness::IncrementalWitness::from_tree(tree.clone());
     for i in 3..=6u8 {
         let mut leaf = [0u8; 32];
@@ -109,8 +110,14 @@ fn a_recovered_sprout_key_produces_a_signed_v4_transaction() {
     // describe different owners.
     let recipient = sprout::SproutPaymentAddress::from_spending_key(&a_sk);
     let outputs = [
-        sprout_spend::JoinSplitOutput { recipient, value: 0 },
-        sprout_spend::JoinSplitOutput { recipient, value: 0 },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: 0,
+        },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: 0,
+        },
     ];
 
     let fields = sprout_spend::compute_joinsplit_fields(
@@ -183,5 +190,30 @@ fn a_recovered_sprout_key_produces_a_signed_v4_transaction() {
             fields.commitments[i],
             "the decrypted output must reproduce its commitment"
         );
+
+        // The scanner does not call `decrypt_note`: it precomputes `pk_enc`
+        // per key and the Diffie-Hellman agreement per JoinSplit, because
+        // `decrypt_note` otherwise redoes a base-point scalar multiplication
+        // on every trial decryption and that is the dominant cost of a
+        // full-chain scan. Splitting a crypto function for speed is exactly
+        // the change that silently stops finding notes — the scan would
+        // report a clean pass over the whole chain and simply miss the funds,
+        // indistinguishable from a wallet that never held any. So the fast
+        // path is pinned against the wrapper here, on real ciphertext.
+        let dhsecret = *x25519_dalek::StaticSecret::from(sprout::sk_enc(&a_sk))
+            .diffie_hellman(&x25519_dalek::PublicKey::from(fields.ephemeral_key))
+            .as_bytes();
+        let fast = sprout::decrypt_note_with_agreement(
+            &dhsecret,
+            &fields.ephemeral_key,
+            recipient.pk_enc(),
+            &fields.ciphertexts[i],
+            &fields.h_sig,
+            i as u8,
+        )
+        .expect("the fast path must decrypt what the wrapper decrypts");
+        assert_eq!(fast.value, recovered.value, "output {i}: value");
+        assert_eq!(fast.rho, recovered.rho, "output {i}: rho");
+        assert_eq!(fast.r, recovered.r, "output {i}: r");
     }
 }

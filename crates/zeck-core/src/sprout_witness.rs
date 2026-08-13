@@ -59,12 +59,19 @@ fn combine(left: &Node, right: &Node) -> Node {
 ///
 /// Sprout's uncommitted leaf is 32 zero bytes, unlike Sapling's, where it is
 /// a specific field element.
-fn empty_roots() -> [Node; TREE_DEPTH + 1] {
-    let mut roots = [[0u8; 32]; TREE_DEPTH + 1];
-    for d in 1..=TREE_DEPTH {
-        roots[d] = combine(&roots[d - 1], &roots[d - 1]);
-    }
-    roots
+fn empty_roots() -> &'static [Node; TREE_DEPTH + 1] {
+    // A compile-time constant in all but name: 29 SHA-256 compressions over
+    // fixed input. Computed once rather than on every `PathFiller`, which the
+    // witness-advance path builds for each note on each appended commitment.
+    static EMPTY_ROOTS: std::sync::LazyLock<[Node; TREE_DEPTH + 1]> =
+        std::sync::LazyLock::new(|| {
+            let mut roots = [[0u8; 32]; TREE_DEPTH + 1];
+            for d in 1..=TREE_DEPTH {
+                roots[d] = combine(&roots[d - 1], &roots[d - 1]);
+            }
+            roots
+        });
+    &EMPTY_ROOTS
 }
 
 /// The root of a completely empty Sprout tree.
@@ -103,7 +110,9 @@ pub fn dummy_path() -> [u8; WITNESS_PATH_SIZE] {
 /// empty roots once the witness's own cached uncles run out.
 struct PathFiller {
     queue: std::collections::VecDeque<Node>,
-    empty: [Node; TREE_DEPTH + 1],
+    /// Borrowed, not copied: this was a 960-byte array inlined into every
+    /// `PathFiller`, and one is built per note per appended commitment.
+    empty: &'static [Node; TREE_DEPTH + 1],
 }
 
 impl PathFiller {

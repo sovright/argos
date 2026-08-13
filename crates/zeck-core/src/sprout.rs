@@ -198,13 +198,43 @@ pub fn decrypt_note(
 
     let secret = x25519_dalek::StaticSecret::from(sk_enc(a_sk));
     let dhsecret = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*epk));
-    let key = kdf_sprout(
+    decrypt_note_with_agreement(
         dhsecret.as_bytes(),
         epk,
         &pk_enc(a_sk),
+        ciphertext,
         h_sig,
         output_index,
-    );
+    )
+}
+
+/// [`decrypt_note`] with the two expensive halves lifted out by the caller.
+///
+/// `decrypt_note` re-derives `sk_enc` and `pk_enc` from `a_sk` on every call,
+/// and `pk_enc` is a full base-point scalar multiplication. It also recomputes
+/// the Diffie-Hellman agreement per output, though the agreement depends only
+/// on `(sk_enc, epk)` and is therefore identical for both outputs of the same
+/// JoinSplit. On the full-chain scan that is four scalar multiplications per
+/// JoinSplit per key where one suffices, and trial decryption is the scan's
+/// dominant cost — so the scanner precomputes `pk_enc` once per key and the
+/// agreement once per JoinSplit, and calls this.
+///
+/// Only the derivation moves; the KDF, nonce and AEAD are unchanged, so this
+/// and `decrypt_note` agree by construction. `sprout_agreement_matches_the_
+/// convenience_wrapper` pins that.
+pub fn decrypt_note_with_agreement(
+    dhsecret: &[u8; 32],
+    epk: &[u8; 32],
+    pk_enc: &[u8; 32],
+    ciphertext: &[u8],
+    h_sig: &[u8; 32],
+    output_index: u8,
+) -> Result<SproutNotePlaintext, SproutNoteError> {
+    if ciphertext.len() != NOTE_CIPHERTEXT_LEN {
+        return Err(SproutNoteError::CiphertextLength(ciphertext.len()));
+    }
+
+    let key = kdf_sprout(dhsecret, epk, pk_enc, h_sig, output_index);
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let plaintext = cipher
@@ -312,7 +342,13 @@ pub fn encrypt_note(
     let secret = x25519_dalek::StaticSecret::from(*esk);
     let epk = x25519_dalek::PublicKey::from(&secret);
     let dhsecret = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*pk_enc));
-    let key = kdf_sprout(dhsecret.as_bytes(), epk.as_bytes(), pk_enc, h_sig, output_index);
+    let key = kdf_sprout(
+        dhsecret.as_bytes(),
+        epk.as_bytes(),
+        pk_enc,
+        h_sig,
+        output_index,
+    );
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     cipher
@@ -554,14 +590,8 @@ mod tests {
         };
 
         for output_index in 0..2u8 {
-            let ct = encrypt_note(
-                &esk,
-                &pk_enc(&a_sk),
-                &h_sig,
-                output_index,
-                &note.to_bytes(),
-            )
-            .expect("encrypt");
+            let ct = encrypt_note(&esk, &pk_enc(&a_sk), &h_sig, output_index, &note.to_bytes())
+                .expect("encrypt");
             assert_eq!(ct.len(), NOTE_CIPHERTEXT_LEN);
 
             let got = decrypt_note(&a_sk, &epk_for(&esk), &ct, &h_sig, output_index)
@@ -605,7 +635,8 @@ mod tests {
             r: [0u8; 32],
             memo: [0u8; 512],
         };
-        let ct = encrypt_note(&esk, &pk_enc(&theirs), &h_sig, 0, &note.to_bytes()).expect("encrypt");
+        let ct =
+            encrypt_note(&esk, &pk_enc(&theirs), &h_sig, 0, &note.to_bytes()).expect("encrypt");
         assert_eq!(
             decrypt_note(&mine, &epk_for(&esk), &ct, &h_sig, 0).unwrap_err(),
             SproutNoteError::NotForThisKey
@@ -661,5 +692,3 @@ mod tests {
         );
     }
 }
-
-

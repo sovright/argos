@@ -426,12 +426,12 @@ pub fn parse_sapling_destination_kind(
     // it was, until this was split — sends someone checking their network
     // setting when the address itself is the problem.
     let found: Found = parsed.convert_if_network(want).map_err(|err| match err {
-        ConversionError::IncorrectNetwork { expected, actual } => ZeckError::InvalidAddress(
-            format!(
+        ConversionError::IncorrectNetwork { expected, actual } => {
+            ZeckError::InvalidAddress(format!(
                 "{destination} is a {actual:?} address, but this is a {expected:?} sweep. \
                  Check the --network setting, or paste the address for this network."
-            ),
-        ),
+            ))
+        }
         other => ZeckError::InvalidAddress(format!(
             "{destination} cannot receive Sprout funds ({other}). Sprout value leaves the \
              pool through the transparent pool and must be consumed by a Sapling output \
@@ -456,13 +456,16 @@ pub fn parse_sapling_destination_kind(
 }
 
 /// The consensus branch in force at `height`.
+///
+/// Routed through [`crate::workspace::consensus_network`] rather than matching
+/// on `MAIN_NETWORK`/`TEST_NETWORK` directly. Under the dev-only
+/// `argos-network` feature the regtest `LocalNetwork` has its own activation
+/// heights, and a direct match silently hands it testnet branch IDs — the same
+/// trap `encode_transparent_address` hit, where the symptom is a signature the
+/// node rejects rather than anything visible locally.
 pub fn branch_id_for_height(network: crate::ZeckNetwork, height: u32) -> BranchId {
-    use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
-    let at = BlockHeight::from_u32(height);
-    match network {
-        crate::ZeckNetwork::Mainnet => BranchId::for_height(&MAIN_NETWORK, at),
-        crate::ZeckNetwork::Testnet => BranchId::for_height(&TEST_NETWORK, at),
-    }
+    let params = crate::workspace::consensus_network(network);
+    BranchId::for_height(&params, BlockHeight::from_u32(height))
 }
 
 /// Prove and broadcast a sweep of every recoverable note.
@@ -751,11 +754,11 @@ mod tests {
              cannot receive, not blamed on the network setting; got: {transparent}"
         );
 
-        let garbage =
-            match parse_sapling_destination("not-an-address", crate::ZeckNetwork::Mainnet) {
-                Ok(_) => panic!("garbage is not an address"),
-                Err(err) => err.to_string(),
-            };
+        let garbage = match parse_sapling_destination("not-an-address", crate::ZeckNetwork::Mainnet)
+        {
+            Ok(_) => panic!("garbage is not an address"),
+            Err(err) => err.to_string(),
+        };
         assert!(
             garbage.contains("not a Zcash address"),
             "unparseable input must be named as such rather than reported as a missing \
