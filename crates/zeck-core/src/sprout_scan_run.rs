@@ -107,13 +107,23 @@ use zcash_protocol::consensus::BranchId;
 
 /// The height of the first block a walk will scan.
 ///
-/// Genesis (height 0) for a fresh scan — the all-zero locator makes the peer
-/// include genesis as the first header — or one past the last recorded block
-/// on resume. Pulled out of `run` so the genesis-is-height-0 invariant, which
-/// the checkpoints are keyed against, is unit-tested directly rather than only
-/// exercised by a full mainnet scan.
+/// Height 1 for a fresh scan, not genesis. `getheaders` returns the blocks
+/// *after* the locator, so an all-zero locator yields the child of genesis:
+/// the peer never serves genesis itself, and an earlier comment here claiming
+/// otherwise ("the all-zero locator makes the peer include genesis") was
+/// simply wrong. Confirmed directly against a node — the first header of a
+/// fresh walk has genesis as its `prev_hash`.
+///
+/// Nothing is lost by starting at 1. A Zcash genesis block holds a single
+/// coinbase transaction and therefore no JoinSplit, so it contributes no
+/// Sprout commitment and cannot shift a tree position.
+///
+/// Getting this wrong is not a missing block, it is an off-by-one in every
+/// later height: the checkpoints are keyed to true heights, so calling the
+/// child of genesis "height 0" makes `checkpoint_at(419_200)` fire on the
+/// block at 419,199 and abort the scan against the honest chain.
 fn first_scan_height(cursor: Option<ScanCursor>) -> u32 {
-    cursor.map_or(0, |c| c.last_height + 1)
+    cursor.map_or(1, |c| c.last_height + 1)
 }
 
 /// How often to write a checkpoint, in blocks.
@@ -278,6 +288,9 @@ pub async fn run_sprout_scan(
             .await;
             match page {
                 Ok(None) => continue,
+                // Empty page: the chain ended (see `fetch_one_page`).
+                // Dropping the sender ends the consumer's loop.
+                Ok(Some(page)) if page.is_empty() => return,
                 Ok(Some(page)) => {
                     fetched += page.len() as u32;
                     if tx.send(Ok(page)).await.is_err() {
@@ -405,6 +418,17 @@ async fn fetch_one_page(
         // the cut were never collected and a spent note gets offered as
         // spendable.
         Ok(_) => {
+            // The hard failure below rests on `target` being a fixed
+            // pre-Canopy height that every synced peer has. Regtest has no
+            // such height — Canopy activates at whatever the node's config
+            // says, so `sprout_scan_end` is `u32::MAX` there — and under that
+            // bound the walk can never terminate normally: it reaches the
+            // chain tip, gets the ordinary empty reply, and reports that a
+            // peer refused to serve blocks it does not have. An empty page
+            // means end of chain, which the caller treats as completion.
+            if target == u32::MAX {
+                return Ok(Some(Vec::new()));
+            }
             *peer = connect_peer(network, extra_peers, &[]).await?;
             *empty_replies += 1;
             if *empty_replies > MAX_EMPTY_REPLIES {
@@ -450,13 +474,25 @@ async fn fetch_one_page(
     // that already contains it; a peer starting partway would skip the blocks
     // before it. Either silently shifts every later commitment position.
     //
-    // Checked at height 0 too, deliberately: genesis's own prev_hash is all
-    // zeros, which is exactly the starting locator, so this needs no special
-    // case. An earlier version guarded it with `height > 0` and thereby
-    // accepted a first page starting anywhere at all — a scan that skipped
-    // blocks 0..n and reported success.
-    let page_is_continuous = headers[0].prev_hash == *locator
-        && headers.windows(2).all(|w| w[1].prev_hash == w[0].hash);
+    // A fresh scan cannot check the first link, because there is nothing to
+    // check it against: `getheaders` serves the blocks *after* the locator,
+    // and an all-zero locator is not a block hash, so `headers[0]` is the
+    // child of genesis and its `prev_hash` is the genesis hash. Requiring it
+    // to equal the locator rejected every fresh scan's first page — the scan
+    // aborted at once, before reading a single block.
+    //
+    // This is deliberately not the old `height > 0` guard, which skipped the
+    // check whenever the counter happened to be zero and so accepted a first
+    // page starting anywhere. The relaxation is tied to the locator being the
+    // all-zero sentinel, which is true exactly once, on the first page of a
+    // fresh walk. Every resumed page is still pinned to the hash the previous
+    // page ended on, the page must still be internally linked, every header
+    // must still carry its own proof of work, and on mainnet the checkpoints
+    // still pin where the walk actually is.
+    let fresh_walk = *locator == [0u8; 32];
+    let first_link_ok = fresh_walk || headers[0].prev_hash == *locator;
+    let page_is_continuous =
+        first_link_ok && headers.windows(2).all(|w| w[1].prev_hash == w[0].hash);
     if !page_is_continuous {
         *peer = connect_peer(network, extra_peers, &[]).await?;
         // Counted against the same budget as an empty reply: a peer that
@@ -605,16 +641,27 @@ mod tests {
         );
     }
 
-    /// Genesis must map to height 0, not 1. The checkpoints are keyed by true
-    /// block heights, and the walk scans and checkpoints a block at `height`
-    /// before incrementing, so if a fresh walk started genesis at height 1 it
-    /// would shift every block by one and reject the honest chain at the first
-    /// checkpoint (419,200). A resumed walk must continue exactly one past the
-    /// block it last recorded, so a scan resumed just below a checkpoint lands
-    /// on it rather than skipping past it.
+    /// Every block must be counted at its true height.
+    ///
+    /// The checkpoints are keyed by true block heights and the walk records a
+    /// block at `height` before incrementing, so a counter that starts one off
+    /// shifts every block and rejects the honest chain at the first checkpoint
+    /// (419,200) — the failure this test exists to prevent, and it still does.
+    ///
+    /// It previously asserted 0, on the premise that a fresh walk scans
+    /// genesis. It does not: `getheaders` serves the blocks *after* the
+    /// locator, so an all-zero locator returns the child of genesis and the
+    /// peer never sends genesis at all. Checked directly against a node. So
+    /// the first block a fresh walk actually receives is height 1, and
+    /// starting the counter at 0 mislabelled it — the same off-by-one this
+    /// test guards against, in the other direction, and it made every fresh
+    /// scan abort on its first page.
+    ///
+    /// No commitment is lost: a Zcash genesis block is a single coinbase
+    /// transaction with no JoinSplit, so it contributes nothing to the tree.
     #[test]
-    fn a_fresh_walk_scans_genesis_as_height_zero() {
-        assert_eq!(first_scan_height(None), 0);
+    fn a_fresh_walk_counts_its_first_block_as_height_one() {
+        assert_eq!(first_scan_height(None), 1);
 
         let just_below_the_first_checkpoint = ScanCursor {
             last_block_hash: [0xAB; 32],
