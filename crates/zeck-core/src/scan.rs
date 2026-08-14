@@ -801,6 +801,50 @@ fn build_account_preview(account: &DerivedAccount) -> AccountBalancePreview {
     }
 }
 
+/// Create the workspace and record the session, before any network work.
+///
+/// The counterpart to `finish_scan`, which was factored out "so the two
+/// cannot drift" while the matching preamble never was — so each new scan
+/// route re-derived it, and `run_transparent_only_scan` re-derived it wrong:
+/// it created the workspace *after* the network call and never wrote the
+/// in-progress sidecar, so an interrupted or failed transparent-only scan
+/// left nothing behind and never appeared in the resume list.
+///
+/// Ordering is the point. The sidecar is written before the probe, with
+/// `target_height` still unknown, so a scan that dies at the network is still
+/// listed rather than vanishing.
+async fn begin_scan_session(
+    state: &SharedScanTaskState,
+    config: &RuntimeScanConfig,
+) -> ZeckResult<RecoveryWorkspace> {
+    let workspace = RecoveryWorkspace::from_runtime(config)?;
+    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
+    {
+        let mut guard = state.lock().await;
+        guard.workspace = Some(workspace.clone());
+    }
+
+    let session_label = if config.label.trim().is_empty() {
+        "(unlabeled scan)".to_owned()
+    } else {
+        config.label.clone()
+    };
+    if let Err(err) = write_session_metadata(
+        workspace.root(),
+        &SessionMetadata::new_in_progress(
+            session_label,
+            config.network,
+            config.birthday,
+            None,
+            now_epoch_seconds(),
+        ),
+    ) {
+        warn!("failed to write initial session sidecar (continuing): {err}");
+    }
+
+    Ok(workspace)
+}
+
 /// Scan a wallet file whose keys have no HD seed behind them.
 ///
 /// Deliberately not the HD loop: there are no account slots to enumerate
@@ -830,30 +874,12 @@ async fn run_imported_scan(
         ));
     }
 
-    let workspace = RecoveryWorkspace::from_runtime(config)?;
-    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
-    {
-        let mut guard = state.lock().await;
-        guard.workspace = Some(workspace.clone());
-    }
-
+    let workspace = begin_scan_session(&state, config).await?;
     let session_label = if config.label.trim().is_empty() {
         "(unlabeled scan)".to_owned()
     } else {
         config.label.clone()
     };
-    if let Err(err) = write_session_metadata(
-        workspace.root(),
-        &SessionMetadata::new_in_progress(
-            session_label.clone(),
-            config.network,
-            config.birthday,
-            None,
-            now_epoch_seconds(),
-        ),
-    ) {
-        warn!("failed to write initial session sidecar (continuing): {err}");
-    }
 
     let network = consensus_network(config.network);
     let configured_endpoints = describe_lightwalletd_endpoints(&config.lightwalletd_url);
@@ -1013,6 +1039,11 @@ async fn run_transparent_only_scan(
 ) -> ZeckResult<()> {
     let transparent = crate::imported::imported_transparent_keys(keys)?;
 
+    // Before the network call, not after: a scan that dies at the endpoint
+    // must still leave a session behind. This path used to create the
+    // workspace only on success, so a failed transparent-only scan vanished.
+    let workspace = begin_scan_session(&state, config).await?;
+
     {
         let mut guard = state.lock().await;
         guard.progress.phase = ScanPhase::ScanningTransparent;
@@ -1030,15 +1061,8 @@ async fn run_transparent_only_scan(
     )
     .await?;
 
-    // A workspace is still created: `finish_scan` writes the session sidecar
-    // there, and a transparent-only scan should appear in the session list
-    // like any other.
-    let workspace = RecoveryWorkspace::from_runtime(config)?;
-    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
-
     {
         let mut guard = state.lock().await;
-        guard.workspace = Some(workspace.clone());
         guard.progress.synced_to_height = Some(u64::from(report.chain_tip_height));
 
         // One preview row, because there is exactly one thing to report: this
@@ -2812,6 +2836,7 @@ mod tests {
             config.lightwalletd_url = "https://127.0.0.1:1".to_owned();
 
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let data_dir = config.data_dir.clone();
             let result = super::super::run_recovery_scan_inner(state, config).await;
 
             if let Err(err) = result {
@@ -2821,6 +2846,40 @@ mod tests {
                      not refused as unscannable; got: {err}"
                 );
             }
+
+            // And it must leave a session behind. This path used to build the
+            // workspace only after the network call succeeded, so a scan that
+            // failed at the endpoint vanished entirely — no sidecar, nothing
+            // in the resume list, the user with no record that it ran. The
+            // endpoint here is unroutable, so this is exactly that case.
+            let sidecars: Vec<_> = walkdir(&data_dir)
+                .into_iter()
+                .filter(|p| p.file_name().is_some_and(|n| n == "session.json"))
+                .collect();
+            assert!(
+                !sidecars.is_empty(),
+                "a failed transparent-only scan must still record a session under \
+                 {}, or it disappears from the resume list",
+                data_dir.display()
+            );
+        }
+
+        /// Minimal recursive file listing; the workspace path contains
+        /// hashes that the test has no business reconstructing.
+        fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = Vec::new();
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return out;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walkdir(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+            out
         }
 
         fn test_config(data_dir: std::path::PathBuf) -> RuntimeScanConfig {
