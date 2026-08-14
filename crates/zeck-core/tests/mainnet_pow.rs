@@ -1,3 +1,4 @@
+#![cfg(feature = "sprout")]
 //! Mainnet Equihash parameters, against real mainnet headers.
 //!
 //! `verify_header_pow` was validated against regtest, which uses Equihash

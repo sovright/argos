@@ -1,3 +1,4 @@
+#![cfg(feature = "sprout")]
 //! The Sprout spend pipeline, end to end, from a real wallet file.
 //!
 //! Every other Sprout test checks one stage. This runs the whole chain a

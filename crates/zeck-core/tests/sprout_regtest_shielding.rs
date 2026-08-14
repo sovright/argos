@@ -1,3 +1,4 @@
+#![cfg(feature = "sprout")]
 //! Broadcast a real Sprout JoinSplit to a node and let consensus judge it.
 //!
 //! Everything else in the Sprout work is checked by me or by the proving

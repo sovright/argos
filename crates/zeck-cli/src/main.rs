@@ -14,12 +14,14 @@ use argos_core::{
     argos_wallet_import::{self, ImportedKeys},
     derive_accounts, detect_birthday, estimate_birthday_from_date,
     imported::{encode_transparent_address, imported_transparent_keys},
-    p2p::wire::P2pNetwork,
-    sprout_recovery::recover_spendable_sprout_notes,
-    sprout_scan_cost::SproutScanCost,
     transparent_recovery::{scan_transparent_only, sweep_transparent_only, TransparentScanReport},
     validate_destination_address, ImportedKeySource, KeySource, RecoveryService, ScanConfig,
     ScanDiscovery, ScanHandle, ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
+};
+#[cfg(feature = "sprout")]
+use argos_core::{
+    p2p::wire::P2pNetwork, sprout_recovery::recover_spendable_sprout_notes,
+    sprout_scan_cost::SproutScanCost,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
@@ -176,6 +178,7 @@ enum Commands {
     ///
     /// A `wallet.dat` almost never needs this — its cached witnesses make
     /// `sweep-sprout` work with no scan at all.
+    #[cfg(feature = "sprout")]
     ScanSprout {
         /// Destination Sapling address to sweep to once the scan finishes.
         /// Omit to scan and report without moving anything.
@@ -201,6 +204,7 @@ enum Commands {
     /// HD pipeline: the notes come from the wallet file rather than from a
     /// scan, and the transaction is assembled by hand because
     /// `zcash_primitives`' builder refuses Sprout outright.
+    #[cfg(feature = "sprout")]
     SweepSprout {
         /// Destination Sapling address. Not a Unified Address: the value
         /// leaves Sprout through the transparent pool and must be consumed
@@ -234,13 +238,17 @@ fn command_uses_birthday_inputs(command: &Commands) -> bool {
 /// does broadcast irreversibly, and was previously ungated for exactly that
 /// reason.
 fn command_requires_tos(command: &Commands) -> bool {
-    matches!(
+    if matches!(command, Commands::Scan | Commands::Sweep { .. }) {
+        return true;
+    }
+    #[cfg(feature = "sprout")]
+    if matches!(
         command,
-        Commands::Scan
-            | Commands::Sweep { .. }
-            | Commands::SweepSprout { .. }
-            | Commands::ScanSprout { .. }
-    )
+        Commands::SweepSprout { .. } | Commands::ScanSprout { .. }
+    ) {
+        return true;
+    }
+    false
 }
 
 /// Read a legacy wallet file into key material.
@@ -286,6 +294,7 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
 /// key that fails this check would derive a wrong address, find no notes,
 /// and give the user no indication why — and if it did somehow match a
 /// note, spending with it would build a transaction for someone else's.
+#[cfg(feature = "sprout")]
 fn report_forged_sprout_keys(keys: &mut ImportedKeys) {
     for rejected in argos_core::sprout_recovery::reject_forged_sprout_keys(keys) {
         eprintln!();
@@ -294,6 +303,13 @@ fn report_forged_sprout_keys(keys: &mut ImportedKeys) {
         eprintln!();
     }
 }
+
+/// Without Sprout support compiled in there is no forged-key check to run —
+/// the Sprout recovery path that would spend such a key does not exist. The
+/// parser still records the keys, so a default build can report their count,
+/// but it neither validates nor drops them.
+#[cfg(not(feature = "sprout"))]
+fn report_forged_sprout_keys(_keys: &mut ImportedKeys) {}
 
 /// Sweep a transparent-only wallet, with the same guard rails the HD sweep
 /// has: a dry run that signs nothing, an explicit confirmation for an
@@ -430,6 +446,7 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
 /// Thin by design: address parsing, branch-id selection, proving and
 /// broadcast all live in `argos-core`, because the GUI needs exactly the
 /// same sequence and a second copy here would drift from it.
+#[cfg(feature = "sprout")]
 async fn sweep_sprout(
     keys: &ImportedKeys,
     network: ZeckNetwork,
@@ -521,6 +538,7 @@ async fn sweep_sprout(
 /// Either from a key file or from a wallet whose own note data was missing.
 /// Both are accepted at once, because a user may hold a `wallet.dat` *and*
 /// a paper key for an address that wallet never rescanned.
+#[cfg(feature = "sprout")]
 fn collect_sprout_scan_keys(
     key_file: Option<&Path>,
     wallet: Option<&ImportedKeys>,
@@ -567,6 +585,7 @@ fn collect_sprout_scan_keys(
 }
 
 /// Scan the chain for a set of Sprout keys, then optionally sweep what it finds.
+#[cfg(feature = "sprout")]
 #[allow(clippy::too_many_arguments)]
 async fn scan_sprout(
     keys: &[[u8; 32]],
@@ -680,6 +699,7 @@ async fn scan_sprout(
 /// than `inspect-wallet` quoted needs to know which notes stayed behind, and
 /// a user whose sweep stopped partway needs the txids of what already went —
 /// those funds have moved and are not coming back.
+#[cfg(feature = "sprout")]
 fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSweepOutcome) {
     for reason in &outcome.skipped {
         println!("  not swept — {reason}");
@@ -698,6 +718,7 @@ fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSwee
     }
 }
 
+#[cfg(feature = "sprout")]
 fn fmt_elapsed(d: std::time::Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
@@ -709,6 +730,7 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 /// JoinSplits — so it pulls full blocks from the p2p network for the whole
 /// pre-Canopy chain. Letting that begin without warning would misrepresent a
 /// multi-hour, multi-gigabyte job as an ordinary scan.
+#[cfg(feature = "sprout")]
 fn print_sprout_scan_cost_warning(network: ZeckNetwork) {
     // Follows the selected network: quoting mainnet's 1,046,400 blocks and
     // 26 GB for a testnet scan is simply false.
@@ -737,6 +759,7 @@ fn print_sprout_scan_cost_warning(network: ZeckNetwork) {
 /// A line that already fits is returned verbatim rather than re-joined:
 /// the warning's two-column rows align with runs of spaces, and splitting
 /// on whitespace would silently collapse them.
+#[cfg(feature = "sprout")]
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if text.chars().count() <= width {
         return vec![text.to_owned()];
@@ -794,47 +817,12 @@ fn print_transparent_report(report: &TransparentScanReport) {
     }
 }
 
-/// Everything Argos recovered, printed without any network access.
-///
-/// This is the only useful thing it can do with a zcashd `wallet.dat`
-/// today, so it must be honest about the difference between "found a
-/// key" and "can move the funds".
-fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
-    println!("━━━ Recovered key material ━━━");
-    println!("  Transparent keys  {}", keys.transparent.len());
-    println!("  Sapling keys      {}", keys.sapling.len());
-    println!("  Sprout keys       {}", keys.sprout.len());
-    println!("  Sprout notes      {}", keys.sprout_notes.len());
-    println!(
-        "  Seed phrase       {}",
-        if keys.mnemonic.is_some() {
-            "recovered"
-        } else {
-            "none (keys are stored individually, not HD-derived)"
-        }
-    );
-    println!();
-
-    // Printing the addresses, not just a count, is the difference between
-    // a user being able to check their own balance in a block explorer and
-    // being told a number they can do nothing with.
-    match imported_transparent_keys(keys) {
-        Ok(resolved) if !resolved.is_empty() => {
-            println!("Transparent addresses:");
-            for key in &resolved {
-                println!("  {}", encode_transparent_address(&key.address, network));
-            }
-            println!();
-        }
-        Ok(_) => {}
-        Err(err) => {
-            // Never silent: a key we cannot resolve is a key the user
-            // still holds and must know about.
-            println!("Could not resolve some transparent keys to addresses: {err}");
-            println!();
-        }
-    }
-
+/// Print the Sprout addresses in a wallet and whether their notes are
+/// spendable from this file alone. Extracted from `print_wallet_inspection`
+/// so the Sprout-recovery dependency compiles out with the feature. The body
+/// is verbatim the block that previously lived inline.
+#[cfg(feature = "sprout")]
+fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     if !keys.sprout.is_empty() {
         println!("Sprout addresses:");
         for key in &keys.sprout {
@@ -888,6 +876,60 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
             println!();
         }
     }
+}
+
+/// Without the Sprout code path compiled in there is no note-recovery logic
+/// to drive, so the inspection prints nothing extra for Sprout. The counts
+/// still appear above from the always-on parser.
+#[cfg(not(feature = "sprout"))]
+fn print_sprout_inspection(_keys: &ImportedKeys, _network: ZeckNetwork) {}
+
+/// Everything Argos recovered, printed without any network access.
+///
+/// This is the only useful thing it can do with a zcashd `wallet.dat`
+/// today, so it must be honest about the difference between "found a
+/// key" and "can move the funds".
+fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
+    println!("━━━ Recovered key material ━━━");
+    println!("  Transparent keys  {}", keys.transparent.len());
+    println!("  Sapling keys      {}", keys.sapling.len());
+    println!("  Sprout keys       {}", keys.sprout.len());
+    println!("  Sprout notes      {}", keys.sprout_notes.len());
+    println!(
+        "  Seed phrase       {}",
+        if keys.mnemonic.is_some() {
+            "recovered"
+        } else {
+            "none (keys are stored individually, not HD-derived)"
+        }
+    );
+    println!();
+
+    // Printing the addresses, not just a count, is the difference between
+    // a user being able to check their own balance in a block explorer and
+    // being told a number they can do nothing with.
+    match imported_transparent_keys(keys) {
+        Ok(resolved) if !resolved.is_empty() => {
+            println!("Transparent addresses:");
+            for key in &resolved {
+                println!("  {}", encode_transparent_address(&key.address, network));
+            }
+            println!();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            // Never silent: a key we cannot resolve is a key the user
+            // still holds and must know about.
+            println!("Could not resolve some transparent keys to addresses: {err}");
+            println!();
+        }
+    }
+
+    // The Sprout address list and spendability verdict live in a helper so
+    // the whole block can compile out with the Sprout code path. A default
+    // build still reports the Sprout key/note counts above (parser data), but
+    // it has no code to recover or spend them, so it prints nothing here.
+    print_sprout_inspection(keys, network);
 
     // Never summarized away: an unread record means key material that
     // still exists only in the original file, and the user is the only
@@ -1034,6 +1076,7 @@ async fn main() -> Result<()> {
     // it needs no HD seed: its keys come from a key file or from a wallet
     // file's Sprout records. Falling through would prompt for a seed phrase
     // the user does not have and cannot supply.
+    #[cfg(feature = "sprout")]
     if let Commands::ScanSprout {
         destination,
         peer,
@@ -1187,8 +1230,10 @@ async fn main() -> Result<()> {
 
         // Dispatched above, before key-source resolution, so that it never
         // prompts for a seed phrase it does not need.
+        #[cfg(feature = "sprout")]
         Commands::ScanSprout { .. } => unreachable!("scan-sprout returns earlier"),
 
+        #[cfg(feature = "sprout")]
         Commands::SweepSprout {
             destination,
             sprout_params,

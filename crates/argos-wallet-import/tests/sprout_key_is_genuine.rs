@@ -1,3 +1,4 @@
+#![cfg(feature = "sprout")]
 //! Prove that a recovered Sprout spending key really controls the address
 //! it was stored under.
 //!

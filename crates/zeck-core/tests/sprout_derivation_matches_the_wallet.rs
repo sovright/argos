@@ -1,3 +1,4 @@
+#![cfg(feature = "sprout")]
 //! Prove that the Sprout derivation chain produces the address the wallet
 //! stored it under — both halves of it.
 //!
