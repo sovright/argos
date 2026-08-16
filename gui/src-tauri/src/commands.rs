@@ -154,6 +154,26 @@ pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> 
         .map(|path| path.to_string_lossy().into_owned()))
 }
 
+/// Whether this build can recover Sprout funds.
+///
+/// Hardcoded `false`, and deliberately so: this build has no Sprout backend
+/// compiled into it at all — the recovery, scan and sweep modules are absent,
+/// and with them the commands the GUI's Sprout panel used to call. There is
+/// nothing to feature-detect against, so the honest answer is a constant.
+///
+/// It exists as a command rather than as a build-time edit to the frontend
+/// because `gui/src/main.js` is a single static file with no bundler, shared
+/// with the Sprout track, whose counterpart returns `true`. Deleting the panel
+/// here and re-adding it there would churn the same code twice and let the two
+/// copies drift; asking at runtime keeps one frontend serving both.
+///
+/// The frontend must treat a failed call as `false` too. Guessing "supported"
+/// would put a user in front of live-looking Sprout controls that cannot work.
+#[tauri::command]
+pub fn sprout_supported() -> bool {
+    false
+}
+
 /// The Sprout-derived portion of a `WalletFileSummary`.
 ///
 /// The fields are plain data (counts, encoded strings). This build carries no

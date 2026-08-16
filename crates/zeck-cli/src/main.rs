@@ -47,15 +47,12 @@ struct Cli {
     #[arg(long, conflicts_with = "seed_file")]
     wallet_file: Option<PathBuf>,
 
-    /// File holding a raw Sprout spending key (`SK…` mainnet / `ST…`
-    /// testnet), one per line, for a key with no wallet file behind it.
-    ///
-    /// A file rather than a flag, for the same reason the wallet passphrase
-    /// is prompt-only: a spending key passed as an argument lands in shell
-    /// history and in `ps` output for every user on the box (T-S6).
-    #[arg(long)]
-    sprout_key_file: Option<PathBuf>,
-
+    // `--sprout-key-file` used to sit here, feeding the Sprout scan. That
+    // scan is not in this build, so the flag is gone rather than accepted and
+    // ignored: a fund-recovery tool that takes a path to a *spending key* and
+    // does nothing with it lets a user believe they supplied their key and
+    // that the run covered it. Failing with `unexpected argument` is the
+    // honest answer for a build that cannot use one.
     /// Directory for wallet database and block cache.
     #[arg(long, default_value = "./argos_data")]
     data_dir: PathBuf,

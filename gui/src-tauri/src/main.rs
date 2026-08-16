@@ -35,6 +35,7 @@ fn main() {
             commands::pick_wallet_file,
             commands::inspect_wallet_file,
             commands::start_scan_from_wallet_file,
+            commands::sprout_supported,
             commands::get_scan_progress,
             commands::cancel_scan,
             commands::propose_sweep,

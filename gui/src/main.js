@@ -357,6 +357,69 @@ $("seed-clear-clipboard")?.addEventListener("click", () => clearOsClipboard("see
 // actually starts. It is cleared as soon as the scan is under way.
 let walletFile = null;
 
+// ─── Sprout capability ──────────────────────────────────────────────────────
+// Whether the backend behind this window can recover Sprout funds at all.
+// Some builds ship with no Sprout code compiled in, and then the commands the
+// Sprout panel calls do not exist — invoking one throws. This file is a single
+// static script with no bundler, shared across those builds, so it asks the
+// backend once at startup rather than being forked and left to drift.
+//
+// Starts `false` and fails closed on error. The alternative — assume supported
+// until told otherwise — is a window where a click fires a command that is not
+// there, which is exactly the failure this replaces.
+let sproutSupported = false;
+
+const sproutSupportReady = (async () => {
+  try {
+    sproutSupported = (await invoke("sprout_supported")) === true;
+  } catch (err) {
+    sproutSupported = false;
+    console.error("sprout_supported failed; treating Sprout as unavailable:", err);
+  }
+  applySproutSupport();
+  return sproutSupported;
+})();
+
+/// Reflect the capability into the panel. Idempotent, and safe to call again
+/// after any render that rebuilds the Sprout section.
+///
+/// When unsupported the panel is disabled and explained, never hidden: the
+/// summary above it reports how many Sprout keys the file holds, and a user
+/// who is told they hold keys and then shown nothing has been left to guess
+/// whether the funds are gone.
+function applySproutSupport() {
+  const notice = $("sprout-unsupported");
+  if (notice) notice.hidden = sproutSupported;
+  if (sproutSupported) return;
+  for (const id of [
+    "sprout-scan-keys",
+    "sprout-scan-check",
+    "sprout-scan-run",
+    "sprout-scan-destination",
+    "sprout-scan-confirm",
+    "sprout-scan-sweep-run",
+    "sprout-destination",
+    "sprout-sweep-run",
+  ]) {
+    const el = $(id);
+    if (el) el.disabled = true;
+  }
+}
+
+/// Guard for every entry point that would invoke a Sprout command. Returns
+/// true when the caller must stop. The controls are disabled already; this is
+/// the second lock, for anything that reaches these functions another way.
+function sproutUnavailable(statusId) {
+  if (sproutSupported) return false;
+  setStatus(
+    statusId,
+    "This build cannot recover Sprout funds — Sprout support is not compiled in. " +
+      "Your keys are unaffected.",
+    "error",
+  );
+  return true;
+}
+
 function renderWalletSummary(summary) {
   const list = $("wallet-summary-list");
   list.innerHTML = "";
@@ -403,7 +466,17 @@ function renderWalletSummary(summary) {
 
   if (summary.sprout_keys > 0) {
     const recoverable = summary.sprout_spendable_notes > 0;
-    if (recoverable) {
+    if (!sproutSupported) {
+      // No Sprout backend: neither branch below can be offered, because both
+      // end in a command this build does not have. The panel is still shown
+      // -- disabled, with `#sprout-unsupported` explaining why -- so the key
+      // count above is accounted for rather than left hanging.
+      sproutHeadline.textContent = "Sprout keys were found, but this build cannot recover them.";
+      sproutDetail.textContent =
+        " This file holds Sprout keys. They are intact and nothing here touches" +
+        " them. Keep the original file: these keys exist only there.";
+      $("sprout-scan-panel").hidden = false;
+    } else if (recoverable) {
       sproutHeadline.textContent = "Sprout funds were recovered from this file.";
       sproutDetail.textContent =
         ` ${summary.sprout_spendable_notes} note(s), ` +
@@ -450,6 +523,10 @@ function renderWalletSummary(summary) {
     }
   }
 
+  // Re-applied after the rebuild above, so a render can never hand back a
+  // live-looking control on a build that has no Sprout backend.
+  applySproutSupport();
+
   const diagnostics = $("wallet-diagnostics");
   const diagList = $("wallet-diagnostics-list");
   diagList.innerHTML = "";
@@ -471,6 +548,10 @@ function renderWalletSummary(summary) {
 async function showSproutSweep() {
   const panel = $("wallet-sprout-sweep");
   panel.hidden = false;
+  if (sproutUnavailable("sprout-sweep-status")) {
+    $("sprout-sweep-run").disabled = true;
+    return;
+  }
 
   try {
     const preview = await invoke("preview_sprout_sweep", {
@@ -507,6 +588,7 @@ async function showSproutSweep() {
 }
 
 async function runSproutSweep() {
+  if (sproutUnavailable("sprout-sweep-status")) return;
   const destination = $("sprout-destination").value.trim();
   if (!destination) {
     setStatus("sprout-sweep-status", "Enter a destination address first.", "error");
@@ -594,12 +676,20 @@ function noteUncoveredSproutKeys(summary) {
 }
 
 function renderSproutUncoveredBanners() {
+  // The last sentence differs by build. Sending someone to the wallet screen
+  // to "recover Sprout funds separately" is only true where a Sprout backend
+  // exists; on a build without one it would be a promise the app cannot keep,
+  // about the one pool the user most needs a straight answer on.
+  const tail = sproutSupported
+    ? `Open it on the wallet screen to recover Sprout funds separately.`
+    : `This build cannot recover Sprout funds — that needs an Argos build with ` +
+      `Sprout support. The keys are unaffected either way.`;
   const text =
     uncoveredSproutKeys > 0
       ? `This total does not include Sprout funds. Your wallet file holds ` +
         `${uncoveredSproutKeys} Sprout key(s), which this scan and sweep do not ` +
         `cover. Keep the original wallet file — it is the only copy of those keys. ` +
-        `Open it on the wallet screen to recover Sprout funds separately.`
+        tail
       : "";
   for (const id of [
     "scan-sprout-uncovered",
@@ -625,6 +715,10 @@ async function openWalletFile() {
   setStatus("wallet-status", "Reading wallet file…", "");
   $("wallet-open").disabled = true;
   try {
+    // Settled before anything renders, so a file opened in the first moments
+    // after launch cannot be drawn with a Sprout panel this build cannot back.
+    await sproutSupportReady;
+
     const summary = await invoke("inspect_wallet_file", {
       path,
       passphrase,
@@ -752,6 +846,7 @@ function sproutScanKeys() {
 }
 
 async function checkSproutKeys() {
+  if (sproutUnavailable("sprout-scan-status")) return;
   const list = $("sprout-scan-addresses");
   list.innerHTML = "";
   const keys = sproutScanKeys();
@@ -781,6 +876,7 @@ async function checkSproutKeys() {
 }
 
 async function runSproutScan() {
+  if (sproutUnavailable("sprout-scan-status")) return;
   const keys = sproutScanKeys();
   if (!keys.length && !walletFile) {
     setStatus(
@@ -831,6 +927,7 @@ async function runSproutScan() {
 /// Resuming a finished scan is instant — the checkpoint is already at the
 /// target — so this is a button rather than another six hours.
 async function runSproutScanSweep() {
+  if (sproutUnavailable("sprout-scan-status")) return;
   const destination = $("sprout-scan-destination").value.trim();
   if (!destination) {
     setStatus("sprout-scan-status", "Enter a destination address first.", "error");
