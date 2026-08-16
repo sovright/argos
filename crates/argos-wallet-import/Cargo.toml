@@ -13,7 +13,6 @@ publish = false
 # nothing in `src/`. It exists solely so the Sprout-specific test
 # (`sprout_key_is_genuine`) can be `#![cfg(feature = "sprout")]`-gated along
 # with the rest of the Sprout-only tests, and compiles out cleanly by default.
-sprout = []
 
 [dependencies]
 aes.workspace = true

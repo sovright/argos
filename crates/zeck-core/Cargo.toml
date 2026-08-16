@@ -31,7 +31,6 @@ argos-network = ["zcash_protocol/local-consensus"]
 # Forwards to `argos-wallet-import/sprout`, which is a marker feature (the
 # parser is unconditional) whose only job is to enable that crate's
 # Sprout-only test under the same flag.
-sprout = ["argos-wallet-import/sprout"]
 
 [dependencies]
 anyhow.workspace = true

@@ -16,7 +16,6 @@ publish = false
 # Sprout key count from the always-on parser while leaving the recovery/scan
 # fields empty (no Sprout spend code is compiled in). The JSON shape of
 # `WalletFileSummary` is identical either way.
-sprout = ["argos-core/sprout"]
 
 [build-dependencies]
 tauri-build.workspace = true
