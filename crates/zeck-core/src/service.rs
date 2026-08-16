@@ -89,7 +89,7 @@ const MAX_FEE_CONVERGENCE_ITERS: usize = 8;
 /// `MaxFeeExceeded` abort *before* the shielding transaction is broadcast,
 /// rather than after it is already mined and its fee unrecoverable (audit
 /// Issue E).
-const MIN_SHIELDED_SEND_FEE_ZATOSHIS: u64 = 10_000;
+pub(crate) const MIN_SHIELDED_SEND_FEE_ZATOSHIS: u64 = 10_000;
 
 /// Whether a balance is worth sweeping: it must *strictly exceed* the ZIP-317
 /// fee floor. At or below the floor, the shielding/sweep transaction's fee would
@@ -1865,7 +1865,7 @@ fn account_transparent_zatoshis(
         .unwrap_or(0))
 }
 
-fn proposal_fee_zatoshis<NoteRef>(
+pub(crate) fn proposal_fee_zatoshis<NoteRef>(
     proposal: &zcash_client_backend::proposal::Proposal<StandardFeeRule, NoteRef>,
 ) -> ZeckResult<u64> {
     proposal.steps().iter().try_fold(0u64, |sum, step| {
@@ -1882,7 +1882,10 @@ fn checked_fee_total(prior_fee_zatoshis: u64, next_fee_zatoshis: u64) -> ZeckRes
         .ok_or_else(|| ZeckError::Internal("fee total overflowed the supported range".to_owned()))
 }
 
-fn enforce_max_fee(total_fee_zatoshis: u64, max_fee_zatoshis: Option<u64>) -> ZeckResult<()> {
+pub(crate) fn enforce_max_fee(
+    total_fee_zatoshis: u64,
+    max_fee_zatoshis: Option<u64>,
+) -> ZeckResult<()> {
     if let Some(max_fee_zatoshis) = max_fee_zatoshis {
         if total_fee_zatoshis > max_fee_zatoshis {
             return Err(ZeckError::MaxFeeExceeded(format!(
@@ -2003,19 +2006,42 @@ fn estimate_remaining_seconds(progress: &ScanProgress, elapsed_seconds: u64) -> 
 /// reported as separate entries. A pool that held nothing appears as a
 /// skipped account rather than being omitted: a pool silently missing from
 /// the report is indistinguishable from one that was never attempted.
+///
+/// The sweep's terminal status is folded in through `assemble_sweep_outcome`
+/// rather than propagated with `?`, exactly as the HD path does. An imported
+/// wallet broadcasts one transaction per Sapling account, so a failure on
+/// the third account arrives with two transactions already on-chain;
+/// returning `Err` there would drop their txids and report a total failure
+/// for a sweep that moved real funds (audit Issue E, second occurrence).
 async fn sweep_imported_session(
     runtime: &RuntimeScanConfig,
     keys: &argos_wallet_import::ImportedKeys,
     request: &SweepRequest,
 ) -> ZeckResult<SweepOutcome> {
-    let outcome = crate::imported_sweep::sweep_imported_wallet(
+    let (outcome, sweep_result) = crate::imported_sweep::sweep_imported_wallet(
         runtime,
         keys,
         &request.destination,
         request.max_fee_zatoshis,
     )
-    .await?;
+    .await;
 
+    assemble_imported_sweep_outcome(outcome, sweep_result)
+}
+
+/// Fold an imported-wallet sweep's records and terminal status into a
+/// [`SweepOutcome`].
+///
+/// Separated from the sweep itself so the partial-failure path — records
+/// kept, error surfaced — is exercisable without a node. It is the only
+/// route from an [`ImportedSweepOutcome`] to a `SweepOutcome`; there is no
+/// second one to drift from it.
+///
+/// [`ImportedSweepOutcome`]: crate::imported_sweep::ImportedSweepOutcome
+fn assemble_imported_sweep_outcome(
+    outcome: crate::imported_sweep::ImportedSweepOutcome,
+    sweep_result: ZeckResult<()>,
+) -> ZeckResult<SweepOutcome> {
     let mut transactions = Vec::new();
     let mut skipped_accounts = Vec::new();
 
@@ -2030,7 +2056,11 @@ async fn sweep_imported_session(
             confirmed_height: None,
         });
     }
-    if outcome.sapling_txids.is_empty() {
+    // Only claimed when the leg actually ran to the end. A leg that aborted
+    // has not established that the pool is empty, and reporting "holds no
+    // spendable Sapling notes" for a pool whose sweep failed would tell the
+    // user the opposite of what happened.
+    if outcome.sapling_txids.is_empty() && outcome.sapling_leg_completed {
         skipped_accounts.push(SkippedSweepAccount {
             account_index: 0,
             reason: "the imported wallet holds no spendable Sapling notes".to_owned(),
@@ -2049,22 +2079,26 @@ async fn sweep_imported_session(
             ),
             confirmed_height: None,
         }),
-        None => skipped_accounts.push(SkippedSweepAccount {
-            account_index: 0,
-            reason: "the imported wallet holds no spendable transparent funds".to_owned(),
-            gross_zatoshis: 0,
-        }),
+        None => {
+            if outcome.transparent_leg_completed {
+                skipped_accounts.push(SkippedSweepAccount {
+                    account_index: 0,
+                    reason: "the imported wallet holds no spendable transparent funds".to_owned(),
+                    gross_zatoshis: 0,
+                });
+            }
+        }
     }
 
-    Ok(SweepOutcome {
+    assemble_sweep_outcome(
         transactions,
         skipped_accounts,
         // Donations are not split out of an imported sweep: the Sapling
         // path builds a single-step send-max proposal, which has no room
         // for a second output.
-        total_donation_zatoshis: 0,
-        error: None,
-    })
+        0,
+        sweep_result,
+    )
 }
 
 #[cfg(test)]
@@ -2351,6 +2385,91 @@ mod tests {
             .error
             .expect("a partial failure carries the underlying error message");
         assert!(message.contains("account 2 rejected"));
+    }
+
+    /// An imported sweep that broadcast some accounts and then failed must
+    /// report the transactions it already sent, with the failure attached.
+    ///
+    /// This is audit Issue E in its second location. An imported zcashd
+    /// wallet ordinarily holds several `sapzkey` records, so the multi-account
+    /// loop is the common case, not an exotic one; each account is built and
+    /// broadcast separately. Aborting the sweep with `Err` on account 3 threw
+    /// away the txids of accounts 0-2 along with the outcome that held them,
+    /// so the user was told the whole sweep failed while real funds had moved
+    /// — and a retry found those notes already spent and appeared to do
+    /// nothing.
+    ///
+    /// Asserted positively on the txids themselves and on the error text. An
+    /// assertion that the result is merely `Ok` would be satisfied by an
+    /// outcome carrying no transactions at all, which is the bug.
+    #[test]
+    fn imported_sweep_partial_failure_preserves_broadcast_txids_and_error() {
+        use super::assemble_imported_sweep_outcome;
+        use crate::imported_sweep::ImportedSweepOutcome;
+
+        let outcome = assemble_imported_sweep_outcome(
+            ImportedSweepOutcome {
+                sapling_txids: vec!["txid-account-0".to_owned(), "txid-account-1".to_owned()],
+                // The leg aborted on account 2, so it never established that
+                // the pool was empty.
+                sapling_leg_completed: false,
+                transparent_txid: None,
+                transparent_zatoshis: 0,
+                transparent_fee_zatoshis: 0,
+                transparent_leg_completed: true,
+            },
+            Err(ZeckError::Broadcast(
+                "the node rejected the Sapling sweep: account 2".to_owned(),
+            )),
+        )
+        .expect("a partial imported sweep must report what it broadcast, not collapse to Err");
+
+        let reported: Vec<_> = outcome
+            .transactions
+            .iter()
+            .filter_map(|tx| tx.txid.clone())
+            .collect();
+        assert_eq!(
+            reported,
+            vec!["txid-account-0".to_owned(), "txid-account-1".to_owned()],
+            "both already-broadcast Sapling transactions must survive the later failure"
+        );
+
+        let message = outcome
+            .error
+            .expect("a partial imported sweep carries the failure that stopped it");
+        assert!(
+            message.contains("account 2"),
+            "the terminal error must name what failed. Got: {message}"
+        );
+
+        // The aborted Sapling leg must not be reported as an empty pool: only
+        // the transparent leg, which did run to the end, is skipped.
+        assert_eq!(outcome.skipped_accounts.len(), 1);
+        assert!(
+            outcome.skipped_accounts[0].reason.contains("transparent"),
+            "an aborted Sapling leg must not claim the pool was empty. Got: {}",
+            outcome.skipped_accounts[0].reason
+        );
+    }
+
+    /// The same fold, with nothing broadcast, must stay a hard failure.
+    ///
+    /// The partial-failure allowance exists only to stop on-chain
+    /// transactions being forgotten. With none, "the sweep failed" is the
+    /// truthful report and must not be softened into a success carrying an
+    /// error field the caller may not read.
+    #[test]
+    fn imported_sweep_failure_before_any_broadcast_stays_an_err() {
+        use super::assemble_imported_sweep_outcome;
+        use crate::imported_sweep::ImportedSweepOutcome;
+
+        let err = assemble_imported_sweep_outcome(
+            ImportedSweepOutcome::default(),
+            Err(ZeckError::Broadcast("account 0 rejected".to_owned())),
+        )
+        .expect_err("a failure with nothing broadcast must remain an Err");
+        assert!(matches!(err, ZeckError::Broadcast(_)));
     }
 
     #[test]
