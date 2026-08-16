@@ -197,6 +197,7 @@ dependencies = [
  "blake2b_simd",
  "cbc",
  "crypto_secretbox",
+ "sapling-crypto",
  "secp256k1",
  "secrecy",
  "sha2 0.10.9",

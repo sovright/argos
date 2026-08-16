@@ -133,6 +133,36 @@ const OFF_ENTRY_COUNT: usize = 20;
 const OFF_PAGE_TYPE: usize = 25;
 const OFF_INDEX_START: usize = 26;
 
+/// On a `P_OVERFLOW` page the two 16-bit header fields are *overloaded*:
+/// the count of payload bytes carried by that page lives in `hf_offset`
+/// (offset 22), and `entries` (offset 20) holds a vestigial reference
+/// count that Berkeley DB's writer hardcodes to 1.
+///
+/// Berkeley DB 6.2.32, `src/dbinc/db_page.h`:
+///
+/// ```text
+/// *  Overflow page overloads:
+/// *      The amount of overflow data stored on each page is stored in the
+/// *      hf_offset field.
+/// *
+/// *      Before 4.3 the implementation reference counted overflow items ...
+/// *      The reference count is stored in the entries field.
+/// #define OV_LEN(p)  (((PAGE *)p)->hf_offset)
+/// #define OV_REF(p)  (((PAGE *)p)->entries)
+/// ```
+///
+/// and `src/db/db_overflow.c` `__db_poff` writes exactly that pairing:
+/// `OV_LEN(pagep) = pagespace; OV_REF(pagep) = 1;`. Reading offset 20
+/// therefore yields a constant 1, not a length.
+const OFF_OVERFLOW_LEN: usize = 22;
+
+/// `SIZEOF_PAGE` in `db_page.h`: the generic page header is 26 bytes, so
+/// both a btree page's index table and an overflow page's payload begin
+/// here. (BDB inserts a checksum/IV block at this point when the database
+/// was created with `DB_AM_CHKSUM`/`DB_AM_ENCRYPT`; zcashd creates neither,
+/// which the golden fixtures confirm.)
+const SIZEOF_PAGE: usize = 26;
+
 /// Leaf entry types.
 const ENTRY_KEYDATA: u8 = 1;
 const ENTRY_OVERFLOW: u8 = 3;
@@ -202,11 +232,11 @@ fn read_overflow(
         }
         let p = page_slice(bytes, page, meta.page_size)?;
         let next = read_u32(p, 16, meta.swapped)?;
-        let this_len = read_u16(p, OFF_ENTRY_COUNT, meta.swapped)? as usize;
+        let this_len = read_u16(p, OFF_OVERFLOW_LEN, meta.swapped)? as usize;
 
         let want = this_len.min(total_len - out.len());
         let data = p
-            .get(26..26 + want)
+            .get(SIZEOF_PAGE..SIZEOF_PAGE + want)
             .ok_or_else(|| unwalkable(format!("overflow page {page} is short")))?;
         out.extend_from_slice(data);
         page = next;
@@ -654,6 +684,135 @@ mod tests {
             let pairs = walk(&bytes).unwrap();
             assert_eq!(pairs.len(), want, "{name}: record count changed");
         }
+    }
+
+    /// Write one `P_OVERFLOW` page into `v` at page `page`, carrying
+    /// `payload` and chaining to `next`.
+    ///
+    /// **This page is hand-built, not captured from a real wallet.** None of
+    /// the golden `wallet.dat` fixtures in `tests/fixtures/` contains a
+    /// value large enough to overflow, so there is no real-world artifact to
+    /// test against and one is constructed here instead. It is laid out to
+    /// the Berkeley DB 6.2.32 `PAGE` header documented in
+    /// `src/dbinc/db_page.h` — `lsn` 0-7, `pgno` 8-11, `prev_pgno` 12-15,
+    /// `next_pgno` 16-19, `entries` 20-21, `hf_offset` 22-23, `level` 24,
+    /// `type` 25, payload from `SIZEOF_PAGE` (26) — with the `P_OVERFLOW`
+    /// overloading of those last two 16-bit fields (`OV_LEN` = `hf_offset`,
+    /// `OV_REF` = `entries`) and with `OV_REF` set to 1, which is what
+    /// `db_overflow.c` `__db_poff` writes.
+    ///
+    /// What a test over this proves: that `read_overflow` reads the byte
+    /// count from the field the format specifies, and reassembles a
+    /// multi-page chain in order. What it does **not** prove: that a real
+    /// zcashd-written `wallet.dat` containing an overflowing record round
+    /// trips through `walk`. Only a captured fixture could show that, and
+    /// none exists.
+    fn put_overflow_page(v: &mut [u8], page_size: u32, page: u32, next: u32, payload: &[u8]) {
+        let base = (page as usize) * (page_size as usize);
+        // pgno, then next_pgno — the field that chains the pages together.
+        v[base + 8..base + 12].copy_from_slice(&page.to_le_bytes());
+        v[base + 16..base + 20].copy_from_slice(&next.to_le_bytes());
+        // OV_REF: the vestigial reference count, always 1. This is the field
+        // the buggy code read as a length.
+        v[base + OFF_ENTRY_COUNT..base + OFF_ENTRY_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        // OV_LEN: the real payload byte count for this page.
+        v[base + OFF_OVERFLOW_LEN..base + OFF_OVERFLOW_LEN + 2]
+            .copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        v[base + OFF_PAGE_TYPE] = PAGE_TYPE_OVERFLOW;
+        v[base + SIZEOF_PAGE..base + SIZEOF_PAGE + payload.len()].copy_from_slice(payload);
+    }
+
+    #[test]
+    fn an_overflow_chain_reassembles_the_whole_value() {
+        // A value split across two overflow pages. See put_overflow_page for
+        // what this hand-built layout does and does not establish.
+        //
+        // The regression: the payload byte count lives in `hf_offset`
+        // (offset 22), not `entries` (offset 20). Reading offset 20 gets
+        // OV_REF — a constant 1 — so each page contributes a single byte and
+        // the reassembled value is silently truncated garbage rather than
+        // the record zcashd wrote. Every byte here is distinct, so a
+        // wrong-offset read cannot pass by coincidence.
+        let page_size = 512u32;
+        let first: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let second: Vec<u8> = (0..100u32).map(|i| (i % 241 + 3) as u8).collect();
+        let expected: Vec<u8> = first.iter().chain(second.iter()).copied().collect();
+
+        let mut v = meta_page(page_size, 3, 1);
+        put_overflow_page(&mut v, page_size, 2, 3, &first);
+        put_overflow_page(&mut v, page_size, 3, 0, &second);
+
+        let meta = read_meta(&v).unwrap();
+        let got = read_overflow(
+            &v,
+            &meta,
+            2,
+            expected.len() as u32,
+            &mut std::collections::BTreeSet::new(),
+        )
+        .expect("a well-formed overflow chain must reassemble");
+
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "overflow chain reassembled {} bytes, expected {}",
+            got.len(),
+            expected.len()
+        );
+        assert_eq!(
+            got, expected,
+            "overflow chain reassembled the wrong bytes: the per-page length \
+             must come from hf_offset (offset 22), not entries (offset 20)"
+        );
+    }
+
+    #[test]
+    fn an_overflow_value_reaches_walk_as_one_record() {
+        // The same reassembly, but driven through the public entry point:
+        // a leaf page whose value entry is a B_OVERFLOW (`unused1:u16,
+        // type:u8, unused2:u8, pgno:u32, tlen:u32` — db_page.h `BOVERFLOW`)
+        // pointing at the chain. Hand-built; see put_overflow_page.
+        let page_size = 512u32;
+        let payload: Vec<u8> = (0..600u32).map(|i| (i % 253 + 1) as u8).collect();
+        let mut v = meta_page(page_size, 4, 1);
+
+        // Page 1: a leaf with one (key, value) pair.
+        let base = page_size as usize;
+        v[base + OFF_PAGE_TYPE] = PAGE_TYPE_LBTREE;
+        v[base + OFF_ENTRY_COUNT..base + OFF_ENTRY_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
+
+        let off_key: u16 = 34;
+        let off_val: u16 = 48;
+        for (i, off) in [off_key, off_val].into_iter().enumerate() {
+            let idx = base + OFF_INDEX_START + i * 2;
+            v[idx..idx + 2].copy_from_slice(&off.to_le_bytes());
+        }
+
+        // Key: an ordinary B_KEYDATA entry (len:u16, type:u8, data...).
+        let key = b"bigvalue";
+        let ks = base + off_key as usize;
+        v[ks..ks + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        v[ks + 2] = ENTRY_KEYDATA;
+        v[ks + 3..ks + 3 + key.len()].copy_from_slice(key);
+
+        // Value: a B_OVERFLOW entry pointing at page 3.
+        let vs = base + off_val as usize;
+        v[vs + 2] = ENTRY_OVERFLOW;
+        v[vs + 4..vs + 8].copy_from_slice(&3u32.to_le_bytes()); // pgno
+        v[vs + 8..vs + 12].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // tlen
+
+        put_overflow_page(&mut v, page_size, 3, 4, &payload[..400]);
+        put_overflow_page(&mut v, page_size, 4, 0, &payload[400..]);
+
+        let pairs = walk(&v).unwrap();
+        assert!(
+            pairs.iter().any(|(k, val)| k == key && *val == payload),
+            "an overflowing value must reach the caller intact; got {:?}",
+            pairs
+                .iter()
+                .map(|(k, val)| (String::from_utf8_lossy(k).into_owned(), val.len()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

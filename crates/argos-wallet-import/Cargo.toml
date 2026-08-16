@@ -19,5 +19,27 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Test-only, and deliberately an *external* implementation: this crate does
+# no Sapling arithmetic of its own, so re-deriving a viewing key with
+# sapling-crypto in tests/sapling_key_is_genuine.rs is an independent oracle
+# rather than a restatement of the code under test — the same relationship
+# secp256k1 has to the transparent path. Already in the workspace lockfile
+# (transitively, under zcash_keys), so this adds no crate to the build.
+#
+# Versioned here rather than through `[workspace.dependencies]`, unlike every
+# other entry below: the recovery crate that lands on top of this one promotes
+# sapling-crypto to a direct workspace dependency of its own, and two
+# declarations of the same key is a hard cargo error. The feature flags are
+# kept identical to that one so the resolver sees a single unified build
+# either way.
+sapling-crypto = { version = "0.7", default-features = false }
 secp256k1.workspace = true
 tempfile.workspace = true
+# Already `[dependencies]`, repeated here because integration tests link
+# only against this crate's public API plus its dev-dependencies. Used to
+# re-encrypt a record under the fixture's own master key, which is the only
+# way to hand `collect_encrypted` a ciphertext that decrypts cleanly to a
+# deliberately wrong length. Adds no crate to the build.
+aes.workspace = true
+blake2b_simd.workspace = true
+cbc.workspace = true

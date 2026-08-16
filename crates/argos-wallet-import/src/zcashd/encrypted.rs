@@ -208,6 +208,11 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                 const EXTFVK_LEN: usize = 169;
                 const FVK_OFFSET: usize = 41;
                 const FVK_LEN: usize = 96;
+                // zcashd `zip32.h`: `ZIP32_XSK_SIZE = 169`. Same number as
+                // `ZIP32_XFVK_SIZE` above but a different structure —
+                // depth(1) + parentFVKTag(4) + childIndex(4) +
+                // chaincode(32) + expsk(ask+nsk+ovk, 96) + dk(32).
+                const EXTSK_LEN: usize = 169;
 
                 let fvk = value.get(FVK_OFFSET..FVK_OFFSET + FVK_LEN);
                 let Some(fvk) = fvk else {
@@ -219,15 +224,39 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                 };
                 let iv = sapling_fvfp_iv(fvk);
 
+                // The decrypted length must be checked before the key is
+                // kept, exactly as zcashd's own `DecryptSaplingSpendingKey`
+                // does (`crypter.cpp`: `if (vchSecret.size() !=
+                // ZIP32_XSK_SIZE) return false;`). AES-CBC with PKCS#7 will
+                // happily return a short or overlong plaintext whenever the
+                // final block's padding byte is coincidentally valid — a
+                // truncated or crafted `csapzkey` can therefore produce a
+                // `SaplingKey` that is structurally wrong. Without this the
+                // failure surfaces in `argos-core` at derivation time,
+                // arbitrarily far from the record that caused it.
                 match value
                     .get(EXTFVK_LEN..)
                     .and_then(read_length_prefixed)
                     .and_then(|(ct, _)| decrypt(master, iv, ct))
                 {
-                    Some(extsk) => out.sapling.push(SaplingKey {
+                    Some(extsk) if extsk.len() == EXTSK_LEN => out.sapling.push(SaplingKey {
                         extsk: Secret::new(extsk),
                         provenance: Provenance::HdDerived,
                     }),
+                    Some(mut wrong_length) => {
+                        let got = wrong_length.len();
+                        // Plaintext derived from the master key: scrub it
+                        // rather than dropping it, even though it is not a
+                        // usable key.
+                        wrong_length.zeroize();
+                        out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
+                            record_type: "csapzkey".to_owned(),
+                            reason: format!(
+                                "ciphertext decrypted to {got} bytes, not a \
+                                 {EXTSK_LEN}-byte extended spending key"
+                            ),
+                        });
+                    }
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "csapzkey".to_owned(),
                         reason: "ciphertext did not decrypt".to_owned(),
