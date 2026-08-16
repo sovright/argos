@@ -175,6 +175,20 @@
         </p>
       </section>
 
+      <section class="notice-band" id="ironwood">
+        <div>
+          <p class="eyebrow">Update required</p>
+          <h2>Older builds can no longer sweep</h2>
+        </div>
+        <p>
+          Zcash activated the Ironwood network upgrade (NU6.3) at block <strong>3,428,143</strong>.
+          Argos <strong>1.1.0</strong> and later handle it. Earlier builds still scan correctly and
+          still show your balance, but the network now rejects the sweep they build, so recovery
+          cannot finish. Nothing is lost and no funds move if this happens — you just need the
+          current version, <a href="#download">below</a>.
+        </p>
+      </section>
+
       <section class="section demo-section" id="demo">
         <div class="section-heading demo-heading">
           <p class="eyebrow">See it in action</p>
@@ -370,15 +384,15 @@
           </p>
         </div>
         <div class="download-grid">
-          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.0.3/Argos_1.0.3_universal.dmg">
+          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.1.0/Argos_1.1.0_universal.dmg">
             <span>macOS (Apple Silicon &amp; Intel)</span>
             <strong>Download .dmg</strong>
           </a>
-          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.0.3/Argos_1.0.3_x64-setup.exe">
+          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.1.0/Argos_1.1.0_x64-setup.exe">
             <span>Windows</span>
             <strong>Download .exe</strong>
           </a>
-          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.0.3/Argos_1.0.3_amd64.AppImage">
+          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.1.0/Argos_1.1.0_amd64.AppImage">
             <span>Linux</span>
             <strong>Download .AppImage</strong>
           </a>
@@ -452,6 +466,17 @@
               Argos recovers transparent, Sapling, and Orchard funds — the three pools that ZecWallet
               Lite derived addresses for. It does <strong>not</strong> recover Sprout funds, because
               ZecWallet Lite never derived Sprout keys from the seed.
+            </p>
+          </details>
+          <details>
+            <summary>Do I need to update Argos before I recover?</summary>
+            <p>
+              Yes, if you have an older copy. Zcash activated the Ironwood network upgrade
+              (NU6.3) at mainnet block <strong>3,428,143</strong>. Argos <strong>1.1.0</strong>
+              and later handle it; earlier builds can still scan and show your balance, but the
+              network rejects the sweep they build, so the recovery cannot finish. Nothing is lost
+              and no funds move — you simply need the current build. The download links on this
+              page always point at the newest release.
             </p>
           </details>
           <details>

@@ -1,72 +1,157 @@
 # Regtest harness for Argos integration tests.
 #
-# Boots a private Zcash regtest network on the local machine: one `zcashd` in
-# regtest mode + one `lightwalletd` pointed at it over plaintext gRPC (the
+# Boots a private Zcash regtest network on the local machine: one `zebrad` in
+# Regtest mode + one `lightwalletd` pointed at it over plaintext gRPC (the
 # `--no-tls-very-insecure` flag — *local-only*, never expose this stack to
 # anything beyond loopback).
 #
-# Once `docker compose up -d` succeeds, run `./setup.sh` to mine the initial
-# 200 blocks (coinbase maturity) and fund the well-known Argos test seed's
-# transparent address with a deterministic amount. Then export:
+# The node was zcashd until the Ironwood (NU6.3) work. It had to change:
+# `UPGRADE_NU6_3` appears nowhere in zcash/zcash — not in v6.20.0, the newest
+# release, nor on master — so a zcashd chain can never reach Ironwood, and the
+# post-activation sweep path could not be tested at all. Zebra implements
+# NU6.3 with per-upgrade configurable Regtest activation heights.
+#
+# Zebra has no wallet: there is no `sendtoaddress`, no `getnewaddress`. Funding
+# therefore runs through the `argos-regtest-funder` helper — see setup.sh.
+#
+# Once `docker compose up -d` succeeds, run `./setup.sh` to mine to maturity
+# and fund the well-known Argos test seed. Then export:
 #
 #     export ARGOS_REGTEST_LIGHTWALLETD_URL=http://localhost:9067
 #
 # and run the C2 integration tests:
 #
-#     cargo test --workspace -- --ignored
+#     cargo test -p argos-core --features argos-network -- --ignored
 #
 # See README.md in this directory for the full setup, prerequisites, and
 # teardown instructions.
 
 services:
-  zcashd-regtest:
-    image: electriccoinco/zcashd:latest
-    container_name: argos-zcashd-regtest
+  zebrad-regtest:
+    # Pinned, not `latest`: the harness's activation heights and the Ironwood
+    # consensus rules it exercises are version-sensitive, and a silently
+    # updated node would change what the tests mean.
+    image: zfnd/zebra:6.2.3
+    container_name: argos-zebrad-regtest
     restart: "no"
     # Only bound to loopback — never publish regtest RPC to a non-loopback
-    # interface. Anything that can talk to this port has full miner rights.
+    # interface. Regtest disables proof-of-work, so anything that can reach
+    # this port can mint coins at will.
     ports:
       - "127.0.0.1:18232:18232"
     volumes:
-      - ./zcashd-regtest.conf:/srv/zcashd/.zcash/zcash.conf:ro
-      - zcashd-data:/srv/zcashd/.zcash
-    healthcheck:
-      # zcashd's RPC takes a while to come up; the lightwalletd container
-      # waits on this healthcheck before launching its gRPC server.
-      test:
-        - "CMD"
-        - "zcash-cli"
-        - "-conf=/srv/zcashd/.zcash/zcash.conf"
-        - "getblockchaininfo"
-      interval: 5s
-      timeout: 5s
-      retries: 30
-      start_period: 10s
+      - ./zebrad-regtest.toml:/etc/zebrad/zebrad.toml:ro
+      - zebrad-data:/var/lib/zebrad
+    environment:
+      # The image's entrypoint takes the config path from this variable and
+      # turns it into `--config` itself. Passing `--config` in `command:`
+      # does NOT work: the entrypoint shifts the first argument off when it
+      # starts with `-`, so the path lands as a bare positional and zebrad
+      # rejects it as an unknown subcommand.
+      CONFIG_FILE_PATH: /etc/zebrad/zebrad.toml
+      # Set as an environment variable rather than in the TOML so the
+      # entrypoint creates the directory and chowns it to the unprivileged
+      # runtime user before zebrad starts. config-rs maps
+      # ZEBRA_<SECTION>__<KEY> onto the same setting.
+      ZEBRA_STATE__CACHE_DIR: /var/lib/zebrad
+    command:
+      - "zebrad"
+      - "start"
 
   lightwalletd-regtest:
-    image: electriccoinco/lightwalletd:latest
+    # v0.5.1 is the first release carrying the Ironwood compact-block fields:
+    # `ChainMetadata.ironwoodCommitmentTreeSize`, and `CompactBlock` field 1
+    # (`protoVersion`) reserved after removal. Both match what
+    # zcash_client_backend 0.24 expects to decode.
+    image: electriccoinco/lightwalletd:v0.5.1
+    # Published for linux/amd64 only — there is no arm64 manifest — so Apple
+    # Silicon runs it under emulation. Acceptable because lightwalletd is a
+    # thin gRPC proxy; the consensus work happens in zebrad, which does have a
+    # native arm64 image.
+    platform: linux/amd64
     container_name: argos-lightwalletd-regtest
     restart: "no"
     depends_on:
-      zcashd-regtest:
-        condition: service_healthy
+      - zebrad-regtest
     ports:
       - "127.0.0.1:9067:9067"
     volumes:
-      - ./lightwalletd-regtest.yaml:/etc/lightwalletd.yaml:ro
-      - zcashd-data:/srv/zcashd/.zcash:ro
       - lwd-data:/var/lib/lightwalletd
+    # Zebra has no zcash.conf, so the RPC credentials are passed as flags
+    # rather than via --zcash-conf-path. lightwalletd requires all four of
+    # rpcuser/rpcpassword/rpchost/rpcport to be non-empty; Zebra runs with
+    # `enable_cookie_auth = false` and ignores the credentials themselves.
+    # They are deliberately well-known and meaningless.
+    #
     # `--no-tls-very-insecure` is required because Argos's
-    # `validate_lightwalletd_endpoint` only allows plaintext over the
-    # loopback host set (`127.0.0.1`, `::1`, `localhost`, `*.localhost`).
-    # The port mapping above keeps this loopback-only.
+    # `validate_lightwalletd_endpoint` only allows plaintext over the loopback
+    # host set (`127.0.0.1`, `::1`, `localhost`, `*.localhost`). The port
+    # mapping above keeps this loopback-only.
     command:
-      - "--config=/etc/lightwalletd.yaml"
       - "--no-tls-very-insecure"
-      - "--zcash-conf-path=/srv/zcashd/.zcash/zcash.conf"
+      - "--grpc-bind-addr=0.0.0.0:9067"
+      - "--rpchost=zebrad-regtest"
+      - "--rpcport=18232"
+      - "--rpcuser=argos-regtest"
+      - "--rpcpassword=argos-regtest"
       - "--data-dir=/var/lib/lightwalletd"
       - "--log-file=/dev/stdout"
 
+  # The Sprout chain. NOT part of the default stack.
+  #
+  # Exists because ZIP 211 disabled adding value to the Sprout pool from
+  # Canopy onward, and the main harness activates Canopy at height 1 — so no
+  # Sprout note can be created there, and the spend path has nothing to spend.
+  #
+  # zcashd rather than Zebra, for two reasons found the hard way:
+  #
+  #   * Zebra refuses to mine below Canopy at all — "Zebra does not support
+  #     generating pre-Canopy block templates" — so a late-Canopy Zebra chain
+  #     cannot be built even one block high.
+  #   * zcashd has `sendtoaddress`, so a transparent output can be paid to a
+  #     key we hold without mining coinbase to it.
+  #
+  # The tradeoff is that zcashd cannot activate Ironwood, so this chain
+  # exercises Sprout under pre-Canopy rules rather than post-Ironwood ones.
+  # That is the right tradeoff: JoinSplit validation is unchanged by the later
+  # upgrades, and the alternative is not testing the spend path at all.
+  #
+  # Run with: docker compose --profile sprout up -d zcashd-sprout
+  zcashd-sprout:
+    profiles: ["sprout"]
+    image: electriccoinco/zcashd:v6.20.0
+    container_name: argos-zcashd-sprout
+    restart: "no"
+    ports:
+      - "127.0.0.1:18242:18232"
+      # The p2p port, so the Sprout scanner can be tested against a real
+      # node speaking the real wire protocol. Sprout notes are invisible to
+      # lightwalletd, so p2p is the only way to find them and the only way
+      # to check the framing against something that did not come from us.
+      - "127.0.0.1:18344:18344"
+    volumes:
+      - zcashd-sprout-data:/srv/zcashd/.zcash
+      - ./zcashd-sprout.conf:/srv/zcashd/.zcash/zcash.conf:ro
+    entrypoint: ["zcashd", "-conf=/srv/zcashd/.zcash/zcash.conf", "-datadir=/srv/zcashd/.zcash", "-printtoconsole"]
+
+  # Fixture generation only. NOT part of the regtest stack.
+  #
+  # zcashd is EOL and cannot activate Ironwood (NU6.3), so it is useless
+  # for sweep testing — but it is the only software that writes a
+  # wallet.dat, and it still generates Sprout keys when Canopy is held
+  # inactive (src/wallet/rpcwallet.cpp:3236 in v6.20.0).
+  #
+  # Run with: docker compose --profile fixtures up zcashd-fixtures
+  zcashd-fixtures:
+    profiles: ["fixtures"]
+    container_name: argos-zcashd-fixtures
+    image: electriccoinco/zcashd:v6.20.0
+    volumes:
+      - ./fixtures/out:/fixtures
+      - ./fixtures/generate.sh:/generate.sh:ro
+    entrypoint: ["/bin/bash", "/generate.sh"]
+
 volumes:
-  zcashd-data:
+  zebrad-data:
   lwd-data:
+  zcashd-sprout-data:

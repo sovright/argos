@@ -11,8 +11,8 @@ use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
     validate_destination_address, validate_mnemonic_words, verify_seed_for_workspace,
-    BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle,
-    SweepOutcome, SweepProposal, SweepRequest, ZeckNetwork,
+    BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle, SweepOutcome,
+    SweepProposal, SweepRequest, ZeckNetwork,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,272 @@ pub async fn validate_address(
     network: ZeckNetwork,
 ) -> Result<argos_core::AddressInfo, String> {
     validate_destination_address(&address, network).map_err(|err| err.to_string())
+}
+
+/// What Argos found in a legacy wallet file, with nothing secret in it.
+///
+/// Deliberately counts rather than keys: this crosses the IPC boundary to
+/// the webview, and the frontend has no use for key material. Mirrors what
+/// `argos inspect-wallet` prints.
+#[derive(Serialize)]
+pub struct WalletFileSummary {
+    pub path: String,
+    pub transparent_keys: usize,
+    pub sapling_keys: usize,
+    pub sprout_keys: usize,
+    /// Sprout addresses, which are public and are the only way a user can
+    /// tell which funds this file holds for the Sprout pool.
+    pub sprout_addresses: Vec<String>,
+    /// Sprout notes recovered from this file alone, and their total value.
+    ///
+    /// This is the whole difference between "your funds are right here" and
+    /// "this needs a multi-hour full-block scan", so it is computed here
+    /// rather than left for the frontend to infer from key counts. A wallet
+    /// can hold Sprout keys and still recover nothing, if the note
+    /// ciphertexts or cached witnesses are absent.
+    pub sprout_spendable_notes: usize,
+    pub sprout_spendable_zatoshis: u64,
+    /// Why notes could not be recovered, when none were. Shown rather than
+    /// summarised away: "no notes" and "notes that failed to decrypt" call
+    /// for very different next steps.
+    pub sprout_issues: Vec<String>,
+    /// What a full-block Sprout scan would cost, in the user's terms.
+    /// Rendered from `argos-core` so the GUI and CLI cannot drift.
+    pub sprout_scan_warning: Vec<String>,
+    /// True when the file yielded a BIP-39 mnemonic, which means it re-enters
+    /// the ordinary HD pipeline and scans and sweeps like a typed seed.
+    pub has_mnemonic: bool,
+    /// True when the file has no Sapling keys, so recovery goes down the
+    /// transparent-only path (ZIP-316 gives it no UFVK to anchor an account).
+    pub transparent_only: bool,
+    /// Records the parser could not read. Surfaced because a wallet that
+    /// silently drops records looks identical to one that had nothing.
+    pub diagnostics: Vec<String>,
+    /// True when the file is encrypted and the supplied passphrase (or its
+    /// absence) could not open it.
+    pub needs_passphrase: bool,
+}
+
+/// Show a native file picker and return the chosen wallet file's path.
+///
+/// Lives in Rust rather than being called from JavaScript, matching how the
+/// opener plugin is used here: the capability file grants the webview no
+/// `dialog:` permission, so the frontend cannot open a dialog of its own
+/// choosing. Returns `None` when the user cancels, which is not an error.
+///
+/// Only the path crosses back. Argos reads the file in the backend, so a
+/// wallet's bytes never transit the webview.
+#[tauri::command]
+pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Open a Zcash wallet file")
+        // zcashd writes `wallet.dat`; ZecWallet Lite writes files with
+        // assorted names, so an "any file" option has to stay reachable or
+        // the picker would hide wallets it can actually read.
+        .add_filter("Wallet files", &["dat"])
+        .add_filter("All files", &["*"])
+        .pick_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+
+    let picked = rx
+        .await
+        .map_err(|_| "the file picker closed unexpectedly".to_owned())?;
+
+    Ok(picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+/// Whether this build can recover Sprout funds.
+///
+/// Hardcoded `false`, and deliberately so: this build has no Sprout backend
+/// compiled into it at all — the recovery, scan and sweep modules are absent,
+/// and with them the commands the GUI's Sprout panel used to call. There is
+/// nothing to feature-detect against, so the honest answer is a constant.
+///
+/// It exists as a command rather than as a build-time edit to the frontend
+/// because `gui/src/main.js` is a single static file with no bundler, shared
+/// with the Sprout track, whose counterpart returns `true`. Deleting the panel
+/// here and re-adding it there would churn the same code twice and let the two
+/// copies drift; asking at runtime keeps one frontend serving both.
+///
+/// The frontend must treat a failed call as `false` too. Guessing "supported"
+/// would put a user in front of live-looking Sprout controls that cannot work.
+#[tauri::command]
+pub fn sprout_supported() -> bool {
+    false
+}
+
+/// The Sprout-derived portion of a `WalletFileSummary`.
+///
+/// The fields are plain data (counts, encoded strings). This build carries no
+/// Sprout recovery code — no forged-key rejection, no note decryption, no
+/// scan-cost wording — so it reports the key count the always-on parser
+/// produces and leaves the rest empty.
+struct SproutSummary {
+    sprout_keys: usize,
+    sprout_addresses: Vec<String>,
+    sprout_spendable_notes: usize,
+    sprout_spendable_zatoshis: u64,
+    sprout_issues: Vec<String>,
+    sprout_scan_warning: Vec<String>,
+}
+
+/// Without the Sprout code path compiled in there is no recovery or
+/// validation logic to run. The always-on parser still counts the keys, so
+/// the summary reports that count (unvalidated) and leaves everything the
+/// recovery path would have produced empty.
+fn compute_sprout_summary(
+    keys: &mut argos_core::argos_wallet_import::ImportedKeys,
+    _network_name: &str,
+) -> SproutSummary {
+    SproutSummary {
+        sprout_keys: keys.sprout.len(),
+        sprout_addresses: Vec::new(),
+        sprout_spendable_notes: 0,
+        sprout_spendable_zatoshis: 0,
+        sprout_issues: Vec::new(),
+        sprout_scan_warning: Vec::new(),
+    }
+}
+
+/// Read a legacy wallet file and report what is in it. No network, and
+/// nothing is written anywhere.
+///
+/// The passphrase crosses the IPC boundary as a `SecretString`, the same
+/// treatment the seed phrase gets (audit Issue A). That is a real exposure
+/// and is recorded in docs/THREAT_MODEL.md as T-S6: a compromised webview
+/// sees it. The CLI avoids the question entirely by prompting on a terminal;
+/// a GUI has no equivalent, so the choice is this or no GUI import at all.
+#[tauri::command]
+pub async fn inspect_wallet_file(
+    path: String,
+    passphrase: Option<SecretString>,
+    network: Option<String>,
+) -> Result<WalletFileSummary, String> {
+    // Needed to encode Sprout addresses in the form the user can actually
+    // match against a backup. Optional so an older frontend still works,
+    // defaulting to mainnet as everything else here does.
+    let network_name = network.unwrap_or_else(|| "mainnet".to_owned());
+    let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
+    let keys =
+        match argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref()) {
+            Ok(keys) => keys,
+            // An encrypted wallet with a missing or wrong passphrase is an
+            // ordinary user situation, not a failure to show raw. Matched on the
+            // typed variant rather than the message text, so rewording the error
+            // cannot silently turn "ask for the passphrase" into "give up".
+            Err(argos_core::argos_wallet_import::ImportError::WrongPassphrase) => {
+                return Ok(WalletFileSummary {
+                    path,
+                    transparent_keys: 0,
+                    sapling_keys: 0,
+                    sprout_keys: 0,
+                    sprout_addresses: Vec::new(),
+                    sprout_spendable_notes: 0,
+                    sprout_spendable_zatoshis: 0,
+                    sprout_issues: Vec::new(),
+                    sprout_scan_warning: Vec::new(),
+                    has_mnemonic: false,
+                    transparent_only: false,
+                    diagnostics: Vec::new(),
+                    needs_passphrase: true,
+                });
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+
+    // The Sprout-specific recovery (forged-key rejection, note decryption,
+    // scan-cost wording) is computed in a helper so it compiles out with the
+    // `sprout` feature. It takes `&mut keys` because rejecting forged Sprout
+    // keys must drop them before anything else reads the wallet.
+    let mut keys = keys;
+    let sprout = compute_sprout_summary(&mut keys, &network_name);
+
+    Ok(WalletFileSummary {
+        path,
+        transparent_keys: keys.transparent.len(),
+        sapling_keys: keys.sapling.len(),
+        sprout_keys: sprout.sprout_keys,
+        sprout_addresses: sprout.sprout_addresses,
+        sprout_spendable_notes: sprout.sprout_spendable_notes,
+        sprout_spendable_zatoshis: sprout.sprout_spendable_zatoshis,
+        sprout_issues: sprout.sprout_issues,
+        sprout_scan_warning: sprout.sprout_scan_warning,
+        has_mnemonic: keys.mnemonic.is_some(),
+        transparent_only: argos_core::key_source::classify_recovery_route(&keys)
+            == argos_core::key_source::RecoveryRoute::TransparentOnly,
+        diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
+        needs_passphrase: false,
+    })
+}
+
+// No `Debug`/`Serialize`/`Clone`, for the same reason as `ScanConfigInput`:
+// this carries a wallet passphrase.
+#[derive(Deserialize)]
+pub struct WalletFileScanInput {
+    pub path: String,
+    pub passphrase: Option<SecretString>,
+    pub birthday: u32,
+    pub num_accounts: Option<u32>,
+    pub gap_limit: u32,
+    pub lightwalletd_url: String,
+    pub data_dir: String,
+    pub network: ZeckNetwork,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Scan a legacy wallet file's keys.
+///
+/// Routing lives in the core service, not here: a wallet that yields a
+/// mnemonic goes down the ordinary HD path, and one that does not is scanned
+/// as imported accounts. The GUI only has to hand over the key source, which
+/// is why this is a thin wrapper over `start_scan_from_key_source`.
+#[tauri::command]
+pub async fn start_scan_from_wallet_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: WalletFileScanInput,
+) -> Result<ScanHandle, String> {
+    use std::sync::Arc;
+
+    ensure_tos_accepted(&app)?;
+
+    let bytes =
+        fs::read(&config.path).map_err(|err| format!("could not read {}: {err}", config.path))?;
+    let keys =
+        argos_core::argos_wallet_import::import_wallet_file(&bytes, config.passphrase.as_ref())
+            .map_err(|err| err.to_string())?;
+
+    let key_source: Arc<dyn argos_core::KeySource> =
+        Arc::new(argos_core::ImportedKeySource::new(keys));
+
+    let handle = state
+        .service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: config.birthday,
+                num_accounts: config.num_accounts,
+                gap_limit: config.gap_limit,
+                lightwalletd_url: config.lightwalletd_url,
+                data_dir: PathBuf::from(config.data_dir),
+                network: config.network,
+                label: config.label.unwrap_or_default(),
+            },
+            key_source,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+
+    spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
+
+    Ok(handle)
 }
 
 #[tauri::command]
@@ -260,6 +526,21 @@ pub fn default_data_dir(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 pub fn donation_address() -> String {
     argos_core::DONATION_ADDRESS.to_owned()
+}
+
+/// The running build's version, for the sidebar.
+///
+/// Support answers increasingly begin "check your version" — most immediately
+/// because builds before 1.1.0 cannot complete a sweep now that Ironwood
+/// (NU6.3) has activated at mainnet height 3_428_143. Someone hitting that has
+/// a wallet that scans correctly and a sweep that fails, and no way to tell
+/// from inside the app which build they are on.
+///
+/// Reports the compiled-in package version rather than anything read at
+/// runtime, so it always describes the binary actually executing.
+#[tauri::command]
+pub fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
 }
 
 /// Exact set of external URLs the UI is allowed to open in the OS browser.
@@ -764,6 +1045,21 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
 
+    /// The sidebar version is a support-facing claim about which binary is
+    /// running, so it must be a real, non-empty version rather than a
+    /// placeholder that silently ships as "0.0.0" or "".
+    #[test]
+    fn app_version_reports_the_compiled_package_version() {
+        let reported = app_version();
+        assert_eq!(reported, env!("CARGO_PKG_VERSION"));
+        assert!(!reported.is_empty(), "version must not be empty");
+        assert!(
+            reported.split('.').count() >= 3,
+            "expected a semver-shaped version, got {reported:?}"
+        );
+        assert_ne!(reported, "0.0.0", "version must not be a placeholder");
+    }
+
     fn temp_workspace() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -945,7 +1241,10 @@ mod tests {
         super::write_private_report(&path, b"fresh").expect("write report");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "a reused report file must be re-tightened to 0o600");
+        assert_eq!(
+            mode, 0o600,
+            "a reused report file must be re-tightened to 0o600"
+        );
         assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -958,8 +1257,12 @@ mod tests {
             assert!(is_allowed_external_url(url), "{url} should be allowed");
         }
         // Exfiltration and look-alike attempts are rejected (exact match, not prefix/substring).
-        assert!(!is_allowed_external_url("https://evil.example/?s=secret-seed"));
-        assert!(!is_allowed_external_url("https://sovright.com.evil.example/"));
+        assert!(!is_allowed_external_url(
+            "https://evil.example/?s=secret-seed"
+        ));
+        assert!(!is_allowed_external_url(
+            "https://sovright.com.evil.example/"
+        ));
         assert!(!is_allowed_external_url("https://sovright.com/extra"));
         assert!(!is_allowed_external_url("file:///etc/passwd"));
         assert!(!is_allowed_external_url("javascript:alert(1)"));
@@ -971,11 +1274,9 @@ mod tests {
     // D). This catches a maintainer adding a link without updating the allowlist.
     #[test]
     fn every_html_external_link_is_allowlisted() {
-        let html = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../src/index.html"
-        ))
-        .expect("read index.html");
+        let html =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/index.html"))
+                .expect("read index.html");
         for (idx, _) in html.match_indices("href=\"") {
             let rest = &html[idx + 6..];
             let end = rest.find('"').expect("closing quote");

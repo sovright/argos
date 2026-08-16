@@ -1,6 +1,6 @@
 use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Instant};
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use tokio::{
     sync::{Mutex, RwLock},
     task::JoinHandle,
@@ -10,11 +10,12 @@ use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
         wallet::{
-            create_proposed_transactions, input_selection::GreedyInputSelector,
+            create_proposed_transactions,
+            input_selection::{GreedyInputSelector, LockedInputPolicy, SpendPolicy},
             propose_send_max_transfer, propose_shielding, propose_transfer, ConfirmationsPolicy,
             SpendingKeys,
         },
-        MaxSpendMode, TransactionStatus, TransparentOutputFilter, WalletRead, WalletWrite,
+        CoinbaseFilter, MaxSpendMode, TransactionStatus, WalletRead, WalletWrite,
     },
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
     proto::service::{
@@ -37,12 +38,13 @@ use zcash_primitives::transaction::{
     TxId,
 };
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, ShieldedProtocol};
+use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, ShieldedPool};
 
 use crate::{
     address::validate_destination_address,
-    derivation::{legacy_transparent_account_key, legacy_transparent_secret_key, mnemonic_seed},
+    derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
     error::{ZeckError, ZeckResult},
+    key_source::{KeySource, SeedKeySource},
     lightwalletd::{
         connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
         validated_lightwalletd_endpoints,
@@ -114,7 +116,7 @@ fn balance_covers_sweep_fee(zatoshis: u64) -> bool {
 /// because the underlying `zcash_client_backend` proposal error is a deep
 /// generic type with no stable typed variant to match here; a false match only
 /// downgrades a fatal abort to a skip (recorded), never the reverse.
-fn is_insufficient_funds_error(message: &str) -> bool {
+pub(crate) fn is_insufficient_funds_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("insufficient funds")
 }
 
@@ -145,12 +147,8 @@ fn execution_donation_address(network: crate::models::ZeckNetwork) -> String {
 }
 
 /// The concrete wallet database type used throughout the execution path.
-type SweepWalletDb = WalletDb<
-    rusqlite::Connection,
-    zcash_protocol::consensus::Network,
-    SystemClock,
-    rand_core::OsRng,
->;
+type SweepWalletDb =
+    WalletDb<rusqlite::Connection, crate::workspace::ArgosParams, SystemClock, rand_core::OsRng>;
 const CONFIRMATION_POLL_INTERVAL_SECS: u64 = 5;
 const CONFIRMATION_POLL_ATTEMPTS: u32 = 24;
 const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
@@ -180,12 +178,23 @@ impl RecoveryService {
         config: ScanConfig,
         seed_phrase: SecretString,
     ) -> ZeckResult<ScanHandle> {
+        self.start_scan_from_key_source(config, Arc::new(SeedKeySource::new(seed_phrase)))
+            .await
+    }
+
+    /// Start a scan from any key source — a seed phrase, or keys read out
+    /// of a legacy wallet file.
+    pub async fn start_scan_from_key_source(
+        &self,
+        config: ScanConfig,
+        key_source: Arc<dyn KeySource>,
+    ) -> ZeckResult<ScanHandle> {
         validate_scan_config(&config)?;
 
         let handle = ScanHandle::new();
         let state = Arc::new(tokio::sync::Mutex::new(ScanTaskState::new(handle.clone())));
         let runtime = RuntimeScanConfig {
-            seed_phrase,
+            key_source,
             birthday: config.birthday,
             num_accounts: config.num_accounts,
             gap_limit: config.gap_limit,
@@ -321,6 +330,52 @@ impl RecoveryService {
                 progress.phase
             )));
         }
+
+        // Confirm the workspace this proposal describes is still there and
+        // still readable, before quoting a number derived from it.
+        //
+        // The balances below come from the in-memory scan state, not from
+        // disk, so without this check a deleted or permission-stripped
+        // workspace produces a confident, fully-priced proposal — and the
+        // proposal's own warning tells the user it came from the persisted
+        // wallet. Executing it would then fail, after the user has already
+        // been shown an amount. For a recovery tool a confidently wrong
+        // balance is a worse failure than a clean error.
+        //
+        // `from_runtime` only computes paths; it creates nothing. But opening
+        // the database is not enough on its own: `open_wallet_db` uses
+        // `Connection::open`, which recreates an empty `wallet.sqlite` when the
+        // file has been deleted but its directory survives — masking the very
+        // loss this guards against. So require a readable wallet summary too; a
+        // missing or freshly-recreated database yields `None` here and fails
+        // loudly, matching what the execute path already demands.
+        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
+        let wallet_db = open_wallet_db(
+            workspace.wallet_db_path(),
+            consensus_network(session.runtime.network),
+        )
+        .map_err(|err| {
+            ZeckError::Wallet(format!(
+                "the recovery workspace backing this scan is no longer readable, so its \
+                 balances cannot be trusted: {err}"
+            ))
+        })?;
+        wallet_db
+            .get_wallet_summary(ConfirmationsPolicy::MIN)
+            .map_err(|err| {
+                ZeckError::Wallet(format!(
+                    "the recovery workspace backing this scan is no longer readable, so its \
+                     balances cannot be trusted: {err}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ZeckError::Wallet(
+                    "the recovery workspace backing this scan no longer contains a wallet, \
+                     so its balances cannot be trusted"
+                        .to_owned(),
+                )
+            })?;
+
         build_sweep_proposal(
             &progress,
             request,
@@ -366,6 +421,17 @@ impl RecoveryService {
                 "current phase is {:?}",
                 progress.phase
             )));
+        }
+
+        // An imported wallet with no HD seed cannot go through the sweep
+        // below, which derives a UnifiedSpendingKey per account. Route it
+        // here rather than in a front-end so the CLI and the GUI cannot
+        // diverge on which key sources are spendable — the branch belongs
+        // wherever `execute_sweep` is the shared surface.
+        if session.runtime.key_source.wallet_seed()?.is_none() {
+            if let Some(keys) = session.runtime.key_source.imported_keys() {
+                return sweep_imported_session(&session.runtime, keys, &request).await;
+            }
         }
 
         let _ = build_sweep_proposal(
@@ -636,14 +702,13 @@ fn build_sweep_proposal(
     if let Some(max_fee_zatoshis) = request.max_fee_zatoshis {
         if total_fee_zatoshis > max_fee_zatoshis {
             return Err(ZeckError::MaxFeeExceeded(format!(
-                "estimated fee {} zats exceeds limit {} zats",
-                total_fee_zatoshis, max_fee_zatoshis
+                "estimated fee {total_fee_zatoshis} zats exceeds limit {max_fee_zatoshis} zats"
             )));
         }
     }
 
     let warning = if net_received_zatoshis > 0 {
-        "This dry-run proposal uses the authoritative scan balances from the persisted wallet workspace. Argos estimates any required shielding first, then a final sweep to the destination Unified Address."
+        "This dry-run proposal uses the balances from the completed scan, checked against the recovery workspace on disk. Argos estimates any required shielding first, then a final sweep to the destination Unified Address."
             .to_owned()
     } else if !skipped_accounts.is_empty() {
         "Balances were detected, but every discovered account was skipped because the ZIP 317 fee floor would consume the recoverable value."
@@ -697,9 +762,16 @@ async fn execute_sweep_for_session(
         )
     };
 
-    let seed = mnemonic_seed(&runtime.seed_phrase)?;
-    let transparent_account =
-        legacy_transparent_account_key(&runtime.seed_phrase, runtime.network)?;
+    // A scan cannot have reached this point without a seed — `run_recovery_scan_inner`
+    // rejects a seedless key source before it derives anything — so this is a
+    // consistency check rather than a user-facing path.
+    let seed = runtime.key_source.wallet_seed()?.ok_or_else(|| {
+        ZeckError::InvalidConfig(format!(
+            "cannot sweep {}: standalone keys with no HD seed are not yet spendable",
+            runtime.key_source.describe()
+        ))
+    })?;
+    let transparent_account = legacy_transparent_account_key_from_seed(runtime.network, &seed)?;
     let network = consensus_network(runtime.network);
     let destination_address =
         ZcashAddress::try_from_encoded(&destination.encoded).map_err(|err| {
@@ -791,7 +863,7 @@ async fn execute_sweep_for_session(
                         tracked_account.derived.index
                     ))
                 })?;
-            let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), zip32_index)
+            let usk = UnifiedSpendingKey::from_seed(&network, &seed, zip32_index)
                 .map_err(|err| {
                     ZeckError::Wallet(format!(
                         "deriving account {}: {err}",
@@ -1040,7 +1112,11 @@ fn standard_zip317_change_strategy<I>() -> SingleOutputChangeStrategy<I> {
     SingleOutputChangeStrategy::<I>::new(
         StandardFeeRule::Zip317,
         None,
-        ShieldedProtocol::Orchard,
+        // Fallback change pool only. From Ironwood (NU6.3) activation the turnstile
+        // forbids value entering the Orchard pool, and the change strategy coerces this
+        // fallback to Ironwood for those transactions; below activation it still means
+        // Orchard, as before.
+        ShieldedPool::Orchard,
         DustOutputPolicy::default(),
     )
 }
@@ -1051,8 +1127,10 @@ async fn execute_shielding_step(
     transparent_account: &zcash_transparent::keys::AccountPrivKey,
     usk: &UnifiedSpendingKey,
 ) -> ZeckResult<Option<u64>> {
-    let mut wallet_db =
-        open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
+    let mut wallet_db = open_wallet_db(
+        ctx.workspace.wallet_db_path(),
+        consensus_network(ctx.network),
+    )?;
     let input_selector = GreedyInputSelector::<_>::new();
     let change_strategy = standard_zip317_change_strategy();
 
@@ -1065,7 +1143,10 @@ async fn execute_shielding_step(
         &tracked_account.transparent_receivers,
         tracked_account.wallet_account_id,
         ConfirmationsPolicy::MIN,
-        TransparentOutputFilter::All,
+        CoinbaseFilter::AllTransparentOutputs,
+        // Argos is a single-process recovery tool with no concurrent proposals, so it
+        // takes no advisory input locks.
+        None,
     ) {
         Ok(proposal) => proposal,
         Err(err) => {
@@ -1125,6 +1206,8 @@ async fn execute_shielding_step(
         &SpendingKeys::new(usk.clone(), standalone_keys),
         OvkPolicy::Sender,
         &proposal,
+        // No explicit expiry override; keep the library's default expiry.
+        None,
     )
     .map_err(|err| ZeckError::TransactionBuild(format!("creating shielding transaction: {err}")))?;
 
@@ -1259,6 +1342,21 @@ fn build_donation_split_proposal(
             &change_strategy,
             request,
             ConfirmationsPolicy::MIN,
+            // This split runs after shielding, so it spends shielded value only —
+            // matching the pre-0.24 behaviour, where `propose_transfer` had no policy
+            // argument and drew on the shielded pools alone. Ironwood is included for
+            // the same reason it is in the sweep proposal: post-NU6.3 value can live
+            // there.
+            &SpendPolicy::shielded_pools([
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
+            ]),
+            // No advisory input locks; no transaction-version override, so the library
+            // selects the version required at the target height (V6 from Ironwood
+            // activation onward).
+            None,
+            None,
         ) {
             Ok(proposal) => {
                 let fee = proposal_fee_zatoshis(&proposal)?;
@@ -1276,11 +1374,13 @@ fn build_donation_split_proposal(
             // path was never exercised end-to-end (all tests pass donation_rate
             // = None / use string stand-ins).
             Err(err) if is_insufficient_funds_error(&err.to_string()) => {
-                candidate_fee = candidate_fee.checked_add(u64::from(MARGINAL_FEE)).ok_or_else(|| {
-                    ZeckError::Internal(
-                        "donation fee convergence overflowed the supported range".to_owned(),
-                    )
-                })?;
+                candidate_fee = candidate_fee
+                    .checked_add(u64::from(MARGINAL_FEE))
+                    .ok_or_else(|| {
+                        ZeckError::Internal(
+                            "donation fee convergence overflowed the supported range".to_owned(),
+                        )
+                    })?;
             }
             Err(err) => {
                 return Err(ZeckError::TransactionBuild(format!(
@@ -1303,20 +1403,33 @@ async fn execute_send_max_step(
     destination_address: &ZcashAddress,
     memo_bytes: Option<MemoBytes>,
 ) -> ZeckResult<Option<(u64, u64)>> {
-    let mut wallet_db =
-        open_wallet_db(ctx.workspace.wallet_db_path(), consensus_network(ctx.network))?;
+    let mut wallet_db = open_wallet_db(
+        ctx.workspace.wallet_db_path(),
+        consensus_network(ctx.network),
+    )?;
 
     // Pass 1 — measure the full-account send-max proposal (build only, no broadcast).
     let max_proposal = match propose_send_max_transfer::<_, _, _, Infallible>(
         &mut wallet_db,
         &consensus_network(ctx.network),
         tracked_account.wallet_account_id,
-        &[ShieldedProtocol::Sapling, ShieldedProtocol::Orchard],
+        // Argos sweeps an account empty, so every shielded pool a recovered wallet can
+        // hold value in must be spendable. Ironwood joins the list at NU6.3: funds
+        // landing there after activation would otherwise be left behind by a sweep that
+        // reported success.
+        &[
+            ShieldedPool::Sapling,
+            ShieldedPool::Orchard,
+            ShieldedPool::Ironwood,
+        ],
         &StandardFeeRule::Zip317,
         destination_address.clone(),
         memo_bytes.clone(),
         MaxSpendMode::MaxSpendable,
         ConfirmationsPolicy::MIN,
+        // Argos takes no advisory input locks; never draw on another holder's.
+        &LockedInputPolicy::Exclude,
+        None,
     ) {
         Ok(proposal) => proposal,
         Err(err) => {
@@ -1348,8 +1461,11 @@ async fn execute_send_max_step(
             )
         })?;
 
-    let donation =
-        crate::donation::donation_for_send_amount(ctx.donation_address, ctx.donation_rate, send_amount);
+    let donation = crate::donation::donation_for_send_amount(
+        ctx.donation_address,
+        ctx.donation_rate,
+        send_amount,
+    );
 
     // `donation_zatoshis` is the amount *actually* placed in a donation output:
     // the requested `donation` when the split proposal is used, or 0 when there
@@ -1360,8 +1476,8 @@ async fn execute_send_max_step(
         // No donation output: behavior is unchanged from the single-pass sweep.
         (max_proposal, 0)
     } else {
-        let donation_zcash_address = ZcashAddress::try_from_encoded(ctx.donation_address)
-            .map_err(|err| {
+        let donation_zcash_address =
+            ZcashAddress::try_from_encoded(ctx.donation_address).map_err(|err| {
                 ZeckError::InvalidAddress(format!("failed to decode donation address: {err}"))
             })?;
         // On non-convergence (or a non-positive user remainder) fall back to the
@@ -1416,6 +1532,8 @@ async fn execute_send_max_step(
         &SpendingKeys::from_unified_spending_key(usk.clone()),
         OvkPolicy::Sender,
         &proposal,
+        // No explicit expiry override; keep the library's default expiry.
+        None,
     )
     .map_err(|err| ZeckError::TransactionBuild(format!("creating sweep transaction: {err}")))?;
 
@@ -1439,7 +1557,7 @@ async fn execute_send_max_step(
 async fn broadcast_transactions(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
-        zcash_protocol::consensus::Network,
+        crate::workspace::ArgosParams,
         SystemClock,
         rand_core::OsRng,
     >,
@@ -1607,7 +1725,7 @@ fn normalized_endpoint_authority(endpoint: &str) -> String {
 async fn wait_for_confirmation(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
-        zcash_protocol::consensus::Network,
+        crate::workspace::ArgosParams,
         SystemClock,
         rand_core::OsRng,
     >,
@@ -1768,8 +1886,7 @@ fn enforce_max_fee(total_fee_zatoshis: u64, max_fee_zatoshis: Option<u64>) -> Ze
     if let Some(max_fee_zatoshis) = max_fee_zatoshis {
         if total_fee_zatoshis > max_fee_zatoshis {
             return Err(ZeckError::MaxFeeExceeded(format!(
-                "actual fee {} zats exceeds limit {} zats",
-                total_fee_zatoshis, max_fee_zatoshis
+                "actual fee {total_fee_zatoshis} zats exceeds limit {max_fee_zatoshis} zats"
             )));
         }
     }
@@ -1810,7 +1927,7 @@ fn shielded_spendable_zatoshis(
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_shielded_funds_to_confirm(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     zeck_network: crate::models::ZeckNetwork,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     lightwalletd_url: &str,
@@ -1823,12 +1940,21 @@ async fn wait_for_shielded_funds_to_confirm(
     loop {
         {
             let mut guard = state.lock().await;
-            guard.progress.message =
-                Some("Waiting for the shielding transaction to confirm before sweeping…".to_owned());
+            guard.progress.message = Some(
+                "Waiting for the shielding transaction to confirm before sweeping…".to_owned(),
+            );
         }
-        run_wallet_sync_with_retry(workspace, network, zeck_network, client, lightwalletd_url, state)
-            .await?;
-        if shielded_spendable_zatoshis(workspace, zeck_network, tracked_account)? > shielded_before {
+        run_wallet_sync_with_retry(
+            workspace,
+            network,
+            zeck_network,
+            client,
+            lightwalletd_url,
+            state,
+        )
+        .await?;
+        if shielded_spendable_zatoshis(workspace, zeck_network, tracked_account)? > shielded_before
+        {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -1869,6 +1995,76 @@ fn estimate_remaining_seconds(progress: &ScanProgress, elapsed_seconds: u64) -> 
             .checked_div(progress.blocks_scanned)
             .unwrap_or(0),
     )
+}
+
+/// Adapt an imported-wallet sweep to the shared `SweepOutcome`.
+///
+/// An imported wallet moves its two pools in two transactions, so both are
+/// reported as separate entries. A pool that held nothing appears as a
+/// skipped account rather than being omitted: a pool silently missing from
+/// the report is indistinguishable from one that was never attempted.
+async fn sweep_imported_session(
+    runtime: &RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+    request: &SweepRequest,
+) -> ZeckResult<SweepOutcome> {
+    let outcome = crate::imported_sweep::sweep_imported_wallet(
+        runtime,
+        keys,
+        &request.destination,
+        request.max_fee_zatoshis,
+    )
+    .await?;
+
+    let mut transactions = Vec::new();
+    let mut skipped_accounts = Vec::new();
+
+    // One entry per Sapling account that moved, so a wallet holding several
+    // Sapling keys reports every transaction rather than only the first.
+    for (index, txid) in outcome.sapling_txids.iter().enumerate() {
+        transactions.push(TxBroadcastResult {
+            source_account: index as u32,
+            txid: Some(txid.clone()),
+            status: "broadcast".to_owned(),
+            detail: "Sapling notes from the imported wallet".to_owned(),
+            confirmed_height: None,
+        });
+    }
+    if outcome.sapling_txids.is_empty() {
+        skipped_accounts.push(SkippedSweepAccount {
+            account_index: 0,
+            reason: "the imported wallet holds no spendable Sapling notes".to_owned(),
+            gross_zatoshis: 0,
+        });
+    }
+
+    match outcome.transparent_txid {
+        Some(txid) => transactions.push(TxBroadcastResult {
+            source_account: 0,
+            txid: Some(txid),
+            status: "broadcast".to_owned(),
+            detail: format!(
+                "transparent UTXOs from the imported wallet ({} zatoshis, {} fee)",
+                outcome.transparent_zatoshis, outcome.transparent_fee_zatoshis
+            ),
+            confirmed_height: None,
+        }),
+        None => skipped_accounts.push(SkippedSweepAccount {
+            account_index: 0,
+            reason: "the imported wallet holds no spendable transparent funds".to_owned(),
+            gross_zatoshis: 0,
+        }),
+    }
+
+    Ok(SweepOutcome {
+        transactions,
+        skipped_accounts,
+        // Donations are not split out of an imported sweep: the Sapling
+        // path builds a single-step send-max proposal, which has no room
+        // for a second output.
+        total_donation_zatoshis: 0,
+        error: None,
+    })
 }
 
 #[cfg(test)]
@@ -1942,6 +2138,7 @@ mod tests {
             error: None,
             sleep_event: None,
             in_sandblasting_zone: false,
+            gap_extension: None,
         }
     }
 
@@ -1984,7 +2181,10 @@ mod tests {
         assert!(sweep.donation_zatoshis > 0);
         assert_eq!(proposal.total_donation_zatoshis, sweep.donation_zatoshis);
         // estimate invariant unchanged
-        assert_eq!(sweep.net_zatoshis + sweep.fee_zatoshis, sweep.gross_zatoshis);
+        assert_eq!(
+            sweep.net_zatoshis + sweep.fee_zatoshis,
+            sweep.gross_zatoshis
+        );
         // donation is strictly less than the amount being sent
         assert!(sweep.donation_zatoshis < sweep.net_zatoshis);
     }
@@ -2190,7 +2390,9 @@ mod tests {
         // predicate is what gates both execution steps so they skip such dust
         // exactly as `build_sweep_proposal` does (instead of erroring the sweep).
         assert!(!balance_covers_sweep_fee(0));
-        assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1));
+        assert!(!balance_covers_sweep_fee(
+            MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1
+        ));
         assert!(!balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS)); // == floor: fee eats it all
         assert!(balance_covers_sweep_fee(MIN_SHIELDED_SEND_FEE_ZATOSHIS + 1));
     }
@@ -2313,12 +2515,8 @@ mod tests {
     #[test]
     fn donation_fallback_ok_none_returns_max() {
         // Fell back → donation-free proposal AND zero actual donation.
-        let got = super::donation_proposal_or_fallback::<&str>(
-            Ok(None),
-            "donation-free-max",
-            5_000,
-            0,
-        );
+        let got =
+            super::donation_proposal_or_fallback::<&str>(Ok(None), "donation-free-max", 5_000, 0);
         assert_eq!(got, ("donation-free-max", 0));
     }
 
@@ -2329,7 +2527,9 @@ mod tests {
         // entire sweep — see PR #66 review (Kristi, 2026-05-28). The actual
         // donation is reported as 0 so the outcome doesn't over-count.
         let got = super::donation_proposal_or_fallback::<&str>(
-            Err(ZeckError::TransactionBuild("synthetic regression".to_owned())),
+            Err(ZeckError::TransactionBuild(
+                "synthetic regression".to_owned(),
+            )),
             "donation-free-max",
             5_000,
             42,
@@ -2356,6 +2556,7 @@ mod tests {
             error: None,
             sleep_event: None,
             in_sandblasting_zone: false,
+            gap_extension: None,
         }
     }
 
@@ -2419,8 +2620,10 @@ mod tests {
         // of net in the estimate).
         for s in &sweeps {
             assert_eq!(s.net_zatoshis + s.fee_zatoshis, s.gross_zatoshis);
-            assert!(s.donation_zatoshis < s.net_zatoshis,
-                "donation must remain strictly below net so user receives positive remainder");
+            assert!(
+                s.donation_zatoshis < s.net_zatoshis,
+                "donation must remain strictly below net so user receives positive remainder"
+            );
         }
     }
 

@@ -20,10 +20,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.87
+      - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.87"
+          toolchain: "1.88"
           components: clippy
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -61,10 +61,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.87
+      - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.87"
+          toolchain: "1.88"
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -82,10 +82,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.87
+      - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.87"
+          toolchain: "1.88"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
@@ -101,6 +101,75 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      # After the `sprout` feature landed, `--workspace` alone builds Track A
+      # only, so nothing in CI compiled the Sprout code at all. This keeps it
+      # type-checked on every push; the node-backed job below is what actually
+      # runs it.
+      - name: cargo test (--features sprout)
+        run: cargo test --workspace --features argos-core/sprout,argos-cli/sprout
+
+  sprout-node-tests:
+    name: Sprout scan against a real node
+    runs-on: ubuntu-latest
+    # Generous: the end-to-end scan mines 110 blocks for coinbase maturity,
+    # plants a note, then walks the chain. ~6 minutes locally.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The only regtest chain that can hold Sprout notes: ZIP 211 forbids
+      # funding the pool from Canopy onward, and this profile holds Canopy
+      # inactive (nuparams e9ff75a6:9999999).
+      - name: Start the regtest Sprout node
+        working-directory: tests/regtest
+        run: docker compose --profile sprout up -d zcashd-sprout
+
+      - name: Wait for the node to accept RPC
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf --user argos-regtest:argos-regtest \
+                 --data '{"jsonrpc":"1.0","id":"ci","method":"getblockchaininfo","params":[]}' \
+                 -H 'content-type: text/plain;' http://127.0.0.1:18242/ >/dev/null; then
+              echo "node is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "node did not accept RPC within 60s"
+          docker compose --profile sprout -f tests/regtest/docker-compose.yml logs --tail=50 zcashd-sprout || true
+          exit 1
+
+      # `--features sprout` AND `--ignored`, both required. These are the only
+      # tests that exercise the Sprout scan end to end, and they are the reason
+      # this job exists: `argos scan-sprout` once shipped unable to scan
+      # anything from a cold start -- every fresh walk aborted on its first
+      # page -- while the docs described it as proven on regtest. Nothing in
+      # CI ran them, so nothing caught it.
+      #
+      # Deliberately not the whole `--ignored` set: the Sprout *proving* tests
+      # need the 725 MB parameter file, which is a separate download and a
+      # separate job if it is ever wanted. These two need no parameters.
+      - name: Sprout scan tests
+        run: |
+          cargo test -p argos-core --features sprout \
+            --test sprout_scan_matches_the_node \
+            --test sprout_scan_finds_a_real_note \
+            -- --ignored --nocapture
+
+      - name: Node logs on failure
+        if: failure()
+        working-directory: tests/regtest
+        run: docker compose --profile sprout logs --tail=200 zcashd-sprout
 
   cargo-deny:
     name: Cargo deny (advisories + bans + licenses + sources)
@@ -127,10 +196,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.87
+      - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.87"
+          toolchain: "1.88"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 

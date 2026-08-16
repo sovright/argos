@@ -6,7 +6,7 @@ use std::sync::{
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use rustls::crypto::ring::default_provider;
-use secrecy::{ExposeSecret, SecretVec};
+use secrecy::SecretVec;
 use tokio::sync::Mutex;
 use tonic::{
     body::Body as TonicBody,
@@ -18,9 +18,9 @@ use zcash_client_backend::{
     data_api::{
         chain::{error::Error as ChainError, BlockCache, BlockSource},
         scanning::ScanRange,
-        wallet::ConfirmationsPolicy,
-        Account as _, AccountBirthday, InputSource, TransparentOutputFilter, WalletRead,
-        WalletWrite, Zip32Derivation,
+        wallet::{input_selection::LockFilter, ConfirmationsPolicy},
+        Account as _, AccountBirthday, CoinbaseFilter, InputSource, WalletRead, WalletWrite,
+        Zip32Derivation,
     },
     proto::{
         compact_formats::CompactBlock,
@@ -38,7 +38,8 @@ use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 use crate::{
     derivation::{
-        derive_accounts, legacy_transparent_account_key, legacy_transparent_pubkey, mnemonic_seed,
+        derive_accounts_from_seed, legacy_transparent_account_key_from_seed,
+        legacy_transparent_pubkey,
     },
     error::{ZeckError, ZeckResult},
     lightwalletd::{
@@ -47,8 +48,8 @@ use crate::{
     },
     models::{
         in_sandblasting_zone, AccountBalancePreview, AddressScope, DerivedAccount, DiscoveryPool,
-        LightwalletdProbe, RuntimeScanConfig, ScanDiscovery, ScanHandle, ScanPhase, ScanProgress,
-        ScanSummary, SleepEvent,
+        GapExtension, LightwalletdProbe, RuntimeScanConfig, ScanDiscovery, ScanHandle, ScanPhase,
+        ScanProgress, ScanSummary, SleepEvent,
     },
     workspace::{
         consensus_network, mark_session_completed, open_wallet_db, touch_session_last_run,
@@ -246,6 +247,7 @@ impl ScanTaskState {
                 error: None,
                 sleep_event: None,
                 in_sandblasting_zone: false,
+                gap_extension: None,
             },
             cancelled: Arc::new(AtomicBool::new(false)),
             workspace: None,
@@ -390,13 +392,67 @@ async fn run_recovery_scan_inner(
     {
         let mut guard = state.lock().await;
         guard.progress.phase = ScanPhase::ValidatingSeed;
-        guard.progress.message = Some("Validating BIP-39 seed phrase.".to_owned());
+        guard.progress.message = Some(format!(
+            "Validating keys from {}.",
+            config.key_source.describe()
+        ));
     }
 
-    let seed = mnemonic_seed(&config.seed_phrase)?;
+    // Every account slot the HD scanner walks is derived from a seed. A
+    // key source without one is scanned by `run_imported_scan` instead,
+    // which registers the wallet file's own keys as accounts.
+    //
+    // A source with neither a seed nor importable keys is refused rather
+    // than scanned as zero accounts: a successful-but-empty scan is the
+    // failure mode a user recovering real funds would most easily mistake
+    // for an answer.
+    let seed = match config.key_source.wallet_seed()? {
+        Some(seed) => seed,
+        None => {
+            let keys = config.key_source.imported_keys().ok_or_else(|| {
+                ZeckError::InvalidConfig(format!(
+                    "{} has no HD seed and no importable keys, so there is nothing to scan.",
+                    config.key_source.describe()
+                ))
+            })?;
+            // This branch used to refuse with a message naming the
+            // transparent-only path — which only the CLI implemented, at its
+            // own front end. The GUI handed the same wallet straight here and
+            // showed the user that refusal, telling them their recoverable
+            // funds were unrecoverable. A transparent-only `wallet.dat` is the
+            // most common legacy zcashd shape, so that was the default
+            // experience for it.
+            //
+            // Scope, stated honestly: this fixes the GUI. The CLI still
+            // dispatches transparent-only at its own front end
+            // (`main.rs`, `is_transparent_only`) and returns through
+            // `print_transparent_report`, so it never reaches this match. The
+            // *predicate* is shared — both sides classify through
+            // `classify_recovery_route` — but the scan invocation is not, and
+            // the two produce different observable output. Routing the CLI
+            // through here would change what it prints, so it is a deliberate
+            // follow-up rather than something this branch quietly did.
+            match crate::key_source::classify_recovery_route(keys) {
+                crate::key_source::RecoveryRoute::TransparentOnly => {
+                    return run_transparent_only_scan(state, &config, keys).await;
+                }
+                crate::key_source::RecoveryRoute::Nothing => {
+                    return Err(ZeckError::InvalidConfig(format!(
+                        "{} contains no transparent or Sapling keys, so there is nothing \
+                         to scan.",
+                        config.key_source.describe()
+                    )));
+                }
+                // A mnemonic would have produced a seed above, so `Hd` is
+                // unreachable here; `ImportedAccounts` falls through.
+                _ => {}
+            }
+            return run_imported_scan(state, &config, keys).await;
+        }
+    };
     let workspace = RecoveryWorkspace::from_runtime(&config)?;
-    workspace.initialize(config.network, seed.expose_secret())?;
-    let transparent_account = legacy_transparent_account_key(&config.seed_phrase, config.network)?;
+    workspace.initialize(config.network, &seed)?;
+    let transparent_account = legacy_transparent_account_key_from_seed(config.network, &seed)?;
 
     // Sidecar v1: written once we have a workspace on disk and before any
     // long-running probe/sync work. `target_height` is unknown until the
@@ -429,8 +485,9 @@ async fn run_recovery_scan_inner(
     let max_accounts = resolve_max_account_count(&config)?;
     let mut imported_accounts = 0u32;
     let mut target_accounts = initial_batch_size(&config, max_accounts);
+    let mut gap_extension_pass = 0u32;
     let network = consensus_network(config.network);
-    let initial_accounts = derive_accounts(&config.seed_phrase, config.network, target_accounts)?;
+    let initial_accounts = derive_accounts_from_seed(&seed, config.network, target_accounts)?;
 
     {
         let mut guard = state.lock().await;
@@ -510,8 +567,7 @@ async fn run_recovery_scan_inner(
             ));
         }
 
-        let derived_accounts =
-            derive_accounts(&config.seed_phrase, config.network, target_accounts)?;
+        let derived_accounts = derive_accounts_from_seed(&seed, config.network, target_accounts)?;
         initialize_accounts(&state, &derived_accounts).await;
 
         // Fast transparent-only probe over the newly-added slice for this
@@ -539,7 +595,7 @@ async fn run_recovery_scan_inner(
         import_accounts(
             &workspace,
             config.network,
-            seed.expose_secret(),
+            &seed,
             &account_birthday,
             &transparent_account,
             &derived_accounts[usize::try_from(imported_accounts)
@@ -591,9 +647,34 @@ async fn run_recovery_scan_inner(
             break;
         }
 
-        target_accounts = (target_accounts + config.gap_limit).min(max_accounts);
+        // Funds were found near the trailing edge, so widen the search and
+        // scan the chain again for the new accounts. Publish a descriptor of
+        // the widening before the next pass resets the block counter, so the
+        // UI can explain the restart rather than let it read as a fault.
+        let new_target = (target_accounts + config.gap_limit).min(max_accounts);
+        gap_extension_pass += 1;
+        {
+            let mut guard = state.lock().await;
+            let extension = describe_gap_extension(
+                &guard.progress.accounts,
+                target_accounts,
+                new_target,
+                gap_extension_pass,
+            );
+            guard.progress.gap_extension = extension;
+        }
+        target_accounts = new_target;
     }
 
+    finish_scan(&state, &workspace).await
+}
+
+/// Publish the terminal state of a completed scan.
+///
+/// Shared by the HD and imported paths so the two cannot drift on what a
+/// finished scan looks like — the summary, the total, and the sidecar flip
+/// that stops the resume list from re-offering this workspace.
+async fn finish_scan(state: &SharedScanTaskState, workspace: &RecoveryWorkspace) -> ZeckResult<()> {
     let (workspace_dir, total_zatoshis) = {
         let guard = state.lock().await;
         let total = guard
@@ -665,7 +746,42 @@ fn initial_batch_size(config: &RuntimeScanConfig, max_accounts: u32) -> u32 {
 
 async fn initialize_accounts(state: &SharedScanTaskState, accounts: &[DerivedAccount]) {
     let mut guard = state.lock().await;
-    guard.progress.accounts = accounts.iter().map(build_account_preview).collect();
+    let existing = std::mem::take(&mut guard.progress.accounts);
+    guard.progress.accounts = merge_account_previews(existing, accounts);
+}
+
+/// Build the account snapshot for a (re-)derived account set, preserving any
+/// already-populated rows instead of clobbering them back to zero previews.
+///
+/// The gap-limit loop re-derives the *full* account set on every extension
+/// iteration and re-invokes [`initialize_accounts`] over all of it. A naive
+/// rebuild would blank every account already refreshed in a prior batch back
+/// to a zero-balance "Waiting for sync" preview — and, because the authoritative
+/// refresh only runs *after* the next (potentially multi-hour) shielded batch
+/// completes, the account table would show `0.00` for those accounts the whole
+/// time. That contradicts the append-only discovery banner, which correctly and
+/// permanently reports the funds found in the earlier batch.
+///
+/// Merging by `account_index` keeps the earlier authoritative balances (and
+/// status) visible while seeding fresh zero previews only for genuinely-new
+/// indices. Rows follow the freshly-derived account order; any preview whose
+/// index is no longer in the derived set is dropped.
+fn merge_account_previews(
+    existing: Vec<AccountBalancePreview>,
+    accounts: &[DerivedAccount],
+) -> Vec<AccountBalancePreview> {
+    let mut existing: std::collections::HashMap<u32, AccountBalancePreview> = existing
+        .into_iter()
+        .map(|preview| (preview.account_index, preview))
+        .collect();
+    accounts
+        .iter()
+        .map(|account| {
+            existing
+                .remove(&account.index)
+                .unwrap_or_else(|| build_account_preview(account))
+        })
+        .collect()
 }
 
 fn build_account_preview(account: &DerivedAccount) -> AccountBalancePreview {
@@ -683,6 +799,357 @@ fn build_account_preview(account: &DerivedAccount) -> AccountBalancePreview {
         has_activity: false,
         status: "Derived locally. Waiting for wallet workspace sync.".to_owned(),
     }
+}
+
+/// Create the workspace and record the session, before any network work.
+///
+/// The counterpart to `finish_scan`, which was factored out "so the two
+/// cannot drift" while the matching preamble never was — so each new scan
+/// route re-derived it, and `run_transparent_only_scan` re-derived it wrong:
+/// it created the workspace *after* the network call and never wrote the
+/// in-progress sidecar, so an interrupted or failed transparent-only scan
+/// left nothing behind and never appeared in the resume list.
+///
+/// Ordering is the point. The sidecar is written before the probe, with
+/// `target_height` still unknown, so a scan that dies at the network is still
+/// listed rather than vanishing.
+async fn begin_scan_session(
+    state: &SharedScanTaskState,
+    config: &RuntimeScanConfig,
+) -> ZeckResult<RecoveryWorkspace> {
+    let workspace = RecoveryWorkspace::from_runtime(config)?;
+    workspace.initialize_from_source(config.network, config.key_source.as_ref())?;
+    {
+        let mut guard = state.lock().await;
+        guard.workspace = Some(workspace.clone());
+    }
+
+    let session_label = if config.label.trim().is_empty() {
+        "(unlabeled scan)".to_owned()
+    } else {
+        config.label.clone()
+    };
+    if let Err(err) = write_session_metadata(
+        workspace.root(),
+        &SessionMetadata::new_in_progress(
+            session_label,
+            config.network,
+            config.birthday,
+            None,
+            now_epoch_seconds(),
+        ),
+    ) {
+        warn!("failed to write initial session sidecar (continuing): {err}");
+    }
+
+    Ok(workspace)
+}
+
+/// Scan a wallet file whose keys have no HD seed behind them.
+///
+/// Deliberately not the HD loop: there are no account slots to enumerate
+/// and no gap to extend. The key set is fixed and fully known the moment
+/// the file is parsed, so every account is registered once and the chain
+/// is scanned once.
+///
+/// Transparent keys are covered here too, without a second pass: they are
+/// attached to the first account as standalone receivers, so
+/// `zcash_client_sqlite` scans them alongside the shielded notes.
+async fn run_imported_scan(
+    state: SharedScanTaskState,
+    config: &RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+) -> ZeckResult<()> {
+    use crate::imported::{
+        imported_account_display, imported_transparent_keys, register_imported_accounts,
+    };
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::DerivingKeys;
+        guard.progress.message = Some(format!(
+            "Preparing {} imported Sapling account(s) and {} transparent key(s).",
+            keys.sapling.len(),
+            keys.transparent.len()
+        ));
+    }
+
+    let workspace = begin_scan_session(&state, config).await?;
+    let session_label = if config.label.trim().is_empty() {
+        "(unlabeled scan)".to_owned()
+    } else {
+        config.label.clone()
+    };
+
+    let network = consensus_network(config.network);
+    let configured_endpoints = describe_lightwalletd_endpoints(&config.lightwalletd_url);
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ProbingLightwalletd;
+        guard.progress.message = Some(format!(
+            "Connecting to {configured_endpoints} and checking chain metadata."
+        ));
+    }
+
+    let _ = default_provider().install_default();
+    let (mut client, endpoint, response) =
+        probe_valid_lightwalletd_endpoints(&config.lightwalletd_url, config.network).await?;
+    let chain_tip_height = u32::try_from(response.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    let probe: LightwalletdProbe = build_probe(endpoint, &response);
+    let sapling_floor = u32::try_from(response.sapling_activation_height)
+        .unwrap_or(419_201)
+        .saturating_add(1);
+    let effective_birthday = config.birthday.max(sapling_floor).min(chain_tip_height);
+    let birthday_treestate = client
+        .get_tree_state(BlockId {
+            height: u64::from(effective_birthday.saturating_sub(1)),
+            hash: vec![],
+        })
+        .await
+        .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+        .into_inner();
+    let account_birthday = AccountBirthday::from_treestate(
+        birthday_treestate,
+        Some(BlockHeight::from_u32(chain_tip_height)),
+    )
+    .map_err(|_| ZeckError::Wallet("constructing account birthday from treestate".to_owned()))?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.server = Some(probe);
+        guard.progress.blocks_total = block_delta(chain_tip_height, effective_birthday);
+    }
+    if let Err(err) = write_session_metadata(
+        workspace.root(),
+        &SessionMetadata::new_in_progress(
+            session_label,
+            config.network,
+            config.birthday,
+            Some(chain_tip_height),
+            now_epoch_seconds(),
+        ),
+    ) {
+        warn!("failed to update session sidecar with target height (continuing): {err}");
+    }
+
+    check_cancelled(&state).await?;
+
+    // Register accounts, then describe them for the progress UI. Both are
+    // driven off the same returned list, so what is scanned and what is
+    // displayed cannot disagree.
+    let registered = {
+        let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), network)?;
+        register_imported_accounts(&mut wallet_db, keys, &account_birthday)?
+    };
+    let resolved_transparent = imported_transparent_keys(keys)?;
+
+    let mut displays = Vec::with_capacity(registered.len());
+    let mut tracked = Vec::with_capacity(registered.len());
+    for (position, account) in registered.iter().enumerate() {
+        let index = u32::try_from(position)
+            .map_err(|_| ZeckError::Internal("imported account index overflowed u32".to_owned()))?;
+        let Some(extsk) = account.sapling_extsk.as_ref() else {
+            continue;
+        };
+        let display = imported_account_display(
+            index,
+            extsk,
+            account.transparent_addresses.first(),
+            config.network,
+        )?;
+        displays.push(display.clone());
+        tracked.push(TrackedAccount {
+            wallet_account_id: account.wallet_account_id,
+            derived: display,
+            transparent_receivers: account.transparent_addresses.clone(),
+        });
+    }
+
+    initialize_accounts(&state, &displays).await;
+    {
+        let mut guard = state.lock().await;
+        guard.tracked_accounts.extend(tracked);
+    }
+
+    // Fast transparent answer before the shielded sync, exactly as the HD
+    // path does — an imported wallet's transparent balance should not wait
+    // on a full chain scan.
+    if !resolved_transparent.is_empty() {
+        if let Err(err) =
+            run_imported_transparent_probe(&state, &mut client, &resolved_transparent, config).await
+        {
+            warn!("transparent quick probe failed (continuing with shielded scan): {err}");
+        }
+    }
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningShielded;
+        guard.progress.message = Some(format!(
+            "Syncing compact blocks for {} imported account(s).",
+            displays.len()
+        ));
+    }
+
+    let poller = ProgressPoller::start(
+        workspace.clone(),
+        config.network,
+        state.clone(),
+        effective_birthday,
+    );
+    let sync_result = run_wallet_sync_with_retry(
+        &workspace,
+        &network,
+        config.network,
+        &mut client,
+        &config.lightwalletd_url,
+        &state,
+    )
+    .await;
+    poller.stop().await;
+    sync_result?;
+    refresh_scan_progress(&state, &workspace, config.network, effective_birthday).await?;
+
+    finish_scan(&state, &workspace).await
+}
+
+/// Preliminary transparent balances for an imported wallet.
+///
+/// Separate from `run_transparent_quick_probe`, which keys results by HD
+/// account index. Every imported transparent key hangs off account 0, so
+/// this folds the whole set into that one account.
+/// Scan a wallet that has transparent keys and nothing else.
+///
+/// No workspace sync and no wallet database: ZIP-316 forbids a
+/// transparent-only unified container, so there is no account to anchor and
+/// nothing for the shielded scanner to walk. `GetAddressUtxos` answers the
+/// whole question directly, which is also why this returns in seconds rather
+/// than hours.
+///
+/// Reached by the GUI. The CLI has its own transparent-only dispatch in
+/// `main.rs` and does not call this — the two share `classify_recovery_route`
+/// but not the scan itself, so their output differs. Consolidating them means
+/// changing what the CLI prints, which is a separate change; until then this
+/// is one of two implementations, not the only one.
+async fn run_transparent_only_scan(
+    state: SharedScanTaskState,
+    config: &RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+) -> ZeckResult<()> {
+    let transparent = crate::imported::imported_transparent_keys(keys)?;
+
+    // Before the network call, not after: a scan that dies at the endpoint
+    // must still leave a session behind. This path used to create the
+    // workspace only on success, so a failed transparent-only scan vanished.
+    let workspace = begin_scan_session(&state, config).await?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningTransparent;
+        guard.progress.message = Some(format!(
+            "Checking {} transparent address(es). This wallet has no shielded keys, so no \
+             block scan is needed.",
+            transparent.len()
+        ));
+    }
+
+    let report = crate::transparent_recovery::scan_transparent_only(
+        &transparent,
+        config.network,
+        &config.lightwalletd_url,
+    )
+    .await?;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.synced_to_height = Some(u64::from(report.chain_tip_height));
+
+        // One preview row, because there is exactly one thing to report: this
+        // key set's transparent total. The shielded fields stay zero and the
+        // addresses stay empty rather than being filled with something
+        // plausible — a wallet with no Sapling key has no Sapling address, and
+        // inventing one would misrepresent what was searched.
+        guard.progress.accounts = vec![crate::models::AccountBalancePreview {
+            account_index: 0,
+            sapling_address: String::new(),
+            unified_address: String::new(),
+            transparent_receive_address: report
+                .funded
+                .first()
+                .map(|f| f.address.clone())
+                .unwrap_or_default(),
+            transparent_change_address: String::new(),
+            transparent_utxo_count: report
+                .funded
+                .iter()
+                .fold(0u32, |acc, f| acc.saturating_add(f.utxo_count)),
+            sapling_zatoshis: 0,
+            orchard_zatoshis: 0,
+            transparent_zatoshis: report.total_zatoshis,
+            total_zatoshis: report.total_zatoshis,
+            has_activity: report.total_zatoshis > 0,
+            status: format!(
+                "{} transparent address(es) checked, {} funded",
+                report.addresses_checked,
+                report.funded.len()
+            ),
+        }];
+
+        // Appended, never replaced: the pump loops in the CLI and Tauri emit
+        // only the tail of this vector on each tick.
+        for funded in &report.funded {
+            guard.progress.discoveries.push(crate::models::ScanDiscovery {
+                account_index: 0,
+                pool: crate::models::DiscoveryPool::Transparent,
+                zatoshis: funded.zatoshis,
+                at_block_height: u64::from(report.chain_tip_height),
+                address: funded.address.clone(),
+            });
+        }
+    }
+
+    finish_scan(&state, &workspace).await
+}
+
+async fn run_imported_transparent_probe(
+    state: &SharedScanTaskState,
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    keys: &[crate::imported::ImportedTransparentKey],
+    config: &RuntimeScanConfig,
+) -> ZeckResult<()> {
+    use crate::transparent_recovery::fetch_transparent_utxos;
+
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningTransparent;
+        guard.progress.message = Some(format!(
+            "Quick-checking {} imported transparent address(es)…",
+            keys.len()
+        ));
+    }
+
+    let utxos = fetch_transparent_utxos(client, keys, config.network).await?;
+    if utxos.is_empty() {
+        return Ok(());
+    }
+
+    let total = utxos.iter().fold(0u64, |acc, u| {
+        acc.saturating_add(u64::from(u.txout.value()))
+    });
+    let count = u32::try_from(utxos.len()).unwrap_or(u32::MAX);
+
+    let mut guard = state.lock().await;
+    if let Some(account) = guard.progress.accounts.first_mut() {
+        account.transparent_zatoshis = total;
+        account.transparent_utxo_count = count;
+        account.total_zatoshis = account
+            .total_zatoshis
+            .max(total.saturating_add(account.sapling_zatoshis))
+            .max(total);
+        account.has_activity = account.has_activity || total > 0;
+    }
+    Ok(())
 }
 
 async fn import_accounts(
@@ -787,24 +1254,46 @@ const SYNC_RETRY_DELAY_SECS: u64 = 5;
 const INITIAL_PROBE_ATTEMPTS: u32 = 4;
 
 /// Stall watchdog: how long we wait without seeing `synced_to_height` advance
-/// before declaring the gRPC stream hung. 60 s comfortably exceeds:
+/// before giving up on the current batch. 60 s comfortably exceeds:
 ///
 ///   - librustzcash's default ~100-block batch boundary (committed in one tick
 ///     even under the R-N13 300 ms/block latency profile = 30 s per batch),
 ///   - the R-N14 32 KB/s throttle's per-batch budget,
 ///   - the regtest harness's typical mid-scan ProgressPoller refresh cycle.
 ///
-/// A stall this long against a real chain means the server stopped sending —
-/// the R-N15 failure mode the watchdog exists to surface.
+/// Every bound above is a *latency* bound, which is why this budget does not
+/// hold inside the sandblasting window — see
+/// [`SANDBLASTING_STALL_TIMEOUT_SECS`].
 const STALL_TIMEOUT_SECS: u64 = 60;
+
+/// Stall budget inside the sandblasting window
+/// ([`SANDBLASTING_START_HEIGHT`]..=[`SANDBLASTING_END_HEIGHT`]).
+///
+/// Those blocks are packed with shielded outputs, so a batch there is bound by
+/// local trial-decryption CPU rather than by network latency, and can run for
+/// many minutes on ordinary hardware. [`STALL_TIMEOUT_SECS`] was calibrated
+/// against the wrong bottleneck for this range.
+///
+/// Applying the normal budget here is not merely impatient, it is a livelock:
+/// the retry restarts the batch from the last committed height, so a batch
+/// needing longer than the budget is killed at the same point on every
+/// attempt, the retry budget drains, and the scan can never cross the era.
+/// A wallet with a pre-2023 birthday must cross it to be recovered at all.
+const SANDBLASTING_STALL_TIMEOUT_SECS: u64 = 900;
 
 /// How often the watchdog polls `synced_to_height`. 5 s keeps the cost
 /// negligible and gives the watchdog 12 ticks before tripping.
 const STALL_CHECK_INTERVAL_SECS: u64 = 5;
 
-/// Returns a [`ZeckError`] when `synced_to_height` has not advanced for
-/// `STALL_TIMEOUT_SECS`. The returned future *only* resolves on stall — used
+/// Returns a [`ZeckError`] when `synced_to_height` has not advanced for the
+/// applicable budget. The returned future *only* resolves on stall — used
 /// inside `tokio::select!` against the actual sync future.
+///
+/// The budget is [`STALL_TIMEOUT_SECS`], widened to
+/// [`SANDBLASTING_STALL_TIMEOUT_SECS`] while the scan is inside the
+/// sandblasting window. `progress.in_sandblasting_zone` is already maintained
+/// by the [`ProgressPoller`] from the live scan height, so the budget tracks
+/// the scan into and back out of the era on its own.
 ///
 /// State lives entirely on the local stack: each call gets a fresh
 /// `last_height` baseline. When the retry loop in
@@ -812,38 +1301,54 @@ const STALL_CHECK_INTERVAL_SECS: u64 = 5;
 /// started, so a progress event on the previous attempt doesn't paper over
 /// a stall on the next.
 ///
-/// The error message contains the substring `"h2 protocol error"` so the
-/// existing retry matcher in `run_wallet_sync_with_retry` catches it
-/// without a separate string match.
+/// The error deliberately claims nothing about the network. All this watchdog
+/// observes is that a batch stopped committing; a hung stream and a dense
+/// block range are indistinguishable from here. It is classified as retryable
+/// via the `"scan stalled"` token in
+/// [`crate::lightwalletd::is_transient_network_error`] rather than by
+/// impersonating a transport error.
 async fn stall_watchdog(state: &SharedScanTaskState) -> ZeckError {
     let mut last_height: Option<u64> = None;
-    let mut stalled_ticks: u32 = 0;
-    // `max_stalled_ticks` is computed at call time rather than as a const so
-    // future tuning of either constant stays internally consistent.
-    let max_stalled_ticks = (STALL_TIMEOUT_SECS / STALL_CHECK_INTERVAL_SECS).max(1) as u32;
+    let mut stalled_secs: u64 = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STALL_CHECK_INTERVAL_SECS)).await;
-        let current = state.lock().await.progress.synced_to_height;
+        let (current, in_sandblasting_zone) = {
+            let guard = state.lock().await;
+            (
+                guard.progress.synced_to_height,
+                guard.progress.in_sandblasting_zone,
+            )
+        };
+        let budget_secs = if in_sandblasting_zone {
+            SANDBLASTING_STALL_TIMEOUT_SECS
+        } else {
+            STALL_TIMEOUT_SECS
+        };
         match (last_height, current) {
             // First observation of a height: just record it. We do not count
             // the pre-progress phase (probing/connecting) toward the stall
             // budget — sync begins when the first block lands.
             (None, Some(h)) => {
                 last_height = Some(h);
-                stalled_ticks = 0;
+                stalled_secs = 0;
             }
             // Advancing — reset the counter.
             (Some(prev), Some(curr)) if curr != prev => {
                 last_height = Some(curr);
-                stalled_ticks = 0;
+                stalled_secs = 0;
             }
             // No advance (either still None, or stuck at the same height).
             _ => {
-                stalled_ticks = stalled_ticks.saturating_add(1);
-                if stalled_ticks >= max_stalled_ticks {
-                    return ZeckError::Lightwalletd(format!(
-                        "scan stalled: no new blocks for {STALL_TIMEOUT_SECS}s — \
-                         h2 protocol error: hung stream from lightwalletd"
+                stalled_secs = stalled_secs.saturating_add(STALL_CHECK_INTERVAL_SECS);
+                if stalled_secs >= budget_secs {
+                    let context = if in_sandblasting_zone {
+                        " (scanning the 2022–2023 sandblasting range, where blocks are \
+                          dense and batches are slow)"
+                    } else {
+                        ""
+                    };
+                    return ZeckError::ScanStalled(format!(
+                        "no block committed for {budget_secs}s{context}; reconnecting"
                     ));
                 }
             }
@@ -861,7 +1366,7 @@ async fn stall_watchdog(state: &SharedScanTaskState) -> ZeckError {
 /// never loses to a coincidentally-tripping watchdog.
 async fn run_wallet_sync_with_stall_watchdog(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
@@ -872,18 +1377,38 @@ async fn run_wallet_sync_with_stall_watchdog(
     }
 }
 
+/// Decides the retry budget to carry into the next attempt after a transient
+/// failure. Returns 0 (a full reset) when `synced_to_height` has advanced since
+/// the previous failure — an isolated stall that recovered must not count
+/// toward the lifetime cap on a multi-hour scan. Otherwise the accumulated
+/// `attempts` is preserved so that only *consecutive* failures with no forward
+/// progress exhaust `MAX_SYNC_RETRIES` (issue #174).
+fn retry_budget_after_failure(
+    attempts: u32,
+    last_failure_height: Option<u64>,
+    current_height: Option<u64>,
+) -> u32 {
+    match (last_failure_height, current_height) {
+        (Some(prev), Some(curr)) if curr > prev => 0,
+        _ => attempts,
+    }
+}
+
 /// Runs `run_wallet_sync`, reconnecting to lightwalletd on transient transport
 /// errors.  Each reconnection attempt tries all configured endpoints in order.
 /// Permanent errors (wallet database corruption, etc.) are returned immediately.
 pub(crate) async fn run_wallet_sync_with_retry(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     zeck_network: crate::models::ZeckNetwork,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     lightwalletd_url: &str,
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
     let mut attempts = 0u32;
+    // Height observed at the most recent transient failure. Forward progress
+    // past this between failures resets the retry budget (issue #174).
+    let mut last_failure_height: Option<u64> = None;
     loop {
         match run_wallet_sync_with_stall_watchdog(workspace, network, client, state).await {
             Ok(()) => return Ok(()),
@@ -894,7 +1419,21 @@ pub(crate) async fn run_wallet_sync_with_retry(
                 // mid-sync and startup paths agree on what is retryable).
                 let is_transient = crate::lightwalletd::is_transient_network_error(&msg);
 
-                if !is_transient || attempts >= MAX_SYNC_RETRIES {
+                if !is_transient {
+                    return Err(err);
+                }
+
+                // Reset the retry budget when the sync advanced since the last
+                // failure: on a long scan against a loaded public endpoint,
+                // isolated stalls that each recover must not accumulate toward
+                // MAX_SYNC_RETRIES. Only consecutive no-progress failures (a
+                // genuinely hung server) exhaust the budget.
+                let current_height = state.lock().await.progress.synced_to_height;
+                attempts =
+                    retry_budget_after_failure(attempts, last_failure_height, current_height);
+                last_failure_height = current_height;
+
+                if attempts >= MAX_SYNC_RETRIES {
                     return Err(err);
                 }
 
@@ -1013,7 +1552,7 @@ async fn probe_valid_lightwalletd_endpoints_once(
 
 pub(crate) async fn run_wallet_sync<ChT>(
     workspace: &RecoveryWorkspace,
-    network: &zcash_protocol::consensus::Network,
+    network: &crate::workspace::ArgosParams,
     client: &mut CompactTxStreamerClient<ChT>,
 ) -> ZeckResult<()>
 where
@@ -1100,7 +1639,14 @@ pub(crate) async fn refresh_scan_progress(
                             address,
                             target_height,
                             ConfirmationsPolicy::MIN,
-                            TransparentOutputFilter::All,
+                            CoinbaseFilter::AllTransparentOutputs,
+                            // Reporting path, not a selection path: this count feeds the
+                            // recovery total shown to the user, so it must reflect
+                            // everything the wallet holds. Argos never takes output locks,
+                            // but `Unfiltered` is the upstream-sanctioned choice for
+                            // retrieval and keeps the total from silently under-reporting
+                            // if a lock ever appears.
+                            LockFilter::Unfiltered,
                         )
                         .map_err(|err| {
                             ZeckError::Wallet(format!(
@@ -1445,6 +1991,42 @@ fn build_account_status(
     format!("Found {}.", parts.join(", "))
 }
 
+/// Highest account index with note activity, or `None` if none are active.
+///
+/// Uses `has_activity` (not balance) to match [`trailing_gap_limit_reached`]:
+/// an account that received and fully spent funds still keeps the search
+/// alive, so it is still the trigger for a widening.
+fn highest_active_account_index(accounts: &[AccountBalancePreview]) -> Option<u32> {
+    accounts
+        .iter()
+        .filter(|account| account.has_activity)
+        .map(|account| account.account_index)
+        .max()
+}
+
+/// Builds the [`GapExtension`] descriptor for a widening from `previous_target`
+/// to `new_target` accounts, or `None` if nothing in `accounts` is active (in
+/// which case the caller would not be extending). `pass` is the 1-based count
+/// of widenings so far this scan.
+///
+/// `accounts_to` is the last *newly-added* index, `new_target - 1`, so the
+/// range `[accounts_from, accounts_to]` names exactly the accounts whose
+/// blocks the upcoming pass will scan.
+fn describe_gap_extension(
+    accounts: &[AccountBalancePreview],
+    previous_target: u32,
+    new_target: u32,
+    pass: u32,
+) -> Option<GapExtension> {
+    let trigger_account_index = highest_active_account_index(accounts)?;
+    Some(GapExtension {
+        pass,
+        accounts_from: previous_target,
+        accounts_to: new_target.saturating_sub(1),
+        trigger_account_index,
+    })
+}
+
 fn trailing_gap_limit_reached(accounts: &[AccountBalancePreview], gap_limit: u32) -> bool {
     let gap = usize::try_from(gap_limit).unwrap_or(usize::MAX);
     if accounts.len() < gap {
@@ -1571,22 +2153,85 @@ async fn check_cancelled(state: &SharedScanTaskState) -> ZeckResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use secrecy::SecretString;
 
+    use crate::key_source::SeedKeySource;
+
     use super::{
-        append_new_discoveries, build_account_status, resolve_max_account_count,
+        append_new_discoveries, build_account_status, describe_gap_extension,
+        highest_active_account_index, merge_account_previews, resolve_max_account_count,
         trailing_gap_limit_reached,
     };
     use crate::models::{
-        AccountBalancePreview, DiscoveryPool, RuntimeScanConfig, ScanDiscovery, ZeckNetwork,
+        AccountBalancePreview, DerivedAccount, DiscoveryPool, RuntimeScanConfig, ScanDiscovery,
+        ZeckNetwork,
     };
+
+    /// Minimal preview carrying only the fields the gap-limit logic reads.
+    fn preview(account_index: u32, has_activity: bool) -> AccountBalancePreview {
+        AccountBalancePreview {
+            account_index,
+            sapling_address: String::new(),
+            unified_address: String::new(),
+            transparent_receive_address: String::new(),
+            transparent_change_address: String::new(),
+            transparent_utxo_count: 0,
+            sapling_zatoshis: 0,
+            orchard_zatoshis: 0,
+            transparent_zatoshis: 0,
+            total_zatoshis: 0,
+            has_activity,
+            status: String::new(),
+        }
+    }
+
+    #[test]
+    fn highest_active_account_index_is_the_trailing_trigger() {
+        // Activity at index 0 and 3; the extension trigger is the *latest*.
+        let accounts = vec![
+            preview(0, true),
+            preview(1, false),
+            preview(2, false),
+            preview(3, true),
+            preview(4, false),
+        ];
+        assert_eq!(highest_active_account_index(&accounts), Some(3));
+    }
+
+    #[test]
+    fn highest_active_account_index_is_none_when_no_activity() {
+        let accounts = vec![preview(0, false), preview(1, false)];
+        assert_eq!(highest_active_account_index(&accounts), None);
+    }
+
+    #[test]
+    fn describe_gap_extension_reports_new_range_and_trigger() {
+        // 20 accounts searched, activity at index 18, widening to 40.
+        let mut accounts: Vec<_> = (0..20).map(|i| preview(i, false)).collect();
+        accounts[18].has_activity = true;
+
+        let ext = describe_gap_extension(&accounts, 20, 40, 1)
+            .expect("activity present, so an extension is described");
+        assert_eq!(ext.pass, 1);
+        assert_eq!(ext.accounts_from, 20);
+        assert_eq!(ext.accounts_to, 39);
+        assert_eq!(ext.trigger_account_index, 18);
+    }
+
+    #[test]
+    fn describe_gap_extension_is_none_without_a_trigger() {
+        let accounts: Vec<_> = (0..20).map(|i| preview(i, false)).collect();
+        assert!(describe_gap_extension(&accounts, 20, 40, 1).is_none());
+    }
 
     fn config(num_accounts: Option<u32>) -> RuntimeScanConfig {
         RuntimeScanConfig {
-            seed_phrase: SecretString::new(
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
                     .to_owned(),
-            ),
+            ))),
             birthday: 419_200,
             num_accounts,
             gap_limit: 20,
@@ -2005,6 +2650,59 @@ mod tests {
         );
     }
 
+    fn derived_account(index: u32) -> DerivedAccount {
+        DerivedAccount {
+            index,
+            sapling_path: String::new(),
+            orchard_path: String::new(),
+            transparent_receive_path: String::new(),
+            transparent_change_path: String::new(),
+            sapling_address: "zs".to_owned(),
+            unified_address: "u".to_owned(),
+            transparent_receive_address: "t1".to_owned(),
+            transparent_change_address: "t2".to_owned(),
+        }
+    }
+
+    #[test]
+    fn gap_extension_reinit_preserves_already_refreshed_balances() {
+        // Regression for the discovery-banner vs account-table discrepancy.
+        // On each gap-extension iteration the scan loop re-derives the full
+        // account set and calls initialize_accounts over all of it. Accounts
+        // already refreshed in a prior batch (with authoritative balances and
+        // a sticky discovery banner) must not be blanked back to zero
+        // "Waiting for sync" previews for the entire duration of the next
+        // (long) shielded batch — otherwise the table contradicts the banner.
+        let refreshed = vec![account_with(0, 12_645_600, 0, 0)];
+        let derived = vec![derived_account(0), derived_account(1)];
+
+        let merged = merge_account_previews(refreshed, &derived);
+
+        assert_eq!(merged.len(), 2);
+        // Account 0 keeps its authoritative sapling balance and status.
+        assert_eq!(merged[0].account_index, 0);
+        assert_eq!(merged[0].sapling_zatoshis, 12_645_600);
+        assert!(merged[0].has_activity);
+        // The genuinely-new account 1 gets a fresh zero preview.
+        assert_eq!(merged[1].account_index, 1);
+        assert_eq!(merged[1].sapling_zatoshis, 0);
+        assert!(merged[1].status.contains("Waiting for"));
+    }
+
+    #[test]
+    fn merge_account_previews_orders_by_derived_set_not_prior_snapshot() {
+        // The returned rows must follow the freshly-derived account order,
+        // and a preview whose index is no longer in the derived set is dropped.
+        let stale = vec![account_with(5, 1, 0, 0), account_with(0, 2, 0, 0)];
+        let derived = vec![derived_account(0), derived_account(1), derived_account(2)];
+
+        let merged = merge_account_previews(stale, &derived);
+
+        let indices: Vec<u32> = merged.iter().map(|a| a.account_index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(merged[0].sapling_zatoshis, 2, "account 0 balance preserved");
+    }
+
     /// Cancel-then-resume workspace persistence tests.
     ///
     /// These tests exercise the invariants that:
@@ -2046,6 +2744,7 @@ mod tests {
         use super::super::{import_accounts, MemoryBlockCache, ScanTaskState};
         use crate::{
             derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
+            key_source::SeedKeySource,
             models::{RuntimeScanConfig, ScanHandle, ZeckNetwork},
             workspace::{consensus_network, RecoveryWorkspace},
         };
@@ -2055,9 +2754,137 @@ mod tests {
                                   abandon abandon abandon abandon abandon abandon \
                                   abandon abandon abandon abandon abandon art";
 
+        fn test_seed_phrase() -> SecretString {
+            SecretString::new(TEST_SEED.to_owned())
+        }
+
+        /// A zcashd `wallet.dat` holds flat, individually-stored keys with
+        /// no HD seed behind them. The scanner walks HD-derived account
+        /// slots, so it has nothing to enumerate for such a source — and
+        /// the dangerous outcome is not an error but a *successful* scan
+        /// that finds nothing, which a user recovering real funds would
+        /// read as "my money is gone".
+        ///
+        /// Pinned here because the refusal is the only thing standing
+        /// between that user and a false negative. It fires before any
+        /// network or filesystem work, so this test needs neither.
+        #[tokio::test]
+        async fn a_seedless_key_source_is_refused_rather_than_scanned_as_empty() {
+            use crate::key_source::{ImportedKeySource, KeySource};
+            // Genuinely empty: no seed, no keys of any kind. A
+            // transparent-only wallet is *not* this case — it has a real
+            // recovery route (see the test below), and treating it as a
+            // refusal is the bug that dead-ended the GUI.
+            let keys = argos_wallet_import::ImportedKeys::default();
+            let source = ImportedKeySource::new(keys);
+            // Non-vacuous: if this source ever grows a seed, the assertion
+            // below would pass for the wrong reason.
+            assert!(
+                source.wallet_seed().expect("wallet_seed").is_none(),
+                "fixture must be genuinely seedless or this test proves nothing"
+            );
+
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let mut config = test_config(tempdir.path().to_owned());
+            config.key_source = Arc::new(source);
+
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let err = super::super::run_recovery_scan_inner(state, config)
+                .await
+                .expect_err("a key source with nothing in it must not scan successfully");
+
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("nothing to scan"),
+                "the refusal must say why, got: {rendered}"
+            );
+        }
+
+        /// A transparent-only wallet must be routed, not refused.
+        ///
+        /// This is the most common legacy zcashd shape. Core used to refuse
+        /// it with a message naming a transparent-only path that only the CLI
+        /// implemented, at its own front end — so the GUI handed the same file
+        /// here and told the user their recoverable funds were unrecoverable.
+        ///
+        /// The scan itself needs a node, so what is pinned is the routing
+        /// decision: it must not come back as the `InvalidConfig` refusal.
+        /// Reaching the network and failing there is a pass — that is past the
+        /// point where the old code gave up.
+        #[tokio::test]
+        async fn a_transparent_only_wallet_is_routed_rather_than_refused() {
+            use argos_wallet_import::keys::{Provenance, TransparentKey};
+            use secrecy::Secret;
+
+            let mut keys = argos_wallet_import::ImportedKeys::default();
+            keys.transparent.push(TransparentKey {
+                secret: Secret::new([0x42; 32]),
+                provenance: Provenance::Standalone,
+            });
+            assert_eq!(
+                crate::key_source::classify_recovery_route(&keys),
+                crate::key_source::RecoveryRoute::TransparentOnly,
+                "fixture must classify as transparent-only or this test proves nothing"
+            );
+
+            let source = crate::key_source::ImportedKeySource::new(keys);
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let mut config = test_config(tempdir.path().to_owned());
+            config.key_source = Arc::new(source);
+            // Unroutable on purpose: the routing decision happens before any
+            // connection, so this fails at the network rather than at config.
+            config.lightwalletd_url = "https://127.0.0.1:1".to_owned();
+
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let data_dir = config.data_dir.clone();
+            let result = super::super::run_recovery_scan_inner(state, config).await;
+
+            if let Err(err) = result {
+                assert!(
+                    !matches!(err, crate::error::ZeckError::InvalidConfig(_)),
+                    "a transparent-only wallet must be routed to the transparent path, \
+                     not refused as unscannable; got: {err}"
+                );
+            }
+
+            // And it must leave a session behind. This path used to build the
+            // workspace only after the network call succeeded, so a scan that
+            // failed at the endpoint vanished entirely — no sidecar, nothing
+            // in the resume list, the user with no record that it ran. The
+            // endpoint here is unroutable, so this is exactly that case.
+            let sidecars: Vec<_> = walkdir(&data_dir)
+                .into_iter()
+                .filter(|p| p.file_name().is_some_and(|n| n == "session.json"))
+                .collect();
+            assert!(
+                !sidecars.is_empty(),
+                "a failed transparent-only scan must still record a session under \
+                 {}, or it disappears from the resume list",
+                data_dir.display()
+            );
+        }
+
+        /// Minimal recursive file listing; the workspace path contains
+        /// hashes that the test has no business reconstructing.
+        fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = Vec::new();
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return out;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walkdir(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+            out
+        }
+
         fn test_config(data_dir: std::path::PathBuf) -> RuntimeScanConfig {
             RuntimeScanConfig {
-                seed_phrase: SecretString::new(TEST_SEED.to_owned()),
+                key_source: Arc::new(SeedKeySource::new(test_seed_phrase())),
                 birthday: 419_200,
                 num_accounts: Some(2),
                 gap_limit: 5,
@@ -2083,15 +2910,15 @@ mod tests {
             let tempdir = tempfile::tempdir().expect("temp dir");
             let config = test_config(tempdir.path().to_owned());
             let workspace = RecoveryWorkspace::from_runtime(&config).expect("workspace");
-            let seed = mnemonic_seed(&config.seed_phrase).expect("seed");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
             workspace
                 .initialize(config.network, seed.expose_secret())
                 .expect("workspace.initialize");
             let transparent_account =
-                legacy_transparent_account_key(&config.seed_phrase, config.network)
+                legacy_transparent_account_key(&test_seed_phrase(), config.network)
                     .expect("transparent account key");
             let accounts =
-                derive_accounts(&config.seed_phrase, config.network, 2).expect("accounts");
+                derive_accounts(&test_seed_phrase(), config.network, 2).expect("accounts");
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
 
             import_accounts(
@@ -2121,12 +2948,12 @@ mod tests {
         async fn resume_reuses_same_workspace_and_does_not_duplicate_accounts() {
             let tempdir = tempfile::tempdir().expect("temp dir");
             let config = test_config(tempdir.path().to_owned());
-            let seed = mnemonic_seed(&config.seed_phrase).expect("seed");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
             let transparent_account =
-                legacy_transparent_account_key(&config.seed_phrase, config.network)
+                legacy_transparent_account_key(&test_seed_phrase(), config.network)
                     .expect("transparent account key");
             let accounts =
-                derive_accounts(&config.seed_phrase, config.network, 2).expect("accounts");
+                derive_accounts(&test_seed_phrase(), config.network, 2).expect("accounts");
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
 
             // ── First scan pass: import 2 accounts then simulate abort ──────────
@@ -2209,7 +3036,6 @@ mod tests {
             let mut hash = [0u8; 32];
             hash[..8].copy_from_slice(&height.to_le_bytes());
             CompactBlock {
-                proto_version: 1,
                 height,
                 hash: hash.to_vec(),
                 prev_hash: prev_hash.to_vec(),
@@ -2219,6 +3045,9 @@ mod tests {
                 chain_metadata: Some(ChainMetadata {
                     sapling_commitment_tree_size: sapling_tree_size,
                     orchard_commitment_tree_size: orchard_tree_size,
+                    // These fixtures model blocks below Ironwood activation, so the
+                    // Ironwood tree has not started growing yet.
+                    ironwood_commitment_tree_size: 0,
                 }),
             }
         }
@@ -2239,12 +3068,12 @@ mod tests {
         async fn scan_advances_cursor_and_resume_skips_already_scanned_blocks() {
             let tempdir = tempfile::tempdir().expect("temp dir");
             let config = test_config(tempdir.path().to_owned());
-            let seed = mnemonic_seed(&config.seed_phrase).expect("seed");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
             let transparent_account =
-                legacy_transparent_account_key(&config.seed_phrase, config.network)
+                legacy_transparent_account_key(&test_seed_phrase(), config.network)
                     .expect("transparent account key");
             let accounts =
-                derive_accounts(&config.seed_phrase, config.network, 1).expect("accounts");
+                derive_accounts(&test_seed_phrase(), config.network, 1).expect("accounts");
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
 
             let network = consensus_network(config.network);
@@ -2569,8 +3398,8 @@ mod tests {
         use tokio::sync::Mutex;
 
         use super::super::{
-            stall_watchdog, ScanTaskState, SharedScanTaskState, STALL_CHECK_INTERVAL_SECS,
-            STALL_TIMEOUT_SECS,
+            stall_watchdog, ScanTaskState, SharedScanTaskState, SANDBLASTING_STALL_TIMEOUT_SECS,
+            STALL_CHECK_INTERVAL_SECS, STALL_TIMEOUT_SECS,
         };
         use crate::ScanHandle;
 
@@ -2580,6 +3409,114 @@ mod tests {
 
         async fn set_height(state: &SharedScanTaskState, h: u64) {
             state.lock().await.progress.synced_to_height = Some(h);
+        }
+
+        async fn set_sandblasting(state: &SharedScanTaskState, value: bool) {
+            state.lock().await.progress.in_sandblasting_zone = value;
+        }
+
+        /// Inside the sandblasting window a batch is bound by local
+        /// trial-decryption CPU, not by network latency, and routinely runs
+        /// past the normal budget. Tripping there is a livelock: the retry
+        /// restarts the same batch, which is killed at the same point, so the
+        /// scan can never cross the era.
+        #[tokio::test(start_paused = true)]
+        async fn does_not_fire_at_the_normal_budget_inside_the_sandblasting_zone() {
+            let state = empty_state();
+            set_height(&state, 2_000_000).await;
+            set_sandblasting(&state, true).await;
+
+            let watchdog = {
+                let state = state.clone();
+                tokio::spawn(async move { stall_watchdog(&state).await })
+            };
+
+            tokio::time::advance(Duration::from_secs(
+                STALL_TIMEOUT_SECS * 4 + STALL_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            tokio::task::yield_now().await;
+
+            assert!(
+                !watchdog.is_finished(),
+                "watchdog tripped at the normal budget inside the sandblasting zone"
+            );
+            watchdog.abort();
+        }
+
+        /// The extended budget is still a budget — a genuinely hung stream in
+        /// the zone must eventually surface rather than hang forever.
+        #[tokio::test(start_paused = true)]
+        async fn fires_at_the_extended_budget_inside_the_sandblasting_zone() {
+            let state = empty_state();
+            set_height(&state, 2_000_000).await;
+            set_sandblasting(&state, true).await;
+
+            let watchdog = {
+                let state = state.clone();
+                tokio::spawn(async move { stall_watchdog(&state).await })
+            };
+
+            tokio::time::advance(Duration::from_secs(
+                SANDBLASTING_STALL_TIMEOUT_SECS + STALL_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            tokio::task::yield_now().await;
+
+            assert!(
+                watchdog
+                    .await
+                    .expect("watchdog task did not panic")
+                    .to_string()
+                    .contains("scan stalled"),
+                "watchdog must still trip at the extended budget"
+            );
+        }
+
+        /// The watchdog observes only that a batch has not committed. It has
+        /// no evidence about the network, so it must not invent any — a
+        /// fabricated transport error sends users chasing servers for what is
+        /// usually local scanning cost.
+        #[tokio::test(start_paused = true)]
+        async fn stall_error_does_not_fabricate_a_network_failure() {
+            let state = empty_state();
+            set_height(&state, 100).await;
+
+            let watchdog = {
+                let state = state.clone();
+                tokio::spawn(async move { stall_watchdog(&state).await })
+            };
+
+            tokio::time::advance(Duration::from_secs(
+                STALL_TIMEOUT_SECS + STALL_CHECK_INTERVAL_SECS,
+            ))
+            .await;
+            tokio::task::yield_now().await;
+
+            let msg = watchdog
+                .await
+                .expect("watchdog task did not panic")
+                .to_string();
+            assert!(msg.contains("scan stalled"), "got: {msg}");
+            for lie in [
+                "h2 protocol error",
+                "hung stream",
+                "lightwalletd probe failed",
+            ] {
+                assert!(
+                    !msg.contains(lie),
+                    "stall error must not claim {lie:?} — nothing observed the network; got: {msg}"
+                );
+            }
+        }
+
+        /// Dropping the fabricated "h2 protocol error" marker must not cost
+        /// the stall its place in the retry loop.
+        #[test]
+        fn stall_error_is_still_classified_as_retryable() {
+            assert!(crate::lightwalletd::is_transient_network_error(
+                "scan stalled: no block committed for 60s"
+            ));
         }
 
         #[tokio::test(start_paused = true)]
@@ -2605,8 +3542,8 @@ mod tests {
             let err = watchdog.await.expect("watchdog task did not panic");
             let msg = err.to_string();
             assert!(
-                msg.contains("scan stalled") && msg.contains("h2 protocol error"),
-                "watchdog error must include the stall marker AND the retry-matcher string; got: {msg}"
+                msg.contains("scan stalled"),
+                "watchdog error must include the stall marker; got: {msg}"
             );
         }
 
@@ -2667,6 +3604,73 @@ mod tests {
                 "watchdog tripped after stall was resolved by resumed progress"
             );
             watchdog.abort();
+        }
+    }
+
+    // ─── retry-budget reset (issue #174) ─────────────────────────────────
+    //
+    // The retry loop in `run_wallet_sync_with_retry` must bound *consecutive*
+    // failures with no forward progress, not the lifetime total. These tests
+    // exercise the pure decision helper directly.
+    mod retry_budget_tests {
+        use super::super::{retry_budget_after_failure, MAX_SYNC_RETRIES};
+
+        #[test]
+        fn resets_when_height_advanced_since_last_failure() {
+            // 9 consecutive stalls, then the sync advanced before the next
+            // failure — the intervening stall recovered, so the budget resets.
+            assert_eq!(retry_budget_after_failure(9, Some(1_000), Some(1_500)), 0);
+        }
+
+        #[test]
+        fn preserves_budget_when_stuck_at_same_height() {
+            // No forward progress between the two failures — budget carries.
+            assert_eq!(retry_budget_after_failure(5, Some(1_000), Some(1_000)), 5);
+        }
+
+        #[test]
+        fn preserves_budget_on_first_failure_before_any_progress() {
+            // No prior failure height and no progress yet: nothing to reset.
+            assert_eq!(retry_budget_after_failure(0, None, None), 0);
+            assert_eq!(retry_budget_after_failure(3, None, Some(1_000)), 3);
+        }
+
+        #[test]
+        fn a_scan_that_makes_progress_between_stalls_never_exhausts_budget() {
+            // Simulate many isolated stalls, each preceded by real progress.
+            // Without the reset this would blow past MAX_SYNC_RETRIES; with it,
+            // the budget never climbs above 1.
+            let mut attempts = 0u32;
+            let mut last_failure_height: Option<u64> = None;
+            for i in 0..(MAX_SYNC_RETRIES as u64 * 5) {
+                let current = Some(1_000 + i * 100); // advanced every time
+                attempts = retry_budget_after_failure(attempts, last_failure_height, current);
+                assert!(
+                    attempts < MAX_SYNC_RETRIES,
+                    "budget exhausted despite forward progress between stalls"
+                );
+                last_failure_height = current;
+                attempts += 1;
+            }
+        }
+
+        #[test]
+        fn consecutive_stalls_with_no_progress_still_exhaust_budget() {
+            // A genuinely hung server (no progress) must still hit the cap.
+            let mut attempts = 0u32;
+            let mut last_failure_height: Option<u64> = None;
+            let mut bailed = false;
+            for _ in 0..(MAX_SYNC_RETRIES + 5) {
+                let current = Some(2_000); // stuck forever
+                attempts = retry_budget_after_failure(attempts, last_failure_height, current);
+                if attempts >= MAX_SYNC_RETRIES {
+                    bailed = true;
+                    break;
+                }
+                last_failure_height = current;
+                attempts += 1;
+            }
+            assert!(bailed, "hung server never hit the retry cap");
         }
     }
 }

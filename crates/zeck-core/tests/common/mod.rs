@@ -6,6 +6,10 @@
 
 pub mod regtest_harness;
 
+// The transparent key the transparent-only sweep test owns outright, kept
+// here so `argos-regtest-funder` and the test derive the same address.
+pub mod standalone_transparent;
+
 // `FakeLightwalletd` is the in-process gRPC test fixture used by the bad-
 // network C2 tests (R-N8, R-N9). It depends on tonic server codegen run by
 // `build.rs`, which only fires under the `argos-network` feature, so it is

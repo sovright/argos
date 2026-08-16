@@ -5,14 +5,18 @@ use std::{
     fs,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
 use argos_core::{
-    derive_accounts, detect_birthday, estimate_birthday_from_date, validate_destination_address,
-    RecoveryService, ScanConfig, ScanDiscovery, ScanHandle, ScanPhase, SweepProposal, SweepRequest,
-    ZeckNetwork,
+    argos_wallet_import::{self, ImportedKeys},
+    derive_accounts, detect_birthday, estimate_birthday_from_date,
+    imported::{encode_transparent_address, imported_transparent_keys},
+    transparent_recovery::{scan_transparent_only, sweep_transparent_only, TransparentScanReport},
+    validate_destination_address, ImportedKeySource, KeySource, RecoveryService, ScanConfig,
+    ScanDiscovery, ScanHandle, ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
@@ -35,6 +39,20 @@ struct Cli {
     #[arg(long)]
     seed_file: Option<PathBuf>,
 
+    /// Path to a legacy wallet file to recover keys from: a zcashd
+    /// `wallet.dat` or a ZecWallet Lite wallet. Read-only — Argos never
+    /// writes to this file. If the wallet is encrypted you are prompted
+    /// for its passphrase; there is deliberately no flag for it, so it
+    /// cannot land in shell history or `ps` output.
+    #[arg(long, conflicts_with = "seed_file")]
+    wallet_file: Option<PathBuf>,
+
+    // `--sprout-key-file` used to sit here, feeding the Sprout scan. That
+    // scan is not in this build, so the flag is gone rather than accepted and
+    // ignored: a fund-recovery tool that takes a path to a *spending key* and
+    // does nothing with it lets a user believe they supplied their key and
+    // that the run covered it. Failing with `unexpected argument` is the
+    // honest answer for a build that cannot use one.
     /// Directory for wallet database and block cache.
     #[arg(long, default_value = "./argos_data")]
     data_dir: PathBuf,
@@ -43,7 +61,7 @@ struct Cli {
     #[arg(
         long,
         visible_alias = "server",
-        default_value = "https://mainnet.lightwalletd.com:9067"
+        default_value = argos_core::lightwalletd::DEFAULT_MAINNET_LIGHTWALLETD
     )]
     lightwalletd_url: String,
 
@@ -105,6 +123,10 @@ enum Commands {
     /// Derive and display all account keys and addresses (no network needed).
     ShowKeys,
 
+    /// Report what Argos can read out of --wallet-file. Purely local: no
+    /// network, and nothing is written anywhere.
+    InspectWallet,
+
     /// Scan the blockchain and report balances for all derived accounts.
     Scan,
 
@@ -144,12 +166,374 @@ fn command_uses_birthday_inputs(command: &Commands) -> bool {
     matches!(command, Commands::Scan | Commands::Sweep { .. })
 }
 
+/// Commands that reach the network or move funds, and so require the Terms
+/// of Service to have been accepted.
+///
+/// Kept separate from the birthday check: the two questions are not the same
+/// one, and a command can broadcast irreversibly without needing a birthday.
+fn command_requires_tos(command: &Commands) -> bool {
+    matches!(command, Commands::Scan | Commands::Sweep { .. })
+}
+
+/// Read a legacy wallet file into key material.
+///
+/// The passphrase is prompted for, never taken as a flag: a flag would
+/// land in shell history and in `ps` output for every user on the box
+/// (T-S6 in the threat model). We attempt an unencrypted read first so an
+/// unencrypted wallet is never asked for a passphrase it does not have.
+fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read wallet file {}", path.display()))?;
+
+    match argos_wallet_import::import_wallet_file(&bytes, None) {
+        Ok(mut keys) => {
+            report_forged_sprout_keys(&mut keys);
+            Ok(keys)
+        }
+        // The parser reports a locked wallet and a wrong passphrase with
+        // the same variant. Here it can only mean "locked", because we
+        // supplied no passphrase to be wrong.
+        Err(argos_wallet_import::ImportError::WrongPassphrase) => {
+            eprintln!("This wallet is encrypted.");
+            let passphrase = Password::new()
+                .with_prompt("Enter the wallet passphrase")
+                .allow_empty_password(false)
+                .interact()
+                .context("failed to read wallet passphrase from terminal")?;
+            let passphrase = SecretString::new(passphrase);
+            let mut keys = argos_wallet_import::import_wallet_file(&bytes, Some(&passphrase))
+                .with_context(|| format!("failed to import wallet file {}", path.display()))?;
+            report_forged_sprout_keys(&mut keys);
+            Ok(keys)
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to import wallet file {}", path.display()))
+        }
+    }
+}
+
+/// Without Sprout support compiled in there is no forged-key check to run —
+/// the Sprout recovery path that would spend such a key does not exist. The
+/// parser still records the keys, so this build can report their count, but
+/// it neither validates nor drops them.
+fn report_forged_sprout_keys(_keys: &mut ImportedKeys) {}
+
+/// Sweep a transparent-only wallet, with the same guard rails the HD sweep
+/// has: a dry run that signs nothing, an explicit confirmation for an
+/// irreversible action, and a fee ceiling checked before signing.
+async fn run_transparent_sweep(
+    keys: &[argos_core::imported::ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+    destination: &str,
+    max_fee: Option<u64>,
+    dry_run: bool,
+    confirm_sweep: bool,
+) -> Result<()> {
+    // Report before deciding, so a dry run and a real sweep show the user
+    // the same numbers.
+    let report = scan_transparent_only(keys, network, lightwalletd_url).await?;
+    print_transparent_report(&report);
+
+    if report.total_zatoshis == 0 {
+        println!();
+        println!("Nothing to sweep.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Destination: {destination}");
+    println!("All transparent funds above would be swept into a single shielded (Sapling) output.");
+
+    if dry_run {
+        println!();
+        println!("╔══════════════════════════════════════╗");
+        println!("║  DRY RUN — no funds will be moved    ║");
+        println!("╚══════════════════════════════════════╝");
+        println!();
+        println!("Re-run with --confirm-sweep to broadcast.");
+        return Ok(());
+    }
+
+    if !confirm_sweep {
+        bail!(
+            "refusing to broadcast without --confirm-sweep. Re-run with --dry-run to preview, \
+             or --confirm-sweep to move the funds. This is irreversible."
+        );
+    }
+
+    let outcome = sweep_transparent_only(keys, network, lightwalletd_url, destination, max_fee)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("there was nothing to sweep"))?;
+
+    println!();
+    println!("━━━ Sweep broadcast ━━━");
+    println!("  Transaction  {}", outcome.txid);
+    println!("  Inputs       {}", outcome.plan.input_count);
+    println!("  Fee          {}", format_zec(outcome.plan.fee_zatoshis));
+    println!(
+        "  Sent         {}",
+        format_zec(outcome.plan.output_zatoshis)
+    );
+    println!("  Destination  {}", outcome.destination);
+    println!();
+    // Mempool acceptance is not confirmation, and a recovery user reading
+    // "broadcast" as "done" may delete the wallet file that still holds the
+    // only copy of these keys.
+    println!(
+        "The network accepted this transaction into its mempool. That is not the same as \
+         it being mined. Check the transaction id above in a block explorer before treating \
+         the funds as moved, and keep the original wallet file until you have."
+    );
+
+    Ok(())
+}
+
+/// Whether this wallet must go down the transparent-only path.
+///
+/// Only when it has *no* Sapling keys. A wallet with Sapling keys can be
+/// given a wallet-database account, and that account carries the
+/// transparent keys as standalone receivers — so the shielded scan covers
+/// both pools in one pass. Routing such a wallet here instead would report
+/// its transparent balance while silently ignoring its Sapling notes.
+fn is_transparent_only(keys: &ImportedKeys) -> bool {
+    // One shared classifier: this predicate, the GUI's, and core's refusal
+    // were three different definitions that had to agree and did not.
+    argos_core::key_source::classify_recovery_route(keys)
+        == argos_core::key_source::RecoveryRoute::TransparentOnly
+}
+
+/// Warn — unmissably — about every pool this recovery will not cover.
+///
+/// This is the project's partial-recovery rule applied to whole pools:
+/// covering what we can must never imply we covered everything. A user who
+/// reads "0.5 ZEC recovered" without knowing a pool was never looked at has
+/// been actively misled about where their money is — and may discard the
+/// wallet file holding the only copy of those keys.
+///
+/// `covers_shielded` distinguishes the two import paths: the transparent-only
+/// path reaches exactly one pool, while the imported-account path scans
+/// Sapling and transparent together and leaves only Sprout behind.
+fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
+    let uncovered_sapling = if covers_shielded {
+        0
+    } else {
+        keys.sapling.len()
+    };
+    if uncovered_sapling == 0 && keys.sprout.is_empty() {
+        return;
+    }
+
+    eprintln!();
+    if covers_shielded {
+        eprintln!("  ⚠ SPROUT FUNDS ARE NOT COVERED");
+    } else {
+        eprintln!("  ⚠ THIS COVERS TRANSPARENT FUNDS ONLY");
+    }
+    if uncovered_sapling > 0 {
+        eprintln!(
+            "    {uncovered_sapling} Sapling key(s) in this wallet are NOT scanned or swept here."
+        );
+    }
+    if !keys.sprout.is_empty() {
+        eprintln!(
+            "    {} Sprout key(s) in this wallet are NOT scanned or swept here.",
+            keys.sprout.len()
+        );
+        eprintln!("    Sprout is recovered separately — run `inspect-wallet` to see what");
+        eprintln!("    this file holds for them, and what recovering them would cost.");
+    }
+    eprintln!("    Any balance reported below excludes those pools entirely.");
+    eprintln!("    Keep the original wallet file: those keys exist only there.");
+    eprintln!();
+}
+
+fn print_transparent_report(report: &TransparentScanReport) {
+    println!();
+    println!("━━━ Transparent balances ━━━");
+    println!("  Addresses checked   {}", report.addresses_checked);
+    println!("  Funded addresses    {}", report.funded.len());
+    println!(
+        "  Total               {}",
+        format_zec(report.total_zatoshis)
+    );
+    if report.chain_tip_height > 0 {
+        println!("  Chain tip           {}", report.chain_tip_height);
+    }
+    println!();
+
+    if report.funded.is_empty() {
+        println!("No spendable transparent funds were found at these addresses.");
+        println!();
+        println!(
+            "Note: this reports what is spendable now, not what the wallet ever held. \
+             A wallet that was funded and later emptied reports zero here."
+        );
+        return;
+    }
+
+    for balance in &report.funded {
+        println!(
+            "  {}  {}  ({} UTXO{})",
+            balance.address,
+            format_zec(balance.zatoshis),
+            balance.utxo_count,
+            if balance.utxo_count == 1 { "" } else { "s" }
+        );
+    }
+}
+
+/// What to tell a user holding Sprout keys, in a build without Sprout support.
+///
+/// `scan-sprout` and `sweep-sprout` do not exist here — the subcommands are
+/// compiled out — so naming them would send the user to
+/// `unrecognized subcommand` for the one pool that is genuinely hard to
+/// recover. The keys are real and were counted above; what is missing is this
+/// build's ability to act on them, and that is what this says.
+fn print_sprout_next_steps() {
+    println!(
+        "Sprout: this wallet holds Sprout keys, and this build cannot recover them — \
+         Sprout support is compiled out. The keys above are real and are not lost. \
+         Recovering them needs an Argos build with the `sprout` feature enabled; \
+         nothing here moves or damages them."
+    );
+}
+
+/// Without the Sprout code path compiled in there is no note-recovery logic
+/// to drive, so the inspection prints nothing extra for Sprout. The counts
+/// still appear above from the always-on parser.
+fn print_sprout_inspection(_keys: &ImportedKeys, _network: ZeckNetwork) {}
+
+/// Everything Argos recovered, printed without any network access.
+///
+/// This is the only useful thing it can do with a zcashd `wallet.dat`
+/// today, so it must be honest about the difference between "found a
+/// key" and "can move the funds".
+fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
+    println!("━━━ Recovered key material ━━━");
+    println!("  Transparent keys  {}", keys.transparent.len());
+    println!("  Sapling keys      {}", keys.sapling.len());
+    println!("  Sprout keys       {}", keys.sprout.len());
+    println!("  Sprout notes      {}", keys.sprout_notes.len());
+    println!(
+        "  Seed phrase       {}",
+        if keys.mnemonic.is_some() {
+            "recovered"
+        } else {
+            "none (keys are stored individually, not HD-derived)"
+        }
+    );
+    println!();
+
+    // Printing the addresses, not just a count, is the difference between
+    // a user being able to check their own balance in a block explorer and
+    // being told a number they can do nothing with.
+    match imported_transparent_keys(keys) {
+        Ok(resolved) if !resolved.is_empty() => {
+            println!("Transparent addresses:");
+            for key in &resolved {
+                println!("  {}", encode_transparent_address(&key.address, network));
+            }
+            println!();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            // Never silent: a key we cannot resolve is a key the user
+            // still holds and must know about.
+            println!("Could not resolve some transparent keys to addresses: {err}");
+            println!();
+        }
+    }
+
+    // The Sprout address list and spendability verdict live in a helper so
+    // the whole block can compile out with the Sprout code path. A default
+    // build still reports the Sprout key/note counts above (parser data), but
+    // it has no code to recover or spend them, so it prints nothing here.
+    print_sprout_inspection(keys, network);
+
+    // Never summarized away: an unread record means key material that
+    // still exists only in the original file, and the user is the only
+    // one who can act on that.
+    if keys.diagnostics.is_empty() {
+        println!("Every record in this file was read.");
+    } else {
+        println!("{} record(s) could not be read:", keys.diagnostics.len());
+        for diagnostic in &keys.diagnostics {
+            println!("  {diagnostic}");
+        }
+        println!();
+        println!("Keep the original wallet file. Anything listed above exists only there.");
+    }
+    println!();
+
+    // Sprout is its own path and its own caveat, stated before the route
+    // advice so it cannot be lost in it. This used to ride on the blanket
+    // "seedless wallets cannot move funds" message, which meant the warning
+    // was only correct by accident — and disappeared the moment that message
+    // became accurate about Sapling and transparent funds.
+    //
+    // Both builds say something, because both builds have already printed a
+    // Sprout key count: the parser is unconditional. Silence would leave keys
+    // on screen with no account of them. What differs is where the user is
+    // sent — a build without Sprout support must not name subcommands it does
+    // not have.
+    if !keys.sprout.is_empty() {
+        print_sprout_next_steps();
+        println!();
+    }
+
+    // Driven by the classifier rather than by `mnemonic.is_some()`, which was
+    // telling every seedless wallet that Argos "cannot yet move funds held by
+    // them" — untrue for both remaining routes, and the same false
+    // unrecoverable claim that dead-ended the GUI. A `match` also means a new
+    // route forces this copy to be updated instead of silently falling into
+    // the wrong arm.
+    match argos_core::key_source::classify_recovery_route(keys) {
+        argos_core::key_source::RecoveryRoute::Hd => {
+            println!("Next: run `argos scan --wallet-file <path>` to check these keys for funds.");
+        }
+        argos_core::key_source::RecoveryRoute::ImportedAccounts => {
+            println!(
+                "Next: run `argos scan --wallet-file <path>` to check these keys for funds. \
+                 This wallet has no HD seed, so its Sapling keys are scanned as imported \
+                 accounts; balances are visible and transparent funds can be swept."
+            );
+        }
+        argos_core::key_source::RecoveryRoute::TransparentOnly => {
+            println!(
+                "Next: run `argos scan --wallet-file <path>` to check these keys for funds. \
+                 This wallet holds only transparent keys, which are scanned and swept \
+                 directly — no HD seed is needed."
+            );
+        }
+        argos_core::key_source::RecoveryRoute::Nothing => {
+            println!(
+                "This wallet file contains no transparent or Sapling keys, so there is \
+                 nothing to scan."
+            );
+        }
+    }
+}
+
+/// Resolve the birthday height for a scan.
+///
+/// `seed_phrase` is `None` for a wallet file with no recoverable mnemonic.
+/// Only auto-detection needs one — it probes on-chain history for
+/// HD-derived addresses — so the other two routes stay available to an
+/// imported wallet rather than blocking it on a seed it does not have.
 async fn resolve_birthday(
     cli: &Cli,
-    seed_phrase: &SecretString,
+    seed_phrase: Option<&SecretString>,
     network: ZeckNetwork,
 ) -> Result<u32> {
     if cli.birthday_auto_detect {
+        let seed_phrase = seed_phrase.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--birthday-auto-detect probes on-chain history for HD-derived addresses, \
+                 which a wallet file without a recoverable seed phrase does not have. \
+                 Pass --birthday <height> or --birthday-date <YYYY-MM-DD> instead."
+            )
+        })?;
         eprintln!("Auto-detecting wallet birthday from on-chain history…");
         let result = detect_birthday(seed_phrase, network, &cli.lightwalletd_url, |msg| {
             eprintln!("  {msg}")
@@ -165,23 +549,147 @@ async fn resolve_birthday(
     }
 }
 
+/// Point this process at the harness's private regtest chain.
+///
+/// Compiled out unless the crate is built with `argos-network`, which a
+/// released build never is. That gate — not this env var — is what stops a
+/// shipped `argos` from being talked onto foreign consensus parameters: with
+/// the feature off, `set_regtest_consensus_params` does not exist to call.
+///
+/// The env var exists so that even a feature-enabled test binary only
+/// retargets when the harness explicitly asks it to.
+#[cfg(feature = "argos-network")]
+fn install_regtest_params_if_requested() -> Result<()> {
+    if std::env::var_os("ARGOS_REGTEST_CONSENSUS").is_none() {
+        return Ok(());
+    }
+    argos_core::workspace::set_regtest_consensus_params(
+        argos_core::workspace::regtest_local_network(),
+    )?;
+    tracing::warn!(
+        "regtest consensus parameters installed via ARGOS_REGTEST_CONSENSUS; \
+         this build is not a release build"
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "argos-network"))]
+fn install_regtest_params_if_requested() -> Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose)?;
 
+    install_regtest_params_if_requested()?;
+
     // Gate the network/funds-moving commands on Terms of Service acceptance.
     // `show-keys` is purely local key derivation and is intentionally ungated.
-    if command_uses_birthday_inputs(&cli.command) {
+    if command_requires_tos(&cli.command) {
         ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
     }
 
     let network: ZeckNetwork = cli.network.into();
 
-    let seed_phrase = load_seed_phrase(cli.seed_file.clone())?;
+    // `key_source` is what the scanner and sweeper use. `seed_phrase` is
+    // the same key material in the one form two local-only paths still
+    // need it in — birthday auto-detection and `show-keys` — and is
+    // absent for a wallet file with no recoverable mnemonic.
+    let (key_source, seed_phrase, imported): (
+        Arc<dyn KeySource>,
+        Option<SecretString>,
+        Option<Arc<ImportedKeySource>>,
+    ) = match &cli.wallet_file {
+        Some(path) => {
+            let keys = load_wallet_file(path)?;
+            let phrase = keys.mnemonic.clone();
+            // `inspect-wallet` prints a fuller version of this below, so
+            // don't say it twice.
+            if !matches!(cli.command, Commands::InspectWallet) {
+                eprintln!(
+                    "Imported {} key(s) from {}.",
+                    keys.total_keys(),
+                    path.display()
+                );
+                if !keys.diagnostics.is_empty() {
+                    eprintln!(
+                        "{} record(s) could not be read — run `argos inspect-wallet \
+                         --wallet-file {}` to see them.",
+                        keys.diagnostics.len(),
+                        path.display()
+                    );
+                }
+            }
+            let source = Arc::new(ImportedKeySource::new(keys));
+            (source.clone(), phrase, Some(source))
+        }
+        None => {
+            // Bail before prompting: an interactive seed prompt for a
+            // command that only reads a wallet file is pure confusion.
+            if matches!(cli.command, Commands::InspectWallet) {
+                bail!("inspect-wallet needs --wallet-file");
+            }
+            let phrase = load_seed_phrase(cli.seed_file.clone())?;
+            (
+                Arc::new(SeedKeySource::new(phrase.clone())),
+                Some(phrase),
+                None,
+            )
+        }
+    };
+
+    // A wallet with no HD seed cannot be scanned as accounts, but its
+    // transparent keys can still be recovered directly — no account model
+    // is involved. Dispatch before the birthday gate, which only makes
+    // sense for an HD scan.
+    if let Some(source) = imported.as_ref() {
+        let keys = source.keys();
+        if is_transparent_only(keys) {
+            match &cli.command {
+                Commands::Scan => {
+                    warn_about_uncovered_pools(keys, false);
+                    let resolved = imported_transparent_keys(keys)?;
+                    let report =
+                        scan_transparent_only(&resolved, network, &cli.lightwalletd_url).await?;
+                    print_transparent_report(&report);
+                    return Ok(());
+                }
+                Commands::Sweep {
+                    destination,
+                    max_fee,
+                    dry_run,
+                    confirm_sweep,
+                    ..
+                } => {
+                    warn_about_uncovered_pools(keys, false);
+                    let resolved = imported_transparent_keys(keys)?;
+                    return run_transparent_sweep(
+                        &resolved,
+                        network,
+                        &cli.lightwalletd_url,
+                        destination,
+                        *max_fee,
+                        *dry_run,
+                        *confirm_sweep,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        } else if keys.mnemonic.is_none()
+            && matches!(cli.command, Commands::Scan | Commands::Sweep { .. })
+        {
+            // Imported-account path: Sapling and transparent are scanned
+            // together, so only Sprout is left uncovered — but it still
+            // must be said before any balance appears.
+            warn_about_uncovered_pools(keys, true);
+        }
+    }
 
     let birthday = if command_uses_birthday_inputs(&cli.command) {
-        Some(resolve_birthday(&cli, &seed_phrase, network).await?)
+        Some(resolve_birthday(&cli, seed_phrase.as_ref(), network).await?)
     } else {
         None
     };
@@ -201,8 +709,20 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::InspectWallet => {
+            let source = imported.expect("--wallet-file is required and was checked above");
+            print_wallet_inspection(source.keys(), network);
+        }
+
         Commands::ShowKeys => {
-            let accounts = derive_accounts(&seed_phrase, network, account_count)?;
+            let phrase = seed_phrase.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no recoverable seed phrase, so there are no HD accounts to \
+                     show. Use `argos inspect-wallet --wallet-file <path>` instead.",
+                    key_source.describe()
+                )
+            })?;
+            let accounts = derive_accounts(phrase, network, account_count)?;
             for account in accounts {
                 println!("━━━ Account {} ━━━", account.index);
                 println!("  Unified address     {}", account.unified_address);
@@ -225,7 +745,7 @@ async fn main() -> Result<()> {
             let birthday = birthday.expect("scan command requires birthday");
             let service = RecoveryService::new();
             let handle = service
-                .start_scan(
+                .start_scan_from_key_source(
                     ScanConfig {
                         birthday,
                         num_accounts: cli.num_accounts,
@@ -235,7 +755,7 @@ async fn main() -> Result<()> {
                         network,
                         label: String::new(),
                     },
-                    seed_phrase,
+                    key_source.clone(),
                 )
                 .await?;
 
@@ -245,6 +765,7 @@ async fn main() -> Result<()> {
             if progress.phase == ScanPhase::Cancelled {
                 std::process::exit(130);
             }
+
             if progress.phase == ScanPhase::Error {
                 bail!("recovery scan failed");
             }
@@ -276,7 +797,7 @@ async fn main() -> Result<()> {
 
             let service = RecoveryService::new();
             let handle = service
-                .start_scan(
+                .start_scan_from_key_source(
                     ScanConfig {
                         birthday,
                         num_accounts: cli.num_accounts,
@@ -286,7 +807,7 @@ async fn main() -> Result<()> {
                         network,
                         label: String::new(),
                     },
-                    seed_phrase,
+                    key_source.clone(),
                 )
                 .await?;
 
@@ -296,6 +817,7 @@ async fn main() -> Result<()> {
             if progress.phase == ScanPhase::Cancelled {
                 std::process::exit(130);
             }
+
             if progress.phase == ScanPhase::Error {
                 bail!("recovery scan failed");
             }
@@ -1339,6 +1861,7 @@ mod tests {
             error: None,
             sleep_event: None,
             in_sandblasting_zone: false,
+            gap_extension: None,
         }
     }
 

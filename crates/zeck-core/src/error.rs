@@ -22,11 +22,37 @@ pub enum ZeckError {
     #[error("invalid scan configuration: {0}")]
     InvalidConfig(String),
 
+    /// The funds exist but cannot cover the fee to move them.
+    ///
+    /// Distinct from `InvalidConfig`, which is the user setting something
+    /// wrong. Nothing here is misconfigured: the wallet is simply worth less
+    /// than it costs to sweep, and no change to the invocation fixes it.
+    #[error("not economically recoverable: {0}")]
+    BelowDustThreshold(String),
+
+    /// A destination carried the right kind of receiver, but its bytes did
+    /// not decode.
+    ///
+    /// Distinct from having no such receiver at all. Telling someone their
+    /// unified address "has no Sapling receiver" when it has a corrupt one
+    /// sends them looking for a different address instead of a clean copy of
+    /// the one they have.
+    #[error("malformed receiver in destination: {0}")]
+    MalformedReceiver(String),
+
     #[error("failed to parse date: {0}")]
     InvalidDate(String),
 
     #[error("lightwalletd probe failed: {0}")]
     Lightwalletd(String),
+
+    /// A scan batch has not committed within its budget. Deliberately *not*
+    /// a [`ZeckError::Lightwalletd`]: the stall watchdog observes only that
+    /// `synced_to_height` stopped advancing, which a hung stream and an
+    /// unusually dense block range produce identically. Attributing it to
+    /// the server would be a guess presented to the user as a fact.
+    #[error("scan stalled: {0}")]
+    ScanStalled(String),
 
     #[error("scan session not found")]
     UnknownScanHandle,
@@ -60,4 +86,7 @@ pub enum ZeckError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("wallet import failed: {0}")]
+    Import(String),
 }

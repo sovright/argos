@@ -4,17 +4,18 @@ use std::{
 };
 
 use rand_core::OsRng;
-use secrecy::{ExposeSecret, SecretString, SecretVec};
+use secrecy::{SecretString, SecretVec};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, WalletRead};
 use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db, WalletDb};
-use zcash_protocol::consensus::Network;
-use zip32::fingerprint::SeedFingerprint;
+use zcash_protocol::consensus::{BlockHeight, Network, NetworkType, NetworkUpgrade, Parameters};
+#[cfg(feature = "argos-network")]
+use zcash_protocol::local_consensus::LocalNetwork;
 
 use crate::{
-    derivation::mnemonic_seed,
     error::{ZeckError, ZeckResult},
+    key_source::{KeySource, SeedKeySource},
     models::{RuntimeScanConfig, ZeckNetwork},
 };
 
@@ -55,10 +56,17 @@ pub struct RecoveryWorkspace {
 
 impl RecoveryWorkspace {
     pub fn from_runtime(config: &RuntimeScanConfig) -> ZeckResult<Self> {
-        let seed = mnemonic_seed(&config.seed_phrase)?;
-        let fingerprint = SeedFingerprint::from_seed(seed.expose_secret()).ok_or_else(|| {
-            ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
-        })?;
+        Self::from_key_source(config.key_source.as_ref(), config)
+    }
+
+    /// Build a workspace from any key source.
+    ///
+    /// `from_runtime` remains as a thin wrapper so existing seed callers
+    /// and their on-disk workspaces are untouched. For a seed source this
+    /// must produce byte-identical paths to the old implementation, or
+    /// every in-progress scan on disk is orphaned.
+    pub fn from_key_source(source: &dyn KeySource, config: &RuntimeScanConfig) -> ZeckResult<Self> {
+        let path_component = source.workspace_path_component()?;
 
         let scope = match config.num_accounts {
             Some(num_accounts) => format!("accounts-{num_accounts}"),
@@ -66,7 +74,7 @@ impl RecoveryWorkspace {
         };
 
         let workspace_id =
-            derive_workspace_id(config.network, &fingerprint, config.birthday, &scope);
+            derive_workspace_id(config.network, &path_component, config.birthday, &scope);
         let private_root = config
             .data_dir
             .join(config.network.label())
@@ -111,6 +119,36 @@ impl RecoveryWorkspace {
         Ok(())
     }
 
+    /// Build the wallet database for any key source. Imported key sets
+    /// have no seed, so `init_wallet_db` receives `None` for them.
+    pub fn initialize_from_source(
+        &self,
+        network: ZeckNetwork,
+        source: &dyn KeySource,
+    ) -> ZeckResult<()> {
+        create_private_dir_all(&self.root)?;
+        tighten_private_perms(&self.private_root, &self.root)?;
+
+        let mut wallet_db = open_wallet_db(&self.wallet_db_path, consensus_network(network))?;
+        let seed = source.wallet_seed()?.map(|s| SecretVec::new(s.to_vec()));
+        init_wallet_db(&mut wallet_db, seed).map_err(|err| {
+            ZeckError::Wallet(format!(
+                "initializing wallet database {}: {err}",
+                self.wallet_db_path.display()
+            ))
+        })?;
+        set_private_file_permissions(&self.wallet_db_path)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = self.wallet_db_path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.exists() {
+                set_private_file_permissions(&sidecar)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -120,16 +158,134 @@ impl RecoveryWorkspace {
     }
 }
 
-pub fn consensus_network(network: ZeckNetwork) -> Network {
+/// The consensus parameter set Argos evaluates heights against.
+///
+/// Production builds only ever hold [`Network::MainNetwork`] or
+/// [`Network::TestNetwork`]. The `argos-network` feature adds a regtest variant
+/// so the integration harness can drive a private chain: a regtest chain is a
+/// few hundred blocks tall, and under testnet activation heights (NU5 at
+/// 1_842_420) every such height resolves to a pre-NU5 consensus branch. Scans
+/// tolerate that, but a sweep would be signed with the wrong branch ID and
+/// rejected by the node, so the harness cannot test sweeping without real
+/// regtest parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgosParams {
+    /// Mainnet or testnet — the only variants a released binary can construct.
+    Consensus(Network),
+    /// A private regtest chain's activation heights. Test builds only.
+    #[cfg(feature = "argos-network")]
+    Regtest(LocalNetwork),
+}
+
+/// Regtest activation heights with every upgrade through Ironwood active from
+/// height 1, matching what the harness configures on Zebra in
+/// `tests/regtest/zebrad-regtest.toml`. Genesis (height 0) is reserved, so 1
+/// is the earliest an upgrade may activate. These two definitions must stay in
+/// sync: Argos evaluates consensus branch IDs against this copy, and a
+/// mismatch means sweeps are signed for a branch the node will reject.
+#[cfg(feature = "argos-network")]
+pub fn regtest_local_network() -> LocalNetwork {
+    let h = Some(BlockHeight::from_u32(1));
+    LocalNetwork {
+        overwinter: h,
+        sapling: h,
+        blossom: h,
+        heartwood: h,
+        canopy: h,
+        nu5: h,
+        nu6: h,
+        nu6_1: h,
+        nu6_2: h,
+        nu6_3: h,
+    }
+}
+
+impl ArgosParams {
+    /// [`regtest_local_network`] wrapped as an [`ArgosParams`].
+    #[cfg(feature = "argos-network")]
+    pub fn regtest_all_active() -> Self {
+        let h = Some(BlockHeight::from_u32(1));
+        Self::Regtest(LocalNetwork {
+            overwinter: h,
+            sapling: h,
+            blossom: h,
+            heartwood: h,
+            canopy: h,
+            nu5: h,
+            nu6: h,
+            nu6_1: h,
+            nu6_2: h,
+            nu6_3: h,
+        })
+    }
+}
+
+impl Parameters for ArgosParams {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            Self::Consensus(network) => network.network_type(),
+            #[cfg(feature = "argos-network")]
+            Self::Regtest(local) => local.network_type(),
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        match self {
+            Self::Consensus(network) => network.activation_height(nu),
+            #[cfg(feature = "argos-network")]
+            Self::Regtest(local) => local.activation_height(nu),
+        }
+    }
+}
+
+/// Regtest override, installed once by the integration harness before any scan
+/// or sweep runs. Compiled out entirely in production builds, so a released
+/// binary has no code path that can retarget consensus parameters.
+#[cfg(feature = "argos-network")]
+static REGTEST_PARAMS: std::sync::OnceLock<LocalNetwork> = std::sync::OnceLock::new();
+
+/// Point Argos at a private regtest chain's consensus rules for the remainder
+/// of the process. Idempotent only in the sense that a second *differing* call
+/// is an error: consensus parameters must not change under a running scan.
+#[cfg(feature = "argos-network")]
+pub fn set_regtest_consensus_params(params: LocalNetwork) -> ZeckResult<()> {
+    match REGTEST_PARAMS.get() {
+        Some(existing) if *existing == params => Ok(()),
+        Some(_) => Err(ZeckError::Internal(
+            "regtest consensus parameters were already set to a different value".to_owned(),
+        )),
+        None => {
+            let _ = REGTEST_PARAMS.set(params);
+            Ok(())
+        }
+    }
+}
+
+/// Whether [`set_regtest_consensus_params`] has been called in this process.
+///
+/// Used to gate the harness's relaxation of lightwalletd network validation.
+/// This is a strictly stronger signal than the chain name the server reports:
+/// it reflects a deliberate local act, so a hostile server cannot talk its way
+/// into the relaxation by naming itself `regtest`.
+#[cfg(feature = "argos-network")]
+pub fn regtest_consensus_params_installed() -> bool {
+    REGTEST_PARAMS.get().is_some()
+}
+
+pub fn consensus_network(network: ZeckNetwork) -> ArgosParams {
+    #[cfg(feature = "argos-network")]
+    if let Some(params) = REGTEST_PARAMS.get() {
+        return ArgosParams::Regtest(*params);
+    }
     match network {
-        ZeckNetwork::Mainnet => Network::MainNetwork,
-        ZeckNetwork::Testnet => Network::TestNetwork,
+        ZeckNetwork::Mainnet => ArgosParams::Consensus(Network::MainNetwork),
+        ZeckNetwork::Testnet => ArgosParams::Consensus(Network::TestNetwork),
     }
 }
 
 fn derive_workspace_id(
     network: ZeckNetwork,
-    fingerprint: &SeedFingerprint,
+    path_component: &str,
     birthday: u32,
     scope: &str,
 ) -> String {
@@ -137,7 +293,7 @@ fn derive_workspace_id(
     hasher.update(b"zeck-workspace-v1\0");
     hasher.update(network.label().as_bytes());
     hasher.update(b"\0");
-    hasher.update(fingerprint.to_string().as_bytes());
+    hasher.update(path_component.as_bytes());
     hasher.update(b"\0");
     hasher.update(birthday.to_le_bytes());
     hasher.update(b"\0");
@@ -145,7 +301,7 @@ fn derive_workspace_id(
     let digest = hasher.finalize();
     let mut out = String::with_capacity(32);
     for byte in digest.iter().take(16) {
-        out.push_str(&format!("{:02x}", byte));
+        out.push_str(&format!("{byte:02x}"));
     }
     out
 }
@@ -284,10 +440,24 @@ fn open_tuned_wallet_connection(path: &Path) -> Result<rusqlite::Connection, rus
 /// Opens a wallet database with the connection tuning from
 /// [`open_tuned_wallet_connection`]. All production opens of
 /// `wallet.sqlite` should come through here.
+/// Test-only accessor for [`open_wallet_db`].
+///
+/// The regtest funding helper has to drive `propose_shielding_coinbase` and
+/// `propose_transfer` directly — Zebra has no wallet RPCs, and coinbase output
+/// may not be spent to a transparent address, so funding the test seed cannot
+/// go through Argos's own sweep. Compiled out of production builds.
+#[cfg(feature = "argos-network")]
+pub fn open_wallet_db_for_tests(
+    path: &Path,
+    network: ArgosParams,
+) -> ZeckResult<WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>> {
+    open_wallet_db(path, network)
+}
+
 pub(crate) fn open_wallet_db(
     path: &Path,
-    network: Network,
-) -> ZeckResult<WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>> {
+    network: ArgosParams,
+) -> ZeckResult<WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>> {
     let conn = open_tuned_wallet_connection(path).map_err(|err| {
         ZeckError::Storage(format!("opening wallet database {}: {err}", path.display()))
     })?;
@@ -565,6 +735,18 @@ pub fn verify_seed_for_workspace(
     workspace_path: &Path,
     seed_phrase: &SecretString,
 ) -> ZeckResult<()> {
+    let source = SeedKeySource::new(seed_phrase.clone());
+    verify_key_source_for_workspace(workspace_path, &source)
+}
+
+/// Re-derive the workspace id from `source` plus the keying segments in
+/// `workspace_path`, and verify it matches the path's `workspace-<id>`
+/// segment. Used at resume time so a caller cannot unlock a workspace with
+/// the wrong keys.
+pub fn verify_key_source_for_workspace(
+    workspace_path: &Path,
+    source: &dyn KeySource,
+) -> ZeckResult<()> {
     let path_id = extract_workspace_id_segment(workspace_path).ok_or_else(|| {
         ZeckError::InvalidConfig(format!(
             "workspace path {} does not contain a workspace-id segment",
@@ -574,11 +756,8 @@ pub fn verify_seed_for_workspace(
     let keying = parse_workspace_keying(workspace_path)?;
     let scope = scope_segment(&keying);
 
-    let seed = mnemonic_seed(seed_phrase)?;
-    let fingerprint = SeedFingerprint::from_seed(seed.expose_secret()).ok_or_else(|| {
-        ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
-    })?;
-    let expected_id = derive_workspace_id(keying.network, &fingerprint, keying.birthday, &scope);
+    let path_component = source.workspace_path_component()?;
+    let expected_id = derive_workspace_id(keying.network, &path_component, keying.birthday, &scope);
 
     if expected_id != path_id {
         return Err(ZeckError::InvalidConfig(
@@ -693,15 +872,96 @@ pub fn parse_workspace_keying(workspace_path: &Path) -> ZeckResult<WorkspaceKeyi
     })
 }
 
+/// Regtest consensus behaviour (`argos-network` builds only).
+///
+/// These tests pin the reason `ArgosParams` exists: against a private regtest
+/// chain a few hundred blocks tall, testnet activation heights resolve to a
+/// pre-NU5 consensus branch, so a sweep would be signed with the wrong branch
+/// ID and rejected. Regtest params must instead report Ironwood.
+#[cfg(all(test, feature = "argos-network"))]
+mod regtest_params_tests {
+    use zcash_protocol::consensus::{
+        BlockHeight, BranchId, NetworkType, NetworkUpgrade, Parameters,
+    };
+
+    use super::*;
+
+    /// Every upgrade active from height 1, matching the harness's Zebra config.
+    fn all_active_regtest() -> ArgosParams {
+        ArgosParams::regtest_all_active()
+    }
+
+    #[test]
+    fn regtest_params_report_regtest_network_type() {
+        assert_eq!(all_active_regtest().network_type(), NetworkType::Regtest);
+    }
+
+    #[test]
+    fn regtest_params_activate_ironwood() {
+        let params = all_active_regtest();
+        assert_eq!(
+            params.activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(1)),
+            "Ironwood must be active on the regtest chain"
+        );
+        assert!(params.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(200)));
+    }
+
+    /// The actual regression: this is what a sweep signs with.
+    #[test]
+    fn regtest_branch_id_at_harness_heights_is_ironwood() {
+        let params = all_active_regtest();
+        for height in [1u32, 200, 300, 1_000] {
+            assert_eq!(
+                BranchId::for_height(&params, BlockHeight::from_u32(height)),
+                BranchId::Nu6_3,
+                "height {height} must resolve to the Ironwood branch"
+            );
+        }
+    }
+
+    /// Guards the bug this type was introduced to prevent: testnet params on a
+    /// short regtest chain resolve to a pre-NU5 branch.
+    #[test]
+    fn testnet_params_would_pick_the_wrong_branch_on_a_regtest_chain() {
+        let testnet = consensus_network(ZeckNetwork::Testnet);
+        let branch = BranchId::for_height(&testnet, BlockHeight::from_u32(200));
+        assert_ne!(
+            branch,
+            BranchId::Nu6_3,
+            "testnet params must NOT be usable for regtest sweeps"
+        );
+    }
+
+    #[test]
+    fn production_networks_are_unaffected() {
+        assert_eq!(
+            consensus_network(ZeckNetwork::Mainnet).network_type(),
+            NetworkType::Main
+        );
+        assert_eq!(
+            consensus_network(ZeckNetwork::Testnet).network_type(),
+            NetworkType::Test
+        );
+        assert_eq!(
+            consensus_network(ZeckNetwork::Mainnet).activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(3_428_143)),
+            "mainnet Ironwood activation height must come through unchanged"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use secrecy::{ExposeSecret, SecretString};
     use zip32::fingerprint::SeedFingerprint;
 
     use super::*;
     use crate::derivation::mnemonic_seed;
+    use crate::key_source::ImportedKeySource;
     use crate::models::RuntimeScanConfig;
 
     fn config(
@@ -712,7 +972,7 @@ mod tests {
         network: ZeckNetwork,
     ) -> RuntimeScanConfig {
         RuntimeScanConfig {
-            seed_phrase: SecretString::new(seed.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(seed.to_owned()))),
             birthday,
             num_accounts,
             gap_limit,
@@ -721,6 +981,10 @@ mod tests {
             network,
             label: String::new(),
         }
+    }
+
+    fn runtime_config(seed: &str) -> RuntimeScanConfig {
+        config(seed, 3_280_000, None, 20, ZeckNetwork::Mainnet)
     }
 
     const SEED: &str = "abandon abandon abandon abandon abandon abandon \
@@ -882,7 +1146,7 @@ mod tests {
         let ws = RecoveryWorkspace::from_runtime(&cfg).unwrap();
         let path_str = ws.root().display().to_string();
 
-        let seed = mnemonic_seed(&cfg.seed_phrase).expect("seed should derive");
+        let seed = mnemonic_seed(&SecretString::new(SEED.to_owned())).expect("seed should derive");
         let fingerprint_str = SeedFingerprint::from_seed(seed.expose_secret())
             .expect("seed fingerprint should derive")
             .to_string();
@@ -989,7 +1253,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("tempdir");
         // Workspace 1: incomplete with sidecar.
         let cfg1 = RuntimeScanConfig {
-            seed_phrase: SecretString::new(SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(SEED.to_owned()))),
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,
@@ -1018,7 +1282,7 @@ mod tests {
 
         // Workspace 2: legacy, no sidecar.
         let cfg2 = RuntimeScanConfig {
-            seed_phrase: SecretString::new(OTHER_SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(OTHER_SEED.to_owned()))),
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,
@@ -1033,7 +1297,7 @@ mod tests {
 
         // Workspace 3: completed — must be filtered out.
         let cfg3 = RuntimeScanConfig {
-            seed_phrase: SecretString::new(SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(SEED.to_owned()))),
             birthday: 2_500_000,
             num_accounts: None,
             gap_limit: 20,
@@ -1101,9 +1365,9 @@ mod tests {
 
     #[test]
     fn workspace_id_is_deterministic_and_distinct_across_inputs() {
-        let cfg = config(SEED, 3_280_000, None, 20, ZeckNetwork::Mainnet);
-        let seed = mnemonic_seed(&cfg.seed_phrase).unwrap();
+        let seed = mnemonic_seed(&SecretString::new(SEED.to_owned())).unwrap();
         let fp = SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
+        let fp = fp.to_string();
         let a = derive_workspace_id(ZeckNetwork::Mainnet, &fp, 3_280_000, "auto-gap-20");
         let b = derive_workspace_id(ZeckNetwork::Mainnet, &fp, 3_280_000, "auto-gap-20");
         assert_eq!(a, b);
@@ -1111,6 +1375,87 @@ mod tests {
         assert_ne!(a, c);
         let d = derive_workspace_id(ZeckNetwork::Testnet, &fp, 3_280_000, "auto-gap-20");
         assert_ne!(a, d);
+    }
+
+    /// Verbatim copy of the pre-refactor `derive_workspace_id`, which hashed
+    /// `fingerprint.to_string()` directly rather than a generalized
+    /// `path_component: &str`. Kept here so
+    /// `a_seed_workspace_path_is_unchanged_by_the_refactor` compares two
+    /// independent derivations rather than the production code against
+    /// itself. Do NOT refactor this to call the production helper.
+    fn original_workspace_id(
+        network: ZeckNetwork,
+        fingerprint: &SeedFingerprint,
+        birthday: u32,
+        scope: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zeck-workspace-v1\0");
+        hasher.update(network.label().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(fingerprint.to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(birthday.to_le_bytes());
+        hasher.update(b"\0");
+        hasher.update(scope.as_bytes());
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(32);
+        for byte in digest.iter().take(16) {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    #[test]
+    fn a_seed_workspace_path_is_unchanged_by_the_refactor() {
+        // Regression guard: existing users must resume their scans. If
+        // this fails, every in-progress scan on disk is orphaned.
+        //
+        // `expected` is built from `original_workspace_id`, a verbatim
+        // copy of the pre-refactor derivation, independent of any
+        // production code touched by this change. `actual` goes through
+        // the new `from_key_source` + `KeySource::workspace_path_component`
+        // seam. This is a genuine differential comparison, not the new
+        // code compared against itself.
+        let cfg = runtime_config(SEED);
+        let seed = mnemonic_seed(&SecretString::new(SEED.to_owned())).unwrap();
+        let fingerprint = SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
+        let scope = "auto-gap-20";
+        let expected_id = original_workspace_id(cfg.network, &fingerprint, cfg.birthday, scope);
+        let expected_path = cfg
+            .data_dir
+            .join(cfg.network.label())
+            .join(format!("workspace-{expected_id}"))
+            .join(format!("birthday-{}", cfg.birthday))
+            .join(scope)
+            .join("wallet.sqlite");
+
+        let source = SeedKeySource::new(SecretString::new(SEED.to_owned()));
+        let actual = RecoveryWorkspace::from_key_source(&source, &cfg).unwrap();
+        assert_eq!(actual.wallet_db_path(), expected_path);
+    }
+
+    #[test]
+    fn an_imported_workspace_differs_from_a_seed_workspace() {
+        let cfg = runtime_config(SEED);
+        let seed_ws = RecoveryWorkspace::from_key_source(
+            &SeedKeySource::new(SecretString::new(SEED.to_owned())),
+            &cfg,
+        )
+        .unwrap();
+        let imported = ImportedKeySource::new(argos_wallet_import::ImportedKeys::default());
+        let imported_ws = RecoveryWorkspace::from_key_source(&imported, &cfg).unwrap();
+        assert_ne!(seed_ws.wallet_db_path(), imported_ws.wallet_db_path());
+    }
+
+    #[test]
+    fn the_workspace_path_still_does_not_leak_the_fingerprint() {
+        let cfg = runtime_config(SEED);
+        let source = SeedKeySource::new(SecretString::new(SEED.to_owned()));
+        let ws = RecoveryWorkspace::from_key_source(&source, &cfg).unwrap();
+        let fp = source.fingerprint().unwrap().to_hex();
+        let path = ws.wallet_db_path().display().to_string();
+        assert!(!path.contains(&fp), "workspace path leaks the fingerprint");
     }
 
     // ─── Workspace permissions (R-W21..R-W23) ─────────────────────────────────
@@ -1200,7 +1545,7 @@ mod tests {
         // String/PathBuf without mangling. Defends against a regression that
         // would lose data on macOS users with localised account names.
         let cfg = RuntimeScanConfig {
-            seed_phrase: SecretString::new(SEED.to_owned()),
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(SEED.to_owned()))),
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,

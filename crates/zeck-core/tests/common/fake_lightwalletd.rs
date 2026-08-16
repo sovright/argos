@@ -66,15 +66,16 @@ mod pb {
 
 use pb::compact_tx_streamer_server::{CompactTxStreamer, CompactTxStreamerServer};
 use pb::{
-    BlockId, BlockRange, CompactBlock, Empty, GetAddressUtxosArg, GetAddressUtxosReplyList,
-    LightdInfo, RawTransaction, SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
+    BlockId, BlockRange, ChainSpec, CompactBlock, Empty, GetAddressUtxosArg,
+    GetAddressUtxosReply, GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, RawTransaction,
+    SendResponse,
+    SubtreeRoot, TransparentAddressBlockFilter, TreeState, TxFilter,
 };
 
 // Argos's runtime client. The fixture uses the same generated client
 // `zcash_client_backend::proto` ships to forward unknown RPCs upstream, so
 // the wire format is guaranteed to match what Argos itself sends.
-use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient
-    as UpstreamClient;
+use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient as UpstreamClient;
 
 /// A running fake lightwalletd instance.
 ///
@@ -373,11 +374,95 @@ where
     let mut buf = Vec::with_capacity(from.encoded_len());
     from.encode(&mut buf)
         .expect("prost::Message::encode into Vec cannot fail");
-    B::decode(&buf[..]).expect("prost wire format is identical between locally- and upstream-generated types")
+    B::decode(&buf[..])
+        .expect("prost wire format is identical between locally- and upstream-generated types")
 }
 
 #[tonic::async_trait]
 impl CompactTxStreamer for FakeService {
+    /// Chain tip, as `zcash_client_backend::sync::run` asks for it.
+    ///
+    /// Proxied rather than synthesised: the sync loop uses this height to
+    /// decide what range to request, so answering with anything other than
+    /// the real upstream tip would make every fault-injection test scan a
+    /// range that does not match the chain they were funded on.
+    async fn get_latest_block(
+        &self,
+        request: Request<ChainSpec>,
+    ) -> Result<Response<BlockId>, Status> {
+        let mut upstream = self.upstream()?;
+        let req = reencode::<_, zcash_client_backend::proto::service::ChainSpec>(request.get_ref());
+        let resp = upstream.get_latest_block(req).await?.into_inner();
+        Ok(Response::new(reencode::<_, BlockId>(&resp)))
+    }
+
+    type GetSubtreeRootsStream = ReceiverStream<Result<SubtreeRoot, Status>>;
+
+    /// Shard-tree roots, also driven by `sync::run` rather than by Argos.
+    ///
+    /// Deliberately *not* subject to the fixture's latency, bandwidth, or
+    /// one-shot fault injection. Those faults model a degraded connection
+    /// during the block-download loop, which is what the resilience tests
+    /// are about; corrupting tree initialisation instead would fail the scan
+    /// before it starts, which is the very failure mode this RPC's absence
+    /// used to cause.
+    async fn get_subtree_roots(
+        &self,
+        request: Request<GetSubtreeRootsArg>,
+    ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
+        let mut upstream = self.upstream()?;
+        let req = reencode::<_, zcash_client_backend::proto::service::GetSubtreeRootsArg>(
+            request.get_ref(),
+        );
+        let mut upstream_stream = upstream.get_subtree_roots(req).await?.into_inner();
+
+        let (tx, rx) = mpsc::channel::<Result<SubtreeRoot, Status>>(16);
+        tokio::spawn(async move {
+            while let Some(item) = upstream_stream.message().await.transpose() {
+                let mapped = match item {
+                    Ok(root) => Ok(reencode::<_, SubtreeRoot>(&root)),
+                    Err(status) => Err(Status::new(status.code(), status.message())),
+                };
+                if tx.send(mapped).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type GetAddressUtxosStreamStream = ReceiverStream<Result<GetAddressUtxosReply, Status>>;
+
+    /// Streaming transparent-output refresh, driven by `sync::run`.
+    ///
+    /// Distinct from `get_address_utxos` below despite the near-identical
+    /// name: they are separate methods on the wire, and implementing only
+    /// the unary one is what made this look present while it was missing.
+    async fn get_address_utxos_stream(
+        &self,
+        request: Request<GetAddressUtxosArg>,
+    ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
+        let mut upstream = self.upstream()?;
+        let req = reencode::<_, zcash_client_backend::proto::service::GetAddressUtxosArg>(
+            request.get_ref(),
+        );
+        let mut upstream_stream = upstream.get_address_utxos_stream(req).await?.into_inner();
+
+        let (tx, rx) = mpsc::channel::<Result<GetAddressUtxosReply, Status>>(16);
+        tokio::spawn(async move {
+            while let Some(item) = upstream_stream.message().await.transpose() {
+                let mapped = match item {
+                    Ok(utxo) => Ok(reencode::<_, GetAddressUtxosReply>(&utxo)),
+                    Err(status) => Err(Status::new(status.code(), status.message())),
+                };
+                if tx.send(mapped).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn get_lightd_info(
         &self,
         _request: Request<Empty>,
@@ -410,14 +495,9 @@ impl CompactTxStreamer for FakeService {
         }))
     }
 
-    async fn get_block(
-        &self,
-        request: Request<BlockId>,
-    ) -> Result<Response<CompactBlock>, Status> {
+    async fn get_block(&self, request: Request<BlockId>) -> Result<Response<CompactBlock>, Status> {
         let mut upstream = self.upstream()?;
-        let req = reencode::<_, zcash_client_backend::proto::service::BlockId>(
-            request.get_ref(),
-        );
+        let req = reencode::<_, zcash_client_backend::proto::service::BlockId>(request.get_ref());
         let resp = upstream.get_block(req).await?.into_inner();
         Ok(Response::new(reencode::<_, CompactBlock>(&resp)))
     }
@@ -429,9 +509,8 @@ impl CompactTxStreamer for FakeService {
         request: Request<BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let mut upstream = self.upstream()?;
-        let req = reencode::<_, zcash_client_backend::proto::service::BlockRange>(
-            request.get_ref(),
-        );
+        let req =
+            reencode::<_, zcash_client_backend::proto::service::BlockRange>(request.get_ref());
         let mut upstream_stream = upstream.get_block_range(req).await?.into_inner();
 
         let (tx, rx) = mpsc::channel::<Result<CompactBlock, Status>>(16);
@@ -449,11 +528,7 @@ impl CompactTxStreamer for FakeService {
             while let Some(item) = upstream_stream.message().await.transpose() {
                 // Steady-state pacing: every successful block is paced by
                 // latency + bandwidth before it leaves the fixture.
-                let block_bytes = item
-                    .as_ref()
-                    .ok()
-                    .map(|b| b.encoded_len())
-                    .unwrap_or(0);
+                let block_bytes = item.as_ref().ok().map(|b| b.encoded_len()).unwrap_or(0);
                 fault.pace_per_block(block_bytes).await;
 
                 let mapped = match item {
@@ -525,9 +600,7 @@ impl CompactTxStreamer for FakeService {
         request: Request<TxFilter>,
     ) -> Result<Response<RawTransaction>, Status> {
         let mut upstream = self.upstream()?;
-        let req = reencode::<_, zcash_client_backend::proto::service::TxFilter>(
-            request.get_ref(),
-        );
+        let req = reencode::<_, zcash_client_backend::proto::service::TxFilter>(request.get_ref());
         let resp = upstream.get_transaction(req).await?.into_inner();
         Ok(Response::new(reencode::<_, RawTransaction>(&resp)))
     }
@@ -537,9 +610,8 @@ impl CompactTxStreamer for FakeService {
         request: Request<RawTransaction>,
     ) -> Result<Response<SendResponse>, Status> {
         let mut upstream = self.upstream()?;
-        let req = reencode::<_, zcash_client_backend::proto::service::RawTransaction>(
-            request.get_ref(),
-        );
+        let req =
+            reencode::<_, zcash_client_backend::proto::service::RawTransaction>(request.get_ref());
         let resp = upstream.send_transaction(req).await?.into_inner();
         Ok(Response::new(reencode::<_, SendResponse>(&resp)))
     }
@@ -551,10 +623,9 @@ impl CompactTxStreamer for FakeService {
         request: Request<TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
         let mut upstream = self.upstream()?;
-        let req = reencode::<
-            _,
-            zcash_client_backend::proto::service::TransparentAddressBlockFilter,
-        >(request.get_ref());
+        let req = reencode::<_, zcash_client_backend::proto::service::TransparentAddressBlockFilter>(
+            request.get_ref(),
+        );
         let mut upstream_stream = upstream.get_taddress_txids(req).await?.into_inner();
 
         let (tx, rx) = mpsc::channel::<Result<RawTransaction, Status>>(16);
@@ -577,9 +648,7 @@ impl CompactTxStreamer for FakeService {
         request: Request<BlockId>,
     ) -> Result<Response<TreeState>, Status> {
         let mut upstream = self.upstream()?;
-        let req = reencode::<_, zcash_client_backend::proto::service::BlockId>(
-            request.get_ref(),
-        );
+        let req = reencode::<_, zcash_client_backend::proto::service::BlockId>(request.get_ref());
         let resp = upstream.get_tree_state(req).await?.into_inner();
         Ok(Response::new(reencode::<_, TreeState>(&resp)))
     }
@@ -589,12 +658,13 @@ impl CompactTxStreamer for FakeService {
         request: Request<GetAddressUtxosArg>,
     ) -> Result<Response<GetAddressUtxosReplyList>, Status> {
         let mut upstream = self.upstream()?;
-        let req = reencode::<
-            _,
-            zcash_client_backend::proto::service::GetAddressUtxosArg,
-        >(request.get_ref());
+        let req = reencode::<_, zcash_client_backend::proto::service::GetAddressUtxosArg>(
+            request.get_ref(),
+        );
         let resp = upstream.get_address_utxos(req).await?.into_inner();
-        Ok(Response::new(reencode::<_, GetAddressUtxosReplyList>(&resp)))
+        Ok(Response::new(reencode::<_, GetAddressUtxosReplyList>(
+            &resp,
+        )))
     }
 }
 

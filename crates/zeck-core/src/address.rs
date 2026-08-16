@@ -56,7 +56,21 @@ pub fn validate_destination_address(
 
     let (address_net, _) = decoded.expect("is_unified implies decode succeeded");
     let expected_net = network_type(network);
-    if address_net != expected_net {
+
+    // The regtest harness derives destinations under regtest parameters, so
+    // they carry the `uregtest` HRP while the scan's network is testnet.
+    // Accept that pairing only when regtest consensus parameters have actually
+    // been installed in this process — a deliberate local act, not something
+    // an address or a server can assert — and only in `argos-network` builds.
+    // A released binary still rejects every regtest address outright.
+    #[cfg(feature = "argos-network")]
+    let regtest_harness_destination = expected_net == NetworkType::Test
+        && address_net == NetworkType::Regtest
+        && crate::workspace::regtest_consensus_params_installed();
+    #[cfg(not(feature = "argos-network"))]
+    let regtest_harness_destination = false;
+
+    if address_net != expected_net && !regtest_harness_destination {
         return Err(ZeckError::WrongNetwork {
             expected: network_type_label(expected_net).to_owned(),
             actual: network_type_label(address_net).to_owned(),
@@ -77,6 +91,109 @@ pub fn validate_destination_address(
         has_transparent,
         destination_ok,
     })
+}
+
+/// The Sapling receiver of a destination address, if it has one.
+///
+/// Absent and malformed are different problems with different fixes and must
+/// not be reported identically: "this address can never receive shielded
+/// value" sends the user for a different address, "these bytes do not decode"
+/// sends them to re-copy the one they have.
+pub enum SaplingReceiver {
+    /// The receiver, and whether it came from a unified address rather than a
+    /// bare Sapling one.
+    Found(sapling_crypto::PaymentAddress, bool),
+    Malformed,
+    Absent,
+}
+
+/// Why a destination could not be read at all.
+pub enum ReceiverLookupError {
+    NotAnAddress(String),
+    IncorrectNetwork { expected: String, actual: String },
+    Unsupported(String),
+}
+
+/// Walk a destination address for its Sapling receiver.
+///
+/// The `TryFromAddress` machinery below existed twice — once in
+/// `sprout_sweep` and once in `transparent_recovery` — as ~85 near-identical
+/// lines each, and the same review finding had to be applied to both. Only
+/// the walk is shared: the two callers map the result onto deliberately
+/// different error vocabularies (one typed, one explanatory), each pinned by
+/// its own tests, so folding those together would silently change one
+/// surface's behaviour.
+pub fn find_sapling_receiver(
+    destination: &str,
+    network: crate::ZeckNetwork,
+) -> Result<SaplingReceiver, ReceiverLookupError> {
+    use zcash_address::{
+        unified::{Container, Receiver},
+        ConversionError, TryFromAddress, ZcashAddress,
+    };
+    use zcash_protocol::consensus::NetworkType;
+
+    let parsed = ZcashAddress::try_from_encoded(destination)
+        .map_err(|err| ReceiverLookupError::NotAnAddress(err.to_string()))?;
+
+    struct Found(SaplingReceiver);
+    impl TryFromAddress for Found {
+        type Error = &'static str;
+
+        fn try_from_sapling(
+            _net: NetworkType,
+            data: [u8; 43],
+        ) -> Result<Self, ConversionError<Self::Error>> {
+            Ok(Found(
+                sapling_crypto::PaymentAddress::from_bytes(&data)
+                    .map(|a| SaplingReceiver::Found(a, false))
+                    .unwrap_or(SaplingReceiver::Malformed),
+            ))
+        }
+
+        fn try_from_unified(
+            _net: NetworkType,
+            ua: zcash_address::unified::Address,
+        ) -> Result<Self, ConversionError<Self::Error>> {
+            for receiver in ua.items() {
+                if let Receiver::Sapling(data) = receiver {
+                    return Ok(Found(
+                        sapling_crypto::PaymentAddress::from_bytes(&data)
+                            .map(|a| SaplingReceiver::Found(a, true))
+                            .unwrap_or(SaplingReceiver::Malformed),
+                    ));
+                }
+            }
+            Ok(Found(SaplingReceiver::Absent))
+        }
+    }
+
+    let want = network_type(network);
+    let retry = parsed.clone();
+    parsed
+        .convert_if_network::<Found>(want)
+        .map(|found| found.0)
+        .map_err(|err| match err {
+            ConversionError::IncorrectNetwork { expected, actual } => {
+                // `convert_if_network` checks the network before the address
+                // kind, so a transparent address on the wrong network reports
+                // as a network mismatch. Both are true, but only one is
+                // fixable: no t-address can receive shielded value on any
+                // network, and blaming the network setting sends the user to
+                // correct the one thing that is not wrong. Re-run against the
+                // address's own network to find out which it really is.
+                match retry.convert_if_network::<Found>(actual) {
+                    Err(ConversionError::Unsupported(err)) => {
+                        ReceiverLookupError::Unsupported(err.to_string())
+                    }
+                    _ => ReceiverLookupError::IncorrectNetwork {
+                        expected: format!("{expected:?}"),
+                        actual: format!("{actual:?}"),
+                    },
+                }
+            }
+            other => ReceiverLookupError::Unsupported(other.to_string()),
+        })
 }
 
 #[cfg(test)]
