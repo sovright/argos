@@ -821,6 +821,34 @@ fn print_transparent_report(report: &TransparentScanReport) {
 /// spendable from this file alone. Extracted from `print_wallet_inspection`
 /// so the Sprout-recovery dependency compiles out with the feature. The body
 /// is verbatim the block that previously lived inline.
+/// What to tell a user holding Sprout keys, in a build that can move them.
+#[cfg(feature = "sprout")]
+fn print_sprout_next_steps() {
+    println!(
+        "Sprout: `scan` and `sweep` do not move Sprout notes — those funds are not \
+         yet recoverable through them. Use `argos scan-sprout` / `argos sweep-sprout`, \
+         which need a full-block scan and land the value in the destination's Sapling \
+         receiver."
+    );
+}
+
+/// The same caveat for a build compiled without Sprout support.
+///
+/// `scan-sprout` and `sweep-sprout` do not exist here — the subcommands are
+/// compiled out — so naming them would send the user to
+/// `unrecognized subcommand` for the one pool that is genuinely hard to
+/// recover. The keys are real and were counted above; what is missing is this
+/// build's ability to act on them, and that is what this says.
+#[cfg(not(feature = "sprout"))]
+fn print_sprout_next_steps() {
+    println!(
+        "Sprout: this wallet holds Sprout keys, and this build cannot recover them — \
+         Sprout support is compiled out. The keys above are real and are not lost. \
+         Recovering them needs an Argos build with the `sprout` feature enabled; \
+         nothing here moves or damages them."
+    );
+}
+
 #[cfg(feature = "sprout")]
 fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     if !keys.sprout.is_empty() {
@@ -946,27 +974,28 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     }
     println!();
 
+    // Sprout is its own path and its own caveat, stated before the route
+    // advice so it cannot be lost in it. This used to ride on the blanket
+    // "seedless wallets cannot move funds" message, which meant the warning
+    // was only correct by accident — and disappeared the moment that message
+    // became accurate about Sapling and transparent funds.
+    //
+    // Both builds say something, because both builds have already printed a
+    // Sprout key count: the parser is unconditional. Silence would leave keys
+    // on screen with no account of them. What differs is where the user is
+    // sent — a build without Sprout support must not name subcommands it does
+    // not have.
+    if !keys.sprout.is_empty() {
+        print_sprout_next_steps();
+        println!();
+    }
+
     // Driven by the classifier rather than by `mnemonic.is_some()`, which was
     // telling every seedless wallet that Argos "cannot yet move funds held by
     // them" — untrue for both remaining routes, and the same false
     // unrecoverable claim that dead-ended the GUI. A `match` also means a new
     // route forces this copy to be updated instead of silently falling into
     // the wrong arm.
-    // Sprout is its own path and its own caveat, stated before the route
-    // advice so it cannot be lost in it. This used to ride on the blanket
-    // "seedless wallets cannot move funds" message, which meant the warning
-    // was only correct by accident — and disappeared the moment that message
-    // became accurate about Sapling and transparent funds.
-    if !keys.sprout.is_empty() {
-        println!(
-            "Sprout: `scan` and `sweep` do not move Sprout notes — those funds are not \
-             yet recoverable through them. Use `argos scan-sprout` / `argos sweep-sprout`, \
-             which need a full-block scan and land the value in the destination's Sapling \
-             receiver."
-        );
-        println!();
-    }
-
     match argos_core::key_source::classify_recovery_route(keys) {
         argos_core::key_source::RecoveryRoute::Hd => {
             println!("Next: run `argos scan --wallet-file <path>` to check these keys for funds.");
