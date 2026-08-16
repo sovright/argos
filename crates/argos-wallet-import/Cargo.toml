@@ -1,0 +1,23 @@
+[package]
+name = "argos-wallet-import"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+aes.workspace = true
+bip0039.workspace = true
+blake2b_simd.workspace = true
+cbc.workspace = true
+crypto_secretbox.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+secp256k1.workspace = true
+tempfile.workspace = true

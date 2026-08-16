@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/zeck-core", "crates/zeck-cli", "gui/src-tauri"]
+members = ["crates/zeck-core", "crates/zeck-cli", "crates/argos-wallet-import", "gui/src-tauri"]
 resolver = "2"
 
 [workspace.package]
@@ -11,10 +11,14 @@ rust-version = "1.87"
 repository = "https://github.com/example/zeck"
 
 [workspace.dependencies]
+aes = "0.8.4"
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 bip0039 = "0.14.0"
+blake2b_simd = "1.0.4"
+cbc = { version = "0.1.2", features = ["alloc"] }
 clap = { version = "4.5.53", features = ["derive"] }
+crypto_secretbox = "0.1.1"
 dialoguer = "0.12.0"
 indicatif = "0.18.2"
 orchard = "0.14"
@@ -36,7 +40,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
 url = "2.5.8"
 keepawake = "0.6"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 zcash_address = "0.12"
 zcash_client_backend = { version = "0.23", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "sync", "transparent-inputs", "transparent-key-import"] }
