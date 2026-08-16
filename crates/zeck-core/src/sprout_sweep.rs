@@ -239,13 +239,20 @@ pub fn build_sweep_for_note(
 
     // Cross-check the fee against the transaction actually assembled,
     // before signing. SPROUT_SWEEP_FEE is a constant derived from an
-    // expected shape; this asks the built bundle how many outputs it really
-    // has, which is what ZIP 317 charges for. The two can only agree by
-    // accident if the shape ever changes -- a second real output, a
-    // transparent leg, a different BundleType -- and the failure mode is
-    // silent: underpay and the node never relays it, overpay and the
-    // difference is burned. The transparent sweep guards this the same way
-    // via the builder's own get_fee, and this path had nothing.
+    // expected shape; this reads the built bundle's real output count and
+    // refuses to sign if it no longer matches -- a second real output, a
+    // transparent leg, a different BundleType would all change it, and the
+    // failure is silent: underpay and the node never relays it, overpay and
+    // the difference is burned.
+    //
+    // This is an internal-consistency check, not an independent oracle. The
+    // transparent sweep recomputes from the builder's own get_fee over the
+    // zcash_primitives ZIP-317 rule; that rule does not model JoinSplits, so
+    // there is no library oracle for the Sprout leg. The JoinSplit's "2
+    // logical actions" is a hand-modelled assumption the constant also
+    // embeds, so both sides share it: this catches output-shape drift, not
+    // that assumption being wrong -- which stays unverified until a real
+    // mainnet sweep exercises it.
     let sapling_outputs = bundle.shielded_outputs().len() as u64;
     // ZIP 317 charges max(spends, outputs) for the Sapling side; there are
     // no Sapling spends in a Sprout sweep, so it is the output count.
