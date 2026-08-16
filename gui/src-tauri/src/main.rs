@@ -43,16 +43,6 @@ fn main() {
             commands::detect_birthday,
             commands::save_recovery_report,
             commands::delete_workspace,
-            #[cfg(feature = "sprout")]
-            commands::check_sprout_key,
-            #[cfg(feature = "sprout")]
-            commands::start_sprout_scan,
-            #[cfg(feature = "sprout")]
-            commands::sweep_sprout_from_scan,
-            #[cfg(feature = "sprout")]
-            commands::preview_sprout_sweep,
-            #[cfg(feature = "sprout")]
-            commands::execute_sprout_sweep,
             commands::default_data_dir,
             commands::notify_user,
             commands::list_incomplete_sessions,
@@ -71,7 +61,6 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running Argos GUI");
 }
-
 
 #[cfg(test)]
 mod version_tests {

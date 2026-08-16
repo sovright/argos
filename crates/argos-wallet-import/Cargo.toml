@@ -7,13 +7,6 @@ authors.workspace = true
 rust-version.workspace = true
 publish = false
 
-[features]
-# `sprout` — marker only. The parser stays UNCONDITIONAL (a default Argos
-# build still detects and counts Sprout keys/notes in a wallet), so this gates
-# nothing in `src/`. It exists solely so the Sprout-specific test
-# (`sprout_key_is_genuine`) can be `#![cfg(feature = "sprout")]`-gated along
-# with the rest of the Sprout-only tests, and compiles out cleanly by default.
-
 [dependencies]
 aes.workspace = true
 bip0039.workspace = true

@@ -72,19 +72,10 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     );
     // A user must not read "recovered a Sprout key" as "can move the money".
     //
-    // Asserted in both builds, because both print a Sprout key count — the
-    // parser is unconditional — and the claim being guarded is about that
-    // count, not about the feature. The wording differs because the honest
-    // statement differs: with Sprout compiled in, the notes are not yet
-    // recoverable through `scan`/`sweep`; without it, they are recoverable but
-    // not by this binary. Sharing one string would have forced one of the two
-    // builds to say something untrue.
-    #[cfg(feature = "sprout")]
-    assert!(
-        stdout.contains("not yet recoverable"),
-        "the report must not imply Sprout funds are spendable, got:\n{stdout}"
-    );
-    #[cfg(not(feature = "sprout"))]
+    // The Sprout key count is printed unconditionally — the parser is
+    // unconditional — and this is the claim guarded against that count. This
+    // build carries no Sprout recovery code, so the honest statement is that
+    // the keys are real and recoverable, but not by this binary.
     assert!(
         stdout.contains("this build cannot recover them"),
         "a build without Sprout support must say so rather than imply the keys it \
@@ -92,7 +83,6 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     );
 
     // And it must never point at a subcommand this build does not have.
-    #[cfg(not(feature = "sprout"))]
     assert!(
         !stdout.contains("scan-sprout") && !stdout.contains("sweep-sprout"),
         "a default build compiles those subcommands out; naming them sends the user to \
