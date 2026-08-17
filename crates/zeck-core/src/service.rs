@@ -147,8 +147,12 @@ fn execution_donation_address(network: crate::models::ZeckNetwork) -> String {
 }
 
 /// The concrete wallet database type used throughout the execution path.
-type SweepWalletDb =
-    WalletDb<rusqlite::Connection, crate::workspace::ArgosParams, SystemClock, rand_core::OsRng>;
+type SweepWalletDb = WalletDb<
+    rusqlite::Connection,
+    crate::workspace::ArgosParams,
+    SystemClock,
+    rand_core::OsRng,
+>;
 const CONFIRMATION_POLL_INTERVAL_SECS: u64 = 5;
 const CONFIRMATION_POLL_ATTEMPTS: u32 = 24;
 const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
