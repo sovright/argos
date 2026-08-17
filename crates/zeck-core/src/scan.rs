@@ -3464,11 +3464,7 @@ mod tests {
             tokio::task::yield_now().await;
 
             assert!(
-                watchdog
-                    .await
-                    .expect("watchdog task did not panic")
-                    .to_string()
-                    .contains("scan stalled"),
+                watchdog.await.expect("watchdog task did not panic").to_string().contains("scan stalled"),
                 "watchdog must still trip at the extended budget"
             );
         }
@@ -3493,10 +3489,7 @@ mod tests {
             .await;
             tokio::task::yield_now().await;
 
-            let msg = watchdog
-                .await
-                .expect("watchdog task did not panic")
-                .to_string();
+            let msg = watchdog.await.expect("watchdog task did not panic").to_string();
             assert!(msg.contains("scan stalled"), "got: {msg}");
             for lie in [
                 "h2 protocol error",
@@ -3619,13 +3612,19 @@ mod tests {
         fn resets_when_height_advanced_since_last_failure() {
             // 9 consecutive stalls, then the sync advanced before the next
             // failure — the intervening stall recovered, so the budget resets.
-            assert_eq!(retry_budget_after_failure(9, Some(1_000), Some(1_500)), 0);
+            assert_eq!(
+                retry_budget_after_failure(9, Some(1_000), Some(1_500)),
+                0
+            );
         }
 
         #[test]
         fn preserves_budget_when_stuck_at_same_height() {
             // No forward progress between the two failures — budget carries.
-            assert_eq!(retry_budget_after_failure(5, Some(1_000), Some(1_000)), 5);
+            assert_eq!(
+                retry_budget_after_failure(5, Some(1_000), Some(1_000)),
+                5
+            );
         }
 
         #[test]
