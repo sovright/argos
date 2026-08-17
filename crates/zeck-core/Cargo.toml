@@ -18,7 +18,7 @@ publish = false
 # Deliberately a dev/test-only escape hatch: production builds compile this
 # out, so a hostile mainnet lightwalletd cannot claim to be `regtest` to
 # bypass network validation in a released Argos binary.
-argos-network = []
+argos-network = ["zcash_protocol/local-consensus"]
 
 [dependencies]
 anyhow.workspace = true
@@ -90,4 +90,12 @@ required-features = ["argos-network"]
 [[bin]]
 name = "argos-sweep-helper"
 path = "tests/bin/argos_sweep_helper.rs"
+required-features = ["argos-network"]
+
+# Replaces zcashd's `sendtoaddress` for funding the test seed: Zebra has no
+# wallet RPCs, and coinbase may not be spent to a transparent address, so
+# funding shields the funder's coinbase straight to the test seed instead.
+[[bin]]
+name = "argos-regtest-funder"
+path = "tests/bin/argos_regtest_funder.rs"
 required-features = ["argos-network"]

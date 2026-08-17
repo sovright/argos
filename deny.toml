@@ -50,6 +50,18 @@ ignore = [
     "RUSTSEC-2025-0075", # unic-char-property et al. unmaintained
     "RUSTSEC-2025-0098", # unic-* unmaintained
     "RUSTSEC-2025-0100", # glib VariantStrIter unsoundness (Tauri stack)
+
+    # quick-xml 0.38 DoS advisories (quadratic attribute scan; unbounded
+    # namespace-declaration allocation in NsReader). Pulled in transitively by
+    # `plist 1.8` <- Tauri; `plist` parses macOS bundle Info.plist files at
+    # build/package time, not attacker-controlled input at runtime. The fix is
+    # quick-xml >=0.41 via `plist >=1.10`, but `plist 1.10` requires
+    # `time-core 0.1.8` while `zcash_client_backend 0.23` pins `time-core
+    # =0.1.2` — the same blocker tracked for RUSTSEC-2026-0009. Rides the next
+    # zcash_client_backend bump; a Tauri-only bump (2.10 -> 2.11) does not move
+    # plist.
+    "RUSTSEC-2026-0194", # quick-xml quadratic run time on duplicate attributes
+    "RUSTSEC-2026-0195", # quick-xml unbounded NsReader namespace allocation
 ]
 
 # ── Licenses ─────────────────────────────────────────────────────────────────

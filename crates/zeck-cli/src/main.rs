@@ -43,7 +43,7 @@ struct Cli {
     #[arg(
         long,
         visible_alias = "server",
-        default_value = "https://mainnet.lightwalletd.com:9067"
+        default_value = argos_core::lightwalletd::DEFAULT_MAINNET_LIGHTWALLETD
     )]
     lightwalletd_url: String,
 
@@ -1339,6 +1339,7 @@ mod tests {
             error: None,
             sleep_event: None,
             in_sandblasting_zone: false,
+            gap_extension: None,
         }
     }
 

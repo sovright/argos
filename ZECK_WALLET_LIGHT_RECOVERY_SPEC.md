@@ -180,7 +180,7 @@ Implementors MUST audit these files to confirm derivation path correctness befor
 Argos connects to a `lightwalletd` instance via gRPC using the compact block protocol defined in `zcash_client_backend::proto`.
 
 ```
---lightwalletd-url <URL>    (default: https://mainnet.lightwalletd.com:9067)
+--lightwalletd-url <URL>    (default: https://zec.rocks:443,https://na.zec.rocks:443)
 ```
 
 Multiple lightwalletd servers should be configurable for fallback. The tool should also accept a `--server` alias for compatibility with ZecWallet Lite CLI conventions.
@@ -343,7 +343,7 @@ GLOBAL OPTIONS:
   --seed-file <PATH>           Read seed phrase from file (one line, trimmed)
   --destination <UA>           Zcash Unified Address for sweep destination
   --lightwalletd-url <URL>     lightwalletd gRPC endpoint
-                               [default: https://mainnet.lightwalletd.com:9067]
+                               [default: https://zec.rocks:443,https://na.zec.rocks:443]
   --num-accounts <N>           Exact number of accounts to scan [default: gap-limit mode]
   --gap-limit <N>              Stop after N consecutive empty accounts [default: 20]
   --birthday <HEIGHT>          Wallet birthday block height [default: 419200]

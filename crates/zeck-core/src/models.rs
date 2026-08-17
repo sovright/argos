@@ -244,6 +244,12 @@ pub struct ScanProgress {
     /// the cursor passes through.
     #[serde(default)]
     pub in_sandblasting_zone: bool,
+    /// Set while the scan is in a gap-extension pass (see [`GapExtension`]).
+    /// `None` during the initial account window. The frontend renders it as a
+    /// persistent banner explaining why the block counter reset, so a widened
+    /// search doesn't read as the scan starting over.
+    #[serde(default)]
+    pub gap_extension: Option<GapExtension>,
 }
 
 /// Snapshot of all detected sleep gaps during the current scan. The poller
@@ -262,6 +268,31 @@ pub struct SleepEvent {
     pub total_lost_seconds: u64,
     /// Number of distinct sleeps observed.
     pub event_count: u32,
+}
+
+/// Describes an in-progress *gap extension*: a scan pass that re-covers the
+/// block range for a freshly-added slice of accounts because funds were found
+/// near the trailing edge of the previous account window.
+///
+/// ZecWallet Lite incremented the account index for each new address instead
+/// of diversifying within one account, so a wallet's funds can be scattered
+/// across many accounts. When the scan finds activity close to the end of the
+/// accounts it has searched, it widens the search and scans the chain again
+/// for the new accounts — which resets the block counter to zero and looks
+/// like the scan restarting. This struct exists so the UI can explain that a
+/// restart is forward progress, not a fault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapExtension {
+    /// 1-based count of how many times the search has been widened this scan.
+    pub pass: u32,
+    /// First newly-added account index in this widening (inclusive). These are
+    /// the accounts whose blocks are being scanned in the current pass.
+    pub accounts_from: u32,
+    /// Last newly-added account index in this widening (inclusive).
+    pub accounts_to: u32,
+    /// The account with activity nearest the previous trailing edge that
+    /// triggered the widening — the reason the search grew.
+    pub trigger_account_index: u32,
 }
 
 /// Mainnet block heights bracketing the sandblasting attack window.
