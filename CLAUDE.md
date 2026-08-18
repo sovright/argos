@@ -48,7 +48,20 @@ Best-effort on scan completion. Platform dispatch in `notify_user` (Tauri) and `
 ### Wallet file import
 Hand-rolled BDB 6.2 parsing rather than shelling out to `db_dump` as
 Zallet and `zewif-zcashd` do — an external binary in a signed desktop app
-is worse for the threat model, and the ZeWIF repos carry no SPDX licence.
+is worse for the threat model.
+
+Depending on the ZeWIF crates instead has its own licensing friction, but
+"the ZeWIF repos carry no SPDX licence" is too flat — it covers two
+different situations. Blockchain Commons' `zewif` and `zewif-zcashd`
+*are* licensed — `LICENSE.md` grants dual MIT/Apache-2.0 — but declare it
+as `license = "MIT or Apache 2.0"`, which is not a parseable SPDX
+expression (`MIT OR Apache-2.0` would be), so GitHub reports NOASSERTION
+and `cargo-deny check licenses` cannot classify them. That is a metadata
+problem, not a permission problem. `zingolabs/zewif-zwl` is the genuinely
+unlicensed one — no licence file, no crate `license` field — and it is the
+repo that matters, since `crates/argos-wallet-import/src/zwl.rs` cites it
+for the ZecWallet Lite byte layout. Hence that layout is re-derived and
+every ZWL fixture is hand-built rather than copied.
 
 `czkey` (encrypted Sprout spending keys) is decrypted here and nowhere
 else in the ecosystem: Zallet drops Sprout keys during migration and
