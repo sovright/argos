@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 version = "1.1.0"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 authors = ["Argos contributors"]
 rust-version = "1.88"
 repository = "https://github.com/example/zeck"
