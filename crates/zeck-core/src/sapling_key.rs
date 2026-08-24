@@ -496,6 +496,25 @@ mod tests {
         assert_eq!(into.sapling.len(), 2);
     }
 
+    /// The exact strings `crates/zeck-cli/tests/wallet_file_cli.rs` pins.
+    /// If upstream encoding ever moves, this fails here — in a unit test with
+    /// a clear message — rather than as a puzzling CLI exit code.
+    #[test]
+    fn the_strings_the_cli_tests_pin_still_decode() {
+        const MAIN: &str = "secret-extended-key-main1qqqqqqqqqqqqqqyx7gddcfgw5zrw2n3nqd8f507vcpv82synampp4p8ljdz2t3ulhcn5yrvjwfsua98evx3p4v6596l8ttyctcphvxvyjf450h2dtevsakxzfjncm4v2gngdakt5384xumspjaw5uelkz2prq6cnmpd4kdczrjxr4zw2svjfq4j9amnkld3h6xetz4zq7p2lp5kzugwr7p2ln77xlj8ley3v2m8k44zduvjuynw7tpzpfv2mreh0qacxzeqrrcymmjgqvp59t";
+        const TEST: &str = "secret-extended-key-test1qqqqqqqqqqqqqqyx7gddcfgw5zrw2n3nqd8f507vcpv82synampp4p8ljdz2t3ulhcn5yrvjwfsua98evx3p4v6596l8ttyctcphvxvyjf450h2dtevsakxzfjncm4v2gngdakt5384xumspjaw5uelkz2prq6cnmpd4kdczrjxr4zw2svjfq4j9amnkld3h6xetz4zq7p2lp5kzugwr7p2ln77xlj8ley3v2m8k44zduvjuynw7tpzpfv2mreh0qacxzeqrrcymmjgts9kat";
+
+        let main = decode_sapling_spending_key(MAIN, ZeckNetwork::Mainnet)
+            .expect("the pinned mainnet key must decode");
+        let test = decode_sapling_spending_key(TEST, ZeckNetwork::Testnet)
+            .expect("the pinned testnet key must decode");
+        assert_eq!(
+            main.to_bytes(),
+            test.to_bytes(),
+            "both strings encode the same key, differing only in network"
+        );
+    }
+
     #[test]
     fn keys_in_into_not_in_extra_survive_untouched() {
         let mut into = ImportedKeys {
