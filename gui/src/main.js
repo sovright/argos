@@ -837,6 +837,47 @@ $("sprout-sweep-run").addEventListener("click", runSproutSweep);
 })();
 
 
+// ─── Typed Sapling keys ─────────────────────────────────────────────────────
+// The route for a user who has a spending key string and no wallet file.
+
+function saplingScanKeys() {
+  const box = $("sapling-scan-keys");
+  if (!box) return [];
+  return box.value.split("\n").map((k) => k.trim()).filter(Boolean);
+}
+
+async function checkSaplingKeys() {
+  const list = $("sapling-key-addresses");
+  list.innerHTML = "";
+  const keys = saplingScanKeys();
+  if (!keys.length) {
+    setStatus(
+      "sapling-key-status",
+      walletFile
+        ? "The Sapling keys in your wallet file will be used."
+        : "Paste a Sapling spending key, or open a wallet file that holds some.",
+      "",
+    );
+    return;
+  }
+  // Checked before the scan, not an hour into it.
+  for (const [i, key] of keys.entries()) {
+    try {
+      const addr = await invoke("check_sapling_key", {
+        key,
+        network: $("network-select").value,
+      });
+      const li = document.createElement("li");
+      li.textContent = addr;
+      list.appendChild(li);
+    } catch (err) {
+      setStatus("sapling-key-status", `✗ key ${i + 1}: ${err}`, "error");
+      return;
+    }
+  }
+  setStatus("sapling-key-status", `${keys.length} key(s) look valid.`, "success");
+}
+
 // ─── Sprout scan ────────────────────────────────────────────────────────────
 // The fallback for a wallet whose note data is missing, and the only route
 // for a raw key with no wallet file. Hours, so it checkpoints and resumes.
@@ -1011,6 +1052,7 @@ async function runSproutScanSweep() {
 
 $("sprout-scan-sweep-run").addEventListener("click", runSproutScanSweep);
 $("sprout-scan-check").addEventListener("click", checkSproutKeys);
+$("sapling-keys-check")?.addEventListener("click", checkSaplingKeys);
 $("sprout-scan-run").addEventListener("click", runSproutScan);
 
 (async () => {
@@ -1240,12 +1282,13 @@ $("destination-input").addEventListener("keydown", (e) => {
 });
 
 $("start-scan").addEventListener("click", async () => {
-  // Either a seed phrase or a wallet file, never both — they are alternative
-  // routes to the same scan.
-  if (!walletFile && !seedInput.value.trim()) {
+  // Three routes to the same scan: a seed phrase, a wallet file, or a
+  // pasted Sapling spending key.
+  if (!walletFile && !seedInput.value.trim() && !saplingScanKeys().length) {
     setStatus(
       "config-status",
-      "A seed phrase or a wallet file is required — go back and provide one.",
+      "A seed phrase, a wallet file, or a Sapling spending key is required — \
+go back and provide one.",
       "error",
     );
     return;
@@ -1313,14 +1356,20 @@ $("start-scan").addEventListener("click", async () => {
 
   try {
     let handle;
-    if (walletFile) {
+    const typedSaplingKeys = saplingScanKeys();
+    if (walletFile || typedSaplingKeys.length) {
       // Routing between the HD path and the imported-account path lives in
       // the core service, not here: it depends on whether the file yielded a
       // mnemonic, which only the backend knows. The GUI just hands over the
-      // file and the passphrase.
+      // key material it was given.
       const { seed: _unused, ...rest } = config;
       handle = await invoke("start_scan_from_wallet_file", {
-        config: { ...rest, path: walletFile.path, passphrase: walletFile.passphrase },
+        config: {
+          ...rest,
+          path: walletFile ? walletFile.path : null,
+          passphrase: walletFile ? walletFile.passphrase : null,
+          sapling_keys: typedSaplingKeys,
+        },
       });
     } else {
       handle = await invoke("start_scan", { config });
@@ -1333,6 +1382,11 @@ $("start-scan").addEventListener("click", async () => {
     if (walletFile) walletFile.passphrase = null;
     const passphraseInput = $("wallet-passphrase");
     if (passphraseInput) passphraseInput.value = "";
+    // The backend holds the decoded keys now; a spending key must not sit
+    // in the DOM for the lifetime of the scan→sweep→complete flow (T-S2).
+    const saplingBox = $("sapling-scan-keys");
+    if (saplingBox) saplingBox.value = "";
+    $("sapling-key-addresses").innerHTML = "";
     goTo("scan");
     await startProgressListeners();
   } catch (err) {

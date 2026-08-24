@@ -286,6 +286,24 @@
           </div>
           <p id="wallet-status" class="status-line"></p>
 
+          <!-- A key with no wallet file behind it: from z_exportkey, from
+               zcashd-wallet-tool, or from a paper backup. Always visible,
+               not gated on a wallet file, because the user who needs it has
+               no wallet file at all. -->
+          <div id="sapling-key-panel">
+            <hr />
+            <p><strong>Or paste a Sapling spending key</strong></p>
+            <label for="sapling-scan-keys">
+              Sapling spending keys (one per line,
+              <code>secret-extended-key-main1…</code>)
+            </label>
+            <textarea id="sapling-scan-keys" rows="3" spellcheck="false"
+              placeholder="Leave blank if you opened a wallet file above"></textarea>
+            <button id="sapling-keys-check" type="button">Check keys</button>
+            <ul id="sapling-key-addresses" class="session-list"></ul>
+            <p id="sapling-key-status" class="status-line"></p>
+          </div>
+
           <div id="wallet-summary" class="report-card" hidden>
             <h3>What Argos found</h3>
             <ul id="wallet-summary-list" class="session-list"></ul>
