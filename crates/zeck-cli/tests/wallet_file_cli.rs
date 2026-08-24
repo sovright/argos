@@ -245,3 +245,137 @@ fn scratch_dir(tag: &str) -> String {
         .expect("temp path is UTF-8")
         .to_owned()
 }
+
+/// Write a key file under the test's temp dir and hand back its path.
+fn key_file(name: &str, contents: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("argos-test-{name}"));
+    std::fs::write(&path, contents).expect("test key file should write");
+    path
+}
+
+/// The same Sapling extended spending key encoded for each network,
+/// derived from the fixed seed `[7u8; 32]`. It controls no real funds and
+/// has never been on any chain.
+///
+/// Pinned rather than derived at test time so this test needs no
+/// dev-dependency on `sapling-crypto`. Regenerate, if upstream encoding ever
+/// changes, by encoding
+/// `sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32])` with
+/// `zcash_keys::encoding::encode_extended_spending_key` under each network's
+/// `HRP_SAPLING_EXTENDED_SPENDING_KEY`.
+const TEST_SAPLING_KEY_MAINNET: &str =
+    "secret-extended-key-main1qqqqqqqqqqqqqqyx7gddcfgw5zrw2n3nqd8f507vcpv82synampp4p8ljdz2t3ulhcn5yrvjwfsua98evx3p4v6596l8ttyctcphvxvyjf450h2dtevsakxzfjncm4v2gngdakt5384xumspjaw5uelkz2prq6cnmpd4kdczrjxr4zw2svjfq4j9amnkld3h6xetz4zq7p2lp5kzugwr7p2ln77xlj8ley3v2m8k44zduvjuynw7tpzpfv2mreh0qacxzeqrrcymmjgqvp59t";
+const TEST_SAPLING_KEY_TESTNET: &str =
+    "secret-extended-key-test1qqqqqqqqqqqqqqyx7gddcfgw5zrw2n3nqd8f507vcpv82synampp4p8ljdz2t3ulhcn5yrvjwfsua98evx3p4v6596l8ttyctcphvxvyjf450h2dtevsakxzfjncm4v2gngdakt5384xumspjaw5uelkz2prq6cnmpd4kdczrjxr4zw2svjfq4j9amnkld3h6xetz4zq7p2lp5kzugwr7p2ln77xlj8ley3v2m8k44zduvjuynw7tpzpfv2mreh0qacxzeqrrcymmjgts9kat";
+
+#[test]
+fn inspect_wallet_reports_a_key_supplied_as_text() {
+    let path = key_file(
+        "sapling-key-good.txt",
+        &format!("# from the paper backup\n{TEST_SAPLING_KEY_MAINNET}\n"),
+    );
+
+    let out = argos(&[
+        "--sapling-key-file",
+        path.to_str().expect("path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    assert!(
+        out.status.success(),
+        "inspect-wallet failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("zs1"),
+        "the address the key controls should be shown, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("secret-extended-key"),
+        "the key itself must never be printed back, got: {stdout}"
+    );
+}
+
+#[test]
+fn a_key_for_the_wrong_network_is_refused_by_name() {
+    let path = key_file(
+        "sapling-key-wrong-network.txt",
+        &format!("{TEST_SAPLING_KEY_TESTNET}\n"),
+    );
+
+    let out = argos(&[
+        "--sapling-key-file",
+        path.to_str().expect("path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    assert!(!out.status.success(), "a testnet key must not pass on mainnet");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("testnet"),
+        "the failure should name the key's real network, got: {stderr}"
+    );
+}
+
+#[test]
+fn a_malformed_key_names_the_line_it_is_on() {
+    let path = key_file(
+        "sapling-key-bad-line.txt",
+        &format!("{TEST_SAPLING_KEY_MAINNET}\nnot-a-key\n"),
+    );
+
+    let out = argos(&[
+        "--sapling-key-file",
+        path.to_str().expect("path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    assert!(!out.status.success(), "a malformed line must fail the run");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("line 2"),
+        "the failure should name the offending line, got: {stderr}"
+    );
+}
+
+/// A seed and a standalone key are different provenance models; accepting
+/// both would leave it ambiguous which one a scan actually used.
+#[test]
+fn a_seed_file_and_a_key_file_cannot_be_combined() {
+    let keys = key_file("sapling-key-conflict.txt", TEST_SAPLING_KEY_MAINNET);
+    let seed = key_file("seed-conflict.txt", "abandon abandon abandon");
+
+    let out = argos(&[
+        "--sapling-key-file",
+        keys.to_str().expect("path is UTF-8"),
+        "--seed-file",
+        seed.to_str().expect("path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    assert!(!out.status.success(), "the two flags must conflict");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "clap should report the conflict, got: {stderr}"
+    );
+}
+
+/// The whole point of the feature: a key with no wallet file behind it must
+/// not be turned away at argument parsing.
+#[test]
+fn a_key_file_alone_does_not_demand_a_wallet_file() {
+    let path = key_file("sapling-key-alone.txt", TEST_SAPLING_KEY_MAINNET);
+
+    let out = argos(&[
+        "--sapling-key-file",
+        path.to_str().expect("path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("needs --wallet-file"),
+        "a key file is its own key source, got: {stderr}"
+    );
+}

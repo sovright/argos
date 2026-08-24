@@ -59,6 +59,19 @@ struct Cli {
     #[arg(long)]
     sprout_key_file: Option<PathBuf>,
 
+    /// File holding Sapling extended spending keys
+    /// (`secret-extended-key-main1…` mainnet, `secret-extended-key-test1…`
+    /// testnet), one per line, for keys with no wallet file behind them.
+    ///
+    /// A file rather than a flag value, for the same reason as
+    /// `--sprout-key-file`: a spending key passed as an argument lands in
+    /// shell history and in `ps` output for every user on the box (T-S6).
+    ///
+    /// Combinable with `--wallet-file`: a user may hold a wallet *and* a
+    /// paper key for an address that wallet never knew about.
+    #[arg(long, conflicts_with = "seed_file")]
+    sapling_key_file: Option<PathBuf>,
+
     /// Directory for wallet database and block cache.
     #[arg(long, default_value = "./argos_data")]
     data_dir: PathBuf,
@@ -278,6 +291,20 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
             Err(err).with_context(|| format!("failed to import wallet file {}", path.display()))
         }
     }
+}
+
+/// Read a Sapling key file into the same key set a wallet file produces.
+///
+/// The file is read as UTF-8 text and never logged. Decoding, comment
+/// handling, deduplication, and line-numbered errors all live in
+/// `argos_core::sapling_key`, so the CLI and the GUI cannot drift apart on
+/// what a key file means.
+fn load_sapling_key_file(path: &Path, network: ZeckNetwork) -> Result<ImportedKeys> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    argos_core::sapling_key::keys_from_sapling_strings(&lines, network)
+        .with_context(|| format!("in {}", path.display()))
 }
 
 /// Drop any Sprout key that does not control its stored address, and say so.
@@ -501,7 +528,11 @@ async fn sweep_sprout(
 
     println!();
     for sent in &outcome.sent {
-        println!("  swept {} \u{2014} {}", format_zec(sent.value_swept), sent.txid);
+        println!(
+            "  swept {} \u{2014} {}",
+            format_zec(sent.value_swept),
+            sent.txid
+        );
     }
     report_sprout_skips_and_errors(&outcome);
     println!("Swept {} to {destination}", format_zec(outcome.total_swept));
@@ -514,7 +545,6 @@ async fn sweep_sprout(
     }
     Ok(())
 }
-
 
 /// Gather the spending keys a Sprout scan should look for.
 ///
@@ -835,6 +865,27 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
         }
     }
 
+    if !keys.sapling.is_empty() {
+        println!("Sapling addresses:");
+        for key in &keys.sapling {
+            // The address, never the key: an address is safe to display,
+            // and the spending key must never be echoed back.
+            use secrecy::ExposeSecret;
+            match argos_core::imported::parse_sapling_extsk(key.extsk.expose_secret()) {
+                Ok(extsk) => {
+                    println!(
+                        "  {}",
+                        argos_core::sapling_key::default_sapling_address(&extsk, network)
+                    );
+                }
+                Err(err) => {
+                    println!("  Could not resolve a Sapling key to an address: {err}");
+                }
+            }
+        }
+        println!();
+    }
+
     if !keys.sprout.is_empty() {
         println!("Sprout addresses:");
         for key in &keys.sprout {
@@ -1072,9 +1123,15 @@ async fn main() -> Result<()> {
         Arc<dyn KeySource>,
         Option<SecretString>,
         Option<Arc<ImportedKeySource>>,
-    ) = match &cli.wallet_file {
-        Some(path) => {
-            let keys = load_wallet_file(path)?;
+    ) = match (&cli.wallet_file, &cli.sapling_key_file) {
+        (Some(path), key_file) => {
+            let mut keys = load_wallet_file(path)?;
+            if let Some(key_path) = key_file {
+                argos_core::sapling_key::merge_sapling_keys(
+                    &mut keys,
+                    load_sapling_key_file(key_path, network)?,
+                );
+            }
             let phrase = keys.mnemonic.clone();
             // `inspect-wallet` prints a fuller version of this below, so
             // don't say it twice.
@@ -1096,11 +1153,27 @@ async fn main() -> Result<()> {
             let source = Arc::new(ImportedKeySource::new(keys));
             (source.clone(), phrase, Some(source))
         }
-        None => {
+        (None, Some(key_path)) => {
+            // A key file is its own key source. There is no seed behind it,
+            // so `seed_phrase` stays `None` — birthday auto-detection and
+            // `show-keys` are unavailable, exactly as for a wallet file with
+            // no recoverable mnemonic.
+            let keys = load_sapling_key_file(key_path, network)?;
+            if !matches!(cli.command, Commands::InspectWallet) {
+                eprintln!(
+                    "Loaded {} Sapling key(s) from {}.",
+                    keys.sapling.len(),
+                    key_path.display()
+                );
+            }
+            let source = Arc::new(ImportedKeySource::new(keys));
+            (source.clone(), None, Some(source))
+        }
+        (None, None) => {
             // Bail before prompting: an interactive seed prompt for a
             // command that only reads a wallet file is pure confusion.
             if matches!(cli.command, Commands::InspectWallet) {
-                bail!("inspect-wallet needs --wallet-file");
+                bail!("inspect-wallet needs --wallet-file or --sapling-key-file");
             }
             let phrase = load_seed_phrase(cli.seed_file.clone())?;
             (
