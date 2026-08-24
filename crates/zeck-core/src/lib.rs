@@ -31,6 +31,9 @@ pub mod sprout_spend;
 // their plaintexts, which is the only place value/rho/r exist.
 #[cfg(feature = "sprout")]
 pub mod sprout_key;
+// Decodes a Sapling extended spending key from its bech32 text encoding.
+// Not gated: Sapling is core, unlike the optional Sprout modules above.
+pub mod sapling_key;
 #[cfg(feature = "sprout")]
 pub mod sprout_recovery;
 // Finds Sprout notes by rebuilding the commitment tree from full blocks,
