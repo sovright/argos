@@ -131,8 +131,7 @@ pub fn keys_from_sapling_strings(
     lines: &[String],
     network: ZeckNetwork,
 ) -> ZeckResult<ImportedKeys> {
-    let mut seen: Vec<[u8; 169]> = Vec::new();
-    let mut sapling: Vec<SaplingKey> = Vec::new();
+    let mut keys = ImportedKeys::default();
 
     for (index, line) in lines.iter().enumerate() {
         let line = line.trim();
@@ -141,18 +140,20 @@ pub fn keys_from_sapling_strings(
         }
         let extsk = decode_sapling_spending_key(line, network)
             .map_err(|err| ZeckError::Import(format!("line {}: {err}", index + 1)))?;
-        let bytes = extsk.to_bytes();
-        if seen.contains(&bytes) {
-            continue;
-        }
-        seen.push(bytes);
-        sapling.push(SaplingKey {
-            extsk: Secret::new(bytes.to_vec()),
-            provenance: Provenance::Standalone,
-        });
+        let decoded = ImportedKeys {
+            sapling: vec![SaplingKey {
+                extsk: Secret::new(extsk.to_bytes().to_vec()),
+                provenance: Provenance::Standalone,
+            }],
+            ..Default::default()
+        };
+        // `merge_sapling_keys` is the single place that decides whether two
+        // Sapling keys are the same — folding one key at a time through it
+        // keeps this loop from growing a second copy of that rule.
+        merge_sapling_keys(&mut keys, decoded);
     }
 
-    if sapling.is_empty() {
+    if keys.sapling.is_empty() {
         return Err(ZeckError::Import(
             "no Sapling spending keys found — expected at least one \
              `secret-extended-key-…` line"
@@ -160,10 +161,7 @@ pub fn keys_from_sapling_strings(
         ));
     }
 
-    Ok(ImportedKeys {
-        sapling,
-        ..Default::default()
-    })
+    Ok(keys)
 }
 
 /// Fold `extra`'s Sapling keys into `into`, skipping any whose raw key
