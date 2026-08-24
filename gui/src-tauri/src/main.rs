@@ -48,6 +48,7 @@ fn main() {
             commands::delete_workspace,
             #[cfg(feature = "sprout")]
             commands::check_sprout_key,
+            commands::check_sapling_key,
             #[cfg(feature = "sprout")]
             commands::start_sprout_scan,
             #[cfg(feature = "sprout")]
