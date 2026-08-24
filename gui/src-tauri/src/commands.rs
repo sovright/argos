@@ -259,8 +259,14 @@ pub async fn inspect_wallet_file(
 // this carries a wallet passphrase.
 #[derive(Deserialize)]
 pub struct WalletFileScanInput {
-    pub path: String,
+    /// Absent when the user supplied only typed Sapling keys — a key string
+    /// is a key source in its own right, with no file behind it.
+    #[serde(default)]
+    pub path: Option<String>,
     pub passphrase: Option<SecretString>,
+    /// Sapling spending keys typed or pasted in the GUI, one per entry.
+    #[serde(default)]
+    pub sapling_keys: Vec<String>,
     pub birthday: u32,
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
@@ -287,11 +293,33 @@ pub async fn start_scan_from_wallet_file(
 
     ensure_tos_accepted(&app)?;
 
-    let bytes =
-        fs::read(&config.path).map_err(|err| format!("could not read {}: {err}", config.path))?;
-    let keys =
-        argos_core::argos_wallet_import::import_wallet_file(&bytes, config.passphrase.as_ref())
-            .map_err(|err| err.to_string())?;
+    // Either source alone is enough, and both together are meaningful: a
+    // user may hold a wallet whose keys were never rescanned *and* a paper
+    // key for an address it never knew about. Mirrors the CLI's
+    // `--wallet-file` + `--sapling-key-file` combination.
+    let mut keys = match &config.path {
+        Some(path) => {
+            let bytes = fs::read(path).map_err(|err| format!("could not read {path}: {err}"))?;
+            argos_core::argos_wallet_import::import_wallet_file(&bytes, config.passphrase.as_ref())
+                .map_err(|err| err.to_string())?
+        }
+        None => argos_core::argos_wallet_import::ImportedKeys::default(),
+    };
+
+    if !config.sapling_keys.is_empty() {
+        let typed = argos_core::sapling_key::keys_from_sapling_strings(
+            &config.sapling_keys,
+            config.network,
+        )
+        .map_err(|err| err.to_string())?;
+        argos_core::sapling_key::merge_sapling_keys(&mut keys, typed);
+    }
+
+    if keys.is_empty() {
+        return Err(
+            "no keys to scan — open a wallet file or paste a Sapling spending key.".to_owned(),
+        );
+    }
 
     let key_source: Arc<dyn argos_core::KeySource> =
         Arc::new(argos_core::ImportedKeySource::new(keys));
@@ -631,7 +659,6 @@ pub async fn execute_sprout_sweep(
     })
 }
 
-
 /// A Sprout scan's outcome, for the frontend.
 #[derive(Serialize)]
 pub struct SproutScanReport {
@@ -655,6 +682,21 @@ pub async fn check_sprout_key(key: String, network: String) -> Result<String, St
     Ok(argos_core::sprout_key::encode_sprout_address(
         &argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk),
         network,
+    ))
+}
+
+/// Resolve a typed Sapling spending key to the address it controls.
+///
+/// Checked before the scan, not an hour into it — and the address is what
+/// comes back, never the key, so nothing secret crosses the IPC boundary in
+/// the reply or reaches a log.
+#[tauri::command]
+pub async fn check_sapling_key(key: String, network: String) -> Result<String, String> {
+    let network = network_from(&network);
+    let extsk = argos_core::sapling_key::decode_sapling_spending_key(key.trim(), network)
+        .map_err(|err| err.to_string())?;
+    Ok(argos_core::sapling_key::default_sapling_address(
+        &extsk, network,
     ))
 }
 

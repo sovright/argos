@@ -44,6 +44,7 @@ fn main() {
             commands::save_recovery_report,
             commands::delete_workspace,
             commands::check_sprout_key,
+            commands::check_sapling_key,
             commands::start_sprout_scan,
             commands::sweep_sprout_from_scan,
             commands::preview_sprout_sweep,
@@ -66,7 +67,6 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running Argos GUI");
 }
-
 
 #[cfg(test)]
 mod version_tests {
