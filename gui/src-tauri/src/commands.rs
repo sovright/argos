@@ -1054,7 +1054,9 @@ pub async fn sweep_sprout_from_scan(
     })
 }
 
-#[cfg(feature = "sprout")]
+// Not gated on `sprout`: `check_sapling_key` is a core-Sapling command and
+// needs this too. It is a plain string-to-enum mapping with no Sprout
+// dependency of its own.
 fn network_from(name: &str) -> argos_core::ZeckNetwork {
     match name {
         "testnet" => argos_core::ZeckNetwork::Testnet,
