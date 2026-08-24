@@ -16,6 +16,8 @@
 //! The test below still pins the literal strings, so an upstream rename
 //! cannot silently move Argos off the prefix users actually hold.
 
+use argos_wallet_import::{ImportedKeys, Provenance, SaplingKey};
+use secrecy::Secret;
 use zcash_keys::encoding::{decode_extended_spending_key, AddressCodec};
 use zcash_keys::keys::sapling::ExtendedSpendingKey;
 use zcash_protocol::constants;
@@ -114,6 +116,75 @@ pub fn default_sapling_address(extsk: &ExtendedSpendingKey, network: ZeckNetwork
     let params = crate::workspace::consensus_network(network);
     let (_, address) = extsk.to_diversifiable_full_viewing_key().default_address();
     address.encode(&params)
+}
+
+/// Turn pasted or file-supplied key strings into the same `ImportedKeys` a
+/// wallet file would have produced.
+///
+/// This is the whole of the integration. Downstream — `ImportedKeySource`,
+/// `run_imported_scan`, `imported_sweep` — cannot tell whether a key came
+/// from a file or from a text box, and should not be able to.
+///
+/// Line numbers in errors are 1-based and count *every* input line,
+/// comments included, so they match what the user sees in their editor.
+pub fn keys_from_sapling_strings(
+    lines: &[String],
+    network: ZeckNetwork,
+) -> ZeckResult<ImportedKeys> {
+    let mut seen: Vec<[u8; 169]> = Vec::new();
+    let mut sapling: Vec<SaplingKey> = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let extsk = decode_sapling_spending_key(line, network)
+            .map_err(|err| ZeckError::Import(format!("line {}: {err}", index + 1)))?;
+        let bytes = extsk.to_bytes();
+        if seen.contains(&bytes) {
+            continue;
+        }
+        seen.push(bytes);
+        sapling.push(SaplingKey {
+            extsk: Secret::new(bytes.to_vec()),
+            provenance: Provenance::Standalone,
+        });
+    }
+
+    if sapling.is_empty() {
+        return Err(ZeckError::Import(
+            "no Sapling spending keys found — expected at least one \
+             `secret-extended-key-…` line"
+                .to_owned(),
+        ));
+    }
+
+    Ok(ImportedKeys {
+        sapling,
+        ..Default::default()
+    })
+}
+
+/// Fold `extra`'s Sapling keys into `into`, skipping any whose raw key
+/// material is already present.
+///
+/// A duplicate key would register a second wallet account for the same key
+/// and scan it twice for nothing — the CLI and GUI both need to merge a
+/// pasted key set into whatever a wallet file already produced, so the
+/// dedup lives once here instead of being re-implemented at each call site.
+pub fn merge_sapling_keys(into: &mut ImportedKeys, extra: ImportedKeys) {
+    use secrecy::ExposeSecret;
+
+    for key in extra.sapling {
+        let already_present = into
+            .sapling
+            .iter()
+            .any(|existing| existing.extsk.expose_secret() == key.extsk.expose_secret());
+        if !already_present {
+            into.sapling.push(key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +341,178 @@ mod tests {
         assert!(
             decode_sapling_spending_key(&typo, ZeckNetwork::Mainnet).is_err(),
             "a one-character typo must not decode"
+        );
+    }
+
+    use secrecy::ExposeSecret;
+
+    fn encoded_key(seed: [u8; 32], network: ZeckNetwork) -> String {
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed);
+        encode_extended_spending_key(
+            match network {
+                ZeckNetwork::Mainnet => constants::mainnet::HRP_SAPLING_EXTENDED_SPENDING_KEY,
+                ZeckNetwork::Testnet => constants::testnet::HRP_SAPLING_EXTENDED_SPENDING_KEY,
+            },
+            &extsk,
+        )
+    }
+
+    /// The bridge's whole purpose: produce exactly the shape the wallet-file
+    /// parsers produce, so every downstream stage works unchanged.
+    #[test]
+    fn a_decoded_key_becomes_an_imported_key_set_the_scanner_accepts() {
+        let line = encoded_key([7u8; 32], ZeckNetwork::Mainnet);
+        let keys = keys_from_sapling_strings(&[line], ZeckNetwork::Mainnet)
+            .expect("a well-formed key must build a key set");
+
+        assert_eq!(keys.sapling.len(), 1);
+        assert!(keys.transparent.is_empty());
+        assert!(keys.sprout.is_empty());
+        assert!(keys.mnemonic.is_none(), "a pasted key carries no seed");
+        assert!(!keys.is_empty());
+
+        // The bytes must be exactly what `imported::parse_sapling_extsk`
+        // expects from a wallet file — that is what makes the paths identical.
+        let bytes = keys.sapling[0].extsk.expose_secret().clone();
+        assert_eq!(bytes.len(), 169);
+        crate::imported::parse_sapling_extsk(&bytes)
+            .expect("the bridged bytes must parse on the wallet-file path");
+
+        assert_eq!(
+            keys.sapling[0].provenance,
+            argos_wallet_import::Provenance::Standalone
+        );
+    }
+
+    /// Blank lines and `#` comments let a user annotate which key came from
+    /// which backup without the file being rejected. Same rule as
+    /// `--sprout-key-file`.
+    #[test]
+    fn blank_lines_and_comments_are_skipped() {
+        let line = encoded_key([7u8; 32], ZeckNetwork::Mainnet);
+        let input = vec![
+            "# from the safe deposit box".to_owned(),
+            String::new(),
+            "   ".to_owned(),
+            line,
+        ];
+        let keys = keys_from_sapling_strings(&input, ZeckNetwork::Mainnet)
+            .expect("comments must not break parsing");
+        assert_eq!(keys.sapling.len(), 1);
+    }
+
+    /// A repeated key would register a duplicate account and scan the same
+    /// key twice for nothing.
+    #[test]
+    fn a_repeated_key_is_deduplicated() {
+        let line = encoded_key([7u8; 32], ZeckNetwork::Mainnet);
+        let keys =
+            keys_from_sapling_strings(&[line.clone(), line.clone(), line], ZeckNetwork::Mainnet)
+                .expect("duplicates are a user typo, not an error");
+        assert_eq!(keys.sapling.len(), 1);
+    }
+
+    #[test]
+    fn two_distinct_keys_both_survive() {
+        let a = encoded_key([7u8; 32], ZeckNetwork::Mainnet);
+        let b = encoded_key([9u8; 32], ZeckNetwork::Mainnet);
+        let keys = keys_from_sapling_strings(&[a, b], ZeckNetwork::Mainnet)
+            .expect("two good keys must both land");
+        assert_eq!(keys.sapling.len(), 2);
+    }
+
+    /// Which line failed, not just that something did. A user with twelve
+    /// keys in a file needs to know which one to look at.
+    #[test]
+    fn a_bad_line_reports_its_position() {
+        let good = encoded_key([7u8; 32], ZeckNetwork::Mainnet);
+        let err = keys_from_sapling_strings(&[good, "not a key".to_owned()], ZeckNetwork::Mainnet)
+            .expect_err("a malformed line must fail the whole set")
+            .to_string();
+        assert!(
+            err.contains("line 2"),
+            "the error should name the offending line, got: {err}"
+        );
+    }
+
+    /// Silently scanning nothing is worse than refusing: it looks like a
+    /// wallet with no funds.
+    #[test]
+    fn an_input_with_no_keys_at_all_is_an_error() {
+        let err = keys_from_sapling_strings(
+            &["# only a comment".to_owned(), String::new()],
+            ZeckNetwork::Mainnet,
+        )
+        .expect_err("an empty key set must not be reported as success")
+        .to_string();
+        assert!(
+            err.contains("no Sapling"),
+            "the error should say no keys were found, got: {err}"
+        );
+    }
+
+    fn imported_sapling_key(seed: [u8; 32]) -> SaplingKey {
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed);
+        SaplingKey {
+            extsk: Secret::new(extsk.to_bytes().to_vec()),
+            provenance: Provenance::Standalone,
+        }
+    }
+
+    #[test]
+    fn merging_into_an_empty_key_set_yields_the_extra_keys() {
+        let mut into = ImportedKeys::default();
+        let extra = ImportedKeys {
+            sapling: vec![imported_sapling_key([1u8; 32])],
+            ..Default::default()
+        };
+        merge_sapling_keys(&mut into, extra);
+        assert_eq!(into.sapling.len(), 1);
+    }
+
+    #[test]
+    fn a_key_already_present_is_not_appended_twice() {
+        let mut into = ImportedKeys {
+            sapling: vec![imported_sapling_key([1u8; 32])],
+            ..Default::default()
+        };
+        let extra = ImportedKeys {
+            sapling: vec![imported_sapling_key([1u8; 32])],
+            ..Default::default()
+        };
+        merge_sapling_keys(&mut into, extra);
+        assert_eq!(into.sapling.len(), 1);
+    }
+
+    #[test]
+    fn a_distinct_key_is_appended() {
+        let mut into = ImportedKeys {
+            sapling: vec![imported_sapling_key([1u8; 32])],
+            ..Default::default()
+        };
+        let extra = ImportedKeys {
+            sapling: vec![imported_sapling_key([2u8; 32])],
+            ..Default::default()
+        };
+        merge_sapling_keys(&mut into, extra);
+        assert_eq!(into.sapling.len(), 2);
+    }
+
+    #[test]
+    fn keys_in_into_not_in_extra_survive_untouched() {
+        let mut into = ImportedKeys {
+            sapling: vec![imported_sapling_key([1u8; 32])],
+            ..Default::default()
+        };
+        let extra = ImportedKeys::default();
+        merge_sapling_keys(&mut into, extra);
+        assert_eq!(into.sapling.len(), 1);
+        assert_eq!(
+            into.sapling[0].extsk.expose_secret(),
+            &imported_sapling_key([1u8; 32])
+                .extsk
+                .expose_secret()
+                .clone()
         );
     }
 }
