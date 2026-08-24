@@ -379,3 +379,54 @@ fn a_key_file_alone_does_not_demand_a_wallet_file() {
         "a key file is its own key source, got: {stderr}"
     );
 }
+
+/// The over-refusal guard, at the surface a user actually types.
+///
+/// `--wallet-file` + `--sapling-key-file` is refused *only* when the wallet
+/// yields a BIP-39 mnemonic, because that wallet takes the HD route and the
+/// standalone key would be silently dropped. A seedless zcashd wallet takes
+/// the imported-account route, which reads `keys.sapling` directly, so the
+/// two must still merge — this is the combination the feature exists for.
+///
+/// The matching refusal cannot be exercised here: only an *encrypted*
+/// ZecWallet Lite wallet recovers a mnemonic, and its passphrase is
+/// prompt-only by design, so no non-interactive fixture can reach that
+/// branch. Both directions are pinned at the unit level instead, on
+/// `argos_core::sapling_key::merge_standalone_sapling_keys` — the single
+/// helper this path and the GUI's both call.
+#[test]
+fn a_seedless_wallet_and_a_key_file_still_merge() {
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let keys = key_file("sapling-key-with-wallet.txt", TEST_SAPLING_KEY_MAINNET);
+
+    let out = argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("fixture path is UTF-8"),
+        "--sapling-key-file",
+        keys.to_str().expect("path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    assert!(
+        out.status.success(),
+        "a seedless wallet plus a supplied key must not be refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("seed phrase"),
+        "the HD refusal must not fire for a seedless wallet, got:\n{stderr}"
+    );
+
+    // The supplied key landed alongside the wallet's own: the fixture holds
+    // one Sapling address, and the pasted key controls a second.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("zs1"),
+        "the merged key set should report Sapling addresses, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("secret-extended-key"),
+        "no key material may be printed back, got: {stdout}"
+    );
+}
