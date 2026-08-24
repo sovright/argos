@@ -437,7 +437,12 @@ pub async fn start_scan_from_wallet_file(
             config.network,
         )
         .map_err(|err| err.to_string())?;
-        argos_core::sapling_key::merge_sapling_keys(&mut keys, typed);
+        // Refuses before any scan work starts when the wallet file yielded a
+        // mnemonic: that wallet takes the HD route, which cannot carry a
+        // standalone key. The same helper the CLI calls, so the two surfaces
+        // cannot drift on which combinations are allowed.
+        argos_core::sapling_key::merge_standalone_sapling_keys(&mut keys, typed)
+            .map_err(|err| err.to_string())?;
     }
 
     if keys.is_empty() {

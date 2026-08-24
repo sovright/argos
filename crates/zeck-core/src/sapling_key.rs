@@ -185,6 +185,41 @@ pub fn merge_sapling_keys(into: &mut ImportedKeys, extra: ImportedKeys) {
     }
 }
 
+/// Merge standalone Sapling keys into the key set a wallet file produced,
+/// refusing the one combination that would silently scan the wrong thing.
+///
+/// A wallet file that yields a BIP-39 mnemonic takes the HD route
+/// (`classify_recovery_route` puts the mnemonic first, and
+/// `ImportedKeySource::wallet_seed` returns `Some`), and that route derives
+/// every key it scans from the seed. A standalone key has no place in it:
+/// it would be counted in "imported N key(s)", carried into the key set,
+/// and then never read — the user would see a successful scan and a zero
+/// balance for the very key they supplied. Argos exists for people who have
+/// already lost access to funds once, so that silence is the worst possible
+/// outcome; refuse instead, and say which invocation does work.
+///
+/// Only that intersection is refused. A seedless wallet plus standalone
+/// keys is the case this feature exists for and merges normally, and a
+/// wallet file on its own is unaffected.
+pub fn merge_standalone_sapling_keys(
+    wallet_keys: &mut ImportedKeys,
+    standalone: ImportedKeys,
+) -> ZeckResult<()> {
+    if wallet_keys.mnemonic.is_some() && !standalone.sapling.is_empty() {
+        return Err(ZeckError::Import(
+            "this wallet file contains a seed phrase, so it is scanned as an HD wallet — \
+             every key comes from the seed, and a separately supplied Sapling spending key \
+             cannot be scanned alongside it. It would be accepted and then never looked at. \
+             Run them as two scans: one with the wallet file alone, and one with the \
+             Sapling key alone (CLI: --sapling-key-file with no --wallet-file; GUI: paste \
+             the key with no wallet file open)."
+                .to_owned(),
+        ));
+    }
+    merge_sapling_keys(wallet_keys, standalone);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +548,87 @@ mod tests {
             test.to_bytes(),
             "both strings encode the same key, differing only in network"
         );
+    }
+
+    const A_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon abandon abandon art";
+
+    fn standalone_set(seed: [u8; 32]) -> ImportedKeys {
+        ImportedKeys {
+            sapling: vec![imported_sapling_key(seed)],
+            ..Default::default()
+        }
+    }
+
+    /// The critical case: a mnemonic-bearing wallet takes the HD route, which
+    /// never reads `keys.sapling`, so merging a standalone key in would drop
+    /// it silently. Refuse instead, and name the reason.
+    #[test]
+    fn a_mnemonic_wallet_refuses_a_standalone_sapling_key() {
+        let mut wallet = ImportedKeys {
+            mnemonic: Some(secrecy::SecretString::new(A_MNEMONIC.to_owned())),
+            ..Default::default()
+        };
+        let err = merge_standalone_sapling_keys(&mut wallet, standalone_set([1u8; 32]))
+            .expect_err("this combination must be refused, not silently dropped")
+            .to_string();
+        assert!(
+            err.contains("seed phrase") && err.contains("HD"),
+            "the message should name why the HD route cannot carry the key, got: {err}"
+        );
+        assert!(
+            err.contains("two scans") || err.contains("--sapling-key-file"),
+            "the message should say what to do next, got: {err}"
+        );
+        assert!(
+            wallet.sapling.is_empty(),
+            "a refused merge must leave the wallet key set untouched"
+        );
+    }
+
+    /// The over-refusal guard, which matters as much as the refusal: a
+    /// seedless `wallet.dat` plus a paper key is the case this feature
+    /// exists for.
+    #[test]
+    fn a_seedless_wallet_still_merges_a_standalone_sapling_key() {
+        use argos_wallet_import::keys::{Provenance, TransparentKey};
+
+        let mut wallet = ImportedKeys {
+            transparent: vec![TransparentKey {
+                secret: Secret::new([0x42; 32]),
+                provenance: Provenance::Standalone,
+            }],
+            ..Default::default()
+        };
+        merge_standalone_sapling_keys(&mut wallet, standalone_set([1u8; 32]))
+            .expect("a seedless wallet plus a supplied key is the supported combination");
+        assert_eq!(wallet.sapling.len(), 1);
+        assert_eq!(wallet.transparent.len(), 1);
+    }
+
+    /// A seedless wallet that already holds Sapling keys still dedups
+    /// through the one merge rule.
+    #[test]
+    fn a_seedless_wallet_dedups_a_key_it_already_holds() {
+        let mut wallet = standalone_set([1u8; 32]);
+        merge_standalone_sapling_keys(&mut wallet, standalone_set([1u8; 32]))
+            .expect("a duplicate is not a refusal");
+        assert_eq!(wallet.sapling.len(), 1);
+    }
+
+    /// A mnemonic wallet with *no* standalone keys supplied is the ordinary
+    /// ZecWallet Lite case and must be completely unaffected.
+    #[test]
+    fn a_mnemonic_wallet_with_nothing_supplied_is_not_refused() {
+        let mut wallet = ImportedKeys {
+            mnemonic: Some(secrecy::SecretString::new(A_MNEMONIC.to_owned())),
+            ..Default::default()
+        };
+        merge_standalone_sapling_keys(&mut wallet, ImportedKeys::default())
+            .expect("a wallet file on its own must never be refused");
+        assert!(wallet.mnemonic.is_some());
+        assert!(wallet.sapling.is_empty());
     }
 
     #[test]
