@@ -10,8 +10,10 @@ use crate::error::ImportDiagnostic;
 pub enum Provenance {
     /// Derived from the wallet's HD chain.
     HdDerived,
-    /// Imported standalone (`z_importkey` / `importprivkey`). Exists in no
-    /// seed — recoverable only from the wallet file.
+    /// Imported standalone (`z_importkey` / `importprivkey`), or supplied
+    /// directly as a key string. Exists in no seed, so it is recoverable
+    /// only from the wallet file or from the key text itself — never
+    /// re-derivable.
     Standalone,
 }
 
