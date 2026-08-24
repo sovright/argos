@@ -1428,6 +1428,13 @@ phrase, or clear the seed phrase to scan the pasted key.",
     if (passphraseInput) passphraseInput.value = "";
     // The backend holds the decoded keys now; a spending key must not sit
     // in the DOM for the lifetime of the scan→sweep→complete flow (T-S2).
+    //
+    // On the success path only, deliberately — same rule as the wallet
+    // passphrase two lines up. If starting the scan throws, the typed key
+    // stays in the textarea so the user can fix the birthday or the endpoint
+    // and retry; wiping it would strand someone whose only copy is on paper.
+    // No scan is running in that case, so nothing holds the key but this
+    // local WebView, which is already showing it.
     const saplingBox = $("sapling-scan-keys");
     if (saplingBox) saplingBox.value = "";
     $("sapling-key-addresses").innerHTML = "";

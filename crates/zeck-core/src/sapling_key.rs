@@ -261,10 +261,24 @@ mod tests {
             .expect("a well-formed mainnet key must decode");
         assert_eq!(decoded.to_bytes(), extsk.to_bytes());
 
+        // Pinned, not shape-checked. `starts_with("zs1")` would hold for any
+        // mainnet Sapling address, so it could not catch this deriving the
+        // wrong address from the right key — which is the failure that would
+        // send a user looking at an account holding none of their funds.
+        // Golden value for `ExtendedSpendingKey::master(&[7u8; 32])`; controls
+        // nothing and has never been on any chain.
         let address = default_sapling_address(&decoded, ZeckNetwork::Mainnet);
-        assert!(
-            address.starts_with("zs1"),
-            "mainnet Sapling address should start with zs1, got {address}"
+        assert_eq!(
+            address,
+            "zs1f0x0t0dgnpyt0au5wl06g7ylnzwanhs5pegkpuvnnly6l4aeactlwdp2479ne6h8zvupqu4uesc"
+        );
+
+        // The same key on testnet must give the same diversified address
+        // under the other HRP — proof the network only selects an encoding
+        // and never changes which key material is in play.
+        assert_eq!(
+            default_sapling_address(&decoded, ZeckNetwork::Testnet),
+            "ztestsapling1f0x0t0dgnpyt0au5wl06g7ylnzwanhs5pegkpuvnnly6l4aeactlwdp2479ne6h8zvupq5zw6hv"
         );
     }
 
@@ -649,3 +663,4 @@ mod tests {
         );
     }
 }
+
