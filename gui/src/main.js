@@ -746,16 +746,39 @@ $("sprout-sweep-run").addEventListener("click", runSproutSweep);
 // ─── Typed Sapling keys ─────────────────────────────────────────────────────
 // The route for a user who has a spending key string and no wallet file.
 
-function saplingScanKeys() {
+// The raw lines of the textarea, in the order and at the positions the user
+// sees them. Deliberately unfiltered: `keys_from_sapling_strings` is the one
+// place that decides what a key file means — which lines are skipped and how
+// they are numbered — and dropping blanks here would both hide `#` comments
+// from that rule and shift every reported line number away from what the
+// textarea shows.
+function saplingScanKeyLines() {
   const box = $("sapling-scan-keys");
   if (!box) return [];
-  return box.value.split("\n").map((k) => k.trim()).filter(Boolean);
+  return box.value.split("\n");
+}
+
+// The one skip rule, mirroring `keys_from_sapling_strings`: blank lines and
+// `#` comments are annotation, not input.
+function isSaplingKeyLine(line) {
+  const t = line.trim();
+  return t !== "" && !t.startsWith("#");
+}
+
+// Whether the user actually supplied any key, as opposed to an empty box or
+// one holding only comments.
+function hasSaplingScanKeys() {
+  return saplingScanKeyLines().some(isSaplingKeyLine);
 }
 
 async function checkSaplingKeys() {
   const list = $("sapling-key-addresses");
   list.innerHTML = "";
-  const keys = saplingScanKeys();
+  // Keep each key paired with the line it sits on, so a failure names the
+  // line the user can see rather than a position in a filtered array.
+  const keys = saplingScanKeyLines()
+    .map((line, i) => ({ key: line.trim(), line: i + 1 }))
+    .filter(({ key }) => isSaplingKeyLine(key));
   if (!keys.length) {
     setStatus(
       "sapling-key-status",
@@ -767,7 +790,7 @@ async function checkSaplingKeys() {
     return;
   }
   // Checked before the scan, not an hour into it.
-  for (const [i, key] of keys.entries()) {
+  for (const { key, line } of keys) {
     try {
       const addr = await invoke("check_sapling_key", {
         key,
@@ -777,7 +800,7 @@ async function checkSaplingKeys() {
       li.textContent = addr;
       list.appendChild(li);
     } catch (err) {
-      setStatus("sapling-key-status", `✗ key ${i + 1}: ${err}`, "error");
+      setStatus("sapling-key-status", `✗ line ${line}: ${err}`, "error");
       return;
     }
   }
@@ -1187,11 +1210,29 @@ $("destination-input").addEventListener("keydown", (e) => {
 $("start-scan").addEventListener("click", async () => {
   // Three routes to the same scan: a seed phrase, a wallet file, or a
   // pasted Sapling spending key.
-  if (!walletFile && !seedInput.value.trim() && !saplingScanKeys().length) {
+  const hasTypedSaplingKeys = hasSaplingScanKeys();
+  if (!walletFile && !seedInput.value.trim() && !hasTypedSaplingKeys) {
     setStatus(
       "config-status",
       "A seed phrase, a wallet file, or a Sapling spending key is required — \
 go back and provide one.",
+      "error",
+    );
+    return;
+  }
+
+  // A seed phrase and a standalone Sapling key are different provenance
+  // models, and only one of them can drive a scan. Taking both and quietly
+  // preferring one would scan a wallet the user did not ask for and report
+  // its balance as the answer. The CLI refuses the same pair outright
+  // (`--sapling-key-file` conflicts with `--seed-file`); refuse it here too
+  // rather than letting the two surfaces mean different things.
+  if (seedInput.value.trim() && hasTypedSaplingKeys) {
+    setStatus(
+      "config-status",
+      "A seed phrase and a pasted Sapling spending key cannot be scanned together — \
+they are separate wallets. Run two scans: clear the key box to scan the seed \
+phrase, or clear the seed phrase to scan the pasted key.",
       "error",
     );
     return;
@@ -1259,7 +1300,10 @@ go back and provide one.",
 
   try {
     let handle;
-    const typedSaplingKeys = saplingScanKeys();
+    // Raw lines, so the backend applies its own skip rule and its errors
+    // number the lines the user sees. Empty when the box holds nothing but
+    // comments, so a wallet-file-only scan is not handed a key set to reject.
+    const typedSaplingKeys = hasTypedSaplingKeys ? saplingScanKeyLines() : [];
     if (walletFile || typedSaplingKeys.length) {
       // Routing between the HD path and the imported-account path lives in
       // the core service, not here: it depends on whether the file yielded a
