@@ -109,8 +109,11 @@ history and in `ps` output for every user on the box (T-S6).
   wallet never knew about — the same argument `collect_sprout_scan_keys`
   makes for Sprout.
 
-Routing needs no change: `is_transparent_only` already sends a key set with
-Sapling keys down the imported-account path.
+Routing rules need no change — `is_transparent_only` already sends a key set
+with Sapling keys down the imported-account path — but the key-source
+construction does: `main.rs` currently builds the `ImportedKeySource` only
+inside `match &cli.wallet_file`. That match becomes a match over "where the
+imported keys came from": wallet file, key file, or both merged.
 
 ### 4. GUI
 
