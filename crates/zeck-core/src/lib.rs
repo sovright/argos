@@ -27,6 +27,8 @@ pub mod sprout_spend;
 // Joins a wallet's note records to the JoinSplit ciphertexts that carry
 // their plaintexts, which is the only place value/rho/r exist.
 pub mod sprout_key;
+// Decodes a Sapling extended spending key from its bech32 text encoding.
+pub mod sapling_key;
 pub mod sprout_recovery;
 // Finds Sprout notes by rebuilding the commitment tree from full blocks,
 // for a wallet that has a spending key and no note metadata at all.
