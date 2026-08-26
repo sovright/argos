@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! The p2p wire format, checked against a real zcashd rather than against
 //! our own encoder.
 //!

@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! Prove a JoinSplit with the real Groth16 parameters, and verify it.
 //!
 //! This is the check the rest of the Sprout work could not make. Everything

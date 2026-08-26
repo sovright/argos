@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! The rebuilt Sprout commitment tree, checked against the node's own.
 //!
 //! Everything about a Sprout scan rests on one claim: that appending every

@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! The Sprout scanner, driven end to end against a real chain.
 //!
 //! Every piece of the scan has been validated in isolation — the rebuilt

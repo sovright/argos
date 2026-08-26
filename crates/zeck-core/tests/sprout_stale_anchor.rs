@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! Does consensus accept a *historical* Sprout anchor?
 //!
 //! # Why this is load-bearing

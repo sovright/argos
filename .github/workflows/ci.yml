@@ -102,30 +102,6 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-      # The `sprout` feature only lands with Track B. On the branches beneath it
-      # the feature is not defined yet, so probe and skip rather than fail on a
-      # feature that does not exist. Correct on every layer -- skips where
-      # absent, runs where present -- so this guard is identical across the
-      # whole stack and survives rebasing.
-      - name: Probe for the sprout feature
-        id: sprout
-        run: |
-          if cargo metadata --format-version 1 --no-deps \
-               | jq -e '.packages[] | select(.name == "argos-core") | .features | has("sprout")' >/dev/null; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::sprout feature not defined at this layer; skipping Sprout build"
-          fi
-
-      # After the `sprout` feature landed, `--workspace` alone builds Track A
-      # only, so nothing in CI compiled the Sprout code at all. This keeps it
-      # type-checked on every push; the node-backed job below is what actually
-      # runs it.
-      - name: cargo test (--features sprout)
-        if: steps.sprout.outputs.present == 'true'
-        run: cargo test --workspace --features argos-core/sprout,argos-cli/sprout
-
   sprout-node-tests:
     name: Sprout scan against a real node
     runs-on: ubuntu-latest
@@ -146,29 +122,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # See the guard note in the test job: skip the whole node-backed run on
-      # layers where the sprout feature is not defined yet.
-      - name: Probe for the sprout feature
-        id: sprout
-        run: |
-          if cargo metadata --format-version 1 --no-deps \
-               | jq -e '.packages[] | select(.name == "argos-core") | .features | has("sprout")' >/dev/null; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::sprout feature not defined at this layer; skipping Sprout node tests"
-          fi
-
       # The only regtest chain that can hold Sprout notes: ZIP 211 forbids
       # funding the pool from Canopy onward, and this profile holds Canopy
       # inactive (nuparams e9ff75a6:9999999).
       - name: Start the regtest Sprout node
-        if: steps.sprout.outputs.present == 'true'
         working-directory: tests/regtest
         run: docker compose --profile sprout up -d zcashd-sprout
 
       - name: Wait for the node to accept RPC
-        if: steps.sprout.outputs.present == 'true'
         run: |
           for i in $(seq 1 60); do
             if curl -sf --user argos-regtest:argos-regtest \
@@ -206,8 +167,8 @@ jobs:
           # than as a confusing proving error.
           test "$(stat -c%s ~/.zcash-params/sprout-groth16.params)" = "725523612"
 
-      # `--features sprout` AND `--ignored`, both required. These are the only
-      # tests that exercise the Sprout scan end to end, and they are the reason
+      # `--ignored` is required. These are the only tests that exercise the
+      # Sprout scan end to end, and they are the reason
       # this job exists: `argos scan-sprout` once shipped unable to scan
       # anything from a cold start -- every fresh walk aborted on its first
       # page -- while the docs described it as proven on regtest. Nothing in
@@ -217,15 +178,14 @@ jobs:
       # are proving-heavy (several minutes each) and belong in their own job if
       # they are ever wanted. These two are the ones that cover the scan.
       - name: Sprout scan tests
-        if: steps.sprout.outputs.present == 'true'
         run: |
-          cargo test -p argos-core --features sprout \
+          cargo test -p argos-core \
             --test sprout_scan_matches_the_node \
             --test sprout_scan_finds_a_real_note \
             -- --ignored --nocapture
 
       - name: Node logs on failure
-        if: failure() && steps.sprout.outputs.present == 'true'
+        if: failure()
         working-directory: tests/regtest
         run: docker compose --profile sprout logs --tail=200 zcashd-sprout
 

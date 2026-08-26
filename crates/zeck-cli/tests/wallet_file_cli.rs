@@ -71,32 +71,12 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
         "expected 103 transparent keys, got:\n{stdout}"
     );
     // A user must not read "recovered a Sprout key" as "can move the money".
-    //
-    // Asserted in both builds, because both print a Sprout key count — the
-    // parser is unconditional — and the claim being guarded is about that
-    // count, not about the feature. The wording differs because the honest
-    // statement differs: with Sprout compiled in, the notes are not yet
-    // recoverable through `scan`/`sweep`; without it, they are recoverable but
-    // not by this binary. Sharing one string would have forced one of the two
-    // builds to say something untrue.
-    #[cfg(feature = "sprout")]
+    // The parser reports a Sprout key count, and recovering those notes still
+    // takes a `scan-sprout` this report has not run, so the wording has to
+    // keep "found a key" and "can move the funds" apart.
     assert!(
         stdout.contains("not yet recoverable"),
         "the report must not imply Sprout funds are spendable, got:\n{stdout}"
-    );
-    #[cfg(not(feature = "sprout"))]
-    assert!(
-        stdout.contains("this build cannot recover them"),
-        "a build without Sprout support must say so rather than imply the keys it \
-         just counted are spendable, got:\n{stdout}"
-    );
-
-    // And it must never point at a subcommand this build does not have.
-    #[cfg(not(feature = "sprout"))]
-    assert!(
-        !stdout.contains("scan-sprout") && !stdout.contains("sweep-sprout"),
-        "a default build compiles those subcommands out; naming them sends the user to \
-         `unrecognized subcommand` for the one pool that is hardest to recover. Got:\n{stdout}"
     );
 }
 

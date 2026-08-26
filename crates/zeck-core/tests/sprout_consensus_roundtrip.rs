@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! Create a real Sprout note on a node, then spend it — and let consensus
 //! judge both halves.
 //!

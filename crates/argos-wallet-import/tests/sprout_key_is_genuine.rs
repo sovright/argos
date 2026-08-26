@@ -1,10 +1,8 @@
 //! Prove that a recovered Sprout spending key really controls the address
 //! it was stored under.
 //!
-//! Deliberately NOT gated behind the `sprout` feature, unlike the Sprout
-//! tests in `argos-core`. The rule is that a test follows the code it covers,
-//! not the topic it is named after: this crate's parser stays unconditional,
-//! so a default Argos build decrypts `czkey` records — the only
+//! This crate's parser has always been unconditional, so every Argos build
+//! decrypts `czkey` records — the only
 //! implementation in the ecosystem that does (Zallet drops Sprout keys during
 //! migration, `zewif-zcashd` returns an explicit error for them). These
 //! assertions are the only specification that decryption has. Gating them

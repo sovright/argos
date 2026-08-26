@@ -8,16 +8,6 @@ rust-version.workspace = true
 build = "build.rs"
 publish = false
 
-[features]
-# `sprout` — opt-in Sprout-pool recovery (Track B). Forwards to the core
-# feature and, with it, gates the five Sprout Tauri commands and their
-# registration. Off by default: the default GUI recovers Sapling-imported,
-# ZecWallet-Lite mnemonic and transparent funds, and inspection reports the
-# Sprout key count from the always-on parser while leaving the recovery/scan
-# fields empty (no Sprout spend code is compiled in). The JSON shape of
-# `WalletFileSummary` is identical either way.
-sprout = ["argos-core/sprout"]
-
 [build-dependencies]
 tauri-build.workspace = true
 
