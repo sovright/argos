@@ -850,16 +850,15 @@ mod destination_tests {
 
     #[test]
     fn a_transparent_destination_is_refused_for_not_being_unified() {
-        let err = match sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Testnet)
-        {
-            Ok(_) => panic!("a t-address must not be accepted as a sweep destination"),
-            Err(err) => err,
-        };
+        let err =
+            match sapling_receiver("t1UE73p3WKJRqjMTyFqRKXieX9FkWTNvZhm", ZeckNetwork::Testnet) {
+                Ok(_) => panic!("a t-address must not be accepted as a sweep destination"),
+                Err(err) => err,
+            };
         assert!(
             matches!(err, ZeckError::DestinationMustBeUnified),
             "a t-address is refused for not being unified, not for anything about \
              networks or receivers; got {err:?}"
         );
     }
-
 }

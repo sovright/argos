@@ -21,7 +21,10 @@
 //!
 //!     cargo test -p argos-core --test mainnet_pow -- --ignored --nocapture
 
-use argos_core::p2p::{peer::Peer, wire::{verify_header_pow, P2pNetwork}};
+use argos_core::p2p::{
+    peer::Peer,
+    wire::{verify_header_pow, P2pNetwork},
+};
 
 const NODE: &str = "127.0.0.1:18233";
 
@@ -70,9 +73,8 @@ async fn real_mainnet_headers_pass_equihash_200_9() {
     assert!(!headers.is_empty(), "a mainnet peer must return headers");
 
     for (i, header) in headers.iter().enumerate() {
-        verify_header_pow(P2pNetwork::Mainnet, header).unwrap_or_else(|err| {
-            panic!("real mainnet header {i} failed verification: {err}")
-        });
+        verify_header_pow(P2pNetwork::Mainnet, header)
+            .unwrap_or_else(|err| panic!("real mainnet header {i} failed verification: {err}"));
     }
     println!(
         "{} real mainnet headers passed Equihash (200, 9) and difficulty",
@@ -183,7 +185,6 @@ async fn a_bounded_mainnet_scan_reads_real_blocks() {
         "each JoinSplit contributes exactly two commitments"
     );
 }
-
 
 /// Every checkpoint must match the real chain, checked directly.
 ///

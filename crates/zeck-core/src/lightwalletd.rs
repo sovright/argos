@@ -168,8 +168,9 @@ pub async fn probe_lightwalletd_endpoints_with_retry(
     loop {
         match probe_lightwalletd_endpoints(raw).await {
             Ok(ready) => return Ok(ready),
-            Err(err) if attempt < INITIAL_CONNECT_ATTEMPTS
-                && is_transient_network_error(&err.to_string()) =>
+            Err(err)
+                if attempt < INITIAL_CONNECT_ATTEMPTS
+                    && is_transient_network_error(&err.to_string()) =>
             {
                 attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(
@@ -192,8 +193,9 @@ pub async fn connect_lightwalletd_endpoints_with_retry(
     loop {
         match connect_lightwalletd_endpoints(raw, preferred).await {
             Ok(ready) => return Ok(ready),
-            Err(err) if attempt < INITIAL_CONNECT_ATTEMPTS
-                && is_transient_network_error(&err.to_string()) =>
+            Err(err)
+                if attempt < INITIAL_CONNECT_ATTEMPTS
+                    && is_transient_network_error(&err.to_string()) =>
             {
                 attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(
@@ -412,7 +414,10 @@ mod tests {
 
     #[test]
     fn describe_empty_returns_sentinel() {
-        assert_eq!(describe_lightwalletd_endpoints(""), "no configured endpoints");
+        assert_eq!(
+            describe_lightwalletd_endpoints(""),
+            "no configured endpoints"
+        );
     }
 
     #[test]
@@ -520,10 +525,7 @@ mod tests {
         };
         let err = validate_lightwalletd_network(ZeckNetwork::Testnet, &info)
             .expect_err("regtest chain must be rejected in production builds");
-        assert!(
-            err.to_string().contains("does not match"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("does not match"), "got: {err}");
     }
 
     #[cfg(feature = "argos-network")]
@@ -659,7 +661,10 @@ mod tests {
         // tighten this in a future revision if we decide credentials in
         // lightwalletd URLs are out of scope.
         let result = validated_lightwalletd_endpoints("https://user:pass@wallet.example.com:443");
-        assert!(result.is_ok(), "current behaviour: credentialed URLs pass validation");
+        assert!(
+            result.is_ok(),
+            "current behaviour: credentialed URLs pass validation"
+        );
     }
 
     #[test]
@@ -672,18 +677,28 @@ mod tests {
         ));
         assert!(is_transient_network_error("h2 protocol error: GoAway"));
         assert!(is_transient_network_error("operation TimedOut"));
-        assert!(is_transient_network_error("received fatal alert: close_notify"));
-        assert!(is_transient_network_error("connection closed: UnexpectedEof"));
+        assert!(is_transient_network_error(
+            "received fatal alert: close_notify"
+        ));
+        assert!(is_transient_network_error(
+            "connection closed: UnexpectedEof"
+        ));
         // DNS resolution failures (varied OS resolver wording) — the gap this fixes.
         assert!(is_transient_network_error(
             "error trying to connect: dns error: failed to lookup address information: \
              nodename nor servname provided, or not known"
         ));
-        assert!(is_transient_network_error("Temporary failure in name resolution"));
-        assert!(is_transient_network_error("No such host is known. (os error 11001)"));
+        assert!(is_transient_network_error(
+            "Temporary failure in name resolution"
+        ));
+        assert!(is_transient_network_error(
+            "No such host is known. (os error 11001)"
+        ));
         assert!(is_transient_network_error("Name or service not known"));
         // Connection-level transients.
-        assert!(is_transient_network_error("tcp connect error: Connection refused"));
+        assert!(is_transient_network_error(
+            "tcp connect error: Connection refused"
+        ));
         assert!(is_transient_network_error("Connection reset by peer"));
     }
 

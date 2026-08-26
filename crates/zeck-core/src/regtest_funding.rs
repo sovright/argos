@@ -36,6 +36,8 @@ use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc};
 
 use secrecy::{ExposeSecret, SecretString};
 use zcash_address::ZcashAddress;
+#[allow(deprecated)]
+use zcash_client_backend::zip321;
 use zcash_client_backend::{
     data_api::{
         wallet::{
@@ -49,8 +51,6 @@ use zcash_client_backend::{
     proto::service::RawTransaction,
     wallet::OvkPolicy,
 };
-#[allow(deprecated)]
-use zcash_client_backend::zip321;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{value::Zatoshis, ShieldedPool};
@@ -117,7 +117,11 @@ pub async fn transfer_from_treasury(
     let started = std::time::Instant::now();
     macro_rules! phase {
         ($name:expr) => {
-            eprintln!("[funder] {} at {:.1}s", $name, started.elapsed().as_secs_f64())
+            eprintln!(
+                "[funder] {} at {:.1}s",
+                $name,
+                started.elapsed().as_secs_f64()
+            )
         };
     }
 
@@ -183,12 +187,9 @@ pub async fn transfer_from_treasury(
         .ok_or_else(|| ZeckError::Wallet("the treasury workspace has no account".to_owned()))?;
 
     let seed_bytes = crate::derivation::mnemonic_seed(treasury_seed)?;
-    let usk = UnifiedSpendingKey::from_seed(
-        &params,
-        seed_bytes.expose_secret(),
-        zip32::AccountId::ZERO,
-    )
-        .map_err(|err| ZeckError::Wallet(format!("deriving the treasury key: {err}")))?;
+    let usk =
+        UnifiedSpendingKey::from_seed(&params, seed_bytes.expose_secret(), zip32::AccountId::ZERO)
+            .map_err(|err| ZeckError::Wallet(format!("deriving the treasury key: {err}")))?;
 
     // All destinations in one transaction. Funding them one at a time would
     // need a mined block and a rescan between each, so that the next call can

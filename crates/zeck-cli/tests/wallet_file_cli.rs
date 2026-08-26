@@ -312,7 +312,10 @@ fn a_key_for_the_wrong_network_is_refused_by_name() {
         path.to_str().expect("path is UTF-8"),
         "inspect-wallet",
     ]);
-    assert!(!out.status.success(), "a testnet key must not pass on mainnet");
+    assert!(
+        !out.status.success(),
+        "a testnet key must not pass on mainnet"
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

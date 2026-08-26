@@ -154,17 +154,15 @@ impl HelperHandle {
                 .await
             {
                 Err(_) => break, // no line available right now
-                Ok(Ok(Some(line))) => {
-                    match serde_json::from_str::<HelperEvent>(&line) {
-                        Ok(ev) => {
-                            self.events.push(ev);
-                            new_events += 1;
-                        }
-                        Err(_) => {
-                            self.unparsed.push_back(line);
-                        }
+                Ok(Ok(Some(line))) => match serde_json::from_str::<HelperEvent>(&line) {
+                    Ok(ev) => {
+                        self.events.push(ev);
+                        new_events += 1;
                     }
-                }
+                    Err(_) => {
+                        self.unparsed.push_back(line);
+                    }
+                },
                 Ok(Ok(None)) => break, // stream closed
                 Ok(Err(e)) => return Err(e),
             }
@@ -182,9 +180,7 @@ impl HelperHandle {
     ) -> Result<T, WaitError> {
         loop {
             // Read whatever has arrived, then test the predicate.
-            self.drain_available()
-                .await
-                .map_err(WaitError::Io)?;
+            self.drain_available().await.map_err(WaitError::Io)?;
             if let Some(v) = pred(&self.events) {
                 return Ok(v);
             }
@@ -196,11 +192,7 @@ impl HelperHandle {
             }
             // Also check if the child has already exited — there's no point
             // polling forever if the helper is gone.
-            if let Some(status) = self
-                .child
-                .try_wait()
-                .map_err(WaitError::Io)?
-            {
+            if let Some(status) = self.child.try_wait().map_err(WaitError::Io)? {
                 // Drain whatever is left on stdout after the exit.
                 let stdout = self.child.stdout.take();
                 drop(stdout);
@@ -231,7 +223,9 @@ impl HelperHandle {
 
     /// Wait for the helper to exit on its own. Useful for tests that don't
     /// SIGKILL (the second run of R-S27 after resume, the smoke tests).
-    pub async fn wait_for_exit(mut self) -> std::io::Result<(std::process::ExitStatus, Vec<HelperEvent>)> {
+    pub async fn wait_for_exit(
+        mut self,
+    ) -> std::io::Result<(std::process::ExitStatus, Vec<HelperEvent>)> {
         let status = self.child.wait().await?;
         // Drain any remaining stdout after exit.
         self.drain_available().await?;

@@ -198,7 +198,9 @@ async fn joinsplits_are_recovered_from_real_blocks() {
 
         let fetched = peer.get_blocks(&hashes).await.expect("getdata");
         for hash in &hashes {
-            let block = fetched.get(hash).expect("every requested block must come back");
+            let block = fetched
+                .get(hash)
+                .expect("every requested block must come back");
             blocks_seen += 1;
             let js = joinsplits_in_block(block, BranchId::Canopy)
                 .expect("a real block from a real node must parse");
@@ -206,7 +208,10 @@ async fn joinsplits_are_recovered_from_real_blocks() {
         }
     }
 
-    println!("scanned {blocks_seen} blocks, found {} JoinSplits", found.len());
+    println!(
+        "scanned {blocks_seen} blocks, found {} JoinSplits",
+        found.len()
+    );
     assert!(
         !found.is_empty(),
         "the sprout chain holds JoinSplit transactions; none were found, so the \
@@ -263,7 +268,10 @@ async fn real_headers_pass_proof_of_work_verification() {
             panic!("header {i} from a real node failed proof-of-work checking: {err}")
         });
     }
-    println!("{} real headers passed Equihash and difficulty", headers.len());
+    println!(
+        "{} real headers passed Equihash and difficulty",
+        headers.len()
+    );
 
     // And a tampered header must fail, or the check above proves nothing.
     let mut tampered = headers[0].clone();

@@ -15,8 +15,7 @@ use std::env;
 ///
 /// Matches the seed funded by `tests/regtest/setup.sh`. Centralised here so
 /// the integration tests and the funding script agree on the same string.
-pub const ARGOS_TEST_SEED: &str =
-    "abandon abandon abandon abandon abandon abandon \
+pub const ARGOS_TEST_SEED: &str = "abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon art";
@@ -121,8 +120,7 @@ pub const ENV_ZEBRA_RPC_URL: &str = "ARGOS_REGTEST_ZEBRA_RPC_URL";
 pub async fn zebra_rpc(method: &str, params: serde_json::Value) -> serde_json::Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let url = env::var(ENV_ZEBRA_RPC_URL)
-        .unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+    let url = env::var(ENV_ZEBRA_RPC_URL).unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
     let host_port = url.strip_prefix("http://").unwrap_or(&url).to_owned();
 
     let body = serde_json::json!({
@@ -207,9 +205,7 @@ pub async fn derive_test_address(account: u32) -> String {
         .split("\"address\":\"")
         .nth(1)
         .and_then(|rest| rest.split('"').next())
-        .unwrap_or_else(|| {
-            panic!("[regtest] could not parse a funding address from: {stdout}")
-        })
+        .unwrap_or_else(|| panic!("[regtest] could not parse a funding address from: {stdout}"))
         .to_owned();
 
     address

@@ -66,9 +66,8 @@ mod pb {
 
 use pb::compact_tx_streamer_server::{CompactTxStreamer, CompactTxStreamerServer};
 use pb::{
-    BlockId, BlockRange, ChainSpec, CompactBlock, Empty, GetAddressUtxosArg,
-    GetAddressUtxosReply, GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, RawTransaction,
-    SendResponse,
+    BlockId, BlockRange, ChainSpec, CompactBlock, Empty, GetAddressUtxosArg, GetAddressUtxosReply,
+    GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, RawTransaction, SendResponse,
     SubtreeRoot, TransparentAddressBlockFilter, TreeState, TxFilter,
 };
 

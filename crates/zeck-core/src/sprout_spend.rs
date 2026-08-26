@@ -166,8 +166,7 @@ pub fn compute_joinsplit_fields(
         // changes every commitment this produces, so it wants its own
         // consensus test rather than a drive-by edit.
         let r = prf_rho(&phi, i, &nullifiers[i]);
-        commitments[i] =
-            note_commitment(outputs[i].recipient.a_pk(), outputs[i].value, &rho, &r);
+        commitments[i] = note_commitment(outputs[i].recipient.a_pk(), outputs[i].value, &rho, &r);
 
         let note = SproutNotePlaintext {
             value: outputs[i].value,
@@ -175,11 +174,14 @@ pub fn compute_joinsplit_fields(
             r,
             memo: [0u8; 512],
         };
-        ciphertexts[i] =
-            encrypt_note(&esk, outputs[i].recipient.pk_enc(), &h_sig, i as u8, &note.to_bytes())
-            .map_err(|err| {
-                ZeckError::TransactionBuild(format!("encrypting a Sprout output: {err}"))
-            })?;
+        ciphertexts[i] = encrypt_note(
+            &esk,
+            outputs[i].recipient.pk_enc(),
+            &h_sig,
+            i as u8,
+            &note.to_bytes(),
+        )
+        .map_err(|err| ZeckError::TransactionBuild(format!("encrypting a Sprout output: {err}")))?;
     }
 
     Ok(JoinSplitFields {
@@ -365,8 +367,9 @@ pub fn load_sprout_proving_key(path: &std::path::Path) -> ZeckResult<Parameters<
         )));
     }
 
-    let file = std::fs::File::open(path)
-        .map_err(|err| ZeckError::InvalidConfig(format!("opening the Sprout proving key: {err}")))?;
+    let file = std::fs::File::open(path).map_err(|err| {
+        ZeckError::InvalidConfig(format!("opening the Sprout proving key: {err}"))
+    })?;
     // 1 MiB buffer: the file is large and read sequentially.
     let reader = std::io::BufReader::with_capacity(1024 * 1024, file);
     let mut reader = HashingReader::new(reader);
@@ -496,9 +499,9 @@ pub fn prove_joinsplit(
     );
 
     let mut bytes = [0u8; GROTH_PROOF_SIZE];
-    proof
-        .write(&mut bytes[..])
-        .map_err(|err| ZeckError::TransactionBuild(format!("serializing the Sprout proof: {err}")))?;
+    proof.write(&mut bytes[..]).map_err(|err| {
+        ZeckError::TransactionBuild(format!("serializing the Sprout proof: {err}"))
+    })?;
     Ok(bytes)
 }
 
@@ -558,7 +561,9 @@ pub fn build_and_sign_v4_shielding(
             .map(|(i, f)| {
                 TxIn::from_parts(
                     OutPoint::new(f.txid, f.index),
-                    Script(zcash_script::script::Code(sigs.get(i).cloned().unwrap_or_default())),
+                    Script(zcash_script::script::Code(
+                        sigs.get(i).cloned().unwrap_or_default(),
+                    )),
                     0xFFFF_FFFF,
                 )
             })
@@ -673,7 +678,9 @@ pub fn build_and_sign_v4_sprout_to_sapling(
     consensus_branch_id: BranchId,
     expiry_height: BlockHeight,
     joinsplits: Vec<sprout_tx::JsDescription>,
-    sapling_unauthed: sapling_crypto::builder::UnauthorizedBundle<zcash_protocol::value::ZatBalance>,
+    sapling_unauthed: sapling_crypto::builder::UnauthorizedBundle<
+        zcash_protocol::value::ZatBalance,
+    >,
     prover: &zcash_proofs::prover::LocalTxProver,
     key: &JoinSplitSigningKey,
     mut rng: impl rand_core::RngCore + rand_core::CryptoRng + Clone,
@@ -692,8 +699,7 @@ pub fn build_and_sign_v4_sprout_to_sapling(
 
     // Prove first: the sighash covers the proofs, and only the signatures
     // are excluded from it.
-    let sapling_proven =
-        sapling_unauthed.create_proofs(prover, prover, &mut rng, ());
+    let sapling_proven = sapling_unauthed.create_proofs(prover, prover, &mut rng, ());
 
     // The sighash is taken with the Sapling bundle proven but unsigned: its
     // binding signature is over this same digest, so it cannot be inside it.
@@ -766,8 +772,14 @@ mod tests {
         ];
         let addr = SproutPaymentAddress::from_spending_key(&recipient);
         let outputs = [
-            JoinSplitOutput { recipient: addr, value: 0 },
-            JoinSplitOutput { recipient: addr, value: 0 },
+            JoinSplitOutput {
+                recipient: addr,
+                value: 0,
+            },
+            JoinSplitOutput {
+                recipient: addr,
+                value: 0,
+            },
         ];
         compute_joinsplit_fields(
             &inputs,
@@ -822,8 +834,14 @@ mod tests {
         ];
         let addr = SproutPaymentAddress::from_spending_key(&recipient);
         let outputs = [
-            JoinSplitOutput { recipient: addr, value: 0 },
-            JoinSplitOutput { recipient: addr, value: 0 },
+            JoinSplitOutput {
+                recipient: addr,
+                value: 0,
+            },
+            JoinSplitOutput {
+                recipient: addr,
+                value: 0,
+            },
         ];
         let b = compute_joinsplit_fields(
             &inputs,
@@ -939,7 +957,10 @@ mod tests {
         tx.write(&mut bytes).expect("serialize");
         let reparsed = Transaction::read(&bytes[..], BranchId::Nu5).expect("re-read");
         assert_eq!(
-            reparsed.sprout_bundle().expect("bundle survives").joinsplit_sig,
+            reparsed
+                .sprout_bundle()
+                .expect("bundle survives")
+                .joinsplit_sig,
             bundle.joinsplit_sig
         );
     }
@@ -970,7 +991,10 @@ mod tests {
             panic!("a short file must fail");
         };
         let msg = format!("{err}");
-        assert!(msg.contains("expected"), "must state the expected size: {msg}");
+        assert!(
+            msg.contains("expected"),
+            "must state the expected size: {msg}"
+        );
     }
 
     #[test]

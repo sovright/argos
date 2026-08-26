@@ -21,7 +21,9 @@ use zcash_client_backend::data_api::{
 };
 use zcash_client_sqlite::{util::SystemClock, AccountUuid, WalletDb};
 use zcash_keys::encoding::AddressCodec;
-use zcash_keys::keys::{sapling::ExtendedSpendingKey, UnifiedAddressRequest, UnifiedFullViewingKey};
+use zcash_keys::keys::{
+    sapling::ExtendedSpendingKey, UnifiedAddressRequest, UnifiedFullViewingKey,
+};
 use zcash_transparent::address::TransparentAddress;
 
 use crate::{
@@ -79,9 +81,7 @@ pub fn imported_account_display(
     network: ZeckNetwork,
 ) -> ZeckResult<DerivedAccount> {
     let params = crate::workspace::consensus_network(network);
-    let (_, sapling_address) = extsk
-        .to_diversifiable_full_viewing_key()
-        .default_address();
+    let (_, sapling_address) = extsk.to_diversifiable_full_viewing_key().default_address();
 
     let ufvk = sapling_ufvk(extsk)?;
     let unified_address = ufvk

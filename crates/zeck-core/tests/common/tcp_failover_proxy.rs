@@ -52,9 +52,7 @@ pub struct TcpFailoverProxy {
 /// # Panics
 /// Panics if `upstreams` is empty — a proxy with no targets has nothing to
 /// forward to.
-pub async fn serve_tcp_failover_proxy(
-    upstreams: Vec<String>,
-) -> std::io::Result<TcpFailoverProxy> {
+pub async fn serve_tcp_failover_proxy(upstreams: Vec<String>) -> std::io::Result<TcpFailoverProxy> {
     assert!(
         !upstreams.is_empty(),
         "TcpFailoverProxy requires at least one upstream"
@@ -214,11 +212,7 @@ pub async fn serve_asymmetric_loss_proxy(
 /// bytes once `drop_after` bytes have been forwarded in that direction.
 /// Upstream reads continue (the upstream socket stays drained) so the
 /// upstream's send buffer doesn't block.
-async fn forward_with_response_drop(
-    client_stream: TcpStream,
-    target: &str,
-    drop_after: usize,
-) {
+async fn forward_with_response_drop(client_stream: TcpStream, target: &str, drop_after: usize) {
     let Ok(upstream_stream) = TcpStream::connect(target).await else {
         return;
     };

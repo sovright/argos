@@ -111,7 +111,9 @@ async fn the_rebuilt_tree_matches_the_nodes_sprout_root() {
 
         let fetched = peer.get_blocks(&hashes).await.expect("getdata");
         for hash in &hashes {
-            let block = fetched.get(hash).expect("every requested block must come back");
+            let block = fetched
+                .get(hash)
+                .expect("every requested block must come back");
             // Canopy is inactive on this chain, so every transaction that
             // can hold a JoinSplit parses under a pre-Canopy branch id.
             let joinsplits =

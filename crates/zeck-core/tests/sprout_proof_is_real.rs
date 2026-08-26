@@ -120,8 +120,14 @@ fn a_joinsplit_we_built_verifies_against_the_consensus_circuit() {
     // describe different owners.
     let recipient = sprout::SproutPaymentAddress::from_spending_key(&a_sk);
     let outputs = [
-        sprout_spend::JoinSplitOutput { recipient, value: 0 },
-        sprout_spend::JoinSplitOutput { recipient, value: 0 },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: 0,
+        },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: 0,
+        },
     ];
 
     // Everything leaves the Sprout pool: 1_000_000 in, 1_000_000 out through
