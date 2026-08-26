@@ -96,6 +96,21 @@ scans and sweeps exactly like a typed seed phrase. A zcashd `wallet.dat`
 holds flat, individually-stored keys with no HD seed; the scanner
 enumerates HD-derived account slots, so it has nothing to walk.
 
+**A Sapling spending key can also arrive as text**, with no wallet file at
+all: `argos_core::sapling_key` decodes zcashd's bech32
+`secret-extended-key-main1…` / `secret-extended-key-test1…` form and
+`keys_from_sapling_strings` packs it into the same `ImportedKeys` a wallet
+file produces, so the scan and sweep paths cannot tell the two apart. CLI
+`--sapling-key-file` (a file, never a flag — a spending key in argv lands in
+shell history and `ps`); GUI a paste field on the wallet screen. Both are
+combinable with a wallet file and deduplicate against it. Unlike Sprout's
+base58 constants, the human-readable prefixes come from
+`zcash_protocol::constants`, so there is no unverifiable-constant caveat —
+but the test pinning them to the ZIP-32 literals stays, so an upstream rename
+cannot silently move Argos off the prefix users hold. Viewing keys
+(`zxviews…`) are deliberately refused: they would show a balance that cannot
+be swept.
+
 **Transparent keys are handled outside that model entirely**
 (`crates/zeck-core/src/transparent_recovery.rs`): `GetAddressUtxos` plus a
 directly-driven `zcash_primitives` builder, no account and no wallet
