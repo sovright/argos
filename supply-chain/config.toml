@@ -281,6 +281,10 @@ criteria = "safe-to-deploy"
 version = "0.16.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.const-oid]]
+version = "0.9.6"
+criteria = "safe-to-deploy"
+
 [[exemptions.constant_time_eq]]
 version = "0.4.2"
 criteria = "safe-to-deploy"
@@ -339,6 +343,14 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ctor]]
 version = "0.2.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.curve25519-dalek]]
+version = "4.1.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.curve25519-dalek-derive]]
+version = "0.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.daggy]]
@@ -447,6 +459,14 @@ criteria = "safe-to-deploy"
 
 [[exemptions.dyn-clone]]
 version = "1.0.20"
+criteria = "safe-to-deploy"
+
+[[exemptions.ed25519]]
+version = "2.2.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.ed25519-zebra]]
+version = "4.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.embed-resource]]
@@ -1113,6 +1133,10 @@ criteria = "safe-to-deploy"
 version = "0.2.5"
 criteria = "safe-to-deploy"
 
+[[exemptions.pkcs8]]
+version = "0.10.2"
+criteria = "safe-to-deploy"
+
 [[exemptions.plist]]
 version = "1.8.0"
 criteria = "safe-to-deploy"
@@ -1249,6 +1273,10 @@ criteria = "safe-to-deploy"
 version = "0.13.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.rfd]]
+version = "0.16.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.ripemd]]
 version = "0.1.3"
 criteria = "safe-to-deploy"
@@ -1381,6 +1409,10 @@ criteria = "safe-to-deploy"
 version = "1.4.8"
 criteria = "safe-to-deploy"
 
+[[exemptions.signature]]
+version = "2.2.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.simd-adler32]]
 version = "0.3.9"
 criteria = "safe-to-deploy"
@@ -1415,6 +1447,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.spin]]
 version = "0.9.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.spki]]
+version = "0.7.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.stable_deref_trait]]
@@ -1487,6 +1523,14 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tauri-plugin]]
 version = "2.5.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.tauri-plugin-dialog]]
+version = "2.7.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.tauri-plugin-fs]]
+version = "2.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.tauri-plugin-opener]]
@@ -1575,6 +1619,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.toml]]
 version = "0.9.12+spec-1.1.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.toml]]
+version = "1.1.2+spec-1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.toml_datetime]]
@@ -2079,6 +2127,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.x11-dl]]
 version = "2.21.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.x25519-dalek]]
+version = "2.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.yoke]]

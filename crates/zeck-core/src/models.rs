@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::key_source::KeySource;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,9 +68,12 @@ pub struct DerivedAccount {
     pub transparent_change_address: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeScanConfig {
-    pub seed_phrase: SecretString,
+    /// Where the scan keys come from. A BIP-39 seed phrase
+    /// (`SeedKeySource`) or a legacy wallet file (`ImportedKeySource`);
+    /// the scanner does not distinguish between them.
+    pub key_source: Arc<dyn KeySource>,
     pub birthday: u32,
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
@@ -79,6 +84,24 @@ pub struct RuntimeScanConfig {
     /// "resume an unfinished scan" UI can identify this scan without the
     /// seed. Empty string is allowed and treated as "(unlabeled scan)".
     pub label: String,
+}
+
+// Manual, because `dyn KeySource` is not `Debug` — deliberately, so a key
+// set can never be rendered by accident. `describe()` is contractually
+// secret-free, which is what makes it safe to print here.
+impl std::fmt::Debug for RuntimeScanConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeScanConfig")
+            .field("key_source", &self.key_source.describe())
+            .field("birthday", &self.birthday)
+            .field("num_accounts", &self.num_accounts)
+            .field("gap_limit", &self.gap_limit)
+            .field("lightwalletd_url", &self.lightwalletd_url)
+            .field("data_dir", &self.data_dir)
+            .field("network", &self.network)
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,11 +457,23 @@ mod tests {
 
     #[test]
     fn sandblasting_zone_brackets_attack_window_on_mainnet() {
-        assert!(!in_sandblasting_zone(SANDBLASTING_START_HEIGHT - 1, ZeckNetwork::Mainnet));
-        assert!(in_sandblasting_zone(SANDBLASTING_START_HEIGHT, ZeckNetwork::Mainnet));
+        assert!(!in_sandblasting_zone(
+            SANDBLASTING_START_HEIGHT - 1,
+            ZeckNetwork::Mainnet
+        ));
+        assert!(in_sandblasting_zone(
+            SANDBLASTING_START_HEIGHT,
+            ZeckNetwork::Mainnet
+        ));
         assert!(in_sandblasting_zone(2_000_000, ZeckNetwork::Mainnet));
-        assert!(in_sandblasting_zone(SANDBLASTING_END_HEIGHT, ZeckNetwork::Mainnet));
-        assert!(!in_sandblasting_zone(SANDBLASTING_END_HEIGHT + 1, ZeckNetwork::Mainnet));
+        assert!(in_sandblasting_zone(
+            SANDBLASTING_END_HEIGHT,
+            ZeckNetwork::Mainnet
+        ));
+        assert!(!in_sandblasting_zone(
+            SANDBLASTING_END_HEIGHT + 1,
+            ZeckNetwork::Mainnet
+        ));
     }
 
     #[test]

@@ -26,8 +26,20 @@ pub fn derive_accounts(
     account_count: u32,
 ) -> ZeckResult<Vec<DerivedAccount>> {
     let seed = mnemonic_seed(seed_phrase)?;
-    let transparent_account =
-        legacy_transparent_account_key_from_seed(network, seed.expose_secret())?;
+    derive_accounts_from_seed(seed.expose_secret(), network, account_count)
+}
+
+/// The same derivation as [`derive_accounts`], from raw seed bytes.
+///
+/// The scanner reaches keys through a `KeySource`, which yields a seed
+/// rather than a mnemonic — a decrypted ZecWallet Lite wallet recovers a
+/// BIP-39 phrase, but a `KeySource` in general need not have one.
+pub fn derive_accounts_from_seed(
+    seed: &[u8; 64],
+    network: ZeckNetwork,
+    account_count: u32,
+) -> ZeckResult<Vec<DerivedAccount>> {
+    let transparent_account = legacy_transparent_account_key_from_seed(network, seed)?;
 
     let external_ivk = transparent_account
         .to_account_pubkey()
@@ -39,15 +51,7 @@ pub fn derive_accounts(
         .map_err(|err| ZeckError::Internal(err.to_string()))?;
 
     (0..account_count)
-        .map(|index| {
-            derive_account(
-                index,
-                network,
-                seed.expose_secret(),
-                &external_ivk,
-                &internal_ivk,
-            )
-        })
+        .map(|index| derive_account(index, network, seed, &external_ivk, &internal_ivk))
         .collect()
 }
 
@@ -174,7 +178,7 @@ fn transparent_path(scope: AddressScope, index: u32, coin_type: u32) -> String {
     format!("m / 44' / {coin_type}' / 0' / {scope_number} / {index}")
 }
 
-fn legacy_transparent_account_key_from_seed(
+pub(crate) fn legacy_transparent_account_key_from_seed(
     network: ZeckNetwork,
     seed: &[u8; 64],
 ) -> ZeckResult<AccountPrivKey> {
@@ -251,8 +255,7 @@ mod tests {
     use super::*;
 
     // Standard BIP-39 test vector: 24× "abandon" + "art"
-    const TEST_SEED: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon \
+    const TEST_SEED: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -433,8 +436,14 @@ mod tests {
             acc.sapling_address,
             "zs16uhd4mux24se6wkm74vld0ec63d4dxt3d7m80l5xytreplkkllrrf9c7fj859mhp8tkcq9hxfvj"
         );
-        assert_eq!(acc.transparent_receive_address, "t1dUDJ62ANtmebE8drFg7g2MWYwXHQ6Xu3F");
-        assert_eq!(acc.transparent_change_address, "t1eFjJFc6eRbhVLeDwsAkjTQoUid6LHi631");
+        assert_eq!(
+            acc.transparent_receive_address,
+            "t1dUDJ62ANtmebE8drFg7g2MWYwXHQ6Xu3F"
+        );
+        assert_eq!(
+            acc.transparent_change_address,
+            "t1eFjJFc6eRbhVLeDwsAkjTQoUid6LHi631"
+        );
         assert_eq!(acc.index, 0);
     }
 
@@ -449,7 +458,10 @@ mod tests {
         assert_ne!(uas[1], uas[2]);
 
         // All transparent receive addresses must be different
-        let tras: Vec<_> = accounts.iter().map(|a| &a.transparent_receive_address).collect();
+        let tras: Vec<_> = accounts
+            .iter()
+            .map(|a| &a.transparent_receive_address)
+            .collect();
         assert_ne!(tras[0], tras[1]);
         assert_ne!(tras[1], tras[2]);
     }

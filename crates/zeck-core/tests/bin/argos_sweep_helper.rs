@@ -58,6 +58,12 @@ use std::time::Duration;
 use argos_core::{
     RecoveryService, ScanConfig, ScanDiscovery, ScanPhase, SweepRequest, ZeckNetwork,
 };
+// Shared with `argos_sweep_helper` and pulled in by path: a `[[bin]]`
+// target cannot `use` the integration tests' `common` module.
+#[path = "../common/regtest_consensus.rs"]
+mod regtest_consensus;
+use regtest_consensus::install_regtest_consensus_params;
+
 use secrecy::SecretString;
 use serde::Serialize;
 
@@ -87,7 +93,9 @@ fn parse_args() -> Args {
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--data-dir" => {
-                data_dir = Some(PathBuf::from(iter.next().expect("--data-dir needs a value")));
+                data_dir = Some(PathBuf::from(
+                    iter.next().expect("--data-dir needs a value"),
+                ));
             }
             "--lightwalletd-url" => {
                 lightwalletd_url = Some(iter.next().expect("--lightwalletd-url needs a value"));
@@ -149,8 +157,12 @@ fn parse_args() -> Args {
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum HelperEvent<'a> {
-    Phase { phase: &'a str },
-    Block { scanned_to: u64 },
+    Phase {
+        phase: &'a str,
+    },
+    Block {
+        scanned_to: u64,
+    },
     Discovery {
         account_index: u32,
         pool: &'a str,
@@ -158,7 +170,9 @@ enum HelperEvent<'a> {
         address: &'a str,
         at_block_height: u64,
     },
-    ScanComplete { total_zatoshis: u64 },
+    ScanComplete {
+        total_zatoshis: u64,
+    },
     SweepStarting,
     Broadcast {
         source_account: u32,
@@ -167,8 +181,12 @@ enum HelperEvent<'a> {
         detail: &'a str,
         confirmed_height: Option<u32>,
     },
-    SweepComplete { broadcast_count: usize },
-    Error { message: &'a str },
+    SweepComplete {
+        broadcast_count: usize,
+    },
+    Error {
+        message: &'a str,
+    },
 }
 
 fn emit(event: &HelperEvent<'_>) {
@@ -206,6 +224,8 @@ fn phase_name(p: ScanPhase) -> &'static str {
 
 #[tokio::main]
 async fn main() {
+    install_regtest_consensus_params();
+
     let args = parse_args();
     let seed = std::env::var("ARGOS_TEST_SEED")
         .expect("ARGOS_TEST_SEED env var must be set (same contract as the C2 harness)");

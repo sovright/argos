@@ -21,6 +21,20 @@ network = "Regtest"
 # Key names are load-bearing: the struct is `deny_unknown_fields` with
 # PascalCase serialization and explicit renames for the NU6.x series, so a
 # typo fails the config load rather than silently defaulting.
+# Do NOT try to fix the decaying block subsidy with
+# `pre_blossom_halving_interval` here. The key exists and the config loads
+# without complaint, but it has no effect on Regtest: `Parameters::new_regtest`
+# takes a `RegtestParameters` struct that has no halving field and hardcodes
+# `.with_halving_interval(PRE_BLOSSOM_REGTEST_HALVING_INTERVAL)`. Verified
+# against zfnd/zebra v6.2.3, the pinned image. Measured with `getblocksubsidy`
+# after setting it to 1_000_000: 6.25 at height 1, 5.96e-6 at 6,000, 0.0 at
+# 32,400 — unchanged, i.e. still the ~150-block default.
+#
+# The key only applies to custom Testnets (`network = "Testnet"` plus
+# testnet_parameters), so making the subsidy survive to ZIP 212 heights would
+# mean migrating this harness off Regtest entirely. See the funding discussion
+# in README.md.
+
 [network.testnet_parameters.activation_heights]
 BeforeOverwinter = 1
 Overwinter = 1

@@ -22,6 +22,41 @@ Argos now includes the major recovery phases end to end:
 - Real shielding/sweep transaction construction and broadcast through `lightwalletd`
 - lightwalletd endpoint fallback, using comma-separated server URLs tried in order
 - Progress metadata for elapsed time and ETA, plus GUI discovery notifications and recovery-report export
+- Legacy wallet file import (`--wallet-file`): zcashd `wallet.dat` and ZecWallet Lite, including encrypted wallets
+
+## Recovering from a wallet file
+
+Instead of a seed phrase, Argos can read keys directly out of a legacy
+wallet file. The file is opened read-only and never modified. If it is
+encrypted you are prompted for the passphrase — there is deliberately no
+flag for it, so it cannot end up in shell history or in `ps` output.
+
+```
+argos --wallet-file /path/to/wallet.dat inspect-wallet
+```
+
+`inspect-wallet` is entirely local: no network, nothing written to disk.
+It reports how many transparent, Sapling, and Sprout keys were recovered,
+lists Sprout addresses, and names every record it could not read.
+
+**What you can do with the result depends on the wallet:**
+
+| Wallet | Scan and sweep? |
+|---|---|
+| ZecWallet Lite | **Yes.** Decryption recovers the BIP-39 mnemonic, so the wallet re-enters the normal HD recovery path. Add `--wallet-file` to `scan` or `sweep`. |
+| zcashd `wallet.dat` | **Transparent: scan + sweep.** **Sapling: scan only** — balances are found and reported, but moving them is not yet implemented. **Sprout: identified only.** Whatever a run does not cover is named explicitly before any balance is shown. |
+
+Partial coverage is always stated, never implied away. Argos will not
+report a balance that silently excludes a pool it never looked at — "0.5
+ZEC recovered" reads as complete to the person who most needs the answer,
+so every uncovered pool is named, with a reminder to keep the original
+wallet file.
+
+Transparent recovery does not use the wallet-database account model at
+all. That model exists to serve shielded scanning; transparent funds need
+only `GetAddressUtxos` and the transaction builder. This matters because a
+transparent-only wallet *cannot* have an account: ZIP-316 forbids a
+unified viewing key containing only transparent items.
 
 ## Security audit
 
@@ -43,7 +78,7 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
 - Broadcasted transactions are polled for confirmation during a bounded wait window. If they are still unmined at the end of that window, Argos reports them as pending instead of pretending they confirmed.
-- Sprout recovery is still out of scope for seed-only flows because ZecWallet Lite did not derive Sprout keys from the HD seed.
+- Sprout recovery from a seed phrase is still out of scope because ZecWallet Lite did not derive Sprout keys from the HD seed. Argos can now recover Sprout spending keys directly from a zcashd `wallet.dat`, but spending recovered Sprout funds is not yet implemented — extracting the key does not yet mean the funds can be moved.
 - The GUI defaults to auto gap-limit mode and can switch to an explicit account count when the user wants an exact scan depth.
 - The desktop complete screen can save a plain-text recovery report inside the persisted workspace.
 

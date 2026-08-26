@@ -58,6 +58,8 @@
             <span class="sidebar-credit-prefix">Built by</span>
             <img class="sidebar-credit-mark" src="./assets/sovright-caption.svg" alt="Sovright" />
           </a>
+          <!-- Selectable so it can be copied verbatim into a support message. -->
+          <p class="sidebar-version" id="app-version"></p>
         </div>
       </aside>
 
@@ -236,9 +238,7 @@
           </div>
           <div class="actions">
             <button class="primary" data-next="seed">I have my 24-word seed phrase</button>
-            <a class="secondary-link" href="https://github.com/zingolabs/zexcavator" target="_blank"
-              >I have a .dat file</a
-            >
+            <button class="secondary" data-next="wallet-file">I have a wallet file</button>
           </div>
           <p class="audit-notice">Independently audited by <a href="https://leastauthority.com" target="_blank" rel="noopener">Least Authority</a>.</p>
 
@@ -249,6 +249,149 @@
               brand-new scan above.
             </p>
             <ul id="resume-sessions" class="session-list"></ul>
+          </div>
+        </section>
+
+        <section class="screen" data-step="wallet-file">
+          <p class="eyebrow">Step 2</p>
+          <h2>Open a wallet file</h2>
+          <p class="lead">
+            A zcashd <code>wallet.dat</code> or a ZecWallet Lite wallet. Argos only reads it — the
+            file is never modified, and nothing is sent anywhere.
+          </p>
+
+          <div id="wallet-drop" class="drop-zone">
+            <p><strong>Drag the wallet file here</strong></p>
+            <p class="muted">or</p>
+            <button class="ghost" id="wallet-browse" type="button">Choose file…</button>
+            <p class="muted">You can also paste its full path below.</p>
+          </div>
+
+          <label class="field">
+            <span>Wallet file path</span>
+            <input id="wallet-path" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+
+          <label class="field" id="wallet-passphrase-field" hidden>
+            <span>Wallet passphrase</span>
+            <input id="wallet-passphrase" type="password" autocomplete="off" />
+            <small>
+              This wallet is encrypted. The passphrase is used to decrypt it in memory and is never
+              written to disk.
+            </small>
+          </label>
+
+          <div class="inline-actions">
+            <button class="ghost" id="wallet-open">Open wallet file</button>
+          </div>
+          <p id="wallet-status" class="status-line"></p>
+
+          <div id="wallet-summary" class="report-card" hidden>
+            <h3>What Argos found</h3>
+            <ul id="wallet-summary-list" class="session-list"></ul>
+            <div id="wallet-sprout-warning" class="guide-warning" hidden>
+              <strong id="wallet-sprout-headline"></strong>
+              <span id="wallet-sprout-detail"></span>
+              <div id="wallet-sprout-scan-cost" hidden></div>
+
+              <!-- Shown when the backend reports no Sprout support (the
+                   `sprout_supported` command). The panel below stays visible
+                   and is disabled instead of being hidden: the summary above
+                   already reports a Sprout key count, so hiding it would leave
+                   keys named with no explanation of why nothing can be done
+                   with them. Wording tracks the CLI's `print_sprout_next_steps`
+                   -- and names no subcommand, because none exists here. -->
+              <div id="sprout-unsupported" class="guide-warning" hidden>
+                <strong>This build cannot recover Sprout funds.</strong>
+                <span>
+                  Sprout support is not compiled in, so the controls below are
+                  disabled. The keys counted above are real and are not lost;
+                  nothing here moves or damages them. Recovering them needs an
+                  Argos build with Sprout support. Keep the original wallet
+                  file — it is the only copy of those keys.
+                </span>
+              </div>
+
+              <!-- Shown only when the wallet file yielded no spendable notes,
+                   which is the one case a scan can help with. Also accepts a
+                   raw key, for a user who has no wallet file at all. -->
+              <div id="sprout-scan-panel" hidden>
+                <hr />
+                <p><strong>Scan the chain for these notes</strong></p>
+                <label for="sprout-scan-keys">
+                  Sprout spending keys (one per line, <code>SK…</code> or <code>ST…</code>)
+                </label>
+                <textarea id="sprout-scan-keys" rows="3" spellcheck="false"
+                  placeholder="Leave blank to use the Sprout keys already in your wallet file"></textarea>
+                <button id="sprout-scan-check" type="button">Check keys</button>
+                <ul id="sprout-scan-addresses" class="session-list"></ul>
+                <button id="sprout-scan-run" type="button">Start scan</button>
+                <p id="sprout-scan-status" class="status-line"></p>
+                <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
+
+                <!-- Revealed only once a scan has actually found notes. A
+                     scan that finds money and offers nothing to click is
+                     six hours spent to be shown funds you still cannot
+                     reach. -->
+                <div id="sprout-scan-sweep" hidden>
+                  <hr />
+                  <p><strong>Move the funds this scan found</strong></p>
+                  <label for="sprout-scan-destination">Destination address</label>
+                  <input
+                    id="sprout-scan-destination"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="zs1… or a Unified Address with a Sapling receiver"
+                  />
+                  <label class="checkbox-row">
+                    <input type="checkbox" id="sprout-scan-confirm" />
+                    I understand this moves funds and cannot be undone.
+                  </label>
+                  <button id="sprout-scan-sweep-run" type="button">Sweep found funds</button>
+                  <ul id="sprout-scan-sweep-results" class="session-list"></ul>
+                </div>
+              </div>
+
+              <!-- Only shown when the wallet file itself yielded spendable
+                   notes. Sprout value must land on a Sapling receiver: it
+                   leaves the pool through the transparent pool and has to be
+                   consumed by a Sapling output in the same transaction. -->
+              <div id="wallet-sprout-sweep" hidden>
+                <hr />
+                <p><strong>Move these funds now</strong></p>
+                <p class="muted">
+                  No scan is needed — the note data is in this file. The destination must
+                  have a Sapling receiver.
+                </p>
+                <label for="sprout-destination">Destination address</label>
+                <input
+                  id="sprout-destination"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="zs1… or a Unified Address with a Sapling receiver"
+                />
+                <p id="sprout-sweep-plan" class="muted"></p>
+                <p id="sprout-sweep-pool" class="muted"></p>
+                <p id="sprout-sweep-params" class="muted"></p>
+                <button id="sprout-sweep-run" type="button" disabled>
+                  Sweep Sprout funds
+                </button>
+                <p id="sprout-sweep-status" class="status-line"></p>
+                <ul id="sprout-sweep-results" class="session-list"></ul>
+              </div>
+            </div>
+            <div id="wallet-diagnostics" class="guide-warning" hidden>
+              <strong>Some records could not be read.</strong>
+              <ul id="wallet-diagnostics-list"></ul>
+              Any key material in those records still exists only in the original file.
+            </div>
+          </div>
+
+          <div class="actions split">
+            <button class="secondary" data-prev="welcome">Back</button>
+            <button class="primary" data-next="config" id="wallet-next" disabled>Continue</button>
           </div>
         </section>
 
@@ -462,6 +605,12 @@
           <p id="scan-message" class="status-line"></p>
           <div class="report-card scan-summary-card">
             <p id="scan-totals" class="status-line">Grand total: 0.00000000 ZEC across 0 accounts.</p>
+            <!-- The total above counts only the pools this scan covers. A
+                 wallet file's Sprout keys are not among them, and the CLI
+                 says so loudly at this exact moment; the GUI used to stay
+                 silent, so a user could read a Sprout-excluding total as
+                 their whole balance. -->
+            <div id="scan-sprout-uncovered" class="guide-warning" hidden></div>
             <p id="scan-workspace" class="status-line">Workspace: not initialized</p>
           </div>
           <div class="table-card">
@@ -566,6 +715,10 @@
           <p class="eyebrow">Step 6</p>
           <h2>Recovery complete</h2>
           <p class="lead" id="complete-summary">Transactions broadcast successfully.</p>
+          <!-- Repeated here deliberately: this screen is where the "Delete
+               workspace" button lives, and the wallet file is the only copy
+               of any Sprout key it holds. -->
+          <div id="complete-sprout-uncovered" class="guide-warning" hidden></div>
           <div id="complete-txids" class="complete-txids"></div>
           <p id="complete-donation" hidden></p>
           <div class="report-card" id="complete-skipped"></div>
@@ -605,6 +758,7 @@
               until the cells are overwritten or TRIM'd. For high-value seeds, consider
               encrypting the volume Argos writes to.
             </p>
+            <div id="delete-sprout-uncovered" class="guide-warning" hidden></div>
             <div class="inline-actions">
               <button class="danger" id="delete-workspace">Delete workspace…</button>
               <p id="delete-workspace-status" class="status-line"></p>

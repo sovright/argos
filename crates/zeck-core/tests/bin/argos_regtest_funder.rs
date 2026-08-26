@@ -43,7 +43,30 @@
 //!     [--blocks <n>]           # coinbase blocks paid to the seed (default 4)
 //!     [--maturity-blocks <n>]  # blocks mined afterwards (default 100)
 //!     [--print-address-only]   # derive and print, mine nothing
+//!     [--address <addr>]       # fund this address instead of the seed's
+//!                              # shielded one (--t-addr is a legacy alias)
+//!     [--print-fixture-addresses]  # print the golden wallet fixture's
+//!                              # Sapling and transparent addresses, then exit
+//!     [--account <n>]          # HD account of the seed to pay (default 0)
+//!     [--transfer <addr>:<n>]  # pay <addr> n zatoshis from the treasury seed
+//!                              # instead of mining coinbase; works at any
+//!                              # height; repeatable, one transaction
+//!     [--lightwalletd-url <u>] # transfer mode only (default localhost:9067)
 //! ```
+//!
+//! ## Why `--t-addr` exists despite the section above
+//!
+//! The shielded-coinbase reasoning above is about `zcash_client_sqlite`'s
+//! UTXO selection, which needs to know an output is coinbase and cannot.
+//! Transparent-only recovery (`argos_core::transparent_recovery`) never
+//! touches the wallet database — it reads `GetAddressUtxos` and drives the
+//! transaction builder directly — so that limitation does not apply to it,
+//! and it needs a funded transparent address to test against.
+//!
+//! A consensus rule does still apply: a transaction spending transparent
+//! coinbase must have no transparent outputs. A transparent-only sweep is
+//! N transparent inputs to exactly one Sapling output with no change, so it
+//! satisfies that by construction.
 //!
 //! The seed to fund is read from `ARGOS_REGTEST_FUND_SEED`.
 //!
@@ -60,6 +83,12 @@
 
 use std::io::Write;
 use std::process::ExitCode;
+
+// A `[[bin]]` target cannot `use` the integration tests' `common` module, so
+// pull in just the shared key definition by path. Keeping one definition is
+// the point: the funder and the test must agree on the address.
+#[path = "../common/standalone_transparent.rs"]
+mod standalone_transparent;
 
 use argos_core::{
     workspace::{consensus_network, regtest_local_network, set_regtest_consensus_params},
@@ -81,9 +110,35 @@ const DEFAULT_FUNDING_BLOCKS: u32 = 4;
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event<'a> {
-    FundAddress { address: &'a str },
-    Mined { blocks: u32, height: u64 },
-    Funded { blocks_to_seed: u32, height: u64 },
+    FundAddress {
+        address: &'a str,
+    },
+    /// The golden wallet fixture's addresses, so setup.sh can fund the
+    /// imported-wallet tests without duplicating the derivation.
+    ///
+    /// `standalone_transparent` is not from the fixture: it belongs to the
+    /// transparent-only test, which needs an address the imported sweep
+    /// will not drain. See `tests/common/standalone_transparent.rs`.
+    FixtureAddresses {
+        sapling: String,
+        transparent: String,
+        standalone_transparent: String,
+    },
+    Mined {
+        blocks: u32,
+        height: u64,
+    },
+    /// A treasury payment, which works at any chain height.
+    Transferred {
+        payments: usize,
+        zatoshis: u64,
+        txid: &'a str,
+        treasury_remaining_zatoshis: u64,
+    },
+    Funded {
+        blocks_to_seed: u32,
+        height: u64,
+    },
 }
 
 fn emit(event: &Event<'_>) {
@@ -98,6 +153,73 @@ struct Args {
     blocks: u32,
     maturity_blocks: u32,
     print_address_only: bool,
+    /// When set, mine coinbase to this address instead of the seed's
+    /// shielded one. Any address Zebra accepts as a miner address.
+    t_addr: Option<String>,
+    /// Print the golden wallet fixture's addresses and exit.
+    print_fixture_addresses: bool,
+    /// `--transfer <addr>:<zatoshis>`, repeatable. Pays from the treasury
+    /// instead of mining coinbase, so it works at any height. All pairs go
+    /// into a single transaction — see `regtest_funding`.
+    transfers: Vec<(String, u64)>,
+    /// lightwalletd endpoint, used only by transfer mode: the treasury has to
+    /// be scanned and the payment broadcast, neither of which Zebra's RPC
+    /// does for a wallet.
+    lightwalletd_url: String,
+    /// Which HD account of the funded seed to pay. R-S29 needs two funded
+    /// accounts so a crash between two sweep broadcasts is observable: with
+    /// one account there is only ever one broadcast, and the property the
+    /// test asserts cannot exist.
+    account: u32,
+}
+
+/// Emit the golden wallet fixture's addresses.
+///
+/// They come from the fixture rather than being generated, because the
+/// imported-wallet tests import that exact file — funding any other
+/// address would leave them looking at an empty wallet.
+fn print_fixture_addresses() {
+    use argos_core::imported::{
+        encode_transparent_address, imported_transparent_keys, parse_sapling_extsk,
+    };
+    use secrecy::ExposeSecret;
+    use zcash_keys::encoding::AddressCodec;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+    );
+    let bytes = std::fs::read(path).expect("golden fixture must exist");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("golden fixture must import");
+
+    let extsk = parse_sapling_extsk(
+        keys.sapling
+            .first()
+            .expect("fixture must hold a Sapling key")
+            .extsk
+            .expose_secret(),
+    )
+    .expect("the fixture Sapling key must parse");
+    let (_, payment_address) = extsk.to_diversifiable_full_viewing_key().default_address();
+
+    let transparent = imported_transparent_keys(&keys).expect("transparent keys must resolve");
+    let params = consensus_network(ZeckNetwork::Testnet);
+
+    emit(&Event::FixtureAddresses {
+        sapling: payment_address.encode(&params),
+        transparent: encode_transparent_address(
+            &transparent
+                .first()
+                .expect("fixture must hold a transparent key")
+                .address,
+            ZeckNetwork::Testnet,
+        ),
+        standalone_transparent: encode_transparent_address(
+            &standalone_transparent::standalone_transparent_key().address,
+            ZeckNetwork::Testnet,
+        ),
+    });
 }
 
 fn parse_args() -> Args {
@@ -105,6 +227,11 @@ fn parse_args() -> Args {
     let mut blocks = DEFAULT_FUNDING_BLOCKS;
     let mut maturity_blocks = COINBASE_MATURITY;
     let mut print_address_only = false;
+    let mut t_addr = None;
+    let mut print_fixture_addresses = false;
+    let mut transfers: Vec<(String, u64)> = Vec::new();
+    let mut lightwalletd_url = String::from("http://localhost:9067");
+    let mut account: u32 = 0;
 
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -119,6 +246,24 @@ fn parse_args() -> Args {
                 maturity_blocks = value().parse().expect("--maturity-blocks must be a u32")
             }
             "--print-address-only" => print_address_only = true,
+            "--address" | "--t-addr" => t_addr = Some(value()),
+            "--print-fixture-addresses" => print_fixture_addresses = true,
+            "--transfer" => {
+                let raw = value();
+                let (addr, amount) = raw
+                    .rsplit_once(':')
+                    .expect("--transfer takes <address>:<zatoshis>");
+                transfers.push((
+                    addr.to_owned(),
+                    amount.parse().expect("--transfer amount must be a u64"),
+                ));
+            }
+            "--lightwalletd-url" => lightwalletd_url = value(),
+            "--account" => {
+                account = value()
+                    .parse()
+                    .expect("--account must be a u32 HD account index");
+            }
             other => panic!("unrecognized argument {other}"),
         }
     }
@@ -128,6 +273,11 @@ fn parse_args() -> Args {
         blocks,
         maturity_blocks,
         print_address_only,
+        t_addr,
+        print_fixture_addresses,
+        account,
+        transfers,
+        lightwalletd_url,
     }
 }
 
@@ -200,12 +350,15 @@ async fn block_count(url: &str) -> u64 {
 /// rejects the testnet HRP outright. The underlying receiver is identical;
 /// only the human-readable prefix differs, so decode under testnet and
 /// re-encode under regtest.
-fn regtest_encoded_sapling_address(seed: &SecretString) -> String {
+fn regtest_encoded_sapling_address(seed: &SecretString, account: u32) -> String {
     use zcash_keys::address::Address;
 
-    let accounts = argos_core::derive_accounts(seed, ZeckNetwork::Testnet, 1)
+    let count = account
+        .checked_add(1)
+        .expect("account index must leave room for a count");
+    let accounts = argos_core::derive_accounts(seed, ZeckNetwork::Testnet, count)
         .unwrap_or_else(|err| panic!("deriving accounts for the seed to fund: {err}"));
-    let testnet_encoded = &accounts[0].sapling_address;
+    let testnet_encoded = &accounts[account as usize].sapling_address;
 
     let address = Address::decode(
         &zcash_protocol::consensus::Network::TestNetwork,
@@ -219,10 +372,9 @@ fn regtest_encoded_sapling_address(seed: &SecretString) -> String {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = parse_args();
-    let seed = SecretString::new(
-        std::env::var("ARGOS_REGTEST_FUND_SEED")
-            .expect("ARGOS_REGTEST_FUND_SEED must be set to the mnemonic to fund"),
-    );
+    // Printing fixture addresses needs no seed — it reads the golden
+    // wallet file — so it must not be gated behind the seed requirement.
+    let seed_env = std::env::var("ARGOS_REGTEST_FUND_SEED");
 
     // Must precede any address encoding: `consensus_network` only reports
     // regtest once these are installed, and without them the derived address
@@ -230,7 +382,53 @@ async fn main() -> ExitCode {
     set_regtest_consensus_params(regtest_local_network())
         .expect("installing regtest consensus parameters");
 
-    let address = regtest_encoded_sapling_address(&seed);
+    if args.print_fixture_addresses {
+        print_fixture_addresses();
+        return ExitCode::SUCCESS;
+    }
+
+    let seed = SecretString::new(
+        seed_env.expect("ARGOS_REGTEST_FUND_SEED must be set to the mnemonic to fund"),
+    );
+
+    // Transfer mode. Unlike every branch below it, this one does not mine:
+    // it spends existing treasury notes, which is the whole point — coinbase
+    // is worthless at the heights the ZIP 212 tests force the chain to.
+    if !args.transfers.is_empty() {
+        let data_dir = std::env::temp_dir().join("argos-regtest-treasury");
+        match argos_core::regtest_funding::transfer_from_treasury(
+            &seed,
+            &args.transfers,
+            &args.lightwalletd_url,
+            data_dir,
+            ZeckNetwork::Testnet,
+        )
+        .await
+        {
+            Ok(transfer) => {
+                emit(&Event::Transferred {
+                    payments: args.transfers.len(),
+                    zatoshis: args.transfers.iter().map(|(_, z)| z).sum(),
+                    txid: &transfer.txid,
+                    treasury_remaining_zatoshis: transfer.remaining_zatoshis,
+                });
+                return ExitCode::SUCCESS;
+            }
+            Err(err) => {
+                eprintln!("[funder] treasury transfer failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // `--t-addr` is taken verbatim: it comes from a test that derived it
+    // from a raw key under regtest parameters, so re-encoding it here would
+    // only risk disagreeing with the address the test will query
+    // lightwalletd for.
+    let address = match &args.t_addr {
+        Some(t_addr) => t_addr.clone(),
+        None => regtest_encoded_sapling_address(&seed, args.account),
+    };
     emit(&Event::FundAddress { address: &address });
 
     if args.print_address_only {

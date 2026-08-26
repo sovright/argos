@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rusqlite::Connection;
 use secrecy::{ExposeSecret, SecretString};
 use tonic::transport::Channel;
@@ -12,6 +14,7 @@ use zcash_client_backend::{
 use crate::{
     derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
     error::{ZeckError, ZeckResult},
+    key_source::SeedKeySource,
     lightwalletd::{
         probe_lightwalletd_endpoints, probe_lightwalletd_endpoints_with_retry,
         validate_lightwalletd_network, validated_lightwalletd_endpoints,
@@ -632,7 +635,9 @@ async fn probe_shielded_window(
     let effective_height = probe_height.max(sapling_floor.saturating_add(1));
 
     let probe_config = RuntimeScanConfig {
-        seed_phrase: SecretString::new(seed_phrase.expose_secret().to_owned()),
+        key_source: Arc::new(SeedKeySource::new(SecretString::new(
+            seed_phrase.expose_secret().to_owned(),
+        ))),
         birthday: effective_height,
         num_accounts: Some(1),
         gap_limit: 1,

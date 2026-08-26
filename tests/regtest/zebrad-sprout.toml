@@ -1,0 +1,51 @@
+# Zebra configuration for the *Sprout* regtest chain.
+#
+# Separate from zebrad-regtest.toml for one reason: Canopy.
+#
+# ZIP 211 permanently disabled adding value to the Sprout pool from Canopy
+# onward. The main harness activates Canopy at height 1, so a Sprout note
+# cannot be created on it at all — a shielding JoinSplit is rejected with
+# "adding to the sprout pool is disabled after Canopy". That makes the Sprout
+# *spend* path, which is what Argos needs for recovery, impossible to test end
+# to end there: there is nothing to spend.
+#
+# This chain holds Canopy back so a note can be created while the pool is
+# still open, then activates everything through Ironwood shortly after, so the
+# spend can be exercised under the same consensus rules a real recovery faces.
+#
+# Sapling is active from height 1 on purpose: JoinSplits carrying Groth16
+# proofs live in v4 transactions, which Sapling introduces. Before Sapling a
+# JoinSplit would need a PHGR13 proof, which Argos never produces.
+#
+# NEVER POINT THIS AT A REAL NETWORK. Regtest disables proof-of-work.
+
+[network]
+network = "Regtest"
+
+[network.testnet_parameters.activation_heights]
+BeforeOverwinter = 1
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+# The whole point. Everything below 1000 can still add to the Sprout pool.
+Canopy = 1000
+NU5 = 1001
+NU6 = 1002
+"NU6.1" = 1003
+"NU6.2" = 1004
+"NU6.3" = 1005
+
+[state]
+ephemeral = false
+
+[rpc]
+listen_addr = "0.0.0.0:18232"
+enable_cookie_auth = false
+
+[mining]
+# Same throwaway miner address as the main harness; see zebrad-regtest.toml.
+miner_address = "tmFzBQeQYURQartF8tcvECq1minSJwyERe2"
+
+[tracing]
+use_color = false

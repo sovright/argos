@@ -59,10 +59,28 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use argos_core::{
-    derive_accounts, workspace::RecoveryWorkspace, RecoveryService, RuntimeScanConfig, ScanConfig,
-    ScanHandle, ScanPhase, SweepRequest, ZeckNetwork,
+    workspace::RecoveryWorkspace, RecoveryService, RuntimeScanConfig, ScanConfig, ScanHandle,
+    ScanPhase, SweepRequest, ZeckNetwork,
 };
 use secrecy::SecretString;
+
+/// How many blocks below the tip R-N13's latency scan starts from.
+///
+/// Bounds the injected-latency budget independently of chain length.
+///
+/// 100 is not arbitrary, and raising it will fail. At 300ms per block a
+/// 100-block window costs 30s, comfortably inside `STALL_TIMEOUT_SECS`
+/// (60s). A 200-block window costs exactly 60s and the scan never completes:
+/// `blocks_scanned` only advances when a batch commits, so the watchdog sees
+/// no progress, declares a stall, reconnects, and repeats forever.
+///
+/// That is a real defect rather than a harness limit — see the false-stall
+/// issue referenced on `sustained_high_latency_scan_completes`. This constant
+/// keeps the test inside the regime the current watchdog can handle so it
+/// still guards the rest of the latency path; it does not make the defect go
+/// away, and should be raised back to 200 once #190 is fixed and the
+/// watchdog accounts for in-flight batch progress.
+const LATENCY_WINDOW_BLOCKS: u64 = 100;
 
 // ─── Shared setup helper ─────────────────────────────────────────────────────
 
@@ -83,11 +101,17 @@ async fn complete_scan_against_test_seed(
     // path is a hash of (network, seed, birthday, scope); identical args
     // to `start_scan` produce the same root.
     let runtime = RuntimeScanConfig {
-        seed_phrase: SecretString::new(harness.test_seed().to_owned()),
-        // The Argos network activates Sapling at height 1; setting a tiny
-        // birthday keeps the scan fast on regtest. zcashd-regtest tops out
-        // at ~200 blocks after setup.sh runs, so the scan is sub-second.
-        birthday: 1,
+        key_source: std::sync::Arc::new(argos_core::SeedKeySource::new(SecretString::new(
+            harness.test_seed().to_owned(),
+        ))),
+        // Scan from where funding happened, not from genesis. The harness
+        // mines past 32,257 for ZIP 212, and the treasury pays test addresses
+        // after that, so everything worth finding sits near the tip and the
+        // blocks below it are empty. This used to read `birthday: 1` with a
+        // note that the chain "tops out at ~200 blocks" — true when funding
+        // was coinbase near genesis, and the single biggest cost in the suite
+        // once it stopped being.
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -104,9 +128,7 @@ async fn complete_scan_against_test_seed(
     // and propose_sweep doesn't care if source == destination — using a
     // derived address from the same seed avoids needing a separately-funded
     // second wallet in the harness.
-    let accounts = derive_accounts(&runtime.seed_phrase, runtime.network, 2)
-        .expect("derive_accounts for destination UA");
-    let destination_ua = accounts[1].unified_address.clone();
+    let destination_ua = regtest_encoded_unified_address_at(harness.test_seed(), 1);
 
     let scan_config = ScanConfig {
         birthday: runtime.birthday,
@@ -217,8 +239,7 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
     // Baseline: run a scan against the bare harness so we know what
     // `synced_to_height` and which discoveries the chain ought to produce.
     let baseline_dir = tempfile::tempdir().expect("temp data dir for baseline scan");
-    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn8-baseline")
-        .await;
+    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn8-baseline").await;
     let baseline_progress = baseline
         .service
         .get_scan_progress(&baseline.handle)
@@ -243,8 +264,10 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
     let fixture_dir = tempfile::tempdir().expect("temp data dir for fixture scan");
     let fixture_seed = harness.test_seed().to_owned();
     let runtime = argos_core::RuntimeScanConfig {
-        seed_phrase: SecretString::new(fixture_seed.clone()),
-        birthday: 1,
+        key_source: std::sync::Arc::new(argos_core::SeedKeySource::new(SecretString::new(
+            fixture_seed.clone(),
+        ))),
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -364,8 +387,7 @@ async fn hostile_compact_block_rejected_cleanly() {
 
     // Baseline first (same pattern as R-N8) so we have a target.
     let baseline_dir = tempfile::tempdir().expect("temp data dir for baseline scan");
-    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn9-baseline")
-        .await;
+    let baseline = complete_scan_against_test_seed(&harness, &baseline_dir, "rn9-baseline").await;
     let baseline_progress = baseline
         .service
         .get_scan_progress(&baseline.handle)
@@ -375,10 +397,15 @@ async fn hostile_compact_block_rejected_cleanly() {
     drop(baseline);
     drop(baseline_dir);
 
-    // Pick a height inside the funded range. Setup.sh funds the test seed
-    // around block ~100; injecting at block 5 is safely past Sapling
-    // activation (height 1) and well before any wallet-relevant block.
-    let hostile_height: u64 = 5;
+    // Inject inside the range this scan actually covers.
+    //
+    // This used to be a hardcoded height 5, with a note that "setup.sh funds
+    // the test seed around block ~100". Both stopped being true: funding moved
+    // to transfers near the tip, and scans start from `funding_birthday()`, so
+    // a block at height 5 is never fetched and the fault is never seen — the
+    // scan completes cleanly and the test fails claiming the hostile chain was
+    // accepted.
+    let hostile_height: u64 = u64::from(common::regtest_harness::funding_birthday()) + 2;
     let fake = common::fake_lightwalletd::FakeLightwalletd::builder()
         .upstream(harness.lightwalletd_url().to_owned())
         .inject_hostile_block_at_height(hostile_height)
@@ -389,7 +416,7 @@ async fn hostile_compact_block_rejected_cleanly() {
     let faulted_dir = tempfile::tempdir().expect("temp data dir for faulted scan");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -411,9 +438,9 @@ async fn hostile_compact_block_rejected_cleanly() {
             .expect("get_scan_progress");
         match progress.phase {
             ScanPhase::Error => break progress,
-            ScanPhase::Complete => panic!(
-                "[regtest] R-N9: scan must NOT complete cleanly against a hostile chain"
-            ),
+            ScanPhase::Complete => {
+                panic!("[regtest] R-N9: scan must NOT complete cleanly against a hostile chain")
+            }
             ScanPhase::Cancelled => panic!("[regtest] R-N9: scan unexpectedly cancelled"),
             _ => {
                 if std::time::Instant::now() > deadline {
@@ -453,8 +480,7 @@ async fn hostile_compact_block_rejected_cleanly() {
     // Uses a fresh workspace so we're testing "no global state pollution",
     // not resume.
     let recovery_dir = tempfile::tempdir().expect("temp data dir for recovery scan");
-    let recovery = complete_scan_against_test_seed(&harness, &recovery_dir, "rn9-recovery")
-        .await;
+    let recovery = complete_scan_against_test_seed(&harness, &recovery_dir, "rn9-recovery").await;
     let recovery_progress = recovery
         .service
         .get_scan_progress(&recovery.handle)
@@ -479,9 +505,21 @@ async fn hostile_compact_block_rejected_cleanly() {
 //   1. Scan reaches phase = Complete.
 //   2. Final synced_to_height equals the baseline uninterrupted scan against
 //      the bare harness.
-//   3. The scan completes within a generous-but-bounded budget (180s — the
-//      regtest harness has ~200 blocks; 200 × 300ms = 60s of pure latency, so
-//      180s is ~3× the lower bound).
+//   3. The scan completes within a generous-but-bounded budget (180s against
+//      `LATENCY_WINDOW_BLOCKS` × 300ms = 60s of pure latency, so ~3× the
+//      lower bound).
+//
+// The window is explicit rather than "however long the chain is" because the
+// chain length is now set by an unrelated requirement: the PCZT tests need
+// ZIP 212 enforced, which forces mining past height 32,257. Scanning all of
+// that at 300ms per block would take hours. An earlier version of this test
+// assumed a ~200-block harness and silently became unsatisfiable when that
+// stopped being true.
+//
+// The window is also capped by a real defect, not just by budget: past ~60s
+// of injected latency the stall watchdog kills the batch before it commits
+// and the scan reconnect-loops forever. See #190 and the comment on
+// `LATENCY_WINDOW_BLOCKS`.
 #[cfg(feature = "argos-network")]
 #[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
 #[tokio::test]
@@ -510,8 +548,26 @@ async fn sustained_high_latency_scan_completes() {
 
     let dir = tempfile::tempdir().expect("temp data dir for faulted scan");
     let seed = harness.test_seed().to_owned();
+
+    // Scan a bounded window rather than the whole chain. Injected latency is
+    // per emitted block, and the harness now mines past height 32,257 so the
+    // PCZT tests get ZIP 212 enforcement — at 300ms each that is over two
+    // hours, against a budget of three minutes. The window keeps the test
+    // measuring what it is named for (sustained per-block latency) instead of
+    // measuring chain length.
+    //
+    // The assertion below is unaffected: `synced_to_height` is the tip the
+    // wallet reached, which does not depend on where the scan started.
+    let tip = common::regtest_harness::zebra_rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .expect("getblockcount returns a number");
+    let birthday = u32::try_from(tip.saturating_sub(LATENCY_WINDOW_BLOCKS))
+        .expect("regtest heights fit in u32")
+        .max(1);
+
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday,
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -530,12 +586,17 @@ async fn sustained_high_latency_scan_completes() {
         let p = service.get_scan_progress(&handle).await.expect("progress");
         match p.phase {
             ScanPhase::Complete => break p,
-            ScanPhase::Error => panic!("[regtest] R-N13: scan errored under latency: {:?}", p.error),
+            ScanPhase::Error => {
+                panic!("[regtest] R-N13: scan errored under latency: {:?}", p.error)
+            }
             ScanPhase::Cancelled => panic!("[regtest] R-N13: scan cancelled"),
             _ => {
                 if std::time::Instant::now() > deadline {
                     panic!(
-                        "[regtest] R-N13: scan did not complete within 180s under 300ms latency"
+                        "[regtest] R-N13: scan did not complete within 180s under 300ms \
+                         latency (birthday {birthday}, tip {tip}); reached phase {:?}, \
+                         synced_to_height {:?}, blocks_scanned {}, message {:?}",
+                        p.phase, p.synced_to_height, p.blocks_scanned, p.message,
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -595,7 +656,7 @@ async fn bandwidth_throttled_scan_does_not_flag_false_stall() {
     let dir = tempfile::tempdir().expect("temp data dir for faulted scan");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -620,11 +681,16 @@ async fn bandwidth_throttled_scan_does_not_flag_false_stall() {
         }
         match p.phase {
             ScanPhase::Complete => break p,
-            ScanPhase::Error => panic!("[regtest] R-N14: scan errored under throttle: {:?}", p.error),
+            ScanPhase::Error => panic!(
+                "[regtest] R-N14: scan errored under throttle: {:?}",
+                p.error
+            ),
             ScanPhase::Cancelled => panic!("[regtest] R-N14: scan cancelled"),
             _ => {
                 if std::time::Instant::now() > deadline {
-                    panic!("[regtest] R-N14: scan did not complete within 240s under 32 KB/s throttle");
+                    panic!(
+                        "[regtest] R-N14: scan did not complete within 240s under 32 KB/s throttle"
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -680,7 +746,7 @@ async fn hung_stream_surfaces_err_within_bounded_time() {
     let dir = tempfile::tempdir().expect("temp data dir for hung-stream scan");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
@@ -813,7 +879,7 @@ async fn dns_drift_retry_succeeds_against_replacement_backend() {
     let dir = tempfile::tempdir().expect("temp data dir");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: proxy.url.clone(),
@@ -885,7 +951,7 @@ async fn captive_portal_shim_surfaces_clean_error() {
     // ScanConfig directly. The scan attempt will fail at the GetLightdInfo
     // probe step inside start_scan, surfaced as an Err.
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: shim.url.clone(),
@@ -899,8 +965,11 @@ async fn captive_portal_shim_surfaces_clean_error() {
     // start_scan returns Err immediately for the captive-portal case (the
     // probe fails synchronously). Older Argos paths may instead transition
     // to phase = Error post-start; tolerate both.
-    let start_outcome =
-        tokio::time::timeout(Duration::from_secs(30), service.start_scan(scan_config, seed)).await;
+    let start_outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        service.start_scan(scan_config, seed),
+    )
+    .await;
 
     match start_outcome {
         Err(_) => panic!(
@@ -1026,7 +1095,7 @@ async fn asymmetric_loss_recovers_via_watchdog_and_retry() {
     let dir = tempfile::tempdir().expect("temp data dir");
     let seed = harness.test_seed().to_owned();
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: proxy.url.clone(),
@@ -1124,9 +1193,7 @@ async fn all_endpoints_unreachable_surfaces_clean_error() {
          no silent infinite retry permitted",
     );
 
-    let err = outcome.expect_err(
-        "[regtest] all-unreachable list must surface Err, not Ok",
-    );
+    let err = outcome.expect_err("[regtest] all-unreachable list must surface Err, not Ok");
 
     let msg = err.to_string();
     assert!(
@@ -1281,12 +1348,10 @@ async fn multi_endpoint_fallback_respects_configured_order() {
     // ── Property 2: `preferred` reorders the list. ──────────────────────
     // Same combined URL — harness still appears second — but the preferred
     // argument names it explicitly, which must reorder it to the front.
-    let (_client, established) = argos_core::lightwalletd::connect_lightwalletd_endpoints(
-        &combined,
-        Some(&harness_url),
-    )
-    .await
-    .expect("connect with preferred=harness must succeed on the first attempt");
+    let (_client, established) =
+        argos_core::lightwalletd::connect_lightwalletd_endpoints(&combined, Some(&harness_url))
+            .await
+            .expect("connect with preferred=harness must succeed on the first attempt");
     assert_eq!(
         established, harness_url,
         "[regtest] preferred reordering should have surfaced harness first; got {established}"
@@ -1352,20 +1417,36 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
     let pre_balance: u64 = pre.accounts.iter().map(|a| a.total_zatoshis).sum();
     eprintln!("[regtest] pre-reorg: tip={pre_tip}, balance={pre_balance}");
 
+    // Driven through Zebra's RPC rather than `zcash_cli`. The harness ran
+    // zcashd when this test was written; the migration to Zebra left the
+    // helper pointing at a container that no longer exists, so the test had
+    // been failing on `No such container: argos-zcashd-regtest` rather than
+    // on anything it asserts (part of #186).
+    //
+    // Zebra does implement `invalidateblock` and `reconsiderblock`. The one
+    // constraint that matters here is that it can only invalidate a block in
+    // the *non-finalized* chain, which is why the reorg depth stays small.
     let invalidate_height = pre_tip.saturating_sub(5);
-    let invalidate_hash = zcashd_cli(&["getblockhash", &invalidate_height.to_string()]);
-    eprintln!(
-        "[regtest] invalidating block @ height {invalidate_height} (hash {invalidate_hash})",
-    );
-    let _ = zcashd_cli(&["invalidateblock", &invalidate_hash]);
-    let _ = zcashd_cli(&["generate", "10"]);
+    let invalidate_hash =
+        common::regtest_harness::zebra_rpc("getblockhash", serde_json::json!([invalidate_height]))
+            .await
+            .as_str()
+            .expect("getblockhash returns a hash string")
+            .to_owned();
+    eprintln!("[regtest] invalidating block @ height {invalidate_height} (hash {invalidate_hash})",);
+    let _ =
+        common::regtest_harness::zebra_rpc("invalidateblock", serde_json::json!([invalidate_hash]))
+            .await;
+    let _ = common::regtest_harness::zebra_rpc("generate", serde_json::json!([10])).await;
 
     // Let lightwalletd's polling loop observe the new tip.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let new_chain_tip: u64 = zcashd_cli(&["getblockcount"])
-        .parse()
-        .expect("[regtest] parse getblockcount output");
+    let new_chain_tip: u64 =
+        common::regtest_harness::zebra_rpc("getblockcount", serde_json::json!([]))
+            .await
+            .as_u64()
+            .expect("getblockcount returns a number");
     assert!(
         new_chain_tip > pre_tip,
         "[regtest] post-reorg chain tip must exceed pre-reorg tip; got new={new_chain_tip}, pre={pre_tip}"
@@ -1374,7 +1455,7 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
 
     // Second scan against the same workspace forces sync's reorg path.
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -1424,7 +1505,11 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
     let post_tip = final_progress
         .synced_to_height
         .expect("[regtest] post-reorg scan must populate synced_to_height");
-    let post_balance: u64 = final_progress.accounts.iter().map(|a| a.total_zatoshis).sum();
+    let post_balance: u64 = final_progress
+        .accounts
+        .iter()
+        .map(|a| a.total_zatoshis)
+        .sum();
     eprintln!("[regtest] post-reorg: tip={post_tip}, balance={post_balance}");
 
     assert!(
@@ -1439,60 +1524,6 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
     );
 
     eprintln!("[regtest] reorg detected and rescanned successfully");
-}
-
-/// Execute a zcash-cli command against the harness's zcashd-regtest container
-/// and return stdout (trimmed). Used by R-S26 to drive chain manipulation
-/// (invalidateblock, generate, getblockhash) via RPC.
-///
-/// Defaults to `docker exec` against the well-known container name from
-/// `tests/regtest/docker-compose.yml`. Bare-metal contributors (those
-/// running zcashd locally rather than via the docker harness) override the
-/// wrapper command line via:
-///
-///     ARGOS_REGTEST_ZCASH_CLI="zcash-cli -conf=/path/to/zcash.conf"
-///
-/// The override is parsed by whitespace-splitting and so cannot contain
-/// args with embedded spaces — sufficient for typical zcash-cli usage.
-///
-/// Panics rather than returning Result because every failure here is a
-/// hard test-setup error (docker missing, container down, zcash-cli
-/// returning non-zero) — the C2 tests are already `#[ignore]`'d so the
-/// panic only surfaces under `cargo test --ignored`.
-/// NOTE: stale since the Zebra migration. The default below shells into
-/// `argos-zcashd-regtest`, a container the harness no longer starts, so every
-/// caller of this helper fails until it is ported. Its only caller is the
-/// reorg test, which is stale for a second reason anyway — it expects a
-/// transparent-funded seed, and funding is now shielded coinbase (see
-/// tests/regtest/README.md). Porting means talking JSON-RPC to Zebra instead
-/// of `zcash-cli`; note Zebra does not implement `invalidateblock`, so the
-/// reorg has to be produced differently.
-fn zcashd_cli(args: &[&str]) -> String {
-    let wrapper = std::env::var("ARGOS_REGTEST_ZCASH_CLI").unwrap_or_else(|_| {
-        "docker exec argos-zcashd-regtest zcash-cli -conf=/srv/zcashd/.zcash/zcash.conf".to_owned()
-    });
-    let parts: Vec<&str> = wrapper.split_whitespace().collect();
-    let (program, base_args) = parts
-        .split_first()
-        .expect("[regtest] ARGOS_REGTEST_ZCASH_CLI must not be empty");
-    let output = std::process::Command::new(program)
-        .args(base_args)
-        .args(args)
-        .output()
-        .unwrap_or_else(|err| {
-            panic!("[regtest] failed to spawn `{program}` for zcash-cli: {err}")
-        });
-    if !output.status.success() {
-        panic!(
-            "[regtest] zcash-cli {args:?} failed: status={:?}, stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-    String::from_utf8(output.stdout)
-        .expect("[regtest] zcash-cli stdout was not valid UTF-8")
-        .trim()
-        .to_owned()
 }
 
 // ─── R-S27: Crash mid-scan resume ───────────────────────────────────────────
@@ -1523,6 +1554,14 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
 
     let harness = RegtestHarness::require();
 
+    // This test scans from genesis rather than from `funding_birthday()`, and
+    // deliberately so: its whole purpose is to SIGKILL a scan *in progress*.
+    // Starting near the tip leaves only a handful of blocks, the scan finishes
+    // before the kill lands, and the test fails with "subprocess should have
+    // died from SIGKILL, but exited cleanly". A long scan is the fixture here,
+    // not an accident.
+    let scan_birthday = "1";
+
     // ─── Baseline: uninterrupted scan, capture total_zatoshis ──────────────
     let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
     let baseline_handle = HelperSpawn::new(
@@ -1531,7 +1570,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", baseline_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", scan_birthday)
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-baseline")
@@ -1561,8 +1600,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     //
     // The threshold is well past the first batch boundary in librustzcash's
     // default batch size (~100 blocks), so the kill lands inside one of the
-    // mid-scan windows R-S27 is meant to exercise. Regtest setup.sh tops the
-    // chain at ~200 blocks; 50 leaves comfortable headroom on either side.
+    // mid-scan windows R-S27 is meant to exercise.
     const SCAN_KILL_AT: u64 = 50;
 
     let resume_dir = tempfile::tempdir().expect("resume tempdir");
@@ -1572,7 +1610,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", resume_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", scan_birthday)
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-crash")
@@ -1610,7 +1648,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     )
     .arg_value("--data-dir", resume_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value("--birthday", scan_birthday)
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs27-crash") // same label keeps the workspace key identical
@@ -1681,6 +1719,13 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
 
     let harness = RegtestHarness::require();
 
+    // Both accounts, funded here rather than assumed. R-S29 sweeps two
+    // accounts and asserts the resumed run produces exactly one broadcast, so
+    // both must hold funds when it starts — which an earlier sweep test would
+    // otherwise have taken.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
+    common::regtest_harness::fund_test_account(1, 1_250_000_000).await;
+
     // Multi-account funding gate: PR B's setup.sh exports
     // ARGOS_REGTEST_TEST_T_ADDR_1 when account 1 was funded. If a
     // contributor is running against an older setup.sh, fail with a
@@ -1697,10 +1742,7 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     // (Both account 0 and account 1 are sources; account 2 is the
     // destination, which keeps the sweep deterministic regardless of which
     // source account is processed first.)
-    let seed = SecretString::new(harness.test_seed().to_owned());
-    let accounts = derive_accounts(&seed, ZeckNetwork::Testnet, 3)
-        .expect("derive 3 accounts to choose a sweep destination outside the funded set");
-    let destination_ua = accounts[2].unified_address.clone();
+    let destination_ua = regtest_encoded_unified_address_at(harness.test_seed(), 2);
 
     let crash_dir = tempfile::tempdir().expect("crash tempdir");
 
@@ -1712,8 +1754,17 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--data-dir", crash_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua.clone())
-    .arg_value("--birthday", "1")
-    .arg_value("--num-accounts", "3") // 0, 1 funded; 2 is the destination
+    .arg_value(
+        "--birthday",
+        common::regtest_harness::funding_birthday().to_string(),
+    )
+    // Two accounts, not three. Account 2 supplies the destination address but
+    // must NOT be scanned: it belongs to the same seed, so tracking it makes
+    // the destination part of the wallet being swept. The first run sweeps
+    // account 0 into account 2; the resumed run then finds account 2 holding
+    // those funds and sweeps it as well, producing two broadcasts where the
+    // test asserts one — "got 2 broadcasts from accounts [1, 2]".
+    .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs29-crash")
     .arg_value("--pause-millis-between-broadcasts", "30000")
@@ -1732,10 +1783,34 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
         .await
         .expect("sweep-helper must emit SweepStarting within 180s");
 
-    // Give the first broadcast time to land in the wallet DB. 8s comfortably
-    // exceeds typical regtest broadcast latency (<1s) and is well inside
-    // the helper's 30s pause window.
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Wait for the first sweep transaction to reach the node's mempool, then
+    // kill. The mempool is the only real-time signal available.
+    //
+    // Two earlier approaches failed in opposite directions. A fixed 8s after
+    // `SweepStarting` fired *before* any broadcast, because building the first
+    // Sapling proof in a debug build takes longer than that — nothing had been
+    // swept, the resumed run swept both accounts, and the failure ("got 2
+    // broadcasts") looked like a double-spend defect. Waiting for the helper's
+    // own `Broadcast` event fires *after* the sweep finishes entirely: those
+    // are emitted from the returned `SweepOutcome`, not as each broadcast
+    // happens, so the helper had already exited and there was nothing to kill.
+    //
+    // `getrawmempool` turns non-empty the moment the first transaction is
+    // accepted, which is exactly the start of the helper's pause window.
+    let mempool_deadline = std::time::Instant::now() + Duration::from_secs(900);
+    loop {
+        let mempool =
+            common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+        if mempool.as_array().map(|a| a.len()).unwrap_or(0) > 0 {
+            eprintln!("[regtest] R-S29: first sweep transaction is in the mempool");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < mempool_deadline,
+            "[regtest] R-S29: no sweep transaction reached the mempool within 900s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     let kill_status = crash_handle
         .sigkill_and_wait()
@@ -1747,6 +1822,23 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     );
     eprintln!("[regtest] R-S29: SIGKILLed first run during pause between broadcasts");
 
+    // Mine the first run's broadcast into the chain before resuming.
+    //
+    // The test's premise is that the resumed run finds the already-swept
+    // account empty and so produces exactly one broadcast. That requires the
+    // killed run's transaction to be *confirmed*: a scan reads compact
+    // blocks, so an unconfirmed transaction sitting in the mempool is
+    // invisible to it. Without this the resumed run re-selects the same notes
+    // and the node rejects the rebroadcast — "another transaction in the
+    // mempool has already spent some of its inputs" — which is the mempool
+    // refusing a double spend, not Argos avoiding one.
+    //
+    // The original comment on this test assumed the tx "was included in the
+    // chain by the harness's miner". Nothing mines on this harness, so that
+    // step has to be explicit.
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     // ─── Resume run: same --data-dir, expect exactly 1 broadcast ──────────
     let resume_handle = HelperSpawn::new(
         env!("CARGO_BIN_EXE_argos-sweep-helper"),
@@ -1755,8 +1847,13 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     .arg_value("--data-dir", crash_dir.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua)
-    .arg_value("--birthday", "1")
-    .arg_value("--num-accounts", "3")
+    .arg_value(
+        "--birthday",
+        common::regtest_harness::funding_birthday().to_string(),
+    )
+    // Must match the crash run: a different account count is a different
+    // workspace, and the resume would start from scratch instead of resuming.
+    .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "rs29-crash") // identical workspace key
     .arg_value("--pause-millis-between-broadcasts", "0")
@@ -1770,7 +1867,8 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
         .expect("resume sweep-helper must run to completion");
     assert!(
         resume_status.success(),
-        "[regtest] R-S29: resume run did not exit cleanly: {resume_status:?}"
+        "[regtest] R-S29: resume run did not exit cleanly: {resume_status:?}; \
+         events: {resume_events:?}"
     );
 
     let resume_broadcasts: Vec<u32> = resume_events
@@ -1830,7 +1928,7 @@ async fn two_instances_same_workspace_cancels_first() {
     let temp_data_dir = tempfile::tempdir().expect("tempdir");
 
     let scan_config = ScanConfig {
-        birthday: 1,
+        birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -1972,16 +2070,73 @@ async fn workspace_deleted_between_scan_and_sweep_surfaces_clean_error() {
         donor_email: None,
     };
 
-    let result = fixture.service.propose_sweep(&fixture.handle, request).await;
-    let err = result.expect_err(
-        "propose_sweep against a deleted workspace must return Err, not Ok",
-    );
+    let result = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await;
+    let err =
+        result.expect_err("propose_sweep against a deleted workspace must return Err, not Ok");
 
     // Don't pin the error variant — the wallet-DB / cache-DB / sidecar-JSON
     // layers all touch the workspace and any of them surfacing the missing
     // path first is correct. The contract is: a clean Err that the GUI/CLI
     // can render to a user, not a panic.
     eprintln!("[regtest] propose_sweep failed as expected after workspace deletion: {err}");
+}
+
+// ─── Only wallet.sqlite deleted, directory intact ──────────────────────────
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
+async fn deleting_only_the_wallet_db_surfaces_a_clean_error() {
+    // The hole the workspace check was written for, and the one the
+    // whole-directory tests above cannot reach.
+    //
+    // `open_wallet_db` goes through `Connection::open`, which defaults to
+    // READ_WRITE | CREATE. With the parent directory intact, deleting only
+    // `wallet.sqlite` means the open *succeeds* by silently recreating an
+    // empty database — so a check that merely opens it passes, and
+    // `propose_sweep` quotes the stale in-memory balance: exactly the
+    // confidently-wrong number the check exists to prevent. It also leaves
+    // a stray empty DB behind during a documented read-only quote.
+    //
+    // Raised in review of #189, where the fix (requiring a readable wallet
+    // summary, not just a successful open) landed without a test that
+    // reaches this specific state.
+
+    let harness = RegtestHarness::require();
+    let temp_data_dir = tempfile::tempdir().expect("tempdir for workspace");
+    let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-rw27").await;
+
+    // Find the wallet DB and remove only that file.
+    let wallet_db = fixture.workspace_root.join("wallet.sqlite");
+    assert!(
+        wallet_db.exists(),
+        "[regtest] expected a wallet.sqlite at {}",
+        wallet_db.display()
+    );
+    std::fs::remove_file(&wallet_db).expect("removing wallet.sqlite must succeed");
+    assert!(
+        fixture.workspace_root.exists(),
+        "[regtest] the workspace directory must remain — that is the whole point"
+    );
+
+    let request = SweepRequest {
+        destination: fixture.destination_ua.clone(),
+        memo: None,
+        max_fee_zatoshis: None,
+        donation_rate: None,
+        donor_email: None,
+    };
+
+    let result = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await;
+    let err = result.expect_err(
+        "propose_sweep must fail when wallet.sqlite is gone, even though the directory \
+         remains and SQLite will happily create an empty database in its place",
+    );
+    eprintln!("[regtest] propose_sweep failed as expected after wallet.sqlite deletion: {err}");
 }
 
 // ─── R-W26: Workspace permissions tampered ─────────────────────────────────
@@ -2020,10 +2175,7 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
     struct RestorePerms<'a>(&'a std::path::Path);
     impl Drop for RestorePerms<'_> {
         fn drop(&mut self) {
-            let _ = std::fs::set_permissions(
-                self.0,
-                std::fs::Permissions::from_mode(0o700),
-            );
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
         }
     }
     let _restore = RestorePerms(&fixture.workspace_root);
@@ -2036,10 +2188,12 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
         donor_email: None,
     };
 
-    let result = fixture.service.propose_sweep(&fixture.handle, request).await;
-    let err = result.expect_err(
-        "propose_sweep against a workspace with stripped permissions must return Err",
-    );
+    let result = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await;
+    let err = result
+        .expect_err("propose_sweep against a workspace with stripped permissions must return Err");
 
     eprintln!("[regtest] propose_sweep failed as expected after chmod 0o000: {err}");
 }
@@ -2063,18 +2217,21 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
 #[tokio::test]
 async fn sweep_places_a_donation_output_when_rate_is_set() {
     let harness = RegtestHarness::require();
+
+    // Fund this test rather than inheriting whatever an earlier sweep left.
+    // These tests share the test seed's accounts and drain them, so which one
+    // had funds used to depend on the order cargo happened to run them in.
+    // Funding also mines a block, clearing any pending sweep from an earlier
+    // test — a scan cannot see an unconfirmed spend, so without that this scan
+    // would build a conflicting transaction and be rejected on broadcast.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
+
     let temp_data_dir = tempfile::tempdir().expect("tempdir for donation sweep");
     let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-donate").await;
 
     // A regtest donation recipient, distinct from the sweep destination, so the
     // donation-split path runs against a decodable testnet UA.
-    let accounts = derive_accounts(
-        &SecretString::new(harness.test_seed().to_owned()),
-        ZeckNetwork::Testnet,
-        3,
-    )
-    .expect("derive_accounts for donation UA");
-    let donation_ua = accounts[2].unified_address.clone();
+    let donation_ua = regtest_encoded_unified_address_at(harness.test_seed(), 2);
     assert_ne!(
         donation_ua, fixture.destination_ua,
         "donation recipient must differ from the sweep destination"
@@ -2088,7 +2245,10 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         donation_rate: Some(0.10),
         donor_email: None,
     };
-    let outcome = fixture.service.execute_sweep(&fixture.handle, request).await;
+    let outcome = fixture
+        .service
+        .execute_sweep(&fixture.handle, request)
+        .await;
 
     // Always clear the override, even on assertion failure below.
     std::env::remove_var("ARGOS_TEST_DONATION_ADDRESS");
@@ -2128,10 +2288,18 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
 #[ignore = "fixture smoke test; run with --ignored --features argos-network"]
 #[tokio::test]
 async fn fake_lightwalletd_smoke() {
-    use argos_core::lightwalletd::{
-        probe_lightwalletd_endpoints, validate_lightwalletd_network,
-    };
+    use argos_core::lightwalletd::{probe_lightwalletd_endpoints, validate_lightwalletd_network};
     use argos_core::models::ZeckNetwork;
+
+    // Needed even though this test talks to a fixture rather than the
+    // harness: `validate_lightwalletd_network` only relaxes the Sapling-height
+    // check when `regtest_consensus_params_installed()` is true, and
+    // `require()` is what installs them. Without this the test passes only
+    // when some *other* test in the same process happened to install them
+    // first, and fails on its own with the original #186 error — "server
+    // Sapling activation height 1 does not match expected 280000 for
+    // testnet". Latent for as long as it was only ever run in a full suite.
+    let _harness = RegtestHarness::require();
 
     let fake = common::fake_lightwalletd::FakeLightwalletd::builder()
         .chain_name("regtest")
@@ -2181,7 +2349,10 @@ async fn argos_scan_helper_smoke() {
     )
     .arg_value("--data-dir", temp.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
-    .arg_value("--birthday", "1")
+    .arg_value(
+        "--birthday",
+        common::regtest_harness::funding_birthday().to_string(),
+    )
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "smoke")
@@ -2208,10 +2379,12 @@ async fn argos_scan_helper_smoke() {
     // Confirm the helper observed a transition through ScanningShielded —
     // proves the stdout schema covers phase transitions, not just final
     // events.
-    let saw_shielded = handle.events().iter().any(|e| matches!(
-        e,
-        HelperEvent::Phase { phase } if phase == "scanning_shielded"
-    ));
+    let saw_shielded = handle.events().iter().any(|e| {
+        matches!(
+            e,
+            HelperEvent::Phase { phase } if phase == "scanning_shielded"
+        )
+    });
     assert!(
         saw_shielded,
         "[regtest] scan-helper smoke: expected a `scanning_shielded` phase event"
@@ -2234,15 +2407,18 @@ async fn argos_sweep_helper_smoke() {
     use common::subprocess_driver::{HelperEvent, HelperSpawn};
 
     let harness = RegtestHarness::require();
+
+    // Fund what this is about to sweep. Every sweep test drains the accounts
+    // it touches, so a test that does not ask for funds gets whatever the
+    // ones before it happened to leave — which is to say, nothing.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
+
     let temp = tempfile::tempdir().expect("temp data dir for sweep-helper smoke");
 
     // Derive account-1's UA from the test seed — same trick the workspace
     // tests use to get a syntactically-valid UA without needing a second
     // funded seed in the harness.
-    let seed = SecretString::new(harness.test_seed().to_owned());
-    let accounts = derive_accounts(&seed, ZeckNetwork::Testnet, 2)
-        .expect("derive_accounts for sweep destination");
-    let destination_ua = accounts[1].unified_address.clone();
+    let destination_ua = regtest_encoded_unified_address_at(harness.test_seed(), 1);
 
     let mut handle = HelperSpawn::new(
         env!("CARGO_BIN_EXE_argos-sweep-helper"),
@@ -2251,7 +2427,10 @@ async fn argos_sweep_helper_smoke() {
     .arg_value("--data-dir", temp.path().display().to_string())
     .arg_value("--lightwalletd-url", harness.lightwalletd_url().to_owned())
     .arg_value("--destination-ua", destination_ua)
-    .arg_value("--birthday", "1")
+    .arg_value(
+        "--birthday",
+        common::regtest_harness::funding_birthday().to_string(),
+    )
     .arg_value("--num-accounts", "2")
     .arg_value("--gap-limit", "5")
     .arg_value("--label", "smoke-sweep")
@@ -2261,7 +2440,11 @@ async fn argos_sweep_helper_smoke() {
     .await
     .expect("spawn argos-sweep-helper");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    // 600s, not 240s. setup.sh now funds accounts 0 and 1 (R-S29 cannot
+    // exist otherwise), so this sweeps two accounts and builds two Sapling
+    // proofs instead of one. Proving dominates, and these tests run against
+    // an unoptimised debug build.
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
     let broadcast_count = handle
         .wait_for(deadline, |events| {
             events.iter().find_map(|e| match e {
@@ -2270,10 +2453,11 @@ async fn argos_sweep_helper_smoke() {
             })
         })
         .await
-        .expect("sweep-helper must reach SweepComplete within 240s");
+        .expect("sweep-helper must reach SweepComplete within 600s");
 
-    // setup.sh as-of this PR funds only account 0, so we expect exactly one
-    // broadcast. The R-S29 PR will extend setup.sh to fund 2 accounts.
+    // Lower bound rather than an exact count: how many accounts setup.sh
+    // funds is the harness's business, not this test's. R-S29 is the test
+    // that depends on the count being exactly two.
     assert!(
         broadcast_count >= 1,
         "[regtest] sweep-helper smoke: expected at least one broadcast"
@@ -2320,19 +2504,28 @@ async fn argos_sweep_helper_smoke() {
 /// identical, only the HRP differs.
 #[cfg(feature = "argos-network")]
 fn regtest_encoded_unified_address(seed: &str) -> String {
+    regtest_encoded_unified_address_at(seed, 0)
+}
+
+/// As above, for a destination account other than the first.
+///
+/// Several tests deliberately sweep to an account *outside* the funded set,
+/// so they need a specific index rather than always account 0.
+#[cfg(feature = "argos-network")]
+fn regtest_encoded_unified_address_at(seed: &str, index: usize) -> String {
     use argos_core::workspace::consensus_network;
     use zcash_keys::address::Address;
 
     let accounts = argos_core::derive_accounts(
         &secrecy::SecretString::new(seed.to_owned()),
         argos_core::ZeckNetwork::Testnet,
-        1,
+        u32::try_from(index + 1).expect("account index fits u32"),
     )
     .expect("deriving destination accounts");
 
     let address = Address::decode(
         &zcash_protocol::consensus::Network::TestNetwork,
-        &accounts[0].unified_address,
+        &accounts[index].unified_address,
     )
     .expect("argos produced an undecodable unified address");
 
@@ -2343,30 +2536,30 @@ fn regtest_encoded_unified_address(seed: &str) -> String {
 #[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
 #[cfg(feature = "argos-network")]
 async fn post_ironwood_sweep_is_accepted_by_the_node() {
-    use argos_core::workspace::{regtest_local_network, set_regtest_consensus_params};
     use argos_core::{RecoveryService, ScanConfig, ScanPhase, SweepRequest, ZeckNetwork};
 
+    // `require()` installs the regtest activation heights for the whole
+    // process; without them this sweep would be signed for a pre-NU5 branch
+    // and rejected by the node, which is the regression under test.
     let harness = RegtestHarness::require();
 
-    // Install regtest activation heights before anything derives a branch ID.
-    // Without this the sweep below is signed for a pre-NU5 branch and the node
-    // rejects it — which is precisely the regression under test.
-    set_regtest_consensus_params(regtest_local_network())
-        .expect("installing regtest consensus parameters");
-
-    // Fund inside the test rather than relying on setup.sh having run. The
+    // Fund from the treasury rather than relying on setup.sh having run. The
     // sweep spends everything it finds, so a second run would otherwise find
     // an empty wallet — or worse, collide with the first run's transaction
-    // still sitting in the mempool. Topping up here keeps the test
-    // independently re-runnable against a long-lived chain.
-    fund_test_seed_with_shielded_coinbase().await;
+    // still sitting in the mempool.
+    //
+    // This used to mine shielded coinbase. That pays nothing here: the
+    // harness sits past height 32,257 for ZIP 212 and the regtest subsidy is
+    // worthless by ~6,000, so the test funded itself with zero and failed as
+    // though the sweep were broken.
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
 
     let data_dir = tempfile::tempdir().expect("temp data dir");
     let service = RecoveryService::new();
     let handle = service
         .start_scan(
             ScanConfig {
-                birthday: 1,
+                birthday: common::regtest_harness::funding_birthday(),
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: harness.lightwalletd_url().to_owned(),
@@ -2473,10 +2666,11 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
 async fn zebra_generate(url: &str, blocks: u32) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let host_port = url.strip_prefix("http://").unwrap_or(url).trim_end_matches('/');
-    let payload = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{blocks}]}}"#
-    );
+    let host_port = url
+        .strip_prefix("http://")
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{blocks}]}}"#);
     let mut stream = tokio::net::TcpStream::connect(host_port).await?;
     stream
         .write_all(
@@ -2493,28 +2687,397 @@ async fn zebra_generate(url: &str, blocks: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Mine shielded coinbase to the Argos test seed and then past maturity, by
-/// running the same `argos-regtest-funder` helper `setup.sh` uses. Keeping the
-/// funding in one place means the test and the documented setup path cannot
-/// drift apart.
+/// Transparent-only recovery, end to end against a real chain.
+///
+/// This is the only test that proves `build_sweep_transaction` produces a
+/// transaction the network actually accepts. Everything else about the
+/// transparent path — fee arithmetic, value conservation, dust refusal — is
+/// unit-tested, but a transaction that balances arithmetically can still be
+/// rejected for a wrong branch ID, a malformed script, or a bad signature.
+/// Only a node can tell us that.
+///
+/// The wallet here is transparent-only *by construction*: a single raw
+/// secp256k1 key, exactly what a zcashd `wallet.dat` yields. It never gets a
+/// wallet-database account, because it cannot have one.
+///
+/// Note the funds are coinbase. Zcash forbids a transaction spending
+/// transparent coinbase from having any transparent output, and a
+/// transparent-only sweep is N inputs to one Sapling output with no change —
+/// so it satisfies that by construction. That makes this the *stricter*
+/// consensus case: an ordinary UTXO differs only in being easier to spend.
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
 #[cfg(feature = "argos-network")]
-async fn fund_test_seed_with_shielded_coinbase() {
-    let zebra_rpc_url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:18232".to_owned());
+async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
+    use argos_core::lightwalletd::connect_lightwalletd_endpoints_with_retry;
+    use argos_core::transparent_recovery::{
+        build_sweep_transaction, fetch_transparent_utxos, plan_sweep, sapling_receiver, summarize,
+    };
+    use argos_core::workspace::consensus_network;
+    use argos_core::{derive_accounts, ZeckNetwork};
+    use common::regtest_harness::zebra_rpc;
+    use secrecy::SecretString;
+    use zcash_client_backend::proto::service::RawTransaction;
+    use zcash_proofs::prover::LocalTxProver;
+    use zcash_protocol::consensus::BlockHeight;
 
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_argos-regtest-funder"))
-        .env("ARGOS_REGTEST_FUND_SEED", RegtestHarness::require().test_seed())
-        .arg("--zebra-rpc-url")
-        .arg(&zebra_rpc_url)
-        .arg("--blocks")
-        .arg("2")
-        .output()
+    // Installs regtest consensus parameters process-wide; every encoding and
+    // branch-ID derivation below depends on them.
+    let harness = RegtestHarness::require();
+
+    // A key this test owns outright, funded by `setup.sh` at a height where
+    // the regtest subsidy is still worth something. It deliberately does not
+    // come from the golden fixture: the imported-Sapling test sweeps that
+    // wallet through `execute_sweep`, which drains its transparent UTXOs too,
+    // so a fixture key would be empty whenever this test ran second. It is
+    // also the more faithful fixture for a transparent-*only* wallet, which
+    // the Sapling-bearing golden file is not. See
+    // `tests/common/standalone_transparent.rs`.
+    let keys = vec![common::standalone_transparent::standalone_transparent_key()];
+
+    // Top this key up from the treasury. It is not an HD account of the test
+    // seed, so `fund_test_account` cannot reach it — hence `fund_address`.
+    // Without this the test inherits whatever setup.sh last left, and any
+    // earlier sweep run against the same chain leaves it empty.
+    common::regtest_harness::fund_address(
+        &argos_core::imported::encode_transparent_address(&keys[0].address, ZeckNetwork::Testnet),
+        1_250_000_000,
+    )
+    .await;
+
+    let (mut client, _endpoint) =
+        connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)
+            .await
+            .expect("connecting to the harness lightwalletd");
+
+    let utxos = fetch_transparent_utxos(&mut client, &keys, ZeckNetwork::Testnet)
         .await
-        .expect("spawning argos-regtest-funder");
+        .expect("fetching UTXOs");
+    assert!(
+        !utxos.is_empty(),
+        "the funded address must have spendable UTXOs; if this is empty the \
+         address encoding or the funding call is wrong, not the sweep"
+    );
+
+    let report = summarize(&utxos, keys.len(), 0, ZeckNetwork::Testnet);
+    assert!(
+        report.total_zatoshis > 0,
+        "a funded wallet must report a non-zero balance"
+    );
+
+    // Target the next block, as a wallet broadcasting now would.
+    let tip = zebra_rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .expect("getblockcount returns a number");
+    let target_height = BlockHeight::from_u32(u32::try_from(tip).expect("height fits u32") + 1);
+    let params = consensus_network(ZeckNetwork::Testnet);
+
+    let plan = plan_sweep(&params, target_height, &utxos)
+        .expect("planning must succeed for a funded wallet")
+        .expect("a funded wallet must produce a plan");
+    assert_eq!(
+        plan.output_zatoshis + plan.fee_zatoshis,
+        plan.total_input_zatoshis
+    );
+
+    // Destination: a unified address from the harness seed. It must be
+    // unified, not a bare Sapling address — Argos's destination policy
+    // rejects non-UA destinations, and `sapling_receiver` deliberately goes
+    // through that same check rather than around it. Testnet-encoded like
+    // every other destination in this suite; the encoding is a display
+    // concern and the builder consumes the raw receiver.
+    let accounts = derive_accounts(
+        &SecretString::new(harness.test_seed().to_owned()),
+        ZeckNetwork::Testnet,
+        1,
+    )
+    .expect("deriving a destination");
+    let recipient = sapling_receiver(&accounts[0].unified_address, ZeckNetwork::Testnet)
+        .expect("the seed's unified address must expose a Sapling receiver");
+
+    let prover = LocalTxProver::bundled();
+    let tx = build_sweep_transaction(
+        &params,
+        target_height,
+        &utxos,
+        &keys,
+        &plan,
+        recipient,
+        &prover,
+        &prover,
+    )
+    .expect("building the sweep transaction");
+
+    let mut raw = Vec::new();
+    tx.write(&mut raw).expect("serializing the transaction");
+
+    // The assertion that matters: the node accepts it. A wrong branch ID, a
+    // malformed script, or a bad signature all fail here and nowhere earlier.
+    let response = client
+        .send_transaction(RawTransaction {
+            data: raw,
+            height: 0,
+        })
+        .await
+        .expect("send_transaction RPC")
+        .into_inner();
+    assert_eq!(
+        response.error_code, 0,
+        "the node rejected the sweep transaction: {}",
+        response.error_message
+    );
+
+    // Mine it and confirm it actually landed, rather than trusting mempool
+    // acceptance alone.
+    zebra_rpc("generate", serde_json::json!([1])).await;
+    let txid = tx.txid().to_string();
+    let mined = zebra_rpc("getrawtransaction", serde_json::json!([txid, 1])).await;
+    assert!(
+        mined.get("height").and_then(|h| h.as_u64()).is_some(),
+        "the swept transaction must be mined into a block, got: {mined}"
+    );
+
+    // And the wallet is now empty: the sweep moved everything.
+    let after = fetch_transparent_utxos(&mut client, &keys, ZeckNetwork::Testnet)
+        .await
+        .expect("re-fetching UTXOs");
+    let after_total: u64 = after.iter().fold(0u64, |acc, u| {
+        acc.saturating_add(u64::from(u.txout.value()))
+    });
+    assert_eq!(
+        after_total, 0,
+        "every UTXO must have been swept; {} zatoshis remain",
+        after_total
+    );
+}
+
+/// An imported zcashd wallet is scanned as real wallet-database accounts.
+///
+/// The unit tests prove `register_imported_accounts` writes the right rows;
+/// only a chain proves the scanner then *uses* them — that a Sapling
+/// account with no ZIP-32 derivation actually syncs, and that the
+/// transparent keys hanging off it as standalone receivers are picked up
+/// in the same pass rather than needing the separate transparent path.
+///
+/// The fixture wallet holds no funds on this chain, so the assertion is
+/// about the scan completing over real accounts, not about a balance. A
+/// scan that silently found zero accounts would look identical in the
+/// total but differ here: the account count and the terminal phase.
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
+#[cfg(feature = "argos-network")]
+async fn an_imported_zcashd_wallet_scans_as_wallet_accounts() {
+    use argos_core::{ImportedKeySource, RecoveryService, ScanConfig, ScanPhase, ZeckNetwork};
+
+    let harness = RegtestHarness::require();
+
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+    );
+    let bytes = std::fs::read(fixture).expect("golden fixture must exist");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("the plaintext fixture must import");
+    let sapling_keys = keys.sapling.len();
+    assert!(
+        sapling_keys > 0 && !keys.transparent.is_empty(),
+        "the fixture must hold both Sapling and transparent keys or this proves nothing"
+    );
+    // The property under test only exists for a wallet with no seed.
+    assert!(
+        keys.mnemonic.is_none(),
+        "the fixture must be seedless or this exercises the HD path instead"
+    );
+
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: String::new(),
+            },
+            std::sync::Arc::new(ImportedKeySource::new(keys)),
+        )
+        .await
+        .expect("starting an imported scan");
+
+    let progress = loop {
+        let progress = service
+            .get_scan_progress(&handle)
+            .await
+            .expect("scan progress should be readable");
+        if progress.phase.is_terminal() {
+            break progress;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+
+    assert_eq!(
+        progress.phase,
+        ScanPhase::Complete,
+        "an imported scan must complete, got {:?}: {:?}",
+        progress.phase,
+        progress.error
+    );
+    assert_eq!(
+        progress.accounts.len(),
+        sapling_keys,
+        "every imported Sapling key must appear as a scanned account"
+    );
+    // The account must be a real one, not a placeholder: a scanned account
+    // reports a usable address.
+    assert!(
+        !progress.accounts[0].sapling_address.is_empty(),
+        "an imported account must report its Sapling address"
+    );
+    assert!(
+        !progress.accounts[0].transparent_receive_address.is_empty(),
+        "the imported transparent keys must be attached to the account"
+    );
+}
+
+/// Spending an imported Sapling key, end to end against a real node.
+///
+/// This is the assertion the whole PCZT detour exists for. A standalone
+/// `sapzkey` cannot be spent through `SpendingKeys`, which takes its
+/// Sapling authority solely from a `UnifiedSpendingKey`; the claim is that
+/// the PCZT roles can. Nothing short of a node accepting the transaction
+/// proves that — a PCZT can be assembled, proved, and signed and still be
+/// rejected for a wrong sighash, a missing proof generation key, or a
+/// signature over the wrong bundle.
+///
+/// The wallet here is seedless by construction: one Sapling key, imported,
+/// registered with no ZIP-32 derivation.
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+#[tokio::test]
+#[cfg(feature = "argos-network")]
+async fn an_imported_sapling_key_can_be_spent_via_pczt() {
+    use argos_core::{ImportedKeySource, RecoveryService, ScanConfig, ScanPhase, ZeckNetwork};
+    use common::regtest_harness::zebra_rpc;
+
+    let harness = RegtestHarness::require();
+
+    // A real Sapling key our own parser recovered from a wallet zcashd wrote.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../argos-wallet-import/tests/fixtures/sprout-plaintext.dat"
+    );
+    let bytes = std::fs::read(fixture).expect("golden fixture must exist");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("fixture must import");
+    assert!(
+        keys.mnemonic.is_none(),
+        "the fixture must be seedless or this exercises the HD path"
+    );
+    assert!(
+        !keys.sapling.is_empty(),
+        "the fixture must hold a Sapling key or there is nothing to spend"
+    );
+
+    // Funding comes from `setup.sh`, which pays shielded coinbase to this
+    // exact address in the first few hundred blocks — the only heights
+    // where the regtest subsidy is worth anything. The test cannot fund
+    // itself: it runs above height 32,257 for PCZT's ZIP 212 requirement,
+    // and coinbase there is worth zero.
+    //
+    // The birthday must therefore be 1. Starting anywhere near the tip
+    // would scan past the funding and find an empty wallet. The cost is a
+    // full-chain scan, which is why this test takes over a minute.
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let config = ScanConfig {
+        birthday: 1,
+        num_accounts: Some(1),
+        gap_limit: 1,
+        lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        data_dir: data_dir.path().to_owned(),
+        network: ZeckNetwork::Testnet,
+        label: String::new(),
+    };
+    // `ImportedKeys` is deliberately not `Clone` — it holds spending keys —
+    // so re-parse the fixture for the second consumer instead.
+    let source = std::sync::Arc::new(ImportedKeySource::new(
+        argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+            .expect("fixture must import"),
+    ));
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(config.clone(), source.clone())
+        .await
+        .expect("starting the imported scan");
+    let progress = loop {
+        let progress = service
+            .get_scan_progress(&handle)
+            .await
+            .expect("progress readable");
+        if progress.phase.is_terminal() {
+            break progress;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    assert_eq!(
+        progress.phase,
+        ScanPhase::Complete,
+        "the scan must complete: {:?}",
+        progress.error
+    );
+    assert!(
+        progress.accounts[0].sapling_zatoshis > 0,
+        "the funded Sapling note must be visible before it can be spent; got {:?}",
+        progress.accounts[0]
+    );
+
+    // Sweep through `RecoveryService::execute_sweep` — the surface the CLI
+    // and the GUI both call — rather than the builder underneath it. That
+    // covers the routing that sends a seedless key source down the imported
+    // path, which is the part a front-end depends on and which calling the
+    // builder directly would leave untested.
+    let destination = regtest_encoded_unified_address(harness.test_seed());
+    let outcome = service
+        .execute_sweep(
+            &handle,
+            SweepRequest {
+                destination: destination.clone(),
+                memo: None,
+                donation_rate: None,
+                donor_email: None,
+                max_fee_zatoshis: None,
+            },
+        )
+        .await
+        .expect("the imported sweep must succeed");
 
     assert!(
-        output.status.success(),
-        "funding the test seed failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        outcome.error.is_none(),
+        "the sweep reported an error: {:?}",
+        outcome.error
+    );
+    let sapling_tx = outcome
+        .transactions
+        .iter()
+        .find(|tx| tx.detail.contains("Sapling"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no Sapling transaction was broadcast; skipped: {:?}",
+                outcome.skipped_accounts
+            )
+        });
+    let txid = sapling_tx
+        .txid
+        .as_ref()
+        .expect("a broadcast transaction must have a txid");
+
+    // Mempool acceptance is not proof of validity — mine it and confirm.
+    zebra_rpc("generate", serde_json::json!([1])).await;
+    let mined = zebra_rpc("getrawtransaction", serde_json::json!([txid, 1])).await;
+    assert!(
+        mined.get("height").and_then(|h| h.as_u64()).is_some(),
+        "the sweep must be mined, got: {mined}"
     );
 }

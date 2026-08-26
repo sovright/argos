@@ -122,14 +122,70 @@ message GetAddressUtxosReplyList {
     repeated GetAddressUtxosReply addressUtxos = 1;
 }
 
-// Pruned CompactTxStreamer service: only the RPC methods used by the Argos
-// gRPC client. The upstream service additionally exposes GetLatestBlock,
+// Argument to GetLatestBlock. Empty in the upstream definition too — the
+// name is historical.
+message ChainSpec {}
+
+// Field numbers and names must match upstream exactly: the fixture
+// re-encodes between these types and the upstream client's via prost, which
+// matches on the wire format, not on Rust type identity.
+enum ShieldedProtocol {
+    sapling = 0;
+    orchard = 1;
+    ironwood = 2;
+}
+
+message GetSubtreeRootsArg {
+    // Index identifying where to start returning subtree roots
+    uint32 startIndex = 1;
+    // Shielded protocol to return subtree roots for
+    ShieldedProtocol shieldedProtocol = 2;
+    // Maximum number of entries to return, or 0 for all entries.
+    uint32 maxEntries = 3;
+}
+
+message SubtreeRoot {
+    // The 32-byte Merkle root of the subtree.
+    bytes rootHash = 2;
+    // The hash of the block that completed this subtree.
+    bytes completingBlockHash = 3;
+    // The height of the block that completed this subtree in the main chain.
+    uint64 completingBlockHeight = 4;
+}
+
+// Pruned CompactTxStreamer service: only the RPC methods reachable through
+// the Argos gRPC client. The upstream service additionally exposes
 // GetBlockNullifiers, GetBlockRangeNullifiers, GetTaddressTransactions,
 // GetTaddressBalance(Stream), GetMempoolTx, GetMempoolStream,
-// GetLatestTreeState, GetSubtreeRoots, GetAddressUtxosStream, and Ping;
-// none of those are called by Argos at the time this fixture was written.
-// If Argos starts using one, add it here and to the FakeLightwalletd impl.
+// GetLatestTreeState, GetAddressUtxosStream, and Ping; none of those are
+// called at the time of writing.
+//
+// Pruning has a sharp edge worth understanding before adding to it. An RPC
+// absent here is not a compile error anywhere — tonic's router simply
+// answers UNIMPLEMENTED at runtime, and a scan fails with "Operation is not
+// implemented or not supported" during setup, long before whatever fault the
+// test meant to inject. That is exactly how GetLatestBlock and
+// GetSubtreeRoots came to be missing (issue #186): Argos does not call them
+// directly, `zcash_client_backend::sync::run` does, so the list above went
+// stale silently as the backend evolved.
+//
+// So the rule is *reachable through Argos*, not *called by Argos*. When
+// upgrading zcash_client_backend, diff its `sync.rs` against this service.
 service CompactTxStreamer {
+    // Called by zcash_client_backend::sync::run to learn the chain tip.
+    // Argos never calls it directly.
+    rpc GetLatestBlock(ChainSpec) returns (BlockID) {}
+
+    // Called by zcash_client_backend::sync::run to initialize shard trees.
+    // Argos never calls it directly.
+    rpc GetSubtreeRoots(GetSubtreeRootsArg) returns (stream SubtreeRoot) {}
+
+    // The *streaming* sibling of GetAddressUtxos below, used by
+    // zcash_client_backend::sync::run to refresh transparent outputs. Argos
+    // calls only the unary form, which is why having that one is not enough
+    // — the two are separate methods on the wire.
+    rpc GetAddressUtxosStream(GetAddressUtxosArg) returns (stream GetAddressUtxosReply) {}
+
     // Used by Argos's birthday probe (Phase 1 needs GetBlock indirectly via
     // the sync machinery; kept for completeness since the sync backend may
     // call it). Returns a single compact block.
