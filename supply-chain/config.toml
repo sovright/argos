@@ -630,7 +630,7 @@ version = "0.18.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.h2]]
-version = "0.4.13"
+version = "0.4.19"
 criteria = "safe-to-deploy"
 
 [[exemptions.hashbrown]]
