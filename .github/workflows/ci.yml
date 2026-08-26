@@ -135,7 +135,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
@@ -181,6 +183,29 @@ jobs:
           docker compose --profile sprout -f tests/regtest/docker-compose.yml logs --tail=50 zcashd-sprout || true
           exit 1
 
+      # `sprout_scan_finds_a_real_note` PLANTS a note, which means building a
+      # JoinSplit, which needs the Sprout proving key -- an earlier version of
+      # this job asserted these two tests needed no parameters. That was wrong,
+      # and CI is where it surfaced. Cached, so the 725 MB download happens
+      # once rather than per run.
+      - name: Cache Sprout proving parameters
+        id: sprout-params
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: ~/.zcash-params/sprout-groth16.params
+          key: sprout-groth16-params-v1
+
+      - name: Fetch Sprout proving parameters
+        if: steps.sprout-params.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.zcash-params
+          curl -fsSL --retry 3 -o ~/.zcash-params/sprout-groth16.params \
+            https://download.z.cash/downloads/sprout-groth16.params
+          # The params are verified by digest before use (see sprout_sweep.rs),
+          # but check the size here so a truncated download fails loudly rather
+          # than as a confusing proving error.
+          test "$(stat -c%s ~/.zcash-params/sprout-groth16.params)" = "725523612"
+
       # `--features sprout` AND `--ignored`, both required. These are the only
       # tests that exercise the Sprout scan end to end, and they are the reason
       # this job exists: `argos scan-sprout` once shipped unable to scan
@@ -188,9 +213,9 @@ jobs:
       # page -- while the docs described it as proven on regtest. Nothing in
       # CI ran them, so nothing caught it.
       #
-      # Deliberately not the whole `--ignored` set: the Sprout *proving* tests
-      # need the 725 MB parameter file, which is a separate download and a
-      # separate job if it is ever wanted. These two need no parameters.
+      # Deliberately not the whole `--ignored` set: the remaining Sprout tests
+      # are proving-heavy (several minutes each) and belong in their own job if
+      # they are ever wanted. These two are the ones that cover the scan.
       - name: Sprout scan tests
         if: steps.sprout.outputs.present == 'true'
         run: |

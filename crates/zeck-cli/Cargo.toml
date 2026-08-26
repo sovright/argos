@@ -36,6 +36,7 @@ argos-network = ["argos-core/argos-network"]
 # a minimal build recovers Sapling-imported, ZecWallet-Lite mnemonic and
 # transparent funds, and only reports (never spends) any Sprout funds a wallet
 # holds.
+sprout = ["argos-core/sprout"]
 
 [[bin]]
 name = "argos"

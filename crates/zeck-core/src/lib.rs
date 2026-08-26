@@ -14,6 +14,45 @@ pub mod models;
 pub mod regtest_funding;
 pub mod scan;
 pub mod service;
+// Sprout key derivation and note decryption. Needed to spend a Sprout note:
+// the proving circuit wants value/rho/r, and the wallet stores none of them.
+#[cfg(feature = "sprout")]
+pub mod sprout;
+// The Sprout commitment tree, and the 966-byte authentication path the
+// JoinSplit prover parses. Needed because a cached wallet witness is the only
+// path source available without a full node.
+#[cfg(feature = "sprout")]
+pub mod sprout_witness;
+// JoinSplit assembly and the V4 transaction carrying it. zcash_primitives'
+// builder refuses Sprout, so this goes through the public low-level surfaces.
+#[cfg(feature = "sprout")]
+pub mod sprout_spend;
+// Joins a wallet's note records to the JoinSplit ciphertexts that carry
+// their plaintexts, which is the only place value/rho/r exist.
+#[cfg(feature = "sprout")]
+pub mod sprout_key;
+#[cfg(feature = "sprout")]
+pub mod sprout_recovery;
+// Finds Sprout notes by rebuilding the commitment tree from full blocks,
+// for a wallet that has a spending key and no note metadata at all.
+#[cfg(feature = "sprout")]
+pub mod sprout_scan;
+// Moves recovered Sprout notes out, via vpub_new into a Sapling output in
+// the same transaction -- Sprout cannot pay Sapling directly.
+#[cfg(feature = "sprout")]
+pub mod sprout_sweep;
+// Direct p2p access. Sprout notes are invisible to lightwalletd -- compact
+// blocks carry no JoinSplits -- so finding one needs full blocks.
+#[cfg(feature = "sprout")]
+pub mod p2p;
+// What a Sprout scan costs in time, bandwidth and disk, and the wording
+// that tells the user -- shared so the CLI and GUI cannot drift apart.
+#[cfg(feature = "sprout")]
+pub mod sprout_scan_cost;
+// Drives a scan: connects, walks the chain, checkpoints. SproutScanner
+// itself is a passive consumer and knows nothing about the network.
+#[cfg(feature = "sprout")]
+pub mod sprout_scan_run;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
