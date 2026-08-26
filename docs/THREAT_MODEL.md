@@ -1,6 +1,6 @@
 # Argos Threat Model
 
-> **Status:** Initial draft, v0.1.0-rc. This document describes the security posture of Argos as of the v0.1.0 release candidate. It is a living document; revisit on every release and whenever a new attack surface is added.
+> **Status:** Living document. This revision describes the security posture of current `main`, including wallet-file import, standalone keys, imported-key sweeping, and generally available Sprout recovery.
 
 ## 0. At a glance
 
@@ -8,15 +8,25 @@ This section summarises the document for readers who don't have time for the ful
 
 ### If you're in a hurry
 
-Argos is a single-use recovery tool. You give it a 24-word seed phrase, it scans the chain, it sweeps your funds into a modern wallet. The seed never leaves your machine, never touches disk, and only lives in memory for the length of the session. Everything else in this document is about *what could go wrong around that core promise* and how we bound the damage.
+Argos is a single-use recovery tool. You give it a ZecWallet Lite seed, a
+legacy wallet file, or a standalone spending key; it scans the chain and
+sweeps recoverable funds into a modern wallet. Recovery secrets never leave
+the machine. The seed and seed-derived spending authority are not written to
+disk, while the resumable Sprout scanner deliberately writes a spend-capable
+checkpoint with private permissions (T-L7). Everything else in this document
+is about *what could go wrong around those promises* and how we bound the
+damage.
 
-The five things most worth knowing:
+The eight things most worth knowing:
 
 | What | Severity | Where we stand |
 |---|---|---|
 | Seed phrase in memory or on disk | Critical | ✅ Wrapped in `secrecy::SecretString`, zeroized on drop, never written to disk. Residual: OS swap (we do not `mlock`). |
+| Wallet files and standalone spending keys | Critical | ⚠️ Kept local and never placed in CLI argv; wallet files are read-only. GUI-entered secrets cross local Tauri IPC, and user-created key-file permissions remain the user's responsibility (T-S6, T-S7). |
+| Sprout scan checkpoint | Critical | ⚠️ Spend-capable by design so a multi-hour scan can resume. Created privately and removed after a successful sweep; interrupted or scan-only runs leave it for the user to protect (T-L7). |
 | Dependency / supply-chain compromise | High | ✅ ~73% of our Rust tree is shared with the upstream Zcash ecosystem (`librustzcash`). The Tauri-side residue is a separate supply-chain surface we view as acceptable on the same terms other Tauri apps accept it. The whole tree is gated in CI by `cargo-deny` (advisories/licenses/bans/sources) and `cargo-vet` — every dependency must be covered by an imported upstream audit, a trusted-publisher entry, or an explicit exemption, or CI fails — backed by SLSA Level 3 build provenance. We do not claim first-party audit coverage of our own tree. |
 | Hostile lightwalletd | Medium–High | ✅ Crafted compact blocks are rejected by `librustzcash` sync; the server learns *that* you're scanning but no scanning-side keys are sent. |
+| Hostile or observed Sprout P2P peer | High | ⚠️ Requests reveal no address selection, and mainnet history is PoW/linkage/checkpoint validated. Plaintext transport still reveals the user's IP and peers can deny service; testnet lacks pinned checkpoints (T-N7). |
 | Windows installer authenticity | Medium | ✅ Both macOS (Apple Developer ID notarization) and Windows (Azure Trusted Signing under the Iqlusion Inc organization identity) installers are code-signed in the release pipeline (T-B3). SLSA Level 3 provenance (T-SC6) complements the signatures by anchoring each artifact to its source commit. |
 | Clipboard residue after paste | Medium | ⚠️ Argos itself never writes the seed to the clipboard. If the user pastes their seed in, that exposure is theirs to manage. The GUI offers a "Clear clipboard" button — see T-S4. |
 
@@ -24,7 +34,12 @@ Where this puts us relative to neighbours: we ship the same `librustzcash` famil
 
 ### If you're not deep in security
 
-Your seed phrase is the master key to your money. If anyone else gets it, they can move your funds. Argos handles your seed for a specific job: it reads the chain, finds your funds, and helps you sweep them somewhere safer. It doesn't store the seed, doesn't send it anywhere, and doesn't keep it after the app closes.
+Your seed phrase, wallet file, and standalone spending keys can each authorize
+money. If anyone else gets the relevant secret, they can move those funds.
+Argos handles them for one job: read the chain, find recoverable funds, and
+sweep them somewhere safer. It never transmits them. The seed is not stored;
+the exceptional persistent secret is the resumable Sprout checkpoint described
+above.
 
 The honest version of "is this safe?" is: **all software has risk, and Argos is no exception.** Our review shows the risks are bounded if you set up your environment well. Specifically:
 
@@ -37,16 +52,24 @@ The risks we *can't* address from inside Argos — a compromised host, a coerced
 
 ## 1. Purpose and scope
 
-Argos is a single-use Zcash wallet **recovery** tool for ZecWallet Lite seeds. Its purpose is to take a 24-word BIP-39 seed phrase, scan the Zcash chain for funds derived under ZecWallet Lite's account layout, and sweep them to a modern wallet (ZODL, YWallet) in a single session. It is not an everyday wallet.
+Argos is a single-use Zcash wallet **recovery** tool for ZecWallet Lite seeds
+and wallet files, zcashd `wallet.dat`, and standalone Sapling or Sprout
+spending keys. It scans the applicable key set and sweeps recoverable funds to
+a modern wallet (ZODL, YWallet). It is not an everyday wallet.
 
 This threat model covers:
 
 - the desktop GUI (Tauri v2: HTML/CSS/JS frontend in WebView2/WKWebView/WebKitGTK + Rust backend)
 - the CLI (`argos-cli`)
 - the shared core library (`argos-core`)
+- the read-only legacy-wallet parser (`argos-wallet-import`)
+- the lightwalletd and direct Zcash P2P network boundaries
 - the build / release / distribution pipeline (GitHub Actions, Vercel marketing site, signed installers)
 
-It does **not** cover the security of the user's host operating system, the user's destination wallet, the lightwalletd nodes operated by third parties, or the Zcash consensus protocol itself.
+It does **not** cover the security of the user's host operating system, the
+user's destination wallet, the internal infrastructure of third-party
+lightwalletd or P2P operators, or the Zcash consensus protocol itself. It does
+cover how Argos behaves when a remote lightwalletd or P2P peer is hostile.
 
 ### 1.1 Model vs. assessment
 
@@ -68,12 +91,13 @@ Where the two unavoidably touch — for example, an asset in the model (§3) ref
 | `argos-core` | (library) | Rust | — |
 | `argos-wallet-import` | (library) | Rust | Read-only parser for legacy wallet files (zcashd `wallet.dat`, ZecWallet Lite). Isolated as a separate crate with no network access, no filesystem writes, and no dependency on `argos-core`, because it is the only component that consumes an attacker-supplied binary file. |
 | lightwalletd | Remote, over TLS gRPC | Go (third party) | Untrusted network peer |
+| Zcash P2P peers | Remote, over plaintext Zcash P2P TCP | Third parties | Untrusted full-block sources used only by Sprout scanning |
 | Local workspace (SQLite) | On disk | — | Same trust as the user's home directory |
 
 ### 2.2 Data flow
 
 ```
-   user input (seed, destination, config)     wallet file (zcashd / ZecWallet Lite)
+ user input (seed, standalone keys, destination, config)  wallet file (zcashd / ZecWallet Lite)
             │                                              │
             │                                              ▼
             │                                   ┌──────────────────────┐
@@ -110,6 +134,11 @@ Where the two unavoidably touch — for example, an asset in the model (§3) ref
             │  Orchard/Sapling/Transparent proposals signed in-process
             ▼
    broadcast (tonic / tls) ──▶ lightwalletd ──▶ Zcash network
+
+   Sprout spending keys ──▶ resumable full-block scanner ──TCP──▶ Zcash P2P peers
+            │                         │
+            │                         └── 0600 spend-capable checkpoint
+            └── Sprout proof + Sapling output ──TLS──▶ lightwalletd broadcast
 ```
 
 ## 3. Assets
@@ -118,11 +147,13 @@ In rough priority order:
 
 1. **The 24-word seed phrase.** Sole authority to spend any funds derivable from it.
 2. **The user's wallet file.** A single artifact containing every spending key the wallet ever held, including standalone keys imported with `z_importkey` that appear in no seed. For a zcashd user this is a higher-value asset than a seed phrase, because a seed cannot reconstruct it.
-3. **Recovered ZEC.** Sweep transactions move value from the legacy ZWL accounts, or from an imported wallet file, to the user's chosen destination.
-4. **The destination unified address.** Privacy-sensitive linkage between the user and the recovered funds.
-5. **Workspace contents.** Contains full viewing keys (FVKs), incoming viewing keys (IVKs), per-account note cache, witnesses, and historic balances. With FVKs alone an attacker cannot spend, but can fully reconstruct the wallet's transaction history.
-6. **The recovery report.** Plaintext file written by the user with workspace path, txids, account labels, and net amounts. Contains much of the same information as the workspace contents above, and is more sensitive than the compact-block cache below.
-7. **The shared compact-block cache.** Public chain data; not sensitive by itself, but the *set of heights present* leaks an upper bound on which wallets have been scanned on this host.
+3. **Standalone spending-key files and pasted keys.** A Sapling or Sprout spending key is direct authority over one legacy address and must be protected like a seed.
+4. **The Sprout scan checkpoint.** Contains raw Sprout spending keys, recovered note plaintexts, witnesses, and the commitment-tree cursor. It is spend-capable, not merely scan metadata.
+5. **Recovered ZEC.** Sweep transactions move value from the legacy ZWL accounts, or from imported keys, to the user's chosen destination.
+6. **The destination address.** Privacy-sensitive linkage between the user and the recovered funds. Sprout necessarily selects a Sapling receiver even when given a Unified Address.
+7. **Workspace contents.** Contains full viewing keys (FVKs), incoming viewing keys (IVKs), per-account note cache, witnesses, and historic balances. With FVKs alone an attacker cannot spend, but can fully reconstruct the wallet's transaction history. The spend-capable Sprout checkpoint is called out separately above.
+8. **The recovery report.** Plaintext file written by the user with workspace path, txids, account labels, and net amounts. Contains much of the same information as the workspace contents above, and is more sensitive than the compact-block cache below.
+9. **The shared compact-block cache.** Public chain data; not sensitive by itself, but the *set of heights present* leaks an upper bound on which wallets have been scanned on this host.
 
 ## 4. Trust relationships
 
@@ -131,6 +162,7 @@ Each entry below names two parties and states how much one trusts the other, and
 - **User ↔ host OS:** Argos fully trusts the host it runs on. This trust is unverified and unconditional: a compromised OS defeats every other mitigation in this document.
 - **Tauri host process ↔ WebView renderer:** The host process does *not* trust the renderer with arbitrary access. The renderer can only reach the host via explicit `#[tauri::command]` handlers, and is itself constrained by the CSP in `gui/src-tauri/tauri.conf.json` (`default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: asset: http://asset.localhost; font-src 'self'; connect-src ipc: http://ipc.localhost`). No remote script or remote `connect-src` is permitted, so the renderer cannot be steered by remote content.
 - **Argos ↔ lightwalletd:** Argos does *not* trust the server. Confidentiality and integrity in transit rest entirely on TLS (bundled WebPKI trust roots — see T-N2 for the no-pinning caveat); a hostile server cannot inject spendable state because no scanning-side spending keys are sent and crafted compact blocks are rejected by `librustzcash` sync (T-N3). What the server unavoidably learns is the *that* and *when* of scanning, not key material. The default endpoints (`zec.rocks`, `na.zec.rocks` for mainnet; `testnet.zec.rocks` for testnet) are configurable per scan, so a user who trusts a specific operator (e.g. their own node) can substitute it.
+- **Argos ↔ Zcash P2P peers:** Sprout scanning does not send keys or addresses; it asks for the same complete historical block range for every key set. Connections are plaintext TCP, so peers and path observers learn the user's IP and that Argos is requesting old blocks. Block bytes are hostile input. The client bounds message sizes and time, recomputes hashes, verifies header linkage and Equihash proof of work, and pins mainnet segments with known checkpoints. Testnet has no equivalent checkpoint pinning (T-N7).
 - **Argos ↔ local disk:** Argos trusts the local filesystem to the same degree it trusts the host OS, and relies on filesystem permissions to keep workspace contents private from other OS users. Workspace directories and database files are written to a user-chosen directory (defaulting to the platform `AppDataDir/workspace`). Workspace directories are created with `0o700` and database files with `0o600` (`workspace.rs:set_private_file_permissions`). Those mode bits do **not** protect against another process already running as the same OS account; that is treated as a host/user-account compromise. The `session.json` sidecar contains no keys — only label, network, birthday, and timestamps — and inherits the OS umask.
 - **Build pipeline ↔ release artifact:** Users trust a released artifact only insofar as it is code-signed and provenance-attested by the pipeline. Signing happens in the tag-triggered release workflow, with GitHub Actions environments providing the out-of-tree approval gate (PR #48). macOS signing uses Apple Developer ID secrets; Windows signing uses **Azure Trusted Signing** (cloud-held key, no secret in CI — the runner authenticates via OIDC; PR #96) under the Iqlusion Inc organization identity (see §8, T-B3). Maintainers must keep required reviewers enabled on the release environments, and should also enable environment branch/tag restrictions in repo settings. The SLSA Level 3 build-provenance attestation (T-SC6) additionally gives every artifact a third-party-verifiable source-to-binary chain, generated by the first-party `actions/attest-build-provenance` and verified with `gh attestation verify`.
 
@@ -152,11 +184,12 @@ Mitigation detail lives in §6; this column only classifies.
 | A *privileged / root* process, or one exploiting an OS-isolation bug | Cross the account boundary via privilege escalation or a kernel / OS-isolation flaw | No — the integrity of the OS account and process isolation is the host OS's responsibility |
 | Network observer (passive sniffer, anywhere on the path) | Passively observe Argos's network traffic, on the local segment or any upstream hop | Yes — all lightwalletd traffic is TLS (T-N1) |
 | Hostile lightwalletd operator | Serve crafted compact blocks, log query patterns | Partial — crafted blocks are rejected by `librustzcash` sync and no scanning-side keys are sent (T-N3); residual: the server unavoidably observes query patterns / IP, which is inherent to the protocol (T-N4) |
+| Hostile Zcash P2P peer or on-path TCP attacker | Serve malformed or fabricated historical blocks, stall the Sprout scan, or observe the user's IP and old-block request pattern | Partial — framing, allocation, timeout, block-hash, header-linkage, proof-of-work, and mainnet checkpoint checks bound integrity and resource attacks; peers can still deny service, the transport is not confidential, and testnet lacks pinned checkpoints (T-N7) |
 | Hostile DNS operator | Return a malicious address for a lightwalletd hostname to redirect the connection | Yes — DNS-only substitution is defeated by TLS certificate validation against the webpki roots (a DNS-only attacker cannot obtain a valid certificate) |
 | Attacker able to compromise WebPKI validation for a lightwalletd hostname | Obtain a mis-issued certificate, compromise a WebPKI CA, or otherwise present a certificate accepted by the bundled WebPKI root set | No — a valid-looking rogue certificate defeats TLS validation because default endpoints are not certificate-pinned; pinning (T-N2) is the tracked would-be mitigation |
 | Compromised upstream Rust dependency | Inject malicious code at build time (`build.rs`, proc macros, or runtime code) | Partial — new resolutions are gated in CI by `cargo-deny` + `cargo-vet` (each crate must be covered by an imported audit, a trusted-publisher entry, or an explicit exemption, or CI fails); residual: the Tauri-side tree (§6.6.4) is carried as exemptions / publisher-trust, and `build.rs`/proc-macro sandboxing (Geiger-style enumeration) is *not yet* adopted (T-SC1). No JS at runtime (§7). See §6.6, §7 |
 | Compromised GitHub Actions / signing key | Sign a malicious installer | Yes — see §8 |
-| A malicious wallet file | Craft a `wallet.dat` or ZecWallet Lite file to exploit the parser (hang, crash, or induce it to emit a well-formed but wrong key) | Partial — parsing is isolated in `argos-wallet-import`, which has no network access and performs no filesystem writes, so a parser bug is bounded to garbage records rather than key exfiltration; the Berkeley DB walker denies indexing, slicing, `unwrap`, `expect`, and `panic` at the crate root, validates every length field against the real file size before allocating, and bounds page traversal with a visited set so a crafted page cycle cannot hang or overflow the stack; fuzzed with `cargo-fuzz`, seeded from real wallet fixtures. Residual: recovered keys are re-derived and checked against their stored addresses (`tests/sprout_key_is_genuine.rs`, `tests/transparent_key_is_genuine.rs`) rather than trusted as parsed, because the domain's failure mode is a well-formed wrong key, not a crash |
+| A malicious wallet file | Craft a `wallet.dat` or ZecWallet Lite file to exploit the parser (hang, crash, or induce it to emit a well-formed but wrong key) | Partial — parsing is isolated in `argos-wallet-import`, which has no network access and performs no filesystem writes, so a parser bug is bounded to garbage records rather than key exfiltration; the Berkeley DB walker denies indexing, slicing, `unwrap`, `expect`, and `panic` at the crate root, validates every length field against the real file size before allocating, and bounds page traversal with a visited set so a crafted page cycle cannot hang or overflow the stack; fuzzed with `cargo-fuzz`, seeded from real wallet fixtures. Residual: recovered transparent, Sapling, and Sprout keys are re-derived and checked against their stored addresses (`tests/transparent_key_is_genuine.rs`, `tests/sapling_key_is_genuine.rs`, `tests/sprout_key_is_genuine.rs`) rather than trusted as parsed, because the domain's failure mode is a well-formed wrong key, not a crash |
 | Casual shoulder-surfer | Read the screen while seed is visible | Yes |
 | Coerced user ($5 wrench attack) | Forced to run a sweep under duress | No |
 | Nation-state with cryptanalytic capability | Break Sapling/Orchard or post-quantum threats | No |
@@ -175,6 +208,7 @@ This section is the **threat assessment** (see §1.1): for each threat implied b
 | T-S4 | Seed phrase leaks via clipboard | M | ⚠️ | **What Argos does:** never calls `writeText(seed)`. The only `writeText` callsites in the GUI are the recovery-report "Copy path" button (PR #53, copies a file path) and the donate-overlay address button (copies a public unified address). There is no "Copy seed" affordance anywhere. **What users can do:** the seed-entry screen and the resume-scan modal both expose a "Clear clipboard" button that calls `navigator.clipboard.writeText("")` to overwrite the bare OS clipboard once the user has finished pasting. **What stays bounded by the user's environment:** clipboard-history managers (e.g. Maccy, ClipboardFusion, the iOS handoff clipboard) may have snapshotted the seed at paste time; our `writeText("")` does not retroactively scrub those. We deliberately do *not* block paste — a password manager → paste flow is safer than retyping a 24-word seed under a keylogger or shoulder-surfer, and "block copy" via `oncopy="return false"` is bypassable theatre on a textarea, not a real control. |
 | T-S5 | Seed visible on screen during entry | L | ✅ | Seed textarea is blurred by default; user must explicitly toggle "Show words on screen". |
 | T-S6 | Wallet-file passphrase (zcashd `wallet.dat` / ZecWallet Lite import) leaks via memory, disk, logs, or CLI argv | H | ⚠️ | Held as `SecretString` end to end, never written to disk, never accepted as a CLI flag (which would leak to shell history and `ps` — prompt-only via `dialoguer::Password` in `crates/zeck-cli/src/main.rs`), and never logged. Decrypted key material zeroizes on drop. `secrecy` zeroizes on drop but does not `mlock`; the passphrase remains reachable from swap and core dumps, as for the seed. See `docs/secret-memory-evaluation.md`. **The GUI now exposes a wallet-file entry point**, so the passphrase does cross the Tauri IPC boundary as plaintext JSON — a **new instance of accepted audit Issue A**, previously recorded here in advance and now realised deliberately. Two commands carry it (`inspect_wallet_file`, `start_scan_from_wallet_file` in `gui/src-tauri/src/commands.rs`); both deserialize it straight into a `SecretString`, and neither input struct derives `Debug`, `Serialize`, or `Clone`. The frontend drops its copy once the scan is under way (T-S2), and only on success — clearing it on failure would strand a retrying user. The wallet *path*, not its bytes, crosses IPC: the backend opens the file itself, so an attacker-supplied wallet never transits the webview. The CLI remains prompt-only via `dialoguer::Password` in `crates/zeck-cli/src/main.rs`, where no process boundary is crossed at all. |
+| T-S7 | A standalone Sapling or Sprout spending key leaks through argv, logs, UI state, or an over-permissive key file | H | ⚠️ | The CLI accepts only `--sapling-key-file` / `--sprout-key-file`, never a key value in argv. Decoders return line-numbered errors without echoing secret text, and key material is not logged. The GUI accepts pasted keys, so they cross the existing local Tauri IPC boundary and reside transiently in WebView memory. Argos cannot force permissions on an existing user-created key file; users are instructed to use `0600`. Sprout scan persistence is assessed separately in T-L7. |
 
 ### 6.2 Frontend (Tauri + WebView)
 
@@ -195,6 +229,7 @@ This section is the **threat assessment** (see §1.1): for each threat implied b
 | T-N4 | Hostile lightwalletd correlates a user's IP with their wallet | H | ⚠️ | Inherent to the lightwalletd protocol. Mitigations: configurable endpoint (run your own), the `GetAddressUtxos` quick-probe queries 10 t-addrs (5 accounts × 2 addresses: external + change) which leaks them in plaintext (post-TLS) to the server, and the compact-block scan range leaks the wallet birthday. No Tor integration. |
 | T-N5 | Auto-detect probe leaks viewing-key-derived addresses | M | ⚠️ | The auto-detect flow (`crates/zeck-core/src/birthday.rs`) imports an account into a temp workspace and runs a windowed sync. This sends FVK-derived address queries to the server. Documented in the UI ("requires a server connection"), but worth surfacing more clearly. |
 | T-N6 | Sweep transaction broadcast reveals consolidation pattern | M | ⚠️ | A single sweep aggregates funds from many ZWL accounts into one destination, which on-chain analysis can link. Inherent to recovery — no good mitigation without changing the sweep model. |
+| T-N7 | A hostile or observed P2P connection corrupts or deanonymizes a Sprout scan | H | ⚠️ | Sprout requests the complete genesis-to-Canopy range regardless of the key, so the request reveals no address-level selection, but plaintext peers and path observers see the user's IP and an Argos user agent. Hostile bytes are bounded by payload and per-page memory ceilings and read/connect timeouts; block hashes are recomputed; header and page linkage, Equihash proof of work, and four mainnet checkpoints are verified. A peer can still stall or refuse service, and testnet has no fixed checkpoints. Users may pass `--peer` for a node they trust. |
 
 ### 6.4 Local storage
 
@@ -206,6 +241,8 @@ This section is the **threat assessment** (see §1.1): for each threat implied b
 | T-L4 | Resume-session metadata identifies prior recoveries | L | ✅ | The resume panel only shows workspaces under the configured data-dir; dismissed sessions stay dismissed via localStorage (PR #53). Sessions can be excluded without deleting on-disk state. |
 | T-L6 | A transparent-only recovery reports a balance that silently excludes shielded pools | M | ✅ | Transparent-only recovery bypasses the wallet database entirely (`transparent_recovery.rs`), so it covers exactly one pool. A wallet also holding Sapling or Sprout keys prints an explicit warning naming each uncovered pool and the count of keys in it, before any balance is shown. The risk being mitigated is not disclosure but *misplaced confidence*: a user who reads a partial total as complete may delete the wallet file that holds the only copy of the keys for the pools never scanned. Covered by `crates/zeck-cli/tests/wallet_file_cli.rs`. |
 | T-L5 | Imported wallet-file key material persists on disk beyond what the seed flow already writes | M | ✅ | Imported key material enters the workspace only in the forms `zcash_client_sqlite` already persists for seed-derived keys (FVKs/IVKs, notes, witnesses) — import adds no new on-disk representation. Imported workspaces are keyed on a `KeySourceFingerprint` derived from hashes of the key material, not the material itself, so the resume path and directory naming do not expose spending keys the way a naive cache-by-key scheme would. |
+| T-L7 | A resumable Sprout scan leaves spend-capable material on disk | H | ⚠️ | The checkpoint necessarily contains raw Sprout spending keys, note plaintexts, and witnesses so a multi-hour scan can resume. It is created atomically with `0600` mode on Unix and a filename containing only a truncated key-set fingerprint, never the key. Argos deletes it after a successful sweep; an interrupted scan or scan-only run leaves it behind by design. Same-account malware, backups, swap, and forensic recovery remain host-level residuals. |
+| T-L8 | A crafted `wallet.dat` reports a phantom Sprout balance | M | ⚠️ | Wallet-backed note recovery verifies internal key/address/note/witness consistency, but every input to that check comes from the file; it cannot prove the JoinSplit was mined. Consensus rejects a fabricated sweep, so funds cannot be stolen through this claim, but the pre-broadcast balance is not authoritative. The full-block Sprout scan derives notes and nullifiers from the validated chain and does not share this limitation. |
 
 ### 6.5 Build, release, distribution
 
@@ -228,7 +265,7 @@ The high-level posture is: **we adopted the practices the rest of the Zcash Rust
 | T-SC1 | Malicious `build.rs` script or procedural macro in a transitive crate runs arbitrary code at compile time (dev machine and CI). | H | ⚠️ | `cargo-vet` gates every transitive crate: each must be covered by an imported upstream audit (from the librustzcash + Mozilla + Google + Embark + Bytecode Alliance + Fermyon + ISRG sets), a trusted-publisher entry, or an explicit `[[exemptions.*]]` entry in `supply-chain/config.toml`, or CI fails (PR #70). Most of the tree is exemptions ("trust but not yet audited") or publisher-trust, **not** first-party code audits — the imported audits cover only the subset of the tree we share with librustzcash. Any new resolution that adds an uncovered crate fails CI. Geiger-style `build.rs` enumeration is not yet adopted; that residue remains. The un-reviewed surface is concentrated in the Tauri stack (§6.6.4 / §7 category 2). |
 | T-SC2 | Maintainer-account takeover on a critical crate (librustzcash family, `rustls`, `tauri`, `secrecy`, `secp256k1`, `bip0039`) ships a malicious version that we knowingly bump to. | H | ⚠️ | `cargo-deny` (T-B1) cannot detect a zero-day at bump time, but `cargo-vet` (T-SC1) requires every new resolution be either covered by an imported audit set or explicitly exempted, which surfaces an unexpected crate-version change as a CI failure with a named-auditor accountability trail. Project policy in `CLAUDE.md` requires conservative dependency review; the README/threat model document who maintains the high-value crates (§7). Formalising the diff-review checklist for `cargo update` is still open (§8). |
 | T-SC3 | A third-party GitHub Action used in CI gets a tag force-moved (or a branch hijacked) to point at malicious code, which then runs with `GITHUB_TOKEN` or signing-environment access. | H | ✅ | Every third-party Action is now SHA-pinned with a `# vX.Y.Z` trailing comment (see PR #70), and the repository-level **Actions → Require SHA pinning for third-party Actions** setting is enabled (T-SC10), so a workflow that regresses to a tag pin is refused at job-start time. Signing/publish steps remain gated on protected environments (T-B2). |
-| T-SC4 | Compromise of the upstream Rust toolchain (rustc / cargo) injects code into produced binaries. | M | ⚠️ | Toolchain version is pinned in CI (Rust 1.87). We rely on rust-lang's release signing and distribution; we do not independently verify toolchain hashes. Out of practical reach for this project; tracked rather than mitigated. |
+| T-SC4 | Compromise of the upstream Rust toolchain (rustc / cargo) injects code into produced binaries. | M | ⚠️ | Toolchain version is pinned in CI (Rust 1.88). We rely on rust-lang's release signing and distribution; we do not independently verify toolchain hashes. Out of practical reach for this project; tracked rather than mitigated. |
 | T-SC5 | A transitive crate is yanked from crates.io with no upstream replacement, so a freshly-resolved build cannot reproduce. | L | ✅ | `deny.toml` sets `yanked = "deny"`, so CI fails on any yanked crate in the lockfile. Made tractable by PR #69, which bumped the librustzcash family to the 2026-04 release wave that replaced the formerly-yanked `core2 0.3.3` with `corez 0.1.1` throughout the tree. Future yanks are now hard CI failures requiring an upstream-or-replace fix. |
 | T-SC6 | The published release binary cannot be independently verified to correspond to the source tree at the tagged commit — i.e. no reproducible builds and no SLSA provenance attestation. | M | ❌ | SHA256 checksums (T-B4) and platform code-signing (T-B2) prove the binary was produced by our release pipeline, but not that the pipeline built the source faithfully. A verifier with the source cannot today rebuild bit-for-bit. Tracked. |
 | T-SC7 | A new direct dependency we add is a typosquat or dependency-confusion package masquerading as a legitimate crate. | M | ✅ | Project policy in `CLAUDE.md` requires explicit approval and an `~/.claude/approved-dependencies.md` entry before any new direct dependency is added, with package name, version, adoption signals, maintenance status, and license recorded. This relies on review discipline, not tooling, and is therefore a process control rather than a hard gate. |
@@ -387,7 +424,8 @@ These are intentionally listed in one place so the document drives a backlog rat
 - Physical attacks on the user's machine (cold-boot, evil maid).
 - Quantum-cryptographic attacks against Sapling/Orchard.
 - User coercion / duress.
-- Pre-Sapling (Sprout) note recovery via a seed phrase — librustzcash dropped Sprout scanning long before this project began; ZWL seeds whose only funds are in Sprout notes (block <419,200, before October 2018) cannot be recovered via Argos from a seed alone. Argos can now recover Sprout spending keys directly from a zcashd `wallet.dat` (see §2.1, `argos-wallet-import`), but **spending** recovered Sprout funds is not yet implemented — no transaction-construction path exists in Argos for the Sprout pool. Extracting the key is not the same as moving the funds; treat Sprout funds as identified, not yet recoverable end to end.
+- Deriving Sprout keys from a ZecWallet Lite seed. Those keys were generated independently and do not exist in the HD seed tree. Sprout recovery itself is implemented end to end when the user supplies a zcashd `wallet.dat` or standalone Sprout spending key.
+- Moving Sprout directly to Orchard. A Sprout JoinSplit exists only in transaction version 4 while Orchard actions require version 5. Argos lands the value in the user's Sapling receiver; any Sapling-to-Orchard hop belongs to the user's destination wallet so Argos never holds an intermediate key.
 
 ## 10. Reporting a security issue
 
@@ -397,6 +435,7 @@ Please **do not** open a public GitHub issue for a security vulnerability. Email
 
 | Date | Author | Notes |
 |---|---|---|
+| 2026-08-26 | Codex | Updated the model for standalone Sapling/Sprout keys, imported Sapling sweeping, generally available Sprout recovery, the full-block P2P trust relationship, spend-capable Sprout checkpoints, and wallet-file phantom-balance limits. |
 | 2026-05-13 | Kristi | Correct T-L1 status (permissions implemented); fix CSP quote; clarify T-N4 address count; PGP note. |
 | 2026-05-19 | Zaki | Initial draft. Covers v0.1.0-rc. Open items listed in §8. |
 | 2026-05-27 | Zaki | Added §6.6 Supply chain integrity (T-SC1..T-SC8), §6.6.1 cross-project posture comparison (zebrad + ZODL), §6.6.2 extending to librustzcash and the Zcash mobile Rust SDKs (documenting their `cargo-vet` posture with federated audits from Bytecode Alliance / Embark / Fermyon / Google / ISRG / Mozilla, `zizmor` on workflows, uniformly SHA-pinned Actions), §6.6.3 adoption plan, and §6.6.4 quantifying dependency-surface divergence: 452/618 (73%) of our crates are shared with zebra or librustzcash; the 166 unique to Argos are essentially the Tauri desktop-GUI stack. |

@@ -18,31 +18,9 @@
 //! - Peers refuse the overwhelming majority of inbound connections outright,
 //!   so finding one at all means racing many.
 //!
-//! # What this does not verify — read before trusting a scan
+//! # Chain validation
 //!
-//! The header chain is taken from one peer and is **not** validated as a
-//! chain: no proof of work, no Equihash solution check, no difficulty, and
-//! no checkpoint against a known block hash. A hostile peer can therefore
-//! answer with a self-consistent chain of cheap fabricated headers and
-//! matching bodies, and this loop will walk it to the target and report a
-//! completed scan. The consequences are the two worst outcomes available:
-//! real notes are silently missed, and real nullifiers are never seen, so a
-//! spent note can be reported spendable.
-//!
-//! Nothing downstream compensates. The commitment tree, witnesses and
-//! decryption are all careful, but they are careful about whatever history
-//! they are handed.
-//!
-//! Partially closed by checkpoints. Four known mainnet block hashes, at the
-//! network-upgrade activation heights, are verified as the walk passes them
-//! (see `p2p::wire::checkpoint_at`). A fabricated chain cannot reproduce
-//! them without doing the real work, so forgery now buys an attacker
-//! nothing past the first checkpoint at height 419,200.
-//!
-//! What remains unverified is everything *between* checkpoints, and the
-//! whole range on testnet, where nothing is pinned.
-//!
-//! Every header is now checked for proof of work
+//! Every header is checked for proof of work
 //! (`p2p::wire::verify_header_pow`): the Equihash solution, and that the
 //! hash meets the difficulty the header claims. A peer must therefore do
 //! real work per header rather than linking cheap ones together, and the
@@ -76,7 +54,8 @@
 //! nothing here, while being easy to get subtly wrong — and a wrong
 //! difficulty rule rejects the *honest* chain, which is the failure mode
 //! this module works hardest to avoid. It would matter on testnet, where
-//! nothing is pinned; Sprout recovery there is not a real scenario.
+//! nothing is pinned; testnet therefore retains a stronger peer-trust
+//! residual than mainnet.
 //!
 //! Both parameter sets are now checked against headers this project did not
 //! construct: regtest's (48, 5) and mainnet's (200, 9), each with a
@@ -594,11 +573,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|err| ZeckError::TransactionBuild(format!("creating {}: {err}", path.display())))?;
-    file.write_all(bytes)
-        .map_err(|err| ZeckError::TransactionBuild(format!("writing the scan checkpoint: {err}")))?;
+    let mut file = options.open(path).map_err(|err| {
+        ZeckError::TransactionBuild(format!("creating {}: {err}", path.display()))
+    })?;
+    file.write_all(bytes).map_err(|err| {
+        ZeckError::TransactionBuild(format!("writing the scan checkpoint: {err}"))
+    })?;
     Ok(())
 }
 
@@ -618,7 +598,11 @@ pub fn discard_checkpoint(path: &Path) {
 /// claim about rotating away from a refusing peer fiction. `connect_to_any`
 /// races a fresh batch each round, so a peer inside its 119-second window
 /// simply loses the race rather than being excluded by name.
-async fn connect_peer(network: P2pNetwork, extra: &[String], _prior: &[String]) -> ZeckResult<Peer> {
+async fn connect_peer(
+    network: P2pNetwork,
+    extra: &[String],
+    _prior: &[String],
+) -> ZeckResult<Peer> {
     connect_to_any(network, extra, 4)
         .await
         .map_err(|err| ZeckError::Broadcast(err.to_string()))

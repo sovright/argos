@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Argos — Recover Your Zcash from ZecWallet Lite</title>
-    <meta name="description" content="Argos is a free, open-source desktop tool that recovers your Zcash from a ZecWallet Lite seed phrase and sweeps it to your new wallet. Runs entirely on your machine — your seed never leaves." />
+    <title>Argos — Recover Legacy Zcash Wallets</title>
+    <meta name="description" content="Argos is a free, open-source desktop tool for recovering ZecWallet Lite seeds, legacy wallet files, and standalone Zcash spending keys. Sensitive recovery material stays local." />
     <style>
       :root {
         --bg: #f4efe6;
@@ -488,7 +488,7 @@
     <!-- Nav -->
     <nav>
       <a class="nav-brand" href="#">
-        <span class="eyebrow">ZecWallet Lite Recovery</span>
+        <span class="eyebrow">Legacy Zcash Recovery</span>
         <span class="wordmark">Argos</span>
       </a>
       <div class="nav-links">
@@ -501,11 +501,11 @@
     <div class="hero">
       <div class="hero-text">
         <p class="eyebrow">Free &amp; Open Source</p>
-        <h1>Recover your <em>Zcash</em> from ZecWallet Lite</h1>
+        <h1>Recover your <em>Zcash</em> from a legacy wallet</h1>
         <p>
-          Enter your 24-word seed phrase. Argos scans the blockchain, finds your
-          funds across every pool and account, and sweeps them to your new wallet —
-          all without your seed ever leaving your machine.
+          Enter a ZecWallet Lite seed, open a legacy wallet file, or supply a
+          standalone Sapling or Sprout spending key. Argos scans the blockchain
+          and sweeps recoverable funds without the recovery secret leaving your machine.
         </p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="https://github.com/sovright/argos/releases" target="_blank">Download for Mac / Windows / Linux</a>
@@ -517,7 +517,7 @@
         <p style="font-size:0.7rem;font-family:'IBM Plex Sans',sans-serif;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);margin-bottom:14px;">Recovery steps</p>
         <ol class="mock-step-list">
           <li class="done">Welcome</li>
-          <li class="done">Seed Entry</li>
+          <li class="done">Recovery Source</li>
           <li class="done">Configure</li>
           <li class="active">Scan</li>
           <li class="dim">Sweep</li>
@@ -537,7 +537,7 @@
     <div class="trust-bar">
       <div class="trust-item">
         <div class="trust-icon">🔒</div>
-        <span>Seed stays on your machine</span>
+        <span>Recovery secrets stay local</span>
       </div>
       <div class="trust-item">
         <div class="trust-icon">⚡</div>
@@ -566,18 +566,18 @@
       <div class="feature-grid">
         <div class="feature-card">
           <div class="feature-icon">🌱</div>
-          <h3>Seed-phrase only</h3>
-          <p>No wallet files, no backups, no databases. Just your 24-word BIP-39 seed phrase — everything else is derived from that.</p>
+          <h3>Multiple recovery sources</h3>
+          <p>Use a 24-word ZecWallet Lite seed, a ZecWallet Lite or zcashd wallet file, or standalone Sapling and Sprout spending keys.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">🔍</div>
           <h3>Finds every ZEC</h3>
-          <p>Scans Sapling, Orchard, and transparent pools across all your accounts. A quick transparent probe surfaces t-addr balances within seconds of starting.</p>
+          <p>Scans Sapling, Orchard, and transparent funds, and includes a separate end-to-end Sprout scan and sweep path for wallets or keys that need it.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">🛡</div>
           <h3>Privacy first</h3>
-          <p>Your seed phrase never leaves your device. All derivation and scanning happens locally — Argos connects only to public lightwalletd nodes to fetch compact block data.</p>
+          <p>Seeds, passphrases, and spending keys never leave your device. Ordinary scans use public lightwalletd nodes; Sprout scans read public full blocks from Zcash P2P peers.</p>
         </div>
         <div class="feature-card">
           <div class="feature-icon">⏸</div>
@@ -600,7 +600,7 @@
     <!-- How it works -->
     <section>
       <p class="section-label">How it works</p>
-      <h2 class="section-heading">Six steps from seed to safe</h2>
+      <h2 class="section-heading">Six steps from backup to safe</h2>
       <p class="section-subhead">The whole process takes a few clicks and some patience while the blockchain scans.</p>
 
       <div class="steps-grid">
@@ -608,14 +608,14 @@
           <div class="step-number">1</div>
           <div class="step-body">
             <h4>Welcome</h4>
-            <p>Open Argos and confirm you have your 24-word BIP-39 seed phrase from ZecWallet Lite.</p>
+            <p>Open Argos with a seed phrase, wallet file, or supported standalone spending key ready.</p>
           </div>
         </div>
         <div class="step-card">
           <div class="step-number">2</div>
           <div class="step-body">
-            <h4>Enter your seed</h4>
-            <p>Paste your seed phrase. Argos validates it locally and clears it from the UI after the session starts.</p>
+            <h4>Select the source</h4>
+            <p>Validate the seed, inspect the read-only wallet file, or check the pasted key locally before the session starts.</p>
           </div>
         </div>
         <div class="step-card">
@@ -629,7 +629,7 @@
           <div class="step-number">4</div>
           <div class="step-body">
             <h4>Scan</h4>
-            <p>Argos syncs compact blocks and probes UTXOs. Watch funds appear in real time as each account is scanned.</p>
+            <p>Argos syncs compact blocks and probes UTXOs. Sprout recovery uses cached wallet witnesses when possible, or a resumable full-block scan when necessary.</p>
           </div>
         </div>
         <div class="step-card">
@@ -654,11 +654,11 @@
       <div class="security-callout">
         <div class="icon">🔐</div>
         <div>
-          <h3>Your seed phrase never leaves your computer</h3>
+          <h3>Your recovery secrets never leave your computer</h3>
           <p>
-            Argos derives all keys locally and stores a temporary wallet database only on your machine.
-            It connects to public Zcash lightwalletd servers solely to download compact block data —
-            the same data every full node downloads. No seed, no keys, no balances are ever transmitted.
+            Argos derives and validates keys locally and stores recovery state only on your machine.
+            It downloads public blockchain data from lightwalletd or, for Sprout, Zcash P2P peers.
+            No seed, wallet passphrase, spending key, or balance is transmitted.
             You can review every line of code on <a href="https://github.com/sovright/argos" target="_blank" style="color:var(--accent)">GitHub</a>.
           </p>
         </div>
@@ -672,7 +672,7 @@
         <p>Download the desktop app for your platform. Free, open-source, no account needed.</p>
         <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap;">
           <a class="btn btn-primary" href="https://github.com/sovright/argos/releases" target="_blank">Download the latest release</a>
-          <a class="btn btn-secondary" href="https://github.com/sovright/argos/blob/main/gui/src/guide.html" target="_blank">Read the user guide</a>
+          <a class="btn btn-secondary" href="https://argos.sovright.com/guide.html" target="_blank">Read the user guide</a>
         </div>
       </div>
     </section>

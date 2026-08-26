@@ -2,7 +2,10 @@
 
 ## Overview
 
-This document tracks the testing strategy for Argos — a ZecWallet Lite recovery tool. The primary focus is **GUI testing**, with live network scan testing as a key component.
+This document tracks the testing strategy for Argos across seed, wallet-file,
+standalone Sapling-key, and Sprout recovery. The primary focus is **GUI
+testing**, with CLI and live-network coverage for paths that have no cheap
+local substitute.
 
 ---
 
@@ -10,8 +13,9 @@ This document tracks the testing strategy for Argos — a ZecWallet Lite recover
 
 ### Step 1: Welcome Screen
 - [ ] App launches and window renders at correct size (1180×860, min 940×720)
-- [ ] Both entry paths visible: seed phrase and `.dat` file
-- [ ] "Start Recovery" navigates to seed entry step
+- [ ] Both entry paths visible: seed phrase and wallet file / standalone key
+- [ ] "I have my 24-word seed phrase" navigates to seed entry
+- [ ] "I have a wallet file" navigates to wallet-file entry
 
 ### Step 2: Seed Entry
 - [ ] 24-word textarea accepts input
@@ -23,6 +27,18 @@ This document tracks the testing strategy for Argos — a ZecWallet Lite recover
 - [ ] Leading/trailing whitespace trimmed automatically
 - [ ] ALL CAPS input normalised to lowercase
 - [ ] Cannot advance without passing validation
+
+### Step 2b: Wallet File and Standalone Keys
+- [ ] Native picker, drag-and-drop, and typed path all open a supported file
+- [ ] Opening a wallet does not modify its bytes or timestamp
+- [ ] zcashd `wallet.dat` and ZecWallet Lite files are identified correctly
+- [ ] Encrypted wallets request a passphrase; wrong passphrases fail cleanly
+- [ ] Summary reports transparent, Sapling, and Sprout key counts, mnemonic presence, and diagnostics
+- [ ] A pasted `secret-extended-key-main1…` / `secret-extended-key-test1…` key is checked for the selected network
+- [ ] Multiple Sapling keys and `#` comment lines are accepted; duplicates are removed
+- [ ] Sapling viewing keys (`zxviews…`) and wrong-network spending keys are rejected
+- [ ] A standalone Sapling key can continue without a wallet file
+- [ ] A standalone Sapling key cannot be combined with a wallet that recovered a mnemonic
 
 ### Step 3: Configuration Form
 - [ ] Network dropdown: Mainnet / Testnet switches correctly
@@ -52,6 +68,9 @@ This document tracks the testing strategy for Argos — a ZecWallet Lite recover
 - [ ] Cancel button stops scan and returns to config
 - [ ] Unreachable server shows a clean error message (not a crash or blank screen)
 - [ ] Fallback to secondary lightwalletd endpoint is reflected in server status label
+- [ ] Imported Sapling balances are reported once per imported key/account
+- [ ] Imported transparent balances are included without being mistaken for HD-derived accounts
+- [ ] A wallet containing Sprout keys shows an explicit separate-recovery warning before totals
 
 ### Step 5: Sweep Review
 - [ ] Transaction table shows: account index, pool, amount, fee, net amount
@@ -61,12 +80,24 @@ This document tracks the testing strategy for Argos — a ZecWallet Lite recover
 - [ ] Back button returns to scan results without losing scan data
 - [ ] `propose_sweep` failure surfaces as a readable error (not silent)
 - [ ] Execute sweep button triggers real sweep — verify broadcast results and transaction IDs are shown
+- [ ] Imported Sapling and transparent legs report separate txids and retain already-broadcast txids after a later failure
 
 ### Step 6: Complete / Report
 - [ ] Recovery report text displayed on screen
 - [ ] "Save Report" button opens a file dialog (`save_recovery_report`)
 - [ ] Report saved to chosen path and readable as plain text
 - [ ] "Start Over" button clears all state and returns to welcome screen
+
+### Sprout Wallet Flow
+- [ ] A wallet with cached spendable note data offers an immediate Sprout sweep without a scan
+- [ ] A wallet with Sprout keys but no usable note data explains the full-block scan cost before enabling it
+- [ ] Mainnet warning states 1,046,400 blocks, roughly 26 GB transferred, under 500 MB retained, and hours of work
+- [ ] Raw `SK…` / `ST…` keys are checked against the selected network
+- [ ] Scan progress is checkpointed; stopping and restarting resumes from the saved height
+- [ ] A Sprout destination must be a bare Sapling address or a Unified Address with a Sapling receiver
+- [ ] The UI explains that funds land in Sapling, not Orchard
+- [ ] A missing or invalid `sprout-groth16.params` fails before broadcast with an actionable message
+- [ ] Every sent txid, skipped note, and partial failure remains visible
 
 ---
 
@@ -97,6 +128,10 @@ This document tracks the testing strategy for Argos — a ZecWallet Lite recover
 | N12 | Spent-account gap limit | Scanner does NOT stop at spent account; continues to find funded accounts beyond it |
 | N13 | Sweep proposal generated | Amounts + fees match expected; proposal screen renders |
 | N14 | Execute sweep | Broadcasts transactions; verify txids and confirmation status shown in UI |
+| N15 | Imported zcashd Sapling + transparent scan | Finds both pools and does not use the HD gap-limit route |
+| N16 | Imported zcashd Sapling + transparent sweep | Broadcasts each applicable pool leg and reports every txid |
+| N17 | Sprout wallet with cached witness | Builds and broadcasts without a chain scan |
+| N18 | Bare-key Sprout scan | Full-block scan finds a planted note, resumes, and sweeps it to Sapling |
 
 ---
 
@@ -110,6 +145,10 @@ This document tracks the testing strategy for Argos — a ZecWallet Lite recover
 - [ ] Window resized to minimum 940×720 — layout does not break or overflow
 - [ ] Seed entered with extra spaces between words — normalised correctly
 - [ ] Multiple rapid clicks on "Validate Seed" — no duplicate requests sent
+- [ ] Truncated/corrupt wallet file — diagnostics or a bounded error, never a hang or panic
+- [ ] Wallet containing several Sapling keys — every funded key is scanned and swept
+- [ ] Mixed imported Sapling + transparent wallet — one pool failing does not erase the other pool's results
+- [ ] Forged imported transparent or Sprout key — rejected before scan/sweep
 
 ---
 
@@ -117,28 +156,46 @@ This document tracks the testing strategy for Argos — a ZecWallet Lite recover
 
 ```bash
 # Show derived keys (no network needed)
-argos show-keys --seed "word1 word2 ... word24" --network mainnet
+chmod 600 /tmp/argos-seed.txt
+argos --seed-file /tmp/argos-seed.txt --network mainnet show-keys
 
 # Scan (network required)
-argos scan \
-  --seed "word1 word2 ... word24" \
-  --lightwalletd-url "zec.rocks:443" \
+argos --seed-file /tmp/argos-seed.txt \
+  --lightwalletd-url "https://zec.rocks:443" \
   --data-dir /tmp/zeck-test \
-  --birthday 2000000
+  --birthday 2000000 \
+  scan
 
 # Sweep proposal (dry run, no broadcast)
-argos sweep \
-  --seed "word1 word2 ... word24" \
-  --lightwalletd-url "zec.rocks:443" \
+argos --seed-file /tmp/argos-seed.txt \
+  --lightwalletd-url "https://zec.rocks:443" \
   --data-dir /tmp/zeck-test \
-  --destination u1... \
-  --memo "recovery test"
+  sweep --destination u1... --memo "recovery test" --dry-run
+
+# Inspect and recover an imported wallet
+argos --wallet-file /path/to/wallet.dat inspect-wallet
+argos --wallet-file /path/to/wallet.dat scan
+argos --wallet-file /path/to/wallet.dat \
+  sweep --destination u1... --dry-run
+
+# Recover standalone Sapling keys
+chmod 600 /tmp/sapling-keys.txt
+argos --sapling-key-file /tmp/sapling-keys.txt scan
+
+# Sprout: preview cached wallet notes, or scan bare keys
+argos --wallet-file /path/to/wallet.dat \
+  sweep-sprout --destination u1... --dry-run
+chmod 600 /tmp/sprout-keys.txt
+argos --sprout-key-file /tmp/sprout-keys.txt scan-sprout
 ```
 
 - [ ] `show-keys` prints Sapling, Orchard, and transparent addresses for accounts 0–4
 - [ ] `scan` progress bar updates in terminal
 - [ ] `scan` writes workspace to `--data-dir`
 - [ ] `sweep` (without `--confirm-sweep`) prints proposal and exits without broadcasting
+- [ ] `inspect-wallet` performs no network access and writes no workspace
+- [ ] imported Sapling and transparent keys both scan and sweep
+- [ ] `scan-sprout` and `sweep-sprout` appear in ordinary `--help` output without a Cargo feature
 - [ ] All commands show useful `--help` text
 
 ---
@@ -176,4 +233,4 @@ cargo test -p argos-core -- --ignored default_endpoints_are_reachable
 
 ---
 
-*Last updated: 2026-07-15*
+*Last updated: 2026-08-26*

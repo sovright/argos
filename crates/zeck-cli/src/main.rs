@@ -32,10 +32,11 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(
     name = "argos",
-    about = "Legacy ZecWallet Lite recovery tool",
-    long_about = "Argos recovers funds from ZecWallet Lite wallets using a BIP-39 seed phrase.\n\
-                  It derives keys, scans the Zcash blockchain via lightwalletd, and can sweep\n\
-                  recovered funds to a new Unified Address.",
+    about = "Legacy Zcash wallet recovery tool",
+    long_about = "Argos recovers funds from ZecWallet Lite seeds and wallet files, zcashd \
+                  wallet.dat files, and standalone Sapling or Sprout spending keys.\n\
+                  It scans the Zcash blockchain through lightwalletd, or full blocks for \
+                  Sprout, and sweeps recovered funds to a modern shielded address.",
     version
 )]
 struct Cli {
@@ -148,7 +149,7 @@ enum Commands {
     /// network, and nothing is written anywhere.
     InspectWallet,
 
-    /// Scan the blockchain and report balances for all derived accounts.
+    /// Scan the blockchain and report balances for derived or imported keys.
     Scan,
 
     /// Scan and then sweep recovered funds to a Unified Address.
@@ -182,7 +183,7 @@ enum Commands {
         confirm_sweep: bool,
     },
 
-    /// Find Sprout notes for a raw spending key by scanning the chain.
+    /// Find Sprout notes for wallet or standalone keys by scanning the chain.
     ///
     /// For keys with no wallet file behind them — a paper backup, or a
     /// `z_exportkey` string. There is no cheaper route: Sprout notes are
@@ -219,9 +220,9 @@ enum Commands {
     /// `zcash_primitives`' builder refuses Sprout outright.
     #[cfg(feature = "sprout")]
     SweepSprout {
-        /// Destination Sapling address. Not a Unified Address: the value
-        /// leaves Sprout through the transparent pool and must be consumed
-        /// by a Sapling output in the same transaction.
+        /// Bare Sapling address, or a Unified Address with a Sapling receiver.
+        /// The value always lands in Sapling because Sprout cannot share a
+        /// transaction with Orchard.
         #[arg(long)]
         destination: String,
 

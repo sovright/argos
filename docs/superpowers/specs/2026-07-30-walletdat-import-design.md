@@ -1,7 +1,7 @@
 # wallet.dat import — design
 
 **Date:** 2026-07-30
-**Status:** approved, ready for implementation planning
+**Status:** implemented on `main`; retained as the original design record
 **Scope:** sub-spec 1 of 3 (see [Project decomposition](#project-decomposition))
 
 ## Problem
@@ -419,7 +419,7 @@ already persists.
 | §5 Threat actors | New vector: **a malicious wallet file**. Argos previously accepted only a mnemonic — a low-structure, low-surface input. Accepting an attacker-crafted binary is a genuinely new actor path. |
 | §6.1 Secret handling | Passphrase handling, and the Tauri IPC plaintext exposure as a **new instance of accepted audit Issue A** — stated explicitly rather than silently inherited from the seed's justification |
 | §6.4 Local storage | Imported keys entering the workspace |
-| §9 Out of scope, and `README.md:46` | Both currently state Sprout recovery is impossible. **Do not edit until the capability ships** — but do not forget, because stale text tells users their funds are unrecoverable when they are not. |
+| §9 Out of scope, and `README.md` | Completed after the capability shipped: both now distinguish seed-only limits from end-to-end Sprout recovery using a wallet file or standalone key. |
 
 ## Testing
 
