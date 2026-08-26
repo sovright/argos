@@ -1,0 +1,21 @@
+[package]
+name = "argos-wallet-import-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+argos-wallet-import = { path = ".." }
+
+[[bin]]
+name = "bdb_walk"
+path = "fuzz_targets/bdb_walk.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
