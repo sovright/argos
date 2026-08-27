@@ -983,11 +983,9 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     // was only correct by accident — and disappeared the moment that message
     // became accurate about Sapling and transparent funds.
     //
-    // Both builds say something, because both builds have already printed a
-    // Sprout key count: the parser is unconditional. Silence would leave keys
-    // on screen with no account of them. What differs is where the user is
-    // sent — a build without Sprout support must not name subcommands it does
-    // not have.
+    // Always says something, because a Sprout key count has already been
+    // printed above: the parser is unconditional. Silence would leave keys on
+    // screen with no account of them.
     if !keys.sprout.is_empty() {
         print_sprout_next_steps();
         println!();

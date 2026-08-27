@@ -35,8 +35,6 @@ fn main() {
             commands::pick_wallet_file,
             commands::inspect_wallet_file,
             commands::start_scan_from_wallet_file,
-            // Registered in both builds — it is the capability probe itself,
-            // and a frontend that cannot ask gets no answer and fails closed.
             commands::get_scan_progress,
             commands::cancel_scan,
             commands::propose_sweep,
