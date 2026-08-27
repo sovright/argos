@@ -105,9 +105,12 @@ jobs:
   sprout-node-tests:
     name: Sprout scan against a real node
     runs-on: ubuntu-latest
-    # Generous: the end-to-end scan mines 110 blocks for coinbase maturity,
-    # plants a note, then walks the chain, and the two spend tests each prove
-    # a JoinSplit against the real 725 MB parameters. ~20 minutes locally.
+    # The end-to-end scan mines 110 blocks for coinbase maturity, plants a
+    # note, then walks the chain; the two spend tests each prove a JoinSplit
+    # against the real 725 MB parameters. With dependencies optimised in the
+    # dev profile (see the root Cargo.toml) the four tests run in a couple of
+    # minutes; the headroom here is for the cold dependency build behind a
+    # cache miss, not for the tests.
     timeout-minutes: 45
     permissions:
       contents: read
