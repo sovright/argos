@@ -189,12 +189,31 @@ jobs:
       #
       # These were previously excluded for being proving-heavy. That was the
       # right trade only while the commitment derivation was frozen.
+      #
+      # `--features argos-network` is not optional: `sprout_consensus_roundtrip`
+      # is `#![cfg(feature = "argos-network")]`, so without it the binary
+      # compiles to zero tests and cargo still reports "ok". A green step that
+      # ran nothing is worse than a red one. The count is asserted below rather
+      # than trusted.
       - name: Sprout spend tests against consensus
         run: |
-          cargo test -p argos-core \
+          set -o pipefail
+          cargo test -p argos-core --features argos-network \
             --test sprout_consensus_roundtrip \
             --test sprout_stale_anchor \
-            -- --ignored --nocapture
+            -- --ignored --nocapture 2>&1 | tee spend-tests.log
+
+      - name: Check the spend tests actually ran
+        run: |
+          passed=$(grep -cE '^test .* \.\.\. ok$' spend-tests.log || true)
+          echo "spend tests passed: $passed"
+          # Two: one per file. Asserted as an exact floor so that a file
+          # silently emptying itself -- a cfg gate, a rename -- turns this
+          # job red instead of green.
+          if [ "$passed" -lt 2 ]; then
+            echo "::error::expected 2 passing spend tests, saw $passed -- a cfg gate or a rename has silently emptied this job"
+            exit 1
+          fi
 
       - name: Node logs on failure
         if: failure()
