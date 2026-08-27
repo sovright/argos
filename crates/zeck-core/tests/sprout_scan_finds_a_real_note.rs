@@ -189,9 +189,12 @@ async fn a_scan_finds_a_note_it_was_never_told_about() {
         0,
         sprout_witness::empty_tree_root(),
         &js_key.verification_key(),
-        random32(),
-        random32(),
-        random32(),
+        &sprout_spend::JoinSplitRandomness {
+            phi: random32(),
+            random_seed: random32(),
+            esk: random32(),
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute fields");
 

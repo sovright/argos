@@ -139,9 +139,12 @@ fn a_joinsplit_we_built_verifies_against_the_consensus_circuit() {
         note.value,
         anchor,
         &key.verification_key(),
-        [0x44; 32],
-        [0x66; 32],
-        [0x55; 32],
+        &sprout_spend::JoinSplitRandomness {
+            phi: [0x44; 32],
+            random_seed: [0x66; 32],
+            esk: [0x55; 32],
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute the JoinSplit fields");
 

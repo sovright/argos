@@ -207,9 +207,12 @@ async fn zcashd_records_no_inbound_sprout_note_so_no_funded_fixture_exists() {
         0,
         sprout_witness::empty_tree_root(),
         &js_key.verification_key(),
-        random32(),
-        random32(),
-        random32(),
+        &sprout_spend::JoinSplitRandomness {
+            phi: random32(),
+            random_seed: random32(),
+            esk: random32(),
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute fields");
     let proof =

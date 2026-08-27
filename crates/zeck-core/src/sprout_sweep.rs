@@ -195,6 +195,10 @@ pub fn build_sweep_for_note(
         },
     ];
 
+    // Every field drawn from one CSPRNG, independently — including each
+    // output's `rcm`, which §4.7.1 requires be sampled rather than derived.
+    let randomness = sprout_spend::JoinSplitRandomness::sample(&mut rng);
+
     let fields = sprout_spend::compute_joinsplit_fields(
         &inputs,
         &outputs,
@@ -202,9 +206,7 @@ pub fn build_sweep_for_note(
         note.note.value,
         anchor,
         &signing_key.verification_key(),
-        random_bytes(&mut rng),
-        random_bytes(&mut rng),
-        random_bytes(&mut rng),
+        &randomness,
     )?;
 
     let proof = sprout_spend::prove_joinsplit(&fields, &inputs, &outputs, proving_key)?;

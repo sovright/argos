@@ -106,8 +106,9 @@ jobs:
     name: Sprout scan against a real node
     runs-on: ubuntu-latest
     # Generous: the end-to-end scan mines 110 blocks for coinbase maturity,
-    # plants a note, then walks the chain. ~6 minutes locally.
-    timeout-minutes: 30
+    # plants a note, then walks the chain, and the two spend tests each prove
+    # a JoinSplit against the real 725 MB parameters. ~20 minutes locally.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -173,15 +174,26 @@ jobs:
       # anything from a cold start -- every fresh walk aborted on its first
       # page -- while the docs described it as proven on regtest. Nothing in
       # CI ran them, so nothing caught it.
-      #
-      # Deliberately not the whole `--ignored` set: the remaining Sprout tests
-      # are proving-heavy (several minutes each) and belong in their own job if
-      # they are ever wanted. These two are the ones that cover the scan.
       - name: Sprout scan tests
         run: |
           cargo test -p argos-core \
             --test sprout_scan_matches_the_node \
             --test sprout_scan_finds_a_real_note \
+            -- --ignored --nocapture
+
+      # The spend half, and the reason it is no longer optional: `rcm` is now
+      # sampled per §4.7.1 rather than derived, which changes *every*
+      # commitment Argos produces. A commitment the circuit and the chain
+      # disagree about is exactly what these catch, and a local proof check
+      # cannot -- only a node decides whether a spend is valid.
+      #
+      # These were previously excluded for being proving-heavy. That was the
+      # right trade only while the commitment derivation was frozen.
+      - name: Sprout spend tests against consensus
+        run: |
+          cargo test -p argos-core \
+            --test sprout_consensus_roundtrip \
+            --test sprout_stale_anchor \
             -- --ignored --nocapture
 
       - name: Node logs on failure

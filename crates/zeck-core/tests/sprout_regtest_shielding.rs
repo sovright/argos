@@ -135,13 +135,17 @@ async fn a_shielding_joinsplit_is_accepted_by_the_node() {
     let fields = sprout_spend::compute_joinsplit_fields(
         &inputs,
         &outputs,
-        shielded_value, // vpub_old: value entering the Sprout pool
+        shielded_value,
+        // vpub_old: value entering the Sprout pool
         0,
         anchor,
         &js_key.verification_key(),
-        [0x91; 32],
-        [0x92; 32],
-        [0x93; 32],
+        &sprout_spend::JoinSplitRandomness {
+            phi: [0x91; 32],
+            random_seed: [0x92; 32],
+            esk: [0x93; 32],
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute JoinSplit fields");
 
