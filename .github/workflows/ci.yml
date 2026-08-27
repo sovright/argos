@@ -123,6 +123,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # The spend tests below build `--features argos-network`, and that is the
+      # only configuration in which `crates/zeck-core/build.rs` compiles the
+      # vendored lightwalletd protos -- which needs `protoc`. No other job
+      # enables the feature, so nothing needed this until the spend tests were
+      # added and the build died before a single test ran.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       # The only regtest chain that can hold Sprout notes: ZIP 211 forbids
       # funding the pool from Canopy onward, and this profile holds Canopy
       # inactive (nuparams e9ff75a6:9999999).
