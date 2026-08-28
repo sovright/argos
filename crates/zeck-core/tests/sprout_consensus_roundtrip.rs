@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! Create a real Sprout note on a node, then spend it — and let consensus
 //! judge both halves.
 //!
@@ -82,7 +81,10 @@ async fn rpc(method: &str, params: serde_json::Value) -> serde_json::Value {
             panic!("zcashd {method} failed: {error}");
         }
     }
-    parsed.get("result").cloned().unwrap_or(serde_json::Value::Null)
+    parsed
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Fresh randomness per run.
@@ -124,15 +126,21 @@ async fn tip_branch_id() -> BranchId {
 #[ignore = "requires the sprout profile and sprout-groth16.params; see the module docs"]
 async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     let params = params_path();
-    assert!(params.exists(), "need the Sprout parameters at {}", params.display());
+    assert!(
+        params.exists(),
+        "need the Sprout parameters at {}",
+        params.display()
+    );
     let proving_key = sprout_spend::load_sprout_proving_key(&params).expect("proving key");
 
     let key = argos_core::imported::ImportedTransparentKey {
         secret: secp256k1::SecretKey::from_slice(&[0x11; 32]).expect("key"),
         address: {
             let secp = secp256k1::Secp256k1::signing_only();
-            let pk = secp256k1::PublicKey::from_secret_key(&secp, 
-                &secp256k1::SecretKey::from_slice(&[0x11; 32]).expect("key"));
+            let pk = secp256k1::PublicKey::from_secret_key(
+                &secp,
+                &secp256k1::SecretKey::from_slice(&[0x11; 32]).expect("key"),
+            );
             zcash_transparent::address::TransparentAddress::from_pubkey(&pk)
         },
     };
@@ -164,8 +172,11 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
         .expect("an output paying our address");
     let value = (vout["value"].as_f64().expect("value") * 1e8).round() as u64;
     let index = vout["n"].as_u64().expect("n") as u32;
-    let script =
-        hex_to_bytes(vout["scriptPubKey"]["hex"].as_str().expect("scriptPubKey hex"));
+    let script = hex_to_bytes(
+        vout["scriptPubKey"]["hex"]
+            .as_str()
+            .expect("scriptPubKey hex"),
+    );
     let mut txid_bytes = hex_to_bytes(&txid);
     txid_bytes.reverse(); // RPC prints txids big-endian; the wire is little-endian.
     let txid_arr: [u8; 32] = txid_bytes.try_into().expect("32-byte txid");
@@ -179,28 +190,47 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     let dummy = sprout_witness::dummy_path().to_vec();
     let inputs = [
         sprout_spend::JoinSplitInput {
-            note: sprout::SproutNotePlaintext { value: 0, rho: random32(), r: random32(), memo: [0u8; 512] },
+            note: sprout::SproutNotePlaintext {
+                value: 0,
+                rho: random32(),
+                r: random32(),
+                memo: [0u8; 512],
+            },
             a_sk,
             witness_path: dummy.clone(),
         },
         sprout_spend::JoinSplitInput {
-            note: sprout::SproutNotePlaintext { value: 0, rho: random32(), r: random32(), memo: [0u8; 512] },
+            note: sprout::SproutNotePlaintext {
+                value: 0,
+                rho: random32(),
+                r: random32(),
+                memo: [0u8; 512],
+            },
             a_sk,
             witness_path: dummy,
         },
     ];
     let outputs = [
-        sprout_spend::JoinSplitOutput { recipient, value: shielded },
-        sprout_spend::JoinSplitOutput { recipient, value: 0 },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: shielded,
+        },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: 0,
+        },
     ];
 
     let fields = sprout_spend::compute_joinsplit_fields(
-        &inputs, &outputs,
+        &inputs,
+        &outputs,
         shielded, // vpub_old: value entering the pool
         0,
         sprout_witness::empty_tree_root(),
         &js_key.verification_key(),
-        random32(), random32(), random32(),
+        random32(),
+        random32(),
+        random32(),
     )
     .expect("compute fields");
 
@@ -208,7 +238,10 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
         .expect("prove the shielding JoinSplit");
     let js = sprout_spend::build_js_description(&fields, &proof).expect("build description");
 
-    let height = rpc("getblockcount", serde_json::json!([])).await.as_u64().unwrap();
+    let height = rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .unwrap();
     let tx = sprout_spend::build_and_sign_v4_shielding(
         tip_branch_id().await,
         BlockHeight::from_u32(height as u32 + 40),
@@ -226,12 +259,21 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
 
     let mut raw = Vec::new();
     tx.write(&mut raw).expect("serialize");
-    let sent = rpc("sendrawtransaction", serde_json::json!([bytes_to_hex(&raw)])).await;
-    let shield_txid = sent.as_str().expect("the node accepted the shielding transaction");
+    let sent = rpc(
+        "sendrawtransaction",
+        serde_json::json!([bytes_to_hex(&raw)]),
+    )
+    .await;
+    let shield_txid = sent
+        .as_str()
+        .expect("the node accepted the shielding transaction");
     eprintln!("[sprout] shielding accepted: {shield_txid}");
 
     rpc("generate", serde_json::json!([1])).await;
-    let shield_height = rpc("getblockcount", serde_json::json!([])).await.as_u64().unwrap();
+    let shield_height = rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .unwrap();
     let mined = rpc("getrawtransaction", serde_json::json!([shield_txid, 1])).await;
     assert!(
         mined["confirmations"].as_u64().unwrap_or(0) >= 1,
@@ -273,7 +315,11 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     // witness code rather than a wrong starting point. `z_gettreestate`
     // returns the serialized tree, which is the structure the wallet parser
     // already reads.
-    let before = rpc("z_gettreestate", serde_json::json!([(shield_height - 1).to_string()])).await;
+    let before = rpc(
+        "z_gettreestate",
+        serde_json::json!([(shield_height - 1).to_string()]),
+    )
+    .await;
     let final_state = before["sprout"]["commitments"]["finalState"]
         .as_str()
         .expect("z_gettreestate returns the sprout tree");
@@ -283,14 +329,20 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     tree.append(fields.commitments[0]).expect("append note");
     let mut witness = sprout_witness::IncrementalWitness::from_tree(tree.clone());
     tree.append(fields.commitments[1]).expect("append sibling");
-    witness.append(fields.commitments[1]).expect("witness forward");
+    witness
+        .append(fields.commitments[1])
+        .expect("witness forward");
     let anchor = witness.root();
     assert_eq!(anchor, tree.root(), "witness must track its tree");
 
     // Cross-check against the node: our reconstruction must equal the tree
     // the chain computed for the block our note landed in. This validates
     // the tree implementation against zcashd rather than against itself.
-    let after = rpc("z_gettreestate", serde_json::json!([shield_height.to_string()])).await;
+    let after = rpc(
+        "z_gettreestate",
+        serde_json::json!([shield_height.to_string()]),
+    )
+    .await;
     let chain_root = after["sprout"]["commitments"]["finalRoot"]
         .as_str()
         .expect("finalRoot");
@@ -318,23 +370,37 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
             witness_path: witness.encode_for_prover().expect("encode path").to_vec(),
         },
         sprout_spend::JoinSplitInput {
-            note: sprout::SproutNotePlaintext { value: 0, rho: random32(), r: random32(), memo: [0u8; 512] },
+            note: sprout::SproutNotePlaintext {
+                value: 0,
+                rho: random32(),
+                r: random32(),
+                memo: [0u8; 512],
+            },
             a_sk,
             witness_path: sprout_witness::dummy_path().to_vec(),
         },
     ];
     let spend_outputs = [
-        sprout_spend::JoinSplitOutput { recipient, value: 0 },
-        sprout_spend::JoinSplitOutput { recipient, value: 0 },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: 0,
+        },
+        sprout_spend::JoinSplitOutput {
+            recipient,
+            value: 0,
+        },
     ];
 
     let spend_fields = sprout_spend::compute_joinsplit_fields(
-        &spend_inputs, &spend_outputs,
+        &spend_inputs,
+        &spend_outputs,
         0,
         spent.value, // vpub_new: the whole note leaves the Sprout pool
         anchor,
         &spend_key.verification_key(),
-        random32(), random32(), random32(),
+        random32(),
+        random32(),
+        random32(),
     )
     .expect("compute spend fields");
 
@@ -373,7 +439,10 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
         .expect("build the Sapling bundle")
         .expect("the bundle must have an output");
 
-    let spend_height = rpc("getblockcount", serde_json::json!([])).await.as_u64().unwrap();
+    let spend_height = rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .unwrap();
     let spend_tx = sprout_spend::build_and_sign_v4_sprout_to_sapling(
         tip_branch_id().await,
         BlockHeight::from_u32(spend_height as u32 + 40),
@@ -387,7 +456,11 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
 
     let mut spend_raw = Vec::new();
     spend_tx.write(&mut spend_raw).expect("serialize");
-    let spend_sent = rpc("sendrawtransaction", serde_json::json!([bytes_to_hex(&spend_raw)])).await;
+    let spend_sent = rpc(
+        "sendrawtransaction",
+        serde_json::json!([bytes_to_hex(&spend_raw)]),
+    )
+    .await;
     let spend_txid = spend_sent
         .as_str()
         .expect("the node accepted the Sprout-to-Sapling transaction");

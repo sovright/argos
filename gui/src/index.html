@@ -312,24 +312,6 @@
               <span id="wallet-sprout-detail"></span>
               <div id="wallet-sprout-scan-cost" hidden></div>
 
-              <!-- Shown when the backend reports no Sprout support (the
-                   `sprout_supported` command). The panel below stays visible
-                   and is disabled instead of being hidden: the summary above
-                   already reports a Sprout key count, so hiding it would leave
-                   keys named with no explanation of why nothing can be done
-                   with them. Wording tracks the CLI's `print_sprout_next_steps`
-                   -- and names no subcommand, because none exists here. -->
-              <div id="sprout-unsupported" class="guide-warning" hidden>
-                <strong>This build cannot recover Sprout funds.</strong>
-                <span>
-                  Sprout support is not compiled in, so the controls below are
-                  disabled. The keys counted above are real and are not lost;
-                  nothing here moves or damages them. Recovering them needs an
-                  Argos build with Sprout support. Keep the original wallet
-                  file — it is the only copy of those keys.
-                </span>
-              </div>
-
               <!-- Shown only when the wallet file yielded no spendable notes,
                    which is the one case a scan can help with. Also accepts a
                    raw key, for a user who has no wallet file at all. -->

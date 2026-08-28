@@ -35,9 +35,6 @@ fn main() {
             commands::pick_wallet_file,
             commands::inspect_wallet_file,
             commands::start_scan_from_wallet_file,
-            // Registered in both builds — it is the capability probe itself,
-            // and a frontend that cannot ask gets no answer and fails closed.
-            commands::sprout_supported,
             commands::get_scan_progress,
             commands::cancel_scan,
             commands::propose_sweep,
@@ -46,16 +43,11 @@ fn main() {
             commands::detect_birthday,
             commands::save_recovery_report,
             commands::delete_workspace,
-            #[cfg(feature = "sprout")]
             commands::check_sprout_key,
             commands::check_sapling_key,
-            #[cfg(feature = "sprout")]
             commands::start_sprout_scan,
-            #[cfg(feature = "sprout")]
             commands::sweep_sprout_from_scan,
-            #[cfg(feature = "sprout")]
             commands::preview_sprout_sweep,
-            #[cfg(feature = "sprout")]
             commands::execute_sprout_sweep,
             commands::default_data_dir,
             commands::notify_user,

@@ -19,20 +19,6 @@ publish = false
 # out, so a hostile mainnet lightwalletd cannot claim to be `regtest` to
 # bypass network validation in a released Argos binary.
 argos-network = ["zcash_protocol/local-consensus"]
-
-# `sprout` — opt-in Sprout-pool recovery (Track B). Gates the entire Sprout
-# code path: the `sprout*` modules, the `p2p` full-block wire stack they
-# depend on, the Sprout CLI subcommands, and the Sprout-only tests. Compiled
-# out by default (Track A: Sapling-imported keys, ZecWallet-Lite mnemonic,
-# transparent-only), so a minimal build carries none of the ~12k lines of
-# Sprout logic. The wallet parser stays unconditional either way, so even a
-# default build can still detect that a wallet holds Sprout funds.
-#
-# Forwards to `argos-wallet-import/sprout`, which is a marker feature (the
-# parser is unconditional) whose only job is to enable that crate's
-# Sprout-only test under the same flag.
-sprout = ["argos-wallet-import/sprout"]
-
 [dependencies]
 anyhow.workspace = true
 argos-wallet-import = { path = "../argos-wallet-import" }

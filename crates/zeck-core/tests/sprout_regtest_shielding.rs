@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! Broadcast a real Sprout JoinSplit to a node and let consensus judge it.
 //!
 //! Everything else in the Sprout work is checked by me or by the proving
@@ -64,12 +63,10 @@ async fn a_shielding_joinsplit_is_accepted_by_the_node() {
         argos_core::imported::encode_transparent_address(&key.address, ZeckNetwork::Testnet);
     common::regtest_harness::fund_address(&address, 500_000_000).await;
 
-    let (mut client, _endpoint) = argos_core::lightwalletd::connect_lightwalletd_endpoints(
-        harness.lightwalletd_url(),
-        None,
-    )
-    .await
-    .expect("connect to lightwalletd");
+    let (mut client, _endpoint) =
+        argos_core::lightwalletd::connect_lightwalletd_endpoints(harness.lightwalletd_url(), None)
+            .await
+            .expect("connect to lightwalletd");
 
     let utxos = argos_core::transparent_recovery::fetch_transparent_utxos(
         &mut client,
@@ -148,8 +145,7 @@ async fn a_shielding_joinsplit_is_accepted_by_the_node() {
     )
     .expect("compute JoinSplit fields");
 
-    let proving_key =
-        sprout_spend::load_sprout_proving_key(&params).expect("load the proving key");
+    let proving_key = sprout_spend::load_sprout_proving_key(&params).expect("load the proving key");
     let proof = sprout_spend::prove_joinsplit(&fields, &inputs, &outputs, &proving_key)
         .expect("prove the shielding JoinSplit");
     let js = sprout_spend::build_js_description(&fields, &proof).expect("build the description");

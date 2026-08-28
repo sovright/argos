@@ -225,7 +225,11 @@ mod tests {
     #[test]
     fn transparent_address_rejected() {
         // t1 address — not a unified address at all
-        let err = validate_destination_address("t1dUDJ62ANtmebE8drFg7g2MWYwXHQ6Xu3F", ZeckNetwork::Mainnet).unwrap_err();
+        let err = validate_destination_address(
+            "t1dUDJ62ANtmebE8drFg7g2MWYwXHQ6Xu3F",
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ZeckError::DestinationMustBeUnified),
             "got {err:?}"
@@ -249,19 +253,13 @@ mod tests {
     #[test]
     fn garbage_string_rejected() {
         let err = validate_destination_address("not-an-address", ZeckNetwork::Mainnet).unwrap_err();
-        assert!(
-            matches!(err, ZeckError::InvalidAddress(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
     }
 
     #[test]
     fn empty_string_rejected() {
         let err = validate_destination_address("", ZeckNetwork::Mainnet).unwrap_err();
-        assert!(
-            matches!(err, ZeckError::InvalidAddress(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
     }
 
     // ─── Address resilience (R-A6..R-A9) ──────────────────────────────────────
@@ -299,13 +297,21 @@ mod tests {
         // R-A8: a space in the middle of a UA is an immediate Bech32m
         // violation. Embedded NUL too — both should reject before any
         // partial parse.
-        let with_space = format!("{}{}{}",
-            &UA_ORCHARD_SAPLING[..40], " ", &UA_ORCHARD_SAPLING[40..]);
+        let with_space = format!(
+            "{}{}{}",
+            &UA_ORCHARD_SAPLING[..40],
+            " ",
+            &UA_ORCHARD_SAPLING[40..]
+        );
         let err = validate_destination_address(&with_space, ZeckNetwork::Mainnet).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
 
-        let with_nul = format!("{}{}{}",
-            &UA_ORCHARD_SAPLING[..40], "\x00", &UA_ORCHARD_SAPLING[40..]);
+        let with_nul = format!(
+            "{}{}{}",
+            &UA_ORCHARD_SAPLING[..40],
+            "\x00",
+            &UA_ORCHARD_SAPLING[40..]
+        );
         let err = validate_destination_address(&with_nul, ZeckNetwork::Mainnet).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidAddress(_)), "got {err:?}");
     }
@@ -356,8 +362,8 @@ mod tests {
 
     #[test]
     fn mainnet_address_rejected_on_testnet_scan() {
-        let err = validate_destination_address(UA_ORCHARD_SAPLING, ZeckNetwork::Testnet)
-            .unwrap_err();
+        let err =
+            validate_destination_address(UA_ORCHARD_SAPLING, ZeckNetwork::Testnet).unwrap_err();
         match err {
             ZeckError::WrongNetwork { expected, actual } => {
                 assert_eq!(expected, "testnet");

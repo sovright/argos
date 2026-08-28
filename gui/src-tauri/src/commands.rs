@@ -154,38 +154,6 @@ pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> 
         .map(|path| path.to_string_lossy().into_owned()))
 }
 
-/// Whether this build can recover Sprout funds.
-///
-/// A constant resolved at compile time, because that is exactly what it
-/// reports: with the `sprout` feature off there is no Sprout backend linked
-/// in at all — the recovery, scan and sweep modules are absent, and with them
-/// the five Tauri commands the Sprout panel calls. There is nothing to
-/// feature-detect at runtime, so the honest answer is whichever constant the
-/// build was compiled with.
-///
-/// It is a command rather than a build-time edit to the frontend because
-/// `gui/src/main.js` is a single static file with no bundler, shared by both
-/// builds. Deleting the panel in one and re-adding it in the other would
-/// churn the same code twice and let the two copies drift; asking the backend
-/// at runtime keeps one frontend serving both.
-///
-/// The frontend must treat a failed call as `false` too. Guessing "supported"
-/// would put a user in front of live-looking Sprout controls that cannot work.
-#[cfg(feature = "sprout")]
-#[tauri::command]
-pub fn sprout_supported() -> bool {
-    true
-}
-
-/// See the counterpart above. Without the feature the Sprout commands are not
-/// compiled at all, so invoking one throws; the frontend has to know that
-/// before it draws a single live-looking control.
-#[cfg(not(feature = "sprout"))]
-#[tauri::command]
-pub fn sprout_supported() -> bool {
-    false
-}
-
 /// Drop any Sprout key that does not control the address it was filed under,
 /// emitting a `sprout-forged-key` event for each so the frontend can surface
 /// it. Mirrors the CLI loader and the `inspect` command, so the GUI's
@@ -193,7 +161,6 @@ pub fn sprout_supported() -> bool {
 /// key. A forged key finds no notes (and the downstream commitment check
 /// stops it from ever spending someone else's), but without this the user
 /// gets an unexplained empty result instead of the reason.
-#[cfg(feature = "sprout")]
 fn drop_and_warn_forged_sprout_keys(
     app: &AppHandle,
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
@@ -203,26 +170,12 @@ fn drop_and_warn_forged_sprout_keys(
     }
 }
 
-/// Without the Sprout code path compiled in there is no key-validation logic
-/// to run, and no Sprout key is ever trial-decrypted against, so there is
-/// nothing to drop and nothing to warn about. Same shape as
-/// `compute_sprout_summary`: the call sites stay unconditional and the body
-/// compiles out.
-#[cfg(not(feature = "sprout"))]
-fn drop_and_warn_forged_sprout_keys(
-    _app: &AppHandle,
-    _keys: &mut argos_core::argos_wallet_import::ImportedKeys,
-) {
-}
-
 /// The Sprout-derived portion of a `WalletFileSummary`.
 ///
-/// Extracted so the Sprout recovery computation — forged-key rejection, note
-/// decryption, scan-cost wording — compiles out with the `sprout` feature.
-/// The fields are plain data (counts, encoded strings) so the JSON the
-/// frontend consumes is identical either way; only their *values* change: a
-/// default build cannot recover or validate Sprout notes, so it reports the
-/// key count from the parser and leaves the rest empty.
+/// Kept as its own struct so the Sprout recovery computation — forged-key
+/// rejection, note decryption, scan-cost wording — stays in one helper
+/// instead of spreading through `inspect_wallet_file`. The fields are plain
+/// data (counts, encoded strings), which is what the frontend consumes.
 struct SproutSummary {
     sprout_keys: usize,
     sprout_addresses: Vec<String>,
@@ -235,7 +188,6 @@ struct SproutSummary {
 /// Compute the Sprout summary for a wallet. Body is verbatim the logic that
 /// previously lived inline in `inspect_wallet_file`: reject forged keys, then
 /// try to recover notes, then quote the scan cost when a scan would be needed.
-#[cfg(feature = "sprout")]
 fn compute_sprout_summary(
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
     network_name: &str,
@@ -286,25 +238,6 @@ fn compute_sprout_summary(
     }
 }
 
-/// Without the Sprout code path compiled in there is no recovery or
-/// validation logic to run. The always-on parser still counts the keys, so
-/// the summary reports that count (unvalidated) and leaves everything the
-/// recovery path would have produced empty.
-#[cfg(not(feature = "sprout"))]
-fn compute_sprout_summary(
-    keys: &mut argos_core::argos_wallet_import::ImportedKeys,
-    _network_name: &str,
-) -> SproutSummary {
-    SproutSummary {
-        sprout_keys: keys.sprout.len(),
-        sprout_addresses: Vec::new(),
-        sprout_spendable_notes: 0,
-        sprout_spendable_zatoshis: 0,
-        sprout_issues: Vec::new(),
-        sprout_scan_warning: Vec::new(),
-    }
-}
-
 /// Read a legacy wallet file and report what is in it. No network, and
 /// nothing is written anywhere.
 ///
@@ -352,9 +285,9 @@ pub async fn inspect_wallet_file(
         };
 
     // The Sprout-specific recovery (forged-key rejection, note decryption,
-    // scan-cost wording) is computed in a helper so it compiles out with the
-    // `sprout` feature. It takes `&mut keys` because rejecting forged Sprout
-    // keys must drop them before anything else reads the wallet.
+    // scan-cost wording) is computed in a helper to keep this function
+    // readable. It takes `&mut keys` because rejecting forged Sprout keys
+    // must drop them before anything else reads the wallet.
     let mut keys = keys;
     let sprout = compute_sprout_summary(&mut keys, &network_name);
 
@@ -426,9 +359,8 @@ pub async fn start_scan_from_wallet_file(
         }
         None => argos_core::argos_wallet_import::ImportedKeys::default(),
     };
-    // Unconditional call site: the body compiles out without the `sprout`
-    // feature. A forged Sprout key must not survive into the scan whether the
-    // keys came from a wallet file or not.
+    // A forged Sprout key must not survive into the scan, whether the keys
+    // came from a wallet file or from pasted text.
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
     if !config.sapling_keys.is_empty() {
@@ -650,7 +582,6 @@ pub async fn execute_sweep(
 }
 
 /// What a Sprout sweep would move, before anything is built.
-#[cfg(feature = "sprout")]
 #[derive(Serialize)]
 pub struct SproutSweepPreview {
     pub notes: usize,
@@ -675,7 +606,6 @@ pub struct SproutSweepPreview {
 /// holding decrypted Sprout spending keys in the backend for the lifetime
 /// of the app would widen the window in which they can be captured, for no
 /// benefit beyond skipping a file read.
-#[cfg(feature = "sprout")]
 #[tauri::command]
 pub async fn preview_sprout_sweep(
     app: AppHandle,
@@ -705,14 +635,12 @@ pub async fn preview_sprout_sweep(
 }
 
 /// One broadcast Sprout sweep, for the frontend.
-#[cfg(feature = "sprout")]
 #[derive(Serialize)]
 pub struct SproutSweepResult {
     pub txid: String,
     pub value_swept: u64,
 }
 
-#[cfg(feature = "sprout")]
 #[derive(Serialize)]
 pub struct SproutSweepReport {
     pub sent: Vec<SproutSweepResult>,
@@ -734,7 +662,6 @@ pub struct SproutSweepReport {
 /// Progress is emitted as `sprout-sweep-progress` events because proving
 /// takes minutes per note, and a silent multi-minute window is
 /// indistinguishable from a hang.
-#[cfg(feature = "sprout")]
 #[tauri::command]
 pub async fn execute_sprout_sweep(
     app: AppHandle,
@@ -797,7 +724,6 @@ pub async fn execute_sprout_sweep(
 }
 
 /// A Sprout scan's outcome, for the frontend.
-#[cfg(feature = "sprout")]
 #[derive(Serialize)]
 pub struct SproutScanReport {
     pub blocks_scanned: u64,
@@ -812,7 +738,6 @@ pub struct SproutScanReport {
 /// Separate from the scan so a typo is caught in a second rather than six
 /// hours in. The address is returned so the user can confirm Argos is about
 /// to look for the one they meant.
-#[cfg(feature = "sprout")]
 #[tauri::command]
 pub async fn check_sprout_key(key: String, network: String) -> Result<String, String> {
     let network = network_from(&network);
@@ -846,7 +771,6 @@ pub async fn check_sapling_key(key: String, network: String) -> Result<String, S
 /// address it never knew about. Mirrors `collect_sprout_scan_keys` in the
 /// CLI, including the dedup: a repeated key trial-decrypts every ciphertext
 /// twice for nothing.
-#[cfg(feature = "sprout")]
 fn collect_scan_keys(
     path: Option<&str>,
     passphrase: Option<&SecretString>,
@@ -899,7 +823,6 @@ fn collect_scan_keys(
 /// Runs for hours, so progress arrives as `sprout-scan-progress` events and
 /// the scan checkpoints as it goes — closing the app and reopening resumes
 /// rather than restarting.
-#[cfg(feature = "sprout")]
 #[tauri::command]
 pub async fn start_sprout_scan(
     app: AppHandle,
@@ -963,7 +886,6 @@ pub async fn start_sprout_scan(
 /// Without it, a scan that found funds after six hours was a dead end: the
 /// wallet-file sweep re-reads the file and cannot see scan-found notes, so
 /// the user was shown money and given nothing to click.
-#[cfg(feature = "sprout")]
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn sweep_sprout_from_scan(

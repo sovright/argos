@@ -112,7 +112,10 @@ mod tests {
     #[test]
     fn donation_is_rate_times_send_amount_when_above_threshold() {
         // 10% of 2_000_000 = 200_000 >= MIN_DONATION_ZATOSHIS (100_000)
-        assert_eq!(donation_for_send_amount(SOME_ADDR, Some(0.10), 2_000_000), 200_000);
+        assert_eq!(
+            donation_for_send_amount(SOME_ADDR, Some(0.10), 2_000_000),
+            200_000
+        );
     }
 
     #[test]
@@ -124,7 +127,10 @@ mod tests {
     #[test]
     fn donation_zero_when_it_would_consume_entire_send_amount() {
         // rounds to 1_000_000 == send_amount → guard returns 0
-        assert_eq!(donation_for_send_amount(SOME_ADDR, Some(0.9999999), 1_000_000), 0);
+        assert_eq!(
+            donation_for_send_amount(SOME_ADDR, Some(0.9999999), 1_000_000),
+            0
+        );
     }
 
     #[test]
@@ -140,7 +146,10 @@ mod tests {
 
     #[test]
     fn memo_omits_blank_email() {
-        assert_eq!(donation_memo_body(Some("   ")), DONATION_MEMO_TAG.to_owned());
+        assert_eq!(
+            donation_memo_body(Some("   ")),
+            DONATION_MEMO_TAG.to_owned()
+        );
     }
 
     #[test]
@@ -176,12 +185,30 @@ mod tests {
         // leading/trailing whitespace (including \n/\r/\t) before any other
         // check — that's intentional for copy-paste tolerance — but a
         // control character in the *middle* of the email is rejected.
-        assert!(validate_donor_email(Some("a\nb@c.com")).is_err(), "embedded LF");
-        assert!(validate_donor_email(Some("a@b\rc.com")).is_err(), "embedded CR");
-        assert!(validate_donor_email(Some("a@b\tc.com")).is_err(), "embedded TAB");
-        assert!(validate_donor_email(Some("a@b.com\x00x")).is_err(), "embedded NUL");
-        assert!(validate_donor_email(Some("a@b.com\x07x")).is_err(), "embedded BEL");
-        assert!(validate_donor_email(Some("a@b.com\x7fx")).is_err(), "embedded DEL");
+        assert!(
+            validate_donor_email(Some("a\nb@c.com")).is_err(),
+            "embedded LF"
+        );
+        assert!(
+            validate_donor_email(Some("a@b\rc.com")).is_err(),
+            "embedded CR"
+        );
+        assert!(
+            validate_donor_email(Some("a@b\tc.com")).is_err(),
+            "embedded TAB"
+        );
+        assert!(
+            validate_donor_email(Some("a@b.com\x00x")).is_err(),
+            "embedded NUL"
+        );
+        assert!(
+            validate_donor_email(Some("a@b.com\x07x")).is_err(),
+            "embedded BEL"
+        );
+        assert!(
+            validate_donor_email(Some("a@b.com\x7fx")).is_err(),
+            "embedded DEL"
+        );
         // Trailing whitespace is OK — trim() strips it before validation.
         assert!(validate_donor_email(Some("a@b.com\n")).is_ok());
         assert!(validate_donor_email(Some("  a@b.com  ")).is_ok());
@@ -203,7 +230,11 @@ mod tests {
         assert_eq!(max_email.len(), MAX_DONOR_EMAIL_BYTES);
         assert!(validate_donor_email(Some(&max_email)).is_ok());
         let memo = donation_memo_body(Some(&max_email));
-        assert!(memo.len() <= 512, "memo body {} bytes exceeds 512", memo.len());
+        assert!(
+            memo.len() <= 512,
+            "memo body {} bytes exceeds 512",
+            memo.len()
+        );
     }
 
     #[test]
@@ -226,7 +257,10 @@ mod tests {
             MIN_DONATION_ZATOSHIS
         );
         // Just above threshold:
-        assert_eq!(donation_for_send_amount(SOME_ADDR, Some(0.10), 1_000_010), 100_001);
+        assert_eq!(
+            donation_for_send_amount(SOME_ADDR, Some(0.10), 1_000_010),
+            100_001
+        );
         // Tiny send_amount where rate × send rounds well below MIN:
         assert_eq!(
             donation_for_send_amount(SOME_ADDR, Some(0.10), MIN_DONATION_ZATOSHIS + 1),
@@ -240,21 +274,64 @@ mod tests {
         // Sweep rates from "definitely skipped" through "essentially everything"
         // for a fixed send_amount well above the threshold.
         let send = 10_000_000u64; // 0.1 ZEC
-        struct Row { rate: f64, want_donation: u64, note: &'static str }
+        struct Row {
+            rate: f64,
+            want_donation: u64,
+            note: &'static str,
+        }
         let rows = [
-            Row { rate: 0.0,       want_donation: 0,         note: "zero rate" },
-            Row { rate: 1e-10,     want_donation: 0,         note: "rounding floor below MIN" },
-            Row { rate: 0.0001,    want_donation: 0,         note: "0.01% of 10M = 1000, below MIN" },
-            Row { rate: 0.01,      want_donation: 100_000,   note: "1% = 100k, exactly MIN" },
-            Row { rate: 0.10,      want_donation: 1_000_000, note: "10% nominal default" },
-            Row { rate: 0.50,      want_donation: 5_000_000, note: "half" },
-            Row { rate: 0.99,      want_donation: 9_900_000, note: "99% leaves 100k for user" },
-            Row { rate: 0.9999999, want_donation: 9_999_999, note: "very high but still under send_amount" },
+            Row {
+                rate: 0.0,
+                want_donation: 0,
+                note: "zero rate",
+            },
+            Row {
+                rate: 1e-10,
+                want_donation: 0,
+                note: "rounding floor below MIN",
+            },
+            Row {
+                rate: 0.0001,
+                want_donation: 0,
+                note: "0.01% of 10M = 1000, below MIN",
+            },
+            Row {
+                rate: 0.01,
+                want_donation: 100_000,
+                note: "1% = 100k, exactly MIN",
+            },
+            Row {
+                rate: 0.10,
+                want_donation: 1_000_000,
+                note: "10% nominal default",
+            },
+            Row {
+                rate: 0.50,
+                want_donation: 5_000_000,
+                note: "half",
+            },
+            Row {
+                rate: 0.99,
+                want_donation: 9_900_000,
+                note: "99% leaves 100k for user",
+            },
+            Row {
+                rate: 0.9999999,
+                want_donation: 9_999_999,
+                note: "very high but still under send_amount",
+            },
         ];
         for r in rows {
             let got = donation_for_send_amount(SOME_ADDR, Some(r.rate), send);
-            assert_eq!(got, r.want_donation, "rate {} ({}): expected {}, got {}", r.rate, r.note, r.want_donation, got);
-            assert!(got < send, "donation must always stay strictly below send_amount");
+            assert_eq!(
+                got, r.want_donation,
+                "rate {} ({}): expected {}, got {}",
+                r.rate, r.note, r.want_donation, got
+            );
+            assert!(
+                got < send,
+                "donation must always stay strictly below send_amount"
+            );
         }
     }
 
@@ -263,9 +340,18 @@ mod tests {
         // None of these should ever produce a donation; they pass through to
         // `rate > 0.0` False (NaN compares false; negatives compare false;
         // Inf > 0.0 but is later rejected by validate_donation_rate).
-        assert_eq!(donation_for_send_amount(SOME_ADDR, Some(f64::NAN), 10_000_000), 0);
-        assert_eq!(donation_for_send_amount(SOME_ADDR, Some(-0.1), 10_000_000), 0);
-        assert_eq!(donation_for_send_amount(SOME_ADDR, Some(-1.0), 10_000_000), 0);
+        assert_eq!(
+            donation_for_send_amount(SOME_ADDR, Some(f64::NAN), 10_000_000),
+            0
+        );
+        assert_eq!(
+            donation_for_send_amount(SOME_ADDR, Some(-0.1), 10_000_000),
+            0
+        );
+        assert_eq!(
+            donation_for_send_amount(SOME_ADDR, Some(-1.0), 10_000_000),
+            0
+        );
     }
 
     #[test]

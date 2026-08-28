@@ -29,15 +29,6 @@ argos-core = { path = "../zeck-core" }
 # mainnet lightwalletd from claiming to be `regtest` to bypass network
 # validation. Enabling it by default would forfeit that.
 argos-network = ["argos-core/argos-network"]
-
-# `sprout` — opt-in Sprout-pool recovery (Track B). Forwards to the core
-# feature of the same name and, with it, gates the `scan-sprout` /
-# `sweep-sprout` subcommands and the Sprout inspection output. Off by default:
-# a minimal build recovers Sapling-imported, ZecWallet-Lite mnemonic and
-# transparent funds, and only reports (never spends) any Sprout funds a wallet
-# holds.
-sprout = ["argos-core/sprout"]
-
 [[bin]]
 name = "argos"
 path = "src/main.rs"

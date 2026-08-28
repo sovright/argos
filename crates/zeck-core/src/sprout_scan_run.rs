@@ -594,11 +594,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|err| ZeckError::TransactionBuild(format!("creating {}: {err}", path.display())))?;
-    file.write_all(bytes)
-        .map_err(|err| ZeckError::TransactionBuild(format!("writing the scan checkpoint: {err}")))?;
+    let mut file = options.open(path).map_err(|err| {
+        ZeckError::TransactionBuild(format!("creating {}: {err}", path.display()))
+    })?;
+    file.write_all(bytes).map_err(|err| {
+        ZeckError::TransactionBuild(format!("writing the scan checkpoint: {err}"))
+    })?;
     Ok(())
 }
 
@@ -618,7 +619,11 @@ pub fn discard_checkpoint(path: &Path) {
 /// claim about rotating away from a refusing peer fiction. `connect_to_any`
 /// races a fresh batch each round, so a peer inside its 119-second window
 /// simply loses the race rather than being excluded by name.
-async fn connect_peer(network: P2pNetwork, extra: &[String], _prior: &[String]) -> ZeckResult<Peer> {
+async fn connect_peer(
+    network: P2pNetwork,
+    extra: &[String],
+    _prior: &[String],
+) -> ZeckResult<Peer> {
     connect_to_any(network, extra, 4)
         .await
         .map_err(|err| ZeckError::Broadcast(err.to_string()))

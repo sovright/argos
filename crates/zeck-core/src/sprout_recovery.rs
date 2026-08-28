@@ -115,7 +115,10 @@ pub enum SproutRecoveryIssue {
     /// The note decrypted, but its cached witness could not be read, so its
     /// position in the commitment tree is unknown and it cannot be spent
     /// without a rescan.
-    UnreadableWitness { outpoint: JsOutPoint, reason: String },
+    UnreadableWitness {
+        outpoint: JsOutPoint,
+        reason: String,
+    },
     /// The ciphertext did not authenticate under this key.
     Undecryptable {
         outpoint: JsOutPoint,
@@ -318,18 +321,17 @@ pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
         // Resolved now, not at sweep time: a witness that cannot be read
         // makes the note unspendable, and saying so during recovery is far
         // better than after a 725 MB proving run.
-        let witness = match crate::sprout_witness::IncrementalWitness::parse_cached(
-            &note_data.witness,
-        ) {
-            Ok(w) => w,
-            Err(err) => {
-                out.issues.push(SproutRecoveryIssue::UnreadableWitness {
-                    outpoint,
-                    reason: err.to_string(),
-                });
-                continue;
-            }
-        };
+        let witness =
+            match crate::sprout_witness::IncrementalWitness::parse_cached(&note_data.witness) {
+                Ok(w) => w,
+                Err(err) => {
+                    out.issues.push(SproutRecoveryIssue::UnreadableWitness {
+                        outpoint,
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+            };
         let witness_path = match witness.encode_for_prover() {
             Ok(path) => path.to_vec(),
             Err(err) => {
@@ -487,7 +489,10 @@ mod tests {
         assert_eq!(note.note.rho, [0x11u8; 32]);
         assert_eq!(note.note.r, [0x22u8; 32]);
         assert_eq!(note.a_sk, a_sk);
-        assert_eq!(note.witness_path.len(), crate::sprout_witness::WITNESS_PATH_SIZE);
+        assert_eq!(
+            note.witness_path.len(),
+            crate::sprout_witness::WITNESS_PATH_SIZE
+        );
         assert_eq!(recovered.total_value(), 123_456_789);
     }
 

@@ -1,4 +1,3 @@
-#![cfg(feature = "sprout")]
 //! Whether a funded `wallet.dat` fixture can be manufactured at all.
 //!
 //! It cannot, and this records the evidence. The file is named for the

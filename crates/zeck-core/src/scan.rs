@@ -1099,13 +1099,16 @@ async fn run_transparent_only_scan(
         // Appended, never replaced: the pump loops in the CLI and Tauri emit
         // only the tail of this vector on each tick.
         for funded in &report.funded {
-            guard.progress.discoveries.push(crate::models::ScanDiscovery {
-                account_index: 0,
-                pool: crate::models::DiscoveryPool::Transparent,
-                zatoshis: funded.zatoshis,
-                at_block_height: u64::from(report.chain_tip_height),
-                address: funded.address.clone(),
-            });
+            guard
+                .progress
+                .discoveries
+                .push(crate::models::ScanDiscovery {
+                    account_index: 0,
+                    pool: crate::models::DiscoveryPool::Transparent,
+                    zatoshis: funded.zatoshis,
+                    at_block_height: u64::from(report.chain_tip_height),
+                    address: funded.address.clone(),
+                });
         }
     }
 
@@ -3464,7 +3467,11 @@ mod tests {
             tokio::task::yield_now().await;
 
             assert!(
-                watchdog.await.expect("watchdog task did not panic").to_string().contains("scan stalled"),
+                watchdog
+                    .await
+                    .expect("watchdog task did not panic")
+                    .to_string()
+                    .contains("scan stalled"),
                 "watchdog must still trip at the extended budget"
             );
         }
@@ -3489,7 +3496,10 @@ mod tests {
             .await;
             tokio::task::yield_now().await;
 
-            let msg = watchdog.await.expect("watchdog task did not panic").to_string();
+            let msg = watchdog
+                .await
+                .expect("watchdog task did not panic")
+                .to_string();
             assert!(msg.contains("scan stalled"), "got: {msg}");
             for lie in [
                 "h2 protocol error",
@@ -3612,19 +3622,13 @@ mod tests {
         fn resets_when_height_advanced_since_last_failure() {
             // 9 consecutive stalls, then the sync advanced before the next
             // failure — the intervening stall recovered, so the budget resets.
-            assert_eq!(
-                retry_budget_after_failure(9, Some(1_000), Some(1_500)),
-                0
-            );
+            assert_eq!(retry_budget_after_failure(9, Some(1_000), Some(1_500)), 0);
         }
 
         #[test]
         fn preserves_budget_when_stuck_at_same_height() {
             // No forward progress between the two failures — budget carries.
-            assert_eq!(
-                retry_budget_after_failure(5, Some(1_000), Some(1_000)),
-                5
-            );
+            assert_eq!(retry_budget_after_failure(5, Some(1_000), Some(1_000)), 5);
         }
 
         #[test]
