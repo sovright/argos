@@ -95,6 +95,15 @@ zcash_transparent = { version = "0.10", default-features = false, features = ["s
 tempfile = "3.20.0"
 zip32 = "0.2.1"
 
+# Dependencies are optimised even in dev/test builds. Sprout proving is
+# Groth16 over BLS12-381, and at opt-level 0 the field arithmetic in
+# `bellman`/`bls12_381` is slow enough that the consensus spend tests take
+# tens of minutes and time out in CI. Workspace crates keep their own dev
+# profile, so debugging and assertions are unaffected -- only third-party
+# code is optimised, and only its compile time pays, once, behind the cache.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = true

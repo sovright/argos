@@ -220,8 +220,13 @@ pub fn decrypt_note(
 /// agreement once per JoinSplit, and calls this.
 ///
 /// Only the derivation moves; the KDF, nonce and AEAD are unchanged, so this
-/// and `decrypt_note` agree by construction. `sprout_agreement_matches_the_
-/// convenience_wrapper` pins that.
+/// and `decrypt_note` agree by construction — but "by construction" is what
+/// every split crypto function claims, so it is pinned on real ciphertext by
+/// `a_recovered_sprout_key_produces_a_signed_v4_transaction` in
+/// `tests/sprout_spend_pipeline.rs`, which decrypts each output both ways and
+/// compares value, rho and r.
+///
+/// That test is not `#[ignore]`d, so it runs in an ordinary `cargo test`.
 pub fn decrypt_note_with_agreement(
     dhsecret: &[u8; 32],
     epk: &[u8; 32],

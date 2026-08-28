@@ -105,9 +105,13 @@ jobs:
   sprout-node-tests:
     name: Sprout scan against a real node
     runs-on: ubuntu-latest
-    # Generous: the end-to-end scan mines 110 blocks for coinbase maturity,
-    # plants a note, then walks the chain. ~6 minutes locally.
-    timeout-minutes: 30
+    # The end-to-end scan mines 110 blocks for coinbase maturity, plants a
+    # note, then walks the chain; the two spend tests each prove a JoinSplit
+    # against the real 725 MB parameters. With dependencies optimised in the
+    # dev profile (see the root Cargo.toml) the four tests run in a couple of
+    # minutes; the headroom here is for the cold dependency build behind a
+    # cache miss, not for the tests.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -121,6 +125,16 @@ jobs:
           toolchain: "1.88"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The spend tests below build `--features argos-network`, and that is the
+      # only configuration in which `crates/zeck-core/build.rs` compiles the
+      # vendored lightwalletd protos -- which needs `protoc`. No other job
+      # enables the feature, so nothing needed this until the spend tests were
+      # added and the build died before a single test ran.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       # The only regtest chain that can hold Sprout notes: ZIP 211 forbids
       # funding the pool from Canopy onward, and this profile holds Canopy
@@ -173,16 +187,46 @@ jobs:
       # anything from a cold start -- every fresh walk aborted on its first
       # page -- while the docs described it as proven on regtest. Nothing in
       # CI ran them, so nothing caught it.
-      #
-      # Deliberately not the whole `--ignored` set: the remaining Sprout tests
-      # are proving-heavy (several minutes each) and belong in their own job if
-      # they are ever wanted. These two are the ones that cover the scan.
       - name: Sprout scan tests
         run: |
           cargo test -p argos-core \
             --test sprout_scan_matches_the_node \
             --test sprout_scan_finds_a_real_note \
             -- --ignored --nocapture
+
+      # The spend half, and the reason it is no longer optional: `rcm` is now
+      # sampled per §4.7.1 rather than derived, which changes *every*
+      # commitment Argos produces. A commitment the circuit and the chain
+      # disagree about is exactly what these catch, and a local proof check
+      # cannot -- only a node decides whether a spend is valid.
+      #
+      # These were previously excluded for being proving-heavy. That was the
+      # right trade only while the commitment derivation was frozen.
+      #
+      # `--features argos-network` is not optional: `sprout_consensus_roundtrip`
+      # is `#![cfg(feature = "argos-network")]`, so without it the binary
+      # compiles to zero tests and cargo still reports "ok". A green step that
+      # ran nothing is worse than a red one. The count is asserted below rather
+      # than trusted.
+      - name: Sprout spend tests against consensus
+        run: |
+          set -o pipefail
+          cargo test -p argos-core --features argos-network \
+            --test sprout_consensus_roundtrip \
+            --test sprout_stale_anchor \
+            -- --ignored --nocapture 2>&1 | tee spend-tests.log
+
+      - name: Check the spend tests actually ran
+        run: |
+          passed=$(grep -cE '^test .* \.\.\. ok$' spend-tests.log || true)
+          echo "spend tests passed: $passed"
+          # Two: one per file. Asserted as an exact floor so that a file
+          # silently emptying itself -- a cfg gate, a rename -- turns this
+          # job red instead of green.
+          if [ "$passed" -lt 2 ]; then
+            echo "::error::expected 2 passing spend tests, saw $passed -- a cfg gate or a rename has silently emptied this job"
+            exit 1
+          fi
 
       - name: Node logs on failure
         if: failure()

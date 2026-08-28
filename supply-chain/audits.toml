@@ -1,7 +1,20 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.chacha20]]
+who = "Zaki Manian <zaki@iqlusion.io>"
+criteria = "safe-to-deploy"
+delta = "0.10.0 -> 0.10.2"
+notes = """
+Delta review of the 0.10.0 -> 0.10.2 diff, performed with Claude Code.
+
+The release fixes an SSE4.1 intrinsic (_mm_extract_epi32) being called from a function declared target_feature(enable = "sse2"), which would execute an illegal instruction on a CPU with SSE2 and no SSE4.1. It is replaced by _mm_storeu_si128, and the counter save/load is factored into Backend::new / Backend::save_ctr. Equivalent behaviour, genuinely SSE2-only.
+
+Rest of the diff: rng.rs corrects a doc typo and replaces a hardcoded 16 with BLOCK_WORDS (same value); chacha.rs narrows a pub use to use; lib.rs moves crate docs to the README. No functional change in any of them.
+
+The NEON backend is rewritten from 4-block to 8-block outer batches, following OpenSSL's ChaCha20_512_neon. This is keystream-generating code and was not accepted on inspection alone: chacha20 0.10.2's own test suite, including the RFC true-value vectors and the RNG output vectors, was run and passes on aarch64-apple-darwin, where the NEON path is the one that executes.
+
+No changes to key or nonce handling, counter semantics, or the round function."""
 
 [[trusted.bellman]]
 criteria = "safe-to-deploy"

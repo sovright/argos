@@ -213,9 +213,12 @@ async fn spend_note_with_anchor(
         note.value,
         anchor,
         &spend_key.verification_key(),
-        random32(),
-        random32(),
-        random32(),
+        &sprout_spend::JoinSplitRandomness {
+            phi: random32(),
+            random_seed: random32(),
+            esk: random32(),
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute spend fields");
 
@@ -376,9 +379,12 @@ async fn a_historical_sprout_anchor_is_still_accepted() {
         0,
         sprout_witness::empty_tree_root(),
         &js_key.verification_key(),
-        random32(),
-        random32(),
-        random32(),
+        &sprout_spend::JoinSplitRandomness {
+            phi: random32(),
+            random_seed: random32(),
+            esk: random32(),
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute fields");
 
@@ -423,17 +429,19 @@ async fn a_historical_sprout_anchor_is_still_accepted() {
         .as_u64()
         .expect("height");
 
-    // Recover both output notes, exactly as the builder derived them.
+    // Recover both output notes. `rho` is derived, so it is recomputed the
+    // way the builder did; `r` is sampled per §4.7.1 and is therefore read
+    // back from the fields rather than recomputed.
     let note_a = sprout::SproutNotePlaintext {
         value: first_value,
         rho: sprout::prf_rho(&fields.phi, 0, &fields.h_sig),
-        r: sprout::prf_rho(&fields.phi, 0, &fields.nullifiers[0]),
+        r: fields.rcm[0],
         memo: [0u8; 512],
     };
     let note_b = sprout::SproutNotePlaintext {
         value: second_value,
         rho: sprout::prf_rho(&fields.phi, 1, &fields.h_sig),
-        r: sprout::prf_rho(&fields.phi, 1, &fields.nullifiers[1]),
+        r: fields.rcm[1],
         memo: [0u8; 512],
     };
     assert_eq!(

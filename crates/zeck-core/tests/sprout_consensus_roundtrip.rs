@@ -224,13 +224,17 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     let fields = sprout_spend::compute_joinsplit_fields(
         &inputs,
         &outputs,
-        shielded, // vpub_old: value entering the pool
+        shielded,
+        // vpub_old: value entering the pool
         0,
         sprout_witness::empty_tree_root(),
         &js_key.verification_key(),
-        random32(),
-        random32(),
-        random32(),
+        &sprout_spend::JoinSplitRandomness {
+            phi: random32(),
+            random_seed: random32(),
+            esk: random32(),
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute fields");
 
@@ -293,12 +297,14 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     // output in the same transaction consumes it.
 
     // The note we are spending is the first output of the shielding
-    // JoinSplit. Its rho and r are derived, not chosen, so they are
-    // recomputed the same way the builder did.
+    // JoinSplit. `rho` is derived, so it is recomputed the way the builder
+    // did; `r` is *sampled* per §4.7.1, so it cannot be recomputed and is
+    // read back from the fields instead. The commitment assertion below is
+    // what would catch getting either of them wrong.
     let spent = sprout::SproutNotePlaintext {
         value: shielded,
         rho: sprout::prf_rho(&fields.phi, 0, &fields.h_sig),
-        r: sprout::prf_rho(&fields.phi, 0, &fields.nullifiers[0]),
+        r: fields.rcm[0],
         memo: [0u8; 512],
     };
     assert_eq!(
@@ -395,12 +401,16 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
         &spend_inputs,
         &spend_outputs,
         0,
-        spent.value, // vpub_new: the whole note leaves the Sprout pool
+        spent.value,
+        // vpub_new: the whole note leaves the Sprout pool
         anchor,
         &spend_key.verification_key(),
-        random32(),
-        random32(),
-        random32(),
+        &sprout_spend::JoinSplitRandomness {
+            phi: random32(),
+            random_seed: random32(),
+            esk: random32(),
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute spend fields");
 

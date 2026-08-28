@@ -101,26 +101,80 @@ pub struct JoinSplitFields {
     pub h_sig: [u8; 32],
     /// The `phi` the output `rho` values were derived from.
     pub phi: [u8; 32],
+    /// The sampled trapdoor for each output.
+    ///
+    /// Carried for the same reason as `phi`: the circuit needs it. It is
+    /// *not* recomputable from the other fields — that is the point of
+    /// §4.7.1 sampling — so the prover has to be handed the same values the
+    /// commitments were made over. An earlier version derived it in both
+    /// places independently, which meant two copies of one rule that could
+    /// disagree; making the prover read it from here is what stops that.
+    pub rcm: [[u8; 32]; JS_OUTPUTS],
 }
 
-/// Compute every field of a JoinSplit except the proof.
+/// The randomness one JoinSplit consumes, every field sampled independently.
 ///
-/// `phi`, `random_seed` and `esk` are supplied rather than sampled internally
-/// so tests can be deterministic. Production callers must pass fresh
-/// randomness for each.
+/// A struct rather than four more parameters because the independence is the
+/// whole security property, and a parameter list cannot state it. Production
+/// code should call [`JoinSplitRandomness::sample`] and never build this
+/// literally; tests build it literally to stay deterministic.
 ///
 /// **`phi` and `random_seed` must be independent.** `random_seed` is a
 /// *public* JoinSplit field; `phi` is a *private* circuit witness. zcashd
 /// samples them separately (`random_uint252` and `random_uint256`). Setting
-/// `random_seed = phi` — which this originally did — publishes `phi`, and
-/// since every output's `rho` is `PRF^rho_phi(i, hSig)`, that makes all
-/// output `rho` values publicly computable. Combined with deriving `r` from
-/// `phi`, it would make the commitment randomness public too, letting anyone
-/// test candidate `a_pk` values against the commitments.
+/// `random_seed = phi` — which this code originally did — publishes `phi`,
+/// and since every output's `rho` is `PRF^rho_phi(i, hSig)`, that makes all
+/// output `rho` values publicly computable, letting anyone test candidate
+/// `a_pk` values against the commitments.
+pub struct JoinSplitRandomness {
+    /// The private circuit witness the output `rho` values derive from.
+    ///
+    /// Only the low 252 bits are used: the circuit takes it as a 252-bit
+    /// witness, and `PRF^rho` overwrites the top four bits with its tag.
+    pub phi: [u8; 32],
+    /// The *public* `randomSeed` field. Independent of `phi` — see above.
+    pub random_seed: [u8; 32],
+    /// The ephemeral Curve25519 secret the output notes are encrypted under.
+    ///
+    /// Reusing an `esk` across JoinSplits reuses the AEAD key under a fixed
+    /// nonce, so this is per-JoinSplit like the rest.
+    pub esk: [u8; 32],
+    /// One note commitment trapdoor per output, sampled independently and
+    /// uniformly as §4.7.1 requires.
+    ///
+    /// Previously derived as `PRF^rho_phi(i, nf_i)` — the same PRF key and
+    /// domain as `rho`, differing only in the second input. The circuit
+    /// accepted it and `phi` is fresh per JoinSplit, so nothing was
+    /// exploitable, but it was not the specified sampling procedure. It is
+    /// now sampled, which is what zcashd's `random_uint256()` does.
+    pub rcm: [[u8; 32]; JS_OUTPUTS],
+}
+
+impl JoinSplitRandomness {
+    /// Draw every field from one cryptographically secure source.
+    ///
+    /// The only correct way to build this outside a test. The `CryptoRng`
+    /// bound makes "someone passed a reproducible RNG" a compile error
+    /// rather than a review item.
+    pub fn sample(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> Self {
+        let mut draw = || {
+            let mut out = [0u8; 32];
+            rng.fill_bytes(&mut out);
+            out
+        };
+        Self {
+            phi: draw(),
+            random_seed: draw(),
+            esk: draw(),
+            rcm: [draw(), draw()],
+        }
+    }
+}
+
+/// Compute every field of a JoinSplit except the proof.
 ///
-/// Only the low 252 bits of `phi` are used: the circuit takes it as a
-/// 252-bit witness, and `PRF^rho` overwrites the top four bits with its tag.
-#[allow(clippy::too_many_arguments)]
+/// Randomness is supplied rather than sampled internally so tests can be
+/// deterministic; see [`JoinSplitRandomness`] for what each field must be.
 pub fn compute_joinsplit_fields(
     inputs: &[JoinSplitInput; JS_INPUTS],
     outputs: &[JoinSplitOutput; JS_OUTPUTS],
@@ -128,10 +182,14 @@ pub fn compute_joinsplit_fields(
     vpub_new: u64,
     anchor: [u8; 32],
     joinsplit_pubkey: &[u8; 32],
-    phi: [u8; 32],
-    random_seed: [u8; 32],
-    esk: [u8; 32],
+    randomness: &JoinSplitRandomness,
 ) -> ZeckResult<JoinSplitFields> {
+    let JoinSplitRandomness {
+        phi,
+        random_seed,
+        esk,
+        rcm,
+    } = *randomness;
     // Nullifiers first: hSig commits to them.
     let nullifiers = [
         prf_nf(&inputs[0].a_sk, &inputs[0].note.rho),
@@ -152,20 +210,12 @@ pub fn compute_joinsplit_fields(
     let mut ciphertexts: [Vec<u8>; JS_OUTPUTS] = [Vec::new(), Vec::new()];
     for i in 0..JS_OUTPUTS {
         let rho = prf_rho(&phi, i, &h_sig);
-        // The output note's commitment randomness.
-        //
-        // A deliberate deviation, recorded rather than hidden: §4.7.1 calls
-        // for `rcm` sampled independently and uniformly, and this derives it
-        // as PRF^rho_phi(i, nullifier_i) instead — the same PRF key and
-        // domain used for rho, differing only in the second input. The
-        // circuit accepts it (`create_proof` treats rcm as an unconstrained
-        // 256-bit witness), and since phi is freshly random per JoinSplit
-        // the result is computationally pseudorandom, so no practical attack
-        // follows. It is still not the specified sampling procedure, and a
-        // reviewer comparing against the spec will notice. Changing it
-        // changes every commitment this produces, so it wants its own
-        // consensus test rather than a drive-by edit.
-        let r = prf_rho(&phi, i, &nullifiers[i]);
+        // The output note's commitment randomness, sampled by the caller
+        // rather than derived here — §4.7.1 requires it be drawn
+        // independently and uniformly, which is what `random_uint256()` does
+        // in zcashd. `rho` stays derived: it is what binds the output to this
+        // JoinSplit, and the spec derives it on purpose.
+        let r = rcm[i];
         commitments[i] = note_commitment(outputs[i].recipient.a_pk(), outputs[i].value, &rho, &r);
 
         let note = SproutNotePlaintext {
@@ -185,6 +235,7 @@ pub fn compute_joinsplit_fields(
     }
 
     Ok(JoinSplitFields {
+        rcm,
         vpub_old,
         vpub_new,
         anchor,
@@ -489,10 +540,10 @@ pub fn prove_joinsplit(
         &auth[1],
         *outputs[0].recipient.a_pk(),
         outputs[0].value,
-        prf_rho(&fields.phi, 0, &fields.nullifiers[0]),
+        fields.rcm[0],
         *outputs[1].recipient.a_pk(),
         outputs[1].value,
-        prf_rho(&fields.phi, 1, &fields.nullifiers[1]),
+        fields.rcm[1],
         fields.vpub_old,
         fields.vpub_new,
         proving_key,
@@ -763,7 +814,7 @@ mod tests {
         }
     }
 
-    fn fields_for_test() -> JoinSplitFields {
+    fn fields_with_rcm(rcm: [[u8; 32]; JS_OUTPUTS]) -> JoinSplitFields {
         let key = JoinSplitSigningKey::from_bytes([9u8; 32]);
         let recipient = [4u8; 32];
         let inputs = [
@@ -788,11 +839,20 @@ mod tests {
             50_000,
             [7u8; 32],
             &key.verification_key(),
-            [11u8; 32],
-            [12u8; 32],
-            [13u8; 32],
+            &JoinSplitRandomness {
+                phi: [11u8; 32],
+                random_seed: [12u8; 32],
+                esk: [13u8; 32],
+                rcm,
+            },
         )
         .expect("fields")
+    }
+
+    /// The shared fixture, with arbitrary but fixed trapdoors. Tests that
+    /// care about `rcm` call `fields_with_rcm` directly.
+    fn fields_for_test() -> JoinSplitFields {
+        fields_with_rcm([[0x31u8; 32], [0x32u8; 32]])
     }
 
     /// The description must survive the byte round trip, since that is the
@@ -850,9 +910,12 @@ mod tests {
             50_000,
             [7u8; 32],
             &other.verification_key(),
-            [11u8; 32],
-            [12u8; 32],
-            [13u8; 32],
+            &JoinSplitRandomness {
+                phi: [11u8; 32],
+                random_seed: [12u8; 32],
+                esk: [13u8; 32],
+                rcm: [[0x31u8; 32], [0x32u8; 32]],
+            },
         )
         .expect("fields");
 
@@ -881,6 +944,99 @@ mod tests {
             let expected = note_commitment(&a_pk(&recipient), note.value, &note.rho, &note.r);
             assert_eq!(expected, fields.commitments[i]);
         }
+    }
+
+    /// §4.7.1 requires `rcm` to be sampled independently and uniformly, the
+    /// way zcashd's `random_uint256()` does. This pins that the value the
+    /// caller sampled is the value that reaches the note and its commitment —
+    /// which is only checkable through the recipient's own decryption, since
+    /// `r` is never published.
+    #[test]
+    fn rcm_is_the_sampled_value_not_one_derived_from_phi() {
+        let recipient = [4u8; 32];
+        let rcm = [[0xAAu8; 32], [0xBBu8; 32]];
+        let fields = fields_with_rcm(rcm);
+
+        for (i, expected) in rcm.iter().enumerate() {
+            let note = crate::sprout::decrypt_note(
+                &recipient,
+                &fields.ephemeral_key,
+                &fields.ciphertexts[i],
+                &fields.h_sig,
+                i as u8,
+            )
+            .expect("the recipient must be able to read their own output");
+            assert_eq!(
+                note.r, *expected,
+                "output {i} carries an `r` the caller never sampled"
+            );
+            // And the commitment must be over that same `r`, or the recipient
+            // holds a note whose commitment they cannot reproduce.
+            assert_eq!(
+                note_commitment(&a_pk(&recipient), note.value, &note.rho, &note.r),
+                fields.commitments[i],
+            );
+        }
+    }
+
+    /// The specific deviation this replaced: `r` was `PRF^rho_phi(i, nf_i)`,
+    /// the same PRF key and domain as `rho` with only the second input
+    /// changed. Pinned by name so it cannot return unnoticed.
+    #[test]
+    fn rcm_is_not_the_old_prf_derivation() {
+        let recipient = [4u8; 32];
+        let phi = [11u8; 32];
+        let fields = fields_with_rcm([[0xAAu8; 32], [0xBBu8; 32]]);
+
+        for i in 0..JS_OUTPUTS {
+            let note = crate::sprout::decrypt_note(
+                &recipient,
+                &fields.ephemeral_key,
+                &fields.ciphertexts[i],
+                &fields.h_sig,
+                i as u8,
+            )
+            .expect("decryptable");
+            assert_ne!(
+                note.r,
+                crate::sprout::prf_rho(&phi, i, &fields.nullifiers[i]),
+                "output {i} still derives `r` from phi and the nullifier"
+            );
+        }
+    }
+
+    /// Two JoinSplits identical in every other input must differ in their
+    /// commitments, which is only true if `rcm` is a free parameter rather
+    /// than a function of the rest.
+    #[test]
+    fn rcm_alone_changes_the_commitments() {
+        let a = fields_with_rcm([[1u8; 32], [2u8; 32]]);
+        let b = fields_with_rcm([[3u8; 32], [4u8; 32]]);
+
+        assert_eq!(a.nullifiers, b.nullifiers, "only rcm should differ");
+        assert_eq!(a.h_sig, b.h_sig, "only rcm should differ");
+        for i in 0..JS_OUTPUTS {
+            assert_ne!(
+                a.commitments[i], b.commitments[i],
+                "commitment {i} ignored the sampled rcm"
+            );
+        }
+    }
+
+    /// Sampling must draw every field independently. Equal fields would mean
+    /// the catastrophic case the type exists to prevent: `random_seed` is
+    /// public, so `random_seed == phi` publishes the private witness.
+    #[test]
+    fn sampling_draws_every_field_independently() {
+        let r = JoinSplitRandomness::sample(&mut rand_core::OsRng);
+        assert_ne!(r.phi, r.random_seed, "phi must not equal the public seed");
+        assert_ne!(r.phi, r.esk);
+        assert_ne!(r.rcm[0], r.rcm[1], "the two trapdoors must differ");
+        assert_ne!(r.rcm[0], r.phi);
+
+        let again = JoinSplitRandomness::sample(&mut rand_core::OsRng);
+        assert_ne!(r.phi, again.phi, "two samplings must not repeat");
+        assert_ne!(r.rcm, again.rcm);
     }
 
     #[test]

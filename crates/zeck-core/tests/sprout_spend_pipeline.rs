@@ -127,9 +127,12 @@ fn a_recovered_sprout_key_produces_a_signed_v4_transaction() {
         note.value,
         anchor,
         &key.verification_key(),
-        [0x44; 32],
-        [0x66; 32],
-        [0x55; 32],
+        &sprout_spend::JoinSplitRandomness {
+            phi: [0x44; 32],
+            random_seed: [0x66; 32],
+            esk: [0x55; 32],
+            rcm: [[0xA1; 32], [0xA2; 32]],
+        },
     )
     .expect("compute the JoinSplit fields");
 
