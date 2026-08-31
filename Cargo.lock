@@ -126,7 +126,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "argos-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "argos-core",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "argos-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "argos-wallet-import",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "argos-gui"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "argos-core",
  "secrecy",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "argos-wallet-import"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "bip0039",
