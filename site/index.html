@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Argos is a local-first desktop rescue wallet for recovering legacy ZecWallet Lite seeds and sweeping funds to a modern Unified Address."
+      content="Argos is a local-first desktop rescue wallet for ZecWallet Lite seeds, legacy wallet files, and standalone Zcash spending keys."
     />
     <meta name="theme-color" content="#5d8aa8" />
     <meta name="robots" content="noarchive" />
@@ -16,7 +16,7 @@
     <meta property="og:title" content="Argos Rescue Wallet | Sovright" />
     <meta
       property="og:description"
-      content="Recover legacy ZecWallet Lite seed phrases with a local-first desktop flow that scans historical wallet state and sweeps funds to a modern Unified Address."
+      content="Recover ZecWallet Lite seeds, zcashd wallet.dat files, and standalone Sapling or Sprout keys with a local-first desktop flow."
     />
     <meta property="og:url" content="https://argos.sovright.com/" />
     <meta property="og:image" content="https://argos.sovright.com/assets/zeck-og.png" />
@@ -35,7 +35,7 @@
     <meta name="twitter:title" content="Argos Rescue Wallet | Sovright" />
     <meta
       name="twitter:description"
-      content="Recover legacy ZecWallet Lite seed phrases with a local-first desktop flow."
+      content="Recover legacy Zcash wallets and spending keys with a local-first desktop flow."
     />
     <meta name="twitter:image" content="https://argos.sovright.com/assets/zeck-og.png" />
     <meta
@@ -79,19 +79,19 @@
     <main>
       <section class="hero">
         <div class="hero-copy">
-          <p class="eyebrow">ZecWallet Lite Recovery</p>
+          <p class="eyebrow">Legacy Zcash Recovery</p>
           <h1>Argos Rescue Wallet</h1>
           <p class="hero-lede">
-            A careful desktop recovery workspace for legacy ZecWallet Lite seed phrases. Validate
-            the seed locally, scan the historical wallet state, then sweep recoverable funds to a
-            modern Zcash Unified Address.
+            A careful desktop recovery workspace for ZecWallet Lite seeds, legacy wallet files,
+            and standalone Sapling or Sprout spending keys. Inspect everything locally, scan the
+            historical chain, then sweep recoverable funds to a modern Zcash address.
           </p>
           <div class="hero-actions" aria-label="Primary actions">
             <a class="button primary" href="#download">Get the desktop app</a>
             <a class="button secondary" href="./guide.html">Read the guide</a>
           </div>
           <ul class="assurance-list" aria-label="Product assurances">
-            <li>Seed-only recovery path</li>
+            <li>Seeds, wallet files, and keys</li>
             <li>Local Rust backend</li>
             <li>Independently audited</li>
             <li>Mainnet and testnet support</li>
@@ -194,8 +194,9 @@
           <p class="eyebrow">See it in action</p>
           <h2>Recover a wallet in about a minute</h2>
           <p>
-            A silent, captioned walkthrough of the whole flow — paste your seed, scan every
-            account, review, and sweep. Nothing sensitive ever leaves your machine.
+            A silent, captioned walkthrough of the seed flow — paste your seed, scan every
+            account, review, and sweep. Wallet-file and standalone-key recoveries use the same
+            scan and review safeguards.
           </p>
         </div>
         <figure class="demo-figure">
@@ -225,19 +226,20 @@
         <div class="section-heading">
           <p class="eyebrow">Recovery Flow</p>
           <div class="legacy-badge">
-            <h2>Made for legacy ZecWallet Lite seeds</h2>
+            <h2>Made for legacy Zcash recovery material</h2>
           </div>
           <p>
-            ZecWallet Lite is no longer maintained. Argos reads its seed format, finds every address
-            your old wallet used, and walks you through moving the funds — with every step visible.
+            Argos reads ZecWallet Lite seeds and wallet files, zcashd <code>wallet.dat</code>, and
+            standalone Sapling or Sprout spending keys. It shows what each source contains and
+            walks you through moving recoverable funds with every step visible.
           </p>
         </div>
 
         <div class="flow-grid">
           <article class="info-card">
             <span class="step-number">01</span>
-            <h3>Paste your 24-word seed</h3>
-            <p>Type or paste your ZecWallet Lite seed into the desktop app. Argos checks it locally before doing anything else.</p>
+            <h3>Choose your recovery source</h3>
+            <p>Enter a 24-word seed, open a wallet file, or paste a standalone spending key. Wallet files are read-only and sensitive data stays local.</p>
           </article>
           <article class="info-card">
             <span class="step-number">02</span>
@@ -247,7 +249,7 @@
           <article class="info-card">
             <span class="step-number">03</span>
             <h3>Find your funds across all addresses</h3>
-            <p>Argos syncs Zcash blocks and surfaces every address tied to your seed — across transparent, Sapling, and Orchard pools.</p>
+            <p>Ordinary recovery covers transparent, Sapling, and Orchard funds. Sprout uses its own complete scan-and-sweep path when those older keys are present.</p>
           </article>
           <article class="info-card">
             <span class="step-number">04</span>
@@ -260,20 +262,21 @@
       <section class="section split-section">
         <div>
           <p class="eyebrow">Who It Helps</p>
-          <h2>For owners of old ZecWallet Lite seeds</h2>
+          <h2>For owners of old Zcash wallets and backups</h2>
           <p>
-            Argos is designed for people who still have a ZecWallet Lite seed phrase but no longer
-            have a working legacy wallet environment. It does not require a wallet database file.
+            A seed phrase is enough for ordinary ZecWallet Lite recovery. If you still have a
+            ZecWallet Lite or zcashd wallet file, Argos can read it directly, including encrypted
+            files. Standalone Sapling and Sprout spending keys are supported too.
           </p>
         </div>
         <div class="check-panel">
           <h3>What you'll need</h3>
           <ul class="check-list">
-            <li>Your 24-word ZecWallet Lite seed phrase</li>
+            <li>Your seed phrase, original wallet file, or standalone spending-key backup</li>
             <li>A modern Zcash wallet to receive your recovered funds — we recommend
               <a href="https://zodl.com">ZODL</a> (iOS / Android, by Electric Coin Co.), which
               generates a Unified Address out of the box</li>
-            <li>A few hours for the scan to finish — older or busier wallets take longer</li>
+            <li>Time for the scan to finish — ordinary scans can take hours; a bare-key Sprout scan also transfers roughly 26 GB on mainnet</li>
           </ul>
         </div>
       </section>
@@ -314,9 +317,9 @@
           <p class="eyebrow">Safety</p>
           <h2>Pick a machine that matches what's at stake</h2>
           <p>
-            Entering a seed phrase into a laptop is inherently risky. Match your precautions to
-            the value you're recovering — and after the sweep finishes, retire the ZecWallet Lite
-            seed permanently.
+            Entering a seed or spending key, or opening a wallet file, is inherently risky. Match
+            your precautions to the value you're recovering — and after the sweep finishes,
+            retire the legacy recovery material.
           </p>
         </div>
         <div class="safety-grid">
@@ -341,9 +344,10 @@
           <article class="info-card">
             <h3>Internet required</h3>
             <p>
-              Argos reads Zcash blocks from a public lightwalletd server, so an air-gapped
-              machine won't work. Your seed never leaves your computer — only public block data
-              comes in, and only the final sweep transaction goes out.
+              Argos reads Zcash blocks from public servers, so an air-gapped machine won't work.
+              Ordinary scans use lightwalletd; Sprout scans read historical full blocks from Zcash
+              P2P peers. Your seed and spending keys never leave your computer — only public block
+              data comes in, and only final sweep transactions go out.
             </p>
           </article>
           <article class="info-card">
@@ -356,12 +360,12 @@
             </p>
           </article>
           <article class="info-card">
-            <h3>Retire the seed afterward</h3>
+            <h3>Retire legacy secrets afterward</h3>
             <p>
-              Any malware that touched the recovery machine may now know your ZecWallet Lite
-              seed. The seed itself is the lasting compromise, not the machine — so reusing it
-              on a different "clean" computer doesn't make you safe. Sweep the funds to a fresh
-              wallet, then destroy the paper backup.
+              Any malware that touched the recovery machine may now know the seed, wallet-file
+              passphrase, or standalone key. The secret is the lasting compromise, not the
+              machine. Sweep to a fresh wallet, confirm the transactions, then retire the old
+              backup. Keep the original wallet file until every applicable pool has moved.
             </p>
           </article>
         </div>
@@ -384,17 +388,17 @@
           </p>
         </div>
         <div class="download-grid">
-          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.1.0/Argos_1.1.0_universal.dmg">
+          <a class="download-card" href="https://github.com/sovright/argos/releases">
             <span>macOS (Apple Silicon &amp; Intel)</span>
-            <strong>Download .dmg</strong>
+            <strong>View macOS releases</strong>
           </a>
-          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.1.0/Argos_1.1.0_x64-setup.exe">
+          <a class="download-card" href="https://github.com/sovright/argos/releases">
             <span>Windows</span>
-            <strong>Download .exe</strong>
+            <strong>View Windows releases</strong>
           </a>
-          <a class="download-card" href="https://github.com/sovright/argos/releases/download/v1.1.0/Argos_1.1.0_amd64.AppImage">
+          <a class="download-card" href="https://github.com/sovright/argos/releases">
             <span>Linux</span>
-            <strong>Download .AppImage</strong>
+            <strong>View Linux releases</strong>
           </a>
         </div>
       </section>
@@ -438,9 +442,9 @@
           </article>
         </div>
         <p class="help-disclaimer">
-          <strong>Argos will never ask for your seed phrase.</strong> We cannot recover it for
-          you and will never request it in any channel. Anyone who does — on Signal, by email, or
-          anywhere else — is a scammer. Never type your 24 words anywhere but the Argos app itself.
+          <strong>Argos support will never ask for your seed phrase, wallet file, passphrase, or
+          spending key.</strong> Anyone who does — on Signal, by email, or anywhere else — is a
+          scammer. Enter recovery secrets only in the signed Argos desktop app.
         </p>
       </section>
 
@@ -463,9 +467,21 @@
           <details>
             <summary>Which kinds of Zcash funds can Argos recover?</summary>
             <p>
-              Argos recovers transparent, Sapling, and Orchard funds — the three pools that ZecWallet
-              Lite derived addresses for. It does <strong>not</strong> recover Sprout funds, because
-              ZecWallet Lite never derived Sprout keys from the seed.
+              Argos recovers transparent, Sapling, and Orchard funds from ZecWallet Lite seeds and
+              supported wallet files. It also recovers Sprout end to end from a zcashd
+              <code>wallet.dat</code> or a standalone <code>SK…</code>/<code>ST…</code> spending
+              key. A ZecWallet Lite seed alone cannot reconstruct Sprout keys because the wallet
+              generated them independently.
+            </p>
+          </details>
+          <details>
+            <summary>Why is a Sprout scan so much slower?</summary>
+            <p>
+              Lightwalletd compact blocks omit the encrypted data needed to find Sprout notes.
+              When a wallet file has no cached note witness, Argos must trial-decrypt every
+              historical JoinSplit by reading full blocks from genesis to Canopy. On mainnet that
+              means 1,046,400 blocks and roughly 26 GB of transfer. Progress is saved, blocks are
+              discarded after processing, and the scan can resume later.
             </p>
           </details>
           <details>

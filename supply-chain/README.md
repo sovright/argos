@@ -27,12 +27,13 @@ The exemption count is a metric to **drive down over time**, not a number to let
 grow with the tree. `574` (NU6.2) is the current baseline; new work should not
 increase it without justification.
 
-## Seed-handling-critical crates
+## Recovery-secret-handling-critical crates
 
-These crates derive, hold, transmit, or sign with the wallet seed and spending
-keys, or terminate the TLS that protects them. A compromised release of any one
-could exfiltrate the seed or derived keys, or subvert signing. They must **never
-be accepted on the basis of a blanket exemption alone**:
+These crates derive, hold, transmit, or sign with wallet seeds and standalone
+spending keys, or terminate the TLS that protects recovery traffic. A
+compromised release of any one could exfiltrate a seed or key, or subvert
+signing. They must **never be accepted on the basis of a blanket exemption
+alone**:
 
 ```
 orchard            sapling-crypto      halo2_gadgets
@@ -46,13 +47,13 @@ ring               rustls              tonic
 ## Policy
 
 1. **Exemption changes are a review trigger.** Any PR that adds or version-bumps
-   an exemption for a seed-handling-critical crate (above) MUST include, in the
+   an exemption for a recovery-secret-handling-critical crate (above) MUST include, in the
    PR description, confirmation that a reviewer inspected the upstream diff
    between the previously accepted version and the new one. A dependency bump is
    not "routine" for these crates.
 
 2. **Prefer audits or publisher-pinned trust over exemptions.** For the
-   seed-handling-critical crates, convert exemptions to either a first-party
+   recovery-secret-handling-critical crates, convert exemptions to either a first-party
    `[[audits]]` entry (a real code review, recorded with
    `cargo vet certify`) or a publisher-pinned `[[trusted]]` entry that trusts a
    named crates.io publisher rather than waiving review entirely:
@@ -62,7 +63,7 @@ ring               rustls              tonic
    # crates have multiple publishers, so the publisher login must be explicit
    # and is a deliberate trust decision):
    cargo vet trust <crate> <publisher-login> --criteria safe-to-deploy \
-       --notes "Seed-handling crate; trusting the upstream publisher (audit Issue F)."
+       --notes "Recovery-secret-handling crate; trusting the upstream publisher (audit Issue F)."
    ```
 
    Choosing *which* crates.io account(s) to trust is a maintainer decision and is
@@ -77,5 +78,5 @@ ring               rustls              tonic
 `config.toml` imports audits from seven upstream sources (Bytecode Alliance,
 Embark, Fermyon, Google, ISRG, Mozilla, and Zcash). These cover 142 crates
 fully and 6 partially. The Zcash import (`librustzcash`) is the most relevant to
-the seed-handling set and should be re-pulled on each librustzcash bump
+the recovery-secret-handling set and should be re-pulled on each librustzcash bump
 (`cargo vet` updates `imports.lock`).

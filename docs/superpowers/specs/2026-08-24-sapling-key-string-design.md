@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-24
 **Branch:** `feat/imported-sapling-sweep`
-**Status:** design approved, not yet implemented
+**Status:** implemented on `main` (CLI key file and GUI paste entry)
 
 ## Problem
 

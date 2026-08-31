@@ -1,12 +1,15 @@
 # Argos
 
-Argos is a recovery workspace for legacy ZecWallet Lite seeds.
+Argos is a recovery workspace for legacy Zcash wallets. It recovers from
+ZecWallet Lite seed phrases and wallet files, zcashd `wallet.dat` files, and
+standalone Sapling or Sprout spending keys.
 
 This repository now contains:
 
-- `crates/argos-core`: shared Rust library for seed validation, address derivation, lightwalletd probing, and recovery session orchestration.
-- `crates/argos-cli`: a terminal interface for showing keys, scanning derived accounts, and preparing sweep requests.
+- `crates/zeck-core`: shared Rust library for key handling, scanning, and recovery session orchestration (package name `argos-core`).
+- `crates/zeck-cli`: a terminal interface for inspecting recovery sources, scanning, and sweeping funds (package name `argos-cli`; binary name `argos`).
 - `gui/`: a Tauri v2 desktop shell with a step-by-step recovery wizard.
+- `crates/argos-wallet-import`: an isolated, read-only parser for legacy wallet files.
 
 ## Current Status
 
@@ -23,13 +26,23 @@ Argos now includes the major recovery phases end to end:
 - lightwalletd endpoint fallback, using comma-separated server URLs tried in order
 - Progress metadata for elapsed time and ETA, plus GUI discovery notifications and recovery-report export
 - Legacy wallet file import (`--wallet-file`): zcashd `wallet.dat` and ZecWallet Lite, including encrypted wallets
+- Standalone Sapling extended spending keys, supplied through `--sapling-key-file` or pasted into the desktop app
+- Scan and sweep support for imported transparent and Sapling keys
+- Generally available Sprout recovery from `wallet.dat` or standalone `SK…` / `ST…` spending keys, including resumable full-block scans when a wallet has no cached note witnesses
 
-## Recovering from a wallet file
+## Recovery sources
 
-Instead of a seed phrase, Argos can read keys directly out of a legacy
-wallet file. The file is opened read-only and never modified. If it is
-encrypted you are prompted for the passphrase — there is deliberately no
-flag for it, so it cannot end up in shell history or in `ps` output.
+| Source | Coverage |
+|---|---|
+| 24-word ZecWallet Lite seed | Derives, scans, and sweeps transparent, Sapling, and Orchard funds across the legacy account layout. ZecWallet Lite did not derive Sprout keys from this seed. |
+| ZecWallet Lite wallet file | Recovers the mnemonic and re-enters the same complete HD recovery path as a typed seed. |
+| zcashd `wallet.dat` | Scans and sweeps every imported transparent and Sapling key. Sprout notes use the separate Sprout workflow described below. |
+| Sapling extended spending key | Scans and sweeps `secret-extended-key-main1…` or `secret-extended-key-test1…` keys without requiring a wallet file. |
+| Sprout spending key | Scans and sweeps `SK…` (mainnet) or `ST…` (testnet) keys without requiring a wallet file. |
+
+Wallet files are opened read-only and never modified. If one is encrypted,
+Argos prompts for its passphrase. There is deliberately no passphrase flag,
+so the passphrase cannot end up in shell history or `ps` output.
 
 ```
 argos --wallet-file /path/to/wallet.dat inspect-wallet
@@ -39,14 +52,82 @@ argos --wallet-file /path/to/wallet.dat inspect-wallet
 It reports how many transparent, Sapling, and Sprout keys were recovered,
 lists Sprout addresses, and names every record it could not read.
 
-**What you can do with the result depends on the wallet:**
+The ordinary `scan` and `sweep` commands cover imported Sapling and
+transparent keys. A zcashd wallet commonly contains several Sapling keys;
+Argos creates one imported account per key and sweeps each funded account.
+Transparent funds use a separate direct recovery path and may produce a
+separate transaction.
 
-| Wallet | Scan and sweep? |
-|---|---|
-| ZecWallet Lite | **Yes.** Decryption recovers the BIP-39 mnemonic, so the wallet re-enters the normal HD recovery path. Add `--wallet-file` to `scan` or `sweep`. |
-| zcashd `wallet.dat` | **Transparent: scan + sweep.** **Sapling: scan only** — balances are found and reported, but moving them is not yet implemented. **Sprout: identified only.** Whatever a run does not cover is named explicitly before any balance is shown. |
+```bash
+# Scan every imported transparent and Sapling key.
+argos --wallet-file /path/to/wallet.dat scan
 
-Partial coverage is always stated, never implied away. Argos will not
+# Preview, then confirm, a sweep to a Unified Address.
+argos --wallet-file /path/to/wallet.dat sweep --destination u1... --dry-run
+argos --wallet-file /path/to/wallet.dat sweep --destination u1... --confirm-sweep
+```
+
+## Recovering a standalone Sapling key
+
+Put one key per line in a private text file. Blank lines and lines beginning
+with `#` are ignored. A key file may be combined with a seedless wallet file;
+duplicate keys are removed. It cannot be combined with a ZecWallet Lite file
+that contains a mnemonic, because that file uses the HD account path.
+
+```bash
+chmod 600 sapling-keys.txt
+argos --sapling-key-file sapling-keys.txt scan
+argos --sapling-key-file sapling-keys.txt sweep --destination u1... --dry-run
+```
+
+Viewing keys such as `zxviews…` are rejected: they can reveal balances but
+cannot authorize the sweep Argos is promising.
+
+## Recovering Sprout funds
+
+Sprout support is part of normal Argos builds and requires no Cargo feature.
+It is intentionally separate from the ordinary compact-block scan:
+
+- If a synced `wallet.dat` contains note data and a cached witness,
+  `sweep-sprout` can use that historical witness without scanning the chain.
+- If all you have is a spending key, or the wallet has no usable note data,
+  `scan-sprout` trial-decrypts every historical JoinSplit. Compact blocks do
+  not contain those ciphertexts, so this reads full blocks directly from the
+  Zcash P2P network from genesis to Canopy. On mainnet that is 1,046,400
+  blocks, roughly 26 GB of transfer, hours of work, and under 500 MB retained
+  on disk. Progress is checkpointed and resumable.
+
+The Sprout checkpoint is spend-capable: it contains the raw keys, recovered
+note plaintexts, and witnesses needed to resume and sweep. Argos creates it
+with private permissions on Unix and removes it after a successful sweep.
+Protect it like the original key file and delete any leftover checkpoint only
+after the destination transaction is confirmed.
+
+```bash
+# First see whether the wallet already has spendable note data.
+argos --wallet-file /path/to/wallet.dat inspect-wallet
+
+# Preview a direct wallet-backed Sprout sweep.
+argos --wallet-file /path/to/wallet.dat sweep-sprout \
+  --destination u1... --dry-run
+
+# Scan one or more standalone keys, then optionally sweep the result.
+chmod 600 sprout-keys.txt
+argos --sprout-key-file sprout-keys.txt scan-sprout
+argos --sprout-key-file sprout-keys.txt scan-sprout \
+  --destination u1... --confirm-sweep
+```
+
+Sprout funds land in Sapling, even when the destination is a Unified Address.
+A Sprout JoinSplit is a version 4 transaction while Orchard actions require
+version 5, so one transaction cannot reach Orchard. If desired, move the
+funds from Sapling to Orchard afterward from your own wallet. Broadcasting a
+Sprout sweep also requires the approximately 725 MB
+`sprout-groth16.params`; Argos checks `--sprout-params`, then
+`$ARGOS_SPROUT_PARAMS`, then the conventional `~/.zcash-params` location.
+
+Ordinary imported-key results state that Sprout is handled separately rather
+than folding it silently into a zero balance. Argos will not
 report a balance that silently excludes a pool it never looked at — "0.5
 ZEC recovered" reads as complete to the person who most needs the answer,
 so every uncovered pool is named, with a reminder to keep the original
@@ -78,7 +159,8 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
 - Broadcasted transactions are polled for confirmation during a bounded wait window. If they are still unmined at the end of that window, Argos reports them as pending instead of pretending they confirmed.
-- Sprout recovery from a seed phrase is still out of scope because ZecWallet Lite did not derive Sprout keys from the HD seed. Argos can now recover Sprout spending keys directly from a zcashd `wallet.dat`, but spending recovered Sprout funds is not yet implemented — extracting the key does not yet mean the funds can be moved.
+- A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
+- A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.
 - The GUI defaults to auto gap-limit mode and can switch to an explicit account count when the user wants an exact scan depth.
 - The desktop complete screen can save a plain-text recovery report inside the persisted workspace.
 
@@ -87,8 +169,9 @@ The findings and their fixes are tracked in this repository's pull-request histo
 ```text
 .
 ├── crates/
-│   ├── argos-core/
-│   └── argos-cli/
+│   ├── zeck-core/            # package: argos-core
+│   ├── zeck-cli/             # package: argos-cli; binary: argos
+│   └── argos-wallet-import/
 ├── gui/
 │   ├── src/
 │   └── src-tauri/

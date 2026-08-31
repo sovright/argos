@@ -5,8 +5,12 @@
 ## Background
 
 Least Authority audit Suggestion 9 notes that the threat model states Argos
-avoids writing the seed to disk and explicitly names writing it to swap as a
-threat, while also acknowledging that `secrecy` does not protect against swap.
+avoids writing transient recovery secrets to disk and explicitly names writing
+them to swap as a threat, while also acknowledging that `secrecy` does not
+protect against swap. The original evaluation focused on the seed; the same
+reasoning now applies to wallet passphrases and standalone Sapling/Sprout keys.
+The deliberately persistent, spend-capable Sprout scan checkpoint is a
+separate T-L7 storage decision, not something `mlock` can address.
 The suggestion is to *consider* alternatives that prevent the OS from paging
 sensitive data to disk — for example `secrets`, or `shush-rs` after source
 review confirms it locks the actual secret backing memory Argos would use.
@@ -36,9 +40,10 @@ strengthens the "don't swap" conclusion below.)
 **What `mlock` actually buys us.** `mlock` keeps pages resident so they are not
 written to swap, and reduces (not eliminates) core-dump exposure. It does
 nothing against an attacker who can already read the process's live memory, and
-nothing about the cleartext seed that — per audit Issue A — unavoidably transits
-the Tauri IPC as plaintext JSON and through serde parse buffers before any
-wrapper can seal it. The strongest mitigation (encrypted or disabled swap) is an
+nothing about the cleartext seed, wallet passphrase, or pasted spending key
+that — per audit Issue A and T-S6/T-S7 — transits the Tauri IPC as plaintext
+JSON and through serde parse buffers before any wrapper can seal it. The
+strongest mitigation (encrypted or disabled swap) is an
 OS-level control the audit itself places outside an individual application.
 
 **`secrets` — strongest protection, highest cost.** libsodium guarded
@@ -53,10 +58,10 @@ it directly complicates the pipeline we are otherwise hardening.
 **`shush-rs` — potentially lower-friction, but immature and unaudited here.**
 It mirrors `secrecy` 0.10's `SecretBox` API and advertises `mlock` with only a
 `libc` dependency, so it is worth revisiting only after a focused source review
-confirms the bytes that hold Argos seed material would actually be page-locked.
+confirms the bytes that hold Argos recovery material would actually be page-locked.
 It is also 0.1.x, ~14k downloads, single-maintainer, and ~19 months since its
-last release as of this writing. Swapping the crate that wraps the **wallet
-seed** — our most security-critical value — from a battle-tested dependency
+last release as of this writing. Swapping the crate that wraps **recovery
+secrets** — our most security-critical values — from a battle-tested dependency
 (122M downloads) to an unproven one trades a known quantity for maintenance and
 correctness risk in exactly the wrong place.
 

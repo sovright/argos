@@ -22,5 +22,6 @@ Pages, publish the `site/` directory and keep `CNAME` set to the target
 subdomain. For Cloudflare Pages, Netlify, or Vercel, set the publish directory
 to `site` and configure the DNS record for `argos.sovright.com`.
 
-Update the download links in `index.html` once release assets are signed and
-published.
+The platform cards in `index.html` lead to the GitHub releases page so they do
+not pin an obsolete build. Link directly to versioned assets only when all
+platform artifacts for that release are signed and published.

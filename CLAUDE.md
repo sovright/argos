@@ -129,10 +129,14 @@ receivers, so a single sync covers both pools. Deliberately not the HD
 loop: an imported key set is fixed and fully known once parsed, so there
 are no slots to enumerate and no gap to extend.
 
-**Spending imported Sapling is still not implemented.** Balances are
-visible; moving them needs the PCZT path below.
+**Imported Sapling is swept through PCZT.** `imported_sweep` proposes one
+send-max transfer per imported Sapling account, supplies the raw spend
+authorizing key through the low-level PCZT signer, and preserves every txid
+if a later account or the transparent leg fails. Transparent UTXOs use the
+direct recovery path and may produce a separate transaction.
 
-**Sprout is recoverable, and Argos's scope for it ends at Sapling.** This
+**Sprout is generally available, and Argos's scope for it ends at Sapling.**
+It is part of normal builds rather than an opt-in product tier. This
 is a decision, not a gap. A JoinSplit exists only in a v4 transaction and
 Orchard actions only in v5 (`zcash_primitives`' `read_v5` hardcodes
 `sprout_bundle: None`), so Sprout cannot reach Orchard in one transaction.
@@ -157,6 +161,12 @@ and the GUI's scan panel — checkpoints to disk, and resumes from a stored
 block cursor. Its tree is validated against zcashd's own root, and it has
 been driven end to end on regtest: given only a spending key it finds a
 planted note and derives a witness anchoring to the chain's root.
+
+The Sprout checkpoint is spend-capable: it contains raw spending keys,
+note plaintexts, and witnesses. `save_checkpoint` creates it atomically at
+`0600` on Unix, and a successful sweep deletes it. Do not describe it as
+mere progress metadata or fold it into the ordinary FVK-only workspace
+claim.
 
 **Argos takes a `wallet.dat` or a raw `zkey`, and nothing else.** Not a
 txid, not a node URL. `sprout_key` decodes zcashd's `SK…`/`ST…` form, and

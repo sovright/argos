@@ -119,18 +119,18 @@
                 <li><strong>Email</strong> — private, one-to-one help: <a href="mailto:support@sovright.com">support@sovright.com</a></li>
               </ul>
               <img class="guide-qr" src="./assets/signal-qr.png" alt="QR code to join the Argos support group on Signal" width="160" height="160" />
-              <p class="guide-warning"><strong>Argos will never ask for your seed phrase.</strong> We can't recover it for you and will never request it in any channel. Anyone who does is a scammer — never type your 24 words anywhere but this app.</p>
+              <p class="guide-warning"><strong>Argos support will never ask for your seed phrase, wallet file, passphrase, or spending key.</strong> Anyone who does is a scammer. Enter recovery secrets only in this signed app.</p>
             </div>
 
             <div class="guide-section">
               <h3>What is Argos?</h3>
-              <p>Argos recovers your Zcash from a ZecWallet Lite seed phrase and sweeps it to a modern wallet like ZODL (formerly Zashi) or YWallet. You need your 24-word BIP-39 seed phrase and the Unified Address of your destination wallet. Nothing else.</p>
+              <p>Argos recovers Zcash from ZecWallet Lite seeds and wallet files, zcashd <code>wallet.dat</code>, and standalone Sapling or Sprout spending keys. It scans the applicable pools and sweeps recoverable funds to a modern wallet like ZODL (formerly Zashi) or YWallet.</p>
             </div>
 
             <div class="guide-section">
               <h3>Before you start</h3>
               <ul>
-                <li><strong>Your 24-word seed phrase</strong> from ZecWallet Lite.</li>
+                <li><strong>Your recovery source:</strong> a 24-word ZecWallet Lite seed, an original wallet file, or a standalone spending-key backup.</li>
                 <li><strong>A destination Unified Address</strong> (starts with <code>u1…</code>) from a modern wallet such as ZODL or YWallet. Transparent (t1…) and Sapling (zs…) addresses are not accepted.</li>
                 <li>A stable internet connection. Long scans can reconnect automatically if the server drops — but don't put your machine to sleep mid-scan.</li>
               </ul>
@@ -138,12 +138,18 @@
 
             <div class="guide-section">
               <h3>Step 1 — Welcome</h3>
-              <p>The welcome screen explains what Argos does. If you have a <code>.dat</code> file rather than a seed phrase, follow the link to Zexcavator instead. Otherwise click <em>I have my 24-word seed phrase</em>.</p>
+              <p>Choose <em>I have my 24-word seed phrase</em> for the ZecWallet Lite HD path, or <em>I have a wallet file</em> to open a ZecWallet Lite/zcashd file or paste a standalone key.</p>
             </div>
 
             <div class="guide-section">
               <h3>Step 2 — Seed Entry</h3>
               <p>Paste your full 24-word seed phrase (separated by spaces). Click <em>Validate seed</em> or press Enter — Argos checks the BIP-39 checksum locally. The phrase is blurred by default; toggle <em>Show words on screen</em> if you need to proofread it. Your seed is never transmitted anywhere.</p>
+            </div>
+
+            <div class="guide-section">
+              <h3>Step 2 — Wallet File or Sapling Key</h3>
+              <p>Choose, drag, or type the path to a ZecWallet Lite wallet or zcashd <code>wallet.dat</code>. Argos opens it read-only. If encrypted, enter the passphrase in the app; it is used in memory and never written to disk. Review the key counts and any unread-record diagnostics before continuing.</p>
+              <p>If you have no wallet file, paste one or more <code>secret-extended-key-main1…</code> or <code>secret-extended-key-test1…</code> Sapling spending keys and click <em>Check keys</em>. Viewing keys cannot authorize a sweep and are rejected.</p>
             </div>
 
             <div class="guide-section">
@@ -160,15 +166,22 @@
 
             <div class="guide-section">
               <h3>Step 4 — Scan</h3>
-              <p>Argos first probes transparent UTXOs (results appear within seconds), then syncs all shielded compact blocks. Progress, phase, and estimated time remaining are shown in real time. Funded accounts appear in the table as they're discovered.</p>
+              <p>Argos first probes transparent UTXOs (results appear within seconds), then syncs all shielded compact blocks. Seed recovery covers transparent, Sapling, and Orchard; a seedless imported wallet covers its transparent and Sapling keys. Sprout is recovered separately so an ordinary total is never presented as the whole wallet.</p>
               <p class="guide-tip">Scans can take anywhere from a few minutes (recent birthday) to several hours (birthday near Sapling activation in 2018). The ETA warms up after about 15 seconds.</p>
               <p>You can cancel and resume at any time. Re-run Argos with the same seed, network, birthday, and account settings to pick up from the last saved block.</p>
             </div>
 
             <div class="guide-section">
               <h3>Step 5 — Sweep</h3>
-              <p>Review the proposed transactions before anything is broadcast. The table shows each account, step (Shield or Sweep), destination, gross amount, fee, and net received. Transparent funds are shielded first in a separate transaction.</p>
+              <p>Review the proposed transactions before anything is broadcast. The table shows each account, destination, gross amount, fee, and net received. Imported Sapling accounts and transparent UTXOs may produce separate transactions.</p>
               <p>Check the <em>irreversible</em> acknowledgement box, then click <em>Sweep Funds</em>. Transactions are broadcast to the Zcash network — this cannot be undone.</p>
+            </div>
+
+            <div class="guide-section">
+              <h3>Sprout Recovery</h3>
+              <p>Sprout support is included in Argos. A ZecWallet Lite seed alone cannot recreate these independently generated keys; use a zcashd <code>wallet.dat</code> or standalone <code>SK…</code>/<code>ST…</code> key.</p>
+              <p>If the wallet file contains cached note data and a witness, Argos can sweep it immediately. Otherwise recovery needs a resumable full-block scan from genesis to Canopy. On mainnet that is 1,046,400 blocks, roughly 26 GB transferred, under 500 MB retained, and hours of work.</p>
+              <p>Sprout funds land in a Sapling receiver, even when you provide a Unified Address. They cannot reach Orchard in the same transaction; move them from Sapling to Orchard afterward from your own wallet if desired. Keep the original file and the private scan checkpoint until every transaction is confirmed.</p>
             </div>
 
             <div class="guide-section">
@@ -195,7 +208,8 @@
                 <li><strong>No npm packages run in the browser.</strong> <code>window.__TAURI__</code> is injected by the Rust host via <code>withGlobalTauri</code> — <code>main.js</code> imports nothing from node_modules.</li>
                 <li><strong>No frontend framework.</strong> No React, Vue, Svelte, router, state library, UI kit, or analytics.</li>
                 <li><strong>Rescue-only workflow.</strong> The GUI is not an everyday wallet — it does one thing (validate, scan, sweep) and exits. There is no persistent session or background process.</li>
-                <li><strong>All key operations happen in Rust.</strong> Seed derivation, scanning, and transaction building run in audited Rust code behind explicit Tauri commands. JavaScript only drives the UI.</li>
+                <li><strong>Key operations happen in Rust.</strong> Derivation, wallet parsing, scanning, and transaction building run in Rust behind explicit Tauri commands. JavaScript drives the UI and transiently holds values the user enters.</li>
+                <li><strong>Protect local secret state.</strong> Use an encrypted disk and encrypted swap (or disable swap), avoid suspend/hibernate during recovery, and treat a Sprout checkpoint like the original spending key.</li>
               </ul>
               <p>Independently audited by <a href="https://leastauthority.com" target="_blank" rel="noopener">Least Authority</a>.</p>
             </div>
@@ -203,11 +217,11 @@
             <div class="guide-section">
               <h3>Frequently asked questions</h3>
               <ul>
-                <li><strong>Is my seed phrase safe?</strong> Yes. Argos never transmits your seed. All key derivation happens locally. Only compact block data is downloaded from lightwalletd servers.</li>
-                <li><strong>Can I use a transparent or Sapling address as my destination?</strong> No. Argos requires a Unified Address with an Orchard or Sapling receiver (starts with <code>u1</code>). Get one from ZODL or YWallet.</li>
+                <li><strong>Are my recovery secrets transmitted?</strong> No. Seeds, wallet passphrases, and spending keys stay local. Ordinary scans download compact blocks from lightwalletd; Sprout scans download public full blocks from Zcash P2P peers.</li>
+                <li><strong>Can I use a transparent or Sapling address as my destination?</strong> Ordinary recovery requires a Unified Address with an Orchard or Sapling receiver. The separate Sprout sweep also accepts a bare Sapling address because Sprout can only land in Sapling.</li>
                 <li><strong>What if I had more than one ZecWallet Lite account?</strong> Argos scans up to 500 accounts automatically. If you enabled the gap-limit scan mode, it stops after 20 consecutive empty accounts by default — enough for almost all wallets.</li>
-                <li><strong>What happens to my data after Argos finishes?</strong> The local wallet workspace (compact block cache and derived keys) stays in the data directory you chose. You can delete it once you've confirmed your funds arrived safely.</li>
-                <li><strong>Can I run Argos offline?</strong> The scan phase requires a lightwalletd connection to download block data. Seed validation and key derivation are fully offline.</li>
+                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume; Argos removes it after a successful sweep. Delete remaining recovery state only after confirming the funds arrived.</li>
+                <li><strong>Can I run Argos offline?</strong> Source validation and key derivation are offline, but scanning requires a network connection: lightwalletd for ordinary recovery or Zcash P2P peers for Sprout.</li>
               </ul>
             </div>
 
@@ -220,12 +234,12 @@
           <p class="eyebrow">Step 1</p>
           <h2>Recover your wallet in a few steps</h2>
           <p class="lead">
-            Enter your 24-word seed phrase and Argos will find your funds and walk you through sending them to your new wallet.
+            Start from a ZecWallet Lite seed, a legacy wallet file, or a standalone spending key. Argos will find recoverable funds and walk you through sending them to your new wallet.
           </p>
           <div class="card-grid">
             <article class="info-card">
-              <h3>Seed-only recovery</h3>
-              <p>All you need is your 24-word seed phrase — no files or backups required.</p>
+              <h3>Use the backup you have</h3>
+              <p>Recover from a 24-word seed, a wallet file, or a standalone Sapling or Sprout spending key.</p>
             </article>
             <article class="info-card">
               <h3>Privacy first</h3>

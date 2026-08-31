@@ -1,5 +1,10 @@
 # Recovery resilience test plan
 
+> **Status:** This plan records the original seed-recovery resilience work.
+> Current coverage for wallet-file import, standalone Sapling keys, imported-key
+> sweeping, and generally available Sprout recovery is maintained in
+> [`TESTING.md`](../../../TESTING.md).
+
 Companion to the sweep + donation tests already on PR #66. This plan covers
 everything *outside* sweep + donation that determines whether a real user
 recovers their funds: the scan side, the network resilience layer, resume /

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
   <title id="title">Argos Rescue Wallet</title>
-  <desc id="desc">A Sovright social preview card for the Argos Rescue Wallet static site.</desc>
+  <desc id="desc">A Sovright social preview card for Argos legacy Zcash wallet recovery.</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#fbf8f1"/>
@@ -30,16 +30,16 @@
 
   <g transform="translate(100 194)">
     <text font-family="Georgia, Times New Roman, serif" font-size="68" font-weight="700" fill="#17221d">Argos Rescue Wallet</text>
-    <text y="74" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="30" fill="#5d685f">Recover legacy ZecWallet Lite seeds with a</text>
-    <text y="116" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="30" fill="#5d685f">local-first desktop flow.</text>
+    <text y="74" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="30" fill="#5d685f">Recover legacy Zcash wallets from seeds,</text>
+    <text y="116" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="30" fill="#5d685f">wallet files, and standalone keys.</text>
 
     <g transform="translate(0 174)">
       <rect width="220" height="44" rx="9" fill="#eef4ec" stroke="#d3dfcf"/>
-      <text x="18" y="29" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#143d34">Seed-only recovery</text>
+      <text x="18" y="29" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#143d34">Seeds, files &amp; keys</text>
       <rect x="238" width="176" height="44" rx="9" fill="#eef4ec" stroke="#d3dfcf"/>
       <text x="256" y="29" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#143d34">Local Rust core</text>
       <rect x="432" width="244" height="44" rx="9" fill="#eef4ec" stroke="#d3dfcf"/>
-      <text x="450" y="29" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#143d34">Unified Address sweep</text>
+      <text x="450" y="29" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#143d34">Sapling + Sprout sweep</text>
     </g>
   </g>
 

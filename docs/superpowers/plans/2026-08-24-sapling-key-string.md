@@ -1,5 +1,7 @@
 # Sapling Extended Spending Key as Text — Implementation Plan
 
+> **Status (2026-08-26):** Implemented and merged to `main`. Retained as a historical execution record; do not re-run these tasks.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let a user recover funds from a bech32 Sapling extended spending key
