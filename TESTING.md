@@ -243,7 +243,9 @@ a queued ninth, cancellation/admission, invalid/duplicate batches, typed versus
 imported mnemonic ownership, retry identity, and conflicting wallet operations.
 The injected scanner blocks locally; these tests do not decrypt funded notes.
 `cargo test -p argos-cli seed_batch_cli_tests` checks file parsing and conflicting
-inputs. Run the full workspace suite and all-target clippy as well.
+inputs, including `--max-concurrent-scans` bounds. Lifecycle tests also cover
+a custom two-slot queue, raising the limit above eight, and refusing limit
+changes during active work. Run the full workspace suite and all-target clippy as well.
 
 For a browser-only usability fixture, run
 `python3 tests/gui/serve_multiseed_fixture.py` and visit `http://127.0.0.1:8765`.

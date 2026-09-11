@@ -442,7 +442,7 @@
           </div>
           <div id="additional-seeds"></div>
           <button class="secondary" id="add-seed" type="button">Add another seed</button>
-          <p class="muted">Scan up to eight seeds simultaneously. Additional seeds wait for a slot.
+          <p class="muted">Add up to 64 seeds. Choose how many scan simultaneously on the next screen; additional seeds wait for a slot.
             Each seed uses its own scan and can be cancelled separately.</p>
           <p id="seed-status" class="status-line" role="status"></p>
           <div class="actions split">
@@ -474,6 +474,12 @@
                 <option value="testnet">Testnet</option>
               </select>
               <small>Use Mainnet unless you were testing with play money (testnet).</small>
+            </label>
+
+            <label class="field span-two">
+              <span>Max simultaneous scans</span>
+              <input id="max-concurrent-scans" type="number" min="1" max="64" step="1" value="8" />
+              <small>Default: 8. Choose 1–64; additional seeds wait in the queue. Higher values use more CPU, memory, and bandwidth. Applies when starting a multi-seed batch.</small>
             </label>
 
             <p class="form-section-heading span-two">Wallet birthday</p>

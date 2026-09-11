@@ -443,6 +443,7 @@ pub async fn start_seed_batch(
     app: AppHandle,
     state: State<'_, AppState>,
     configs: Vec<ScanConfigInput>,
+    max_concurrent_scans: Option<usize>,
 ) -> Result<Vec<ScanHandle>, String> {
     ensure_tos_accepted(&app)?;
     let entries = configs
@@ -464,7 +465,7 @@ pub async fn start_seed_batch(
         .collect();
     let handles = state
         .service
-        .start_seed_batch(entries)
+        .start_seed_batch_with_concurrency(entries, max_concurrent_scans)
         .await
         .map_err(|err| err.to_string())?;
     for handle in &handles {

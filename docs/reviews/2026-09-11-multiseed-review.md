@@ -9,8 +9,8 @@ This is source inspection, automated local tests, and a synthetic browser
 walkthrough by the implementing agent, not an independent security audit or
 a representative-user study.
 
-The change reuses the current scan engine and per-wallet workspaces. Eight
-active tasks share a service-level semaphore; extra entries queue. A service
+The change reuses the current scan engine and per-wallet workspaces. A user-selected concurrency of 1–64 (default 8) is enforced by a service-level
+semaphore; extra entries queue. A service
 retains at most 64 sessions, including terminal sessions. GUI sweeps remain
 per seed; the CLI can preview multiple seeds then sweep them sequentially.
 No actual funds were scanned or moved during this pass.
@@ -58,8 +58,8 @@ Changes prompted by inspection:
 
 ## Validation evidence
 
-- `cargo test --workspace`: **568 passed, 0 failed, 17 ignored**.
-- `cargo test -p argos-core batch_tests --lib`: **7 passed**. Includes an
+- `cargo test --workspace`: **571 passed, 0 failed, 17 ignored**.
+- `cargo test -p argos-core batch_tests --lib`: **9 passed**. Includes an
   injected scanner to exercise lifecycle behavior without network timing.
 - `cargo check --workspace --all-targets`: passed during implementation.
 - `cargo check --workspace --all-targets --features argos-network`: passed
@@ -116,7 +116,8 @@ argos --seeds-file seeds.txt scan
 argos --seeds-file seeds.txt sweep --destination <your-unified-address> --dry-run
 ```
 
-The parser accepts at most 64 entries; eight execute at once. Do not place
+The parser accepts at most 64 entries; concurrency defaults to eight and is
+configurable with `--max-concurrent-scans` (1–64). Do not place
 actual phrases in shell arguments. Broadcasting retains the existing explicit
 `--confirm-sweep` gate.
 
@@ -135,3 +136,22 @@ unfinished scans, and returning to the welcome screen for a fresh recovery.
 `cargo build -p argos-gui` and `node --check gui/src/main.js` passed. The local
 native development executable is `target/debug/argos-gui`. This is build and
 synthetic-UI evidence, not packaged-release or funded-chain qualification.
+
+
+## Configurable concurrency
+
+The GUI's **Max simultaneous scans** field and CLI
+`--max-concurrent-scans` option accept 1–64, defaulting to 8. The existing
+64-session/batch limit is unchanged. Concurrency is chosen at batch startup;
+changing the service's limit while scans are active or queued is refused.
+An unchanged limit can be reused. Configuration and batch registration share
+the admission lock; invalid batches cannot silently change concurrency.
+
+Lifecycle tests cover a two-slot queue, increasing to twelve active scans,
+shared limits across service clones, refusing changes during active work,
+and invalid values including zero and values above 64. The browser fixture
+verified two running scans and one queued with a custom limit of two, then
+admission of the queued seed after cancelling a running scan. These are scheduling/UI tests,
+not performance qualification at high concurrency.
+
+Example: `argos --seeds-file seeds.txt --max-concurrent-scans 4 scan`.

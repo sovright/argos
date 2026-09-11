@@ -455,8 +455,10 @@ Please **do not** open a public GitHub issue for a security vulnerability. Email
 
 ## Multi-seed development change (2026-09-11)
 
-This branch adds up to eight concurrent HD/imported scan tasks within one
-`RecoveryService`, with at most 64 total retained sessions. It retains the
+This branch adds configurable concurrent HD/imported scan tasks within one
+`RecoveryService` (1–64 active, default 8), with at most 64 total retained
+sessions. The limit is chosen before batch startup; changing it while scans
+are active or queued is refused. It retains the
 existing per-wallet database, in-memory block cache, and upstream sync engine.
 Sprout scanning remains a separate path outside this limit.
 

@@ -73,6 +73,14 @@ The review outcome should determine readiness. No code or runtime tests were cha
 
 Work is on `feat/multiseed-eight-scans`. The initial core/GUI/CLI implementation now exists; see [security and usability review](../../reviews/2026-09-11-multiseed-review.md) for evidence and remaining gates. The earlier sections record the design baseline, not a claim that every release requirement is complete.
 
-Implemented: eight service-wide active slots, up to 64 retained/queued sessions, duplicate admission protection including mnemonic imports, per-seed retry/cancel/release, attributed events, masked GUI entry rows and per-seed controls, and protected CLI `--seeds-file` scan/sweep. GUI sweeping is deliberately reviewed one seed at a time; CLI previews successful seeds then sweeps sequentially when explicitly requested. No shared block cache or workspace migration was introduced.
+Implemented: configurable service-wide concurrency (1–64 active scans, default 8), up to 64 retained/queued sessions, duplicate admission protection including mnemonic imports, per-seed retry/cancel/release, attributed events, masked GUI entry rows and per-seed controls, and protected CLI `--seeds-file` scan/sweep. GUI sweeping is deliberately reviewed one seed at a time; CLI previews successful seeds then sweeps sequentially when explicitly requested. No shared block cache or workspace migration was introduced.
 
 Terminal sessions now remain until explicit release or application exit, bounded by the 64-session cap. This replaces the old five-minute expiry for failed/cancelled sessions so a user can return after other seeds finish. Completed scans already retained their keys for sweeping. Release preserves the existing on-disk workspace. Queued scans have no persisted workspace until they begin; after application exit their seeds and settings must be entered again. No persistent batch manifest has been added.
+
+## Concurrency setting
+
+User direction now makes concurrency configurable while retaining the
+64-seed batch/session limit. The earlier eight-scan requirement is the
+default configuration and remains part of qualification. GUI and CLI let
+the user choose 1–64 simultaneous scans before startup; excess work queues.
+Higher values require additional real-workload performance qualification.

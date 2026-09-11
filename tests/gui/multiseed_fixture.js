@@ -1,8 +1,9 @@
 // Browser-only fixture: never included by production index.html.
 const scans = new Map();
+let concurrency = 8;
 function admit() {
   let active = [...scans.values()].filter(s => s.phase === "scanning_shielded").length;
-  for (const scan of scans.values()) if (scan.phase === "queued" && active++ < 8) scan.phase = "scanning_shielded";
+  for (const scan of scans.values()) if (scan.phase === "queued" && active++ < concurrency) scan.phase = "scanning_shielded";
 }
 window.__TAURI__ = {
   event: { listen: async () => () => {} },
@@ -15,6 +16,9 @@ window.__TAURI__ = {
       case "validate_seed": if (args.words.length !== 24) throw new Error("Expected 24 words"); return true;
       case "validate_address": return { destination_ok: true, has_orchard: true, has_sapling: true };
       case "start_seed_batch": {
+        const limit = args.maxConcurrentScans ?? 8;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 64) throw new Error("Invalid concurrency");
+        concurrency = limit;
         if (new Set(args.configs.map(c => c.seed)).size !== args.configs.length) throw new Error("Duplicate seed in batch");
         const handles = args.configs.map((_, index) => ({ id: `synthetic-${index + 1}` }));
         for (const handle of handles) scans.set(handle.id, { handle, phase: "queued", blocks_scanned: 20, blocks_total: 100, accounts: [], discoveries: [], synced_to_height: 419220, elapsed_seconds: 1 });

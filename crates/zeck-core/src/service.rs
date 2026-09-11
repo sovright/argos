@@ -1,4 +1,12 @@
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use secrecy::SecretString;
 use tokio::{
@@ -164,8 +172,8 @@ struct ScanSession {
 
 type SharedScanSession = Arc<ScanSession>;
 
-/// Maximum number of concurrent HD/imported recovery scans per service.
-pub const MAX_ACTIVE_SCANS: usize = 8;
+/// Default concurrent HD/imported recovery scans per service.
+pub const DEFAULT_SCAN_CONCURRENCY: usize = 8;
 /// Bound retained queued secrets as well as active work.
 pub const MAX_PENDING_SCANS: usize = 64;
 
@@ -174,6 +182,7 @@ pub struct RecoveryService {
     sessions: Arc<RwLock<HashMap<String, SharedScanSession>>>,
     admission: Arc<Mutex<()>>,
     scan_slots: Arc<Semaphore>,
+    scan_concurrency: Arc<AtomicUsize>,
     #[cfg(test)]
     scan_probe: Option<Arc<batch_tests::ScanProbe>>,
 }
@@ -183,7 +192,8 @@ impl Default for RecoveryService {
         Self {
             sessions: Arc::default(),
             admission: Arc::default(),
-            scan_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SCANS)),
+            scan_slots: Arc::new(Semaphore::new(DEFAULT_SCAN_CONCURRENCY)),
+            scan_concurrency: Arc::new(AtomicUsize::new(DEFAULT_SCAN_CONCURRENCY)),
             #[cfg(test)]
             scan_probe: None,
         }
@@ -193,6 +203,50 @@ impl Default for RecoveryService {
 impl RecoveryService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn scan_concurrency(&self) -> usize {
+        self.scan_concurrency.load(Ordering::Relaxed)
+    }
+
+    /// Configure admission before starting work. Existing active or queued
+    /// scans must finish/cancel before changing the limit; no task is evicted.
+    pub async fn set_scan_concurrency(&self, limit: usize) -> ZeckResult<()> {
+        let _admission = self.admission.lock().await;
+        self.set_scan_concurrency_locked(limit).await
+    }
+
+    async fn set_scan_concurrency_locked(&self, limit: usize) -> ZeckResult<()> {
+        if !(1..=MAX_PENDING_SCANS).contains(&limit) {
+            return Err(ZeckError::InvalidConfig(format!(
+                "max simultaneous scans must be between 1 and {MAX_PENDING_SCANS}"
+            )));
+        }
+        let current = self.scan_concurrency();
+        if limit == current {
+            return Ok(());
+        }
+        for session in self.sessions.read().await.values() {
+            if !session.state.lock().await.progress.phase.is_terminal() {
+                return Err(ZeckError::ScanNotReady(
+                    "finish or cancel active and queued scans before changing concurrency"
+                        .to_owned(),
+                ));
+            }
+        }
+        if limit > current {
+            self.scan_slots.add_permits(limit - current);
+        } else {
+            // A terminal task can still be returning from its final await.
+            // Wait for those permits rather than forgetting fewer than asked.
+            self.scan_slots
+                .acquire_many((current - limit) as u32)
+                .await
+                .expect("scan semaphore stays open")
+                .forget();
+        }
+        self.scan_concurrency.store(limit, Ordering::Relaxed);
+        Ok(())
     }
 
     pub async fn start_scan(
@@ -223,6 +277,16 @@ impl RecoveryService {
         &self,
         entries: Vec<(ScanConfig, SecretString)>,
     ) -> ZeckResult<Vec<ScanHandle>> {
+        self.start_seed_batch_with_concurrency(entries, None).await
+    }
+
+    /// Configure and register a validated batch under one admission lock, so
+    /// another caller cannot change its limit between validation and startup.
+    pub async fn start_seed_batch_with_concurrency(
+        &self,
+        entries: Vec<(ScanConfig, SecretString)>,
+        concurrency: Option<usize>,
+    ) -> ZeckResult<Vec<ScanHandle>> {
         if entries.is_empty() || entries.len() > MAX_PENDING_SCANS {
             return Err(ZeckError::InvalidConfig(format!(
                 "provide between 1 and {MAX_PENDING_SCANS} seeds"
@@ -249,6 +313,9 @@ impl RecoveryService {
         }
         let _admission = self.admission.lock().await;
         self.check_admission(&runtimes).await?;
+        if let Some(limit) = concurrency {
+            self.set_scan_concurrency_locked(limit).await?;
+        }
         let mut handles = Vec::with_capacity(runtimes.len());
         for runtime in runtimes {
             handles.push(self.start_prepared(runtime).await?);
@@ -3081,6 +3148,66 @@ mod batch_tests {
             service.cancel_scan(handle).await.unwrap();
             service.release_session(handle).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn custom_limit_admits_only_selected_number_and_is_shared_by_clones() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        let handles = service
+            .start_seed_batch_with_concurrency(
+                (0..4).map(|i| entry(i, root.path())).collect(),
+                Some(2),
+            )
+            .await
+            .unwrap();
+        wait_entered(&probe, 2).await;
+        let clone = service.clone();
+        assert_eq!(clone.scan_concurrency(), 2);
+        assert_eq!(service.scan_slots.available_permits(), 0);
+        assert!(clone.set_scan_concurrency(3).await.is_err());
+        assert_eq!(service.scan_concurrency(), 2);
+        dispose(&service, &handles).await;
+        service.set_scan_concurrency(12).await.unwrap();
+        let already_entered = probe.entered.load(Ordering::SeqCst);
+        assert_eq!(clone.scan_concurrency(), 12);
+        let handles = clone
+            .start_seed_batch((0..12).map(|i| entry(i, root.path())).collect())
+            .await
+            .unwrap();
+        wait_entered(&probe, already_entered + 12).await;
+        assert_eq!(service.scan_slots.available_permits(), 0);
+        dispose(&service, &handles).await;
+        assert_eq!(service.scan_slots.available_permits(), 12);
+    }
+
+    #[tokio::test]
+    async fn invalid_concurrency_does_not_start_work_or_change_the_default() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        for limit in [0, MAX_PENDING_SCANS + 1, usize::MAX] {
+            assert!(service
+                .start_seed_batch_with_concurrency(vec![entry(0, root.path())], Some(limit))
+                .await
+                .is_err());
+            assert_eq!(service.scan_concurrency(), DEFAULT_SCAN_CONCURRENCY);
+            assert!(service.sessions.read().await.is_empty());
+        }
+        assert_eq!(probe.entered.load(Ordering::SeqCst), 0);
+        service.set_scan_concurrency(1).await.unwrap();
+        assert_eq!(service.scan_slots.available_permits(), 1);
+        service
+            .set_scan_concurrency(MAX_PENDING_SCANS)
+            .await
+            .unwrap();
+        assert_eq!(service.scan_slots.available_permits(), MAX_PENDING_SCANS);
+        let mut duplicate = entry(0, root.path());
+        duplicate.0.birthday += 1;
+        assert!(service
+            .start_seed_batch_with_concurrency(vec![entry(0, root.path()), duplicate], Some(2))
+            .await
+            .is_err());
+        assert_eq!(service.scan_concurrency(), MAX_PENDING_SCANS);
     }
 
     #[tokio::test]

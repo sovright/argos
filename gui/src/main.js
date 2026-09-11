@@ -28,6 +28,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 const state = {
   batchEntries: [],
+  scanConcurrency: 8,
   walletBusy: false,
   scanHandle: null,
   lastProgress: null,
@@ -459,7 +460,7 @@ function renderBatch() {
     entry.receiptButton.hidden = !entry.receipt;
     entry.receiptButton.disabled = state.walletBusy;
   }
-  const summary = `${counts.running} / 8 running · ${counts.queued} queued · ${counts.complete} complete · ${counts.error} failed · ${counts.cancelled} cancelled${counts.released ? ` · ${counts.released} released` : ""}`;
+  const summary = `${counts.running} / ${state.scanConcurrency} running · ${counts.queued} queued · ${counts.complete} complete · ${counts.error} failed · ${counts.cancelled} cancelled${counts.released ? ` · ${counts.released} released` : ""}`;
   if ($("batch-summary").textContent !== summary) $("batch-summary").textContent = summary;
   const busy = state.walletBusy || entries.some((entry) => entry.busy);
   $("cancel-batch").disabled = busy || !(counts.running || counts.queued);
@@ -1600,6 +1601,10 @@ phrase, or clear the seed phrase to scan the pasted key.",
   try {
     const extraRows = [...document.querySelectorAll(".extra-seed-row")];
     if (extraRows.length) {
+      const maxConcurrentScans = Number($("max-concurrent-scans").value);
+      if (!Number.isInteger(maxConcurrentScans) || maxConcurrentScans < 1 || maxConcurrentScans > 64) {
+        throw new Error("Max simultaneous scans must be a whole number from 1 to 64.");
+      }
       const configs = [config, ...extraRows.map((row, index) => {
         const rawBirthday = row.querySelector(".extra-seed-birthday").value;
         const birthday = rawBirthday === "" ? config.birthday : Number(rawBirthday);
@@ -1610,7 +1615,8 @@ phrase, or clear the seed phrase to scan the pasted key.",
           birthday, label: row.querySelector(".extra-seed-label").value.trim() || `Seed ${index + 2}` };
       })];
       try {
-        const handles = await invoke("start_seed_batch", { configs });
+        const handles = await invoke("start_seed_batch", { configs, maxConcurrentScans });
+        state.scanConcurrency = maxConcurrentScans;
         state.batchEntries = handles.map((handle, index) => {
           const { seed, ...settings } = configs[index];
           const ordinal = `Seed ${index + 1}`;

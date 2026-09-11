@@ -45,10 +45,14 @@ struct Cli {
     seed_file: Option<PathBuf>,
 
     /// Protected file containing one seed per line, optionally followed by
-    /// | birthday-block. Up to eight scans run at once; additional seeds queue.
+    /// | birthday-block. Concurrency defaults to eight; additional seeds queue.
     /// Supports scan and sweep. Must be chmod 600 on Unix.
     #[arg(long, conflicts_with_all = ["seed_file", "wallet_file", "sapling_key_file", "sprout_key_file", "birthday_date", "birthday_auto_detect"])]
     seeds_file: Option<PathBuf>,
+
+    /// Maximum simultaneous scans for --seeds-file (1–64). Extra seeds queue.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
+    max_concurrent_scans: u16,
 
     /// Path to a legacy wallet file to recover keys from: a zcashd
     /// `wallet.dat` or a ZecWallet Lite wallet. Read-only — Argos never
@@ -1680,6 +1684,9 @@ async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Res
         None
     };
     let service = RecoveryService::new();
+    service
+        .set_scan_concurrency(usize::from(cli.max_concurrent_scans))
+        .await?;
     let handles = service
         .start_seed_batch(
             entries
@@ -2742,6 +2749,39 @@ mod tests {
 #[cfg(test)]
 mod seed_batch_cli_tests {
     use super::*;
+    #[test]
+    fn concurrency_accepts_custom_values_and_rejects_out_of_range() {
+        for limit in ["1", "12", "64"] {
+            let cli = Cli::try_parse_from([
+                "argos",
+                "--seeds-file",
+                "batch",
+                "--max-concurrent-scans",
+                limit,
+                "scan",
+            ])
+            .unwrap();
+            assert_eq!(cli.max_concurrent_scans.to_string(), limit);
+        }
+        for limit in ["0", "65", "-1", "1.5"] {
+            assert!(Cli::try_parse_from([
+                "argos",
+                "--seeds-file",
+                "batch",
+                "--max-concurrent-scans",
+                limit,
+                "scan"
+            ])
+            .is_err());
+        }
+        assert_eq!(
+            Cli::try_parse_from(["argos", "--seeds-file", "batch", "scan"])
+                .unwrap()
+                .max_concurrent_scans,
+            8
+        );
+    }
+
     #[test]
     fn batch_birthdays_and_comments_are_unambiguous() {
         let entries = parse_seed_batch("# comment\n\nphrase one | 100\nphrase two\n", 200).unwrap();
