@@ -1672,7 +1672,7 @@ fn confirm_batch_seed(
     destination: &str,
 ) -> Result<bool> {
     writeln!(output, "Seed {ordinal}: destination {destination}")?;
-    write!(output, "To confirm you are authorized to recover this wallet and broadcast its irreversible sweep, type SWEEP {ordinal} (anything else skips this seed): ")?;
+    write!(output, "To confirm this is your own wallet and broadcast its irreversible sweep, type SWEEP {ordinal} (anything else skips this seed): ")?;
     output.flush()?;
     let mut answer = String::new();
     input.read_line(&mut answer)?;

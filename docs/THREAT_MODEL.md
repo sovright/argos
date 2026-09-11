@@ -499,14 +499,13 @@ must not be interpreted as independent audit coverage of this new change.
 
 ### Authorized use and batch abuse analysis
 
-Batch recovery is intended for wallets owned by the operator or recovered with
-the wallet owner's explicit authorization. Possession of a seed alone is not
-proof of that authorization. The product direction in this work came directly
-from the repository operator: multiple seeds, GUI support, configurable scan
-concurrency, and an unchanged 64-seed batch limit. This records the requirement's
-source, not independent verification of any seed's ownership or a specific
-customer recovery case. The release owner should document representative
-first-party/authorized recovery workflows before release qualification.
+Batch recovery is intended only for the operator's own wallets. The repository
+operator explicitly confirmed this use case: recovering multiple personally
+owned wallets, with GUI support, configurable scan concurrency, and an unchanged
+64-seed batch limit. Recovery services for other owners and custodial bulk
+operations are outside this feature's intended use. This records the confirmed
+product requirement; possession of a seed and local consent prompts do not
+independently verify ownership.
 
 An attacker who already has stolen seeds can use ordinary wallet software or
 modify Argos to spend them. Local UI gates cannot establish legal ownership or

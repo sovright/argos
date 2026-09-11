@@ -185,11 +185,11 @@ retrying, cancel-all and releasing Seed 2 while Seed 1's sweep response remained
 pending; the final synthetic receipt stayed attributed to Seed 1.
 
 A subsequent review raised batch authorization and abuse ergonomics. The threat
-model now states the intended owner/authorized-operator boundary, records the
-repository operator as the requirement source without inventing a verified
-customer use case, and explains the limits of local consent gates. CLI batch
+model now states the intended own-wallets-only boundary, records the
+repository operator as the requirement source and their explicit confirmation
+that this feature is for recovering their own wallets, and explains the limits of local consent gates. CLI batch
 broadcast requires an interactive terminal and a separate `SWEEP N` response
 for each seed; decline/EOF skips it. Non-interactive scans/previews remain
 available. Parser/confirmation tests cover terminal refusal, seed mismatch,
-default denial, EOF and correct per-seed consent. Release-owner use-case
-validation remains documented; no seed-ownership verification is claimed.
+default denial, EOF and correct per-seed consent. The intended-use question is resolved by that confirmation; no technical
+seed-ownership verification is claimed.
