@@ -27,6 +27,9 @@ document.addEventListener("DOMContentLoaded", () => {
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = {
+  batchEntries: [],
+  scanConcurrency: 8,
+  walletBusy: false,
   scanHandle: null,
   lastProgress: null,
   sweepProposal: null,
@@ -88,6 +91,7 @@ const fmt = (n) => (Number(n) / 1e8).toFixed(8) + " ZEC";
 function phaseLabel(phase) {
   const labels = {
     idle: "Idle",
+    queued: "Queued — waiting for a scan slot",
     validating_seed: "Validating seed…",
     deriving_keys: "Deriving keys…",
     probing_lightwalletd: "Probing lightwalletd…",
@@ -237,6 +241,16 @@ let furthestStep = 0; // tracks how far the user has reached
 const STEP_ALIASES = { "wallet-file": "seed" };
 
 function goTo(step) {
+  if (state.walletBusy && !(state.batchEntries.length && ["scan", "sweep"].includes(step))) return;
+  if (state.batchEntries.length && ["welcome", "seed", "config", "wallet-file"].includes(step)) {
+    step = "scan";
+  }
+  if (state.batchEntries.length && step === "sweep" && !state.sweepProposal) step = "scan";
+  if (state.batchEntries.length && step === "complete") {
+    const entry = selectedBatchEntry();
+    if (entry?.receipt) renderCompleteScreen(...entry.receipt);
+    else step = "scan";
+  }
   const stepIdx = steps.indexOf(STEP_ALIASES[step] ?? step);
   if (stepIdx > furthestStep) furthestStep = stepIdx;
 
@@ -301,21 +315,308 @@ seedVisibility.addEventListener("change", () => {
 });
 
 async function validateSeed() {
-  const words = seedInput.value.trim().toLowerCase().split(/\s+/);
   setStatus("seed-status", "Validating…", "");
   seedNextBtn.disabled = true;
-  try {
-    await invoke("validate_seed", { words });
-    setStatus("seed-status", "✓ Seed phrase is valid.", "success");
-    seedNextBtn.disabled = false;
-  } catch (err) {
-    setStatus("seed-status", `✗ ${err}`, "error");
+  const inputs = [seedInput, ...document.querySelectorAll(".extra-seed-phrase")];
+  for (let index = 0; index < inputs.length; index++) {
+    try {
+      await invoke("validate_seed", { words: inputs[index].value.trim().toLowerCase().split(/\s+/) });
+    } catch (err) {
+      setStatus("seed-status", `Seed ${index + 1}: ${err}`, "error");
+      inputs[index].focus();
+      return;
+    }
   }
+  setStatus("seed-status", `✓ ${inputs.length} seed phrase(s) valid.`, "success");
+  seedNextBtn.disabled = false;
 }
 
 $("seed-validate").addEventListener("click", validateSeed);
 seedInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); validateSeed(); }
+});
+
+// Entry identity is independent of scheduling order. Secret phrases stay in
+// their input fields only until IPC accepts the batch; never in app state.
+let nextSeedNumber = 2;
+$("add-seed").addEventListener("click", () => {
+  if (document.querySelectorAll(".extra-seed-row").length >= 63) return;
+  const number = nextSeedNumber++;
+  const row = document.createElement("fieldset");
+  row.className = "extra-seed-row";
+  const legend = document.createElement("legend");
+  legend.textContent = `Seed ${number}`;
+  row.appendChild(legend);
+  function field(text, input) {
+    const label = document.createElement("label");
+    label.className = "field";
+    const span = document.createElement("span");
+    span.textContent = text;
+    label.append(span, input);
+    row.appendChild(label);
+  }
+  const name = document.createElement("input");
+  name.className = "extra-seed-label";
+  name.value = `Seed ${number}`;
+  name.maxLength = 120;
+  field("Label", name);
+  const phrase = document.createElement("textarea");
+  phrase.className = "extra-seed-phrase masked";
+  phrase.rows = 3;
+  phrase.autocomplete = "off";
+  phrase.spellcheck = false;
+  phrase.setAttribute("autocapitalize", "off");
+  phrase.setAttribute("autocorrect", "off");
+  field("Seed phrase", phrase);
+  const show = document.createElement("input");
+  show.type = "checkbox";
+  show.addEventListener("change", () => phrase.classList.toggle("masked", !show.checked));
+  field("Show this seed's words", show);
+  const birthday = document.createElement("input");
+  birthday.type = "number";
+  birthday.min = "1";
+  birthday.max = "4294967295";
+  birthday.className = "extra-seed-birthday";
+  birthday.placeholder = "Use the birthday from scan settings";
+  field("Birthday block (optional override)", birthday);
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "secondary";
+  remove.textContent = `Remove Seed ${number}`;
+  remove.addEventListener("click", () => {
+    phrase.value = "";
+    row.remove();
+    seedNextBtn.disabled = true;
+    $("add-seed").disabled = false;
+    $("add-seed").focus();
+  });
+  row.appendChild(remove);
+  row.addEventListener("input", () => { seedNextBtn.disabled = true; });
+  $("additional-seeds").appendChild(row);
+  $("add-seed").disabled = document.querySelectorAll(".extra-seed-row").length >= 63;
+  seedNextBtn.disabled = true;
+  phrase.focus();
+});
+seedInput.addEventListener("input", () => { seedNextBtn.disabled = true; });
+
+function selectedBatchEntry() {
+  return state.batchEntries.find((entry) => entry.handle.id === state.scanHandle?.id);
+}
+
+let batchPollTimer = null;
+async function pollBatch() {
+  const entries = state.batchEntries;
+  await Promise.all(entries.filter((entry) => !entry.released && !entry.progress?.phase?.match(/^(complete|cancelled|error)$/)).map(async (entry) => {
+    const handle = entry.handle;
+    const revision = entry.revision || 0;
+    try {
+      const progress = await invoke("get_scan_progress", { handle });
+      if (state.batchEntries !== entries || entry.released || entry.busy ||
+          entry.handle.id !== handle.id || (entry.revision || 0) !== revision) return;
+      entry.progress = progress;
+      entry.pollError = null;
+      if (entry.handle.id === state.scanHandle?.id) updateScanUI(entry.progress);
+    } catch (_) {
+      if (state.batchEntries === entries && !entry.released && !entry.busy &&
+          entry.handle.id === handle.id && (entry.revision || 0) === revision) {
+        entry.pollError = "Progress unavailable; retrying. Saved workspace is preserved.";
+      }
+    }
+  }));
+  if (state.batchEntries !== entries || !entries.length) return;
+  renderBatch();
+  batchPollTimer = setTimeout(pollBatch, 1000);
+}
+
+function renderBatch() {
+  const entries = state.batchEntries;
+  $("batch-panel").hidden = !entries.length;
+  $("batch-context").hidden = !entries.length;
+  if (!entries.length) return;
+  const counts = { complete: 0, error: 0, cancelled: 0, queued: 0, running: 0, released: 0 };
+  for (const entry of entries) {
+    const phase = entry.progress?.phase || "queued";
+    if (entry.released) counts.released++;
+    else if (phase in counts) counts[phase]++; else counts.running++;
+    const selected = entry.handle.id === state.scanHandle?.id;
+    entry.viewButton.setAttribute("aria-pressed", String(selected));
+    entry.status.textContent = entry.released ? "Session released — workspace preserved" :
+      entry.pollError || `${phaseLabel(phase)} · ${fmt(entry.progress?.summary?.total_zatoshis ??
+        entry.progress?.accounts?.reduce((sum, a) => sum + a.total_zatoshis, 0) ?? 0)}${phase !== "complete" ? " (provisional)" : ""}${entry.progress?.error ? ` · ${entry.progress.error}` : ""}`;
+    const scanned = Math.max(0, Number(entry.progress?.blocks_scanned) || 0);
+    const total = Math.max(0, Number(entry.progress?.blocks_total) || 0);
+    entry.meter.max = total || 1;
+    if (total) entry.meter.value = Math.min(scanned, total);
+    else entry.meter.removeAttribute("value");
+    entry.meter.hidden = entry.released || phase === "queued" || !total;
+    entry.coverage.textContent = total ? `${scanned.toLocaleString()} / ${total.toLocaleString()} blocks` :
+      phase === "queued" ? "Waiting for a scan slot" : "Waiting for scan progress";
+    entry.coverage.hidden = entry.released;
+    entry.cancelButton.disabled = !canCancelEntry(entry);
+    entry.releaseButton.disabled = entry.released || entry.busy || entryWalletBusy(entry) || !["complete", "cancelled", "error"].includes(phase);
+    entry.retryButton.disabled = entry.busy || entryWalletBusy(entry);
+    entry.viewButton.disabled = entry.released || state.walletBusy;
+    entry.retryBox.hidden = entry.released || !["cancelled", "error"].includes(phase);
+    entry.receiptButton.hidden = !entry.receipt;
+    entry.receiptButton.disabled = state.walletBusy;
+  }
+  const summary = `${counts.running} / ${state.scanConcurrency} running · ${counts.queued} queued · ${counts.complete} complete · ${counts.error} failed · ${counts.cancelled} cancelled${counts.released ? ` · ${counts.released} released` : ""}`;
+  if ($("batch-summary").textContent !== summary) $("batch-summary").textContent = summary;
+  const busy = state.walletBusy || entries.some((entry) => entry.busy);
+  $("cancel-batch").disabled = !entries.some(canCancelEntry);
+  $("restart-batch").disabled = busy || !!(counts.running || counts.queued);
+  const selected = selectedBatchEntry();
+  $("batch-selected-context").textContent = selected ? `Selected: ${selected.label}. Sweep and report actions apply only to this seed.` : "Select a seed to review.";
+  $("selected-scan-label").textContent = selected?.label || "";
+}
+
+function canCancelEntry(entry) {
+  return !entry.released && !entry.busy && !entryWalletBusy(entry) &&
+    !["complete", "cancelled", "error"].includes(entry.progress?.phase);
+}
+
+function entryWalletBusy(entry) {
+  return state.walletBusy && entry.handle.id === state.scanHandle?.id;
+}
+
+async function mutateBatchEntry(entry, action) {
+  if (entry.busy || entryWalletBusy(entry) || entry.released) return;
+  entry.busy = true;
+  entry.revision = (entry.revision || 0) + 1;
+  renderBatch();
+  try { await action(); }
+  finally { entry.busy = false; renderBatch(); }
+}
+
+function resetSelectedScanDetails() {
+  state.lastProgress = null;
+  $("scan-server").textContent = "Not connected";
+  $("scan-server").title = "";
+  $("scan-progress-text").textContent = "0 / 0";
+  $("scan-progress-bar").style.width = "0%";
+  $("scan-eta").textContent = "Waiting for scan progress";
+  $("scan-totals").textContent = "Balance not yet available for this seed.";
+  $("scan-workspace").textContent = "Workspace: not initialized";
+  $("scan-rows").replaceChildren();
+  setStatus("scan-message", "", "");
+  $("back-to-config").style.display = "none";
+  for (const id of ["scan-sleep-banner", "scan-sandblasting-banner", "scan-gap-extension-banner"]) $(id).style.display = "none";
+}
+
+async function selectBatchEntry(entry, receipt = false) {
+  if (state.walletBusy || (entry.released && !receipt)) return;
+  cleanupListeners();
+  state.scanHandle = entry.handle;
+  state.scanConfig = entry.config;
+  state.sweepProposal = null;
+  state.savedReportPath = null;
+  $("copy-report-path").style.display = "none";
+  $("save-report").disabled = entry.released;
+  $("delete-workspace").disabled = entry.released;
+  setStatus("delete-workspace-status", "", "");
+  setStatus("save-report-status", "", "");
+  setStatus("sweep-execute-status", "", "");
+  $("scan-discoveries").replaceChildren();
+  $("scan-discoveries").style.display = "none";
+  eta.reset();
+  resetSelectedScanDetails();
+  if (entry.progress) updateScanUI(entry.progress);
+  else {
+    state.lastProgress = null;
+    $("scan-phase").textContent = "Queued";
+    $("scan-rows").replaceChildren();
+    $("review-sweep").disabled = true;
+  }
+  renderBatch();
+  if (receipt && entry.receipt) {
+    renderCompleteScreen(...entry.receipt);
+    goTo("complete");
+  } else goTo("scan");
+}
+
+function createBatchCards(entries) {
+  $("batch-scans").replaceChildren();
+  for (const entry of entries) {
+    const card = document.createElement("fieldset");
+    const title = document.createElement("legend");
+    title.textContent = entry.label;
+    entry.status = document.createElement("p");
+    entry.meter = document.createElement("progress");
+    entry.meter.setAttribute("aria-label", `Scan progress for ${entry.label}`);
+    entry.coverage = document.createElement("p");
+    entry.coverage.className = "batch-coverage";
+    card.append(title, entry.status, entry.meter, entry.coverage);
+    function button(text, action) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "secondary";
+      btn.textContent = text.split(" ")[0];
+      btn.setAttribute("aria-label", text);
+      btn.addEventListener("click", () => action().catch((err) => setStatus("batch-status", String(err), "error")));
+      card.appendChild(btn);
+      return btn;
+    }
+    entry.viewButton = button(`View ${entry.label}`, () => selectBatchEntry(entry));
+    entry.cancelButton = button(`Cancel ${entry.label}`, () => mutateBatchEntry(entry, async () => {
+      await invoke("cancel_scan", { handle: entry.handle });
+      entry.progress = await invoke("get_scan_progress", { handle: entry.handle });
+      if (entry.handle.id === state.scanHandle?.id) updateScanUI(entry.progress);
+      renderBatch();
+    }));
+    entry.releaseButton = button(`Release ${entry.label}`, () => mutateBatchEntry(entry, async () => {
+      if (entryWalletBusy(entry)) return;
+      await invoke("release_session", { handle: entry.handle });
+      entry.released = true;
+      card.querySelectorAll("textarea").forEach((input) => { input.value = ""; });
+      if (entry.handle.id === state.scanHandle?.id) {
+        state.scanHandle = null;
+        $("review-sweep").disabled = true;
+      }
+      renderBatch();
+    }));
+    entry.receiptButton = button(`Receipt for ${entry.label}`, () => selectBatchEntry(entry, true));
+    entry.retryBox = document.createElement("details");
+    const retryTitle = document.createElement("summary");
+    retryTitle.textContent = `Retry ${entry.label}`;
+    const retryLabel = document.createElement("label");
+    retryLabel.className = "field";
+    retryLabel.textContent = `Re-enter the seed for ${entry.label}`;
+    const retrySeed = document.createElement("textarea");
+    retrySeed.className = "masked";
+    retrySeed.rows = 3;
+    retrySeed.autocomplete = "off";
+    retrySeed.spellcheck = false;
+    retryLabel.appendChild(retrySeed);
+    const retryButton = document.createElement("button");
+    entry.retryButton = retryButton;
+    retryButton.type = "button";
+    retryButton.textContent = `Resume ${entry.label}`;
+    retryButton.addEventListener("click", async () => {
+      if (entryWalletBusy(entry)) return;
+      try { await mutateBatchEntry(entry, async () => {
+        const selected = state.scanHandle?.id === entry.handle.id;
+        entry.handle = await invoke("retry_seed_scan", { handle: entry.handle, seed: retrySeed.value.trim() });
+        entry.progress = null;
+        entry.pollError = null;
+        entry.retryBox.open = false;
+        if (selected) await selectBatchEntry(entry);
+        renderBatch();
+      }); } catch (err) { setStatus("batch-status", String(err), "error"); }
+      finally { retrySeed.value = ""; }
+    });
+    entry.retryBox.append(retryTitle, retryLabel, retryButton);
+    card.appendChild(entry.retryBox);
+    $("batch-scans").appendChild(card);
+  }
+}
+$("return-to-batch").addEventListener("click", () => goTo("scan"));
+$("cancel-batch").addEventListener("click", async () => {
+  const results = await Promise.allSettled(state.batchEntries.filter(canCancelEntry).map((entry) => mutateBatchEntry(entry, async () => {
+      await invoke("cancel_scan", { handle: entry.handle });
+      entry.progress = await invoke("get_scan_progress", { handle: entry.handle });
+      if (entry.handle.id === state.scanHandle?.id) updateScanUI(entry.progress);
+  })));
+  setStatus("batch-status", results.some((result) => result.status === "rejected") ? "Some scans could not be cancelled; check their status." : "Available unfinished scans cancelled. Completed scans remain available to sweep.", "");
 });
 
 // Clear-clipboard affordance. Overwrites the OS clipboard with empty text so
@@ -1209,6 +1510,11 @@ $("destination-input").addEventListener("keydown", (e) => {
 });
 
 $("start-scan").addEventListener("click", async () => {
+  if (state.batchEntries.length) { goTo("scan"); return; }
+  if (document.querySelectorAll(".extra-seed-row").length && (walletFile || hasSaplingScanKeys())) {
+    setStatus("config-status", "Multiple seed rows cannot be combined with wallet files or standalone keys. Remove the extra seed rows first.", "error");
+    return;
+  }
   // Three routes to the same scan: a seed phrase, a wallet file, or a
   // pasted Sapling spending key.
   const hasTypedSaplingKeys = hasSaplingScanKeys();
@@ -1300,6 +1606,37 @@ phrase, or clear the seed phrase to scan the pasted key.",
   $("start-scan").disabled = true;
 
   try {
+    const extraRows = [...document.querySelectorAll(".extra-seed-row")];
+    if (extraRows.length) {
+      const maxConcurrentScans = Number($("max-concurrent-scans").value);
+      if (!Number.isInteger(maxConcurrentScans) || maxConcurrentScans < 1 || maxConcurrentScans > 64) {
+        throw new Error("Max simultaneous scans must be a whole number from 1 to 64.");
+      }
+      const configs = [config, ...extraRows.map((row, index) => {
+        const rawBirthday = row.querySelector(".extra-seed-birthday").value;
+        const birthday = rawBirthday === "" ? config.birthday : Number(rawBirthday);
+        if (!Number.isInteger(birthday) || birthday < 1 || birthday > 4294967295) {
+          throw new Error(`Seed ${index + 2}: enter a valid birthday block.`);
+        }
+        return { ...config, seed: row.querySelector(".extra-seed-phrase").value.trim().toLowerCase(),
+          birthday, label: row.querySelector(".extra-seed-label").value.trim() || `Seed ${index + 2}` };
+      })];
+      try {
+        const handles = await invoke("start_seed_batch", { configs, maxConcurrentScans });
+        state.scanConcurrency = maxConcurrentScans;
+        state.batchEntries = handles.map((handle, index) => {
+          const { seed, ...settings } = configs[index];
+          const ordinal = `Seed ${index + 1}`;
+          return { handle, label: settings.label === ordinal ? ordinal : `${ordinal} — ${settings.label}`, config: settings, progress: null, released: false };
+        });
+        createBatchCards(state.batchEntries);
+        await selectBatchEntry(state.batchEntries[0]);
+        await pollBatch(); // Snapshot reconciliation includes scans that completed before IPC returned.
+      } finally {
+        configs.forEach((entry) => { entry.seed = ""; });
+      }
+      return;
+    }
     let handle;
     // Raw lines, so the backend applies its own skip rule and its errors
     // number the lines the user sees. Empty when the box holds nothing but
@@ -1352,6 +1689,7 @@ phrase, or clear the seed phrase to scan the pasted key.",
     // succeeded; on failure the user can retype, and a successful scan no
     // longer needs the cleartext phrase visible.
     seedInput.value = "";
+    document.querySelectorAll(".extra-seed-phrase").forEach((input) => { input.value = ""; });
   }
 });
 
@@ -1395,7 +1733,8 @@ async function startProgressListeners() {
       cleanupListeners();
     }),
     listen("scan-discovery", (event) => {
-      const d = event.payload;
+      if (event.payload.handle?.id !== state.scanHandle?.id) return;
+      const d = event.payload.value;
       const div = document.createElement("div");
       div.className = "discovery-toast";
       // at_block_height is the scan frontier when first observed, not the
@@ -1413,6 +1752,17 @@ async function startProgressListeners() {
   state.unlistenProgress = unlistenProgress;
   state.unlistenComplete = unlistenComplete;
   state.unlistenDiscovered = unlistenDiscovered;
+  // A short scan may finish before the listeners attach. Reconcile the
+  // authoritative snapshot after subscription, including for resume.
+  const handle = state.scanHandle;
+  if (handle) {
+    try {
+      const progress = await invoke("get_scan_progress", { handle });
+      if (state.scanHandle?.id !== handle.id) return;
+      updateScanUI(progress);
+      if (["complete", "cancelled", "error"].includes(progress.phase)) cleanupListeners();
+    } catch (err) { setStatus("scan-message", `Could not load scan status: ${err}`, "error"); }
+  }
 }
 
 function scanCompletionSummary(progress) {
@@ -1452,6 +1802,17 @@ function cleanupListeners() {
 
 function updateScanUI(progress) {
   state.lastProgress = progress;
+  if (state.batchEntries.length) {
+    const container = $("scan-discoveries");
+    container.replaceChildren();
+    for (const discovery of progress.discoveries || []) {
+      const row = document.createElement("div");
+      row.className = "discovery-toast";
+      row.textContent = `Found ${fmt(discovery.zatoshis)} on account ${discovery.account_index} — ${discovery.pool} (scanned through block ${discovery.at_block_height}).`;
+      container.appendChild(row);
+    }
+    container.style.display = container.children.length ? "" : "none";
+  }
 
   $("scan-phase").textContent = phaseLabel(progress.phase);
 
@@ -1539,9 +1900,7 @@ function updateScanUI(progress) {
 
   const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
   $("cancel-scan").style.display = terminal ? "none" : "";
-  if (progress.phase === "complete") {
-    $("review-sweep").disabled = false;
-  }
+  $("review-sweep").disabled = progress.phase !== "complete" || !!selectedBatchEntry()?.receipt;
 }
 
 function renderAccountRows(accounts) {
@@ -1565,7 +1924,12 @@ function appendCell(tr, text) {
   tr.appendChild(td);
 }
 
-$("back-to-config").addEventListener("click", () => {
+$("back-to-config").addEventListener("click", async () => {
+  if (state.batchEntries.length) { goTo("scan"); return; }
+  if (state.scanHandle) {
+    try { await invoke("release_session", { handle: state.scanHandle }); }
+    catch (err) { setStatus("scan-message", String(err), "error"); return; }
+  }
   cleanupListeners();
   state.scanHandle = null;
   $("back-to-config").style.display = "none";
@@ -1596,16 +1960,20 @@ function donationParamsFromForm() {
   return { donationRate, donorEmail };
 }
 
+let proposalGeneration = 0;
 async function refreshSweepProposal() {
+  const generation = ++proposalGeneration;
   const { donationRate, donorEmail } = donationParamsFromForm();
+  const handle = state.scanHandle;
   const proposal = await invoke("propose_sweep", {
-    handle: state.scanHandle,
+    handle,
     destination: state.destination,
     memo: state.memo,
     maxFeeZec: state.maxFeeZec,
     donationRate,
     donorEmail,
   });
+  if (state.scanHandle?.id !== handle?.id || generation !== proposalGeneration) return;
   state.sweepProposal = proposal;
   renderSweepProposal(proposal);
 }
@@ -1620,15 +1988,20 @@ async function maybeRefreshProposal() {
 }
 
 $("review-sweep").addEventListener("click", async () => {
+  if (state.walletBusy) return;
+  state.walletBusy = true;
   setStatus("scan-message", "Fetching sweep proposal…", "");
   $("review-sweep").disabled = true;
 
   try {
     await refreshSweepProposal();
+    state.walletBusy = false;
     goTo("sweep");
   } catch (err) {
     setStatus("scan-message", `✗ ${err}`, "error");
     $("review-sweep").disabled = false;
+  } finally {
+    state.walletBusy = false;
   }
 });
 
@@ -1808,6 +2181,9 @@ $("irreversible-check").addEventListener("change", () => {
 });
 
 $("execute-sweep").addEventListener("click", async () => {
+  if (state.walletBusy || selectedBatchEntry()?.receipt) return;
+  state.walletBusy = true;
+  renderBatch();
   $("execute-sweep").disabled = true;
   $("irreversible-check").disabled = true;
   setStatus("sweep-execute-status", "Broadcasting transactions to the Zcash network… this may take up to 2 minutes.", "");
@@ -1826,6 +2202,9 @@ $("execute-sweep").addEventListener("click", async () => {
       donorEmail,
     });
     setStatus("sweep-execute-status", "", "");
+    const entry = selectedBatchEntry();
+    if (entry) entry.receipt = [outcome.transactions, outcome.skipped_accounts,
+      outcome.total_donation_zatoshis || 0, donationRate, outcome.error];
     renderCompleteScreen(
       outcome.transactions,
       outcome.skipped_accounts,
@@ -1833,11 +2212,16 @@ $("execute-sweep").addEventListener("click", async () => {
       donationRate,
       outcome.error,
     );
+    state.walletBusy = false;
+    renderBatch();
     goTo("complete");
   } catch (err) {
     $("execute-sweep").disabled = false;
     $("irreversible-check").disabled = false;
     setStatus("sweep-execute-status", `✗ Sweep failed: ${err}`, "error");
+  } finally {
+    state.walletBusy = false;
+    renderBatch();
   }
 });
 
@@ -1991,6 +2375,7 @@ function buildReport(results) {
     "Argos Recovery Report",
     `Date: ${new Date().toISOString()}`,
     "",
+    `Seed label:       ${selectedBatchEntry()?.label || cfg?.label || "(unlabeled scan)"}`,
     "Scan Summary",
     "────────────",
     `Network:          ${network}`,
@@ -2018,6 +2403,7 @@ function buildDefaultReportPath() {
 }
 
 $("save-report").addEventListener("click", async () => {
+  if (state.walletBusy) return;
   const path = $("report-path").value.trim();
   const report = $("save-report").dataset.report ?? "";
   if (!report) {
@@ -2025,6 +2411,7 @@ $("save-report").addEventListener("click", async () => {
     return;
   }
   try {
+    state.walletBusy = true;
     const saved = await invoke("save_recovery_report", {
       handle: state.scanHandle,
       path,
@@ -2035,7 +2422,7 @@ $("save-report").addEventListener("click", async () => {
     $("copy-report-path").style.display = "";
   } catch (err) {
     setStatus("save-report-status", `✗ ${err}`, "error");
-  }
+  } finally { state.walletBusy = false; }
 });
 
 $("copy-report-path").addEventListener("click", () => {
@@ -2048,6 +2435,7 @@ $("copy-report-path").addEventListener("click", () => {
 });
 
 $("delete-workspace").addEventListener("click", async () => {
+  if (state.walletBusy) return;
   if (!state.scanHandle) {
     setStatus("delete-workspace-status", "No workspace to delete.", "error");
     return;
@@ -2065,10 +2453,14 @@ $("delete-workspace").addEventListener("click", async () => {
   btn.disabled = true;
   setStatus("delete-workspace-status", "Deleting…", "");
   try {
+    state.walletBusy = true;
     const deletedPath = await invoke("delete_workspace", { handle: state.scanHandle });
     setStatus("delete-workspace-status", `✓ Deleted ${deletedPath}`, "success");
     // The session is gone server-side; further per-handle commands would fail.
+    const entry = selectedBatchEntry();
+    if (entry) entry.released = true;
     state.scanHandle = null;
+    renderBatch();
     state.savedReportPath = null;
     // The recovery report is inside the workspace we just deleted; the
     // "Copy path" affordance now points at nothing.
@@ -2077,10 +2469,37 @@ $("delete-workspace").addEventListener("click", async () => {
   } catch (err) {
     setStatus("delete-workspace-status", `✗ ${err}`, "error");
     btn.disabled = false;
-  }
+  } finally { state.walletBusy = false; }
 });
 
-$("restart-flow").addEventListener("click", () => {
+async function restartRecovery() {
+  if (state.walletBusy || state.batchEntries.some((entry) => entry.busy)) return;
+  if (state.batchEntries.some((entry) => !entry.released && !["complete", "error", "cancelled"].includes(entry.progress?.phase))) {
+    goTo("scan");
+    setStatus("batch-status", "Cancel unfinished scans before starting a new recovery.", "");
+    return;
+  }
+  const handles = state.batchEntries.length ? state.batchEntries.filter((entry) => !entry.released).map((entry) => entry.handle) : [state.scanHandle].filter(Boolean);
+  state.walletBusy = true;
+  renderBatch();
+  try {
+    for (const handle of handles) {
+      try {
+        await invoke("release_session", { handle });
+        const entry = state.batchEntries.find((candidate) => candidate.handle.id === handle.id);
+        if (entry) entry.released = true;
+      } catch (err) {
+        setStatus(state.batchEntries.length ? "batch-status" : "delete-workspace-status", `Could not release session: ${err}`, "error");
+        return;
+      }
+    }
+  } finally { state.walletBusy = false; renderBatch(); }
+  clearTimeout(batchPollTimer);
+  state.batchEntries = [];
+  renderBatch();
+  $("additional-seeds").replaceChildren();
+  $("add-seed").disabled = false;
+  nextSeedNumber = 2;
   cleanupListeners();
   furthestStep = 0;
   Object.assign(state, {
@@ -2141,7 +2560,9 @@ $("restart-flow").addEventListener("click", () => {
   $("cancel-scan").style.display = "";
 
   goTo("welcome");
-});
+}
+$("restart-flow").addEventListener("click", restartRecovery);
+$("restart-batch").addEventListener("click", restartRecovery);
 
 // ─── Donate ───────────────────────────────────────────────────────────────────
 

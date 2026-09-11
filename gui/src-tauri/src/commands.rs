@@ -437,6 +437,75 @@ pub async fn start_scan(
     Ok(handle)
 }
 
+/// Batch inputs retain their order; no seeds are returned to the WebView.
+#[tauri::command]
+pub async fn start_seed_batch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    configs: Vec<ScanConfigInput>,
+    max_concurrent_scans: Option<usize>,
+) -> Result<Vec<ScanHandle>, String> {
+    ensure_tos_accepted(&app)?;
+    let entries = configs
+        .into_iter()
+        .map(|config| {
+            (
+                ScanConfig {
+                    birthday: config.birthday,
+                    num_accounts: config.num_accounts,
+                    gap_limit: config.gap_limit,
+                    lightwalletd_url: config.lightwalletd_url,
+                    data_dir: PathBuf::from(config.data_dir),
+                    network: config.network,
+                    label: config.label.unwrap_or_default(),
+                },
+                config.seed,
+            )
+        })
+        .collect();
+    let handles = state
+        .service
+        .start_seed_batch_with_concurrency(entries, max_concurrent_scans)
+        .await
+        .map_err(|err| err.to_string())?;
+    for handle in &handles {
+        spawn_scan_progress_pump(app.clone(), state.service.clone(), handle.clone());
+    }
+    Ok(handles)
+}
+
+#[tauri::command]
+pub async fn release_session(state: State<'_, AppState>, handle: ScanHandle) -> Result<(), String> {
+    state
+        .service
+        .release_session(&handle)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn retry_seed_scan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    handle: ScanHandle,
+    seed: SecretString,
+) -> Result<ScanHandle, String> {
+    ensure_tos_accepted(&app)?;
+    let handle = state
+        .service
+        .retry_seed_scan(&handle, seed)
+        .await
+        .map_err(|err| err.to_string())?;
+    spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
+    Ok(handle)
+}
+
+#[derive(Clone, Serialize)]
+struct ScanEvent<'a, T: Serialize> {
+    handle: &'a ScanHandle,
+    value: &'a T,
+}
+
 /// Forward `scan-progress` / `scan-discovery` / `scan-complete` events to
 /// the frontend while a scan is running. Identical for fresh scans and
 /// resumed scans, so it's factored out.
@@ -454,7 +523,13 @@ fn spawn_scan_progress_pump(app: AppHandle, service: RecoveryService, handle: Sc
             }
             if progress.discoveries.len() > emitted_discoveries {
                 for discovery in &progress.discoveries[emitted_discoveries..] {
-                    let _ = app.emit("scan-discovery", discovery);
+                    let _ = app.emit(
+                        "scan-discovery",
+                        ScanEvent {
+                            handle: &handle,
+                            value: discovery,
+                        },
+                    );
                 }
                 emitted_discoveries = progress.discoveries.len();
             }
@@ -572,9 +647,21 @@ pub async fn execute_sweep(
         .map_err(|err| err.to_string())?;
 
     for result in &outcome.transactions {
-        let _ = app.emit("sweep-tx-broadcast", result);
+        let _ = app.emit(
+            "sweep-tx-broadcast",
+            ScanEvent {
+                handle: &handle,
+                value: result,
+            },
+        );
         if result.status == "confirmed" {
-            let _ = app.emit("sweep-tx-confirmed", result);
+            let _ = app.emit(
+                "sweep-tx-confirmed",
+                ScanEvent {
+                    handle: &handle,
+                    value: result,
+                },
+            );
         }
     }
 

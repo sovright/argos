@@ -139,6 +139,7 @@ impl Default for ScanHandle {
 #[serde(rename_all = "snake_case")]
 pub enum ScanPhase {
     Idle,
+    Queued,
     ValidatingSeed,
     DerivingKeys,
     ProbingLightwalletd,

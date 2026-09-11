@@ -44,6 +44,16 @@ struct Cli {
     #[arg(long)]
     seed_file: Option<PathBuf>,
 
+    /// Protected file containing one seed per line, optionally followed by
+    /// | birthday-block. Concurrency defaults to eight; additional seeds queue.
+    /// Supports scan and sweep. Must be chmod 600 on Unix.
+    #[arg(long, conflicts_with_all = ["seed_file", "wallet_file", "sapling_key_file", "sprout_key_file", "birthday_date", "birthday_auto_detect"])]
+    seeds_file: Option<PathBuf>,
+
+    /// Maximum simultaneous scans for --seeds-file (1–64). Extra seeds queue.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
+    max_concurrent_scans: u16,
+
     /// Path to a legacy wallet file to recover keys from: a zcashd
     /// `wallet.dat` or a ZecWallet Lite wallet. Read-only — Argos never
     /// writes to this file. If the wallet is encrypted you are prompted
@@ -178,6 +188,7 @@ enum Commands {
         dry_run: bool,
 
         /// Confirm you understand this is irreversible and broadcast the sweep.
+        /// With --seeds-file, also requires interactive confirmation for each seed.
         #[arg(long)]
         confirm_sweep: bool,
     },
@@ -1102,6 +1113,9 @@ async fn main() -> Result<()> {
     }
 
     let network: ZeckNetwork = cli.network.into();
+    if let Some(path) = &cli.seeds_file {
+        return run_seed_batch_cli(&cli, path, network).await;
+    }
 
     // `scan-sprout` is dispatched here, before key-source resolution, because
     // it needs no HD seed: its keys come from a key file or from a wallet
@@ -1598,6 +1612,274 @@ fn init_tracing(verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// Parse without echoing secret-bearing lines in errors. The owner-held file
+/// is the only batch secret input; no phrase is accepted in command arguments.
+fn parse_seed_batch(contents: &str, default_birthday: u32) -> Result<Vec<(SecretString, u32)>> {
+    let mut entries = Vec::new();
+    for (line_index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('|');
+        let phrase = parts.next().unwrap_or_default().trim();
+        let birthday = match parts.next() {
+            Some(value) => value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("line {}: invalid birthday block", line_index + 1))?,
+            None => default_birthday,
+        };
+        if parts.next().is_some() || phrase.is_empty() {
+            bail!(
+                "line {}: expected phrase or phrase | birthday",
+                line_index + 1
+            );
+        }
+        entries.push((SecretString::new(phrase.to_owned()), birthday));
+        if entries.len() > argos_core::service::MAX_PENDING_SCANS {
+            bail!(
+                "at most {} seed entries are allowed",
+                argos_core::service::MAX_PENDING_SCANS
+            );
+        }
+    }
+    if entries.is_empty() {
+        bail!("seeds file is empty");
+    }
+    Ok(entries)
+}
+
+fn validate_batch_confirmation(command: &Commands, interactive: bool) -> Result<()> {
+    if matches!(
+        command,
+        Commands::Sweep {
+            confirm_sweep: true,
+            dry_run: false,
+            ..
+        }
+    ) && !interactive
+    {
+        bail!("batch broadcasting requires an interactive terminal and confirmation for each seed; use --dry-run to preview without broadcasting");
+    }
+    Ok(())
+}
+
+fn confirm_batch_seed(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+    ordinal: usize,
+    destination: &str,
+) -> Result<bool> {
+    writeln!(output, "Seed {ordinal}: destination {destination}")?;
+    write!(output, "To confirm this is your own wallet and broadcast its irreversible sweep, type SWEEP {ordinal} (anything else skips this seed): ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim() == format!("SWEEP {ordinal}"))
+}
+
+async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Result<()> {
+    if !matches!(cli.command, Commands::Scan | Commands::Sweep { .. }) {
+        bail!("--seeds-file supports only scan and sweep");
+    }
+    validate_batch_confirmation(&cli.command, std::io::stdin().is_terminal())?;
+    let metadata = fs::metadata(path).context("could not inspect seeds file")?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        bail!("seeds file must be a regular file smaller than 1 MiB");
+    }
+    validate_seed_file_permissions(path, &metadata)?;
+    use secrecy::ExposeSecret;
+    let contents =
+        SecretString::new(fs::read_to_string(path).context("could not read seeds file")?);
+    let entries = parse_seed_batch(contents.expose_secret(), cli.birthday)?;
+    drop(contents);
+    let request = if let Commands::Sweep {
+        destination,
+        memo,
+        donation_rate,
+        donor_email,
+        max_fee,
+        ..
+    } = &cli.command
+    {
+        validate_destination_address(destination, network)?;
+        Some(SweepRequest {
+            destination: destination.clone(),
+            memo: memo.clone(),
+            max_fee_zatoshis: *max_fee,
+            donation_rate: *donation_rate,
+            donor_email: donor_email.clone(),
+        })
+    } else {
+        None
+    };
+    let service = RecoveryService::new();
+    service
+        .set_scan_concurrency(usize::from(cli.max_concurrent_scans))
+        .await?;
+    let handles = service
+        .start_seed_batch(
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, (phrase, birthday))| {
+                    (
+                        ScanConfig {
+                            birthday,
+                            num_accounts: cli.num_accounts,
+                            gap_limit: cli.gap_limit,
+                            lightwalletd_url: cli.lightwalletd_url.clone(),
+                            data_dir: cli.data_dir.clone(),
+                            network,
+                            label: format!("Seed {}", index + 1),
+                        },
+                        phrase,
+                    )
+                })
+                .collect(),
+        )
+        .await?;
+    let mut last_status = vec![None; handles.len()];
+    let mut failed = false;
+    loop {
+        let mut finished = 0;
+        for (index, handle) in handles.iter().enumerate() {
+            if last_status[index].is_some_and(|(phase, _): (ScanPhase, u64)| phase.is_terminal()) {
+                finished += 1;
+                continue;
+            }
+            let progress = service.get_scan_progress(handle).await?;
+            let status = (progress.phase, progress.blocks_scanned);
+            if last_status[index] != Some(status) {
+                println!(
+                    "Seed {}: {:?} — {} / {} blocks",
+                    index + 1,
+                    progress.phase,
+                    progress.blocks_scanned,
+                    progress.blocks_total
+                );
+                last_status[index] = Some(status);
+            }
+            if progress.phase.is_terminal() {
+                finished += 1;
+                println!("Seed {} result:", index + 1);
+                print_scan_result(&progress);
+                failed |= progress.phase != ScanPhase::Complete;
+            }
+        }
+        if finished == handles.len() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Preview every successful seed before any broadcast. Partial scan failure
+    // does not discard other seeds' results. Fees retain their per-seed
+    // sweep meaning; summed estimates are reported separately.
+    if let Some(request) = request {
+        println!("Destination: {}. Max fee applies separately to each seed sweep, not to the batch total.", request.destination);
+        let mut ready = Vec::new();
+        let mut total_fee = 0u64;
+        let mut total_donation = 0u64;
+        for (index, handle) in handles.iter().enumerate() {
+            if last_status[index].is_some_and(|(phase, _)| phase == ScanPhase::Complete) {
+                match service.propose_sweep(handle, request.clone()).await {
+                    Ok(proposal) => {
+                        println!("Seed {} sweep preview:", index + 1);
+                        print_sweep_preview(&proposal);
+                        total_fee = total_fee
+                            .checked_add(proposal.total_fee_zatoshis)
+                            .context("batch fee overflow")?;
+                        total_donation = total_donation
+                            .checked_add(proposal.total_donation_zatoshis)
+                            .context("batch donation overflow")?;
+                        ready.push((index, handle));
+                    }
+                    Err(err) => {
+                        failed = true;
+                        eprintln!("Seed {} preview failed: {err}", index + 1);
+                    }
+                }
+            }
+        }
+        println!(
+            "Batch estimated fees: {}; estimated donations: {}",
+            format_zec(total_fee),
+            format_zec(total_donation)
+        );
+        if matches!(
+            cli.command,
+            Commands::Sweep {
+                confirm_sweep: true,
+                dry_run: false,
+                ..
+            }
+        ) {
+            for (index, handle) in ready {
+                if !confirm_batch_seed(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stderr(),
+                    index + 1,
+                    &request.destination,
+                )? {
+                    println!(
+                        "Seed {} skipped; nothing broadcast for this seed.",
+                        index + 1
+                    );
+                    continue;
+                }
+                match service.execute_sweep(handle, request.clone()).await {
+                    Ok(outcome) => {
+                        // Structured output retains every txid even if a later
+                        // account or seed fails after broadcasting.
+                        for tx in &outcome.transactions {
+                            println!(
+                                "Seed {} account {}: {} txid={} {}",
+                                index + 1,
+                                tx.source_account,
+                                tx.status,
+                                tx.txid.as_deref().unwrap_or("none"),
+                                tx.detail
+                            );
+                        }
+                        for skipped in &outcome.skipped_accounts {
+                            println!(
+                                "Seed {} account {} skipped: {}",
+                                index + 1,
+                                skipped.account_index,
+                                skipped.reason
+                            );
+                        }
+                        println!(
+                            "Seed {} donated: {}",
+                            index + 1,
+                            format_zec(outcome.total_donation_zatoshis)
+                        );
+                        if let Some(error) = &outcome.error {
+                            eprintln!("Seed {} stopped: {error}. Any txids listed above remain broadcast.", index + 1);
+                        }
+                        failed |= outcome.error.is_some()
+                            || outcome.transactions.iter().any(|tx| tx.status == "failed");
+                    }
+                    Err(err) => {
+                        failed = true;
+                        eprintln!("Seed {} sweep failed: {err}", index + 1);
+                    }
+                }
+            }
+        } else {
+            println!("Preview only. Use --confirm-sweep in a terminal and confirm each seed to broadcast.");
+        }
+    }
+    for handle in &handles {
+        let _ = service.release_session(handle).await;
+    }
+    if failed {
+        bail!("one or more seeds failed; successful results are listed above");
+    }
+    Ok(())
+}
+
 fn load_seed_phrase(seed_file: Option<PathBuf>) -> Result<SecretString> {
     if let Some(path) = seed_file {
         let metadata = fs::metadata(&path)
@@ -1816,6 +2098,7 @@ async fn wait_for_scan(
 
 fn phase_label(progress: &argos_core::ScanProgress) -> String {
     match progress.phase {
+        ScanPhase::Queued => "Waiting for a scan slot".to_string(),
         ScanPhase::Idle => "Starting".to_string(),
         ScanPhase::ValidatingSeed => "Validating seed".to_string(),
         ScanPhase::DerivingKeys => "Deriving keys".to_string(),
@@ -2503,5 +2786,133 @@ mod tests {
     #[test]
     fn powershell_quote_strips_control_chars() {
         assert_eq!(powershell_quote("abc\x00def"), "'abcdef'");
+    }
+}
+
+#[cfg(test)]
+mod seed_batch_cli_tests {
+    use super::*;
+    #[test]
+    fn batch_broadcast_requires_terminal_and_seed_specific_confirmation() {
+        let cli = Cli::try_parse_from([
+            "argos",
+            "--seeds-file",
+            "batch",
+            "sweep",
+            "--destination",
+            "u1fixture",
+            "--confirm-sweep",
+        ])
+        .unwrap();
+        assert!(validate_batch_confirmation(&cli.command, false).is_err());
+        assert!(validate_batch_confirmation(&cli.command, true).is_ok());
+        let preview = Cli::try_parse_from([
+            "argos",
+            "--seeds-file",
+            "batch",
+            "sweep",
+            "--destination",
+            "u1fixture",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(validate_batch_confirmation(&preview.command, false).is_ok());
+        for (answer, accepted) in [
+            ("SWEEP 2\n", true),
+            ("SWEEP 1\n", false),
+            ("yes\n", false),
+            ("\n", false),
+            ("", false),
+        ] {
+            let mut output = Vec::new();
+            assert_eq!(
+                confirm_batch_seed(
+                    &mut std::io::Cursor::new(answer),
+                    &mut output,
+                    2,
+                    "u1fixture"
+                )
+                .unwrap(),
+                accepted
+            );
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("Seed 2: destination u1fixture"));
+        }
+    }
+
+    #[test]
+    fn concurrency_accepts_custom_values_and_rejects_out_of_range() {
+        for limit in ["1", "12", "64"] {
+            let cli = Cli::try_parse_from([
+                "argos",
+                "--seeds-file",
+                "batch",
+                "--max-concurrent-scans",
+                limit,
+                "scan",
+            ])
+            .unwrap();
+            assert_eq!(cli.max_concurrent_scans.to_string(), limit);
+        }
+        for limit in ["0", "65", "-1", "1.5"] {
+            assert!(Cli::try_parse_from([
+                "argos",
+                "--seeds-file",
+                "batch",
+                "--max-concurrent-scans",
+                limit,
+                "scan"
+            ])
+            .is_err());
+        }
+        assert_eq!(
+            Cli::try_parse_from(["argos", "--seeds-file", "batch", "scan"])
+                .unwrap()
+                .max_concurrent_scans,
+            8
+        );
+    }
+
+    #[test]
+    fn batch_birthdays_and_comments_are_unambiguous() {
+        let entries = parse_seed_batch("# comment\n\nphrase one | 100\nphrase two\n", 200).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, 100);
+        assert_eq!(entries[1].1, 200);
+    }
+    #[test]
+    fn malformed_lines_do_not_echo_secrets() {
+        for line in ["secret phrase | bad", "secret phrase | 1 | 2", " | 2"] {
+            assert!(!parse_seed_batch(line, 0)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("secret phrase"));
+        }
+        assert!(parse_seed_batch("# empty", 0).is_err());
+    }
+    #[test]
+    fn batch_file_conflicts_with_other_secret_sources_and_auto_birthday() {
+        for flag in [
+            "--seed-file",
+            "--wallet-file",
+            "--sapling-key-file",
+            "--sprout-key-file",
+            "--birthday-date",
+        ] {
+            assert!(
+                Cli::try_parse_from(["argos", "--seeds-file", "batch", flag, "other", "scan"])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "argos",
+            "--seeds-file",
+            "batch",
+            "--birthday-auto-detect",
+            "scan"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["argos", "--seeds-file", "batch", "scan"]).is_ok());
     }
 }

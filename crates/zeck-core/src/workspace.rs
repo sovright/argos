@@ -90,6 +90,32 @@ impl RecoveryWorkspace {
         })
     }
 
+    /// Cooperating Argos processes retain this advisory lock through scanning,
+    /// sweeping and workspace deletion. Never unlink the lock file: replacing
+    /// its inode would let a new process bypass an existing owner's lock.
+    pub(crate) fn acquire_ownership(&self) -> ZeckResult<std::sync::Arc<fs::File>> {
+        create_private_dir_all(&self.private_root)?;
+        tighten_private_perms(&self.private_root, &self.private_root)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(self.private_root.join(".argos.lock"))
+            .map_err(|err| {
+                ZeckError::Storage(format!("opening workspace ownership lock: {err}"))
+            })?;
+        file.try_lock().map_err(|err| match err {
+            fs::TryLockError::WouldBlock => ZeckError::ScanNotReady(
+                "this workspace is in use by another Argos session; release it or close the other app before retrying".to_owned()),
+            fs::TryLockError::Error(err) => ZeckError::Storage(format!("locking workspace: {err}")),
+        })?;
+        Ok(std::sync::Arc::new(file))
+    }
+
     pub fn initialize(&self, network: ZeckNetwork, seed: &[u8; 64]) -> ZeckResult<()> {
         create_private_dir_all(&self.root)?;
         // recursive create only sets mode on newly-created dirs; explicitly

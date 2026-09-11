@@ -7,7 +7,7 @@ edition = "2021"
 version = "1.2.0"
 license = "MIT OR Apache-2.0"
 authors = ["The Bootstrap Org Inc"]
-rust-version = "1.88"
+rust-version = "1.89"
 repository = "https://github.com/sovright/argos"
 
 [workspace.dependencies]

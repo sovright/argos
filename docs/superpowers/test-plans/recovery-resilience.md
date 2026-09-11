@@ -94,7 +94,8 @@ boot and CI runners don't keep it warm. C3/C4 are humans driving the app.
 | R-W21 | Created workspace directory has mode `0o700` (Unix) | C1 | ➕ added in this branch |
 | R-W22 | Wallet DB files have mode `0o600` (Unix) | C1 | ➕ added in this branch |
 | R-W23 | Workspace path with unicode characters round-trips correctly | C1 | ➕ added in this branch |
-| R-W24 | Two argos instances on same workspace — first cancels, second proceeds | C2 | ✅ implemented |
+| R-W24 | Two starts in one service on the same wallet — duplicate refused; explicit cancel/release permits resume | C2 | ✅ implemented |
+| R-W25 | Separate OS processes on the same workspace — second owner refused; release, deletion, normal exit and forced termination permit reacquisition | C1 | ✅ implemented in `service::batch_tests::ownership_excludes_other_processes_and_recovers_after_exit_and_kill` (synthetic seeds, no node) |
 | R-W25 | Workspace deleted between scan and sweep — clean error | C2 | ✅ implemented |
 | R-W26 | Workspace permissions tampered (chmod 0444) — clean error | C2 | ✅ implemented |
 
