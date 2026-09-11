@@ -54,13 +54,6 @@ struct Cli {
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
     max_concurrent_scans: u16,
 
-    /// Assert that you personally own every seed in --seeds-file. Required to
-    /// broadcast a multi-seed batch sweep, which sends several wallets' funds to
-    /// one destination. Argos recovers wallets you control; it is not for
-    /// sweeping seed phrases that belong to other people.
-    #[arg(long)]
-    i_own_all_seeds: bool,
-
     /// Path to a legacy wallet file to recover keys from: a zcashd
     /// `wallet.dat` or a ZecWallet Lite wallet. Read-only — Argos never
     /// writes to this file. If the wallet is encrypted you are prompted
@@ -1656,18 +1649,24 @@ fn parse_seed_batch(contents: &str, default_birthday: u32) -> Result<Vec<(Secret
     Ok(entries)
 }
 
-/// Guard broadcasting a multi-seed batch sweep. One `--confirm-sweep` would
-/// otherwise broadcast every ready seed to a single destination in one run;
-/// sweeping more than one wallet requires the operator to explicitly assert
-/// they own all of them (`--i-own-all-seeds`). This blocks before any funds
-/// move; previewing and single-seed sweeps never need the assertion.
-fn ensure_batch_broadcast_allowed(ready_seeds: usize, i_own_all_seeds: bool) -> Result<()> {
-    if ready_seeds > 1 && !i_own_all_seeds {
+/// Broadcasting a batch sweep is capped at a small number of wallets per run.
+/// A handful of your own recovered wallets is fine; sweeping many seed phrases
+/// to a single address in one run is the shape of a tool for draining stolen
+/// seeds, so it is refused and authorized case by case by the Argos team rather
+/// than self-served. Scanning and previewing the whole `--seeds-file` batch stays
+/// available (no funds move); only the broadcast is limited, before any
+/// transaction is sent. This ceiling is a policy value, not a technical maximum.
+const MAX_BATCH_SWEEP_WALLETS: usize = 3;
+const BATCH_SWEEP_CONTACT: &str = "security@sovright.com";
+
+fn ensure_batch_sweep_within_limit(ready_seeds: usize) -> Result<()> {
+    if ready_seeds > MAX_BATCH_SWEEP_WALLETS {
         bail!(
-            "refusing to broadcast a {ready_seeds}-seed sweep to one destination without \
-             --i-own-all-seeds. Argos sweeps only wallets you personally control; never run it \
-             on seed phrases belonging to other people. Preview with --dry-run, or add \
-             --i-own-all-seeds to confirm you own every seed in the file."
+            "refusing to broadcast a sweep for {ready_seeds} wallets in one run (limit is \
+             {MAX_BATCH_SWEEP_WALLETS}). This cap keeps Argos from being used to drain many \
+             seed phrases to a single address. Preview the whole batch with --dry-run, sweep \
+             the wallets in smaller runs, or if you legitimately need to sweep more wallets you \
+             own at once, contact the Argos team at {BATCH_SWEEP_CONTACT}."
         );
     }
     Ok(())
@@ -1810,10 +1809,10 @@ async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Res
         ) {
             // A batch sweep sends several wallets' funds to a single
             // destination — the same shape as a tool for draining many stolen
-            // seeds. Broadcasting more than one seed therefore requires an
-            // explicit ownership assertion on top of --confirm-sweep. Preview
-            // and single-seed sweeps are unaffected.
-            ensure_batch_broadcast_allowed(ready.len(), cli.i_own_all_seeds)?;
+            // seeds. Broadcasting is capped at a small number of wallets per
+            // run; larger recoveries are authorized by the team. Preview and
+            // small sweeps are unaffected. This blocks before any funds move.
+            ensure_batch_sweep_within_limit(ready.len())?;
             for (index, handle) in ready {
                 match service.execute_sweep(handle, request.clone()).await {
                     Ok(outcome) => {
@@ -2781,43 +2780,26 @@ mod seed_batch_cli_tests {
     use super::*;
 
     #[test]
-    fn batch_broadcast_requires_ownership_ack_for_multiple_seeds() {
-        // Nothing ready, or a single wallet: no extra assertion needed.
-        assert!(ensure_batch_broadcast_allowed(0, false).is_ok());
-        assert!(ensure_batch_broadcast_allowed(1, false).is_ok());
-        // Two or more wallets to one destination without the assertion: refused,
-        // before any broadcast — and the error must not tell a caller to bypass
-        // the check silently.
-        for ready in [2usize, 8, 64] {
-            let err = ensure_batch_broadcast_allowed(ready, false).unwrap_err().to_string();
-            assert!(err.contains("--i-own-all-seeds"));
-            assert!(err.contains(&ready.to_string()));
+    fn batch_sweep_broadcast_is_capped_and_points_to_the_team() {
+        // A small number of your own wallets is allowed, including exactly at
+        // the cap. Zero ready seeds is a no-op.
+        for ready in [0usize, 1, 2, MAX_BATCH_SWEEP_WALLETS] {
+            assert!(ensure_batch_sweep_within_limit(ready).is_ok());
         }
-        // Explicit ownership assertion permits the multi-seed broadcast.
-        assert!(ensure_batch_broadcast_allowed(64, true).is_ok());
+        // Above the cap: refused before any broadcast, and the message names the
+        // count, the limit, and how to get a larger recovery authorized.
+        for ready in [MAX_BATCH_SWEEP_WALLETS + 1, 8, 64] {
+            let err = ensure_batch_sweep_within_limit(ready).unwrap_err().to_string();
+            assert!(err.contains(&ready.to_string()));
+            assert!(err.contains(&MAX_BATCH_SWEEP_WALLETS.to_string()));
+            assert!(err.contains(BATCH_SWEEP_CONTACT));
+        }
     }
 
     #[test]
-    fn ownership_ack_flag_parses_and_defaults_off() {
-        assert!(
-            !Cli::try_parse_from(["argos", "--seeds-file", "batch", "scan"])
-                .unwrap()
-                .i_own_all_seeds
-        );
-        assert!(
-            Cli::try_parse_from([
-                "argos",
-                "--seeds-file",
-                "batch",
-                "--i-own-all-seeds",
-                "sweep",
-                "--destination",
-                "u1example",
-                "--confirm-sweep",
-            ])
-            .unwrap()
-            .i_own_all_seeds
-        );
+    fn batch_sweep_cap_is_small_enough_to_block_bulk() {
+        // Guard against the policy value drifting up to a bulk-draining size.
+        assert!((2..=8).contains(&MAX_BATCH_SWEEP_WALLETS));
     }
 
     #[test]
