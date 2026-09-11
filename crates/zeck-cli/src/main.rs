@@ -54,6 +54,13 @@ struct Cli {
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
     max_concurrent_scans: u16,
 
+    /// Assert that you personally own every seed in --seeds-file. Required to
+    /// broadcast a multi-seed batch sweep, which sends several wallets' funds to
+    /// one destination. Argos recovers wallets you control; it is not for
+    /// sweeping seed phrases that belong to other people.
+    #[arg(long)]
+    i_own_all_seeds: bool,
+
     /// Path to a legacy wallet file to recover keys from: a zcashd
     /// `wallet.dat` or a ZecWallet Lite wallet. Read-only — Argos never
     /// writes to this file. If the wallet is encrypted you are prompted
@@ -1649,6 +1656,23 @@ fn parse_seed_batch(contents: &str, default_birthday: u32) -> Result<Vec<(Secret
     Ok(entries)
 }
 
+/// Guard broadcasting a multi-seed batch sweep. One `--confirm-sweep` would
+/// otherwise broadcast every ready seed to a single destination in one run;
+/// sweeping more than one wallet requires the operator to explicitly assert
+/// they own all of them (`--i-own-all-seeds`). This blocks before any funds
+/// move; previewing and single-seed sweeps never need the assertion.
+fn ensure_batch_broadcast_allowed(ready_seeds: usize, i_own_all_seeds: bool) -> Result<()> {
+    if ready_seeds > 1 && !i_own_all_seeds {
+        bail!(
+            "refusing to broadcast a {ready_seeds}-seed sweep to one destination without \
+             --i-own-all-seeds. Argos sweeps only wallets you personally control; never run it \
+             on seed phrases belonging to other people. Preview with --dry-run, or add \
+             --i-own-all-seeds to confirm you own every seed in the file."
+        );
+    }
+    Ok(())
+}
+
 async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Result<()> {
     if !matches!(cli.command, Commands::Scan | Commands::Sweep { .. }) {
         bail!("--seeds-file supports only scan and sweep");
@@ -1784,6 +1808,12 @@ async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Res
                 ..
             }
         ) {
+            // A batch sweep sends several wallets' funds to a single
+            // destination — the same shape as a tool for draining many stolen
+            // seeds. Broadcasting more than one seed therefore requires an
+            // explicit ownership assertion on top of --confirm-sweep. Preview
+            // and single-seed sweeps are unaffected.
+            ensure_batch_broadcast_allowed(ready.len(), cli.i_own_all_seeds)?;
             for (index, handle) in ready {
                 match service.execute_sweep(handle, request.clone()).await {
                     Ok(outcome) => {
@@ -2749,6 +2779,47 @@ mod tests {
 #[cfg(test)]
 mod seed_batch_cli_tests {
     use super::*;
+
+    #[test]
+    fn batch_broadcast_requires_ownership_ack_for_multiple_seeds() {
+        // Nothing ready, or a single wallet: no extra assertion needed.
+        assert!(ensure_batch_broadcast_allowed(0, false).is_ok());
+        assert!(ensure_batch_broadcast_allowed(1, false).is_ok());
+        // Two or more wallets to one destination without the assertion: refused,
+        // before any broadcast — and the error must not tell a caller to bypass
+        // the check silently.
+        for ready in [2usize, 8, 64] {
+            let err = ensure_batch_broadcast_allowed(ready, false).unwrap_err().to_string();
+            assert!(err.contains("--i-own-all-seeds"));
+            assert!(err.contains(&ready.to_string()));
+        }
+        // Explicit ownership assertion permits the multi-seed broadcast.
+        assert!(ensure_batch_broadcast_allowed(64, true).is_ok());
+    }
+
+    #[test]
+    fn ownership_ack_flag_parses_and_defaults_off() {
+        assert!(
+            !Cli::try_parse_from(["argos", "--seeds-file", "batch", "scan"])
+                .unwrap()
+                .i_own_all_seeds
+        );
+        assert!(
+            Cli::try_parse_from([
+                "argos",
+                "--seeds-file",
+                "batch",
+                "--i-own-all-seeds",
+                "sweep",
+                "--destination",
+                "u1example",
+                "--confirm-sweep",
+            ])
+            .unwrap()
+            .i_own_all_seeds
+        );
+    }
+
     #[test]
     fn concurrency_accepts_custom_values_and_rejects_out_of_range() {
         for limit in ["1", "12", "64"] {
