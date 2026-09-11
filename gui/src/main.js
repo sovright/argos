@@ -241,7 +241,7 @@ let furthestStep = 0; // tracks how far the user has reached
 const STEP_ALIASES = { "wallet-file": "seed" };
 
 function goTo(step) {
-  if (state.walletBusy) return;
+  if (state.walletBusy && !(state.batchEntries.length && ["scan", "sweep"].includes(step))) return;
   if (state.batchEntries.length && ["welcome", "seed", "config", "wallet-file"].includes(step)) {
     step = "scan";
   }
@@ -452,9 +452,9 @@ function renderBatch() {
     entry.coverage.textContent = total ? `${scanned.toLocaleString()} / ${total.toLocaleString()} blocks` :
       phase === "queued" ? "Waiting for a scan slot" : "Waiting for scan progress";
     entry.coverage.hidden = entry.released;
-    entry.cancelButton.disabled = entry.released || entry.busy || ["complete", "cancelled", "error"].includes(phase);
-    entry.releaseButton.disabled = entry.released || entry.busy || state.walletBusy || !["complete", "cancelled", "error"].includes(phase);
-    entry.retryButton.disabled = entry.busy || state.walletBusy;
+    entry.cancelButton.disabled = !canCancelEntry(entry);
+    entry.releaseButton.disabled = entry.released || entry.busy || entryWalletBusy(entry) || !["complete", "cancelled", "error"].includes(phase);
+    entry.retryButton.disabled = entry.busy || entryWalletBusy(entry);
     entry.viewButton.disabled = entry.released || state.walletBusy;
     entry.retryBox.hidden = entry.released || !["cancelled", "error"].includes(phase);
     entry.receiptButton.hidden = !entry.receipt;
@@ -463,15 +463,24 @@ function renderBatch() {
   const summary = `${counts.running} / ${state.scanConcurrency} running · ${counts.queued} queued · ${counts.complete} complete · ${counts.error} failed · ${counts.cancelled} cancelled${counts.released ? ` · ${counts.released} released` : ""}`;
   if ($("batch-summary").textContent !== summary) $("batch-summary").textContent = summary;
   const busy = state.walletBusy || entries.some((entry) => entry.busy);
-  $("cancel-batch").disabled = busy || !(counts.running || counts.queued);
+  $("cancel-batch").disabled = !entries.some(canCancelEntry);
   $("restart-batch").disabled = busy || !!(counts.running || counts.queued);
   const selected = selectedBatchEntry();
   $("batch-selected-context").textContent = selected ? `Selected: ${selected.label}. Sweep and report actions apply only to this seed.` : "Select a seed to review.";
   $("selected-scan-label").textContent = selected?.label || "";
 }
 
+function canCancelEntry(entry) {
+  return !entry.released && !entry.busy && !entryWalletBusy(entry) &&
+    !["complete", "cancelled", "error"].includes(entry.progress?.phase);
+}
+
+function entryWalletBusy(entry) {
+  return state.walletBusy && entry.handle.id === state.scanHandle?.id;
+}
+
 async function mutateBatchEntry(entry, action) {
-  if (entry.busy || state.walletBusy || entry.released) return;
+  if (entry.busy || entryWalletBusy(entry) || entry.released) return;
   entry.busy = true;
   entry.revision = (entry.revision || 0) + 1;
   renderBatch();
@@ -555,7 +564,7 @@ function createBatchCards(entries) {
       renderBatch();
     }));
     entry.releaseButton = button(`Release ${entry.label}`, () => mutateBatchEntry(entry, async () => {
-      if (state.walletBusy) return;
+      if (entryWalletBusy(entry)) return;
       await invoke("release_session", { handle: entry.handle });
       entry.released = true;
       card.querySelectorAll("textarea").forEach((input) => { input.value = ""; });
@@ -583,7 +592,7 @@ function createBatchCards(entries) {
     retryButton.type = "button";
     retryButton.textContent = `Resume ${entry.label}`;
     retryButton.addEventListener("click", async () => {
-      if (state.walletBusy) return;
+      if (entryWalletBusy(entry)) return;
       try { await mutateBatchEntry(entry, async () => {
         const selected = state.scanHandle?.id === entry.handle.id;
         entry.handle = await invoke("retry_seed_scan", { handle: entry.handle, seed: retrySeed.value.trim() });
@@ -602,14 +611,12 @@ function createBatchCards(entries) {
 }
 $("return-to-batch").addEventListener("click", () => goTo("scan"));
 $("cancel-batch").addEventListener("click", async () => {
-  if (state.walletBusy || state.batchEntries.some((entry) => entry.busy)) return;
-  const results = await Promise.allSettled(state.batchEntries.filter((entry) => !entry.released &&
-    !["complete", "cancelled", "error"].includes(entry.progress?.phase)).map((entry) => mutateBatchEntry(entry, async () => {
+  const results = await Promise.allSettled(state.batchEntries.filter(canCancelEntry).map((entry) => mutateBatchEntry(entry, async () => {
       await invoke("cancel_scan", { handle: entry.handle });
       entry.progress = await invoke("get_scan_progress", { handle: entry.handle });
       if (entry.handle.id === state.scanHandle?.id) updateScanUI(entry.progress);
   })));
-  setStatus("batch-status", results.some((result) => result.status === "rejected") ? "Some scans could not be cancelled; check their status." : "Unfinished scans cancelled. Completed scans remain available to sweep.", "");
+  setStatus("batch-status", results.some((result) => result.status === "rejected") ? "Some scans could not be cancelled; check their status." : "Available unfinished scans cancelled. Completed scans remain available to sweep.", "");
 });
 
 // Clear-clipboard affordance. Overwrites the OS clipboard with empty text so
@@ -2176,6 +2183,7 @@ $("irreversible-check").addEventListener("change", () => {
 $("execute-sweep").addEventListener("click", async () => {
   if (state.walletBusy || selectedBatchEntry()?.receipt) return;
   state.walletBusy = true;
+  renderBatch();
   $("execute-sweep").disabled = true;
   $("irreversible-check").disabled = true;
   setStatus("sweep-execute-status", "Broadcasting transactions to the Zcash network… this may take up to 2 minutes.", "");

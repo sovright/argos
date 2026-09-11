@@ -167,6 +167,7 @@ struct ScanSession {
     task: Mutex<Option<JoinHandle<()>>>,
     workspace_root: std::path::PathBuf,
     key_identity: [u8; 32],
+    ownership: Arc<std::fs::File>,
     operation: Arc<Mutex<()>>,
 }
 
@@ -268,7 +269,8 @@ impl RecoveryService {
         let runtime = prepare_scan(config, key_source)?;
         let _admission = self.admission.lock().await;
         self.check_admission(std::slice::from_ref(&runtime)).await?;
-        self.start_prepared(runtime).await
+        let ownership = RecoveryWorkspace::from_runtime(&runtime)?.acquire_ownership()?;
+        self.start_prepared(runtime, ownership).await
     }
 
     /// Validate the entire batch before registering any session. Return handles
@@ -313,12 +315,18 @@ impl RecoveryService {
         }
         let _admission = self.admission.lock().await;
         self.check_admission(&runtimes).await?;
+        // Reserve every workspace before registering any batch entry. A conflict
+        // drops all reservations without starting work or changing concurrency.
+        let ownerships = runtimes
+            .iter()
+            .map(|runtime| RecoveryWorkspace::from_runtime(runtime)?.acquire_ownership())
+            .collect::<ZeckResult<Vec<_>>>()?;
         if let Some(limit) = concurrency {
             self.set_scan_concurrency_locked(limit).await?;
         }
         let mut handles = Vec::with_capacity(runtimes.len());
-        for runtime in runtimes {
-            handles.push(self.start_prepared(runtime).await?);
+        for (runtime, ownership) in runtimes.into_iter().zip(ownerships) {
+            handles.push(self.start_prepared(runtime, ownership).await?);
         }
         Ok(handles)
     }
@@ -347,7 +355,11 @@ impl RecoveryService {
         Ok(())
     }
 
-    async fn start_prepared(&self, runtime: RuntimeScanConfig) -> ZeckResult<ScanHandle> {
+    async fn start_prepared(
+        &self,
+        runtime: RuntimeScanConfig,
+        ownership: Arc<std::fs::File>,
+    ) -> ZeckResult<ScanHandle> {
         let workspace_root = RecoveryWorkspace::from_runtime(&runtime)?.root().to_owned();
         let key_identity = session_key_identity(runtime.key_source.as_ref())?;
         let handle = ScanHandle::new();
@@ -360,6 +372,7 @@ impl RecoveryService {
             task: Mutex::new(None),
             workspace_root,
             key_identity,
+            ownership: ownership.clone(),
             operation: Arc::new(Mutex::new(())),
         });
 
@@ -372,6 +385,8 @@ impl RecoveryService {
         #[cfg(test)]
         let probe = self.scan_probe.clone();
         let task = tokio::spawn(async move {
+            // A detached task must retain ownership even if the service is dropped.
+            let _ownership = ownership;
             // The owned permit survives every await and releases on failure,
             // panic or cancellation. Queued work has no network/DB activity.
             let _slot = slots
@@ -430,30 +445,32 @@ impl RecoveryService {
     }
 
     pub async fn cancel_scan(&self, handle: &ScanHandle) -> ZeckResult<()> {
-        let _admission = self.admission.lock().await;
+        let admission = self.admission.lock().await;
         let session = self.session(handle).await?;
-
-        {
-            let state = session.state.lock().await;
-            // Never cancel an already-complete scan: the phase would flip to
-            // Cancelled and any still-alive pump loop would emit scan-complete
-            // with Cancelled, corrupting the UI for the user's sweep workflow.
-            if state.progress.phase == ScanPhase::Complete {
-                return Ok(());
+        let operation = session.operation.clone().try_lock_owned().map_err(|_| {
+            ZeckError::ScanNotReady("another operation is using this wallet".to_owned())
+        })?;
+        drop(admission);
+        // Keep the operation guard until the scan actually stops, even if the
+        // IPC caller disconnects or drops its cancellation future.
+        tokio::spawn(async move {
+            let _operation = operation;
+            {
+                let mut state = session.state.lock().await;
+                if state.progress.phase == ScanPhase::Complete {
+                    return;
+                }
+                state.cancelled.store(true, Ordering::SeqCst);
+                state.progress.phase = ScanPhase::Cancelled;
+                state.progress.message = Some("Recovery scan cancelled.".to_owned());
             }
-            state
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        {
-            let mut state = session.state.lock().await;
-            state.progress.phase = ScanPhase::Cancelled;
-            state.progress.message = Some("Recovery scan cancelled.".to_owned());
-        }
-        if let Some(task) = session.task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
-        }
+            if let Some(task) = session.task.lock().await.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        })
+        .await
+        .map_err(|err| ZeckError::Storage(format!("cancelling scan: {err}")))?;
         Ok(())
     }
 
@@ -604,50 +621,45 @@ impl RecoveryService {
     /// the filesystem and SSD controller may retain blocks until the cells
     /// are overwritten or TRIM'd. UI callers should surface this honestly.
     pub async fn delete_workspace(&self, handle: &ScanHandle) -> ZeckResult<std::path::PathBuf> {
-        let _admission = self.admission.lock().await;
+        let admission = self.admission.lock().await;
         let session = self.session(handle).await?;
-        let _operation = session.operation.clone().try_lock_owned().map_err(|_| {
+        let operation = session.operation.clone().try_lock_owned().map_err(|_| {
             ZeckError::ScanNotReady("another operation is using this wallet".to_owned())
         })?;
-
-        // Refuse mid-scan to avoid tearing the SQLite write-ahead state out
-        // from under the running task. Callers can cancel first if they really
-        // mean it.
-        {
-            let state = session.state.lock().await;
-            let phase = state.progress.phase;
-            if !matches!(
-                phase,
-                ScanPhase::Complete | ScanPhase::Cancelled | ScanPhase::Error
-            ) {
-                return Err(ZeckError::ScanNotReady(format!(
-                    "cannot delete workspace while scan is {phase:?}; cancel first",
-                )));
+        if !session.state.lock().await.progress.phase.is_terminal() {
+            return Err(ZeckError::ScanNotReady(
+                "cannot delete workspace during a scan; cancel first".to_owned(),
+            ));
+        }
+        drop(admission);
+        let sessions = self.sessions.clone();
+        let id = handle.id.clone();
+        // Keep the registry reservation AND process lock until deletion ends.
+        // Detaching this coordinator on caller cancellation is intentional.
+        tokio::spawn(async move {
+            let _operation = operation;
+            if let Some(task) = session.task.lock().await.take() {
+                task.abort();
+                let _ = task.await;
             }
-        }
-
-        // Drop any lingering task handle so the SQLite files aren't held open.
-        if let Some(task) = session.task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
-        }
-
-        let workspace_root = session.workspace_root.clone();
-
-        // Remove the session from the registry before touching disk so a
-        // concurrent caller cannot operate on the now-doomed workspace.
-        self.sessions.write().await.remove(&handle.id);
-
-        if workspace_root.exists() {
-            std::fs::remove_dir_all(&workspace_root).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "deleting workspace {}: {err}",
-                    workspace_root.display()
-                ))
-            })?;
-        }
-
-        Ok(workspace_root)
+            let root = session.workspace_root.clone();
+            let path = root.clone();
+            let ownership = session.ownership.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ownership = ownership;
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(ZeckError::Storage(format!("deleting workspace: {err}"))),
+                }
+            })
+            .await
+            .map_err(|err| ZeckError::Storage(format!("deleting workspace: {err}")))??;
+            sessions.write().await.remove(&id);
+            Ok(root)
+        })
+        .await
+        .map_err(|err| ZeckError::Storage(format!("deleting workspace: {err}")))?
     }
 
     /// Retry a failed/cancelled seed without letting a different seed inherit
@@ -681,7 +693,8 @@ impl RecoveryService {
             let _ = task.await;
         }
         self.sessions.write().await.remove(&handle.id);
-        self.start_prepared(runtime).await
+        self.start_prepared(runtime, session.ownership.clone())
+            .await
     }
 
     /// Forget a terminal session and its keys without deleting recovery data.
@@ -3150,6 +3163,178 @@ mod batch_tests {
         }
     }
 
+    // Run this helper in a real OS subprocess, never with a real seed.
+    #[test]
+    #[ignore = "subprocess helper invoked by ownership regression test"]
+    fn ownership_process_helper() {
+        let root = std::path::PathBuf::from(std::env::var_os("ARGOS_LOCK_TEST_ROOT").unwrap());
+        let mode = std::env::var("ARGOS_LOCK_TEST_MODE").unwrap();
+        let (config, phrase) = entry(0, &root);
+        let runtime = prepare_scan(config, Arc::new(SeedKeySource::new(phrase))).unwrap();
+        let workspace = RecoveryWorkspace::from_runtime(&runtime).unwrap();
+        let ownership = workspace.acquire_ownership();
+        if mode == "blocked" {
+            assert!(matches!(ownership, Err(ZeckError::ScanNotReady(_))));
+        } else {
+            let _ownership = ownership.unwrap();
+            if mode == "hold" {
+                std::fs::write(root.join("child-ready"), b"ready").unwrap();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).unwrap();
+            }
+        }
+    }
+
+    fn ownership_child(root: &std::path::Path, mode: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::batch_tests::ownership_process_helper",
+                "--ignored",
+            ])
+            .env("ARGOS_LOCK_TEST_ROOT", root)
+            .env("ARGOS_LOCK_TEST_MODE", mode)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ownership_excludes_other_processes_and_recovers_after_exit_and_kill() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        let (config, phrase) = entry(0, root.path());
+        let handle = service.start_scan(config, phrase).await.unwrap();
+        wait_entered(&probe, 1).await;
+        assert!(ownership_child(root.path(), "blocked")
+            .wait()
+            .unwrap()
+            .success());
+        service.cancel_scan(&handle).await.unwrap();
+        // Terminal sessions still own their workspace for later sweeps.
+        assert!(ownership_child(root.path(), "blocked")
+            .wait()
+            .unwrap()
+            .success());
+        service.release_session(&handle).await.unwrap();
+        assert!(ownership_child(root.path(), "free")
+            .wait()
+            .unwrap()
+            .success());
+        for kill in [false, true] {
+            let mut child = ownership_child(root.path(), "hold");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.path().join("child-ready").exists() {
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("lock holder did not start");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let (config, phrase) = entry(0, root.path());
+            assert!(service.start_scan(config, phrase).await.is_err());
+            // Failed batch acquisition must roll back earlier reservations and config.
+            assert!(service
+                .start_seed_batch_with_concurrency(
+                    vec![entry(1, root.path()), entry(0, root.path())],
+                    Some(2)
+                )
+                .await
+                .is_err());
+            assert!(service.sessions.read().await.is_empty());
+            assert_eq!(service.scan_concurrency(), DEFAULT_SCAN_CONCURRENCY);
+            let (config, phrase) = entry(1, root.path());
+            let other = service.start_scan(config, phrase).await.unwrap();
+            dispose(&service, &[other]).await;
+            if kill {
+                child.kill().unwrap();
+            } else {
+                drop(child.stdin.take());
+            }
+            child.wait().unwrap();
+            std::fs::remove_file(root.path().join("child-ready")).unwrap();
+            let (config, phrase) = entry(0, root.path());
+            let resumed = service.start_scan(config, phrase).await.unwrap();
+            service.cancel_scan(&resumed).await.unwrap();
+            service.delete_workspace(&resumed).await.unwrap();
+            assert!(ownership_child(root.path(), "free")
+                .wait()
+                .unwrap()
+                .success());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_cancel_and_delete_reserve_only_their_wallet_even_if_caller_aborts() {
+        for delete in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (service, probe) = service();
+            let (config, phrase) = entry(0, root.path());
+            let handle = service.start_scan(config, phrase).await.unwrap();
+            wait_entered(&probe, 1).await;
+            service.cancel_scan(&handle).await.unwrap();
+            let session = service.session(&handle).await.unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            // Simulate a scan in synchronous work that cannot observe abort yet.
+            *session.task.lock().await = Some(tokio::spawn(async move {
+                started_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+            started_rx.await.unwrap();
+            let worker = service.clone();
+            let id = handle.clone();
+            let caller = tokio::spawn(async move {
+                if delete {
+                    worker.delete_workspace(&id).await.map(|_| ())
+                } else {
+                    worker.cancel_scan(&id).await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while session.operation.try_lock().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            caller.abort();
+            let _ = caller.await;
+            let (config, phrase) = entry(1, root.path());
+            let other =
+                tokio::time::timeout(Duration::from_secs(2), service.start_scan(config, phrase))
+                    .await
+                    .expect("unrelated admission must not wait for cancellation/deletion")
+                    .unwrap();
+            let (config, phrase) = entry(0, root.path());
+            assert!(service.start_scan(config, phrase).await.is_err());
+            assert!(service.release_session(&handle).await.is_err());
+            assert!(ownership_child(root.path(), "blocked")
+                .wait()
+                .unwrap()
+                .success());
+            finish_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while session.operation.try_lock().is_err() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(session);
+            if !delete {
+                service.release_session(&handle).await.unwrap();
+            }
+            assert!(ownership_child(root.path(), "free")
+                .wait()
+                .unwrap()
+                .success());
+            dispose(&service, &[other]).await;
+        }
+    }
+
     #[tokio::test]
     async fn custom_limit_admits_only_selected_number_and_is_shared_by_clones() {
         let root = tempfile::tempdir().unwrap();
@@ -3385,6 +3570,7 @@ mod batch_tests {
         let err = service.execute_sweep(&handle, request).await.unwrap_err();
         assert!(err.to_string().contains("another operation"));
         drop(busy);
+        drop(session);
         service.release_session(&handle).await.unwrap();
         let (config, phrase) = entry(0, root.path());
         let resumed = service.start_scan(config, phrase).await.unwrap();

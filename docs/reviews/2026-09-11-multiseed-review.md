@@ -58,8 +58,8 @@ Changes prompted by inspection:
 
 ## Validation evidence
 
-- `cargo test --workspace`: **571 passed, 0 failed, 17 ignored**.
-- `cargo test -p argos-core batch_tests --lib`: **9 passed**. Includes an
+- `cargo test --workspace`: **574 passed, 0 failed, 18 ignored**.
+- `cargo test -p argos-core batch_tests --lib`: **11 passed, 1 subprocess helper ignored by direct discovery**. Includes an
   injected scanner to exercise lifecycle behavior without network timing.
 - `cargo check --workspace --all-targets`: passed during implementation.
 - `cargo check --workspace --all-targets --features argos-network`: passed
@@ -76,10 +76,10 @@ Changes prompted by inspection:
 
 ## Outstanding release gates
 
-1. **Cross-process ownership (high-priority security qualification).** The
-   admission and operation guards apply to one service and its clones. Separate
-   app/CLI processes do not share them; no filesystem advisory lock has been
-   added. Review and implement or explicitly constrain this before release.
+1. **Platform ownership qualification.** Cross-process ownership is now
+   implemented and exercised by local subprocess tests (see follow-up below).
+   Confirm the same behavior in packaged Windows/macOS/Linux builds and on
+   supported filesystems. Older binaries do not cooperate with the new lock.
 2. **Funded-chain correctness.** Compare eight distinct funded seeds against
    standalone baselines, with different birthdays, gap expansion, pool
    coverage, interrupted resume, and partial sweeps. The local Docker daemon
@@ -119,7 +119,7 @@ argos --seeds-file seeds.txt sweep --destination <your-unified-address> --dry-ru
 The parser accepts at most 64 entries; concurrency defaults to eight and is
 configurable with `--max-concurrent-scans` (1–64). Do not place
 actual phrases in shell arguments. Broadcasting retains the existing explicit
-`--confirm-sweep` gate.
+`--confirm-sweep` gate plus interactive `SWEEP N` confirmation for each seed.
 
 ## GUI follow-up (2026-09-11)
 
@@ -155,3 +155,41 @@ admission of the queued seed after cancelling a running scan. These are scheduli
 not performance qualification at high concurrency.
 
 Example: `argos --seeds-file seeds.txt --max-concurrent-scans 4 scan`.
+
+## PR review fixes
+
+- Added OS advisory workspace ownership via `std::fs::File::try_lock`; Rust
+  minimum and CI/release toolchains move to 1.89, with no new dependency.
+  The empty lock file lives outside the deleted workspace and is never unlinked.
+  Sessions and scan tasks retain it; retry transfers it; batch acquisition is
+  all-or-nothing before configuration or registration.
+- Cancellation and deletion drop global admission after taking the per-wallet
+  operation guard. Deletion retains its registry reservation until disk work
+  completes and runs disk removal on the blocking pool. Dedicated coordinators
+  retain guards even if an IPC caller disconnects mid-operation.
+- GUI cancel/retry/release gates are scoped to the busy wallet. Selection stays
+  fixed during sweep execution to preserve proposal/receipt attribution.
+- R-W24 remains the in-process duplicate/resume test. The old implementation
+  explicitly excluded subprocesses, despite the ambiguous test-plan wording;
+  new R-W25 independently covers real OS-process ownership and crash recovery.
+
+Subprocess regressions cover active and terminal exclusion, batch rollback,
+normal exit, forced termination, deletion and subsequent reacquisition. Slow
+scan tests check unrelated admission and same-wallet reservation while a cancel
+or delete caller is aborted. These tests use synthetic seeds and no node.
+
+Follow-up validation: `cargo test --workspace` passed (574 tests; 18 ignored,
+one of which is the subprocess helper executed by its parent test). All-target
+clippy and native GUI build passed. The browser fixture verified cancelling,
+retrying, cancel-all and releasing Seed 2 while Seed 1's sweep response remained
+pending; the final synthetic receipt stayed attributed to Seed 1.
+
+A subsequent review raised batch authorization and abuse ergonomics. The threat
+model now states the intended owner/authorized-operator boundary, records the
+repository operator as the requirement source without inventing a verified
+customer use case, and explains the limits of local consent gates. CLI batch
+broadcast requires an interactive terminal and a separate `SWEEP N` response
+for each seed; decline/EOF skips it. Non-interactive scans/previews remain
+available. Parser/confirmation tests cover terminal refusal, seed mismatch,
+default denial, EOF and correct per-seed consent. Release-owner use-case
+validation remains documented; no seed-ownership verification is claimed.

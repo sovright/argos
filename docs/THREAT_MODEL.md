@@ -265,7 +265,7 @@ The high-level posture is: **we adopted the practices the rest of the Zcash Rust
 | T-SC1 | Malicious `build.rs` script or procedural macro in a transitive crate runs arbitrary code at compile time (dev machine and CI). | H | ⚠️ | `cargo-vet` gates every transitive crate: each must be covered by an imported upstream audit (from the librustzcash + Mozilla + Google + Embark + Bytecode Alliance + Fermyon + ISRG sets), a trusted-publisher entry, or an explicit `[[exemptions.*]]` entry in `supply-chain/config.toml`, or CI fails (PR #70). Most of the tree is exemptions ("trust but not yet audited") or publisher-trust, **not** first-party code audits — the imported audits cover only the subset of the tree we share with librustzcash. Any new resolution that adds an uncovered crate fails CI. Geiger-style `build.rs` enumeration is not yet adopted; that residue remains. The un-reviewed surface is concentrated in the Tauri stack (§6.6.4 / §7 category 2). |
 | T-SC2 | Maintainer-account takeover on a critical crate (librustzcash family, `rustls`, `tauri`, `secrecy`, `secp256k1`, `bip0039`) ships a malicious version that we knowingly bump to. | H | ⚠️ | `cargo-deny` (T-B1) cannot detect a zero-day at bump time, but `cargo-vet` (T-SC1) requires every new resolution be either covered by an imported audit set or explicitly exempted, which surfaces an unexpected crate-version change as a CI failure with a named-auditor accountability trail. Project policy in `CLAUDE.md` requires conservative dependency review; the README/threat model document who maintains the high-value crates (§7). Formalising the diff-review checklist for `cargo update` is still open (§8). |
 | T-SC3 | A third-party GitHub Action used in CI gets a tag force-moved (or a branch hijacked) to point at malicious code, which then runs with `GITHUB_TOKEN` or signing-environment access. | H | ✅ | Every third-party Action is now SHA-pinned with a `# vX.Y.Z` trailing comment (see PR #70), and the repository-level **Actions → Require SHA pinning for third-party Actions** setting is enabled (T-SC10), so a workflow that regresses to a tag pin is refused at job-start time. Signing/publish steps remain gated on protected environments (T-B2). |
-| T-SC4 | Compromise of the upstream Rust toolchain (rustc / cargo) injects code into produced binaries. | M | ⚠️ | Toolchain version is pinned in CI (Rust 1.88). We rely on rust-lang's release signing and distribution; we do not independently verify toolchain hashes. Out of practical reach for this project; tracked rather than mitigated. |
+| T-SC4 | Compromise of the upstream Rust toolchain (rustc / cargo) injects code into produced binaries. | M | ⚠️ | Toolchain version is pinned in CI (Rust 1.89). We rely on rust-lang's release signing and distribution; we do not independently verify toolchain hashes. Out of practical reach for this project; tracked rather than mitigated. |
 | T-SC5 | A transitive crate is yanked from crates.io with no upstream replacement, so a freshly-resolved build cannot reproduce. | L | ✅ | `deny.toml` sets `yanked = "deny"`, so CI fails on any yanked crate in the lockfile. Made tractable by PR #69, which bumped the librustzcash family to the 2026-04 release wave that replaced the formerly-yanked `core2 0.3.3` with `corez 0.1.1` throughout the tree. Future yanks are now hard CI failures requiring an upstream-or-replace fix. |
 | T-SC6 | The published release binary cannot be independently verified to correspond to the source tree at the tagged commit — i.e. no reproducible builds and no SLSA provenance attestation. | M | ❌ | SHA256 checksums (T-B4) and platform code-signing (T-B2) prove the binary was produced by our release pipeline, but not that the pipeline built the source faithfully. A verifier with the source cannot today rebuild bit-for-bit. Tracked. |
 | T-SC7 | A new direct dependency we add is a typosquat or dependency-confusion package masquerading as a legitimate crate. | M | ✅ | Project policy in `CLAUDE.md` requires explicit approval and an `~/.claude/approved-dependencies.md` entry before any new direct dependency is added, with package name, version, adoption signals, maintenance status, and license recorded. This relies on review discipline, not tooling, and is therefore a process control rather than a hard gate. |
@@ -465,8 +465,19 @@ Sprout scanning remains a separate path outside this limit.
 Admission is serialized and rejects a wallet already represented in the
 service, even across different birthdays or typed/imported mnemonic sources.
 Sweep execution, proposal construction, release, and deletion use per-wallet
-operation guards. These are in-process controls; separate app/CLI processes
-are not coordinated by a cross-process lock.
+operation guards. Each service session also holds an OS advisory file lock
+outside the deletable workspace directory. Queued and terminal sessions keep
+ownership until release; retry transfers the lock without an unlocked gap.
+Scan tasks and deletion workers retain ownership if their caller disconnects.
+Batch lock acquisition completes before any session starts, rolling back on
+conflict. Real subprocess tests cover exclusion and recovery after normal exit
+and forced termination. Lock files are empty, private on Unix, and never unlinked.
+
+These locks coordinate cooperating versions of Argos using the same workspace
+on filesystems that implement OS locking. Older builds, direct library callers
+that bypass RecoveryService, and external database tools do not honor them.
+They do not prevent concurrent use of the same seed in different workspaces or
+copies of the data directory. SQLite locking alone is not session ownership.
 
 Batch secrets use the existing secret wrappers; the CLI accepts protected
 files, not raw phrase arguments. The GUI clears submitted phrases, uses
@@ -485,3 +496,25 @@ tests do not establish eight-wallet chain correctness or acceptable performance.
 The [first-party implementation review](reviews/2026-09-11-multiseed-review.md)
 records the scope and outstanding qualification. Existing audit statements
 must not be interpreted as independent audit coverage of this new change.
+
+### Authorized use and batch abuse analysis
+
+Batch recovery is intended for wallets owned by the operator or recovered with
+the wallet owner's explicit authorization. Possession of a seed alone is not
+proof of that authorization. The product direction in this work came directly
+from the repository operator: multiple seeds, GUI support, configurable scan
+concurrency, and an unchanged 64-seed batch limit. This records the requirement's
+source, not independent verification of any seed's ownership or a specific
+customer recovery case. The release owner should document representative
+first-party/authorized recovery workflows before release qualification.
+
+An attacker who already has stolen seeds can use ordinary wallet software or
+modify Argos to spend them. Local UI gates cannot establish legal ownership or
+prevent that attacker. Nevertheless, batch scanning should not silently imply
+consent to move every wallet's funds. GUI sweeps require individual seed review.
+CLI batch broadcast now requires a terminal and an explicit `SWEEP N` response
+for each seed, showing its ordinal and destination; `--confirm-sweep` alone
+cannot broadcast the whole batch. Decline or EOF skips that seed. Non-interactive
+scan and dry-run previews remain available. These are deliberate-consent and
+mistake-prevention measures, not a claim to technically prevent stolen-key use.
+The scan concurrency and 64-seed batch limit are unchanged.

@@ -254,5 +254,23 @@ are involved. Its seed validator only counts words; cryptographic validation
 is exercised by the Rust tests. The fixture never ships in production HTML.
 
 The [multi-seed review](docs/reviews/2026-09-11-multiseed-review.md) lists
-remaining funded-chain, cross-process, performance, packaged-app, and user
+remaining funded-chain, performance, packaged-app, and user
 review gates.
+
+Multi-seed ownership regressions launch real subprocesses with deterministic
+synthetic seeds. They check conflicting starts, all-or-nothing batch admission,
+terminal retention, release/deletion, and recovery after normal process exit or
+forced termination. The ignored `ownership_process_helper` is invoked by its
+parent test, not a skipped qualification gate. Slow cancellation/deletion tests
+also verify unrelated admission and reservation retention after caller abort.
+
+To test GUI independence, start two fixture seeds, complete the first, review
+and start its sweep. Leave the synthetic response pending; use **All scans**
+and cancel, retry, or release the second seed. Selection of the sweeping seed
+must remain fixed. **Finish pending fixture sweep** resolves the synthetic
+receipt; no transaction is broadcast.
+
+CLI batch broadcasts additionally require a terminal and `SWEEP N` confirmation
+per seed after the previews. The CLI tests verify that non-interactive broadcast
+is refused, dry runs remain usable, and only the matching ordinal authorizes a
+seed (blank, EOF, yes, or another ordinal do not).

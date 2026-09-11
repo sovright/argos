@@ -1,6 +1,7 @@
 // Browser-only fixture: never included by production index.html.
 const scans = new Map();
 let concurrency = 8;
+let pendingSweep = null;
 function admit() {
   let active = [...scans.values()].filter(s => s.phase === "scanning_shielded").length;
   for (const scan of scans.values()) if (scan.phase === "queued" && active++ < concurrency) scan.phase = "scanning_shielded";
@@ -37,7 +38,7 @@ window.__TAURI__ = {
         admit(); return handle;
       }
       case "propose_sweep": return { transactions: [], skipped_accounts: [], total_send_zatoshis: 0, total_fee_zatoshis: 0, net_received_zatoshis: 0, total_donation_zatoshis: 0 };
-      case "execute_sweep": return { transactions: [{ source_account: 0, status: "pending", txid: `synthetic-receipt-${args.handle.id}`, detail: "UI fixture only" }], skipped_accounts: [], total_donation_zatoshis: 0, error: null };
+      case "execute_sweep": await new Promise(resolve => { pendingSweep = resolve; }); return { transactions: [{ source_account: 0, status: "pending", txid: `synthetic-receipt-${args.handle.id}`, detail: "UI fixture only" }], skipped_accounts: [], total_donation_zatoshis: 0, error: null };
       default: return null;
     }
   } }
@@ -48,6 +49,9 @@ document.addEventListener("DOMContentLoaded", () => {
   const complete = document.createElement("button");
   complete.textContent = "Complete first fixture scan";
   complete.onclick = () => { const s = scans.get("synthetic-1"); if (s) { s.phase = "complete"; s.summary = { total_zatoshis: 100000000, workspace_dir: "/tmp/synthetic-1", authoritative_balances: true }; admit(); } };
-  banner.append(complete);
+  const finishSweep = document.createElement("button");
+  finishSweep.textContent = "Finish pending fixture sweep";
+  finishSweep.onclick = () => { pendingSweep?.(); pendingSweep = null; };
+  banner.append(complete, finishSweep);
   document.body.prepend(banner);
 });

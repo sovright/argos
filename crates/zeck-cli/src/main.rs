@@ -188,6 +188,7 @@ enum Commands {
         dry_run: bool,
 
         /// Confirm you understand this is irreversible and broadcast the sweep.
+        /// With --seeds-file, also requires interactive confirmation for each seed.
         #[arg(long)]
         confirm_sweep: bool,
     },
@@ -1649,10 +1650,40 @@ fn parse_seed_batch(contents: &str, default_birthday: u32) -> Result<Vec<(Secret
     Ok(entries)
 }
 
+fn validate_batch_confirmation(command: &Commands, interactive: bool) -> Result<()> {
+    if matches!(
+        command,
+        Commands::Sweep {
+            confirm_sweep: true,
+            dry_run: false,
+            ..
+        }
+    ) && !interactive
+    {
+        bail!("batch broadcasting requires an interactive terminal and confirmation for each seed; use --dry-run to preview without broadcasting");
+    }
+    Ok(())
+}
+
+fn confirm_batch_seed(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+    ordinal: usize,
+    destination: &str,
+) -> Result<bool> {
+    writeln!(output, "Seed {ordinal}: destination {destination}")?;
+    write!(output, "To confirm you are authorized to recover this wallet and broadcast its irreversible sweep, type SWEEP {ordinal} (anything else skips this seed): ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim() == format!("SWEEP {ordinal}"))
+}
+
 async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Result<()> {
     if !matches!(cli.command, Commands::Scan | Commands::Sweep { .. }) {
         bail!("--seeds-file supports only scan and sweep");
     }
+    validate_batch_confirmation(&cli.command, std::io::stdin().is_terminal())?;
     let metadata = fs::metadata(path).context("could not inspect seeds file")?;
     if !metadata.is_file() || metadata.len() > 1024 * 1024 {
         bail!("seeds file must be a regular file smaller than 1 MiB");
@@ -1785,6 +1816,18 @@ async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Res
             }
         ) {
             for (index, handle) in ready {
+                if !confirm_batch_seed(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stderr(),
+                    index + 1,
+                    &request.destination,
+                )? {
+                    println!(
+                        "Seed {} skipped; nothing broadcast for this seed.",
+                        index + 1
+                    );
+                    continue;
+                }
                 match service.execute_sweep(handle, request.clone()).await {
                     Ok(outcome) => {
                         // Structured output retains every txid even if a later
@@ -1825,7 +1868,7 @@ async fn run_seed_batch_cli(cli: &Cli, path: &Path, network: ZeckNetwork) -> Res
                 }
             }
         } else {
-            println!("Preview only. Use --confirm-sweep to broadcast.");
+            println!("Preview only. Use --confirm-sweep in a terminal and confirm each seed to broadcast.");
         }
     }
     for handle in &handles {
@@ -2749,6 +2792,54 @@ mod tests {
 #[cfg(test)]
 mod seed_batch_cli_tests {
     use super::*;
+    #[test]
+    fn batch_broadcast_requires_terminal_and_seed_specific_confirmation() {
+        let cli = Cli::try_parse_from([
+            "argos",
+            "--seeds-file",
+            "batch",
+            "sweep",
+            "--destination",
+            "u1fixture",
+            "--confirm-sweep",
+        ])
+        .unwrap();
+        assert!(validate_batch_confirmation(&cli.command, false).is_err());
+        assert!(validate_batch_confirmation(&cli.command, true).is_ok());
+        let preview = Cli::try_parse_from([
+            "argos",
+            "--seeds-file",
+            "batch",
+            "sweep",
+            "--destination",
+            "u1fixture",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(validate_batch_confirmation(&preview.command, false).is_ok());
+        for (answer, accepted) in [
+            ("SWEEP 2\n", true),
+            ("SWEEP 1\n", false),
+            ("yes\n", false),
+            ("\n", false),
+            ("", false),
+        ] {
+            let mut output = Vec::new();
+            assert_eq!(
+                confirm_batch_seed(
+                    &mut std::io::Cursor::new(answer),
+                    &mut output,
+                    2,
+                    "u1fixture"
+                )
+                .unwrap(),
+                accepted
+            );
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("Seed 2: destination u1fixture"));
+        }
+    }
+
     #[test]
     fn concurrency_accepts_custom_values_and_rejects_out_of_range() {
         for limit in ["1", "12", "64"] {
