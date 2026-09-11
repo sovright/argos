@@ -1656,7 +1656,7 @@ fn parse_seed_batch(contents: &str, default_birthday: u32) -> Result<Vec<(Secret
 /// than self-served. Scanning and previewing the whole `--seeds-file` batch stays
 /// available (no funds move); only the broadcast is limited, before any
 /// transaction is sent. This ceiling is a policy value, not a technical maximum.
-const MAX_BATCH_SWEEP_WALLETS: usize = 3;
+const MAX_BATCH_SWEEP_WALLETS: usize = 8;
 const BATCH_SWEEP_CONTACT: &str = "security@sovright.com";
 
 fn ensure_batch_sweep_within_limit(ready_seeds: usize) -> Result<()> {
@@ -2788,7 +2788,7 @@ mod seed_batch_cli_tests {
         }
         // Above the cap: refused before any broadcast, and the message names the
         // count, the limit, and how to get a larger recovery authorized.
-        for ready in [MAX_BATCH_SWEEP_WALLETS + 1, 8, 64] {
+        for ready in [MAX_BATCH_SWEEP_WALLETS + 1, MAX_BATCH_SWEEP_WALLETS * 2, 64] {
             let err = ensure_batch_sweep_within_limit(ready).unwrap_err().to_string();
             assert!(err.contains(&ready.to_string()));
             assert!(err.contains(&MAX_BATCH_SWEEP_WALLETS.to_string()));
