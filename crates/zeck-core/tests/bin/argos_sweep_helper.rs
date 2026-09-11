@@ -210,6 +210,7 @@ fn discovery_key(d: &ScanDiscovery) -> String {
 
 fn phase_name(p: ScanPhase) -> &'static str {
     match p {
+        ScanPhase::Queued => "queued",
         ScanPhase::Idle => "idle",
         ScanPhase::ValidatingSeed => "validating_seed",
         ScanPhase::DerivingKeys => "deriving_keys",

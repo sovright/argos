@@ -1893,37 +1893,13 @@ async fn crash_mid_broadcast_does_not_double_spend_on_resume() {
     );
 }
 
-// ─── R-W24: Two scans against the same workspace cancels the first ─────────
+// ─── R-W24: Duplicate workspace is refused until explicitly released ─────────
 #[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
 #[tokio::test]
-async fn two_instances_same_workspace_cancels_first() {
-    // Verifies the in-process conflict-cancellation logic in
-    // `RecoveryService::start_scan`: when a second `start_scan` is issued
-    // against a config that resolves to the same workspace as a previously
-    // active scan, the existing session is cancelled before the new one
-    // proceeds. This is the property that protects the GUI's typical
-    // "double-click Start Scan" race.
-    //
-    // ## What this test covers
-    //
-    //   1. The second `start_scan` returns a fresh handle without
-    //      blocking on or merging with the first.
-    //   2. After the second `start_scan` returns, the first handle's
-    //      session has been cancelled (phase = Cancelled).
-    //   3. The second scan proceeds to ScanPhase::Complete — workspace
-    //      reuse after cancellation does not produce SQLite lock errors
-    //      or half-merged state. Final balances on the second handle
-    //      reflect a complete scan, not a partial one.
-    //
-    // ## What this test deliberately does NOT cover
-    //
-    // Two argos-cli *subprocesses* against the same workspace would
-    // exercise SQLite WAL contention, not Argos's cancellation logic
-    // (each subprocess has its own RecoveryService, so the in-process
-    // cancellation path doesn't fire across processes). That belongs in a
-    // separate test with subprocess scaffolding, which lands with the
-    // R-S27/R-S29 SIGKILL work.
-
+async fn two_instances_same_workspace_requires_explicit_release() {
+    // Registration refuses a duplicate without cancelling the original.
+    // Explicit cancel + release makes a subsequent resume possible. This
+    // exercises the node-backed path; batch_tests also races concurrent starts.
     let harness = RegtestHarness::require();
     let temp_data_dir = tempfile::tempdir().expect("tempdir");
 
@@ -1934,12 +1910,6 @@ async fn two_instances_same_workspace_cancels_first() {
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
         data_dir: temp_data_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
-        // Labels go into session.json — the workspace path itself is
-        // derived from (seed, network, birthday, gap-strategy) only, so
-        // changing the label does NOT change the workspace identity. The
-        // conflict-cancellation logic will fire even with different
-        // labels, which is the correct behaviour (a relaunched session
-        // with a different label is still the same workspace).
         label: "argos-rw24-first".to_owned(),
     };
 
@@ -1953,51 +1923,27 @@ async fn two_instances_same_workspace_cancels_first() {
         .await
         .expect("first start_scan must succeed");
 
-    // Hand off briefly so the spawned scan task gets at least one tick.
-    // Cancellation works regardless of phase (it sets the flag + aborts
-    // the task handle even mid-Idle), but giving the first scan a chance
-    // to actually begin makes the "we really did cancel something in
-    // flight" property meaningful.
     tokio::task::yield_now().await;
-
+    let duplicate = service
+        .start_scan(
+            scan_config.clone(),
+            SecretString::new(harness.test_seed().to_owned()),
+        )
+        .await;
+    assert!(duplicate.is_err(), "duplicate must not replace its owner");
+    assert_ne!(
+        service.get_scan_progress(&handle1).await.unwrap().phase,
+        ScanPhase::Cancelled
+    );
+    service.cancel_scan(&handle1).await.unwrap();
+    service.release_session(&handle1).await.unwrap();
     let handle2 = service
         .start_scan(
-            ScanConfig {
-                label: "argos-rw24-second".to_owned(),
-                ..scan_config
-            },
+            scan_config,
             SecretString::new(harness.test_seed().to_owned()),
         )
         .await
-        .expect("second start_scan must succeed against the same workspace");
-
-    assert_ne!(
-        handle1.id, handle2.id,
-        "[regtest] start_scan must return a fresh handle, not merge with the first"
-    );
-
-    // The first handle's session must be Cancelled. cancel_scan sets the
-    // phase synchronously before returning, then aborts the task handle.
-    // Either outcome (still in the sessions map as Cancelled, or already
-    // cleaned up via SESSION_RETENTION_SECS) is acceptable — but a
-    // still-Running phase would be a real bug.
-    match service.get_scan_progress(&handle1).await {
-        Ok(progress) => {
-            assert_eq!(
-                progress.phase,
-                ScanPhase::Cancelled,
-                "[regtest] first session must be Cancelled after the second \
-                 start_scan; got phase = {:?}",
-                progress.phase,
-            );
-        }
-        Err(_) => {
-            // Session retention cleanup ran ahead of us; the first handle
-            // is no longer in the map. Acceptable — the property under
-            // test is "the first scan stopped," which is necessarily true
-            // if the handle is gone.
-        }
-    }
+        .unwrap();
 
     // Second scan must run to completion. 120s is generous headroom for a
     // ~200-block regtest scan.
@@ -2013,11 +1959,7 @@ async fn two_instances_same_workspace_cancels_first() {
                 panic!("[regtest] second scan errored: {:?}", progress.error)
             }
             ScanPhase::Cancelled => {
-                panic!(
-                    "[regtest] second scan was unexpectedly cancelled — \
-                     the conflict-cancellation logic should target the \
-                     PRIOR scan, not the new one"
-                )
+                panic!("[regtest] explicitly resumed scan was unexpectedly cancelled")
             }
             _ => {
                 if std::time::Instant::now() > deadline {

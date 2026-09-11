@@ -451,3 +451,35 @@ Please **do not** open a public GitHub issue for a security vulnerability. Email
 | 2026-08-01 | Claude | Corrected T-S6 (assessment-only, no model change): the previous entry described the wallet passphrase crossing the Tauri IPC boundary as a live exposure, but the GUI exposes no wallet-file entry point — import is CLI-only, where the passphrase is prompt-only and never crosses a process boundary. The IPC crossing is now recorded as a *future* instance of accepted audit Issue A rather than a current one, so the mitigation column describes what Argos actually does. Also names the prompt site (`crates/zeck-cli/src/main.rs`). |
 | 2026-08-02 | Claude | Transparent-only recovery from a zcashd `wallet.dat` (assessment update, no change to the model's assets or actors): added T-L6 to §6.4 for the risk that a single-pool recovery is read as a complete one. The mechanism is new — transparent recovery deliberately bypasses the `zcash_client_sqlite` account model, because ZIP-316 forbids a transparent-only unified viewing key and such a wallet therefore cannot have an account (zcash/librustzcash#2582) — but the exposure is one of misplaced confidence rather than disclosure: a user who reads a transparent-only total as the whole wallet may discard the file holding the only copy of their Sapling or Sprout keys. Mitigated by naming every uncovered pool before any balance is displayed. Signing keys never leave process memory and no new on-disk artifact is created; the sweep writes nothing to the workspace. |
 | 2026-08-03 | Claude | GUI wallet-file import (model change, not assessment-only): the GUI gained a wallet-file entry point, so the passphrase now crosses the Tauri IPC boundary as plaintext JSON. T-S6 previously stated the opposite and recorded the crossing as a future event; that prediction is now realised and the row describes what Argos actually does. The crossing is a deliberate new instance of accepted audit Issue A, not an inherited one. Two new commands carry the passphrase (`inspect_wallet_file`, `start_scan_from_wallet_file`); their input structs deliberately derive none of `Debug`, `Serialize`, or `Clone`, matching `ScanConfigInput`. Note what does *not* cross IPC: the wallet file's bytes. The frontend passes a path — obtained from Tauri's native drag-drop event or typed by the user — and the backend reads the file, so attacker-supplied binary input never transits the webview and the parser keeps its existing isolation. A native file picker was deliberately not added: it would require `tauri-plugin-dialog`, a new dependency. |
+
+
+## Multi-seed development change (2026-09-11)
+
+This branch adds up to eight concurrent HD/imported scan tasks within one
+`RecoveryService`, with at most 64 total retained sessions. It retains the
+existing per-wallet database, in-memory block cache, and upstream sync engine.
+Sprout scanning remains a separate path outside this limit.
+
+Admission is serialized and rejects a wallet already represented in the
+service, even across different birthdays or typed/imported mnemonic sources.
+Sweep execution, proposal construction, release, and deletion use per-wallet
+operation guards. These are in-process controls; separate app/CLI processes
+are not coordinated by a cross-process lock.
+
+Batch secrets use the existing secret wrappers; the CLI accepts protected
+files, not raw phrase arguments. The GUI clears submitted phrases, uses
+opaque scan IDs on events, and offers explicit release without disk deletion.
+All terminal sessions now retain their keys until release or application
+exit (including failed/cancelled sessions, which previously expired after five
+minutes). The session cap bounds count, not retention duration. Queued seeds
+remain in process memory; they are not persisted for restart. Existing
+JavaScript/IPC/swap residual risks apply to every retained seed.
+
+Concurrent transparent probes can expose relationships between wallets to a
+server observing the same client. This implementation makes no unlinkability
+claim. Independent downloads multiply resource demand; eight-task admission
+tests do not establish eight-wallet chain correctness or acceptable performance.
+
+The [first-party implementation review](reviews/2026-09-11-multiseed-review.md)
+records the scope and outstanding qualification. Existing audit statements
+must not be interpreted as independent audit coverage of this new change.

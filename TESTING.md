@@ -234,3 +234,23 @@ cargo test -p argos-core -- --ignored default_endpoints_are_reachable
 ---
 
 *Last updated: 2026-08-26*
+
+
+## Multi-seed development checks
+
+`cargo test -p argos-core batch_tests --lib` exercises eight active tasks and
+a queued ninth, cancellation/admission, invalid/duplicate batches, typed versus
+imported mnemonic ownership, retry identity, and conflicting wallet operations.
+The injected scanner blocks locally; these tests do not decrypt funded notes.
+`cargo test -p argos-cli seed_batch_cli_tests` checks file parsing and conflicting
+inputs. Run the full workspace suite and all-target clippy as well.
+
+For a browser-only usability fixture, run
+`python3 tests/gui/serve_multiseed_fixture.py` and visit `http://127.0.0.1:8765`.
+It serves the real GUI with synthetic Tauri responses. No real scans or funds
+are involved. Its seed validator only counts words; cryptographic validation
+is exercised by the Rust tests. The fixture never ships in production HTML.
+
+The [multi-seed review](docs/reviews/2026-09-11-multiseed-review.md) lists
+remaining funded-chain, cross-process, performance, packaged-app, and user
+review gates.

@@ -2,7 +2,7 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Instant};
 
 use secrecy::SecretString;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
     task::JoinHandle,
     time::Duration,
 };
@@ -62,7 +62,6 @@ use crate::{
 };
 
 const RECOVERY_MEMO_DEFAULT: &str = "Argos recovery";
-const SESSION_RETENTION_SECS: u64 = 300;
 /// After a shielding tx is broadcast, how long to wait for it to mine so its
 /// shielded note becomes spendable by the following send-max. zcash_client_backend
 /// forbids spending transparent funds straight to an external address, so a
@@ -159,13 +158,36 @@ struct ScanSession {
     started_at: Instant,
     task: Mutex<Option<JoinHandle<()>>>,
     workspace_root: std::path::PathBuf,
+    key_identity: [u8; 32],
+    operation: Arc<Mutex<()>>,
 }
 
 type SharedScanSession = Arc<ScanSession>;
 
-#[derive(Clone, Default)]
+/// Maximum number of concurrent HD/imported recovery scans per service.
+pub const MAX_ACTIVE_SCANS: usize = 8;
+/// Bound retained queued secrets as well as active work.
+pub const MAX_PENDING_SCANS: usize = 64;
+
+#[derive(Clone)]
 pub struct RecoveryService {
     sessions: Arc<RwLock<HashMap<String, SharedScanSession>>>,
+    admission: Arc<Mutex<()>>,
+    scan_slots: Arc<Semaphore>,
+    #[cfg(test)]
+    scan_probe: Option<Arc<batch_tests::ScanProbe>>,
+}
+
+impl Default for RecoveryService {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::default(),
+            admission: Arc::default(),
+            scan_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SCANS)),
+            #[cfg(test)]
+            scan_probe: None,
+        }
+    }
 }
 
 impl RecoveryService {
@@ -189,43 +211,89 @@ impl RecoveryService {
         config: ScanConfig,
         key_source: Arc<dyn KeySource>,
     ) -> ZeckResult<ScanHandle> {
-        validate_scan_config(&config)?;
+        let runtime = prepare_scan(config, key_source)?;
+        let _admission = self.admission.lock().await;
+        self.check_admission(std::slice::from_ref(&runtime)).await?;
+        self.start_prepared(runtime).await
+    }
 
-        let handle = ScanHandle::new();
-        let state = Arc::new(tokio::sync::Mutex::new(ScanTaskState::new(handle.clone())));
-        let runtime = RuntimeScanConfig {
-            key_source,
-            birthday: config.birthday,
-            num_accounts: config.num_accounts,
-            gap_limit: config.gap_limit,
-            lightwalletd_url: config.lightwalletd_url,
-            data_dir: config.data_dir,
-            network: config.network,
-            label: config.label,
-        };
-
-        let workspace_root = RecoveryWorkspace::from_runtime(&runtime)?.root().to_owned();
-
-        // Cancel any existing session targeting the same workspace to prevent
-        // concurrent SQLite writers from locking each other out.
-        let conflicting: Vec<ScanHandle> = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .iter()
-                .filter(|(_, session)| session.workspace_root == workspace_root)
-                .map(|(id, _)| ScanHandle { id: id.clone() })
-                .collect()
-        };
-        for conflicting_handle in conflicting {
-            let _ = self.cancel_scan(&conflicting_handle).await;
+    /// Validate the entire batch before registering any session. Return handles
+    /// in input order; scheduling must never change the user's seed identity.
+    pub async fn start_seed_batch(
+        &self,
+        entries: Vec<(ScanConfig, SecretString)>,
+    ) -> ZeckResult<Vec<ScanHandle>> {
+        if entries.is_empty() || entries.len() > MAX_PENDING_SCANS {
+            return Err(ZeckError::InvalidConfig(format!(
+                "provide between 1 and {MAX_PENDING_SCANS} seeds"
+            )));
         }
+        let mut runtimes = Vec::with_capacity(entries.len());
+        let mut identities = std::collections::HashSet::new();
+        for (index, (config, phrase)) in entries.into_iter().enumerate() {
+            let runtime =
+                prepare_scan(config, Arc::new(SeedKeySource::new(phrase))).map_err(|_| {
+                    ZeckError::InvalidConfig(format!(
+                        "seed {}: invalid seed or scan settings",
+                        index + 1
+                    ))
+                })?;
+            let identity = session_key_identity(runtime.key_source.as_ref())?;
+            if !identities.insert(identity) {
+                return Err(ZeckError::InvalidConfig(format!(
+                    "seed {} duplicates an earlier seed",
+                    index + 1
+                )));
+            }
+            runtimes.push(runtime);
+        }
+        let _admission = self.admission.lock().await;
+        self.check_admission(&runtimes).await?;
+        let mut handles = Vec::with_capacity(runtimes.len());
+        for runtime in runtimes {
+            handles.push(self.start_prepared(runtime).await?);
+        }
+        Ok(handles)
+    }
 
+    // Called with admission held: duplicate checking and registration cannot
+    // interleave with another start, sweep, cancellation, or deletion.
+    async fn check_admission(&self, runtimes: &[RuntimeScanConfig]) -> ZeckResult<()> {
+        let sessions = self.sessions.read().await;
+        if sessions.len() + runtimes.len() > MAX_PENDING_SCANS {
+            return Err(ZeckError::InvalidConfig(
+                "too many retained scans; finish or release existing sessions first".to_owned(),
+            ));
+        }
+        for runtime in runtimes {
+            let identity = session_key_identity(runtime.key_source.as_ref())?;
+            let root = RecoveryWorkspace::from_runtime(runtime)?.root().to_owned();
+            for session in sessions.values() {
+                if session.key_identity == identity || session.workspace_root == root {
+                    return Err(ZeckError::InvalidConfig(
+                        "this wallet already has a session; release it before restarting"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_prepared(&self, runtime: RuntimeScanConfig) -> ZeckResult<ScanHandle> {
+        let workspace_root = RecoveryWorkspace::from_runtime(&runtime)?.root().to_owned();
+        let key_identity = session_key_identity(runtime.key_source.as_ref())?;
+        let handle = ScanHandle::new();
+        let state = Arc::new(Mutex::new(ScanTaskState::new(handle.clone())));
+        state.lock().await.progress.phase = ScanPhase::Queued;
         let session = Arc::new(ScanSession {
             state: state.clone(),
             runtime: runtime.clone(),
             started_at: Instant::now(),
             task: Mutex::new(None),
             workspace_root,
+            key_identity,
+            operation: Arc::new(Mutex::new(())),
         });
 
         self.sessions
@@ -233,9 +301,16 @@ impl RecoveryService {
             .await
             .insert(handle.id.clone(), session.clone());
 
-        let sessions = self.sessions.clone();
-        let handle_id = handle.id.clone();
+        let slots = self.scan_slots.clone();
+        #[cfg(test)]
+        let probe = self.scan_probe.clone();
         let task = tokio::spawn(async move {
+            // The owned permit survives every await and releases on failure,
+            // panic or cancellation. Queued work has no network/DB activity.
+            let _slot = slots
+                .acquire_owned()
+                .await
+                .expect("scan semaphore stays open");
             // Acquire a power-management guard so the OS doesn't put the
             // machine to sleep mid-scan. Held for the entire scan task; the
             // Drop impl releases on completion, error, panic, or task abort.
@@ -257,15 +332,18 @@ impl RecoveryService {
                     None
                 }
             };
+            #[cfg(test)]
+            if let Some(probe) = probe {
+                probe.run(&state).await;
+            } else {
+                run_recovery_scan(state.clone(), runtime).await;
+            }
+            #[cfg(not(test))]
             run_recovery_scan(state.clone(), runtime).await;
             drop(_awake);
-            // Keep completed sessions alive so the user can proceed to sweep
-            // at their own pace. Only clean up cancelled/error sessions after
-            // a short delay so they don't accumulate.
-            let phase = state.lock().await.progress.phase;
-            if phase != ScanPhase::Complete {
-                spawn_session_cleanup(sessions, handle_id);
-            }
+            // Retain terminal sessions until explicit release: another seed
+            // may still be scanning hours later when the user returns here.
+            // MAX_PENDING_SCANS bounds retained key-bearing sessions.
         });
         *session.task.lock().await = Some(task);
 
@@ -285,6 +363,7 @@ impl RecoveryService {
     }
 
     pub async fn cancel_scan(&self, handle: &ScanHandle) -> ZeckResult<()> {
+        let _admission = self.admission.lock().await;
         let session = self.session(handle).await?;
 
         {
@@ -306,13 +385,7 @@ impl RecoveryService {
         }
         if let Some(task) = session.task.lock().await.take() {
             task.abort();
-        }
-        // spawn_session_cleanup is intentionally omitted here: aborting the
-        // task prevents the scan from completing naturally, so the cleanup
-        // that was scheduled in start_scan will not fire.  We schedule a
-        // fresh one to ensure the session is eventually removed.
-        if self.sessions.read().await.contains_key(&handle.id) {
-            spawn_session_cleanup(self.sessions.clone(), handle.id.clone());
+            let _ = task.await;
         }
         Ok(())
     }
@@ -322,7 +395,12 @@ impl RecoveryService {
         handle: &ScanHandle,
         request: SweepRequest,
     ) -> ZeckResult<SweepProposal> {
+        let admission = self.admission.lock().await;
         let session = self.session(handle).await?;
+        let _operation = session.operation.clone().try_lock_owned().map_err(|_| {
+            ZeckError::ScanNotReady("another operation is using this wallet".to_owned())
+        })?;
+        drop(admission);
         let progress = session.state.lock().await.progress.clone();
         if progress.phase != ScanPhase::Complete {
             return Err(ZeckError::ScanNotReady(format!(
@@ -414,7 +492,12 @@ impl RecoveryService {
         request: SweepRequest,
         pause_between_broadcasts: Option<std::time::Duration>,
     ) -> ZeckResult<SweepOutcome> {
+        let admission = self.admission.lock().await;
         let session = self.session(handle).await?;
+        let _operation = session.operation.clone().try_lock_owned().map_err(|_| {
+            ZeckError::ScanNotReady("another operation is using this wallet".to_owned())
+        })?;
+        drop(admission);
         let progress = session.state.lock().await.progress.clone();
         if progress.phase != ScanPhase::Complete {
             return Err(ZeckError::ScanNotReady(format!(
@@ -454,7 +537,11 @@ impl RecoveryService {
     /// the filesystem and SSD controller may retain blocks until the cells
     /// are overwritten or TRIM'd. UI callers should surface this honestly.
     pub async fn delete_workspace(&self, handle: &ScanHandle) -> ZeckResult<std::path::PathBuf> {
+        let _admission = self.admission.lock().await;
         let session = self.session(handle).await?;
+        let _operation = session.operation.clone().try_lock_owned().map_err(|_| {
+            ZeckError::ScanNotReady("another operation is using this wallet".to_owned())
+        })?;
 
         // Refuse mid-scan to avoid tearing the SQLite write-ahead state out
         // from under the running task. Callers can cancel first if they really
@@ -496,6 +583,60 @@ impl RecoveryService {
         Ok(workspace_root)
     }
 
+    /// Retry a failed/cancelled seed without letting a different seed inherit
+    /// its label or settings. Re-entry also avoids keeping secrets in the UI.
+    pub async fn retry_seed_scan(
+        &self,
+        handle: &ScanHandle,
+        phrase: SecretString,
+    ) -> ZeckResult<ScanHandle> {
+        let _admission = self.admission.lock().await;
+        let session = self.session(handle).await?;
+        let _operation = session.operation.clone().try_lock_owned().map_err(|_| {
+            ZeckError::ScanNotReady("another operation is using this wallet".to_owned())
+        })?;
+        let phase = session.state.lock().await.progress.phase;
+        if !matches!(phase, ScanPhase::Cancelled | ScanPhase::Error) {
+            return Err(ZeckError::ScanNotReady(
+                "only failed or cancelled scans can be retried".to_owned(),
+            ));
+        }
+        let source = Arc::new(SeedKeySource::new(phrase));
+        if session_key_identity(source.as_ref())? != session.key_identity {
+            return Err(ZeckError::InvalidConfig(
+                "seed does not match this session".to_owned(),
+            ));
+        }
+        let mut runtime = session.runtime.clone();
+        runtime.key_source = source;
+        if let Some(task) = session.task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.sessions.write().await.remove(&handle.id);
+        self.start_prepared(runtime).await
+    }
+
+    /// Forget a terminal session and its keys without deleting recovery data.
+    pub async fn release_session(&self, handle: &ScanHandle) -> ZeckResult<()> {
+        let _admission = self.admission.lock().await;
+        let session = self.session(handle).await?;
+        let _operation = session.operation.clone().try_lock_owned().map_err(|_| {
+            ZeckError::ScanNotReady("another operation is using this wallet".to_owned())
+        })?;
+        if !session.state.lock().await.progress.phase.is_terminal() {
+            return Err(ZeckError::ScanNotReady(
+                "cancel the scan before releasing it".to_owned(),
+            ));
+        }
+        if let Some(task) = session.task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.sessions.write().await.remove(&handle.id);
+        Ok(())
+    }
+
     async fn session(&self, handle: &ScanHandle) -> ZeckResult<SharedScanSession> {
         self.sessions
             .read()
@@ -504,6 +645,44 @@ impl RecoveryService {
             .cloned()
             .ok_or(ZeckError::UnknownScanHandle)
     }
+}
+
+// Admission identity deliberately differs from workspace identity. A typed
+// mnemonic and a wallet-file mnemonic control the same spending authority,
+// even if their provenance or scan scope differs. Never change disk keying.
+fn session_key_identity(source: &dyn KeySource) -> ZeckResult<[u8; 32]> {
+    use secrecy::ExposeSecret;
+    use sha2::{Digest, Sha256};
+    if let Some(seed) = source.wallet_seed()? {
+        let seed = secrecy::Secret::new(seed);
+        let mut hash = Sha256::new();
+        hash.update(b"argos-active-seed-v1");
+        hash.update(seed.expose_secret());
+        Ok(hash.finalize().into())
+    } else {
+        Ok(*source.fingerprint()?.as_bytes())
+    }
+}
+
+fn prepare_scan(
+    config: ScanConfig,
+    key_source: Arc<dyn KeySource>,
+) -> ZeckResult<RuntimeScanConfig> {
+    validate_scan_config(&config)?;
+    let runtime = RuntimeScanConfig {
+        key_source,
+        birthday: config.birthday,
+        num_accounts: config.num_accounts,
+        gap_limit: config.gap_limit,
+        lightwalletd_url: config.lightwalletd_url,
+        data_dir: config.data_dir,
+        network: config.network,
+        label: config.label,
+    };
+    // Validate key identity and workspace derivation before any task starts.
+    runtime.key_source.fingerprint()?;
+    RecoveryWorkspace::from_runtime(&runtime)?;
+    Ok(runtime)
 }
 
 fn validate_scan_config(config: &ScanConfig) -> ZeckResult<()> {
@@ -532,16 +711,6 @@ fn validate_scan_config(config: &ScanConfig) -> ZeckResult<()> {
     validated_lightwalletd_endpoints(&config.lightwalletd_url)?;
 
     Ok(())
-}
-
-fn spawn_session_cleanup(
-    sessions: Arc<RwLock<HashMap<String, SharedScanSession>>>,
-    handle_id: String,
-) {
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(SESSION_RETENTION_SECS)).await;
-        sessions.write().await.remove(&handle_id);
-    });
 }
 
 fn build_sweep_proposal(
@@ -2841,5 +3010,257 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ZeckError::InvalidConfig(_)));
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use bip0039::{English, Mnemonic};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Exercise real service registration, permit acquisition, cancellation,
+    // and cleanup without depending on public network timing or real funds.
+    pub(super) struct ScanProbe {
+        entered: AtomicUsize,
+        finish: Semaphore,
+    }
+
+    impl ScanProbe {
+        pub(super) async fn run(&self, state: &SharedScanTaskState) {
+            state.lock().await.progress.phase = ScanPhase::ScanningShielded;
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.finish.acquire().await.unwrap().forget();
+            state.lock().await.progress.phase = ScanPhase::Complete;
+        }
+    }
+
+    fn service() -> (RecoveryService, Arc<ScanProbe>) {
+        let probe = Arc::new(ScanProbe {
+            entered: AtomicUsize::new(0),
+            finish: Semaphore::new(0),
+        });
+        let service = RecoveryService {
+            scan_probe: Some(probe.clone()),
+            ..Default::default()
+        };
+        (service, probe)
+    }
+
+    fn entry(index: u8, root: &std::path::Path) -> (ScanConfig, SecretString) {
+        (
+            ScanConfig {
+                birthday: 419_200,
+                num_accounts: Some(1),
+                gap_limit: 20,
+                lightwalletd_url: "https://zec.rocks:443".to_owned(),
+                data_dir: root.to_owned(),
+                network: crate::models::ZeckNetwork::Mainnet,
+                label: format!("Seed {index}"),
+            },
+            SecretString::new(
+                Mnemonic::<English>::from_entropy(vec![index; 32])
+                    .unwrap()
+                    .into_phrase(),
+            ),
+        )
+    }
+
+    async fn wait_entered(probe: &ScanProbe, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while probe.entered.load(Ordering::SeqCst) != count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected scans to start");
+    }
+
+    async fn dispose(service: &RecoveryService, handles: &[ScanHandle]) {
+        for handle in handles {
+            service.cancel_scan(handle).await.unwrap();
+            service.release_session(handle).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn eight_run_and_ninth_waits_until_cancellation_releases_a_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        let handles = service
+            .start_seed_batch((0..9).map(|i| entry(i, root.path())).collect())
+            .await
+            .unwrap();
+        wait_entered(&probe, 8).await;
+        assert_eq!(service.scan_slots.available_permits(), 0);
+        let mut progress = Vec::new();
+        for handle in &handles {
+            progress.push(service.get_scan_progress(handle).await.unwrap());
+        }
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|p| p.phase == ScanPhase::Queued)
+                .count(),
+            1
+        );
+        let running = progress
+            .iter()
+            .find(|p| p.phase == ScanPhase::ScanningShielded)
+            .unwrap()
+            .handle
+            .clone();
+        service.cancel_scan(&running).await.unwrap();
+        wait_entered(&probe, 9).await;
+        assert_eq!(
+            service.get_scan_progress(&running).await.unwrap().phase,
+            ScanPhase::Cancelled
+        );
+        assert_eq!(service.scan_slots.available_permits(), 0);
+        dispose(&service, &handles).await;
+        assert_eq!(service.scan_slots.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_seed_never_starts_and_completion_admits_next_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        let first = service
+            .start_seed_batch((0..8).map(|i| entry(i, root.path())).collect())
+            .await
+            .unwrap();
+        wait_entered(&probe, 8).await;
+        let (config, phrase) = entry(9, root.path());
+        let cancelled = service.start_scan(config, phrase).await.unwrap();
+        let (config, phrase) = entry(10, root.path());
+        let next = service.start_scan(config, phrase).await.unwrap();
+        service.cancel_scan(&cancelled).await.unwrap();
+        probe.finish.add_permits(1);
+        wait_entered(&probe, 9).await;
+        assert_eq!(
+            service.get_scan_progress(&cancelled).await.unwrap().phase,
+            ScanPhase::Cancelled
+        );
+        assert_eq!(
+            service.get_scan_progress(&next).await.unwrap().phase,
+            ScanPhase::ScanningShielded
+        );
+        let mut all = first;
+        all.extend([cancelled, next]);
+        dispose(&service, &all).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_or_invalid_batch_starts_nothing_and_does_not_echo_secret() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        let err = service
+            .start_seed_batch(vec![entry(0, root.path()), entry(0, root.path())])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicates"));
+        let (config, _) = entry(1, root.path());
+        let err = service
+            .start_seed_batch(vec![
+                entry(0, root.path()),
+                (
+                    config,
+                    SecretString::new("private invalid words".to_owned()),
+                ),
+            ])
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("private invalid words"));
+        assert!(service.sessions.read().await.is_empty());
+        assert_eq!(probe.entered.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_starts_have_one_owner_even_with_different_birthdays() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = service();
+        let (a, seed_a) = entry(0, root.path());
+        let (mut b, seed_b) = entry(0, root.path());
+        b.birthday += 100;
+        let (a, b) = tokio::join!(service.start_scan(a, seed_a), service.start_scan(b, seed_b));
+        assert_ne!(a.is_ok(), b.is_ok());
+        let handle = a.or(b).unwrap();
+        assert_eq!(service.sessions.read().await.len(), 1);
+        dispose(&service, &[handle]).await;
+    }
+
+    #[tokio::test]
+    async fn imported_mnemonic_cannot_bypass_seed_admission_with_a_new_birthday() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = service();
+        let (config, phrase) = entry(0, root.path());
+        let handle = service.start_scan(config, phrase).await.unwrap();
+        let (mut config, phrase) = entry(0, root.path());
+        config.birthday += 100;
+        let source = crate::key_source::ImportedKeySource::new(argos_wallet_import::ImportedKeys {
+            mnemonic: Some(phrase),
+            ..Default::default()
+        });
+        assert!(service
+            .start_scan_from_key_source(config, Arc::new(source))
+            .await
+            .is_err());
+        dispose(&service, &[handle]).await;
+    }
+
+    #[tokio::test]
+    async fn retry_requires_original_seed_and_keeps_workspace_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        let (config, phrase) = entry(0, root.path());
+        let handle = service.start_scan(config, phrase).await.unwrap();
+        wait_entered(&probe, 1).await;
+        service.cancel_scan(&handle).await.unwrap();
+        let (_, wrong) = entry(1, root.path());
+        assert!(service.retry_seed_scan(&handle, wrong).await.is_err());
+        assert_eq!(service.sessions.read().await.len(), 1);
+        let before = service
+            .session(&handle)
+            .await
+            .unwrap()
+            .workspace_root
+            .clone();
+        let (_, phrase) = entry(0, root.path());
+        let resumed = service.retry_seed_scan(&handle, phrase).await.unwrap();
+        assert_ne!(handle.id, resumed.id);
+        assert_eq!(
+            before,
+            service.session(&resumed).await.unwrap().workspace_root
+        );
+        assert!(service.get_scan_progress(&handle).await.is_err());
+        dispose(&service, &[resumed]).await;
+    }
+
+    #[tokio::test]
+    async fn busy_wallet_cannot_be_deleted_released_or_swept_again() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, probe) = service();
+        let (config, phrase) = entry(0, root.path());
+        let handle = service.start_scan(config, phrase).await.unwrap();
+        wait_entered(&probe, 1).await;
+        service.cancel_scan(&handle).await.unwrap();
+        let session = service.session(&handle).await.unwrap();
+        let busy = session.operation.lock().await;
+        assert!(service.release_session(&handle).await.is_err());
+        assert!(service.delete_workspace(&handle).await.is_err());
+        let request = SweepRequest {
+            destination: String::new(),
+            memo: None,
+            max_fee_zatoshis: None,
+            donation_rate: None,
+            donor_email: None,
+        };
+        let err = service.execute_sweep(&handle, request).await.unwrap_err();
+        assert!(err.to_string().contains("another operation"));
+        drop(busy);
+        service.release_session(&handle).await.unwrap();
+        let (config, phrase) = entry(0, root.path());
+        let resumed = service.start_scan(config, phrase).await.unwrap();
+        dispose(&service, &[resumed]).await;
     }
 }

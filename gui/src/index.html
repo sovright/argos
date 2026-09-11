@@ -230,6 +230,10 @@
       </div>
 
       <main class="main-panel">
+        <div id="batch-context" class="banner info" hidden>
+          <strong id="batch-selected-context"></strong>
+          <button class="secondary" id="return-to-batch" type="button">All scans</button>
+        </div>
         <section class="screen active" data-step="welcome">
           <p class="eyebrow">Step 1</p>
           <h2>Recover your wallet in a few steps</h2>
@@ -411,7 +415,7 @@
 
         <section class="screen" data-step="seed">
           <p class="eyebrow">Step 2</p>
-          <h2>Enter the seed phrase</h2>
+          <h2>Enter your seed phrases</h2>
           <p class="lead">
             Paste the full 24 words. The phrase stays on this machine and is cleared from the UI
             after you start a session.
@@ -436,7 +440,11 @@
             <button class="ghost" id="seed-validate">Validate seed</button>
             <button class="ghost" id="seed-clear-clipboard" type="button" title="Overwrite the OS clipboard with empty text. Does not clear clipboard-history apps.">Clear clipboard</button>
           </div>
-          <p id="seed-status" class="status-line"></p>
+          <div id="additional-seeds"></div>
+          <button class="secondary" id="add-seed" type="button">Add another seed</button>
+          <p class="muted">Scan up to eight seeds simultaneously. Additional seeds wait for a slot.
+            Each seed uses its own scan and can be cancelled separately.</p>
+          <p id="seed-status" class="status-line" role="status"></p>
           <div class="actions split">
             <button class="secondary" data-prev="welcome">Back</button>
             <button class="primary" data-next="config" id="seed-next" disabled>Continue</button>
@@ -446,6 +454,10 @@
         <section class="screen" data-step="config">
           <p class="eyebrow">Step 3</p>
           <h2>Configure the recovery session</h2>
+          <p class="muted">For multiple seeds, the label below names the first seed. Network, account settings,
+            destination, and fee settings apply to every seed. Each additional seed can override the birthday
+            on the seed-entry screen. Auto-detection below uses only the first seed; use an earlier shared
+            birthday if you are unsure about the others. The fee limit applies separately to each seed sweep, not to the whole batch.</p>
           <div class="form-grid">
 
             <p class="form-section-heading span-two">Scan identity</p>
@@ -560,7 +572,19 @@
 
         <section class="screen" data-step="scan">
           <p class="eyebrow">Step 4</p>
-          <h2>Recovery scan</h2>
+          <h2>Recovery scans</h2>
+          <div id="batch-panel" hidden>
+            <p id="batch-summary" role="status"></p>
+            <div id="batch-scans"></div>
+            <div class="inline-actions">
+              <button class="secondary" id="cancel-batch" type="button">Cancel unfinished scans</button>
+              <button class="secondary" id="restart-batch" type="button">Start a new recovery</button>
+            </div>
+            <p class="muted">Release forgets this session's keys without deleting its saved workspace.
+              To sweep later, re-enter the seed and use the same settings. Sweeps are reviewed one seed at a time.</p>
+            <p id="batch-status" role="status"></p>
+          </div>
+          <h3 id="selected-scan-label"></h3>
           <div class="banner warning" id="scan-warning">
             Transparent funds are detected within seconds. Argos must still finish the full
             shielded block sync before sweeping — <strong>Review &amp; Sweep unlocks when the
