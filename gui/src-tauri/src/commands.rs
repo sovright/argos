@@ -60,6 +60,38 @@ pub struct ScanConfigInput {
     pub label: Option<String>,
 }
 
+// Only one offline derivation job at a time, including abandoned IPC calls.
+static ADDRESS_DERIVATION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+#[derive(Deserialize)]
+pub struct AddressDerivationInput {
+    seed: SecretString,
+    network: ZeckNetwork,
+    start_index: u32,
+    count: u32,
+}
+
+#[tauri::command]
+pub async fn show_addresses(
+    input: AddressDerivationInput,
+) -> Result<Vec<argos_core::DerivedAccount>, String> {
+    let permit = ADDRESS_DERIVATION
+        .try_acquire()
+        .map_err(|_| "Address derivation is already running. Please wait.".to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        argos_core::derivation::derive_addresses_range(
+            &input.seed,
+            input.network,
+            input.start_index,
+            input.count,
+        )
+        .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|_| "Address derivation could not finish.".to_owned())?
+}
+
 #[tauri::command]
 pub async fn validate_seed(words: Vec<String>) -> Result<bool, String> {
     validate_mnemonic_words(&words)
@@ -1515,6 +1547,21 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn address_derivation_refuses_overlap_without_echoing_seed() {
+        let _permit = super::ADDRESS_DERIVATION.acquire().await.unwrap();
+        let error = super::show_addresses(super::AddressDerivationInput {
+            seed: secrecy::SecretString::new("synthetic invalid seed".to_owned()),
+            network: argos_core::ZeckNetwork::Mainnet,
+            start_index: 0,
+            count: 20,
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("already running"));
+        assert!(!error.contains("synthetic"));
+    }
+
     use super::*;
 
     /// The sidebar version is a support-facing claim about which binary is

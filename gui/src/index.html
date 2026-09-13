@@ -254,6 +254,7 @@
             <button class="primary" data-next="seed">I have my 24-word seed phrase</button>
             <button class="secondary" data-next="wallet-file">I have a wallet file</button>
           </div>
+          <div class="actions"><button class="secondary" id="open-addresses">Show addresses offline</button></div>
           <p class="audit-notice">Independently audited by <a href="https://leastauthority.com" target="_blank" rel="noopener">Least Authority</a>.</p>
 
           <div id="resume-panel" class="report-card" hidden>
@@ -817,6 +818,33 @@
       </div>
     </div>
 
+    <dialog id="addresses-dialog" aria-labelledby="addresses-title">
+      <h2 id="addresses-title">Show addresses offline</h2>
+      <p>Derive public addresses from your own seed, without checking balances or sending funds. No server connection is needed. Private keys are never displayed.</p>
+      <form id="addresses-form">
+        <label class="field">24-word seed phrase
+          <textarea id="addresses-seed" class="masked" rows="3" autocomplete="off" autocapitalize="off" spellcheck="false" required></textarea>
+        </label>
+        <label><input type="checkbox" id="addresses-reveal"> Show seed words</label>
+        <p>The seed field is cleared after submission. Re-enter it to derive another range.</p>
+        <div class="address-options">
+          <label class="field">Network<select id="addresses-network"><option value="mainnet">Mainnet</option><option value="testnet">Testnet</option></select></label>
+          <label class="field">Starting index<input id="addresses-start" type="number" min="0" max="2147483647" step="1" value="0" required></label>
+          <label class="field">Number of indexes<input id="addresses-count" type="number" min="1" max="1000" step="1" value="20" required></label>
+        </div>
+        <p>Uses Argos's ZecWallet Lite derivation: transparent account 0, both receive and change branches; the index is the final address index. Shielded addresses use the index as their account number. Other wallet derivation schemes and imported standalone keys may differ.</p>
+        <button type="submit" id="derive-addresses">Derive addresses</button>
+      </form>
+      <p id="addresses-status" role="status" aria-live="polite"></p>
+      <div id="addresses-results" hidden>
+        <label class="field">Find an exact address in these results<input id="addresses-target" type="text" autocomplete="off" spellcheck="false" placeholder="Paste a known address"></label>
+        <p id="addresses-match" role="status"></p>
+        <div class="addresses-table-wrap"><table><caption id="addresses-caption"></caption><thead><tr><th>Index</th><th>Type</th><th>Address and derivation path</th></tr></thead><tbody id="addresses-rows"></tbody></table></div>
+        <div class="actions"><button id="addresses-previous" type="button">Previous</button><span id="addresses-page"></span><button id="addresses-next" type="button">Next</button></div>
+      </div>
+      <div class="actions"><button id="close-addresses" type="button">Close and clear</button></div>
+    </dialog>
     <script src="./main.js"></script>
+    <script src="./addresses.js"></script>
   </body>
 </html>

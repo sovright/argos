@@ -234,3 +234,40 @@ cargo test -p argos-core -- --ignored default_endpoints_are_reachable
 ---
 
 *Last updated: 2026-08-26*
+
+## Offline GUI address inspection
+
+From Welcome, choose **Show addresses offline**. Enter a synthetic test seed,
+choose Mainnet/Testnet and an explicit starting index and count (1–1000).
+The dialog shows transparent receive/change, Sapling and Unified addresses with
+paths. Transparent derivation uses ZecWallet Lite's account 0; the row index is
+its final child index, while shielded derivation uses that index as the account.
+It does not search arbitrary wallet derivation schemes or imported standalone keys.
+
+Run `cargo test -p argos-core derivation::tests --lib` for range equivalence,
+network and boundary coverage. Run `cargo test -p argos-gui address_derivation_refuses_overlap`
+for concurrent-job rejection. Run `node --test tests/gui/addresses.test.cjs` for
+pagination, exact matching outside the current page, error handling, clearing,
+and rejection of late results after close/reopen. The Node harness checks state
+behavior, not native rendering.
+
+For manual UI checks, `python3 tests/gui/serve_addresses_fixture.py` serves the
+actual HTML/JS on http://127.0.0.1:8776 with clearly synthetic address responses.
+Use synthetic words only; the fixture does not perform cryptographic derivation.
+Check matching `t1fixture-change-417` after deriving indexes 400–419, pagination,
+no-match wording, seed masking, Escape/close cleanup and the delayed-response
+controls. Those controls are fixture-only and never loaded in the production app.
+
+Implementation validation: 559 workspace tests passed (17 ignored), 18 focused
+derivation tests passed, and all-target clippy and GUI compilation passed.
+Browser checks confirmed dialog entry, results for indexes 400–419 and seed
+field clearing. Later browser calls repeatedly timed out, so native visual,
+keyboard and supported-platform walkthroughs remain review checks.
+
+Security: the new command performs only local derivation, takes the seed in a
+Deserialize-only SecretString input, returns public addresses and paths, and
+creates no recovery workspace or network client. A blocking worker holds the
+single-job permit through completion even if IPC is abandoned. Closing the
+dialog clears displayed data and invalidates pending responses; it does not
+terminate an already-running bounded Rust derivation. JavaScript/IPC copies have
+the existing webview secret-lifetime limitations. Results are not persisted.
