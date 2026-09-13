@@ -30,6 +30,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::validate_seed,
+            commands::show_addresses,
             commands::validate_address,
             commands::start_scan,
             commands::pick_wallet_file,

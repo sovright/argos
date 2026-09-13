@@ -39,6 +39,43 @@ pub fn derive_accounts_from_seed(
     network: ZeckNetwork,
     account_count: u32,
 ) -> ZeckResult<Vec<DerivedAccount>> {
+    derive_accounts_range_from_seed(seed, network, 0, account_count)
+}
+
+/// Derive public addresses for an explicit range, without scanning or gap rules.
+/// Range bounds are checked before deriving any keys.
+pub fn derive_addresses_range(
+    phrase: &SecretString,
+    network: ZeckNetwork,
+    start_index: u32,
+    count: u32,
+) -> ZeckResult<Vec<DerivedAccount>> {
+    if count == 0
+        || count > 1000
+        || start_index
+            .checked_add(count)
+            .is_none_or(|end| end > (1 << 31))
+    {
+        return Err(ZeckError::InvalidConfig(
+            "choose 1–1000 indexes within 0–2147483647".to_owned(),
+        ));
+    }
+    let seed = mnemonic_seed(phrase)?;
+    derive_accounts_range_from_seed(seed.expose_secret(), network, start_index, count)
+}
+
+fn derive_accounts_range_from_seed(
+    seed: &[u8; 64],
+    network: ZeckNetwork,
+    start_index: u32,
+    count: u32,
+) -> ZeckResult<Vec<DerivedAccount>> {
+    let end = start_index
+        .checked_add(count)
+        .filter(|end| *end <= (1 << 31))
+        .ok_or_else(|| {
+            ZeckError::InvalidConfig("address range exceeds the derivation index limit".to_owned())
+        })?;
     let transparent_account = legacy_transparent_account_key_from_seed(network, seed)?;
 
     let external_ivk = transparent_account
@@ -50,7 +87,7 @@ pub fn derive_accounts_from_seed(
         .derive_internal_ivk()
         .map_err(|err| ZeckError::Internal(err.to_string()))?;
 
-    (0..account_count)
+    (start_index..end)
         .map(|index| derive_account(index, network, seed, &external_ivk, &internal_ivk))
         .collect()
 }
@@ -492,5 +529,24 @@ mod tests {
         assert_eq!(acc.sapling_path, "m_Sapling / 32' / 133' / 0'");
         assert_eq!(acc.transparent_receive_path, "m / 44' / 133' / 0' / 0 / 0");
         assert_eq!(acc.transparent_change_path, "m / 44' / 133' / 0' / 1 / 0");
+    }
+    #[test]
+    fn address_ranges_match_existing_derivation_and_reject_invalid_bounds() {
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let full = derive_accounts(&test_seed(), network, 5).unwrap();
+            let range = derive_addresses_range(&test_seed(), network, 3, 2).unwrap();
+            assert_eq!(
+                serde_json::to_value(&full[3..]).unwrap(),
+                serde_json::to_value(range).unwrap()
+            );
+        }
+        for (start, count) in [(0, 0), (0, 1001), (u32::MAX, 1), ((1 << 31) - 1, 2)] {
+            assert!(
+                derive_addresses_range(&test_seed(), ZeckNetwork::Mainnet, start, count).is_err()
+            );
+        }
+        let last =
+            derive_addresses_range(&test_seed(), ZeckNetwork::Mainnet, (1 << 31) - 1, 1).unwrap();
+        assert_eq!(last[0].index, (1 << 31) - 1);
     }
 }
