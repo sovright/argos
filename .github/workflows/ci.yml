@@ -102,6 +102,15 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      - name: Install Node for GUI interaction tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: ""
+
+      - name: GUI address discovery interaction tests
+        run: node --test tests/gui/*.test.cjs
+
   sprout-node-tests:
     name: Sprout scan against a real node
     runs-on: ubuntu-latest

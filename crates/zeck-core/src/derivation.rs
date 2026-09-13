@@ -55,6 +55,52 @@ pub fn derive_accounts_from_seed(
         .collect()
 }
 
+pub(crate) fn derive_exact_account_from_seed(
+    seed: &[u8; 64],
+    network: ZeckNetwork,
+    index: u32,
+) -> ZeckResult<DerivedAccount> {
+    let account_id = AccountId::try_from(index)
+        .map_err(|_| ZeckError::InvalidConfig(format!("account index {index} is out of range")))?;
+    let transparent_account = match network {
+        ZeckNetwork::Mainnet => AccountPrivKey::from_seed(&MAIN_NETWORK, seed, account_id),
+        ZeckNetwork::Testnet => AccountPrivKey::from_seed(&TEST_NETWORK, seed, account_id),
+    }
+    .map_err(|err| ZeckError::Internal(err.to_string()))?;
+    let external_ivk = transparent_account
+        .to_account_pubkey()
+        .derive_external_ivk()
+        .map_err(|err| ZeckError::Internal(err.to_string()))?;
+    let internal_ivk = transparent_account
+        .to_account_pubkey()
+        .derive_internal_ivk()
+        .map_err(|err| ZeckError::Internal(err.to_string()))?;
+    let mut derived = derive_account(index, network, seed, &external_ivk, &internal_ivk)?;
+    // Standard BIP-44 account-scoped transparent receivers begin at child 0.
+    // The ordinary ZecWallet Lite scan deliberately uses account 0 with the
+    // account number as its child index; an exact ZIP-32 handoff must not.
+    let child = NonHardenedChildIndex::from_index(0).expect("zero is non-hardened");
+    let external = external_ivk
+        .derive_address(child)
+        .map_err(|err| ZeckError::Internal(err.to_string()))?;
+    let internal = internal_ivk
+        .derive_address(child)
+        .map_err(|err| ZeckError::Internal(err.to_string()))?;
+    derived.transparent_receive_address = match network {
+        ZeckNetwork::Mainnet => external.encode(&MAIN_NETWORK),
+        ZeckNetwork::Testnet => external.encode(&TEST_NETWORK),
+    };
+    derived.transparent_change_address = match network {
+        ZeckNetwork::Mainnet => internal.encode(&MAIN_NETWORK),
+        ZeckNetwork::Testnet => internal.encode(&TEST_NETWORK),
+    };
+    derived.transparent_receive_path =
+        format!("m / 44' / {}' / {index}' / 0 / 0", network.coin_type());
+    derived.transparent_change_path =
+        format!("m / 44' / {}' / {index}' / 1 / 0", network.coin_type());
+    Ok(derived)
+}
+
 pub(crate) fn mnemonic_seed(seed_phrase: &SecretString) -> ZeckResult<Secret<[u8; 64]>> {
     let mnemonic = Mnemonic::<English>::from_phrase(seed_phrase.expose_secret())
         .map_err(|err| redact_mnemonic_error(&err, seed_phrase.expose_secret()))?;
@@ -187,6 +233,39 @@ pub(crate) fn legacy_transparent_account_key_from_seed(
         ZeckNetwork::Testnet => AccountPrivKey::from_seed(&TEST_NETWORK, seed, AccountId::ZERO),
     }
     .map_err(|err| ZeckError::Internal(err.to_string()))
+}
+
+pub(crate) fn legacy_transparent_secret_key_for_account(
+    network: ZeckNetwork,
+    seed: &[u8; 64],
+    account: u32,
+    scope: AddressScope,
+    index: u32,
+) -> ZeckResult<secp256k1::SecretKey> {
+    let account = AccountId::try_from(account).map_err(|_| {
+        ZeckError::InvalidConfig("transparent account index is out of range".to_owned())
+    })?;
+    let key = match network {
+        ZeckNetwork::Mainnet => AccountPrivKey::from_seed(&MAIN_NETWORK, seed, account),
+        ZeckNetwork::Testnet => AccountPrivKey::from_seed(&TEST_NETWORK, seed, account),
+    }
+    .map_err(|err| ZeckError::Internal(err.to_string()))?;
+    legacy_transparent_secret_key(&key, scope, index)
+}
+
+pub(crate) fn transparent_address_from_seed(
+    network: ZeckNetwork,
+    seed: &[u8; 64],
+    account: u32,
+    scope: AddressScope,
+    index: u32,
+) -> ZeckResult<zcash_transparent::address::TransparentAddress> {
+    let secret = legacy_transparent_secret_key_for_account(network, seed, account, scope, index)?;
+    let public =
+        secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::signing_only(), &secret);
+    Ok(zcash_transparent::address::TransparentAddress::from_pubkey(
+        &public,
+    ))
 }
 
 fn transparent_child_index(index: u32) -> ZeckResult<NonHardenedChildIndex> {

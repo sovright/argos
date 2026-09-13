@@ -482,6 +482,10 @@ pub struct SessionMetadata {
     /// Unix epoch seconds of the most recent run (start or retry).
     pub last_run_at_epoch_seconds: i64,
     pub completed: bool,
+    /// Public derivation coordinates for an address-match handoff. The seed
+    /// and optional BIP-39 passphrase are deliberately never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_coordinates: Option<crate::address_match_recovery::MatchCoordinates>,
 }
 
 impl SessionMetadata {
@@ -500,7 +504,16 @@ impl SessionMetadata {
             target_height,
             last_run_at_epoch_seconds: now_epoch_seconds,
             completed: false,
+            match_coordinates: None,
         }
+    }
+
+    pub fn with_match_coordinates(
+        mut self,
+        coordinates: Option<crate::address_match_recovery::MatchCoordinates>,
+    ) -> Self {
+        self.match_coordinates = coordinates;
+        self
     }
 }
 
@@ -516,6 +529,8 @@ pub struct IncompleteSession {
     pub synced_to_height: Option<u32>,
     pub target_height: Option<u32>,
     pub last_run_at_epoch_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_coordinates: Option<crate::address_match_recovery::MatchCoordinates>,
 }
 
 fn session_path(workspace_root: &Path) -> PathBuf {
@@ -702,9 +717,14 @@ fn try_build_incomplete_row(
 
     let synced_to_height = read_synced_height(&wallet_db_path, network);
 
-    let (label, target_height, last_run_at) = match meta {
-        Some(m) => (m.label, m.target_height, Some(m.last_run_at_epoch_seconds)),
-        None => ("(unlabeled scan)".to_owned(), None, None),
+    let (label, target_height, last_run_at, match_coordinates) = match meta {
+        Some(m) => (
+            m.label,
+            m.target_height,
+            Some(m.last_run_at_epoch_seconds),
+            m.match_coordinates,
+        ),
+        None => ("(unlabeled scan)".to_owned(), None, None, None),
     };
 
     Some(IncompleteSession {
@@ -715,6 +735,7 @@ fn try_build_incomplete_row(
         synced_to_height,
         target_height,
         last_run_at_epoch_seconds: last_run_at,
+        match_coordinates,
     })
 }
 

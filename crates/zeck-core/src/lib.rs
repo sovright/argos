@@ -1,4 +1,7 @@
 pub mod address;
+pub mod address_match_recovery;
+pub mod address_search;
+pub mod address_search_shielded;
 pub mod birthday;
 pub mod derivation;
 pub mod donation;
@@ -74,3 +77,5 @@ pub use workspace::{
     list_incomplete_sessions, parse_workspace_keying, verify_seed_for_workspace, IncompleteSession,
     SessionMetadata, WorkspaceKeying,
 };
+
+pub use address_match_recovery::{prepare_match_recovery, MatchCoordinates};

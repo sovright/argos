@@ -38,8 +38,8 @@ use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 use crate::{
     derivation::{
-        derive_accounts_from_seed, legacy_transparent_account_key_from_seed,
-        legacy_transparent_pubkey,
+        derive_accounts_from_seed, derive_exact_account_from_seed,
+        legacy_transparent_account_key_from_seed, legacy_transparent_pubkey,
     },
     error::{ZeckError, ZeckResult},
     lightwalletd::{
@@ -472,8 +472,12 @@ async fn run_recovery_scan_inner(
             config.birthday,
             None,
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned()),
     ) {
+        if config.key_source.match_coordinates().is_some() {
+            return Err(err);
+        }
         warn!("failed to write initial session sidecar (continuing): {err}");
     }
 
@@ -550,9 +554,51 @@ async fn run_recovery_scan_inner(
             config.birthday,
             Some(chain_tip_height),
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned()),
     ) {
         warn!("failed to update session sidecar with target height (continuing): {err}");
+    }
+
+    if let Some(account_index) = config.key_source.exact_hd_account() {
+        let derived = derive_exact_account_from_seed(&seed, config.network, account_index)?;
+        initialize_accounts(&state, std::slice::from_ref(&derived)).await;
+        import_accounts_scoped(
+            &workspace,
+            config.network,
+            &seed,
+            &account_birthday,
+            None,
+            std::slice::from_ref(&derived),
+            &state,
+        )
+        .await?;
+        {
+            let mut guard = state.lock().await;
+            guard.progress.phase = ScanPhase::ScanningShielded;
+            guard.progress.message = Some(format!(
+                "Syncing the exact matched ZIP-32 account {account_index}."
+            ));
+        }
+        let poller = ProgressPoller::start(
+            workspace.clone(),
+            config.network,
+            state.clone(),
+            effective_birthday,
+        );
+        let sync_result = run_wallet_sync_with_retry(
+            &workspace,
+            &network,
+            config.network,
+            &mut client,
+            &config.lightwalletd_url,
+            &state,
+        )
+        .await;
+        poller.stop().await;
+        sync_result?;
+        refresh_scan_progress(&state, &workspace, config.network, effective_birthday).await?;
+        return finish_scan(&state, &workspace).await;
     }
 
     while imported_accounts < target_accounts {
@@ -837,8 +883,12 @@ async fn begin_scan_session(
             config.birthday,
             None,
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned()),
     ) {
+        if config.key_source.match_coordinates().is_some() {
+            return Err(err);
+        }
         warn!("failed to write initial session sidecar (continuing): {err}");
     }
 
@@ -928,7 +978,8 @@ async fn run_imported_scan(
             config.birthday,
             Some(chain_tip_height),
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned()),
     ) {
         warn!("failed to update session sidecar with target height (continuing): {err}");
     }
@@ -1164,6 +1215,27 @@ async fn import_accounts(
     accounts: &[DerivedAccount],
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
+    import_accounts_scoped(
+        workspace,
+        network,
+        seed,
+        birthday,
+        Some(transparent_account),
+        accounts,
+        state,
+    )
+    .await
+}
+
+async fn import_accounts_scoped(
+    workspace: &RecoveryWorkspace,
+    network: crate::models::ZeckNetwork,
+    seed: &[u8; 64],
+    birthday: &AccountBirthday,
+    legacy_transparent_account: Option<&zcash_transparent::keys::AccountPrivKey>,
+    accounts: &[DerivedAccount],
+    state: &SharedScanTaskState,
+) -> ZeckResult<()> {
     if accounts.is_empty() {
         return Ok(());
     }
@@ -1201,46 +1273,67 @@ async fn import_accounts(
                 .id()
         };
 
-        let external_pubkey =
-            legacy_transparent_pubkey(transparent_account, AddressScope::External, account.index)?;
-        let internal_pubkey =
-            legacy_transparent_pubkey(transparent_account, AddressScope::Internal, account.index)?;
-        let external_address = TransparentAddress::from_pubkey(&external_pubkey);
-        let internal_address = TransparentAddress::from_pubkey(&internal_pubkey);
-        let existing_receivers = wallet_db
-            .get_transparent_receivers(wallet_account_id, true, true)
-            .map_err(|err| {
-                ZeckError::Wallet(format!(
-                    "loading transparent receivers for account {}: {err}",
-                    account.index
-                ))
-            })?;
-
-        if !existing_receivers.contains_key(&external_address) {
-            wallet_db
-                .import_standalone_transparent_pubkey(wallet_account_id, external_pubkey)
+        let transparent_receivers = if let Some(transparent_account) = legacy_transparent_account {
+            let external_pubkey = legacy_transparent_pubkey(
+                transparent_account,
+                AddressScope::External,
+                account.index,
+            )?;
+            let internal_pubkey = legacy_transparent_pubkey(
+                transparent_account,
+                AddressScope::Internal,
+                account.index,
+            )?;
+            let external_address = TransparentAddress::from_pubkey(&external_pubkey);
+            let internal_address = TransparentAddress::from_pubkey(&internal_pubkey);
+            let existing_receivers = wallet_db
+                .get_transparent_receivers(wallet_account_id, true, true)
                 .map_err(|err| {
                     ZeckError::Wallet(format!(
-                        "importing external transparent receiver for account {}: {err}",
+                        "loading transparent receivers for account {}: {err}",
                         account.index
                     ))
                 })?;
-        }
-        if !existing_receivers.contains_key(&internal_address) {
+            if !existing_receivers.contains_key(&external_address) {
+                wallet_db
+                    .import_standalone_transparent_pubkey(wallet_account_id, external_pubkey)
+                    .map_err(|err| {
+                        ZeckError::Wallet(format!(
+                            "importing external transparent receiver for account {}: {err}",
+                            account.index
+                        ))
+                    })?;
+            }
+            if !existing_receivers.contains_key(&internal_address) {
+                wallet_db
+                    .import_standalone_transparent_pubkey(wallet_account_id, internal_pubkey)
+                    .map_err(|err| {
+                        ZeckError::Wallet(format!(
+                            "importing internal transparent receiver for account {}: {err}",
+                            account.index
+                        ))
+                    })?;
+            }
+            vec![external_address, internal_address]
+        } else {
+            // Exact ZIP-32 accounts use the standard transparent receivers
+            // created by `import_account_hd`; their USK remains the signer.
             wallet_db
-                .import_standalone_transparent_pubkey(wallet_account_id, internal_pubkey)
+                .get_transparent_receivers(wallet_account_id, true, true)
                 .map_err(|err| {
                     ZeckError::Wallet(format!(
-                        "importing internal transparent receiver for account {}: {err}",
+                        "loading transparent receivers for account {}: {err}",
                         account.index
                     ))
-                })?;
-        }
+                })?
+                .into_keys()
+                .collect()
+        };
 
         tracked_accounts.push(TrackedAccount {
             wallet_account_id,
             derived: account.clone(),
-            transparent_receivers: vec![external_address, internal_address],
+            transparent_receivers,
         });
     }
 
@@ -2736,7 +2829,7 @@ mod tests {
             data_api::{
                 chain::{scan_cached_blocks, ChainState},
                 wallet::ConfirmationsPolicy,
-                AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
+                Account as _, AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
             },
             proto::compact_formats::{ChainMetadata, CompactBlock},
         };
@@ -2744,7 +2837,9 @@ mod tests {
         use zcash_primitives::block::BlockHash;
         use zcash_protocol::consensus::BlockHeight;
 
-        use super::super::{import_accounts, MemoryBlockCache, ScanTaskState};
+        use super::super::{
+            import_accounts, import_accounts_scoped, MemoryBlockCache, ScanTaskState,
+        };
         use crate::{
             derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
             key_source::SeedKeySource,
@@ -2945,6 +3040,72 @@ mod tests {
                 db_path.exists(),
                 "wallet DB must persist on disk after the workspace handle is dropped (resume contract)"
             );
+        }
+
+        #[tokio::test]
+        async fn exact_match_imports_the_actual_high_index_account_only() {
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let config = test_config(tempdir.path().to_owned());
+            let workspace = RecoveryWorkspace::from_runtime(&config).expect("workspace");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
+            workspace
+                .initialize(config.network, seed.expose_secret())
+                .unwrap();
+            let transparent_account =
+                legacy_transparent_account_key(&test_seed_phrase(), config.network).unwrap();
+            let account = crate::derivation::derive_exact_account_from_seed(
+                seed.expose_secret(),
+                config.network,
+                511,
+            )
+            .unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts_scoped(
+                &workspace,
+                config.network,
+                seed.expose_secret(),
+                &test_birthday(),
+                None,
+                std::slice::from_ref(&account),
+                &state,
+            )
+            .await
+            .unwrap();
+
+            let db = crate::workspace::open_wallet_db(
+                workspace.wallet_db_path(),
+                consensus_network(config.network),
+            )
+            .unwrap();
+            let fingerprint =
+                zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
+            let exact = zcash_client_backend::data_api::Zip32Derivation::new(
+                fingerprint,
+                zip32::AccountId::try_from(511).unwrap(),
+            );
+            let zero = zcash_client_backend::data_api::Zip32Derivation::new(
+                fingerprint,
+                zip32::AccountId::ZERO,
+            );
+            let imported = db
+                .get_derived_account(&exact)
+                .unwrap()
+                .expect("account 511");
+            assert!(db.get_derived_account(&zero).unwrap().is_none());
+            let legacy_pubkey = crate::derivation::legacy_transparent_pubkey(
+                &transparent_account,
+                crate::models::AddressScope::External,
+                511,
+            )
+            .unwrap();
+            let legacy_address =
+                zcash_transparent::address::TransparentAddress::from_pubkey(&legacy_pubkey);
+            let receivers = db
+                .get_transparent_receivers(imported.id(), true, true)
+                .unwrap();
+            assert!(!receivers.contains_key(&legacy_address));
+            assert_eq!(state.lock().await.tracked_accounts.len(), 1);
+            assert_eq!(state.lock().await.tracked_accounts[0].derived.index, 511);
         }
 
         #[tokio::test]
