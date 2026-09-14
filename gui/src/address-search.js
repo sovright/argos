@@ -76,16 +76,36 @@ document.addEventListener("DOMContentLoaded", () => {
     seedList.querySelectorAll("input, textarea").forEach((input) => { input.value = ""; });
   }
 
+  function updateProfileScope() {
+    const target = byId("address-search-target").value.trim();
+    const transparent = !target || /^(t1|tm)/.test(target);
+    const fixedAccount = transparent && byId("address-search-profile").value === "zecwallet_lite";
+    byId("address-search-account-start").disabled = fixedAccount;
+    byId("address-search-account-count").disabled = fixedAccount;
+    if (fixedAccount) {
+      byId("address-search-account-start").value = "0";
+      byId("address-search-account-count").value = "1";
+    }
+    byId("address-search-profile-note").textContent = fixedAccount
+      ? "ZecWallet Lite: search receive-address indices in account 0. Every index in your range is checked, even after unused addresses. Change addresses are optional under Advanced."
+      : "Search the selected account and address/diversifier ranges. Every index is checked; unused addresses do not stop the search. Account and change settings are under Advanced.";
+  }
+  byId("address-search-profile").addEventListener("change", updateProfileScope);
+  byId("address-search-target").addEventListener("input", updateProfileScope);
+
   function resetForm() {
     clearSecrets();
     seedList.replaceChildren();
     addSeedRow();
     form.reset();
+    byId("address-search-profile").value = "zecwallet_lite";
+    byId("address-search-advanced").open = false;
     byId("address-search-account-start").value = "0";
     byId("address-search-account-count").value = "1";
     byId("address-search-index-start").value = "0";
-    byId("address-search-index-count").value = "20";
-    byId("address-search-change").checked = true;
+    byId("address-search-index-count").value = "1000";
+    byId("address-search-change").checked = false;
+    updateProfileScope();
     setFormStatus("");
   }
 

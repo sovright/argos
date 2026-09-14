@@ -16,7 +16,10 @@ stop. This is address discovery, not a balance scan.
 | Orchard receiver inside a UA | ZIP32 Orchard `m/32'/coin_type'/account'` | Account, external/internal scope, diversifier index |
 
 Mainnet coin type is 133; testnet is 1. The **ZecWallet Lite** preset fixes
-transparent account 0. **Advanced BIP44 accounts** enables other transparent
+transparent account 0. The GUI defaults to receive indices 0–999, with a
+configurable start and count. Change/internal scanning is off by default.
+Other accounts and change scanning are available under **Advanced**. The
+**Advanced BIP44 accounts** profile enables other transparent
 accounts; shielded derivation remains ZIP32. A profile is a search scope, not
 an assertion that a particular wallet generated the target.
 

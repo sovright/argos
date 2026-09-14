@@ -876,14 +876,20 @@
             <span class="address-search-step">3</span>
             <div class="address-search-section-body">
               <h3>Where to look</h3>
+              <p id="address-search-profile-note" class="scope-note">ZecWallet Lite: search receive-address indices in account 0. Every index in your range is checked, even after unused addresses.</p>
               <div class="address-search-options">
-                <label class="field"><span>Wallet derivation</span><select id="address-search-profile"><option value="zecwallet_lite">ZecWallet Lite</option><option value="bip44">Advanced BIP44 accounts</option></select></label>
-                <label class="field"><span>First account</span><input id="address-search-account-start" type="number" min="0" max="2147483647" step="1" value="0" required /></label>
-                <label class="field"><span>Accounts to check</span><input id="address-search-account-count" type="number" min="1" max="1000" step="1" value="1" required /></label>
                 <label class="field"><span>First address / diversifier index</span><input id="address-search-index-start" type="number" min="0" max="2147483647" step="1" value="0" required /></label>
-                <label class="field"><span>Indexes per selected scope</span><input id="address-search-index-count" type="number" min="1" max="10000" step="1" value="20" required /></label>
+                <label class="field"><span>Indexes to check</span><input id="address-search-index-count" type="number" min="1" max="10000" step="1" value="1000" required /></label>
               </div>
-              <label class="checkline"><input id="address-search-change" type="checkbox" checked /><span>Also check internal/change scope (transparent and Orchard)</span></label>
+              <details id="address-search-advanced">
+                <summary>Advanced: other accounts and change addresses</summary>
+                <div class="address-search-options">
+                  <label class="field"><span>Wallet derivation</span><select id="address-search-profile"><option value="zecwallet_lite">ZecWallet Lite</option><option value="bip44">Advanced BIP44 accounts</option></select></label>
+                  <label class="field"><span>First account</span><input id="address-search-account-start" type="number" min="0" max="2147483647" step="1" value="0" required /></label>
+                  <label class="field"><span>Accounts to check</span><input id="address-search-account-count" type="number" min="1" max="1000" step="1" value="1" required /></label>
+                </div>
+                <label class="checkline"><input id="address-search-change" type="checkbox" /><span>Also check internal/change scope (transparent and Orchard)</span></label>
+              </details>
               <p class="scope-note"><strong>Search scope:</strong> Sapling matching checks external addresses only. Orchard and transparent matching can also check internal/change scope. ZecWallet Lite transparent matching uses account 0; Advanced BIP44 can search transparent account ranges. Wallets can use other paths, accounts, indexes, passphrases, or imported keys.</p>
             </div>
           </div>

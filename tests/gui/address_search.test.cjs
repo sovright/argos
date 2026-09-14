@@ -43,6 +43,7 @@ function harness(invoke) {
     "address-search-live-matches", "address-search-matches", "address-search-outcome", "address-search-limitation",
     "open-address-search", "close-address-search", "address-search-clear", "add-address-search-seed", "address-search-again",
     "address-search-new", "cancel-address-search", "start-address-search",
+    "address-search-advanced", "address-search-profile-note",
   ];
   const elements = new Map(ids.map((id) => [id, new Element()]));
   elements.get("address-search-form").tagName = "FORM";
@@ -210,4 +211,36 @@ test("range ends, work cap, and ZecWallet Lite transparent scope reject without 
   assert.match(el("address-search-form-status").textContent, /account 0 only/);
   assert.equal(words.value, original);
   assert.equal(starts, 0);
+});
+
+
+test("ZecWallet Lite defaults to 1000 receive indices and unlocks accounts only for advanced coverage", async () => {
+  const calls = [];
+  const { el } = harness(async (command, args) => {
+    calls.push([command, args]);
+    if (command === "start_address_search") return { id: "opaque-search-1" };
+    if (command === "get_address_search") return snapshot();
+    return null;
+  });
+  await el("open-address-search").fire("click");
+  assert.equal(el("address-search-index-count").value, "1000");
+  assert.equal(el("address-search-change").checked, false);
+  assert.equal(el("address-search-account-start").disabled, true);
+  assert.equal(el("address-search-account-count").disabled, true);
+  assert.equal(el("address-search-advanced").open, false);
+  el("address-search-profile").value = "bip44";
+  await el("address-search-profile").fire("change");
+  assert.equal(el("address-search-account-start").disabled, false);
+  el("address-search-account-start").value = "5";
+  el("address-search-account-count").value = "10";
+  el("address-search-profile").value = "zecwallet_lite";
+  await el("address-search-profile").fire("change");
+  assert.equal(el("address-search-account-start").value, "0");
+  assert.equal(el("address-search-account-count").value, "1");
+  el("address-search-target").value = PUBLIC_MATCH.address;
+  el("address-search-network").value = "mainnet";
+  el("address-search-seeds").children[0].querySelector(".candidate-seed-words").value = "synthetic fixture";
+  await el("address-search-form").fire("submit");
+  const input = calls.find(([cmd]) => cmd === "start_address_search")[1].input;
+  assert.deepEqual([input.account_start, input.account_count, input.index_start, input.index_count, input.include_change], [0, 1, 0, 1000, false]);
 });

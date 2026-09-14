@@ -520,6 +520,28 @@ mod tests {
         assert!(service.matched_seed(&id, &found.id).is_err());
     }
     #[test]
+    fn zecwallet_lite_finds_receive_index_997_without_account_expansion() {
+        let service = AddressSearchService::default();
+        let mut input = request(target(0, 997, AddressScope::External));
+        input.profile = SearchProfile::ZecwalletLite;
+        input.account_start = 0;
+        input.account_count = 1;
+        input.index_count = 1000;
+        input.include_change = false;
+        let id = service.start(input).unwrap();
+        let result = terminal(&service, &id);
+        assert!(matches!(result.status, SearchStatus::Complete));
+        assert_eq!(result.checked, 1000);
+        assert_eq!(result.matches.len(), 1);
+        let found = &result.matches[0];
+        assert_eq!(found.account, 0);
+        assert_eq!(found.scope, AddressScope::External);
+        assert_eq!(found.index, 997);
+        assert_eq!(found.path, "m/44'/133'/0'/0/997");
+        service.release(&id).unwrap();
+    }
+
+    #[test]
     fn cancellation_holds_registration_until_worker_stops() {
         let service = AddressSearchService::default();
         let target = target(3, 127, AddressScope::Internal);
