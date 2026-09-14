@@ -281,3 +281,9 @@ For the corresponding internal Sapling matched-recovery check, use the test
 filter `internal_sapling_match_recovers_and_sweeps_mined_note` with the same
 command. It funds an internal receiver at account 4 and a nonzero diversifier,
 then requires the sweep to be mined. Both tests use public synthetic seeds.
+
+For ordinary seed recovery without known-address discovery, use the test
+filter `automatic_transparent_range_recovers_low_and_high_indices`. It funds
+account-0 receive indices 7 and 997, scans one shielded account with the default
+transparent range, and checks that the mined sweep consumes both addresses'
+UTXOs. The explicit range must survive resume before sweeping.

@@ -16,7 +16,7 @@ use zcash_protocol::local_consensus::LocalNetwork;
 use crate::{
     error::{ZeckError, ZeckResult},
     key_source::{KeySource, SeedKeySource},
-    models::{RuntimeScanConfig, ZeckNetwork},
+    models::{RuntimeScanConfig, TransparentScanConfig, ZeckNetwork},
 };
 
 /// Filename for the per-workspace session metadata sidecar. Lives next to
@@ -68,10 +68,14 @@ impl RecoveryWorkspace {
     pub fn from_key_source(source: &dyn KeySource, config: &RuntimeScanConfig) -> ZeckResult<Self> {
         let path_component = source.workspace_path_component()?;
 
-        let scope = match config.num_accounts {
-            Some(num_accounts) => format!("accounts-{num_accounts}"),
-            None => format!("auto-gap-{}", config.gap_limit),
-        };
+        if let Some(range) = config.transparent_scan {
+            range.validate()?;
+        }
+        let scope = scan_scope_segment(
+            config.num_accounts,
+            config.gap_limit,
+            config.transparent_scan,
+        );
 
         let workspace_id =
             derive_workspace_id(config.network, &path_component, config.birthday, &scope);
@@ -486,6 +490,8 @@ pub struct SessionMetadata {
     /// and optional BIP-39 passphrase are deliberately never persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_coordinates: Option<crate::address_match_recovery::MatchCoordinates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_scan: Option<TransparentScanConfig>,
 }
 
 impl SessionMetadata {
@@ -505,7 +511,13 @@ impl SessionMetadata {
             last_run_at_epoch_seconds: now_epoch_seconds,
             completed: false,
             match_coordinates: None,
+            transparent_scan: None,
         }
+    }
+
+    pub fn with_transparent_scan(mut self, range: Option<TransparentScanConfig>) -> Self {
+        self.transparent_scan = range;
+        self
     }
 
     pub fn with_match_coordinates(
@@ -531,6 +543,8 @@ pub struct IncompleteSession {
     pub last_run_at_epoch_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_coordinates: Option<crate::address_match_recovery::MatchCoordinates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_scan: Option<TransparentScanConfig>,
 }
 
 fn session_path(workspace_root: &Path) -> PathBuf {
@@ -736,6 +750,11 @@ fn try_build_incomplete_row(
         target_height,
         last_run_at_epoch_seconds: last_run_at,
         match_coordinates,
+        // Scope in the hashed workspace path is authoritative, including when
+        // an older session has no sidecar or the sidecar is incomplete.
+        transparent_scan: parse_workspace_keying(workspace_path)
+            .ok()?
+            .transparent_scan,
     })
 }
 
@@ -789,10 +808,34 @@ pub fn verify_key_source_for_workspace(
 }
 
 fn scope_segment(keying: &WorkspaceKeying) -> String {
-    match keying.num_accounts {
-        Some(num_accounts) => format!("accounts-{num_accounts}"),
-        None => format!("auto-gap-{}", keying.gap_limit),
+    scan_scope_segment(
+        keying.num_accounts,
+        keying.gap_limit,
+        keying.transparent_scan,
+    )
+}
+
+fn scan_scope_segment(
+    accounts: Option<u32>,
+    gap: u32,
+    range: Option<TransparentScanConfig>,
+) -> String {
+    let mut scope = match accounts {
+        Some(count) => format!("accounts-{count}"),
+        None => format!("auto-gap-{gap}"),
+    };
+    if let Some(range) = range {
+        let branch = if range.include_change {
+            "both"
+        } else {
+            "receive"
+        };
+        scope.push_str(&format!(
+            "-transparent-{}-{}-{branch}",
+            range.index_start, range.index_count
+        ));
     }
+    scope
 }
 
 /// Layout: `<data_dir>/<network>/workspace-<id>/birthday-N/<scope>`. The
@@ -826,6 +869,7 @@ pub struct WorkspaceKeying {
     pub birthday: u32,
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
+    pub transparent_scan: Option<TransparentScanConfig>,
 }
 
 pub fn parse_workspace_keying(workspace_path: &Path) -> ZeckResult<WorkspaceKeying> {
@@ -864,6 +908,36 @@ pub fn parse_workspace_keying(workspace_path: &Path) -> ZeckResult<WorkspaceKeyi
             ZeckError::InvalidConfig(format!("malformed birthday segment {birthday_seg:?}"))
         })?;
 
+    let (scope, transparent_scan) = if let Some((base, range)) = scope.split_once("-transparent-") {
+        let mut parts = range.split('-');
+        let malformed = || ZeckError::InvalidConfig("malformed transparent scan scope".to_owned());
+        let index_start = parts
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(malformed)?;
+        let index_count = parts
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(malformed)?;
+        let include_change = match parts.next() {
+            Some("receive") => false,
+            Some("both") => true,
+            _ => return Err(malformed()),
+        };
+        if parts.next().is_some() {
+            return Err(malformed());
+        }
+        let range = TransparentScanConfig {
+            index_start,
+            index_count,
+            include_change,
+        };
+        range.validate()?;
+        (base, Some(range))
+    } else {
+        (scope.as_str(), None)
+    };
+
     // Two scope shapes: `auto-gap-N` (gap_limit driven) or `accounts-N`
     // (explicit num_accounts). These are exclusive; pick whichever matches.
     let (num_accounts, gap_limit) = if let Some(rest) = scope.strip_prefix("auto-gap-") {
@@ -890,6 +964,7 @@ pub fn parse_workspace_keying(workspace_path: &Path) -> ZeckResult<WorkspaceKeyi
         birthday,
         num_accounts,
         gap_limit,
+        transparent_scan,
     })
 }
 
@@ -997,6 +1072,7 @@ mod tests {
             birthday,
             num_accounts,
             gap_limit,
+            transparent_scan: None,
             lightwalletd_url: "https://example.invalid:443".to_owned(),
             data_dir: PathBuf::from("/tmp/zeck-test-data"),
             network,
@@ -1232,6 +1308,81 @@ mod tests {
     }
 
     #[test]
+    fn transparent_range_is_part_of_workspace_identity_and_resume_keying() {
+        let legacy = runtime_config(SEED);
+        let legacy_workspace = RecoveryWorkspace::from_runtime(&legacy).unwrap();
+        assert_eq!(
+            parse_workspace_keying(legacy_workspace.root())
+                .unwrap()
+                .transparent_scan,
+            None
+        );
+        let ranges = [
+            TransparentScanConfig::default(),
+            TransparentScanConfig {
+                index_start: 900,
+                index_count: 100,
+                include_change: false,
+            },
+            TransparentScanConfig {
+                index_start: 900,
+                index_count: 100,
+                include_change: true,
+            },
+        ];
+        let mut paths = std::collections::HashSet::new();
+        for range in ranges {
+            let mut config = legacy.clone();
+            config.transparent_scan = Some(range);
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            assert_ne!(workspace.root(), legacy_workspace.root());
+            assert!(paths.insert(workspace.root().to_owned()));
+            let keying = parse_workspace_keying(workspace.root()).unwrap();
+            assert_eq!(keying.transparent_scan, Some(range));
+            assert_eq!(keying.num_accounts, config.num_accounts);
+            verify_key_source_for_workspace(workspace.root(), config.key_source.as_ref()).unwrap();
+            let mut resumed = config.clone();
+            resumed.transparent_scan = keying.transparent_scan;
+            assert_eq!(
+                RecoveryWorkspace::from_runtime(&resumed).unwrap().root(),
+                workspace.root()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_transparent_workspace_ranges_are_rejected() {
+        for scope in [
+            "accounts-1-transparent-0-0-receive",
+            "accounts-1-transparent-2147483647-2-receive",
+            "accounts-1-transparent-0-10001-receive",
+            "accounts-1-transparent-0-1000-other",
+            "accounts-1-transparent-0-1000-both-extra",
+        ] {
+            let path = PathBuf::from("/tmp/data/mainnet/workspace-id/birthday-3280000").join(scope);
+            assert!(parse_workspace_keying(&path).is_err(), "{scope}");
+        }
+    }
+
+    #[test]
+    fn transparent_range_metadata_is_public_and_legacy_metadata_still_loads() {
+        let range = TransparentScanConfig {
+            index_start: 997,
+            index_count: 12,
+            include_change: true,
+        };
+        let meta =
+            SessionMetadata::new_in_progress("fixture".into(), ZeckNetwork::Mainnet, 1, None, 0)
+                .with_transparent_scan(Some(range));
+        let mut json = serde_json::to_value(&meta).unwrap();
+        let loaded: SessionMetadata = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(loaded.transparent_scan, Some(range));
+        json.as_object_mut().unwrap().remove("transparent_scan");
+        let old: SessionMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(old.transparent_scan, None);
+    }
+
+    #[test]
     fn parse_workspace_keying_auto_gap() {
         let path =
             PathBuf::from("/tmp/data/mainnet/workspace-deadbeef/birthday-3280000/auto-gap-20");
@@ -1278,6 +1429,7 @@ mod tests {
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,
+            transparent_scan: None,
             lightwalletd_url: "https://example.invalid:443".to_owned(),
             data_dir: data_dir.path().to_owned(),
             network: ZeckNetwork::Mainnet,
@@ -1307,6 +1459,7 @@ mod tests {
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,
+            transparent_scan: None,
             lightwalletd_url: "https://example.invalid:443".to_owned(),
             data_dir: data_dir.path().to_owned(),
             network: ZeckNetwork::Mainnet,
@@ -1322,6 +1475,7 @@ mod tests {
             birthday: 2_500_000,
             num_accounts: None,
             gap_limit: 20,
+            transparent_scan: None,
             lightwalletd_url: "https://example.invalid:443".to_owned(),
             data_dir: data_dir.path().to_owned(),
             network: ZeckNetwork::Mainnet,
@@ -1570,6 +1724,7 @@ mod tests {
             birthday: 3_280_000,
             num_accounts: None,
             gap_limit: 20,
+            transparent_scan: None,
             lightwalletd_url: "https://example.invalid:443".to_owned(),
             data_dir: PathBuf::from("/tmp/zeck-tëst-ñam-日本/data"),
             network: ZeckNetwork::Mainnet,

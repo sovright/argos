@@ -191,6 +191,7 @@ async fn main() {
         birthday: args.birthday,
         num_accounts: args.num_accounts,
         gap_limit: args.gap_limit,
+        transparent_scan: None,
         lightwalletd_url: args.lightwalletd_url,
         data_dir: args.data_dir,
         network: ZeckNetwork::Testnet,

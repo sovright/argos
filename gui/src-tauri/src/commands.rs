@@ -160,6 +160,8 @@ pub struct ScanConfigInput {
     pub lightwalletd_url: String,
     pub data_dir: String,
     pub network: ZeckNetwork,
+    #[serde(default = "argos_core::default_transparent_scan")]
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
     /// User-supplied label for the scan, written to the on-disk session
     /// sidecar so the launch-time "resume an unfinished scan" UI can show
     /// something more recognizable than a fingerprint suffix. Optional —
@@ -177,6 +179,8 @@ pub struct MatchedScanConfigInput {
     pub data_dir: String,
     pub network: ZeckNetwork,
     #[serde(default)]
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
+    #[serde(default)]
     pub label: Option<String>,
 }
 
@@ -189,6 +193,11 @@ pub async fn start_matched_recovery(
     config: MatchedScanConfigInput,
 ) -> Result<ScanHandle, String> {
     ensure_tos_accepted(&app)?;
+    if config.transparent_scan.is_some() {
+        return Err(
+            "matched-address recovery cannot widen its transparent address range".to_owned(),
+        );
+    }
     let snapshot = state
         .address_search
         .snapshot(&search_id)
@@ -223,6 +232,7 @@ pub async fn start_matched_recovery(
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
+                transparent_scan: None,
             },
             key_source,
         )
@@ -504,6 +514,8 @@ pub struct WalletFileScanInput {
     pub lightwalletd_url: String,
     pub data_dir: String,
     pub network: ZeckNetwork,
+    #[serde(default = "argos_core::default_transparent_scan")]
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -574,6 +586,7 @@ pub async fn start_scan_from_wallet_file(
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
+                transparent_scan: config.transparent_scan,
             },
             key_source,
         )
@@ -603,6 +616,7 @@ pub async fn start_scan(
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
+                transparent_scan: config.transparent_scan,
             },
             config.seed,
         )
@@ -1505,6 +1519,7 @@ pub struct SessionRow {
     pub target_height: Option<u32>,
     pub last_run_at_epoch_seconds: Option<i64>,
     pub match_coordinates: Option<argos_core::MatchCoordinates>,
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
 }
 
 impl From<IncompleteSession> for SessionRow {
@@ -1518,6 +1533,7 @@ impl From<IncompleteSession> for SessionRow {
             target_height: s.target_height,
             last_run_at_epoch_seconds: s.last_run_at_epoch_seconds,
             match_coordinates: s.match_coordinates,
+            transparent_scan: s.transparent_scan,
         }
     }
 }
@@ -1599,6 +1615,7 @@ pub async fn resume_session(
         data_dir,
         network: keying.network,
         label,
+        transparent_scan: keying.transparent_scan,
     };
     let metadata = argos_core::workspace::read_session_metadata(&workspace_path)
         .map_err(|err| err.to_string())?;
@@ -1720,6 +1737,54 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_scan_inputs_default_to_the_complete_receive_range() {
+        let seed: ScanConfigInput = serde_json::from_value(serde_json::json!({
+            "seed": "synthetic seed text for serde only",
+            "birthday": 419200,
+            "num_accounts": null,
+            "gap_limit": 20,
+            "lightwalletd_url": "https://fixture.invalid",
+            "data_dir": "/fixture",
+            "network": "mainnet"
+        }))
+        .expect("seed scan input should deserialize");
+        assert_eq!(
+            seed.transparent_scan,
+            argos_core::default_transparent_scan()
+        );
+
+        let wallet: WalletFileScanInput = serde_json::from_value(serde_json::json!({
+            "path": "/fixture/wallet.dat",
+            "passphrase": null,
+            "sapling_keys": [],
+            "birthday": 419200,
+            "num_accounts": null,
+            "gap_limit": 20,
+            "lightwalletd_url": "https://fixture.invalid",
+            "data_dir": "/fixture",
+            "network": "mainnet"
+        }))
+        .expect("wallet-file scan input should deserialize");
+        assert_eq!(
+            wallet.transparent_scan,
+            argos_core::default_transparent_scan()
+        );
+    }
+
+    #[test]
+    fn matched_scan_explicit_null_keeps_the_complete_range_disabled() {
+        let matched: MatchedScanConfigInput = serde_json::from_value(serde_json::json!({
+            "birthday": 419200,
+            "lightwalletd_url": "https://fixture.invalid",
+            "data_dir": "/fixture",
+            "network": "mainnet",
+            "transparent_scan": null
+        }))
+        .expect("matched scan input should deserialize");
+        assert_eq!(matched.transparent_scan, None);
+    }
 
     /// The sidebar version is a support-facing claim about which binary is
     /// running, so it must be a real, non-empty version rather than a

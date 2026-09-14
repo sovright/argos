@@ -6,6 +6,30 @@ network requests. It checks every candidate in the selected ranges, even
 when preceding addresses have no activity; there is no unused-address gap
 stop. This is address discovery, not a balance scan.
 
+## Automatic screening in ordinary recovery
+
+A new seed-based scan automatically checks BIP44 account 0 receive indices
+0–999 for funds, alongside standard wallet receivers. This complete-range
+check is separate from the shielded account count and gap limit: one shielded
+account can still recover transparent funds at index 997. Funded addresses
+are included in the normal shielding and sweep flow.
+
+The GUI's advanced transparent controls and CLI `--transparent-index-start`,
+`--transparent-index-count`, and `--transparent-change` flags adjust this
+additional range. Change scanning is optional; a standard wallet receiver
+outside the additional range can still be tracked by the underlying wallet.
+At most 10,000 indices per branch may be selected. Empty lower indices do not
+stop the scan. Import failures prevent the scan from reporting completion;
+a quick balance probe is preliminary and wallet sync remains authoritative.
+
+The configured range forms part of the hashed workspace identity and is saved
+as public session metadata. Resume reconstructs the range from that identity;
+old workspaces retain their historical derivation mapping. Changing the range
+starts a separate workspace rather than modifying an older scan's scope.
+Known-address discovery remains useful for locating the owning seed or looking
+beyond the automatic range. **Recover this match** stays restricted to its
+verified match rather than enabling the broader automatic scan.
+
 ## Supported derivations
 
 | Target | Derivation | Search coordinates |

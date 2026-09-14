@@ -258,6 +258,7 @@ function goTo(step) {
   });
   const screen = document.querySelector(`.screen[data-step="${step}"]`);
   if (screen) screen.classList.add("active");
+  if (step === "config") updateTransparentScanSettingsVisibility();
 }
 
 // Make sidebar steps clickable — only allow jumping to already-reached steps
@@ -1030,12 +1031,76 @@ function clearMatchedRecoveryUi() {
   $("accounts-range-field").hidden = false;
   $("auto-gap-limit-field").hidden = false;
   $("gap-limit-row").hidden = false;
+  $("transparent-scan-settings").hidden = false;
 }
 
 function configForMatchedRecovery(config) {
   const { seed: _unused, ...seedless } = config;
-  return { ...seedless, num_accounts: 1, gap_limit: 1 };
+  return { ...seedless, num_accounts: 1, gap_limit: 1, transparent_scan: null };
 }
+
+function transparentScanFromInputs(startRaw, countRaw, includeChange) {
+  const indexStart = Number(startRaw);
+  const indexCount = Number(countRaw);
+  const limit = 2147483648;
+  if (!Number.isSafeInteger(indexStart) || indexStart < 0 || indexStart >= limit) {
+    throw new Error("First transparent index must be a whole number from 0 to 2,147,483,647.");
+  }
+  if (!Number.isSafeInteger(indexCount) || indexCount < 1 || indexCount > 10000) {
+    throw new Error("Transparent indexes to check must be a whole number from 1 to 10,000.");
+  }
+  if (indexStart + indexCount > limit) {
+    throw new Error("The transparent index range must end at or before 2,147,483,647.");
+  }
+  return { index_start: indexStart, index_count: indexCount, include_change: !!includeChange };
+}
+
+function transparentScanSummary(startRaw, countRaw, includeChange) {
+  try {
+    const range = transparentScanFromInputs(startRaw, countRaw, includeChange);
+    const end = range.index_start + range.index_count - 1;
+    const branches = range.include_change ? "receive + change" : "receive";
+    return {
+      valid: true,
+      text: `Seed-based wallets: account 0 ${branches} indices ${range.index_start.toLocaleString()}–${end.toLocaleString()} are checked as an additional complete range.`,
+    };
+  } catch (error) {
+    return { valid: false, text: `Fix the transparent range: ${error.message || error}` };
+  }
+}
+
+function updateTransparentScanSummary() {
+  const summary = transparentScanSummary(
+    $("transparent-index-start").value,
+    $("transparent-index-count").value,
+    $("transparent-include-change").checked,
+  );
+  $("transparent-scan-summary").textContent = summary.text;
+  $("transparent-scan-summary").style.color = summary.valid ? "" : "var(--danger)";
+}
+
+function shouldShowTransparentRange(matched, hasSeed, hasWallet, walletHasMnemonic, hasStandaloneKeys) {
+  if (matched) return false;
+  if (hasSeed) return true;
+  if (hasWallet) return !!walletHasMnemonic;
+  if (hasStandaloneKeys) return false;
+  return true;
+}
+
+function updateTransparentScanSettingsVisibility() {
+  $("transparent-scan-settings").hidden = !shouldShowTransparentRange(
+    !!state.matchedRecovery,
+    !!seedInput.value.trim(),
+    !!walletFile,
+    !!walletFile?.summary?.has_mnemonic,
+    hasSaplingScanKeys(),
+  );
+}
+
+$("transparent-index-start").addEventListener("input", updateTransparentScanSummary);
+$("transparent-index-count").addEventListener("input", updateTransparentScanSummary);
+$("transparent-include-change").addEventListener("change", updateTransparentScanSummary);
+updateTransparentScanSummary();
 
 window.addEventListener("beforeunload", () => {
   // Backend-owned cleanup survives the webview unloading during configuration.
@@ -1077,6 +1142,7 @@ document.addEventListener("address-match-recovery", async (event) => {
     $("accounts-range-field").hidden = true;
     $("auto-gap-limit-field").hidden = true;
     $("gap-limit-row").hidden = true;
+    $("transparent-scan-settings").hidden = true;
     const recoveryScope = retainedMatch.pool === "transparent"
       ? "Transparent recovery scans only the exact matched address."
       : "Shielded recovery scans the matched account, including supported external and internal receivers.";
@@ -1325,6 +1391,23 @@ phrase, or clear the seed phrase to scan the pasted key.",
     return;
   }
 
+  let transparentScan = null;
+  if (shouldShowTransparentRange(
+    !!state.matchedRecovery, !!seedInput.value.trim(), !!walletFile,
+    !!walletFile?.summary?.has_mnemonic, hasTypedSaplingKeys,
+  )) {
+    try {
+      transparentScan = transparentScanFromInputs(
+        $("transparent-index-start").value,
+        $("transparent-index-count").value,
+        $("transparent-include-change").checked,
+      );
+    } catch (err) {
+      setStatus("config-status", `✗ ${err.message || err}`, "error");
+      return;
+    }
+  }
+
   const address = $("destination-input").value.trim();
   if (!address) {
     setStatus("config-status", "A destination Unified Address is required.", "error");
@@ -1375,6 +1458,7 @@ phrase, or clear the seed phrase to scan the pasted key.",
     data_dir: dataDirVal,
     network: $("network-select").value,
     label: labelRaw || defaultScanLabel(),
+    transparent_scan: transparentScan,
   };
   // Store a seed-less copy. The seed is passed to `start_scan` below, but
   // must not persist in JS state for the lifetime of the scan→sweep→complete
@@ -2275,6 +2359,10 @@ $("restart-flow").addEventListener("click", () => {
   $("destination-input").value = "";
   $("max-fee-zec").value = "";
   $("sweep-memo").value = "";
+  $("transparent-index-start").value = "0";
+  $("transparent-index-count").value = "1000";
+  $("transparent-include-change").checked = false;
+  updateTransparentScanSummary();
   // Reset donation form to its default-on state so a previous run's choices
   // don't silently carry into the next sweep. `state.donationEnabled` itself
   // is feature-availability (whether the backend has a baked address) and is
@@ -2526,6 +2614,17 @@ function buildSessionRow(row, onDismiss) {
     matched.className = "session-meta";
     matched.textContent = `Address-match recovery · ${row.match_coordinates.path || "saved derivation path"}`;
     info.appendChild(matched);
+  }
+  if (row.transparent_scan) {
+    const start = Number(row.transparent_scan.index_start);
+    const count = Number(row.transparent_scan.index_count);
+    if (Number.isSafeInteger(start) && Number.isSafeInteger(count) && start >= 0 && count > 0 &&
+        count <= 10000 && start + count <= 2147483648) {
+      const transparent = document.createElement("div");
+      transparent.className = "session-meta";
+      transparent.textContent = `Additional transparent range: account 0 ${row.transparent_scan.include_change ? "receive + change" : "receive"} indices ${start.toLocaleString()}–${(start + count - 1).toLocaleString()}`;
+      info.appendChild(transparent);
+    }
   }
   li.appendChild(info);
 

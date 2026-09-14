@@ -152,6 +152,10 @@ type SweepWalletDb =
 const CONFIRMATION_POLL_INTERVAL_SECS: u64 = 5;
 const CONFIRMATION_POLL_ATTEMPTS: u32 = 24;
 const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
+/// Hard stop for repeated block-space-limited transparent shielding proposals.
+/// Balance must decrease after every confirmed step; this is a second bound
+/// against a pathological stream of newly-arriving UTXOs.
+const MAX_TRANSPARENT_SHIELDING_STEPS: u32 = 10_000;
 
 struct ScanSession {
     state: SharedScanTaskState,
@@ -191,6 +195,16 @@ impl RecoveryService {
     ) -> ZeckResult<ScanHandle> {
         validate_scan_config(&config)?;
 
+        // Imported sources and exact matched-account sources define their own
+        // key set. An unrelated broad BIP-44 range must never be applied to
+        // either route, including when resuming a reused frontend config.
+        let transparent_scan =
+            if key_source.wallet_seed()?.is_none() || key_source.exact_hd_account().is_some() {
+                None
+            } else {
+                config.transparent_scan
+            };
+
         let handle = ScanHandle::new();
         let state = Arc::new(tokio::sync::Mutex::new(ScanTaskState::new(handle.clone())));
         let runtime = RuntimeScanConfig {
@@ -198,6 +212,7 @@ impl RecoveryService {
             birthday: config.birthday,
             num_accounts: config.num_accounts,
             gap_limit: config.gap_limit,
+            transparent_scan,
             lightwalletd_url: config.lightwalletd_url,
             data_dir: config.data_dir,
             network: config.network,
@@ -507,6 +522,9 @@ impl RecoveryService {
 }
 
 fn validate_scan_config(config: &ScanConfig) -> ZeckResult<()> {
+    if let Some(transparent_scan) = &config.transparent_scan {
+        transparent_scan.validate()?;
+    }
     if config.gap_limit == 0 {
         return Err(ZeckError::InvalidConfig(
             "gap limit must be at least 1".to_owned(),
@@ -585,16 +603,25 @@ fn build_sweep_proposal(
         let mut shielded_available = shielded_existing;
 
         if account.transparent_zatoshis > 0 {
-            if account.transparent_zatoshis <= minimum_fee_zatoshis {
+            // ZIP 317 charges at least two logical actions, and each P2PKH
+            // input is one action. Large input sets may be split across
+            // several shielding transactions by the selector; this is the
+            // aggregate input-action estimate, while execution enforces each
+            // proposal's exact fee against the user's cap before broadcast.
+            let shielding_fee_zatoshis = u64::from(MARGINAL_FEE)
+                .checked_mul(u64::from(account.transparent_utxo_count).max(2))
+                .ok_or_else(|| {
+                    ZeckError::Internal("shielding fee estimate overflowed u64".to_owned())
+                })?;
+            if account.transparent_zatoshis <= shielding_fee_zatoshis {
                 skipped_accounts.push(SkippedSweepAccount {
                     account_index: account.account_index,
                     gross_zatoshis: account.transparent_zatoshis,
                     reason: format!(
-                        "Transparent balance is too small to cover the ZIP 317 shielding fee floor of {minimum_fee_zatoshis} zats."
+                        "Transparent balance is too small to cover the estimated ZIP 317 shielding fee of {shielding_fee_zatoshis} zats."
                     ),
                 });
             } else {
-                let shielding_fee_zatoshis = minimum_fee_zatoshis;
                 let shielded_after_step_one = account.transparent_zatoshis - shielding_fee_zatoshis;
                 shielded_available = shielded_available
                     .checked_add(shielded_after_step_one)
@@ -627,7 +654,7 @@ fn build_sweep_proposal(
                     net_zatoshis: shielded_after_step_one,
                     donation_zatoshis: 0,
                     note: format!(
-                        "Estimated shielding step for {} transparent UTXOs before the external sweep.",
+                        "Estimated shielding of {} transparent UTXOs before the external sweep; large input sets may require multiple transactions.",
                         account.transparent_utxo_count
                     ),
                     memo: None,
@@ -838,7 +865,7 @@ async fn execute_sweep_for_session(
     // so a mid-sequence abort still surfaces the records of every transaction
     // already broadcast (audit Issue E) instead of discarding `results`.
     let sweep_result: ZeckResult<()> = async {
-        for tracked_account in tracked_accounts {
+        'accounts: for tracked_account in tracked_accounts {
             let account_total = account_total_zatoshis(
                 &workspace,
                 runtime.network,
@@ -871,14 +898,25 @@ async fn execute_sweep_for_session(
                     ))
                 })?;
 
-            let transparent_balance =
+            let mut transparent_balance =
                 account_transparent_zatoshis(&workspace, runtime.network, &tracked_account)?;
             // Only shield a transparent balance that exceeds the fee floor; a
             // sub-floor (dust) balance can't cover the shielding fee and would
             // hard-fail `propose_shielding`. The dry-run proposal skips it, so
             // execution must too (otherwise the whole sweep aborts). The dust is
             // left unshielded, exactly as the proposal excludes it.
-            if balance_covers_sweep_fee(transparent_balance) {
+            let mut shielding_steps = 0u32;
+            while balance_covers_sweep_fee(transparent_balance) {
+                shielding_steps = shielding_steps.checked_add(1).ok_or_else(|| {
+                    ZeckError::Internal("shielding step count overflowed u32".to_owned())
+                })?;
+                if shielding_steps > MAX_TRANSPARENT_SHIELDING_STEPS {
+                    return Err(ZeckError::TransactionBuild(
+                        format!(
+                            "transparent shielding did not converge within {MAX_TRANSPARENT_SHIELDING_STEPS} transactions"
+                        ),
+                    ));
+                }
                 let shielded_fee = {
                     let mut ctx = SweepStepCtx {
                         workspace: &workspace,
@@ -917,7 +955,7 @@ async fn execute_sweep_for_session(
                     // confirm. A timeout leaves the funds shielded (re-running
                     // the sweep picks them up) and moves on without aborting.
                     if last_account_broadcast_failed(&results, tracked_account.derived.index) {
-                        continue;
+                        continue 'accounts;
                     }
                     let shielded_before = shielded_spendable_zatoshis(
                         &workspace,
@@ -936,7 +974,7 @@ async fn execute_sweep_for_session(
                     )
                     .await?
                     {
-                        continue;
+                        continue 'accounts;
                     }
                     refresh_scan_progress(
                         &session.state,
@@ -945,10 +983,23 @@ async fn execute_sweep_for_session(
                         runtime.birthday.min(chain_tip_height(&mut client).await?),
                     )
                     .await?;
+                    let remaining = account_transparent_zatoshis(
+                        &workspace,
+                        runtime.network,
+                        &tracked_account,
+                    )?;
+                    if remaining >= transparent_balance {
+                        return Err(ZeckError::TransactionBuild(format!(
+                            "account {} transparent balance did not decrease after confirmed shielding",
+                            tracked_account.derived.index
+                        )));
+                    }
+                    transparent_balance = remaining;
                 } else {
                     // Shielding returned None: the account has transparent funds
                     // above the fee floor that propose_shielding couldn't select.
                     transparent_unshieldable = true;
+                    break;
                 }
             }
 
@@ -1181,23 +1232,8 @@ async fn execute_shielding_step(
         ctx.max_fee_zatoshis,
     )?;
 
-    let mut standalone_keys = HashMap::new();
-    standalone_keys.insert(
-        tracked_account.transparent_receivers[0],
-        vec![legacy_transparent_secret_key(
-            transparent_account,
-            crate::models::AddressScope::External,
-            tracked_account.derived.index,
-        )?],
-    );
-    standalone_keys.insert(
-        tracked_account.transparent_receivers[1],
-        vec![legacy_transparent_secret_key(
-            transparent_account,
-            crate::models::AddressScope::Internal,
-            tracked_account.derived.index,
-        )?],
-    );
+    let standalone_keys =
+        standalone_transparent_signing_keys(tracked_account, transparent_account)?;
     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
         &mut wallet_db,
         &consensus_network(ctx.network),
@@ -1225,6 +1261,24 @@ async fn execute_shielding_step(
     .await?;
 
     Ok(Some(fee_zatoshis))
+}
+
+fn standalone_transparent_signing_keys(
+    tracked_account: &TrackedAccount,
+    transparent_account: &zcash_transparent::keys::AccountPrivKey,
+) -> ZeckResult<HashMap<zcash_transparent::address::TransparentAddress, Vec<secp256k1::SecretKey>>>
+{
+    let mut keys = HashMap::new();
+    for coordinate in &tracked_account.transparent_key_coordinates {
+        keys.entry(coordinate.address)
+            .or_insert_with(Vec::new)
+            .push(legacy_transparent_secret_key(
+                transparent_account,
+                coordinate.scope,
+                coordinate.index,
+            )?);
+    }
+    Ok(keys)
 }
 
 /// Build a two-output proposal that splits the full account balance between a
@@ -2103,17 +2157,73 @@ fn assemble_imported_sweep_outcome(
 
 #[cfg(test)]
 mod tests {
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
 
-    use super::{build_sweep_proposal, is_distinct_lightwalletd_endpoint};
+    use super::{
+        build_sweep_proposal, is_distinct_lightwalletd_endpoint,
+        standalone_transparent_signing_keys,
+    };
     use crate::{
+        derivation::{
+            legacy_transparent_account_key, mnemonic_seed, transparent_address_from_seed,
+        },
         derive_accounts,
         error::ZeckError,
         models::{
-            AccountBalancePreview, ProposedTxKind, ScanHandle, ScanPhase, ScanProgress,
-            SweepRequest, ZeckNetwork,
+            AccountBalancePreview, AddressScope, ProposedTxKind, ScanHandle, ScanPhase,
+            ScanProgress, SweepRequest, ZeckNetwork,
         },
+        scan::{TrackedAccount, TrackedTransparentKey},
     };
+
+    #[test]
+    fn transparent_range_signer_map_controls_every_coordinate() {
+        let phrase = SecretString::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
+        );
+        let seed = mnemonic_seed(&phrase).unwrap();
+        let account_key = legacy_transparent_account_key(&phrase, ZeckNetwork::Mainnet).unwrap();
+        let derived = derive_accounts(&phrase, ZeckNetwork::Mainnet, 1)
+            .unwrap()
+            .remove(0);
+        let mut coordinates = Vec::new();
+        for index in [997, 998] {
+            for scope in [AddressScope::External, AddressScope::Internal] {
+                coordinates.push(TrackedTransparentKey {
+                    address: transparent_address_from_seed(
+                        ZeckNetwork::Mainnet,
+                        seed.expose_secret(),
+                        0,
+                        scope,
+                        index,
+                    )
+                    .unwrap(),
+                    scope,
+                    index,
+                });
+            }
+        }
+        let tracked = TrackedAccount {
+            wallet_account_id: zcash_client_sqlite::AccountUuid::default(),
+            derived,
+            transparent_receivers: coordinates.iter().map(|key| key.address).collect(),
+            transparent_key_coordinates: coordinates.clone(),
+        };
+        let signer_map = standalone_transparent_signing_keys(&tracked, &account_key).unwrap();
+        assert_eq!(signer_map.len(), coordinates.len());
+        let secp = secp256k1::Secp256k1::signing_only();
+        for coordinate in coordinates {
+            let secrets = signer_map
+                .get(&coordinate.address)
+                .expect("coordinate signer");
+            assert_eq!(secrets.len(), 1);
+            let public = secp256k1::PublicKey::from_secret_key(&secp, &secrets[0]);
+            assert_eq!(
+                zcash_transparent::address::TransparentAddress::from_pubkey(&public),
+                coordinate.address
+            );
+        }
+    }
 
     #[test]
     fn equivalent_lightwalletd_urls_are_not_distinct_confirmation_sources() {

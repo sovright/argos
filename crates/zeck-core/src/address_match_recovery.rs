@@ -426,6 +426,7 @@ mod tests {
             birthday: 1,
             num_accounts: Some(1),
             gap_limit: 1,
+            transparent_scan: None,
             lightwalletd_url: "https://example.invalid".to_owned(),
             data_dir: temp.path().to_owned(),
             network: ZeckNetwork::Testnet,

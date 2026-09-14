@@ -94,6 +94,18 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     gap_limit: u32,
 
+    /// First index in the additional complete transparent range for HD seed sources.
+    #[arg(long, default_value_t = 0)]
+    transparent_index_start: u32,
+
+    /// Number of indices in the additional complete transparent range (default: 0–999).
+    #[arg(long, default_value_t = 1000)]
+    transparent_index_count: u32,
+
+    /// Also scan the transparent change branch for HD seed sources.
+    #[arg(long)]
+    transparent_change: bool,
+
     /// Wallet birthday as a block height. Use 0 for a full scan from genesis.
     #[arg(long, default_value_t = 419_200)]
     birthday: u32,
@@ -137,6 +149,20 @@ impl From<NetworkArg> for ZeckNetwork {
             NetworkArg::Testnet => ZeckNetwork::Testnet,
         }
     }
+}
+
+fn transparent_scan_config(
+    index_start: u32,
+    index_count: u32,
+    include_change: bool,
+) -> Result<argos_core::TransparentScanConfig> {
+    let config = argos_core::TransparentScanConfig {
+        index_start,
+        index_count,
+        include_change,
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 #[derive(Debug, Subcommand)]
@@ -1351,6 +1377,11 @@ async fn main() -> Result<()> {
                         data_dir: cli.data_dir.clone(),
                         network,
                         label: String::new(),
+                        transparent_scan: Some(transparent_scan_config(
+                            cli.transparent_index_start,
+                            cli.transparent_index_count,
+                            cli.transparent_change,
+                        )?),
                     },
                     key_source.clone(),
                 )
@@ -1403,6 +1434,11 @@ async fn main() -> Result<()> {
                         data_dir: cli.data_dir.clone(),
                         network,
                         label: String::new(),
+                        transparent_scan: Some(transparent_scan_config(
+                            cli.transparent_index_start,
+                            cli.transparent_index_count,
+                            cli.transparent_change,
+                        )?),
                     },
                     key_source.clone(),
                 )

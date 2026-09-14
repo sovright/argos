@@ -514,6 +514,20 @@
               </label>
             </div>
 
+            <div id="transparent-scan-settings" class="span-two">
+              <p class="form-section-heading">Transparent addresses</p>
+              <p class="scope-note" id="transparent-scan-summary">Seed-based wallets: account 0 receive indices 0–999 are checked automatically as an additional complete range.</p>
+              <details>
+                <summary>Advanced: change the transparent address range</summary>
+                <div class="address-search-options">
+                  <label class="field"><span>First transparent index</span><input id="transparent-index-start" type="number" min="0" max="2147483647" step="1" value="0" /></label>
+                  <label class="field"><span>Transparent indexes to check</span><input id="transparent-index-count" type="number" min="1" max="10000" step="1" value="1000" /></label>
+                </div>
+                <label class="checkline"><input id="transparent-include-change" type="checkbox" /><span>Also check transparent change addresses</span></label>
+                <small>This additional complete-range scan checks every selected index without stopping at unused addresses. Use a larger or shifted range only if needed.</small>
+              </details>
+            </div>
+
             <p class="form-section-heading span-two">Server</p>
 
             <label class="field">

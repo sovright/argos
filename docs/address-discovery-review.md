@@ -37,7 +37,23 @@ or an independent security audit.
   and pasted-key inputs; it fixes the network and hides irrelevant account-gap
   controls. The backend also fixes matched scan scope.
 
+- **Ordinary recovery missed higher transparent indices:** new seed scans
+  register the complete configured account-0 receive range, optionally change,
+  independently of shielded account depth. The sweep uses public derivation
+  coordinates to reconstruct every standalone signing key, rather than assuming
+  two positional receivers per account. Raw keys are not stored in metadata.
+- **Range changes mixed incompatible workspaces:** the range is part of the
+  workspace identity. Resume restores the saved scope; older workspaces keep
+  their original account/transparent mapping. Exact-match recovery cannot be
+  widened through these controls.
+
 ## Validation and remaining limits
+
+The automatic-range update passes 587 workspace tests (17 ignored) and 16 GUI
+interaction tests, with workspace and funded-regtest compilation checked by
+Clippy with warnings denied. Default-range registration, two-account ownership,
+mid-registration cancellation followed by resume, range identity, and signing
+coordinates are covered by offline tests.
 
 Regression tests cover nonzero transparent account/change indices beyond a
 standard gap, multiple passphrase candidates, cancellation, range and network
@@ -67,3 +83,8 @@ and mined transaction acceptance using the existing Docker harness. These are
 backend integration tests, not a substitute
 for the requested native GUI funded-flow check. The local Docker daemon did
 not respond during this review, so funded execution remains unverified.
+
+An additional ignored funded regression covers normal seed recovery at indices
+7 and 997 without a known-address search. It checks both addresses' UTXOs
+before and after the mined sweep. This harness test must be executed along
+with native GUI qualification before claiming funded end-to-end validation.
