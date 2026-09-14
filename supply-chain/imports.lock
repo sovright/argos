@@ -169,8 +169,8 @@ user-login = "briansmith"
 user-name = "Brian Smith"
 
 [[publisher.rustls]]
-version = "0.23.37"
-when = "2026-02-24"
+version = "0.23.39"
+when = "2026-04-22"
 user-id = 209038
 user-login = "cpu"
 user-name = "Daniel McCarney"

@@ -54,7 +54,7 @@ pczt = { version = "0.9.1", default-features = false, features = ["prover", "sig
 prost = "0.14.3"
 rand_core = "0.6.4"
 rusqlite = "0.37.0"
-rustls = { version = "0.23.37", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 secp256k1 = "0.29.1"
 secrecy = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }

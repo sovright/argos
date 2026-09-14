@@ -16,6 +16,18 @@ The NEON backend is rewritten from 4-block to 8-block outer batches, following O
 
 No changes to key or nonce handling, counter semantics, or the round function."""
 
+[[audits.rustls]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.23.39 -> 0.23.45"
+notes = "Reviewed complete source delta: offered-suite and transport checks, HRR PSK/suite consistency, deframer handshake alignment, signature-scheme filtering, malformed OCSP/ticket handling, ECH authentication and padding, bounded ticket requests, zeroizing DER, and key-log permissions. No new unsafe code or build-script behavior. Optional AWS-LC changes inspected; dependencies audited separately. Source review only; upstream tests not executed. See docs/dependency-review-rustls-2026-09.md."
+
+[[audits.rustls-webpki]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.103.13 -> 0.103.15"
+notes = "Reviewed the complete published source delta: CRL serial lookup propagates identical errors via ?, AWS-LC FIPS reporting uses try_fips_mode, and ML-DSA exports move to the stable AWS-LC feature. No changes to algorithm identifiers or ring verification bindings. Argos uses ring; optional AWS-LC behavior was inspected but not executed. Review scope and validation limits are documented in docs/dependency-review-rustls-2026-09.md."
+
 [[trusted.bellman]]
 criteria = "safe-to-deploy"
 user-id = 6289 # Jack Grigg (str4d)
