@@ -3633,6 +3633,22 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     mining.abort();
     let outcome = outcome.expect("range sweep timed out").unwrap();
     assert!(
+        outcome.error.is_none(),
+        "sweep must fully finish: {:?}",
+        outcome.error
+    );
+    assert!(
+        outcome.skipped_accounts.is_empty(),
+        "funded range must not be skipped"
+    );
+    assert!(
+        outcome
+            .transactions
+            .iter()
+            .any(|tx| tx.detail.starts_with("sweep transaction") && tx.txid.is_some()),
+        "consuming transparent inputs through shielding alone is not a completed recovery"
+    );
+    assert!(
         !outcome.transactions.is_empty(),
         "range sweep must broadcast"
     );
