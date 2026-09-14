@@ -15,13 +15,15 @@ or an independent security audit.
 - **False Unified Address ownership:** receivers are decoded and compared
   independently. Results identify the matched pool and explain that other
   receivers may belong to different keys.
-- **Incorrect Sapling internal labels:** Sapling discovery checks external
-  diversifiers only; internal searches cannot return an external receiver with
-  an internal label. The excluded scope is documented in the GUI.
+- **Incorrect Sapling internal labels:** Sapling discovery derives external and internal
+  viewing keys separately and verifies the exact scope/index during handoff.
+  Imported Sapling sweeping selects proof authority by each note recipient
+  and rejects unknown or missing recipient scope.
 - **Secret retention during close and handoff:** form inputs clear on
   submission/close, pending start responses have a stale-response guard, and
-  close waits for cancellation before releasing the retained job. Backend
-  handoff cleanup continues independently of the GUI. Search input types do
+  close waits for cancellation before releasing the retained job. Search results remain available for sequential recovery, with recovery actions
+  locked while another recovery is active. Explicit close releases the search
+  independently of the active recovery key source. Search input types do
   not implement serialization or debug formatting.
 - **Unbounded worker creation:** the backend registers only one retained
   search, enforces candidate/range/work limits, and keeps that registration
@@ -29,7 +31,8 @@ or an independent security audit.
 - **Lost resume provenance:** session metadata carries public coordinates and
   matched scans fail if their initial metadata cannot be written. Resume
   requires the mnemonic/passphrase combination to reproduce the address and
-  the workspace fingerprint.
+  the workspace fingerprint. A mismatch explicitly asks users to check the
+  seed and case-sensitive BIP39 passphrase, separate from the wallet password.
 - **Stale wizard inputs:** selecting a match clears previous seed, wallet-file,
   and pasted-key inputs; it fixes the network and hides irrelevant account-gap
   controls. The backend also fixes matched scan scope.
@@ -57,3 +60,10 @@ wallet metadata, which still deserve privacy when sharing diagnostics.
 
 Coverage exclusions and exact search bounds are documented in
 [address-discovery-profiles.md](address-discovery-profiles.md).
+
+Ignored funded regtest regressions exercise transparent index 997 and
+Sapling internal-address matching, exact-key/account recovery, sweep proposal,
+and mined transaction acceptance using the existing Docker harness. These are
+backend integration tests, not a substitute
+for the requested native GUI funded-flow check. The local Docker daemon did
+not respond during this review, so funded execution remains unverified.

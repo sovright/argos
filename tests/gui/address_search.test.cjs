@@ -48,16 +48,38 @@ function harness(invoke) {
   const elements = new Map(ids.map((id) => [id, new Element()]));
   elements.get("address-search-form").tagName = "FORM";
   const dispatched = [];
+  const documentListeners = {};
   const document = {
     getElementById: (id) => elements.get(id),
     createElement: (tag) => new Element(tag),
-    addEventListener: (type, fn) => { if (type === "DOMContentLoaded") fn(); },
-    dispatchEvent: (event) => dispatched.push(event),
+    addEventListener: (type, fn) => {
+      if (type === "DOMContentLoaded") fn();
+      else (documentListeners[type] ||= []).push(fn);
+    },
+    dispatchEvent: (event) => {
+      dispatched.push(event);
+      for (const fn of documentListeners[event.type] || []) fn(event);
+    },
   };
   class CustomEvent { constructor(type, options) { this.type = type; this.detail = options.detail; } }
-  const window = { __TAURI__: { core: { invoke } }, addEventListener() {}, setTimeout: () => 1, clearTimeout() {} };
-  vm.runInNewContext(fs.readFileSync("gui/src/address-search.js", "utf8"), { document, window, CustomEvent, console });
-  return { el: (id) => elements.get(id), dispatched };
+  const timers = [];
+  const window = {
+    __TAURI__: { core: { invoke } }, addEventListener() {},
+    setTimeout: (fn) => { timers.push(fn); return timers.length; },
+    clearTimeout: (id) => { if (id > 0) timers[id - 1] = null; },
+  };
+  vm.runInNewContext(fs.readFileSync("gui/src/address-search.js", "utf8"), {
+    document, window, CustomEvent, console: { warn() {}, error() {} },
+  });
+  return {
+    el: (id) => elements.get(id), dispatched,
+    fireDocument: (type, detail = {}) => document.dispatchEvent(new CustomEvent(type, { detail })),
+    runTimer: async () => {
+      let fn = null;
+      while (!fn && timers.length) fn = timers.shift();
+      if (fn) await fn();
+    },
+  };
 }
 
 function fillValidForm(el) {
@@ -211,6 +233,92 @@ test("range ends, work cap, and ZecWallet Lite transparent scope reject without 
   assert.match(el("address-search-form-status").textContent, /account 0 only/);
   assert.equal(words.value, original);
   assert.equal(starts, 0);
+});
+
+test("two retained matches can recover sequentially without rerunning search and close releases", async () => {
+  const second = { ...PUBLIC_MATCH, id: "opaque-match-2", seed_label: "Travel backup", seed_index: 1, path: "m/44'/133'/0'/0/9", index: 9 };
+  const calls = [];
+  const { el, dispatched, fireDocument } = harness(async (command) => {
+    calls.push(command);
+    if (command === "start_address_search") return { id: "opaque-search-1" };
+    if (command === "get_address_search") return snapshot({ matches: [PUBLIC_MATCH, second] });
+    return null;
+  });
+  fillValidForm(el);
+  await el("address-search-form").fire("submit");
+  await new Promise(setImmediate);
+  const cards = el("address-search-matches").children;
+  await cards[0].children[1].fire("click");
+  assert.equal(el("address-search-modal").hidden, true);
+
+  fireDocument("address-search-reopen", { searchId: "opaque-search-1" });
+  await new Promise(setImmediate);
+  assert.equal(el("address-search-modal").hidden, false);
+  fireDocument("address-search-lock-recovery", { locked: true });
+  const refreshedCards = el("address-search-matches").children;
+  assert.equal(refreshedCards[1].children[1].disabled, true);
+  fireDocument("address-search-lock-recovery", { locked: false });
+  await refreshedCards[1].children[1].fire("click");
+
+  const recoveries = dispatched.filter((event) => event.type === "address-match-recovery");
+  assert.deepEqual(recoveries.map((event) => event.detail.matchId), ["opaque-match-1", "opaque-match-2"]);
+  assert.equal(calls.filter((command) => command === "start_address_search").length, 1);
+
+  fireDocument("address-search-reopen", { searchId: "opaque-search-1" });
+  await new Promise(setImmediate);
+  await el("close-address-search").fire("click");
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.slice(-3), ["cancel_address_search", "get_address_search", "release_address_search"]);
+});
+
+test("reopening a live retained search refreshes, stays locked, resumes polling, and renders final results", async () => {
+  const second = { ...PUBLIC_MATCH, id: "opaque-match-2", seed_label: "Later match", seed_index: 1 };
+  let reads = 0;
+  const { el, dispatched, fireDocument, runTimer } = harness(async (command) => {
+    if (command === "start_address_search") return { id: "opaque-search-1" };
+    if (command === "get_address_search") {
+      reads++;
+      if (reads === 1) return snapshot({ status: "running", checked: 10, matches: [PUBLIC_MATCH] });
+      if (reads === 2) return snapshot({ status: "running", checked: 40, matches: [PUBLIC_MATCH, second] });
+      return snapshot({ status: "complete", checked: 80, matches: [PUBLIC_MATCH, second] });
+    }
+    return null;
+  });
+  fillValidForm(el);
+  await el("address-search-form").fire("submit");
+  await new Promise(setImmediate);
+  await el("address-search-live-matches").children[0].children[1].fire("click");
+  fireDocument("address-search-lock-recovery", { locked: true });
+  fireDocument("address-search-reopen", { searchId: "opaque-search-1" });
+  await new Promise(setImmediate);
+  assert.equal(el("address-search-progress").hidden, false);
+  assert.equal(el("address-search-live-matches").children.length, 2);
+  const laterButton = el("address-search-live-matches").children[1].children[1];
+  assert.equal(laterButton.disabled, true);
+  await laterButton.fire("click");
+  assert.equal(dispatched.filter((event) => event.type === "address-match-recovery").length, 1);
+
+  await runTimer();
+  await new Promise(setImmediate);
+  assert.equal(el("address-search-results").hidden, false);
+  assert.equal(el("address-search-matches").children.length, 2);
+  assert.equal(el("address-search-matches").children[0].children[1].disabled, true);
+});
+
+test("a failed backend release does not claim retained secrets were released", async () => {
+  const { el, dispatched } = harness(async (command) => {
+    if (command === "start_address_search") return { id: "opaque-search-1" };
+    if (command === "get_address_search") return snapshot();
+    if (command === "release_address_search") throw new Error("still retained");
+    return null;
+  });
+  fillValidForm(el);
+  await el("address-search-form").fire("submit");
+  await new Promise(setImmediate);
+  await el("address-search-again").fire("click");
+  assert.equal(dispatched.some((event) => event.type === "address-search-released"), false);
+  assert.equal(el("address-search-results").hidden, false);
+  assert.match(el("address-search-limitation").textContent, /could not clear/);
 });
 
 

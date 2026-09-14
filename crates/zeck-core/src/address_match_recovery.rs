@@ -35,9 +35,11 @@ pub struct MatchCoordinates {
 
 /// Build a spend-capable source for exactly the matched address/account.
 ///
-/// `seed` is already the BIP-39 PBKDF output, including any optional BIP-39
-/// passphrase. It is held only by the returned key source and never placed in
-/// the serializable match descriptor.
+/// `seed` is already the BIP-39 PBKDF output, including any optional,
+/// case-sensitive BIP-39 passphrase. Recovery must re-enter the exact seed
+/// phrase and passphrase used during discovery. The passphrase is separate
+/// from a wallet-file encryption password; neither secret is retained in the
+/// serializable match descriptor or echoed in errors.
 pub fn prepare_match_recovery(
     seed: &[u8; 64],
     network: ZeckNetwork,
@@ -77,11 +79,6 @@ pub fn prepare_match_recovery(
             Ok(Arc::new(MatchedImportedKeySource::new(keys, coordinates)))
         }
         DiscoveryPool::Sapling => {
-            if coordinates.scope != AddressScope::External {
-                return Err(ZeckError::InvalidConfig(
-                    "Sapling address matching supports external diversifiers only".to_owned(),
-                ));
-            }
             let account = AccountId::try_from(coordinates.account).map_err(|_| {
                 ZeckError::InvalidConfig(format!(
                     "account index {} is out of range",
@@ -89,14 +86,15 @@ pub fn prepare_match_recovery(
                 ))
             })?;
             let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), account);
-            let address = extsk
-                .to_diversifiable_full_viewing_key()
-                .address(coordinates.index.into())
-                .ok_or_else(|| {
-                    ZeckError::InvalidConfig(
-                        "saved Sapling diversifier index is invalid".to_owned(),
-                    )
-                })?;
+            let dfvk = match coordinates.scope {
+                AddressScope::External => extsk.to_diversifiable_full_viewing_key(),
+                AddressScope::Internal => {
+                    extsk.derive_internal().to_diversifiable_full_viewing_key()
+                }
+            };
+            let address = dfvk.address(coordinates.index.into()).ok_or_else(|| {
+                ZeckError::InvalidConfig("saved Sapling diversifier index is invalid".to_owned())
+            })?;
             use zcash_keys::encoding::AddressCodec;
             let encoded = match network {
                 ZeckNetwork::Mainnet => address.encode(&zcash_protocol::consensus::MAIN_NETWORK),
@@ -143,7 +141,7 @@ pub fn prepare_match_recovery(
 fn verify_public_match(coordinates: &MatchCoordinates, derived: &str) -> ZeckResult<()> {
     if coordinates.address != derived {
         return Err(ZeckError::InvalidConfig(
-            "the re-entered seed does not derive the matched address at the saved path".to_owned(),
+            "the re-entered seed phrase and case-sensitive BIP-39 passphrase do not derive the matched address at the saved path; check both exactly (the wallet-file password is separate)".to_owned(),
         ));
     }
     Ok(())
@@ -265,6 +263,11 @@ mod tests {
             keys.transparent[0].secret.expose_secret(),
             &wanted.secret_bytes()
         );
+        assert_eq!(source.match_coordinates().unwrap().index, 19);
+        assert_eq!(
+            source.match_coordinates().unwrap().scope,
+            AddressScope::Internal
+        );
     }
 
     #[test]
@@ -297,6 +300,39 @@ mod tests {
     }
 
     #[test]
+    fn sapling_internal_handoff_rederives_exact_scope_and_index() {
+        let account = AccountId::try_from(4).unwrap();
+        let extsk = zcash_keys::keys::sapling::spending_key(&SEED, 133, account);
+        let (index, address) = (1u32..1000)
+            .find_map(|index| {
+                extsk
+                    .derive_internal()
+                    .to_diversifiable_full_viewing_key()
+                    .address(index.into())
+                    .map(|address| (index, address))
+            })
+            .expect("a valid nonzero Sapling diversifier in bounded test range");
+        use zcash_keys::encoding::AddressCodec;
+        let encoded = address.encode(&zcash_protocol::consensus::MAIN_NETWORK);
+        let source = prepare_match_recovery(
+            &SEED,
+            ZeckNetwork::Mainnet,
+            MatchCoordinates {
+                pool: DiscoveryPool::Sapling,
+                account: 4,
+                scope: AddressScope::Internal,
+                index,
+                network: ZeckNetwork::Mainnet,
+                address: encoded,
+                path: format!("m_Sapling / 32' / 133' / 4' / {index} (internal)"),
+            },
+        )
+        .unwrap();
+        assert_eq!(source.imported_keys().unwrap().sapling.len(), 1);
+        assert_eq!(source.match_coordinates().unwrap().index, index);
+    }
+
+    #[test]
     fn changed_passphrase_seed_cannot_reconstruct_saved_match() {
         let address = transparent_address_from_seed(
             ZeckNetwork::Mainnet,
@@ -324,9 +360,11 @@ mod tests {
             Ok(_) => panic!("different raw seed must not resume the saved match"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("does not derive the matched address"));
+        let message = err.to_string();
+        assert!(message.contains("seed phrase and case-sensitive BIP-39 passphrase"));
+        assert!(message.contains("check both exactly"));
+        assert!(message.contains("wallet-file password is separate"));
+        assert!(!message.contains("8"));
     }
 
     #[test]

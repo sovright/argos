@@ -657,6 +657,7 @@
           <div class="actions split">
             <button class="secondary" id="cancel-scan">Cancel</button>
             <button class="ghost" id="back-to-config" style="display:none">← Back to config</button>
+            <button class="ghost" id="scan-return-address-matches" type="button" hidden>← Back to address matches</button>
             <button class="primary" id="review-sweep" disabled>Review & Sweep</button>
           </div>
         </section>
@@ -790,6 +791,7 @@
             </div>
           </div>
           <div class="actions">
+            <button class="secondary" id="complete-return-address-matches" type="button" hidden>Recover another matched address</button>
             <button class="primary" data-next="welcome" id="restart-flow">Start over</button>
           </div>
         </section>
@@ -888,9 +890,9 @@
                   <label class="field"><span>First account</span><input id="address-search-account-start" type="number" min="0" max="2147483647" step="1" value="0" required /></label>
                   <label class="field"><span>Accounts to check</span><input id="address-search-account-count" type="number" min="1" max="1000" step="1" value="1" required /></label>
                 </div>
-                <label class="checkline"><input id="address-search-change" type="checkbox" /><span>Also check internal/change scope (transparent and Orchard)</span></label>
+                <label class="checkline"><input id="address-search-change" type="checkbox" /><span>Also check supported internal/change scopes</span></label>
               </details>
-              <p class="scope-note"><strong>Search scope:</strong> Sapling matching checks external addresses only. Orchard and transparent matching can also check internal/change scope. ZecWallet Lite transparent matching uses account 0; Advanced BIP44 can search transparent account ranges. Wallets can use other paths, accounts, indexes, passphrases, or imported keys.</p>
+              <p class="scope-note"><strong>Search scope:</strong> transparent, Sapling, and Orchard matching checks supported external addresses and, when selected, internal/change addresses. ZecWallet Lite transparent matching uses account 0; Advanced BIP44 can search transparent account ranges. Wallets can use other paths, accounts, indexes, passphrases, or imported keys.</p>
             </div>
           </div>
 
@@ -913,7 +915,8 @@
           <div id="address-search-outcome" class="search-outcome"></div>
           <div id="address-search-matches" class="match-list"></div>
           <p id="address-search-limitation" class="scope-note"></p>
-          <div class="actions"><button class="primary" id="address-search-again" type="button">Search another address</button></div>
+          <p class="secret-note">Argos retains only the matching seeds until you explicitly close or clear these results, restart the recovery flow, or quit Argos. This lets you recover another result without deriving everything again. Each started recovery owns its own independent key source.</p>
+          <div class="actions"><button class="primary" id="address-search-again" type="button">Clear results and search another address</button></div>
         </section>
       </div>
     </div>

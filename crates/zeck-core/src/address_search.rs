@@ -513,11 +513,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.match_coordinates(), Some(&coordinates));
+        let imported = source
+            .imported_keys()
+            .expect("transparent match uses imported route");
+        assert_eq!(imported.transparent.len(), 1);
+        let expected = crate::derivation::legacy_transparent_secret_key_for_account(
+            ZeckNetwork::Mainnet,
+            seed.expose_secret(),
+            found.account,
+            found.scope,
+            found.index,
+        )
+        .unwrap();
+        assert_eq!(
+            imported.transparent[0].secret.expose_secret(),
+            &expected.secret_bytes(),
+            "the retained match must hand the existing signer its exact nonzero-index key"
+        );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains(PHRASE));
         assert!(!serialized.contains("TREZOR"));
         service.release(&id).unwrap();
         assert!(service.matched_seed(&id, &found.id).is_err());
+    }
+
+    #[test]
+    fn one_handoff_does_not_consume_a_second_match() {
+        let service = AddressSearchService::default();
+        let wanted = target(3, 127, AddressScope::Internal);
+        let mut input = request(wanted);
+        input.seeds.push(CandidateSeed {
+            label: "same recovery material, second candidate".into(),
+            seed: SecretString::new(PHRASE.into()),
+            passphrase: SecretString::new("TREZOR".into()),
+        });
+        let id = service.start(input).unwrap();
+        let result = terminal(&service, &id);
+        assert_eq!(result.matches.len(), 2);
+
+        let first = &result.matches[0];
+        let second = &result.matches[1];
+        let (first_public, first_seed) = service.matched_seed(&id, &first.id).unwrap();
+        let first_source = crate::prepare_match_recovery(
+            first_seed.expose_secret(),
+            ZeckNetwork::Mainnet,
+            crate::MatchCoordinates {
+                pool: first_public.pool,
+                account: first_public.account,
+                scope: first_public.scope,
+                index: first_public.index,
+                network: ZeckNetwork::Mainnet,
+                address: first_public.address,
+                path: first_public.path,
+            },
+        )
+        .unwrap();
+        drop(first_source);
+
+        assert!(service.matched_seed(&id, &second.id).is_ok());
+        assert!(service.snapshot(&id).is_ok());
+        service.release(&id).unwrap();
+        assert!(service.matched_seed(&id, &second.id).is_err());
     }
     #[test]
     fn zecwallet_lite_finds_receive_index_997_without_account_expansion() {

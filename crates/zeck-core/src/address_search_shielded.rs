@@ -78,6 +78,7 @@ pub struct AccountMatcher {
     network: ZeckNetwork,
     account: u32,
     sapling_fvk: sapling_crypto::zip32::DiversifiableFullViewingKey,
+    sapling_internal_fvk: sapling_crypto::zip32::DiversifiableFullViewingKey,
     orchard_fvk: orchard::keys::FullViewingKey,
 }
 impl AccountMatcher {
@@ -88,10 +89,14 @@ impl AccountMatcher {
         let sapling_sk = sapling::spending_key(seed, network.coin_type(), id);
         let orchard_sk = orchard::keys::SpendingKey::from_zip32_seed(seed, network.coin_type(), id)
             .map_err(|e| ZeckError::Internal(e.to_string()))?;
+        let sapling_internal_fvk = sapling_sk
+            .derive_internal()
+            .to_diversifiable_full_viewing_key();
         Ok(Self {
             network,
             account,
             sapling_fvk: sapling_sk.to_diversifiable_full_viewing_key(),
+            sapling_internal_fvk,
             orchard_fvk: orchard::keys::FullViewingKey::from(&orchard_sk),
         })
     }
@@ -102,28 +107,28 @@ impl AccountMatcher {
         index: u32,
     ) -> ZeckResult<Vec<MatchedReceiver>> {
         let mut out = Vec::new();
-        // The upstream API does not expose Sapling's internal diversifier key.
-        // Never test an external address while labeling it internal.
-        if matches!(scope, AddressScope::External) {
-            if let Some(address) = self.sapling_fvk.to_external_ivk().address_at(index) {
-                if target
-                    .receivers
-                    .contains(&ShieldedReceiver::Sapling(address.to_bytes()))
-                {
-                    let encoded = match self.network {
-                        ZeckNetwork::Mainnet => address.encode(&MAIN_NETWORK),
-                        ZeckNetwork::Testnet => address.encode(&TEST_NETWORK),
-                    };
-                    out.push(MatchedReceiver {
-                        pool: DiscoveryPool::Sapling,
-                        address: encoded,
-                        path: format!(
-                            "m_Sapling / 32' / {}' / {}' / {index}",
-                            self.network.coin_type(),
-                            self.account
-                        ),
-                    });
-                }
+        let sapling_fvk = match scope {
+            AddressScope::External => &self.sapling_fvk,
+            AddressScope::Internal => &self.sapling_internal_fvk,
+        };
+        if let Some(address) = sapling_fvk.to_external_ivk().address_at(index) {
+            if target
+                .receivers
+                .contains(&ShieldedReceiver::Sapling(address.to_bytes()))
+            {
+                let encoded = match self.network {
+                    ZeckNetwork::Mainnet => address.encode(&MAIN_NETWORK),
+                    ZeckNetwork::Testnet => address.encode(&TEST_NETWORK),
+                };
+                out.push(MatchedReceiver {
+                    pool: DiscoveryPool::Sapling,
+                    address: encoded,
+                    path: format!(
+                        "m_Sapling / 32' / {}' / {}' / {index} ({scope:?})",
+                        self.network.coin_type(),
+                        self.account
+                    ),
+                });
             }
         }
         let os = match scope {
@@ -244,6 +249,28 @@ mod tests {
         // A matcher using find_address would incorrectly return it here.
         assert!(m
             .matches(&target, AddressScope::External, invalid)
+            .unwrap()
+            .is_empty());
+
+        let internal_fvk = &m.sapling_internal_fvk;
+        let (internal_index, internal_address) = (1u32..1000)
+            .find_map(|i| internal_fvk.to_external_ivk().address_at(i).map(|a| (i, a)))
+            .unwrap();
+        let internal_ua =
+            UnifiedAddress::try_from_items(vec![Receiver::Sapling(internal_address.to_bytes())])
+                .unwrap();
+        let internal_target = TargetReceivers::parse(
+            &internal_ua.encode(&NetworkType::Main),
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let internal_found = m
+            .matches(&internal_target, AddressScope::Internal, internal_index)
+            .unwrap();
+        assert_eq!(internal_found.len(), 1);
+        assert!(internal_found[0].path.contains("(Internal)"));
+        assert!(m
+            .matches(&internal_target, AddressScope::External, internal_index)
             .unwrap()
             .is_empty());
     }

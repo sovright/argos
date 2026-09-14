@@ -228,13 +228,11 @@ pub async fn start_matched_recovery(
         )
         .await
         .map_err(|err| err.to_string())?;
-    // Once the scan source owns the minimum required authority, cancel the
-    // search and autonomously discard every retained candidate seed after its
-    // worker reaches a terminal state. This also runs if the webview closes.
-    tokio::spawn(cancel_and_release_address_search(
-        state.address_search.clone(),
-        search_id,
-    ));
+    // The search remains registered until explicit close/release. A result set
+    // may contain multiple funded paths, and handing one capability to a scan
+    // must not destroy the others. The frontend's close and beforeunload paths
+    // call `release_address_search`, whose backend-owned cleanup waits for the
+    // worker and then drops every retained matched seed.
     spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
     Ok(handle)
 }

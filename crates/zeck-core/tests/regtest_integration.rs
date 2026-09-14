@@ -3081,3 +3081,367 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
         "the sweep must be mined, got: {mined}"
     );
 }
+
+/// Exercises the same search -> matched key source -> scan -> proposal -> sweep
+/// services as the GUI, with a funded ZecWallet Lite receive index beyond zero.
+/// Native GUI interaction still has its own release qualification checklist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
+    use argos_core::address_search::{
+        candidate_seed, AddressSearchService, CandidateSeed, SearchProfile, SearchRequest,
+        SearchStatus,
+    };
+    use argos_core::{prepare_match_recovery, MatchCoordinates};
+    use secrecy::ExposeSecret;
+    use zcash_transparent::{
+        address::TransparentAddress,
+        keys::{AccountPrivKey, NonHardenedChildIndex, TransparentKeyScope},
+    };
+
+    let harness = RegtestHarness::require();
+    let phrase = SecretString::new(harness.test_seed().to_owned());
+    let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
+    let params = argos_core::workspace::consensus_network(ZeckNetwork::Testnet);
+    let account =
+        AccountPrivKey::from_seed(&params, seed.expose_secret(), zip32::AccountId::ZERO).unwrap();
+    let public = account
+        .to_account_pubkey()
+        .derive_address_pubkey(
+            TransparentKeyScope::EXTERNAL,
+            NonHardenedChildIndex::from_index(997).unwrap(),
+        )
+        .unwrap();
+    let address = argos_core::imported::encode_transparent_address(
+        &TransparentAddress::from_pubkey(&public),
+        ZeckNetwork::Testnet,
+    );
+    common::regtest_harness::fund_address(&address, 1_250_000_000).await;
+
+    let searches = AddressSearchService::default();
+    let id = searches
+        .start(SearchRequest {
+            target: address.clone(),
+            network: ZeckNetwork::Testnet,
+            seeds: vec![CandidateSeed {
+                label: "public regtest vector".into(),
+                seed: phrase,
+                passphrase: SecretString::new(String::new()),
+            }],
+            profile: SearchProfile::ZecwalletLite,
+            account_start: 0,
+            account_count: 1,
+            index_start: 0,
+            index_count: 1000,
+            include_change: false,
+        })
+        .unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = searches.snapshot(&id).unwrap();
+            match snapshot.status {
+                SearchStatus::Complete => {
+                    assert_eq!(snapshot.checked, 1000);
+                    assert_eq!(snapshot.matches.len(), 1);
+                    break snapshot.matches[0].clone();
+                }
+                SearchStatus::Running => tokio::time::sleep(Duration::from_millis(20)).await,
+                _ => panic!("address search failed: {:?}", snapshot.error),
+            }
+        }
+    })
+    .await
+    .expect("offline search timed out");
+    assert_eq!(found.index, 997);
+    assert_eq!(found.path, "m/44'/1'/0'/0/997");
+    let (matched, retained_seed) = searches.matched_seed(&id, &found.id).unwrap();
+    let source = prepare_match_recovery(
+        retained_seed.expose_secret(),
+        ZeckNetwork::Testnet,
+        MatchCoordinates {
+            pool: matched.pool,
+            account: matched.account,
+            scope: matched.scope,
+            index: matched.index,
+            network: ZeckNetwork::Testnet,
+            address: matched.address,
+            path: matched.path,
+        },
+    )
+    .unwrap();
+    // Closing discovery must not invalidate the independent recovery source.
+    searches.release(&id).unwrap();
+    drop(retained_seed);
+    drop(seed);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "matched transparent index 997".into(),
+            },
+            source,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => {
+                    assert!(progress
+                        .discoveries
+                        .iter()
+                        .any(|d| d.zatoshis >= 1_250_000_000));
+                    break;
+                }
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("matched scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("matched balance scan timed out");
+    let request = SweepRequest {
+        destination: regtest_encoded_unified_address_at(harness.test_seed(), 2),
+        memo: None,
+        max_fee_zatoshis: Some(100_000),
+        donation_rate: None,
+        donor_email: None,
+    };
+    service
+        .propose_sweep(&handle, request.clone())
+        .await
+        .expect("matched sweep proposal");
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        service.execute_sweep(&handle, request),
+    )
+    .await;
+    mining.abort();
+    let outcome = outcome
+        .expect("matched sweep timed out")
+        .expect("matched sweep failed");
+    assert!(
+        !outcome.transactions.is_empty(),
+        "funded match must broadcast a sweep"
+    );
+    let txids: Vec<String> = outcome
+        .transactions
+        .iter()
+        .map(|tx| {
+            tx.txid
+                .clone()
+                .expect("broadcast transaction must have a txid")
+        })
+        .collect();
+    for tx in &outcome.transactions {
+        assert!(
+            matches!(tx.status.as_str(), "confirmed" | "broadcast"),
+            "{}: {}",
+            tx.status,
+            tx.detail
+        );
+        assert!(tx.txid.is_some());
+        eprintln!("matched index 997 sweep accepted: {:?}", tx.txid);
+    }
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    for txid in txids {
+        let mined =
+            common::regtest_harness::zebra_rpc("getrawtransaction", serde_json::json!([txid, 1]))
+                .await;
+        assert!(
+            mined
+                .get("height")
+                .and_then(|height| height.as_u64())
+                .is_some(),
+            "matched index 997 sweep must be mined, got: {mined}"
+        );
+    }
+}
+
+/// Proves that a Sapling note sent to an internal diversifier can be found by
+/// its exact coordinates and swept with the scope-correct proof authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
+    use argos_core::address_search::{
+        candidate_seed, AddressSearchService, CandidateSeed, SearchProfile, SearchRequest,
+        SearchStatus,
+    };
+    use argos_core::{prepare_match_recovery, AddressScope, DiscoveryPool, MatchCoordinates};
+    use secrecy::ExposeSecret;
+    use zcash_keys::encoding::AddressCodec;
+
+    let harness = RegtestHarness::require();
+    let phrase = SecretString::new(harness.test_seed().to_owned());
+    let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
+    let account_index = 4u32;
+    let account = zip32::AccountId::try_from(account_index).unwrap();
+    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account);
+    let internal_dfvk = extsk.derive_internal().to_diversifiable_full_viewing_key();
+    let (address_index, internal_address) = (1u32..100)
+        .find_map(|index| {
+            internal_dfvk
+                .address(index.into())
+                .map(|address| (index, address))
+        })
+        .expect("the fixture range must contain a valid internal diversifier");
+    let encoded = internal_address.encode(&zcash_protocol::consensus::TEST_NETWORK);
+    common::regtest_harness::fund_address(&encoded, 900_000_000).await;
+
+    let searches = AddressSearchService::default();
+    let id = searches
+        .start(SearchRequest {
+            target: encoded.clone(),
+            network: ZeckNetwork::Testnet,
+            seeds: vec![CandidateSeed {
+                label: "public regtest vector".into(),
+                seed: phrase,
+                passphrase: SecretString::new(String::new()),
+            }],
+            profile: SearchProfile::Bip44,
+            account_start: account_index,
+            account_count: 1,
+            index_start: address_index,
+            index_count: 1,
+            include_change: true,
+        })
+        .unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = searches.snapshot(&id).unwrap();
+            match snapshot.status {
+                SearchStatus::Complete => {
+                    assert_eq!(snapshot.matches.len(), 1);
+                    break snapshot.matches[0].clone();
+                }
+                SearchStatus::Running => tokio::time::sleep(Duration::from_millis(20)).await,
+                _ => panic!("internal Sapling search failed: {:?}", snapshot.error),
+            }
+        }
+    })
+    .await
+    .expect("internal Sapling search timed out");
+    assert_eq!(found.pool, DiscoveryPool::Sapling);
+    assert_eq!(found.scope, AddressScope::Internal);
+    assert_eq!(found.account, account_index);
+    assert_eq!(found.index, address_index);
+
+    let (matched, retained_seed) = searches.matched_seed(&id, &found.id).unwrap();
+    let source = prepare_match_recovery(
+        retained_seed.expose_secret(),
+        ZeckNetwork::Testnet,
+        MatchCoordinates {
+            pool: matched.pool,
+            account: matched.account,
+            scope: matched.scope,
+            index: matched.index,
+            network: ZeckNetwork::Testnet,
+            address: matched.address,
+            path: matched.path,
+        },
+    )
+    .unwrap();
+    searches.release(&id).unwrap();
+    drop(retained_seed);
+    drop(seed);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "matched internal Sapling receiver".into(),
+            },
+            source,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => {
+                    assert!(progress.accounts.iter().any(|account| {
+                        account.account_index == 0 && account.sapling_zatoshis >= 900_000_000
+                    }));
+                    break;
+                }
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("matched internal Sapling scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("matched internal Sapling scan timed out");
+
+    let request = SweepRequest {
+        destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
+        memo: None,
+        max_fee_zatoshis: Some(100_000),
+        donation_rate: None,
+        donor_email: None,
+    };
+    service
+        .propose_sweep(&handle, request.clone())
+        .await
+        .unwrap();
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        service.execute_sweep(&handle, request),
+    )
+    .await
+    .expect("internal Sapling sweep timed out")
+    .expect("internal Sapling sweep failed");
+    mining.abort();
+    let txid = outcome
+        .transactions
+        .iter()
+        .find(|tx| tx.detail.contains("Sapling"))
+        .and_then(|tx| tx.txid.clone())
+        .expect("internal Sapling sweep must broadcast a Sapling transaction");
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    let mined =
+        common::regtest_harness::zebra_rpc("getrawtransaction", serde_json::json!([txid, 1])).await;
+    assert!(
+        mined
+            .get("height")
+            .and_then(|height| height.as_u64())
+            .is_some(),
+        "internal Sapling sweep must be mined, got: {mined}"
+    );
+}

@@ -11,7 +11,7 @@ stop. This is address discovery, not a balance scan.
 | Target | Derivation | Search coordinates |
 | --- | --- | --- |
 | Transparent P2PKH (`t1` on mainnet) | BIP44 `m/44'/coin_type'/account'/branch/index` | Account, external/internal branch, child index |
-| Sapling (`zs`) | ZIP32 Sapling `m/32'/coin_type'/account'` | Account and external diversifier index |
+| Sapling (`zs`) | ZIP32 Sapling `m/32'/coin_type'/account'` | Account, external/internal scope, diversifier index |
 | Unified (`u`) | Decode receivers and check each supported pool independently | Transparent, Sapling, and/or Orchard coordinates |
 | Orchard receiver inside a UA | ZIP32 Orchard `m/32'/coin_type'/account'` | Account, external/internal scope, diversifier index |
 
@@ -24,9 +24,9 @@ accounts; shielded derivation remains ZIP32. A profile is a search scope, not
 an assertion that a particular wallet generated the target.
 
 Shielded scopes are not BIP44 change levels. The current matcher searches
-external Sapling addresses and external/internal Orchard addresses. It skips
+external/internal Sapling and Orchard addresses. It skips
 invalid Sapling diversifiers without advancing them to a different index.
-Sapling internal address discovery is excluded from this implementation.
+Sapling recovery selects the corresponding external or internal proof authority for each spent note.
 
 Search coordinates are limited to 0 through 2,147,483,647. This is an Argos
 implementation bound, not the shielded diversifier space: both Sapling and
@@ -70,7 +70,7 @@ coordinates. Resuming requires re-entering the seed and, when used, the same
 BIP39 passphrase; both the address and workspace fingerprint are verified.
 Search requests and recovery metadata do not serialize seed bytes or
 passphrases. GUI inputs clear after submission. Retained backend search keys
-are released after cancellation or successful handoff. JavaScript strings
+remain available for sequential recovery of other matches until the search is explicitly closed or cleared, restarted, or the app exits. After discovery completes, only candidates that produced matches remain retained. A recovery keeps its own key source independently. JavaScript strings
 cannot provide a guaranteed memory-zeroization boundary.
 
 ## Sources

@@ -10,12 +10,12 @@ document.addEventListener("DOMContentLoaded", () => {
   let searchId = null;
   let pollTimer = null;
   let generation = 0;
-  let handedOff = false;
   let renderedMatchIds = new Set();
   let publicScope = null;
   let startInFlight = null;
   let cleanupInFlight = Promise.resolve();
   let cleanupRunning = false;
+  let recoveryLocked = false;
 
   const invoke = (command, args) => window.__TAURI__.core.invoke(command, args);
 
@@ -115,27 +115,36 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   async function releaseCurrent(id) {
-    if (!id) return;
-    try { await invoke("release_address_search", { id }); }
-    catch (error) { console.warn("Could not release address search:", error); }
+    if (!id) return true;
+    try {
+      await invoke("release_address_search", { id });
+      document.dispatchEvent(new CustomEvent("address-search-released", { detail: { searchId: id } }));
+      return true;
+    } catch (error) {
+      console.warn("Could not release address search:", error);
+      return false;
+    }
   }
 
   async function cancelAndRelease(id) {
-    if (!id) return;
+    if (!id) return true;
     try { await invoke("cancel_address_search", { id }); } catch (_) { /* already terminal/released */ }
     for (;;) {
       try {
         const snapshot = await invoke("get_address_search", { id });
         if (snapshot.status !== "running") break;
-      } catch (_) { return; }
+      } catch (_) { break; }
       await new Promise((resolve) => window.setTimeout(resolve, 200));
     }
-    await releaseCurrent(id);
+    return releaseCurrent(id);
   }
 
   function beginCleanup(id) {
     cleanupRunning = true;
-    cleanupInFlight = cancelAndRelease(id).finally(() => {
+    cleanupInFlight = cancelAndRelease(id).then((released) => {
+      if (!released && !searchId) searchId = id;
+      return released;
+    }).finally(() => {
       cleanupRunning = false;
       if (!modal.hidden && !startInFlight) byId("start-address-search").disabled = false;
     });
@@ -146,9 +155,13 @@ document.addEventListener("DOMContentLoaded", () => {
     const id = searchId;
     generation++;
     stopPolling();
-    if (id && !preserveSearch) beginCleanup(id);
+    if (preserveSearch) {
+      clearSecrets();
+      modal.hidden = true;
+      return;
+    }
+    if (id) beginCleanup(id);
     searchId = null;
-    publicScope = null;
     clearSecrets();
     resetForm();
     progress.hidden = true;
@@ -226,8 +239,9 @@ document.addEventListener("DOMContentLoaded", () => {
     recover.className = "primary small-button";
     recover.type = "button";
     recover.textContent = "Recover this match";
+    recover.disabled = recoveryLocked;
     recover.addEventListener("click", async () => {
-      handedOff = true;
+      if (recoveryLocked || recover.disabled) return;
       const event = new CustomEvent("address-match-recovery", {
         detail: { searchId: id, matchId: match.id, match },
         bubbles: true,
@@ -244,6 +258,16 @@ document.addEventListener("DOMContentLoaded", () => {
       if (renderedMatchIds.has(match.id)) continue;
       renderedMatchIds.add(match.id);
       appendMatch(container, match, snapshot.id);
+    }
+  }
+
+  function setRecoveryLocked(locked) {
+    recoveryLocked = locked;
+    for (const container of [byId("address-search-live-matches"), byId("address-search-matches")]) {
+      container.querySelectorAll("button").forEach((button) => {
+        button.disabled = recoveryLocked;
+        button.title = recoveryLocked ? "Finish or stop the current recovery before starting another." : "";
+      });
     }
   }
 
@@ -313,8 +337,11 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   byId("open-address-search").addEventListener("click", () => {
+    if (searchId) {
+      document.dispatchEvent(new CustomEvent("address-search-reopen", { detail: { searchId } }));
+      return;
+    }
     generation++;
-    handedOff = false;
     searchId = null;
     resetForm();
     byId("start-address-search").disabled = !!startInFlight || cleanupRunning;
@@ -325,13 +352,57 @@ document.addEventListener("DOMContentLoaded", () => {
     modal.hidden = false;
     byId("address-search-target").focus();
   });
+  document.addEventListener("address-search-reopen", async (event) => {
+    if (!searchId || (event.detail?.searchId && event.detail.searchId !== searchId)) return;
+    const requestGeneration = ++generation;
+    stopPolling();
+    modal.hidden = false;
+    form.hidden = true;
+    progress.hidden = false;
+    results.hidden = true;
+    byId("address-search-progress-title").textContent = "Refreshing retained results…";
+    try {
+      const snapshot = await invoke("get_address_search", { id: searchId });
+      if (requestGeneration !== generation || !searchId) return;
+      const terminal = renderSnapshot(snapshot);
+      if (event.detail?.error) {
+        byId(terminal ? "address-search-limitation" : "address-search-count").textContent = event.detail.error;
+      }
+      setRecoveryLocked(recoveryLocked);
+      if (terminal) {
+        byId("address-search-matches").querySelector("button")?.focus();
+      } else {
+        byId("address-search-progress-title").textContent = "Checking derived addresses…";
+        pollTimer = window.setTimeout(() => poll(searchId, requestGeneration), 200);
+      }
+    } catch (error) {
+      if (requestGeneration !== generation || !searchId) return;
+      progress.hidden = false;
+      results.hidden = true;
+      byId("address-search-progress-title").textContent = "Could not refresh retained results";
+      byId("address-search-count").textContent = String(error);
+    }
+  });
+  document.addEventListener("address-search-release", (event) => {
+    if (!searchId || (event.detail?.searchId && event.detail.searchId !== searchId)) return;
+    close();
+  });
+  document.addEventListener("address-search-lock-recovery", (event) => {
+    setRecoveryLocked(!!event.detail?.locked);
+  });
   byId("close-address-search").addEventListener("click", () => close());
   byId("address-search-clear").addEventListener("click", resetForm);
   byId("add-address-search-seed").addEventListener("click", addSeedRow);
   byId("address-search-again").addEventListener("click", async () => {
     const id = searchId;
     searchId = null;
-    await releaseCurrent(id);
+    const released = await releaseCurrent(id);
+    if (!released) {
+      searchId = id;
+      results.hidden = false;
+      byId("address-search-limitation").textContent = "Argos could not clear the retained results yet. Close the app to release them, or try again.";
+      return;
+    }
     resetForm();
     form.hidden = false;
     results.hidden = true;
@@ -391,7 +462,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   window.addEventListener("beforeunload", () => {
-    if (searchId && !handedOff) {
+    if (searchId) {
       invoke("cancel_address_search", { id: searchId }).catch(() => {});
       invoke("release_address_search", { id: searchId }).catch(() => {});
     }

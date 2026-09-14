@@ -55,6 +55,35 @@ enum ProofKeyError {
     // Carried for its Debug rendering in the error message; never matched on.
     Parse(#[allow(dead_code)] pczt::sapling::ParseError),
     Update(#[allow(dead_code)] sapling::pczt::UpdaterError),
+    MissingRecipient,
+    UnknownRecipientScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaplingSpendScope {
+    External,
+    Internal,
+}
+
+fn classify_spend_scope(
+    extsk: &ExtendedSpendingKey,
+    recipient: Option<&sapling::PaymentAddress>,
+) -> Result<SaplingSpendScope, ProofKeyError> {
+    let recipient = recipient.ok_or(ProofKeyError::MissingRecipient)?;
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    // Compare recipients directly: sapling-crypto 0.7.0's decrypt_diversifier
+    // checks the external key in its internal branch.
+    if dfvk.diversified_address(*recipient.diversifier()).as_ref() == Some(recipient) {
+        Ok(SaplingSpendScope::External)
+    } else if dfvk
+        .diversified_change_address(*recipient.diversifier())
+        .as_ref()
+        == Some(recipient)
+    {
+        Ok(SaplingSpendScope::Internal)
+    } else {
+        Err(ProofKeyError::UnknownRecipientScope)
+    }
 }
 
 impl From<pczt::sapling::ParseError> for ProofKeyError {
@@ -146,18 +175,30 @@ where
     .map_err(|err| ZeckError::TransactionBuild(format!("creating the PCZT: {err}")))?;
 
     // Supply the proof generation key the account's missing ZIP-32
-    // derivation would otherwise have provided. Every spend in this bundle
-    // belongs to the one imported key, because the proposal was restricted
-    // to this account's Sapling pool.
-    let pgk = extsk.expsk.proof_generation_key();
+    // derivation would otherwise have provided. Internal notes use the
+    // account's derived internal nsk (ask is unchanged), so classify every PCZT recipient
+    // through the DFVK and fail closed if it is missing or foreign.
+    let internal_extsk = extsk.derive_internal();
+    let mut spend_scopes = Vec::new();
     let pczt = LowLevelSigner::new(pczt)
         .sign_sapling_with(|_, bundle, _| {
-            let spends = bundle.spends().len();
+            spend_scopes = bundle
+                .spends()
+                .iter()
+                .map(|spend| classify_spend_scope(extsk, spend.recipient().as_ref()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let proof_keys: Vec<_> = spend_scopes
+                .iter()
+                .map(|scope| match scope {
+                    SaplingSpendScope::External => extsk.expsk.proof_generation_key(),
+                    SaplingSpendScope::Internal => internal_extsk.expsk.proof_generation_key(),
+                })
+                .collect();
             bundle
                 .update_with(|mut updater| {
-                    for index in 0..spends {
+                    for (index, pgk) in proof_keys.into_iter().enumerate() {
                         updater.update_spend_with(index, |mut spend| {
-                            spend.set_proof_generation_key(pgk.clone())
+                            spend.set_proof_generation_key(pgk)
                         })?;
                     }
                     Ok(())
@@ -233,11 +274,18 @@ where
     let mut signer = Signer::new(pczt)
         .map_err(|err| ZeckError::TransactionBuild(format!("preparing the signer: {err:?}")))?;
     for index in 0..spend_count {
-        signer
-            .sign_sapling(index, &extsk.expsk.ask)
-            .map_err(|err| {
-                ZeckError::TransactionBuild(format!("signing Sapling spend {index}: {err:?}"))
-            })?;
+        let ask = match spend_scopes.get(index) {
+            Some(SaplingSpendScope::External) => &extsk.expsk.ask,
+            Some(SaplingSpendScope::Internal) => &internal_extsk.expsk.ask,
+            None => {
+                return Err(ZeckError::TransactionBuild(format!(
+                    "Sapling spend {index} has no verified recipient scope"
+                )))
+            }
+        };
+        signer.sign_sapling(index, ask).map_err(|err| {
+            ZeckError::TransactionBuild(format!("signing Sapling spend {index}: {err:?}"))
+        })?;
     }
     let pczt = signer.finish();
 
@@ -717,6 +765,52 @@ mod fee_cap_tests {
         assert!(matches!(
             enforce_sapling_fee_floor(Some(crate::service::MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1)),
             Err(ZeckError::MaxFeeExceeded(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod sapling_scope_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_external_and_internal_note_authority() {
+        let extsk = ExtendedSpendingKey::master(&[7u8; 32]);
+        let external = extsk.default_address().1;
+        let internal_extsk = extsk.derive_internal();
+        let internal = internal_extsk.default_address().1;
+
+        assert_eq!(
+            classify_spend_scope(&extsk, Some(&external)).unwrap(),
+            SaplingSpendScope::External
+        );
+        assert_eq!(
+            classify_spend_scope(&extsk, Some(&internal)).unwrap(),
+            SaplingSpendScope::Internal
+        );
+        assert_ne!(
+            extsk.expsk.proof_generation_key().nsk,
+            internal_extsk.expsk.proof_generation_key().nsk,
+            "internal Sapling notes require the internal nsk proof authority"
+        );
+        assert_eq!(
+            extsk.expsk.ask.to_bytes(),
+            internal_extsk.expsk.ask.to_bytes(),
+            "Sapling internal derivation preserves ask while changing nsk"
+        );
+    }
+
+    #[test]
+    fn missing_or_foreign_recipient_fails_closed() {
+        let extsk = ExtendedSpendingKey::master(&[7u8; 32]);
+        let stranger = ExtendedSpendingKey::master(&[8u8; 32]).default_address().1;
+        assert!(matches!(
+            classify_spend_scope(&extsk, None),
+            Err(ProofKeyError::MissingRecipient)
+        ));
+        assert!(matches!(
+            classify_spend_scope(&extsk, Some(&stranger)),
+            Err(ProofKeyError::UnknownRecipientScope)
         ));
     }
 }
