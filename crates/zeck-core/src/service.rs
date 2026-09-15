@@ -917,6 +917,15 @@ async fn execute_sweep_for_session(
                         ),
                     ));
                 }
+                // Baseline the spendable shielded balance *before* broadcasting the
+                // shield, so the wait below measures a rise that is still in the
+                // future. `execute_shielding_step` itself waits for the tx to mine,
+                // so a baseline taken after it can already include the shielded
+                // proceeds — the strict `>` then never fires, the wait burns its full
+                // timeout, and the account falls through to `continue` with the sweep
+                // leg silently skipped.
+                let shielded_before =
+                    shielded_spendable_zatoshis(&workspace, runtime.network, &tracked_account)?;
                 let shielded_fee = {
                     let mut ctx = SweepStepCtx {
                         workspace: &workspace,
@@ -957,11 +966,6 @@ async fn execute_sweep_for_session(
                     if last_account_broadcast_failed(&results, tracked_account.derived.index) {
                         continue 'accounts;
                     }
-                    let shielded_before = shielded_spendable_zatoshis(
-                        &workspace,
-                        runtime.network,
-                        &tracked_account,
-                    )?;
                     if !wait_for_shielded_funds_to_confirm(
                         &workspace,
                         &network,
