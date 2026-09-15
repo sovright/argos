@@ -215,6 +215,25 @@ jobs:
       - name: Install Tauri CLI
         run: npm install -g @tauri-apps/cli@2.11.1
 
+      # Compile BEFORE authenticating.
+      #
+      # `tauri build` compiles and signs in one step, so with azure/login ahead
+      # of it the first signing call landed ~11 minutes after authentication —
+      # and that is when signing hung. A standalone smoke test on the same
+      # runner image, the same pinned dlib and the same certificate profile
+      # signed a stock binary in 8.8s with the token issued in 0.6s, the only
+      # difference being that it signed ~20 seconds after login. The federated
+      # assertion azure/login authenticates with is short-lived, and the dlib
+      # asks for a *different* scope (codesigning.azure.net) than the CLI
+      # cached, so acquiring it 11 minutes later is a fresh acquisition against
+      # an assertion that has expired.
+      #
+      # Warming the build here leaves `tauri build` below an incremental
+      # rebuild — same package, same profile, same target directory — so
+      # signing runs seconds after login instead of minutes.
+      - name: Pre-compile, so signing runs shortly after authentication
+        run: cargo build --release -p argos-gui
+
       # Azure Trusted Signing (cloud-held key) via OIDC — no secret in CI.
       # Signs the inner Argos.exe *and* the MSI/NSIS installers during the
       # build (see signCommand injected below). The attest-build-provenance
@@ -228,6 +247,34 @@ jobs:
           client-id: ${{ vars.AZURE_SIGNING_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_SIGNING_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SIGNING_SUBSCRIPTION_ID }}
+
+      # Pre-flight the credential BEFORE the ~11-minute compile.
+      #
+      # `tauri build` compiles and signs in one step, so a broken credential
+      # only surfaces after the whole build — and a v1.3.0 run stalled 22m35s
+      # at the first signing call with no output at all. Asking for the signing
+      # token here costs seconds and turns that into a specific Azure error at
+      # the top of the log, before anything expensive runs.
+      #
+      # Diagnostic only: the token is never used or printed, and the step is
+      # deliberately non-fatal so it cannot itself break a release that would
+      # otherwise sign fine.
+      - name: Pre-flight the signing credential
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "az version:"
+          az version --output tsv 2>&1 | Select-Object -First 1
+          Write-Host "Signed-in identity:"
+          az account show --query "{tenant:tenantId, user:user.name, type:user.type}" -o tsv 2>&1
+          Write-Host "Requesting a Trusted Signing token (https://codesigning.azure.net/.default):"
+          $null = az account get-access-token --scope https://codesigning.azure.net/.default -o none 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "OK: a signing-scoped token was issued non-interactively."
+          } else {
+            Write-Host "FAILED: could not obtain a signing-scoped token (exit $LASTEXITCODE)."
+            az account get-access-token --scope https://codesigning.azure.net/.default -o none
+          }
 
       - name: Set up Trusted Signing (dlib + signtool + signCommand)
         id: ts
@@ -321,15 +368,6 @@ jobs:
 
       - name: Build + sign Tauri app
         working-directory: gui
-        env:
-          # The Trusted Signing dlib authenticates with DefaultAzureCredential.
-          # When its non-interactive sources fail, that chain can fall back to
-          # opening a browser and then blocks forever waiting for a human — in
-          # CI that is an indefinite hang, not an error. A cancelled v1.3.0 run
-          # sat 22m35s after "Signing ... with a custom signing command" with no
-          # output and left two orphaned msedge processes behind. Deny the
-          # interactive path so an auth failure fails loudly instead.
-          AZURE_TOKEN_CREDENTIALS: AzureCliCredential
         run: tauri build --bundles msi --bundles nsis --config "${{ steps.ts.outputs.sign_config }}"
 
       - name: Attest build provenance
