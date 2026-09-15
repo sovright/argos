@@ -978,6 +978,23 @@ async fn execute_sweep_for_session(
                     )
                     .await?
                     {
+                        // The shield is broadcast and the value is safe in this
+                        // wallet's shielded pool, but it did not become spendable
+                        // inside the wait window, so the send-max leg never ran and
+                        // nothing reached the destination. Record the account as
+                        // skipped: an empty `skipped_accounts` with no error is how
+                        // `execute_sweep` reports a *completed* sweep, and reporting
+                        // completion for funds that were never sent is the one
+                        // outcome a recovery tool must never produce.
+                        skipped_accounts.push(SkippedSweepAccount {
+                            account_index: tracked_account.derived.index,
+                            gross_zatoshis: account_total,
+                            reason: "Funds were shielded, but the shielding transaction did not \
+                                     become spendable in time, so they were not swept to the \
+                                     destination. They are safe in this wallet — run the sweep \
+                                     again once that transaction has confirmed."
+                                .to_owned(),
+                        });
                         continue 'accounts;
                     }
                     refresh_scan_progress(
