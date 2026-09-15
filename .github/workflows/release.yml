@@ -44,6 +44,7 @@ permissions: {}
 jobs:
   build-linux:
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write      # Sigstore OIDC for attest-build-provenance
@@ -108,6 +109,7 @@ jobs:
 
   build-macos:
     runs-on: macos-latest
+    timeout-minutes: 60
     # Gated by the `release-sign` Environment — its required-reviewer protection
     # rule (in repo settings) is the real control on who can trigger signing.
     # See the SECURITY note at the top of this file (audit Suggestion 7).
@@ -172,6 +174,7 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 60
     # Gated by the `release-sign` Environment — its required-reviewer protection
     # rule (in repo settings) is the real control on who can trigger signing.
     # See the SECURITY note at the top of this file (audit Suggestion 7).
@@ -318,6 +321,15 @@ jobs:
 
       - name: Build + sign Tauri app
         working-directory: gui
+        env:
+          # The Trusted Signing dlib authenticates with DefaultAzureCredential.
+          # When its non-interactive sources fail, that chain can fall back to
+          # opening a browser and then blocks forever waiting for a human — in
+          # CI that is an indefinite hang, not an error. A cancelled v1.3.0 run
+          # sat 22m35s after "Signing ... with a custom signing command" with no
+          # output and left two orphaned msedge processes behind. Deny the
+          # interactive path so an auth failure fails loudly instead.
+          AZURE_TOKEN_CREDENTIALS: AzureCliCredential
         run: tauri build --bundles msi --bundles nsis --config "${{ steps.ts.outputs.sign_config }}"
 
       - name: Attest build provenance
@@ -338,6 +350,7 @@ jobs:
   release:
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Gated by the `release-publish` Environment — its required-reviewer
     # protection rule (in repo settings) is the real control on who can publish
     # a Release. See the SECURITY note at the top of this file (audit Suggestion 7).
