@@ -254,6 +254,13 @@
             <button class="primary" data-next="seed">I have my 24-word seed phrase</button>
             <button class="secondary" data-next="wallet-file">I have a wallet file</button>
           </div>
+          <div class="address-search-entry">
+            <div>
+              <strong>Know an old wallet address?</strong>
+              <span>Compare it with candidate seeds entirely offline.</span>
+            </div>
+            <button class="ghost" id="open-address-search" type="button">Find its seed and path</button>
+          </div>
           <p class="audit-notice">Independently audited by <a href="https://leastauthority.com" target="_blank" rel="noopener">Least Authority</a>.</p>
 
           <div id="resume-panel" class="report-card" hidden>
@@ -446,6 +453,10 @@
         <section class="screen" data-step="config">
           <p class="eyebrow">Step 3</p>
           <h2>Configure the recovery session</h2>
+          <div id="matched-recovery-banner" class="banner" hidden>
+            <strong>Exact address match selected.</strong>
+            <span id="matched-recovery-summary"></span> Choose the birthday, server, destination, and scan limits below. The first network request happens only when you start the recovery scan.
+          </div>
           <div class="form-grid">
 
             <p class="form-section-heading span-two">Scan identity</p>
@@ -483,15 +494,15 @@
               <small>Pick roughly when you first created your ZecWallet Lite — Argos will fill in the block height for you. <strong>Auto-detect</strong> probes the blockchain using your seed phrase (requires a server connection).</small>
             </label>
 
-            <p class="form-section-heading span-two">Accounts to scan</p>
+            <p class="form-section-heading span-two" id="accounts-heading">Accounts to scan</p>
 
-            <label class="field">
+            <label class="field" id="accounts-range-field">
               <span>Starting number of accounts</span>
               <input id="accounts-range" type="range" min="1" max="500" value="20" />
               <strong id="accounts-range-value">20</strong>
               <small>Most users only ever had 1 account. Leave at 20 to be safe. With gap scanning enabled, Argos may check additional accounts beyond this number.</small>
             </label>
-            <label class="checkline field">
+            <label class="checkline field" id="auto-gap-limit-field">
               <input id="auto-gap-limit" type="checkbox" checked />
               <span>Keep scanning until no more funds are found <em>(recommended)</em></span>
             </label>
@@ -501,6 +512,20 @@
                 <input id="gap-limit" type="number" min="1" max="50" value="20" />
                 <small>Only change this if you know you had many unused accounts. Default of 20 is fine for almost everyone.</small>
               </label>
+            </div>
+
+            <div id="transparent-scan-settings" class="span-two">
+              <p class="form-section-heading">Transparent addresses</p>
+              <p class="scope-note" id="transparent-scan-summary">Seed-based wallets: account 0 receive indices 0–999 are checked automatically as an additional complete range.</p>
+              <details>
+                <summary>Advanced: change the transparent address range</summary>
+                <div class="address-search-options">
+                  <label class="field"><span>First transparent index</span><input id="transparent-index-start" type="number" min="0" max="2147483647" step="1" value="0" /></label>
+                  <label class="field"><span>Transparent indexes to check</span><input id="transparent-index-count" type="number" min="1" max="10000" step="1" value="1000" /></label>
+                </div>
+                <label class="checkline"><input id="transparent-include-change" type="checkbox" /><span>Also check transparent change addresses</span></label>
+                <small>This additional complete-range scan checks every selected index without stopping at unused addresses. Use a larger or shifted range only if needed.</small>
+              </details>
             </div>
 
             <p class="form-section-heading span-two">Server</p>
@@ -553,7 +578,7 @@
           </div>
           <p id="config-status" class="status-line"></p>
           <div class="actions split">
-            <button class="secondary" data-prev="seed">Back</button>
+            <button class="secondary" id="config-back" data-prev="seed">Back</button>
             <button class="primary" id="start-scan">Start Scan</button>
           </div>
         </section>
@@ -646,6 +671,7 @@
           <div class="actions split">
             <button class="secondary" id="cancel-scan">Cancel</button>
             <button class="ghost" id="back-to-config" style="display:none">← Back to config</button>
+            <button class="ghost" id="scan-return-address-matches" type="button" hidden>← Back to address matches</button>
             <button class="primary" id="review-sweep" disabled>Review & Sweep</button>
           </div>
         </section>
@@ -779,6 +805,7 @@
             </div>
           </div>
           <div class="actions">
+            <button class="secondary" id="complete-return-address-matches" type="button" hidden>Recover another matched address</button>
             <button class="primary" data-next="welcome" id="restart-flow">Start over</button>
           </div>
         </section>
@@ -804,6 +831,11 @@
           </label>
           <button class="ghost" id="resume-seed-clear-clipboard" type="button" title="Overwrite the OS clipboard with empty text. Does not clear clipboard-history apps.">Clear clipboard</button>
         </div>
+        <label class="field" id="resume-bip39-passphrase-field" hidden>
+          <span>BIP39 passphrase (if used)</span>
+          <input id="resume-bip39-passphrase" type="password" autocomplete="off" spellcheck="false" />
+          <small>This must match the passphrase used when the address was found. It is not your wallet encryption password.</small>
+        </label>
         <label class="field">
           <span>Label (optional rename)</span>
           <input id="resume-label-input" type="text" maxlength="120" />
@@ -817,6 +849,93 @@
       </div>
     </div>
 
+    <div id="address-search-modal" class="modal-overlay address-search-modal" role="dialog" aria-modal="true" aria-labelledby="address-search-title" hidden>
+      <div class="modal-card address-search-card">
+        <div class="address-search-header">
+          <div>
+            <p class="eyebrow">Offline address matcher</p>
+            <h2 id="address-search-title">Find which seed made an address</h2>
+            <p class="lead">Argos derives addresses on this computer and compares them exactly. It does not contact the Zcash network or look up balances.</p>
+          </div>
+          <button class="guide-close" id="close-address-search" type="button" aria-label="Close and clear address matcher">✕</button>
+        </div>
+
+        <form id="address-search-form" autocomplete="off">
+          <div class="address-search-section">
+            <span class="address-search-step">1</span>
+            <div class="address-search-section-body">
+              <label class="field">
+                <span>Known address</span>
+                <input id="address-search-target" type="text" spellcheck="false" autocapitalize="off" placeholder="t1…  zs…  or u1…" required />
+                <small>Paste the complete address. Matches are exact and network-specific.</small>
+              </label>
+              <label class="field compact-field">
+                <span>Network</span>
+                <select id="address-search-network"><option value="mainnet">Mainnet</option><option value="testnet">Testnet</option></select>
+              </label>
+            </div>
+          </div>
+
+          <div class="address-search-section">
+            <span class="address-search-step">2</span>
+            <div class="address-search-section-body">
+              <div class="section-title-row">
+                <div><h3>Candidate seeds</h3><p class="hint">Add up to 64 seeds. Labels help you recognize backups in the results.</p></div>
+                <button class="ghost small-button" id="add-address-search-seed" type="button">+ Add seed</button>
+              </div>
+              <div id="address-search-seeds" class="candidate-seeds"></div>
+              <p class="secret-note">Seed phrases and optional BIP39 passphrases are held only for this search and cleared from the form when it starts or closes. A BIP39 passphrase changes the wallet derived from the seed; it is not a wallet encryption password.</p>
+            </div>
+          </div>
+
+          <div class="address-search-section">
+            <span class="address-search-step">3</span>
+            <div class="address-search-section-body">
+              <h3>Where to look</h3>
+              <p id="address-search-profile-note" class="scope-note">ZecWallet Lite: search receive-address indices in account 0. Every index in your range is checked, even after unused addresses.</p>
+              <div class="address-search-options">
+                <label class="field"><span>First address / diversifier index</span><input id="address-search-index-start" type="number" min="0" max="2147483647" step="1" value="0" required /></label>
+                <label class="field"><span>Indexes to check</span><input id="address-search-index-count" type="number" min="1" max="10000" step="1" value="1000" required /></label>
+              </div>
+              <details id="address-search-advanced">
+                <summary>Advanced: other accounts and change addresses</summary>
+                <div class="address-search-options">
+                  <label class="field"><span>Wallet derivation</span><select id="address-search-profile"><option value="zecwallet_lite">ZecWallet Lite</option><option value="bip44">Advanced BIP44 accounts</option></select></label>
+                  <label class="field"><span>First account</span><input id="address-search-account-start" type="number" min="0" max="2147483647" step="1" value="0" required /></label>
+                  <label class="field"><span>Accounts to check</span><input id="address-search-account-count" type="number" min="1" max="1000" step="1" value="1" required /></label>
+                </div>
+                <label class="checkline"><input id="address-search-change" type="checkbox" /><span>Also check supported internal/change scopes</span></label>
+              </details>
+              <p class="scope-note"><strong>Search scope:</strong> transparent, Sapling, and Orchard matching checks supported external addresses and, when selected, internal/change addresses. ZecWallet Lite transparent matching uses account 0; Advanced BIP44 can search transparent account ranges. Wallets can use other paths, accounts, indexes, passphrases, or imported keys.</p>
+            </div>
+          </div>
+
+          <p id="address-search-form-status" class="status-line" role="alert"></p>
+          <div class="actions split">
+            <button class="secondary" id="address-search-clear" type="button">Clear</button>
+            <button class="primary" id="start-address-search" type="submit">Start offline search</button>
+          </div>
+        </form>
+
+        <section id="address-search-progress" class="address-search-progress" hidden aria-live="polite">
+          <div class="section-title-row"><div><p class="eyebrow">Searching locally</p><h3 id="address-search-progress-title">Checking derived addresses…</h3></div><span id="address-search-percent" class="progress-percent">0%</span></div>
+          <div class="progress-shell"><div id="address-search-progress-bar" class="progress-bar" style="width:0%"></div></div>
+          <p id="address-search-count" class="hint">Preparing search…</p>
+          <div id="address-search-live-matches" class="match-list"></div>
+          <div class="actions split"><button class="secondary" id="cancel-address-search" type="button">Cancel search</button><button class="ghost" id="address-search-new" type="button" hidden>Search another address</button></div>
+        </section>
+
+        <section id="address-search-results" class="address-search-results" hidden aria-live="polite">
+          <div id="address-search-outcome" class="search-outcome"></div>
+          <div id="address-search-matches" class="match-list"></div>
+          <p id="address-search-limitation" class="scope-note"></p>
+          <p class="secret-note">Argos retains only the matching seeds until you explicitly close or clear these results, restart the recovery flow, or quit Argos. This lets you recover another result without deriving everything again. Each started recovery owns its own independent key source.</p>
+          <div class="actions"><button class="primary" id="address-search-again" type="button">Clear results and search another address</button></div>
+        </section>
+      </div>
+    </div>
+
     <script src="./main.js"></script>
+    <script src="./address-search.js"></script>
   </body>
 </html>

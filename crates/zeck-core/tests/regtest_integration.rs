@@ -114,6 +114,7 @@ async fn complete_scan_against_test_seed(
         birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
+        transparent_scan: None,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
         data_dir: temp_data_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
@@ -138,6 +139,7 @@ async fn complete_scan_against_test_seed(
         data_dir: runtime.data_dir.clone(),
         network: runtime.network,
         label: runtime.label.clone(),
+        transparent_scan: None,
     };
 
     let service = RecoveryService::new();
@@ -270,6 +272,7 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
         birthday: common::regtest_harness::funding_birthday(),
         num_accounts: Some(2),
         gap_limit: 5,
+        transparent_scan: None,
         lightwalletd_url: fake.url.clone(),
         data_dir: fixture_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
@@ -283,6 +286,7 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
         data_dir: runtime.data_dir.clone(),
         network: runtime.network,
         label: runtime.label.clone(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let handle = service
@@ -423,6 +427,7 @@ async fn hostile_compact_block_rejected_cleanly() {
         data_dir: faulted_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn9-faulted".to_owned(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let handle = service
@@ -574,6 +579,7 @@ async fn sustained_high_latency_scan_completes() {
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn13-latency".to_owned(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let handle = service
@@ -663,6 +669,7 @@ async fn bandwidth_throttled_scan_does_not_flag_false_stall() {
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn14-throttle".to_owned(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let handle = service
@@ -753,6 +760,7 @@ async fn hung_stream_surfaces_err_within_bounded_time() {
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn15-hang".to_owned(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let handle = service
@@ -886,6 +894,7 @@ async fn dns_drift_retry_succeeds_against_replacement_backend() {
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn16-drift".to_owned(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let handle = service
@@ -958,6 +967,7 @@ async fn captive_portal_shim_surfaces_clean_error() {
         data_dir: tempfile::tempdir().expect("temp data dir").keep(),
         network: ZeckNetwork::Testnet,
         label: "rn17-captive".to_owned(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let seed = SecretString::new(common::regtest_harness::ARGOS_TEST_SEED.to_owned());
@@ -1102,6 +1112,7 @@ async fn asymmetric_loss_recovers_via_watchdog_and_retry() {
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn18-asymmetric".to_owned(),
+        transparent_scan: None,
     };
     let service = RecoveryService::new();
     let handle = service
@@ -1462,6 +1473,7 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
         data_dir: temp_data_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "argos-rs26-post".to_owned(),
+        transparent_scan: None,
     };
     let handle = fixture
         .service
@@ -1941,6 +1953,7 @@ async fn two_instances_same_workspace_cancels_first() {
         // labels, which is the correct behaviour (a relaunched session
         // with a different label is still the same workspace).
         label: "argos-rw24-first".to_owned(),
+        transparent_scan: None,
     };
 
     let service = RecoveryService::new();
@@ -1964,6 +1977,7 @@ async fn two_instances_same_workspace_cancels_first() {
         .start_scan(
             ScanConfig {
                 label: "argos-rw24-second".to_owned(),
+                transparent_scan: None,
                 ..scan_config
             },
             SecretString::new(harness.test_seed().to_owned()),
@@ -2566,6 +2580,7 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
                 data_dir: data_dir.path().to_path_buf(),
                 network: ZeckNetwork::Testnet,
                 label: "post-ironwood-sweep".to_owned(),
+                transparent_scan: None,
             },
             secrecy::SecretString::new(harness.test_seed().to_owned()),
         )
@@ -2902,6 +2917,7 @@ async fn an_imported_zcashd_wallet_scans_as_wallet_accounts() {
                 data_dir: data_dir.path().to_owned(),
                 network: ZeckNetwork::Testnet,
                 label: String::new(),
+                transparent_scan: None,
             },
             std::sync::Arc::new(ImportedKeySource::new(keys)),
         )
@@ -2999,6 +3015,7 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
         data_dir: data_dir.path().to_owned(),
         network: ZeckNetwork::Testnet,
         label: String::new(),
+        transparent_scan: None,
     };
     // `ImportedKeys` is deliberately not `Clone` — it holds spending keys —
     // so re-parse the fixture for the second consumer instead.
@@ -3079,5 +3096,583 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
     assert!(
         mined.get("height").and_then(|h| h.as_u64()).is_some(),
         "the sweep must be mined, got: {mined}"
+    );
+}
+
+/// Exercises the same search -> matched key source -> scan -> proposal -> sweep
+/// services as the GUI, with a funded ZecWallet Lite receive index beyond zero.
+/// Native GUI interaction still has its own release qualification checklist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
+    use argos_core::address_search::{
+        candidate_seed, AddressSearchService, CandidateSeed, SearchProfile, SearchRequest,
+        SearchStatus,
+    };
+    use argos_core::{prepare_match_recovery, MatchCoordinates};
+    use secrecy::ExposeSecret;
+    use zcash_transparent::{
+        address::TransparentAddress,
+        keys::{AccountPrivKey, NonHardenedChildIndex, TransparentKeyScope},
+    };
+
+    let harness = RegtestHarness::require();
+    let phrase = SecretString::new(harness.test_seed().to_owned());
+    let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
+    let params = argos_core::workspace::consensus_network(ZeckNetwork::Testnet);
+    let account =
+        AccountPrivKey::from_seed(&params, seed.expose_secret(), zip32::AccountId::ZERO).unwrap();
+    let public = account
+        .to_account_pubkey()
+        .derive_address_pubkey(
+            TransparentKeyScope::EXTERNAL,
+            NonHardenedChildIndex::from_index(997).unwrap(),
+        )
+        .unwrap();
+    let address = argos_core::imported::encode_transparent_address(
+        &TransparentAddress::from_pubkey(&public),
+        ZeckNetwork::Testnet,
+    );
+    common::regtest_harness::fund_address(&address, 1_250_000_000).await;
+
+    let searches = AddressSearchService::default();
+    let id = searches
+        .start(SearchRequest {
+            target: address.clone(),
+            network: ZeckNetwork::Testnet,
+            seeds: vec![CandidateSeed {
+                label: "public regtest vector".into(),
+                seed: phrase,
+                passphrase: SecretString::new(String::new()),
+            }],
+            profile: SearchProfile::ZecwalletLite,
+            account_start: 0,
+            account_count: 1,
+            index_start: 0,
+            index_count: 1000,
+            include_change: false,
+        })
+        .unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = searches.snapshot(&id).unwrap();
+            match snapshot.status {
+                SearchStatus::Complete => {
+                    assert_eq!(snapshot.checked, 1000);
+                    assert_eq!(snapshot.matches.len(), 1);
+                    break snapshot.matches[0].clone();
+                }
+                SearchStatus::Running => tokio::time::sleep(Duration::from_millis(20)).await,
+                _ => panic!("address search failed: {:?}", snapshot.error),
+            }
+        }
+    })
+    .await
+    .expect("offline search timed out");
+    assert_eq!(found.index, 997);
+    assert_eq!(found.path, "m/44'/1'/0'/0/997");
+    let (matched, retained_seed) = searches.matched_seed(&id, &found.id).unwrap();
+    let source = prepare_match_recovery(
+        retained_seed.expose_secret(),
+        ZeckNetwork::Testnet,
+        MatchCoordinates {
+            pool: matched.pool,
+            account: matched.account,
+            scope: matched.scope,
+            index: matched.index,
+            network: ZeckNetwork::Testnet,
+            address: matched.address,
+            path: matched.path,
+        },
+    )
+    .unwrap();
+    // Closing discovery must not invalidate the independent recovery source.
+    searches.release(&id).unwrap();
+    drop(retained_seed);
+    drop(seed);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "matched transparent index 997".into(),
+                transparent_scan: None,
+            },
+            source,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => {
+                    assert!(progress
+                        .discoveries
+                        .iter()
+                        .any(|d| d.zatoshis >= 1_250_000_000));
+                    break;
+                }
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("matched scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("matched balance scan timed out");
+    let request = SweepRequest {
+        destination: regtest_encoded_unified_address_at(harness.test_seed(), 2),
+        memo: None,
+        max_fee_zatoshis: Some(100_000),
+        donation_rate: None,
+        donor_email: None,
+    };
+    service
+        .propose_sweep(&handle, request.clone())
+        .await
+        .expect("matched sweep proposal");
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        service.execute_sweep(&handle, request),
+    )
+    .await;
+    mining.abort();
+    let outcome = outcome
+        .expect("matched sweep timed out")
+        .expect("matched sweep failed");
+    assert!(
+        !outcome.transactions.is_empty(),
+        "funded match must broadcast a sweep"
+    );
+    let txids: Vec<String> = outcome
+        .transactions
+        .iter()
+        .map(|tx| {
+            tx.txid
+                .clone()
+                .expect("broadcast transaction must have a txid")
+        })
+        .collect();
+    for tx in &outcome.transactions {
+        assert!(
+            matches!(tx.status.as_str(), "confirmed" | "broadcast"),
+            "{}: {}",
+            tx.status,
+            tx.detail
+        );
+        assert!(tx.txid.is_some());
+        eprintln!("matched index 997 sweep accepted: {:?}", tx.txid);
+    }
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    for txid in txids {
+        let mined =
+            common::regtest_harness::zebra_rpc("getrawtransaction", serde_json::json!([txid, 1]))
+                .await;
+        assert!(
+            mined
+                .get("height")
+                .and_then(|height| height.as_u64())
+                .is_some(),
+            "matched index 997 sweep must be mined, got: {mined}"
+        );
+    }
+}
+
+/// Proves that a Sapling note sent to an internal diversifier can be found by
+/// its exact coordinates and swept with the scope-correct proof authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
+    use argos_core::address_search::{
+        candidate_seed, AddressSearchService, CandidateSeed, SearchProfile, SearchRequest,
+        SearchStatus,
+    };
+    use argos_core::{prepare_match_recovery, AddressScope, DiscoveryPool, MatchCoordinates};
+    use secrecy::ExposeSecret;
+    use zcash_keys::encoding::AddressCodec;
+
+    let harness = RegtestHarness::require();
+    let phrase = SecretString::new(harness.test_seed().to_owned());
+    let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
+    let account_index = 4u32;
+    let account = zip32::AccountId::try_from(account_index).unwrap();
+    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account);
+    let internal_dfvk = extsk.derive_internal().to_diversifiable_full_viewing_key();
+    let (address_index, internal_address) = (1u32..100)
+        .find_map(|index| {
+            internal_dfvk
+                .address(index.into())
+                .map(|address| (index, address))
+        })
+        .expect("the fixture range must contain a valid internal diversifier");
+    let encoded = internal_address.encode(&zcash_protocol::consensus::TEST_NETWORK);
+    common::regtest_harness::fund_address(&encoded, 900_000_000).await;
+
+    let searches = AddressSearchService::default();
+    let id = searches
+        .start(SearchRequest {
+            target: encoded.clone(),
+            network: ZeckNetwork::Testnet,
+            seeds: vec![CandidateSeed {
+                label: "public regtest vector".into(),
+                seed: phrase,
+                passphrase: SecretString::new(String::new()),
+            }],
+            profile: SearchProfile::Bip44,
+            account_start: account_index,
+            account_count: 1,
+            index_start: address_index,
+            index_count: 1,
+            include_change: true,
+        })
+        .unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = searches.snapshot(&id).unwrap();
+            match snapshot.status {
+                SearchStatus::Complete => {
+                    assert_eq!(snapshot.matches.len(), 1);
+                    break snapshot.matches[0].clone();
+                }
+                SearchStatus::Running => tokio::time::sleep(Duration::from_millis(20)).await,
+                _ => panic!("internal Sapling search failed: {:?}", snapshot.error),
+            }
+        }
+    })
+    .await
+    .expect("internal Sapling search timed out");
+    assert_eq!(found.pool, DiscoveryPool::Sapling);
+    assert_eq!(found.scope, AddressScope::Internal);
+    assert_eq!(found.account, account_index);
+    assert_eq!(found.index, address_index);
+
+    let (matched, retained_seed) = searches.matched_seed(&id, &found.id).unwrap();
+    let source = prepare_match_recovery(
+        retained_seed.expose_secret(),
+        ZeckNetwork::Testnet,
+        MatchCoordinates {
+            pool: matched.pool,
+            account: matched.account,
+            scope: matched.scope,
+            index: matched.index,
+            network: ZeckNetwork::Testnet,
+            address: matched.address,
+            path: matched.path,
+        },
+    )
+    .unwrap();
+    searches.release(&id).unwrap();
+    drop(retained_seed);
+    drop(seed);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "matched internal Sapling receiver".into(),
+                transparent_scan: None,
+            },
+            source,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => {
+                    assert!(progress.accounts.iter().any(|account| {
+                        account.account_index == 0 && account.sapling_zatoshis >= 900_000_000
+                    }));
+                    break;
+                }
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("matched internal Sapling scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("matched internal Sapling scan timed out");
+
+    let request = SweepRequest {
+        destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
+        memo: None,
+        max_fee_zatoshis: Some(100_000),
+        donation_rate: None,
+        donor_email: None,
+    };
+    service
+        .propose_sweep(&handle, request.clone())
+        .await
+        .unwrap();
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        service.execute_sweep(&handle, request),
+    )
+    .await
+    .expect("internal Sapling sweep timed out")
+    .expect("internal Sapling sweep failed");
+    mining.abort();
+    let txid = outcome
+        .transactions
+        .iter()
+        .find(|tx| tx.detail.contains("Sapling"))
+        .and_then(|tx| tx.txid.clone())
+        .expect("internal Sapling sweep must broadcast a Sapling transaction");
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    let mined =
+        common::regtest_harness::zebra_rpc("getrawtransaction", serde_json::json!([txid, 1])).await;
+    assert!(
+        mined
+            .get("height")
+            .and_then(|height| height.as_u64())
+            .is_some(),
+        "internal Sapling sweep must be mined, got: {mined}"
+    );
+}
+
+/// Regression for automatic transparent range discovery: both a low and a
+/// high receive index must be imported into one normal seed scan and then
+/// consumed by the sweep. This is deliberately independent of address search.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn automatic_transparent_range_recovers_low_and_high_indices() {
+    use argos_core::imported::ImportedTransparentKey;
+    use argos_core::lightwalletd::connect_lightwalletd_endpoints_with_retry;
+    use argos_core::transparent_recovery::fetch_transparent_utxos;
+    use argos_core::TransparentScanConfig;
+    use secrecy::ExposeSecret;
+    use zcash_transparent::keys::{AccountPrivKey, NonHardenedChildIndex, TransparentKeyScope};
+
+    let harness = RegtestHarness::require();
+    let seed = argos_core::address_search::candidate_seed(
+        &SecretString::new(harness.test_seed().to_owned()),
+        &SecretString::new(String::new()),
+    )
+    .unwrap();
+    let params = argos_core::workspace::consensus_network(ZeckNetwork::Testnet);
+    let account =
+        AccountPrivKey::from_seed(&params, seed.expose_secret(), zip32::AccountId::ZERO).unwrap();
+    let address_at = |index| {
+        let pk = account
+            .to_account_pubkey()
+            .derive_address_pubkey(
+                TransparentKeyScope::EXTERNAL,
+                NonHardenedChildIndex::from_index(index).unwrap(),
+            )
+            .unwrap();
+        argos_core::imported::encode_transparent_address(
+            &zcash_transparent::address::TransparentAddress::from_pubkey(&pk),
+            ZeckNetwork::Testnet,
+        )
+    };
+    let low = address_at(7);
+    let high = address_at(997);
+    common::regtest_harness::fund_address(&low, 600_000_000).await;
+    common::regtest_harness::fund_address(&high, 700_000_000).await;
+    let exact_keys = [7u32, 997u32]
+        .into_iter()
+        .map(|index| {
+            let secret = account
+                .derive_secret_key(
+                    TransparentKeyScope::EXTERNAL,
+                    NonHardenedChildIndex::from_index(index).unwrap(),
+                )
+                .unwrap();
+            ImportedTransparentKey {
+                secret,
+                address: match zcash_keys::address::Address::decode(&params, &address_at(index)) {
+                    Some(zcash_keys::address::Address::Transparent(address)) => address,
+                    _ => panic!("derived transparent address must decode"),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let (mut utxo_client, _) =
+        connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)
+            .await
+            .unwrap();
+    let before = fetch_transparent_utxos(&mut utxo_client, &exact_keys, ZeckNetwork::Testnet)
+        .await
+        .unwrap();
+    for key in &exact_keys {
+        assert!(
+            before.iter().any(|utxo| utxo.address == key.address),
+            "each funded index must have a spendable UTXO"
+        );
+    }
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = ScanConfig {
+        birthday: common::regtest_harness::funding_birthday(),
+        num_accounts: Some(1),
+        gap_limit: 1,
+        lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        data_dir: data_dir.path().to_owned(),
+        network: ZeckNetwork::Testnet,
+        label: "automatic transparent range".into(),
+        transparent_scan: Some(TransparentScanConfig::default()),
+    };
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan(
+            config.clone(),
+            SecretString::new(harness.test_seed().to_owned()),
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let p = service.get_scan_progress(&handle).await.unwrap();
+            match p.phase {
+                ScanPhase::Complete => break p,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("range scan failed: {:?}", p.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("range scan timed out");
+    assert!(
+        progress.accounts.iter().any(|account| {
+            account.account_index == 0 && account.transparent_zatoshis >= 1_300_000_000
+        }),
+        "account aggregate must include both range-funded addresses: {:?}",
+        progress.accounts
+    );
+
+    // Reconstruct the saved range from the workspace identity, as GUI resume
+    // does, and re-derive signing keys from the seed after a service restart.
+    let workspace_path =
+        std::path::PathBuf::from(progress.summary.as_ref().unwrap().workspace_dir.clone());
+    let keying = argos_core::workspace::parse_workspace_keying(&workspace_path).unwrap();
+    assert_eq!(keying.transparent_scan, config.transparent_scan);
+    let config = ScanConfig {
+        transparent_scan: keying.transparent_scan,
+        ..config
+    };
+    let resumed = RecoveryService::new();
+    let resumed_handle = resumed
+        .start_scan(config, SecretString::new(harness.test_seed().to_owned()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let p = resumed.get_scan_progress(&resumed_handle).await.unwrap();
+            match p.phase {
+                ScanPhase::Complete => break,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("resumed range scan failed: {:?}", p.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("resumed range scan timed out");
+    let request = SweepRequest {
+        destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
+        memo: None,
+        max_fee_zatoshis: Some(100_000),
+        donation_rate: None,
+        donor_email: None,
+    };
+    resumed
+        .propose_sweep(&resumed_handle, request.clone())
+        .await
+        .unwrap();
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        resumed.execute_sweep(&resumed_handle, request),
+    )
+    .await;
+    mining.abort();
+    let outcome = outcome.expect("range sweep timed out").unwrap();
+    assert!(
+        outcome.error.is_none(),
+        "sweep must fully finish: {:?}",
+        outcome.error
+    );
+    assert!(
+        outcome.skipped_accounts.is_empty(),
+        "funded range must not be skipped"
+    );
+    assert!(
+        outcome
+            .transactions
+            .iter()
+            .any(|tx| tx.detail.starts_with("sweep transaction") && tx.txid.is_some()),
+        "consuming transparent inputs through shielding alone is not a completed recovery"
+    );
+    assert!(
+        !outcome.transactions.is_empty(),
+        "range sweep must broadcast"
+    );
+    let txids: Vec<_> = outcome
+        .transactions
+        .iter()
+        .filter_map(|tx| tx.txid.clone())
+        .collect();
+    common::regtest_harness::zebra_rpc("generate", serde_json::json!([1])).await;
+    for txid in txids {
+        let tx =
+            common::regtest_harness::zebra_rpc("getrawtransaction", serde_json::json!([txid, 1]))
+                .await;
+        assert!(tx.get("height").and_then(|h| h.as_u64()).is_some());
+    }
+    let (mut after_client, _) =
+        connect_lightwalletd_endpoints_with_retry(harness.lightwalletd_url(), None)
+            .await
+            .unwrap();
+    let after = fetch_transparent_utxos(&mut after_client, &exact_keys, ZeckNetwork::Testnet)
+        .await
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "the sweep must spend both index 7 and index 997 UTXOs"
     );
 }

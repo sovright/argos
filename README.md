@@ -67,6 +67,31 @@ argos --wallet-file /path/to/wallet.dat sweep --destination u1... --dry-run
 argos --wallet-file /path/to/wallet.dat sweep --destination u1... --confirm-sweep
 ```
 
+## Automatic transparent address coverage
+
+Ordinary seed recovery checks account 0 receive indices **0–999** in addition
+to the standard receivers of the shielded accounts being recovered. It checks
+the entire range even when earlier addresses are unused. All funded addresses
+in that range feed into the normal balance summary and shielding/sweep flow;
+there is no need to know a target address or use **Find this address** first.
+
+In the GUI, open **Advanced: change the transparent address range** to adjust
+the first index, count, or include the corresponding change-address range.
+The CLI exposes the same settings for both `scan` and `sweep`:
+
+```sh
+argos --transparent-index-start 0 --transparent-index-count 2000 --transparent-change scan
+```
+
+Use the same range flags for a later CLI `sweep` command.
+
+The range is independent of the shielded account count/gap. It is limited to
+10,000 indices per branch per scan and must stay within non-hardened BIP44
+indices. A changed range uses a separate workspace; resuming a saved scan
+restores its original scope, including the historical scope of old sessions.
+Wallet files containing an HD seed use the same range. Standalone/imported-key
+and exact-address-match recovery retain their own key scope.
+
 ## Recovering a standalone Sapling key
 
 Put one key per line in a private text file. Blank lines and lines beginning

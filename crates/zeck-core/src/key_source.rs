@@ -25,6 +25,9 @@ const FINGERPRINT_DOMAIN: &[u8] = b"argos-key-source-fingerprint-v1";
 pub struct KeySourceFingerprint([u8; 32]);
 
 impl KeySourceFingerprint {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -63,6 +66,17 @@ pub trait KeySource: Send + Sync {
     /// Defaults to `None` so a new `KeySource` implementation is treated
     /// as seed-like unless it says otherwise.
     fn imported_keys(&self) -> Option<&ImportedKeys> {
+        None
+    }
+
+    fn match_coordinates(&self) -> Option<&crate::address_match_recovery::MatchCoordinates> {
+        None
+    }
+
+    /// Restricts an HD source to one exact ZIP-32 account. Used for an
+    /// Orchard discovery match so high account indices do not scan every
+    /// preceding account.
+    fn exact_hd_account(&self) -> Option<u32> {
         None
     }
 }

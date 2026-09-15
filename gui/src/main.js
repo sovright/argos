@@ -39,6 +39,9 @@ const state = {
   scanConfig: null,
   savedReportPath: null,
   donationEnabled: false,
+  matchedRecovery: null,
+  retainedAddressSearchId: null,
+  addressMatchRecoveryLocked: false,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -237,6 +240,10 @@ let furthestStep = 0; // tracks how far the user has reached
 const STEP_ALIASES = { "wallet-file": "seed" };
 
 function goTo(step) {
+  const leavingMatchedConfig = state.matchedRecovery &&
+    document.querySelector('.screen[data-step="config"]')?.classList.contains("active") &&
+    step !== "config" && step !== "scan";
+  if (leavingMatchedConfig) abandonMatchedRecovery();
   const stepIdx = steps.indexOf(STEP_ALIASES[step] ?? step);
   if (stepIdx > furthestStep) furthestStep = stepIdx;
 
@@ -251,6 +258,7 @@ function goTo(step) {
   });
   const screen = document.querySelector(`.screen[data-step="${step}"]`);
   if (screen) screen.classList.add("active");
+  if (step === "config") updateTransparentScanSettingsVisibility();
 }
 
 // Make sidebar steps clickable — only allow jumping to already-reached steps
@@ -282,6 +290,10 @@ document.querySelectorAll("[data-next]").forEach((btn) => {
 
 document.querySelectorAll("[data-prev]").forEach((btn) => {
   btn.addEventListener("click", () => {
+    if (btn.dataset.prev === "seed" && state.matchedRecovery) {
+      returnToAddressMatches();
+      return;
+    }
     if (btn.dataset.prev === "config") {
       $("start-scan").disabled = false;
       setStatus("config-status", "", "");
@@ -1009,6 +1021,146 @@ const SERVER_PRESETS = {
   testnet: "https://testnet.zec.rocks:443",
 };
 
+function clearMatchedRecoveryUi() {
+  state.matchedRecovery = null;
+  $("matched-recovery-banner").hidden = true;
+  $("matched-recovery-summary").textContent = "";
+  $("network-select").disabled = false;
+  $("birthday-autodetect").disabled = false;
+  $("accounts-heading").hidden = false;
+  $("accounts-range-field").hidden = false;
+  $("auto-gap-limit-field").hidden = false;
+  $("gap-limit-row").hidden = false;
+  $("transparent-scan-settings").hidden = false;
+}
+
+function configForMatchedRecovery(config) {
+  const { seed: _unused, ...seedless } = config;
+  return { ...seedless, num_accounts: 1, gap_limit: 1, transparent_scan: null };
+}
+
+function transparentScanFromInputs(startRaw, countRaw, includeChange) {
+  const indexStart = Number(startRaw);
+  const indexCount = Number(countRaw);
+  const limit = 2147483648;
+  if (!Number.isSafeInteger(indexStart) || indexStart < 0 || indexStart >= limit) {
+    throw new Error("First transparent index must be a whole number from 0 to 2,147,483,647.");
+  }
+  if (!Number.isSafeInteger(indexCount) || indexCount < 1 || indexCount > 10000) {
+    throw new Error("Transparent indexes to check must be a whole number from 1 to 10,000.");
+  }
+  if (indexStart + indexCount > limit) {
+    throw new Error("The transparent index range must end at or before 2,147,483,647.");
+  }
+  return { index_start: indexStart, index_count: indexCount, include_change: !!includeChange };
+}
+
+function transparentScanSummary(startRaw, countRaw, includeChange) {
+  try {
+    const range = transparentScanFromInputs(startRaw, countRaw, includeChange);
+    const end = range.index_start + range.index_count - 1;
+    const branches = range.include_change ? "receive + change" : "receive";
+    return {
+      valid: true,
+      text: `Seed-based wallets: account 0 ${branches} indices ${range.index_start.toLocaleString()}–${end.toLocaleString()} are checked as an additional complete range.`,
+    };
+  } catch (error) {
+    return { valid: false, text: `Fix the transparent range: ${error.message || error}` };
+  }
+}
+
+function updateTransparentScanSummary() {
+  const summary = transparentScanSummary(
+    $("transparent-index-start").value,
+    $("transparent-index-count").value,
+    $("transparent-include-change").checked,
+  );
+  $("transparent-scan-summary").textContent = summary.text;
+  $("transparent-scan-summary").style.color = summary.valid ? "" : "var(--danger)";
+}
+
+function shouldShowTransparentRange(matched, hasSeed, hasWallet, walletHasMnemonic, hasStandaloneKeys) {
+  if (matched) return false;
+  if (hasSeed) return true;
+  if (hasWallet) return !!walletHasMnemonic;
+  if (hasStandaloneKeys) return false;
+  return true;
+}
+
+function updateTransparentScanSettingsVisibility() {
+  $("transparent-scan-settings").hidden = !shouldShowTransparentRange(
+    !!state.matchedRecovery,
+    !!seedInput.value.trim(),
+    !!walletFile,
+    !!walletFile?.summary?.has_mnemonic,
+    hasSaplingScanKeys(),
+  );
+}
+
+$("transparent-index-start").addEventListener("input", updateTransparentScanSummary);
+$("transparent-index-count").addEventListener("input", updateTransparentScanSummary);
+$("transparent-include-change").addEventListener("change", updateTransparentScanSummary);
+updateTransparentScanSummary();
+
+window.addEventListener("beforeunload", () => {
+  // Backend-owned cleanup survives the webview unloading during configuration.
+  const id = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
+  if (id) invoke("release_address_search", { id }).catch(() => {});
+});
+
+function abandonMatchedRecovery() {
+  const searchId = state.matchedRecovery?.searchId;
+  clearMatchedRecoveryUi();
+  state.retainedAddressSearchId = null;
+  document.dispatchEvent(new CustomEvent("address-search-release", { detail: { searchId } }));
+}
+
+document.addEventListener("address-match-recovery", async (event) => {
+  const { searchId, matchId } = event.detail || {};
+  if (!searchId || !matchId || state.addressMatchRecoveryLocked) return;
+  try {
+    const snapshot = await invoke("get_address_search", { id: searchId });
+    const retainedMatch = (snapshot.matches || []).find((candidate) => candidate.id === matchId);
+    if (!retainedMatch) {
+      throw new Error("The selected address match is no longer available.");
+    }
+    state.matchedRecovery = { searchId, matchId, match: retainedMatch, network: snapshot.network };
+    state.retainedAddressSearchId = searchId;
+    // A matched capability is the sole recovery source. Clear any inputs left
+    // from an earlier wizard visit so secret provenance cannot be ambiguous.
+    seedInput.value = "";
+    walletFile = null;
+    $("wallet-passphrase").value = "";
+    $("sapling-scan-keys").value = "";
+    $("sapling-key-addresses").replaceChildren();
+    $("network-select").value = snapshot.network;
+    $("network-select").disabled = true;
+    $("server-preset").value = "recommended";
+    $("lightwalletd-url").value = SERVER_PRESETS[snapshot.network] ?? SERVER_PRESETS.mainnet;
+    $("birthday-autodetect").disabled = true;
+    $("accounts-heading").hidden = true;
+    $("accounts-range-field").hidden = true;
+    $("auto-gap-limit-field").hidden = true;
+    $("gap-limit-row").hidden = true;
+    $("transparent-scan-settings").hidden = true;
+    const recoveryScope = retainedMatch.pool === "transparent"
+      ? "Transparent recovery scans only the exact matched address."
+      : "Shielded recovery scans the matched account, including supported external and internal receivers.";
+    $("matched-recovery-summary").textContent =
+      `${retainedMatch.seed_label || `Candidate ${Number(retainedMatch.seed_index) + 1}`} matched ${retainedMatch.address} at ${retainedMatch.path}. ${recoveryScope}`;
+    $("matched-recovery-banner").hidden = false;
+    setStatus("config-status", "", "");
+    furthestStep = Math.max(furthestStep, steps.indexOf("config"));
+    goTo("config");
+  } catch (err) {
+    clearMatchedRecoveryUi();
+    state.retainedAddressSearchId = searchId;
+    document.dispatchEvent(new CustomEvent("address-search-reopen", {
+      detail: { searchId, error: `Could not open the matched recovery: ${err}` },
+    }));
+  }
+});
+
 $("network-select").addEventListener("change", () => {
   if ($("server-preset").value === "recommended") {
     $("lightwalletd-url").value = SERVER_PRESETS[$("network-select").value] ?? SERVER_PRESETS.mainnet;
@@ -1212,7 +1364,7 @@ $("start-scan").addEventListener("click", async () => {
   // Three routes to the same scan: a seed phrase, a wallet file, or a
   // pasted Sapling spending key.
   const hasTypedSaplingKeys = hasSaplingScanKeys();
-  if (!walletFile && !seedInput.value.trim() && !hasTypedSaplingKeys) {
+  if (!state.matchedRecovery && !walletFile && !seedInput.value.trim() && !hasTypedSaplingKeys) {
     setStatus(
       "config-status",
       "A seed phrase, a wallet file, or a Sapling spending key is required — \
@@ -1237,6 +1389,23 @@ phrase, or clear the seed phrase to scan the pasted key.",
       "error",
     );
     return;
+  }
+
+  let transparentScan = null;
+  if (shouldShowTransparentRange(
+    !!state.matchedRecovery, !!seedInput.value.trim(), !!walletFile,
+    !!walletFile?.summary?.has_mnemonic, hasTypedSaplingKeys,
+  )) {
+    try {
+      transparentScan = transparentScanFromInputs(
+        $("transparent-index-start").value,
+        $("transparent-index-count").value,
+        $("transparent-include-change").checked,
+      );
+    } catch (err) {
+      setStatus("config-status", `✗ ${err.message || err}`, "error");
+      return;
+    }
   }
 
   const address = $("destination-input").value.trim();
@@ -1283,12 +1452,13 @@ phrase, or clear the seed phrase to scan the pasted key.",
   const config = {
     seed: seedInput.value.trim().toLowerCase(),
     birthday: parseInt($("birthday-height").value, 10) || 419200,
-    num_accounts: autoGap ? null : parseInt($("accounts-range").value, 10),
-    gap_limit: autoGap ? parseInt($("gap-limit").value, 10) : 20,
+    num_accounts: state.matchedRecovery ? 1 : (autoGap ? null : parseInt($("accounts-range").value, 10)),
+    gap_limit: state.matchedRecovery ? 1 : (autoGap ? parseInt($("gap-limit").value, 10) : 20),
     lightwalletd_url: $("lightwalletd-url").value.trim(),
     data_dir: dataDirVal,
     network: $("network-select").value,
     label: labelRaw || defaultScanLabel(),
+    transparent_scan: transparentScan,
   };
   // Store a seed-less copy. The seed is passed to `start_scan` below, but
   // must not persist in JS state for the lifetime of the scan→sweep→complete
@@ -1305,7 +1475,19 @@ phrase, or clear the seed phrase to scan the pasted key.",
     // number the lines the user sees. Empty when the box holds nothing but
     // comments, so a wallet-file-only scan is not handed a key set to reject.
     const typedSaplingKeys = hasTypedSaplingKeys ? saplingScanKeyLines() : [];
-    if (walletFile || typedSaplingKeys.length) {
+    if (state.matchedRecovery) {
+      const matched = state.matchedRecovery;
+      const matchedConfig = configForMatchedRecovery(config);
+      state.addressMatchRecoveryLocked = true;
+      document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: true } }));
+      handle = await invoke("start_matched_recovery", {
+        searchId: matched.searchId,
+        matchId: matched.matchId,
+        config: matchedConfig,
+      });
+      state.matchedRecovery = null;
+      clearMatchedRecoveryUi();
+    } else if (walletFile || typedSaplingKeys.length) {
       // Routing between the HD path and the imported-account path lives in
       // the core service, not here: it depends on whether the file yielded a
       // mnemonic, which only the backend knows. The GUI just hands over the
@@ -1323,6 +1505,9 @@ phrase, or clear the seed phrase to scan the pasted key.",
       handle = await invoke("start_scan", { config });
     }
     state.scanHandle = handle;
+    if (state.retainedAddressSearchId) {
+      document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: true } }));
+    }
     // Drop the wallet passphrase now that the backend holds the decrypted
     // keys (threat model T-S2). Only on success: the passphrase field lives
     // on the wallet screen, so clearing it after a failure would strand a
@@ -1345,6 +1530,10 @@ phrase, or clear the seed phrase to scan the pasted key.",
     goTo("scan");
     await startProgressListeners();
   } catch (err) {
+    if (state.matchedRecovery) {
+      state.addressMatchRecoveryLocked = false;
+      document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
+    }
     setStatus("config-status", `✗ ${err}`, "error");
     $("start-scan").disabled = false;
   } finally {
@@ -1367,6 +1556,8 @@ async function startProgressListeners() {
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
   $("back-to-config").style.display = "none";
+  $("scan-return-address-matches").hidden = true;
+  $("cancel-scan").disabled = false;
   // Reset the sleep + sandblasting + gap-extension banners so a previous
   // scan's state doesn't carry over into a fresh start.
   $("scan-sleep-banner").style.display = "none";
@@ -1494,7 +1685,7 @@ function updateScanUI(progress) {
 
   if (progress.error) {
     setStatus("scan-message", progress.error, "error");
-    $("back-to-config").style.display = "";
+    $("back-to-config").style.display = state.retainedAddressSearchId ? "none" : "";
   } else if (progress.message) {
     setStatus("scan-message", progress.message, "");
   }
@@ -1538,11 +1729,58 @@ function updateScanUI(progress) {
   }
 
   const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
+  if (progress.phase === "cancelled" && !state.retainedAddressSearchId) {
+    $("back-to-config").style.display = "";
+    $("start-scan").disabled = false;
+  }
+  if (terminal && state.retainedAddressSearchId) {
+    const canReturn = canReturnToAddressMatches(progress, state.retainedAddressSearchId);
+    state.addressMatchRecoveryLocked = !canReturn;
+    document.dispatchEvent(new CustomEvent("address-search-lock-recovery", {
+      detail: { locked: !canReturn },
+    }));
+  }
   $("cancel-scan").style.display = terminal ? "none" : "";
+  $("scan-return-address-matches").hidden =
+    !canReturnToAddressMatches(progress, state.retainedAddressSearchId);
   if (progress.phase === "complete") {
     $("review-sweep").disabled = false;
   }
 }
+
+function canReturnToAddressMatches(progress, retainedSearchId) {
+  const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
+  const completedWithFunds = progress.phase === "complete" &&
+    Number(progress.summary?.total_zatoshis || 0) > 0;
+  return !!retainedSearchId && terminal && !completedWithFunds;
+}
+
+function returnToAddressMatches() {
+  const searchId = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
+  if (!searchId) return;
+  cleanupListeners();
+  clearMatchedRecoveryUi();
+  state.scanHandle = null;
+  state.lastProgress = null;
+  state.sweepProposal = null;
+  state.addressMatchRecoveryLocked = false;
+  $("start-scan").disabled = false;
+  setStatus("config-status", "", "");
+  $("scan-return-address-matches").hidden = true;
+  $("complete-return-address-matches").hidden = true;
+  document.dispatchEvent(new CustomEvent("address-search-reopen", { detail: { searchId } }));
+}
+
+$("scan-return-address-matches").addEventListener("click", returnToAddressMatches);
+$("complete-return-address-matches").addEventListener("click", returnToAddressMatches);
+document.addEventListener("address-search-released", (event) => {
+  if (!event.detail?.searchId || event.detail.searchId === state.retainedAddressSearchId) {
+    state.retainedAddressSearchId = null;
+    state.addressMatchRecoveryLocked = false;
+    $("scan-return-address-matches").hidden = true;
+    $("complete-return-address-matches").hidden = true;
+  }
+});
 
 function renderAccountRows(accounts) {
   const tbody = $("scan-rows");
@@ -1577,11 +1815,11 @@ $("cancel-scan").addEventListener("click", async () => {
   if (!state.scanHandle) return;
   try {
     await invoke("cancel_scan", { handle: state.scanHandle });
-    cleanupListeners();
-    setStatus("scan-message", "Scan cancelled. Workspace state preserved on disk.", "");
-    $("scan-phase").textContent = "Cancelled";
-    $("back-to-config").style.display = "";
-    $("start-scan").disabled = false;
+    $("cancel-scan").disabled = true;
+    setStatus("scan-message", "Cancellation requested… waiting for the scan to stop safely.", "");
+    // Refresh in case the terminal event arrived before the cancel response.
+    const progress = await invoke("get_scan_progress", { handle: state.scanHandle });
+    if (progress.handle?.id === state.scanHandle?.id) updateScanUI(progress);
   } catch (err) {
     setStatus("scan-message", `Cancel failed: ${err}`, "error");
   }
@@ -1844,6 +2082,11 @@ $("execute-sweep").addEventListener("click", async () => {
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
 function renderCompleteScreen(results, skipped, donated, donationRate, error) {
+  $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
+  if (state.retainedAddressSearchId) {
+    state.addressMatchRecoveryLocked = false;
+    document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
+  }
   const confirmed = results.filter((r) => r.status === "confirmed").length;
   const pending = results.filter((r) => r.status === "pending").length;
   const failed = results.filter((r) => r.status === "failed").length;
@@ -2082,6 +2325,12 @@ $("delete-workspace").addEventListener("click", async () => {
 
 $("restart-flow").addEventListener("click", () => {
   cleanupListeners();
+  if (state.retainedAddressSearchId || state.matchedRecovery) {
+    const searchId = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
+    state.retainedAddressSearchId = null;
+    clearMatchedRecoveryUi();
+    document.dispatchEvent(new CustomEvent("address-search-release", { detail: { searchId } }));
+  }
   furthestStep = 0;
   Object.assign(state, {
     scanHandle: null,
@@ -2092,6 +2341,9 @@ $("restart-flow").addEventListener("click", () => {
     maxFeeZec: null,
     scanConfig: null,
     savedReportPath: null,
+    matchedRecovery: null,
+    retainedAddressSearchId: null,
+    addressMatchRecoveryLocked: false,
   });
   $("copy-report-path").style.display = "none";
   $("delete-workspace").disabled = false;
@@ -2107,6 +2359,10 @@ $("restart-flow").addEventListener("click", () => {
   $("destination-input").value = "";
   $("max-fee-zec").value = "";
   $("sweep-memo").value = "";
+  $("transparent-index-start").value = "0";
+  $("transparent-index-count").value = "1000";
+  $("transparent-include-change").checked = false;
+  updateTransparentScanSummary();
   // Reset donation form to its default-on state so a previous run's choices
   // don't silently carry into the next sweep. `state.donationEnabled` itself
   // is feature-availability (whether the backend has a baked address) and is
@@ -2353,6 +2609,23 @@ function buildSessionRow(row, onDismiss) {
     `${row.network} · birthday ${birthday} · ` +
     `scanned ${synced} of ${target} · ${fmtRelativeTime(row.last_run_at_epoch_seconds)}`;
   info.appendChild(meta);
+  if (row.match_coordinates) {
+    const matched = document.createElement("div");
+    matched.className = "session-meta";
+    matched.textContent = `Address-match recovery · ${row.match_coordinates.path || "saved derivation path"}`;
+    info.appendChild(matched);
+  }
+  if (row.transparent_scan) {
+    const start = Number(row.transparent_scan.index_start);
+    const count = Number(row.transparent_scan.index_count);
+    if (Number.isSafeInteger(start) && Number.isSafeInteger(count) && start >= 0 && count > 0 &&
+        count <= 10000 && start + count <= 2147483648) {
+      const transparent = document.createElement("div");
+      transparent.className = "session-meta";
+      transparent.textContent = `Additional transparent range: account 0 ${row.transparent_scan.include_change ? "receive + change" : "receive"} indices ${start.toLocaleString()}–${(start + count - 1).toLocaleString()}`;
+      info.appendChild(transparent);
+    }
+  }
   li.appendChild(info);
 
   const actions = document.createElement("div");
@@ -2431,6 +2704,8 @@ function openResumeModal(row) {
   $("resume-seed-input").classList.add("masked");
   $("resume-seed-visibility").checked = false;
   $("resume-label-input").value = "";
+  $("resume-bip39-passphrase").value = "";
+  $("resume-bip39-passphrase-field").hidden = !row.match_coordinates;
   setStatus("resume-modal-status", "", "");
   $("resume-modal").hidden = false;
   $("resume-seed-input").focus();
@@ -2440,6 +2715,11 @@ function closeResumeModal() {
   pendingResumeRow = null;
   $("resume-modal").hidden = true;
   $("resume-seed-input").value = "";
+  $("resume-bip39-passphrase").value = "";
+}
+
+function passphraseForResumedSession(row, value) {
+  return row.match_coordinates ? value : null;
 }
 
 $("resume-cancel").addEventListener("click", closeResumeModal);
@@ -2458,6 +2738,10 @@ $("resume-confirm").addEventListener("click", async () => {
     return;
   }
   const labelOverride = $("resume-label-input").value.trim();
+  const passphrase = passphraseForResumedSession(
+    pendingResumeRow,
+    $("resume-bip39-passphrase").value,
+  );
   const lightwalletdUrl =
     $("lightwalletd-url").value.trim() ||
     (pendingResumeRow.network === "testnet"
@@ -2471,6 +2755,7 @@ $("resume-confirm").addEventListener("click", async () => {
       input: {
         workspace_path: pendingResumeRow.workspace_path,
         seed,
+        passphrase,
         lightwalletd_url: lightwalletdUrl,
         label: labelOverride || null,
       },

@@ -262,3 +262,28 @@ latency, reorg, DNS drift) predate the Zebra migration and were written against
 a transparent-funded seed. See the funding section above for why that funding
 shape is no longer available; they need either re-pointing at shielded funds or
 a different funding route.
+
+### Exact matched transparent key recovery
+
+After preparing the funded harness above, run the index-997 discovery and
+recovery regression with:
+
+```sh
+ARGOS_REGTEST_LIGHTWALLETD_URL=http://127.0.0.1:9067 cargo test -p argos-core --features argos-network --test regtest_integration address_match_index_997_recovers_and_sweeps_funded_utxos -- --ignored --nocapture --test-threads=1
+```
+
+The test funds the public harness seed's account-0 receive address at index
+997, searches indices 0–999, imports the matched key, closes discovery, scans
+its UTXOs, and proposes and submits a sweep. It exercises the backend services
+used by the GUI; native GUI interaction still requires a separate check.
+
+For the corresponding internal Sapling matched-recovery check, use the test
+filter `internal_sapling_match_recovers_and_sweeps_mined_note` with the same
+command. It funds an internal receiver at account 4 and a nonzero diversifier,
+then requires the sweep to be mined. Both tests use public synthetic seeds.
+
+For ordinary seed recovery without known-address discovery, use the test
+filter `automatic_transparent_range_recovers_low_and_high_indices`. It funds
+account-0 receive indices 7 and 997, scans one shielded account with the default
+transparent range, and checks that the mined sweep consumes both addresses'
+UTXOs. The explicit range must survive resume before sweeping.

@@ -68,6 +68,50 @@ pub struct DerivedAccount {
     pub transparent_change_address: String,
 }
 
+/// Additional account-0 BIP44 transparent addresses checked independently of
+/// the shielded account range. Every index is checked; unused addresses never
+/// terminate this range early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransparentScanConfig {
+    pub index_start: u32,
+    pub index_count: u32,
+    pub include_change: bool,
+}
+
+impl Default for TransparentScanConfig {
+    fn default() -> Self {
+        Self {
+            index_start: 0,
+            index_count: 1000,
+            include_change: false,
+        }
+    }
+}
+
+impl TransparentScanConfig {
+    pub const MAX_INDEX_COUNT: u32 = 10_000;
+
+    pub fn validate(&self) -> crate::error::ZeckResult<()> {
+        if self.index_count == 0 || self.index_count > Self::MAX_INDEX_COUNT {
+            return Err(crate::error::ZeckError::InvalidConfig(format!(
+                "transparent index count must be between 1 and {}",
+                Self::MAX_INDEX_COUNT
+            )));
+        }
+        if u64::from(self.index_start) + u64::from(self.index_count) > (1u64 << 31) {
+            return Err(crate::error::ZeckError::InvalidConfig(
+                "transparent index range must end at or before 2,147,483,647".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn default_transparent_scan() -> Option<TransparentScanConfig> {
+    Some(TransparentScanConfig::default())
+}
+
 #[derive(Clone)]
 pub struct RuntimeScanConfig {
     /// Where the scan keys come from. A BIP-39 seed phrase
@@ -77,6 +121,9 @@ pub struct RuntimeScanConfig {
     pub birthday: u32,
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
+    /// None preserves the historical scan scope for existing workspaces and
+    /// exact-match/imported-key recovery. New seed scans select an explicit range.
+    pub transparent_scan: Option<TransparentScanConfig>,
     pub lightwalletd_url: String,
     pub data_dir: PathBuf,
     pub network: ZeckNetwork,
@@ -96,6 +143,7 @@ impl std::fmt::Debug for RuntimeScanConfig {
             .field("birthday", &self.birthday)
             .field("num_accounts", &self.num_accounts)
             .field("gap_limit", &self.gap_limit)
+            .field("transparent_scan", &self.transparent_scan)
             .field("lightwalletd_url", &self.lightwalletd_url)
             .field("data_dir", &self.data_dir)
             .field("network", &self.network)
@@ -109,6 +157,8 @@ pub struct ScanConfig {
     pub birthday: u32,
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
+    #[serde(default = "default_transparent_scan")]
+    pub transparent_scan: Option<TransparentScanConfig>,
     pub lightwalletd_url: String,
     pub data_dir: PathBuf,
     pub network: ZeckNetwork,
@@ -481,5 +531,46 @@ mod tests {
         // Testnet had no comparable spam attack — banner must not surface
         // for testnet sweeps even though heights overlap.
         assert!(!in_sandblasting_zone(2_000_000, ZeckNetwork::Testnet));
+    }
+}
+
+#[cfg(test)]
+mod transparent_range_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_new_scan_range_defaults_to_first_thousand_receive_indices() {
+        let config: ScanConfig = serde_json::from_value(serde_json::json!({
+            "birthday": 1, "num_accounts": 1, "gap_limit": 1,
+            "lightwalletd_url": "https://fixture.invalid", "data_dir": "/tmp/fixture",
+            "network": "mainnet"
+        }))
+        .unwrap();
+        assert_eq!(
+            config.transparent_scan,
+            Some(TransparentScanConfig::default())
+        );
+        assert!(!config.transparent_scan.unwrap().include_change);
+    }
+
+    #[test]
+    fn transparent_range_bounds_never_wrap_or_accept_hardened_indices() {
+        for (start, count, valid) in [
+            (0, 1000, true),
+            (2_147_483_647, 1, true),
+            (2_147_483_647, 2, false),
+            (2_147_483_648, 1, false),
+            (u32::MAX, u32::MAX, false),
+            (0, 0, false),
+            (0, 10_000, true),
+            (0, 10_001, false),
+        ] {
+            let range = TransparentScanConfig {
+                index_start: start,
+                index_count: count,
+                include_change: true,
+            };
+            assert_eq!(range.validate().is_ok(), valid, "{start}/{count}");
+        }
     }
 }

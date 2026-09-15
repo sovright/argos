@@ -641,6 +641,7 @@ async fn probe_shielded_window(
         birthday: effective_height,
         num_accounts: Some(1),
         gap_limit: 1,
+        transparent_scan: None,
         lightwalletd_url: lightwalletd_url.to_owned(),
         data_dir: probe_dir.clone(),
         network,

@@ -1132,3 +1132,119 @@ select {
   user-select: text;
   cursor: text;
 }
+
+/* Offline known-address matcher */
+.address-search-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 18px 0 4px;
+  padding: 15px 18px;
+  border: 1px solid rgba(93, 138, 168, 0.28);
+  border-radius: 16px;
+  background: var(--accent-soft);
+}
+.address-search-entry div { display: grid; gap: 2px; }
+.address-search-entry span { color: var(--muted); font-size: 0.9rem; }
+.address-search-entry button { flex: 0 0 auto; }
+.address-search-modal { z-index: 1200; }
+.address-search-card {
+  width: min(920px, 100%);
+  max-width: 920px;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  border-radius: 22px;
+  padding: 28px;
+}
+.address-search-header,
+.section-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+.address-search-header h2 { font-size: clamp(1.8rem, 4vw, 2.55rem); }
+.address-search-header .lead { max-width: 700px; margin-bottom: 8px; }
+.address-search-section {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 14px;
+  margin: 18px 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.address-search-step {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  font: 700 0.85rem "Avenir Next", "IBM Plex Sans", sans-serif;
+}
+.address-search-section-body { min-width: 0; }
+.address-search-section-body h3 { margin-bottom: 4px; }
+.address-search-section-body > .field + .field { margin-top: 12px; }
+.compact-field { max-width: 220px; margin-top: 12px; }
+.small-button { padding: 8px 12px; white-space: nowrap; }
+.candidate-seeds { display: grid; gap: 10px; margin-top: 12px; }
+.candidate-seed {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.45fr) minmax(260px, 1.55fr) minmax(150px, 0.8fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.46);
+}
+.candidate-seed .field { margin: 0; }
+.candidate-seed textarea { min-height: 64px; resize: vertical; }
+.remove-candidate-seed { margin-bottom: 2px; }
+.secret-note,
+.scope-note {
+  margin: 12px 0 0;
+  padding: 11px 13px;
+  border-radius: 12px;
+  color: var(--muted);
+  background: rgba(93, 138, 168, 0.09);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+.address-search-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+.address-search-options .field { margin: 0; }
+.address-search-progress,
+.address-search-results { border-top: 1px solid var(--line); padding-top: 20px; }
+.progress-percent { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+.match-list { display: grid; gap: 12px; margin: 16px 0; }
+.address-match {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  padding: 15px;
+  border: 1px solid rgba(93, 138, 168, 0.3);
+  border-radius: 15px;
+  background: var(--panel-strong);
+}
+.address-match h4 { margin: 0 0 5px; font-size: 1rem; }
+.address-match p { margin: 4px 0; color: var(--muted); }
+.address-match code { display: block; overflow-wrap: anywhere; user-select: text; color: var(--ink); }
+.match-meta { font-size: 0.84rem; }
+.search-outcome { padding: 16px; border-radius: 15px; background: var(--accent-soft); }
+.search-outcome h3 { margin-bottom: 5px; }
+.search-outcome p { margin: 0; }
+
+@media (max-width: 760px) {
+  .address-search-entry,
+  .section-title-row { align-items: stretch; flex-direction: column; }
+  .candidate-seed,
+  .address-search-options { grid-template-columns: 1fr; }
+  .address-match { grid-template-columns: 1fr; }
+}

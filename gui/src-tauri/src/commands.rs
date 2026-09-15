@@ -14,13 +14,121 @@ use argos_core::{
     BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle, SweepOutcome,
     SweepProposal, SweepRequest, ZeckNetwork,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: RecoveryService,
+    pub address_search: argos_core::address_search::AddressSearchService,
+}
+
+#[derive(Deserialize)]
+pub struct AddressSearchCandidateInput {
+    pub label: String,
+    pub seed: SecretString,
+    #[serde(default)]
+    pub passphrase: Option<SecretString>,
+}
+
+#[derive(Deserialize)]
+pub struct AddressSearchInput {
+    pub target: String,
+    pub network: ZeckNetwork,
+    pub seeds: Vec<AddressSearchCandidateInput>,
+    pub profile: argos_core::address_search::SearchProfile,
+    pub account_start: u32,
+    pub account_count: u32,
+    pub index_start: u32,
+    pub index_count: u32,
+    pub include_change: bool,
+}
+
+#[derive(Serialize)]
+pub struct AddressSearchHandle {
+    pub id: String,
+}
+
+#[tauri::command]
+pub async fn start_address_search(
+    state: State<'_, AppState>,
+    input: AddressSearchInput,
+) -> Result<AddressSearchHandle, String> {
+    state
+        .address_search
+        .start(argos_core::address_search::SearchRequest {
+            target: input.target,
+            network: input.network,
+            seeds: input
+                .seeds
+                .into_iter()
+                .map(|candidate| argos_core::address_search::CandidateSeed {
+                    label: candidate.label,
+                    seed: candidate.seed,
+                    passphrase: candidate
+                        .passphrase
+                        .unwrap_or_else(|| SecretString::new(String::new())),
+                })
+                .collect(),
+            profile: input.profile,
+            account_start: input.account_start,
+            account_count: input.account_count,
+            index_start: input.index_start,
+            index_count: input.index_count,
+            include_change: input.include_change,
+        })
+        .map(|id| AddressSearchHandle { id })
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn get_address_search(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<argos_core::address_search::SearchSnapshot, String> {
+    state
+        .address_search
+        .snapshot(&id)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_address_search(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .address_search
+        .cancel(&id)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn release_address_search(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    cancel_and_release_address_search(state.address_search.clone(), id).await;
+    Ok(())
+}
+
+async fn cancel_and_release_address_search(
+    search: argos_core::address_search::AddressSearchService,
+    id: String,
+) {
+    let _ = search.cancel(&id);
+    loop {
+        match search.snapshot(&id) {
+            Ok(snapshot)
+                if matches!(
+                    snapshot.status,
+                    argos_core::address_search::SearchStatus::Running
+                ) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Ok(_) => {
+                let _ = search.release(&id);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 fn ensure_tos_accepted(app: &AppHandle) -> Result<(), String> {
@@ -52,12 +160,91 @@ pub struct ScanConfigInput {
     pub lightwalletd_url: String,
     pub data_dir: String,
     pub network: ZeckNetwork,
+    #[serde(default = "argos_core::default_transparent_scan")]
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
     /// User-supplied label for the scan, written to the on-disk session
     /// sidecar so the launch-time "resume an unfinished scan" UI can show
     /// something more recognizable than a fingerprint suffix. Optional —
     /// empty/missing strings render as "(unlabeled scan)".
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// Scan settings for a matched-address handoff. Secret input is retained by
+/// `AddressSearchService`, so there is intentionally no seed field here.
+#[derive(Deserialize)]
+pub struct MatchedScanConfigInput {
+    pub birthday: u32,
+    pub lightwalletd_url: String,
+    pub data_dir: String,
+    pub network: ZeckNetwork,
+    #[serde(default)]
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[tauri::command]
+pub async fn start_matched_recovery(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    search_id: String,
+    match_id: String,
+    config: MatchedScanConfigInput,
+) -> Result<ScanHandle, String> {
+    ensure_tos_accepted(&app)?;
+    if config.transparent_scan.is_some() {
+        return Err(
+            "matched-address recovery cannot widen its transparent address range".to_owned(),
+        );
+    }
+    let snapshot = state
+        .address_search
+        .snapshot(&search_id)
+        .map_err(|err| err.to_string())?;
+    if snapshot.network != config.network {
+        return Err("matched-address recovery network differs from the search network".to_owned());
+    }
+    let (matched, seed) = state
+        .address_search
+        .matched_seed(&search_id, &match_id)
+        .map_err(|err| err.to_string())?;
+    let coordinates = argos_core::MatchCoordinates {
+        pool: matched.pool,
+        account: matched.account,
+        scope: matched.scope,
+        index: matched.index,
+        network: snapshot.network,
+        address: matched.address,
+        path: matched.path,
+    };
+    let key_source =
+        argos_core::prepare_match_recovery(seed.expose_secret(), config.network, coordinates)
+            .map_err(|err| err.to_string())?;
+    let handle = state
+        .service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: config.birthday,
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: config.lightwalletd_url,
+                data_dir: PathBuf::from(config.data_dir),
+                network: config.network,
+                label: config.label.unwrap_or_default(),
+                transparent_scan: None,
+            },
+            key_source,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    // The search remains registered until explicit close/release. A result set
+    // may contain multiple funded paths, and handing one capability to a scan
+    // must not destroy the others. The frontend's close and beforeunload paths
+    // call `release_address_search`, whose backend-owned cleanup waits for the
+    // worker and then drops every retained matched seed.
+    spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
+    Ok(handle)
 }
 
 #[tauri::command]
@@ -327,6 +514,8 @@ pub struct WalletFileScanInput {
     pub lightwalletd_url: String,
     pub data_dir: String,
     pub network: ZeckNetwork,
+    #[serde(default = "argos_core::default_transparent_scan")]
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -397,6 +586,7 @@ pub async fn start_scan_from_wallet_file(
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
+                transparent_scan: config.transparent_scan,
             },
             key_source,
         )
@@ -426,6 +616,7 @@ pub async fn start_scan(
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
+                transparent_scan: config.transparent_scan,
             },
             config.seed,
         )
@@ -1327,6 +1518,8 @@ pub struct SessionRow {
     pub synced_to_height: Option<u32>,
     pub target_height: Option<u32>,
     pub last_run_at_epoch_seconds: Option<i64>,
+    pub match_coordinates: Option<argos_core::MatchCoordinates>,
+    pub transparent_scan: Option<argos_core::TransparentScanConfig>,
 }
 
 impl From<IncompleteSession> for SessionRow {
@@ -1339,6 +1532,8 @@ impl From<IncompleteSession> for SessionRow {
             synced_to_height: s.synced_to_height,
             target_height: s.target_height,
             last_run_at_epoch_seconds: s.last_run_at_epoch_seconds,
+            match_coordinates: s.match_coordinates,
+            transparent_scan: s.transparent_scan,
         }
     }
 }
@@ -1375,6 +1570,8 @@ pub async fn list_incomplete_sessions(
 pub struct ResumeSessionInput {
     pub workspace_path: String,
     pub seed: SecretString,
+    #[serde(default)]
+    pub passphrase: Option<SecretString>,
     pub lightwalletd_url: String,
     /// If supplied (non-empty after trimming), overwrites the existing
     /// label in the sidecar at resume time. Mostly useful when resuming a
@@ -1400,8 +1597,6 @@ pub async fn resume_session(
         return Err("workspace path cannot be empty".to_owned());
     }
     let seed_phrase = input.seed;
-
-    verify_seed_for_workspace(&workspace_path, &seed_phrase).map_err(|err| err.to_string())?;
     let keying = parse_workspace_keying(&workspace_path).map_err(|err| err.to_string())?;
     let data_dir = data_dir_from_workspace(&workspace_path)
         .ok_or_else(|| "workspace path is not under a recognizable data dir".to_owned())?;
@@ -1412,22 +1607,48 @@ pub async fn resume_session(
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
 
-    let handle = state
-        .service
-        .start_scan(
-            ScanConfig {
-                birthday: keying.birthday,
-                num_accounts: keying.num_accounts,
-                gap_limit: keying.gap_limit,
-                lightwalletd_url: input.lightwalletd_url,
-                data_dir,
-                network: keying.network,
-                label,
-            },
-            seed_phrase,
-        )
-        .await
+    let scan_config = ScanConfig {
+        birthday: keying.birthday,
+        num_accounts: keying.num_accounts,
+        gap_limit: keying.gap_limit,
+        lightwalletd_url: input.lightwalletd_url,
+        data_dir,
+        network: keying.network,
+        label,
+        transparent_scan: keying.transparent_scan,
+    };
+    let metadata = argos_core::workspace::read_session_metadata(&workspace_path)
         .map_err(|err| err.to_string())?;
+    let handle = if let Some(coordinates) = metadata.and_then(|m| m.match_coordinates) {
+        let passphrase = input
+            .passphrase
+            .unwrap_or_else(|| SecretString::new(String::new()));
+        let seed = argos_core::address_search::candidate_seed(&seed_phrase, &passphrase)
+            .map_err(|err| err.to_string())?;
+        let key_source =
+            argos_core::prepare_match_recovery(seed.expose_secret(), keying.network, coordinates)
+                .map_err(|err| err.to_string())?;
+        argos_core::workspace::verify_key_source_for_workspace(
+            &workspace_path,
+            key_source.as_ref(),
+        )
+        .map_err(|err| err.to_string())?;
+        state
+            .service
+            .start_scan_from_key_source(scan_config, key_source)
+            .await
+    } else {
+        if input
+            .passphrase
+            .as_ref()
+            .is_some_and(|p| !p.expose_secret().is_empty())
+        {
+            return Err("this scan was created without a BIP-39 passphrase".to_owned());
+        }
+        verify_seed_for_workspace(&workspace_path, &seed_phrase).map_err(|err| err.to_string())?;
+        state.service.start_scan(scan_config, seed_phrase).await
+    }
+    .map_err(|err| err.to_string())?;
 
     spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
     Ok(handle)
@@ -1516,6 +1737,54 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_scan_inputs_default_to_the_complete_receive_range() {
+        let seed: ScanConfigInput = serde_json::from_value(serde_json::json!({
+            "seed": "synthetic seed text for serde only",
+            "birthday": 419200,
+            "num_accounts": null,
+            "gap_limit": 20,
+            "lightwalletd_url": "https://fixture.invalid",
+            "data_dir": "/fixture",
+            "network": "mainnet"
+        }))
+        .expect("seed scan input should deserialize");
+        assert_eq!(
+            seed.transparent_scan,
+            argos_core::default_transparent_scan()
+        );
+
+        let wallet: WalletFileScanInput = serde_json::from_value(serde_json::json!({
+            "path": "/fixture/wallet.dat",
+            "passphrase": null,
+            "sapling_keys": [],
+            "birthday": 419200,
+            "num_accounts": null,
+            "gap_limit": 20,
+            "lightwalletd_url": "https://fixture.invalid",
+            "data_dir": "/fixture",
+            "network": "mainnet"
+        }))
+        .expect("wallet-file scan input should deserialize");
+        assert_eq!(
+            wallet.transparent_scan,
+            argos_core::default_transparent_scan()
+        );
+    }
+
+    #[test]
+    fn matched_scan_explicit_null_keeps_the_complete_range_disabled() {
+        let matched: MatchedScanConfigInput = serde_json::from_value(serde_json::json!({
+            "birthday": 419200,
+            "lightwalletd_url": "https://fixture.invalid",
+            "data_dir": "/fixture",
+            "network": "mainnet",
+            "transparent_scan": null
+        }))
+        .expect("matched scan input should deserialize");
+        assert_eq!(matched.transparent_scan, None);
+    }
 
     /// The sidebar version is a support-facing claim about which binary is
     /// running, so it must be a real, non-empty version rather than a

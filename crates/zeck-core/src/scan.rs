@@ -32,14 +32,16 @@ use zcash_client_backend::{
     sync,
 };
 use zcash_client_sqlite::AccountUuid;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_keys::encoding::AddressCodec;
+use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK, TEST_NETWORK};
 use zcash_transparent::address::TransparentAddress;
 use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 use crate::{
     derivation::{
-        derive_accounts_from_seed, legacy_transparent_account_key_from_seed,
-        legacy_transparent_pubkey,
+        derive_accounts_from_seed, derive_exact_account_from_seed,
+        legacy_transparent_account_key_from_seed, legacy_transparent_pubkey,
+        transparent_address_from_seed,
     },
     error::{ZeckError, ZeckResult},
     lightwalletd::{
@@ -218,6 +220,23 @@ pub struct TrackedAccount {
     pub wallet_account_id: AccountUuid,
     pub derived: DerivedAccount,
     pub transparent_receivers: Vec<TransparentAddress>,
+    pub(crate) transparent_key_coordinates: Vec<TrackedTransparentKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrackedTransparentKey {
+    pub address: TransparentAddress,
+    pub scope: AddressScope,
+    pub index: u32,
+}
+
+enum TransparentImportMode<'a> {
+    Legacy(&'a zcash_transparent::keys::AccountPrivKey),
+    Standard,
+    Range {
+        account: &'a zcash_transparent::keys::AccountPrivKey,
+        config: &'a crate::models::TransparentScanConfig,
+    },
 }
 
 #[derive(Debug)]
@@ -472,8 +491,13 @@ async fn run_recovery_scan_inner(
             config.birthday,
             None,
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned())
+        .with_transparent_scan(config.transparent_scan),
     ) {
+        if config.key_source.match_coordinates().is_some() || config.transparent_scan.is_some() {
+            return Err(err);
+        }
         warn!("failed to write initial session sidecar (continuing): {err}");
     }
 
@@ -487,13 +511,18 @@ async fn run_recovery_scan_inner(
     let mut target_accounts = initial_batch_size(&config, max_accounts);
     let mut gap_extension_pass = 0u32;
     let network = consensus_network(config.network);
-    let initial_accounts = derive_accounts_from_seed(&seed, config.network, target_accounts)?;
+    let initial_accounts = derive_scan_accounts(
+        &seed,
+        config.network,
+        target_accounts,
+        config.transparent_scan.as_ref(),
+    )?;
 
     {
         let mut guard = state.lock().await;
         guard.progress.phase = ScanPhase::DerivingKeys;
         guard.progress.message = Some(format!(
-            "Derived {target_accounts} ZecWallet Lite-compatible account slots locally. Checking lightwalletd next."
+            "Derived {target_accounts} wallet account(s) locally. Checking lightwalletd next."
         ));
     }
     initialize_accounts(&state, &initial_accounts).await;
@@ -550,9 +579,52 @@ async fn run_recovery_scan_inner(
             config.birthday,
             Some(chain_tip_height),
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned())
+        .with_transparent_scan(config.transparent_scan),
     ) {
         warn!("failed to update session sidecar with target height (continuing): {err}");
+    }
+
+    if let Some(account_index) = config.key_source.exact_hd_account() {
+        let derived = derive_exact_account_from_seed(&seed, config.network, account_index)?;
+        initialize_accounts(&state, std::slice::from_ref(&derived)).await;
+        import_accounts_scoped(
+            &workspace,
+            config.network,
+            &seed,
+            &account_birthday,
+            TransparentImportMode::Standard,
+            std::slice::from_ref(&derived),
+            &state,
+        )
+        .await?;
+        {
+            let mut guard = state.lock().await;
+            guard.progress.phase = ScanPhase::ScanningShielded;
+            guard.progress.message = Some(format!(
+                "Syncing the exact matched ZIP-32 account {account_index}."
+            ));
+        }
+        let poller = ProgressPoller::start(
+            workspace.clone(),
+            config.network,
+            state.clone(),
+            effective_birthday,
+        );
+        let sync_result = run_wallet_sync_with_retry(
+            &workspace,
+            &network,
+            config.network,
+            &mut client,
+            &config.lightwalletd_url,
+            &state,
+        )
+        .await;
+        poller.stop().await;
+        sync_result?;
+        refresh_scan_progress(&state, &workspace, config.network, effective_birthday).await?;
+        return finish_scan(&state, &workspace).await;
     }
 
     while imported_accounts < target_accounts {
@@ -562,12 +634,17 @@ async fn run_recovery_scan_inner(
             let mut guard = state.lock().await;
             guard.progress.phase = ScanPhase::DerivingKeys;
             guard.progress.message = Some(format!(
-                "Preparing legacy account slots 0 through {}.",
+                "Preparing wallet accounts 0 through {}.",
                 target_accounts.saturating_sub(1)
             ));
         }
 
-        let derived_accounts = derive_accounts_from_seed(&seed, config.network, target_accounts)?;
+        let derived_accounts = derive_scan_accounts(
+            &seed,
+            config.network,
+            target_accounts,
+            config.transparent_scan.as_ref(),
+        )?;
         initialize_accounts(&state, &derived_accounts).await;
 
         // Fast transparent-only probe over the newly-added slice for this
@@ -586,33 +663,59 @@ async fn run_recovery_scan_inner(
         let new_slice_end = usize::try_from(target_accounts)
             .map_err(|_| ZeckError::Internal("account index overflowed usize".to_owned()))?;
         let new_accounts = &derived_accounts[new_slice_start..new_slice_end];
-        if let Err(err) =
-            run_transparent_quick_probe(&state, &mut client, new_accounts, chain_tip_height).await
-        {
-            warn!("transparent quick probe failed (continuing with shielded scan): {err}");
+        if config.transparent_scan.is_none() {
+            if let Err(err) =
+                run_transparent_quick_probe(&state, &mut client, new_accounts, chain_tip_height)
+                    .await
+            {
+                warn!("transparent quick probe failed (continuing with shielded scan): {err}");
+            }
         }
 
-        import_accounts(
+        let new_accounts = &derived_accounts[usize::try_from(imported_accounts)
+            .map_err(|_| ZeckError::Internal("account index overflowed usize".to_owned()))?
+            ..usize::try_from(target_accounts)
+                .map_err(|_| ZeckError::Internal("account index overflowed usize".to_owned()))?];
+        let import_mode = match &config.transparent_scan {
+            Some(range) => TransparentImportMode::Range {
+                account: &transparent_account,
+                config: range,
+            },
+            None => TransparentImportMode::Legacy(&transparent_account),
+        };
+        import_accounts_scoped(
             &workspace,
             config.network,
             &seed,
             &account_birthday,
-            &transparent_account,
-            &derived_accounts[usize::try_from(imported_accounts)
-                .map_err(|_| ZeckError::Internal("account index overflowed usize".to_owned()))?
-                ..usize::try_from(target_accounts).map_err(|_| {
-                    ZeckError::Internal("account index overflowed usize".to_owned())
-                })?],
+            import_mode,
+            new_accounts,
             &state,
         )
         .await?;
+        if let Some(range) = &config.transparent_scan {
+            if imported_accounts == 0 {
+                if let Err(err) = run_transparent_range_quick_probe(
+                    &state,
+                    &mut client,
+                    &transparent_account,
+                    range,
+                    config.network,
+                    chain_tip_height,
+                )
+                .await
+                {
+                    warn!("transparent range quick probe failed (continuing with authoritative wallet sync): {err}");
+                }
+            }
+        }
         imported_accounts = target_accounts;
 
         {
             let mut guard = state.lock().await;
             guard.progress.phase = ScanPhase::ScanningShielded;
             guard.progress.message = Some(format!(
-                "Syncing compact blocks and transparent UTXOs for {imported_accounts} imported legacy account slots."
+                "Syncing compact blocks and transparent UTXOs for {imported_accounts} wallet account(s)."
             ));
         }
 
@@ -704,7 +807,7 @@ async fn finish_scan(state: &SharedScanTaskState, workspace: &RecoveryWorkspace)
                 "Compact-block recovery finished. Transparent, Sapling, and Orchard balances now come from the persisted wallet workspace and are ready for sweep planning."
                     .to_owned()
             } else {
-                "Compact-block recovery finished, but no spendable funds were found in the scanned legacy account range."
+                "Compact-block recovery finished, but no spendable funds were found in the configured account and address ranges."
                     .to_owned()
             },
             workspace_dir,
@@ -736,6 +839,63 @@ fn resolve_max_account_count(config: &RuntimeScanConfig) -> ZeckResult<u32> {
         Some(count) => Ok(count),
         None => Ok(MAX_ACCOUNT_SCAN_COUNT),
     }
+}
+
+fn derive_scan_accounts(
+    seed: &[u8; 64],
+    network: crate::models::ZeckNetwork,
+    count: u32,
+    transparent_scan: Option<&crate::models::TransparentScanConfig>,
+) -> ZeckResult<Vec<DerivedAccount>> {
+    let Some(range) = transparent_scan else {
+        return derive_accounts_from_seed(seed, network, count);
+    };
+    let mut accounts: Vec<_> = (0..count)
+        .map(|index| derive_exact_account_from_seed(seed, network, index))
+        .collect::<ZeckResult<_>>()?;
+    apply_transparent_range_display(&mut accounts, seed, network, range)?;
+    Ok(accounts)
+}
+
+fn apply_transparent_range_display(
+    accounts: &mut [DerivedAccount],
+    seed: &[u8; 64],
+    network: crate::models::ZeckNetwork,
+    range: &crate::models::TransparentScanConfig,
+) -> ZeckResult<()> {
+    let Some(account) = accounts.iter_mut().find(|account| account.index == 0) else {
+        return Ok(());
+    };
+    let receive =
+        transparent_address_from_seed(network, seed, 0, AddressScope::External, range.index_start)?;
+    account.transparent_receive_address = match network {
+        crate::models::ZeckNetwork::Mainnet => receive.encode(&MAIN_NETWORK),
+        crate::models::ZeckNetwork::Testnet => receive.encode(&TEST_NETWORK),
+    };
+    account.transparent_receive_path = format!(
+        "m / 44' / {}' / 0' / 0 / {}",
+        network.coin_type(),
+        range.index_start
+    );
+    if range.include_change {
+        let change = transparent_address_from_seed(
+            network,
+            seed,
+            0,
+            AddressScope::Internal,
+            range.index_start,
+        )?;
+        account.transparent_change_address = match network {
+            crate::models::ZeckNetwork::Mainnet => change.encode(&MAIN_NETWORK),
+            crate::models::ZeckNetwork::Testnet => change.encode(&TEST_NETWORK),
+        };
+        account.transparent_change_path = format!(
+            "m / 44' / {}' / 0' / 1 / {}",
+            network.coin_type(),
+            range.index_start
+        );
+    }
+    Ok(())
 }
 
 fn initial_batch_size(config: &RuntimeScanConfig, max_accounts: u32) -> u32 {
@@ -837,8 +997,12 @@ async fn begin_scan_session(
             config.birthday,
             None,
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned()),
     ) {
+        if config.key_source.match_coordinates().is_some() {
+            return Err(err);
+        }
         warn!("failed to write initial session sidecar (continuing): {err}");
     }
 
@@ -928,7 +1092,8 @@ async fn run_imported_scan(
             config.birthday,
             Some(chain_tip_height),
             now_epoch_seconds(),
-        ),
+        )
+        .with_match_coordinates(config.key_source.match_coordinates().cloned()),
     ) {
         warn!("failed to update session sidecar with target height (continuing): {err}");
     }
@@ -963,6 +1128,7 @@ async fn run_imported_scan(
             wallet_account_id: account.wallet_account_id,
             derived: display,
             transparent_receivers: account.transparent_addresses.clone(),
+            transparent_key_coordinates: Vec::new(),
         });
     }
 
@@ -1155,6 +1321,7 @@ async fn run_imported_transparent_probe(
     Ok(())
 }
 
+#[cfg(test)]
 async fn import_accounts(
     workspace: &RecoveryWorkspace,
     network: crate::models::ZeckNetwork,
@@ -1164,9 +1331,31 @@ async fn import_accounts(
     accounts: &[DerivedAccount],
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
+    import_accounts_scoped(
+        workspace,
+        network,
+        seed,
+        birthday,
+        TransparentImportMode::Legacy(transparent_account),
+        accounts,
+        state,
+    )
+    .await
+}
+
+async fn import_accounts_scoped(
+    workspace: &RecoveryWorkspace,
+    network: crate::models::ZeckNetwork,
+    seed: &[u8; 64],
+    birthday: &AccountBirthday,
+    transparent_mode: TransparentImportMode<'_>,
+    accounts: &[DerivedAccount],
+    state: &SharedScanTaskState,
+) -> ZeckResult<()> {
     if accounts.is_empty() {
         return Ok(());
     }
+    let cancelled = state.lock().await.cancelled.clone();
 
     let seed_fingerprint = SeedFingerprint::from_seed(seed).ok_or_else(|| {
         ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
@@ -1201,46 +1390,153 @@ async fn import_accounts(
                 .id()
         };
 
-        let external_pubkey =
-            legacy_transparent_pubkey(transparent_account, AddressScope::External, account.index)?;
-        let internal_pubkey =
-            legacy_transparent_pubkey(transparent_account, AddressScope::Internal, account.index)?;
-        let external_address = TransparentAddress::from_pubkey(&external_pubkey);
-        let internal_address = TransparentAddress::from_pubkey(&internal_pubkey);
-        let existing_receivers = wallet_db
-            .get_transparent_receivers(wallet_account_id, true, true)
-            .map_err(|err| {
-                ZeckError::Wallet(format!(
-                    "loading transparent receivers for account {}: {err}",
-                    account.index
-                ))
-            })?;
-
-        if !existing_receivers.contains_key(&external_address) {
-            wallet_db
-                .import_standalone_transparent_pubkey(wallet_account_id, external_pubkey)
-                .map_err(|err| {
-                    ZeckError::Wallet(format!(
-                        "importing external transparent receiver for account {}: {err}",
-                        account.index
-                    ))
-                })?;
-        }
-        if !existing_receivers.contains_key(&internal_address) {
-            wallet_db
-                .import_standalone_transparent_pubkey(wallet_account_id, internal_pubkey)
-                .map_err(|err| {
-                    ZeckError::Wallet(format!(
-                        "importing internal transparent receiver for account {}: {err}",
-                        account.index
-                    ))
-                })?;
-        }
+        let (transparent_receivers, transparent_key_coordinates) = match &transparent_mode {
+            TransparentImportMode::Legacy(transparent_account) => {
+                let external_pubkey = legacy_transparent_pubkey(
+                    transparent_account,
+                    AddressScope::External,
+                    account.index,
+                )?;
+                let internal_pubkey = legacy_transparent_pubkey(
+                    transparent_account,
+                    AddressScope::Internal,
+                    account.index,
+                )?;
+                let external_address = TransparentAddress::from_pubkey(&external_pubkey);
+                let internal_address = TransparentAddress::from_pubkey(&internal_pubkey);
+                let existing_receivers = wallet_db
+                    .get_transparent_receivers(wallet_account_id, true, true)
+                    .map_err(|err| {
+                        ZeckError::Wallet(format!(
+                            "loading transparent receivers for account {}: {err}",
+                            account.index
+                        ))
+                    })?;
+                if !existing_receivers.contains_key(&external_address) {
+                    wallet_db
+                        .import_standalone_transparent_pubkey(wallet_account_id, external_pubkey)
+                        .map_err(|err| {
+                            ZeckError::Wallet(format!(
+                                "importing external transparent receiver for account {}: {err}",
+                                account.index
+                            ))
+                        })?;
+                }
+                if !existing_receivers.contains_key(&internal_address) {
+                    wallet_db
+                        .import_standalone_transparent_pubkey(wallet_account_id, internal_pubkey)
+                        .map_err(|err| {
+                            ZeckError::Wallet(format!(
+                                "importing internal transparent receiver for account {}: {err}",
+                                account.index
+                            ))
+                        })?;
+                }
+                (
+                    vec![external_address, internal_address],
+                    vec![
+                        TrackedTransparentKey {
+                            address: external_address,
+                            scope: AddressScope::External,
+                            index: account.index,
+                        },
+                        TrackedTransparentKey {
+                            address: internal_address,
+                            scope: AddressScope::Internal,
+                            index: account.index,
+                        },
+                    ],
+                )
+            }
+            TransparentImportMode::Standard => {
+                // Exact ZIP-32 accounts use the standard transparent receivers
+                // created by `import_account_hd`; their USK remains the signer.
+                (
+                    wallet_db
+                        .get_transparent_receivers(wallet_account_id, true, true)
+                        .map_err(|err| {
+                            ZeckError::Wallet(format!(
+                                "loading transparent receivers for account {}: {err}",
+                                account.index
+                            ))
+                        })?
+                        .into_keys()
+                        .collect(),
+                    Vec::new(),
+                )
+            }
+            TransparentImportMode::Range {
+                account: transparent_account,
+                config,
+            } if account.index == 0 => {
+                let existing_receivers = wallet_db
+                    .get_transparent_receivers(wallet_account_id, true, true)
+                    .map_err(|err| {
+                        ZeckError::Wallet(format!(
+                            "loading transparent receivers for account {}: {err}",
+                            account.index
+                        ))
+                    })?;
+                let mut receivers: Vec<_> = existing_receivers.keys().copied().collect();
+                let mut coordinates = Vec::new();
+                let scopes: &[AddressScope] = if config.include_change {
+                    &[AddressScope::External, AddressScope::Internal]
+                } else {
+                    &[AddressScope::External]
+                };
+                for (offset, index) in
+                    (config.index_start..config.index_start + config.index_count).enumerate()
+                {
+                    if offset % 64 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    if cancelled.load(Ordering::SeqCst) {
+                        return Err(ZeckError::Cancelled);
+                    }
+                    for &scope in scopes {
+                        let pubkey = legacy_transparent_pubkey(transparent_account, scope, index)?;
+                        let address = TransparentAddress::from_pubkey(&pubkey);
+                        if !existing_receivers.contains_key(&address) {
+                            wallet_db
+                                .import_standalone_transparent_pubkey(wallet_account_id, pubkey)
+                                .map_err(|err| {
+                                    ZeckError::Wallet(format!(
+                                        "importing transparent {scope:?} index {index}: {err}"
+                                    ))
+                                })?;
+                        }
+                        if !receivers.contains(&address) {
+                            receivers.push(address);
+                        }
+                        coordinates.push(TrackedTransparentKey {
+                            address,
+                            scope,
+                            index,
+                        });
+                    }
+                }
+                (receivers, coordinates)
+            }
+            TransparentImportMode::Range { .. } => (
+                wallet_db
+                    .get_transparent_receivers(wallet_account_id, true, true)
+                    .map_err(|err| {
+                        ZeckError::Wallet(format!(
+                            "loading transparent receivers for account {}: {err}",
+                            account.index
+                        ))
+                    })?
+                    .into_keys()
+                    .collect(),
+                Vec::new(),
+            ),
+        };
 
         tracked_accounts.push(TrackedAccount {
             wallet_account_id,
             derived: account.clone(),
-            transparent_receivers: vec![external_address, internal_address],
+            transparent_receivers,
+            transparent_key_coordinates,
         });
     }
 
@@ -1713,7 +2009,7 @@ pub(crate) async fn refresh_scan_progress(
         total_zatoshis,
         authoritative_balances: true,
         note: format!(
-            "Wallet workspace synced through height {} and is tracking {} imported legacy account slots.",
+            "Wallet workspace synced through height {} and is tracking {} wallet account(s).",
             u32::from(summary.fully_scanned_height()),
             guard.progress.accounts.len()
         ),
@@ -1884,6 +2180,108 @@ async fn run_transparent_quick_probe(
         "Transparent quick-check complete. Continuing with shielded compact-block scan…".to_owned(),
     );
 
+    Ok(())
+}
+
+/// Best-effort early balance probe for an explicit BIP-44 range. Registration
+/// in the wallet database happens first and is authoritative; this probe is
+/// chunked only to keep individual lightwalletd requests bounded.
+async fn run_transparent_range_quick_probe(
+    state: &SharedScanTaskState,
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    account: &zcash_transparent::keys::AccountPrivKey,
+    range: &crate::models::TransparentScanConfig,
+    network: crate::models::ZeckNetwork,
+    chain_tip_height: u32,
+) -> ZeckResult<()> {
+    const PROBE_CHUNK: usize = 256;
+    let scopes: &[AddressScope] = if range.include_change {
+        &[AddressScope::External, AddressScope::Internal]
+    } else {
+        &[AddressScope::External]
+    };
+    let mut addresses = Vec::with_capacity(
+        usize::try_from(range.index_count)
+            .unwrap_or(0)
+            .saturating_mul(scopes.len()),
+    );
+    for index in range.index_start..range.index_start + range.index_count {
+        check_cancelled(state).await?;
+        for &scope in scopes {
+            let address =
+                TransparentAddress::from_pubkey(&legacy_transparent_pubkey(account, scope, index)?);
+            addresses.push(match network {
+                crate::models::ZeckNetwork::Mainnet => address.encode(&MAIN_NETWORK),
+                crate::models::ZeckNetwork::Testnet => address.encode(&TEST_NETWORK),
+            });
+        }
+    }
+    {
+        let mut guard = state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningTransparent;
+        guard.progress.message = Some(format!(
+            "Quick-checking {} configured transparent addresses via lightwalletd…",
+            addresses.len()
+        ));
+    }
+    let mut total = 0u64;
+    let mut count = 0u32;
+    let mut funded_address = None;
+    for chunk in addresses.chunks(PROBE_CHUNK) {
+        check_cancelled(state).await?;
+        let reply = client
+            .get_address_utxos(GetAddressUtxosArg {
+                addresses: chunk.to_vec(),
+                start_height: 0,
+                max_entries: 0,
+            })
+            .await
+            .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+            .into_inner();
+        for utxo in reply.address_utxos {
+            let value = u64::try_from(utxo.value_zat).map_err(|_| {
+                ZeckError::Lightwalletd(format!(
+                    "lightwalletd returned negative value for {}",
+                    utxo.address
+                ))
+            })?;
+            total = total.checked_add(value).ok_or_else(|| {
+                ZeckError::Internal("transparent range balance overflowed u64".to_owned())
+            })?;
+            count = count.checked_add(1).ok_or_else(|| {
+                ZeckError::Internal("transparent range UTXO count overflowed u32".to_owned())
+            })?;
+            funded_address.get_or_insert(utxo.address);
+        }
+    }
+    if total > 0 {
+        let mut guard = state.lock().await;
+        if let Some(preview) = guard
+            .progress
+            .accounts
+            .iter_mut()
+            .find(|a| a.account_index == 0)
+        {
+            preview.transparent_zatoshis = total;
+            preview.transparent_utxo_count = count;
+            preview.total_zatoshis = preview.total_zatoshis.max(total);
+            preview.has_activity = true;
+        }
+        if !guard
+            .progress
+            .discoveries
+            .iter()
+            .any(|d| d.account_index == 0 && d.pool == DiscoveryPool::Transparent)
+        {
+            guard.progress.discoveries.push(ScanDiscovery {
+                account_index: 0,
+                pool: DiscoveryPool::Transparent,
+                zatoshis: total,
+                at_block_height: u64::from(chain_tip_height),
+                address: funded_address.unwrap_or_default(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2238,6 +2636,7 @@ mod tests {
             birthday: 419_200,
             num_accounts,
             gap_limit: 20,
+            transparent_scan: None,
             lightwalletd_url: "https://example.com".to_owned(),
             data_dir: std::path::PathBuf::from("zeck_data"),
             network: ZeckNetwork::Mainnet,
@@ -2736,7 +3135,7 @@ mod tests {
             data_api::{
                 chain::{scan_cached_blocks, ChainState},
                 wallet::ConfirmationsPolicy,
-                AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
+                Account as _, AccountBirthday, WalletCommitmentTrees, WalletRead, WalletWrite,
             },
             proto::compact_formats::{ChainMetadata, CompactBlock},
         };
@@ -2744,7 +3143,10 @@ mod tests {
         use zcash_primitives::block::BlockHash;
         use zcash_protocol::consensus::BlockHeight;
 
-        use super::super::{import_accounts, MemoryBlockCache, ScanTaskState};
+        use super::super::{
+            import_accounts, import_accounts_scoped, MemoryBlockCache, ScanTaskState,
+            TransparentImportMode,
+        };
         use crate::{
             derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
             key_source::SeedKeySource,
@@ -2891,6 +3293,7 @@ mod tests {
                 birthday: 419_200,
                 num_accounts: Some(2),
                 gap_limit: 5,
+                transparent_scan: None,
                 lightwalletd_url: "https://example.invalid:443".to_owned(),
                 data_dir,
                 network: ZeckNetwork::Mainnet,
@@ -2944,6 +3347,286 @@ mod tests {
             assert!(
                 db_path.exists(),
                 "wallet DB must persist on disk after the workspace handle is dropped (resume contract)"
+            );
+        }
+
+        #[tokio::test]
+        async fn exact_match_imports_the_actual_high_index_account_only() {
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let config = test_config(tempdir.path().to_owned());
+            let workspace = RecoveryWorkspace::from_runtime(&config).expect("workspace");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
+            workspace
+                .initialize(config.network, seed.expose_secret())
+                .unwrap();
+            let transparent_account =
+                legacy_transparent_account_key(&test_seed_phrase(), config.network).unwrap();
+            let account = crate::derivation::derive_exact_account_from_seed(
+                seed.expose_secret(),
+                config.network,
+                511,
+            )
+            .unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts_scoped(
+                &workspace,
+                config.network,
+                seed.expose_secret(),
+                &test_birthday(),
+                TransparentImportMode::Standard,
+                std::slice::from_ref(&account),
+                &state,
+            )
+            .await
+            .unwrap();
+
+            let db = crate::workspace::open_wallet_db(
+                workspace.wallet_db_path(),
+                consensus_network(config.network),
+            )
+            .unwrap();
+            let fingerprint =
+                zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
+            let exact = zcash_client_backend::data_api::Zip32Derivation::new(
+                fingerprint,
+                zip32::AccountId::try_from(511).unwrap(),
+            );
+            let zero = zcash_client_backend::data_api::Zip32Derivation::new(
+                fingerprint,
+                zip32::AccountId::ZERO,
+            );
+            let imported = db
+                .get_derived_account(&exact)
+                .unwrap()
+                .expect("account 511");
+            assert!(db.get_derived_account(&zero).unwrap().is_none());
+            let legacy_pubkey = crate::derivation::legacy_transparent_pubkey(
+                &transparent_account,
+                crate::models::AddressScope::External,
+                511,
+            )
+            .unwrap();
+            let legacy_address =
+                zcash_transparent::address::TransparentAddress::from_pubkey(&legacy_pubkey);
+            let receivers = db
+                .get_transparent_receivers(imported.id(), true, true)
+                .unwrap();
+            assert!(!receivers.contains_key(&legacy_address));
+            assert_eq!(state.lock().await.tracked_accounts.len(), 1);
+            assert_eq!(state.lock().await.tracked_accounts[0].derived.index, 511);
+        }
+
+        #[tokio::test]
+        async fn transparent_range_registers_high_receive_and_change_indices() {
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let config = test_config(tempdir.path().to_owned());
+            let workspace = RecoveryWorkspace::from_runtime(&config).expect("workspace");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
+            workspace
+                .initialize(config.network, seed.expose_secret())
+                .unwrap();
+            let transparent_account =
+                legacy_transparent_account_key(&test_seed_phrase(), config.network).unwrap();
+            let account = crate::derivation::derive_exact_account_from_seed(
+                seed.expose_secret(),
+                config.network,
+                0,
+            )
+            .unwrap();
+            let range = crate::models::TransparentScanConfig {
+                index_start: 997,
+                index_count: 1,
+                include_change: true,
+            };
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts_scoped(
+                &workspace,
+                config.network,
+                seed.expose_secret(),
+                &test_birthday(),
+                TransparentImportMode::Range {
+                    account: &transparent_account,
+                    config: &range,
+                },
+                std::slice::from_ref(&account),
+                &state,
+            )
+            .await
+            .unwrap();
+
+            let guard = state.lock().await;
+            let tracked = guard
+                .tracked_accounts
+                .first()
+                .expect("account zero tracked");
+            assert_eq!(tracked.transparent_key_coordinates.len(), 2);
+            for scope in [
+                crate::models::AddressScope::External,
+                crate::models::AddressScope::Internal,
+            ] {
+                let expected = crate::derivation::transparent_address_from_seed(
+                    config.network,
+                    seed.expose_secret(),
+                    0,
+                    scope,
+                    997,
+                )
+                .unwrap();
+                assert!(tracked.transparent_receivers.contains(&expected));
+                assert!(tracked.transparent_key_coordinates.iter().any(|key| {
+                    key.address == expected && key.scope == scope && key.index == 997
+                }));
+            }
+        }
+
+        #[tokio::test]
+        async fn default_transparent_range_is_complete_idempotent_and_account_zero_only() {
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let config = test_config(tempdir.path().to_owned());
+            let workspace = RecoveryWorkspace::from_runtime(&config).expect("workspace");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
+            workspace
+                .initialize(config.network, seed.expose_secret())
+                .unwrap();
+            let transparent_account =
+                legacy_transparent_account_key(&test_seed_phrase(), config.network).unwrap();
+            let accounts = (0..2)
+                .map(|index| {
+                    crate::derivation::derive_exact_account_from_seed(
+                        seed.expose_secret(),
+                        config.network,
+                        index,
+                    )
+                })
+                .collect::<crate::error::ZeckResult<Vec<_>>>()
+                .unwrap();
+            let range = crate::models::TransparentScanConfig::default();
+
+            for _ in 0..2 {
+                let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+                import_accounts_scoped(
+                    &workspace,
+                    config.network,
+                    seed.expose_secret(),
+                    &test_birthday(),
+                    TransparentImportMode::Range {
+                        account: &transparent_account,
+                        config: &range,
+                    },
+                    &accounts,
+                    &state,
+                )
+                .await
+                .unwrap();
+                let guard = state.lock().await;
+                assert_eq!(guard.tracked_accounts.len(), 2);
+                assert_eq!(
+                    guard.tracked_accounts[0].transparent_key_coordinates.len(),
+                    1000
+                );
+                assert!(guard.tracked_accounts[0]
+                    .transparent_key_coordinates
+                    .iter()
+                    .any(|key| {
+                        key.scope == crate::models::AddressScope::External && key.index == 997
+                    }));
+                assert!(guard.tracked_accounts[1]
+                    .transparent_key_coordinates
+                    .is_empty());
+                let account_zero_id = guard.tracked_accounts[0].wallet_account_id;
+                let legacy_slot_one = crate::derivation::transparent_address_from_seed(
+                    config.network,
+                    seed.expose_secret(),
+                    0,
+                    crate::models::AddressScope::External,
+                    1,
+                )
+                .unwrap();
+                assert!(!guard.tracked_accounts[1]
+                    .transparent_receivers
+                    .contains(&legacy_slot_one));
+                drop(guard);
+                let expected_997 = crate::derivation::transparent_address_from_seed(
+                    config.network,
+                    seed.expose_secret(),
+                    0,
+                    crate::models::AddressScope::External,
+                    997,
+                )
+                .unwrap();
+                let db = crate::workspace::open_wallet_db(
+                    workspace.wallet_db_path(),
+                    consensus_network(config.network),
+                )
+                .unwrap();
+                assert!(db
+                    .get_transparent_receivers(account_zero_id, true, true)
+                    .unwrap()
+                    .contains_key(&expected_997));
+            }
+        }
+
+        #[tokio::test]
+        async fn transparent_range_registration_observes_mid_loop_cancellation() {
+            let tempdir = tempfile::tempdir().expect("temp dir");
+            let config = test_config(tempdir.path().to_owned());
+            let workspace = RecoveryWorkspace::from_runtime(&config).expect("workspace");
+            let seed = mnemonic_seed(&test_seed_phrase()).expect("seed");
+            workspace
+                .initialize(config.network, seed.expose_secret())
+                .unwrap();
+            let transparent_account =
+                legacy_transparent_account_key(&test_seed_phrase(), config.network).unwrap();
+            let account = crate::derivation::derive_exact_account_from_seed(
+                seed.expose_secret(),
+                config.network,
+                0,
+            )
+            .unwrap();
+            let range = crate::models::TransparentScanConfig::default();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let cancelled = state.lock().await.cancelled.clone();
+            let birthday = test_birthday();
+            let import = import_accounts_scoped(
+                &workspace,
+                config.network,
+                seed.expose_secret(),
+                &birthday,
+                TransparentImportMode::Range {
+                    account: &transparent_account,
+                    config: &range,
+                },
+                std::slice::from_ref(&account),
+                &state,
+            );
+            let cancel = async move {
+                tokio::task::yield_now().await;
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            };
+            let (result, ()) = tokio::join!(import, cancel);
+            assert!(matches!(result, Err(crate::error::ZeckError::Cancelled)));
+            assert!(state.lock().await.tracked_accounts.is_empty());
+            // A fresh run must safely finish a partially registered range.
+            let resumed_state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts_scoped(
+                &workspace,
+                config.network,
+                seed.expose_secret(),
+                &birthday,
+                TransparentImportMode::Range {
+                    account: &transparent_account,
+                    config: &range,
+                },
+                std::slice::from_ref(&account),
+                &resumed_state,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resumed_state.lock().await.tracked_accounts[0]
+                    .transparent_key_coordinates
+                    .len(),
+                1000
             );
         }
 

@@ -27,10 +27,16 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             service: RecoveryService::new(),
+            address_search: argos_core::address_search::AddressSearchService::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::validate_seed,
             commands::validate_address,
+            commands::start_address_search,
+            commands::get_address_search,
+            commands::cancel_address_search,
+            commands::release_address_search,
+            commands::start_matched_recovery,
             commands::start_scan,
             commands::pick_wallet_file,
             commands::inspect_wallet_file,
