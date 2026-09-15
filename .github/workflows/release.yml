@@ -215,6 +215,25 @@ jobs:
       - name: Install Tauri CLI
         run: npm install -g @tauri-apps/cli@2.11.1
 
+      # Compile BEFORE authenticating.
+      #
+      # `tauri build` compiles and signs in one step, so with azure/login ahead
+      # of it the first signing call landed ~11 minutes after authentication —
+      # and that is when signing hung. A standalone smoke test on the same
+      # runner image, the same pinned dlib and the same certificate profile
+      # signed a stock binary in 8.8s with the token issued in 0.6s, the only
+      # difference being that it signed ~20 seconds after login. The federated
+      # assertion azure/login authenticates with is short-lived, and the dlib
+      # asks for a *different* scope (codesigning.azure.net) than the CLI
+      # cached, so acquiring it 11 minutes later is a fresh acquisition against
+      # an assertion that has expired.
+      #
+      # Warming the build here leaves `tauri build` below an incremental
+      # rebuild — same package, same profile, same target directory — so
+      # signing runs seconds after login instead of minutes.
+      - name: Pre-compile, so signing runs shortly after authentication
+        run: cargo build --release -p argos-gui
+
       # Azure Trusted Signing (cloud-held key) via OIDC — no secret in CI.
       # Signs the inner Argos.exe *and* the MSI/NSIS installers during the
       # build (see signCommand injected below). The attest-build-provenance
