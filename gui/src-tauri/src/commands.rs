@@ -1009,6 +1009,99 @@ fn collect_scan_keys(
     Ok(keys)
 }
 
+/// How many user-supplied peers a scan accepts.
+///
+/// Small on purpose: these are dialled before the DNS seeds, so a long list
+/// of dead entries only delays reaching a peer that works.
+const MAX_CUSTOM_PEERS: usize = 8;
+
+/// Parse and validate user-supplied P2P peers into `host:port` strings.
+///
+/// The GUI's counterpart to `argos scan-sprout --peer`: the escape hatch for
+/// when every public peer's inbound slots are full. Entries may arrive one
+/// per element or several in one element separated by commas or newlines.
+/// Each is trimmed, empties are dropped, and duplicates (ASCII
+/// case-insensitive) collapse to the first occurrence.
+///
+/// A bad entry is an error rather than something to skip: silently dropping
+/// the one node a user typed would leave them watching Argos dial the same
+/// busy public peers with no idea their input was ignored.
+///
+/// Purely syntactic — nothing is resolved or dialled here.
+fn parse_custom_peers(entries: &[String]) -> Result<Vec<String>, String> {
+    let mut peers: Vec<String> = Vec::new();
+    let candidates = entries
+        .iter()
+        .flat_map(|entry| entry.split([',', '\n', '\r']))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty());
+
+    for entry in candidates {
+        validate_peer(entry).map_err(|why| {
+            format!(
+                "custom peer \"{entry}\" is not valid: {why}. Use host:port, for example \
+                 192.0.2.10:8233, node.example.org:8233 or [2001:db8::1]:8233."
+            )
+        })?;
+        if !peers.iter().any(|seen| seen.eq_ignore_ascii_case(entry)) {
+            peers.push(entry.to_owned());
+        }
+    }
+
+    if peers.len() > MAX_CUSTOM_PEERS {
+        return Err(format!(
+            "at most {MAX_CUSTOM_PEERS} custom peers are accepted; {} were given.",
+            peers.len()
+        ));
+    }
+    Ok(peers)
+}
+
+/// Check one trimmed, non-empty entry is `host:port` or `[ipv6]:port`.
+fn validate_peer(entry: &str) -> Result<(), &'static str> {
+    let (host, port) = if let Some(rest) = entry.strip_prefix('[') {
+        let (addr, port) = rest
+            .split_once("]:")
+            .ok_or("a bracketed IPv6 address must be followed by :port")?;
+        addr.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| "the bracketed part is not an IPv6 address")?;
+        (None, port)
+    } else {
+        let (host, port) = entry.rsplit_once(':').ok_or("the port is missing")?;
+        (Some(host), port)
+    };
+
+    if let Some(host) = host {
+        if host.contains(':') {
+            return Err("an IPv6 address must be written in brackets, as [addr]:port");
+        }
+        let label_ok = |label: &str| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if host.is_empty() || host.len() > 253 || !host.split('.').all(label_ok) {
+            return Err("the host is not an IP address or hostname");
+        }
+    }
+
+    // Digits only: `u16::from_str` would also take a leading `+`.
+    if port.is_empty() {
+        return Err("the port is missing");
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("the port is not a number");
+    }
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => Err("the port must be between 1 and 65535"),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// Scan the chain for notes belonging to raw Sprout spending keys.
 ///
 /// Runs for hours, so progress arrives as `sprout-scan-progress` events and
@@ -1026,6 +1119,9 @@ pub async fn start_sprout_scan(
 ) -> Result<SproutScanReport, String> {
     ensure_tos_accepted(&app)?;
     let network = network_from(&network);
+    // Before the wallet file is read: a mistyped peer should not cost a
+    // passphrase-stretching decrypt to find out about.
+    let peers = parse_custom_peers(&peers)?;
 
     // The panel offers to use the wallet file's own keys; it now actually
     // can. Previously this took typed keys only, so the one user it exists
@@ -1095,6 +1191,7 @@ pub async fn sweep_sprout_from_scan(
 ) -> Result<SproutSweepReport, String> {
     ensure_tos_accepted(&app)?;
     let net = network_from(&network);
+    let peers = parse_custom_peers(&peers)?;
     let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, net)?;
 
     // Validated before anything else: an address with no Sapling receiver
@@ -1743,6 +1840,145 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peers(entries: &[&str]) -> Result<Vec<String>, String> {
+        let owned: Vec<String> = entries.iter().map(|e| (*e).to_owned()).collect();
+        parse_custom_peers(&owned)
+    }
+
+    #[test]
+    fn custom_peers_accept_ipv4_hostname_and_bracketed_ipv6() {
+        assert_eq!(
+            peers(&["192.0.2.10:8233", "node.example.org:8233", "[::1]:8233"]),
+            Ok(vec![
+                "192.0.2.10:8233".to_owned(),
+                "node.example.org:8233".to_owned(),
+                "[::1]:8233".to_owned(),
+            ])
+        );
+        assert_eq!(
+            peers(&["localhost:18233"]),
+            Ok(vec!["localhost:18233".to_owned()])
+        );
+        assert_eq!(
+            peers(&["[2001:db8::1]:65535"]),
+            Ok(vec!["[2001:db8::1]:65535".to_owned()])
+        );
+    }
+
+    #[test]
+    fn custom_peers_trim_split_and_drop_empties() {
+        assert_eq!(peers(&[]), Ok(vec![]));
+        assert_eq!(peers(&["", "   ", "\n", " , ,\n"]), Ok(vec![]));
+        assert_eq!(
+            peers(&["  192.0.2.10:8233 ,node.example.org:8233\r\n[::1]:8233\n"]),
+            Ok(vec![
+                "192.0.2.10:8233".to_owned(),
+                "node.example.org:8233".to_owned(),
+                "[::1]:8233".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_peers_reject_a_missing_port() {
+        for bad in [
+            "192.0.2.10",
+            "node.example.org",
+            "node.example.org:",
+            "[::1]",
+            "[::1]:",
+        ] {
+            let err = peers(&[bad]).expect_err(bad);
+            assert!(err.contains(bad), "error should name the entry: {err}");
+        }
+    }
+
+    #[test]
+    fn custom_peers_reject_an_out_of_range_or_malformed_port() {
+        for bad in [
+            "192.0.2.10:0",
+            "192.0.2.10:65536",
+            "192.0.2.10:99999999999",
+            "192.0.2.10:-1",
+            "192.0.2.10:+8233",
+            "192.0.2.10:82e3",
+            "[::1]:0",
+        ] {
+            let err = peers(&[bad]).expect_err(bad);
+            assert!(err.contains(bad), "error should name the entry: {err}");
+        }
+    }
+
+    #[test]
+    fn custom_peers_reject_a_malformed_host() {
+        for bad in [
+            ":8233",
+            "::1:8233",
+            "[::1:8233",
+            "[not-an-address]:8233",
+            "[]:8233",
+            "https://node.example.org:8233",
+            "node example.org:8233",
+            "node..example.org:8233",
+            "-node.example.org:8233",
+            "user@node.example.org:8233",
+        ] {
+            let err = peers(&[bad]).expect_err(bad);
+            assert!(err.contains(bad), "error should name the entry: {err}");
+        }
+    }
+
+    #[test]
+    fn custom_peers_one_bad_entry_fails_the_whole_list() {
+        assert!(peers(&["192.0.2.10:8233", "oops"]).is_err());
+        assert!(peers(&["192.0.2.10:8233,oops"]).is_err());
+    }
+
+    #[test]
+    fn custom_peers_deduplicate_keeping_first_occurrence_order() {
+        assert_eq!(
+            peers(&[
+                "node.example.org:8233",
+                "192.0.2.10:8233",
+                "Node.Example.ORG:8233",
+                " 192.0.2.10:8233 ",
+            ]),
+            Ok(vec![
+                "node.example.org:8233".to_owned(),
+                "192.0.2.10:8233".to_owned(),
+            ])
+        );
+        // Same host on another port is a different peer.
+        assert_eq!(
+            peers(&["192.0.2.10:8233", "192.0.2.10:8234"]).map(|p| p.len()),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn custom_peers_are_capped_after_deduplication() {
+        let at_cap: Vec<String> = (0..MAX_CUSTOM_PEERS)
+            .map(|i| format!("192.0.2.{i}:8233"))
+            .collect();
+        assert_eq!(
+            parse_custom_peers(&at_cap).map(|p| p.len()),
+            Ok(MAX_CUSTOM_PEERS)
+        );
+
+        // Duplicates do not count towards the cap.
+        let mut padded = at_cap.clone();
+        padded.extend(at_cap.iter().cloned());
+        assert_eq!(
+            parse_custom_peers(&padded).map(|p| p.len()),
+            Ok(MAX_CUSTOM_PEERS)
+        );
+
+        let mut over = at_cap;
+        over.push("192.0.2.200:8233".to_owned());
+        let err = parse_custom_peers(&over).expect_err("over the cap");
+        assert!(err.contains(&MAX_CUSTOM_PEERS.to_string()), "{err}");
+    }
 
     #[test]
     fn ordinary_scan_inputs_default_to_the_complete_receive_range() {
