@@ -81,6 +81,16 @@ pub enum ZeckError {
     #[error("broadcast failed: {0}")]
     Broadcast(String),
 
+    /// No Zcash peer could be reached over the raw P2P network.
+    ///
+    /// Deliberately *not* a [`ZeckError::Broadcast`], which it once was: the
+    /// Sprout full-block scan connects to peers to *read* blocks, and a scan
+    /// that never got a connection has sent nothing. Labelling it "broadcast
+    /// failed" told a user who had not yet moved any funds that a transaction
+    /// of theirs had gone wrong.
+    #[error("could not reach the Zcash network: {0}")]
+    PeerConnection(String),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 

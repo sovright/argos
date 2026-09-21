@@ -605,7 +605,7 @@ async fn connect_peer(
 ) -> ZeckResult<Peer> {
     connect_to_any(network, extra, 4)
         .await
-        .map_err(|err| ZeckError::Broadcast(err.to_string()))
+        .map_err(ZeckError::from)
 }
 
 #[cfg(test)]

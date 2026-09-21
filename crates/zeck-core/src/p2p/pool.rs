@@ -22,6 +22,13 @@
 //! the first is normal and worth retrying. A recovery tool that collapses
 //! them into "connection failed" sends people chasing their firewall when
 //! the network was merely busy.
+//!
+//! The reverse mistake is just as costly, and this module once made it: a
+//! timeout was counted as a refusal, so a network that drops outbound 8233
+//! was told the peers were busy and to retry. Refusal, silence, and
+//! everything else are therefore three separate counts ([`FailureTally`]),
+//! and the advice in [`PoolError::AllPeersRefused`] follows from which one
+//! dominates.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -97,21 +104,89 @@ pub const PEER_RECONNECT_DELAY: Duration = Duration::from_secs(119);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
-    #[error(
-        "no Zcash peer would accept a connection. {refused} of {tried} peers refused a \
-         connection slot, which is normal when the network is busy — retrying usually \
-         succeeds. ({other} failed for other reasons.)"
-    )]
+    /// Every candidate was tried and none completed a handshake.
+    ///
+    /// The name is historical: it covers silence and other faults as well as
+    /// refusals, and the counts say which. `fallback_refused` is how many of
+    /// the refusals came from [`SOVRIGHT_MAINNET_NODES`].
+    #[error("{}", describe_no_peer(*tried, *refused, *timed_out, *other, *fallback_refused))]
     AllPeersRefused {
         tried: usize,
         refused: usize,
+        timed_out: usize,
         other: usize,
+        fallback_refused: usize,
     },
     #[error(
         "could not resolve any Zcash DNS seed ({0}). This usually means no internet \
          connection, or DNS is blocked on this network."
     )]
     NoSeedsResolved(String),
+}
+
+/// The text of [`PoolError::AllPeersRefused`].
+///
+/// This is the only thing a stuck user sees, and what they do next depends
+/// on it, so each branch gives advice that is true for that case rather than
+/// one sentence stretched over all of them:
+///
+/// - Mostly silence. A full peer closes the connection; it does not ignore
+///   it. Silence from most of the network points at something between this
+///   machine and the peers dropping the traffic, and retrying from the same
+///   network cannot fix that. "Most" rather than "any", because a handful of
+///   slow or dead addresses among the seeds is ordinary.
+/// - Refusals that include the Sovright fallback nodes. "Retrying usually
+///   succeeds" was only ever true because the fallback had room. A user was
+///   told it for two days while all four fallback nodes were full; once they
+///   have refused as well, the honest advice is to wait or to bring a node.
+/// - Refusals alone. The routine case, and the only one where an immediate
+///   retry is good advice.
+/// - No refusals at all. Whatever happened, it is not a busy network.
+fn describe_no_peer(
+    tried: usize,
+    refused: usize,
+    timed_out: usize,
+    other: usize,
+    fallback_refused: usize,
+) -> String {
+    const OWN_NODE: &str = "supply a node you know is reachable with --peer host:port on \
+                            `argos scan-sprout`";
+
+    if tried == 0 {
+        return format!("there were no Zcash peer addresses to try. To continue, {OWN_NODE}.");
+    }
+
+    let head = "no Zcash peer would accept a connection.";
+    if timed_out * 2 > tried {
+        format!(
+            "{head} {timed_out} of {tried} peers never answered at all ({refused} refused a \
+             connection slot, {other} failed for other reasons). A busy peer refuses \
+             quickly; silence from most of them usually means outbound connections to port \
+             8233 (18233 on testnet) are blocked on this network by a firewall, VPN, or \
+             restrictive Wi-Fi. Retrying from the same network is unlikely to help. Try a \
+             different network, or {OWN_NODE}."
+        )
+    } else if fallback_refused > 0 {
+        format!(
+            "{head} {refused} of {tried} peers refused a connection slot, including \
+             {fallback_refused} of the Sovright fallback nodes that exist for when the \
+             public network is full ({timed_out} timed out, {other} failed for other \
+             reasons). The fallback nodes are also at capacity, so retrying straight away \
+             is unlikely to succeed. Try again later, or {OWN_NODE}."
+        )
+    } else if refused == 0 {
+        format!(
+            "{head} None of the {tried} peers tried refused a connection slot, so this is \
+             not the network being busy: {timed_out} timed out and {other} failed for other \
+             reasons. Check this machine's internet connection, or {OWN_NODE}."
+        )
+    } else {
+        format!(
+            "{head} {refused} of {tried} peers refused a connection slot, which is normal \
+             when the network is busy — retrying usually succeeds. ({timed_out} timed out, \
+             {other} failed for other reasons.)"
+        )
+    }
 }
 
 /// Resolve the DNS seeds into candidate peer addresses.
@@ -166,32 +241,96 @@ pub async fn resolve_seeds(network: P2pNetwork) -> Result<Vec<String>, PoolError
 ///
 /// Losing attempts are cancelled as soon as one wins, so a peer that would
 /// have taken the full timeout does not hold up the scan.
-async fn race_batch(candidates: &[String], network: P2pNetwork) -> (Option<Peer>, usize, usize) {
+async fn race_batch(candidates: &[String], network: P2pNetwork) -> (Option<Peer>, FailureTally) {
     let mut set = tokio::task::JoinSet::new();
     for addr in candidates {
         let addr = addr.clone();
-        set.spawn(async move { Peer::connect(&addr, network).await });
+        // The address travels with the result: which peer failed matters as
+        // much as how, because a refusal from a fallback node changes what
+        // the user should be told.
+        set.spawn(async move {
+            let result = Peer::connect(&addr, network).await;
+            (addr, result)
+        });
     }
 
-    let mut refused = 0;
-    let mut other = 0;
+    let mut tally = FailureTally::default();
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok(Ok(peer)) => {
+            Ok((_, Ok(peer))) => {
                 // Dropping the set aborts the rest.
-                return (Some(peer), refused, other);
+                return (Some(peer), tally);
             }
-            Ok(Err(err)) => {
-                if is_slot_refusal(&err) {
-                    refused += 1;
-                } else {
-                    other += 1;
-                }
-            }
-            Err(_) => other += 1,
+            Ok((addr, Err(err))) => tally.record(&addr, &err),
+            Err(_) => tally.other += 1,
         }
     }
-    (None, refused, other)
+    (None, tally)
+}
+
+/// Why the candidates that failed, failed.
+///
+/// Three buckets rather than two, because the three call for different
+/// advice: a refusal is routine, silence suggests a blocked port, and
+/// anything else is a fault worth reading. Every failure lands in exactly
+/// one of `refused`, `timed_out` and `other`, so on a total failure they sum
+/// to the number tried.
+///
+/// `fallback_refused` is not a fourth bucket but a subset of `refused`: the
+/// refusals that came from [`SOVRIGHT_MAINNET_NODES`]. It is tracked because
+/// the promise that retrying works rests on those nodes having room.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FailureTally {
+    refused: usize,
+    timed_out: usize,
+    other: usize,
+    fallback_refused: usize,
+}
+
+impl FailureTally {
+    fn record(&mut self, addr: &str, err: &PeerError) {
+        if is_slot_refusal(err) {
+            self.refused += 1;
+            // Only a refusal counts here. A fallback node that stayed silent
+            // is evidence about the path to it, not about its capacity.
+            if SOVRIGHT_MAINNET_NODES.contains(&addr) {
+                self.fallback_refused += 1;
+            }
+        } else if is_timeout(err) {
+            self.timed_out += 1;
+        } else {
+            self.other += 1;
+        }
+    }
+
+    fn absorb(&mut self, batch: FailureTally) {
+        self.refused += batch.refused;
+        self.timed_out += batch.timed_out;
+        self.other += batch.other;
+        self.fallback_refused += batch.fallback_refused;
+    }
+
+    fn into_error(self, tried: usize) -> PoolError {
+        PoolError::AllPeersRefused {
+            tried,
+            refused: self.refused,
+            timed_out: self.timed_out,
+            other: self.other,
+            fallback_refused: self.fallback_refused,
+        }
+    }
+}
+
+/// A pool failure means no peer was reached, and nothing else.
+///
+/// It was once mapped to `ZeckError::Broadcast` at the call site, so a scan
+/// that had not connected — let alone sent a transaction — reported
+/// "broadcast failed". The conversion lives here so there is one mapping and
+/// no call site can pick a different label.
+impl From<PoolError> for crate::error::ZeckError {
+    fn from(err: PoolError) -> Self {
+        Self::PeerConnection(err.to_string())
+    }
 }
 
 /// Whether an error is a peer declining to give us a connection slot, as
@@ -199,6 +338,11 @@ async fn race_batch(candidates: &[String], network: P2pNetwork) -> (Option<Peer>
 ///
 /// Both present as a failed connection, but only this kind is routine and
 /// worth retrying, so they are counted separately and reported separately.
+///
+/// A timeout is deliberately *not* a refusal. A peer with no free slot
+/// answers — it completes the TCP handshake and closes, or resets — whereas
+/// a timeout is no answer at all, which is also exactly what a firewall
+/// dropping outbound 8233 produces. See [`is_timeout`].
 fn is_slot_refusal(err: &PeerError) -> bool {
     match err {
         PeerError::Closed => true,
@@ -208,11 +352,23 @@ fn is_slot_refusal(err: &PeerError) -> bool {
                 | std::io::ErrorKind::ConnectionRefused
                 | std::io::ErrorKind::ConnectionAborted
         ),
-        PeerError::Connect { source, .. } => matches!(
-            source.kind(),
-            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
-        ),
+        PeerError::Connect { source, .. } => source.kind() == std::io::ErrorKind::ConnectionRefused,
+        _ => false,
+    }
+}
+
+/// Whether an error is a peer never answering, at any stage.
+///
+/// Covers our own handshake deadline and the operating system's connect
+/// timeout alike: from the user's side both are silence, and silence from
+/// most of the network is the signature of a blocked port rather than a busy
+/// one.
+fn is_timeout(err: &PeerError) -> bool {
+    match err {
         PeerError::Timeout { .. } => true,
+        PeerError::Io(io) | PeerError::Connect { source: io, .. } => {
+            io.kind() == std::io::ErrorKind::TimedOut
+        }
         _ => false,
     }
 }
@@ -232,8 +388,7 @@ pub async fn connect_to_any(
     }
 
     let mut tried = 0;
-    let mut refused = 0;
-    let mut other = 0;
+    let mut tally = FailureTally::default();
 
     // Each round takes a *fresh* slice of candidates rather than retrying the
     // ones that just refused: a peer that refused seconds ago will refuse for
@@ -250,9 +405,8 @@ pub async fn connect_to_any(
         let batch = &batch[..batch.len().min(CONCURRENT_ATTEMPTS)];
         tried += batch.len();
 
-        let (peer, r, o) = race_batch(batch, network).await;
-        refused += r;
-        other += o;
+        let (peer, failures) = race_batch(batch, network).await;
+        tally.absorb(failures);
         if let Some(peer) = peer {
             return Ok(peer);
         }
@@ -262,11 +416,7 @@ pub async fn connect_to_any(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    Err(PoolError::AllPeersRefused {
-        tried,
-        refused,
-        other,
-    })
+    Err(tally.into_error(tried))
 }
 
 #[cfg(test)]
@@ -276,15 +426,27 @@ mod tests {
     /// The distinction the error message depends on. A peer declining a slot
     /// is routine; a checksum failure means something is rewriting our
     /// traffic, and telling a user to "just retry" would be wrong.
+    ///
+    /// Silence is a third thing and must not be folded into either. An
+    /// earlier version counted a timeout as a refusal, so a network that
+    /// drops outbound 8233 produced "N of N peers refused ... retrying
+    /// usually succeeds" — the exact misdiagnosis the module doc rules out.
     #[test]
     fn slot_refusals_are_told_apart_from_real_faults() {
         assert!(is_slot_refusal(&PeerError::Closed));
         assert!(is_slot_refusal(&PeerError::Io(std::io::Error::from(
             std::io::ErrorKind::ConnectionReset
         ))));
-        assert!(is_slot_refusal(&PeerError::Timeout {
+        assert!(is_slot_refusal(&connect_error(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+
+        assert!(!is_slot_refusal(&PeerError::Timeout {
             what: "a header".to_owned()
         }));
+        assert!(!is_slot_refusal(&connect_error(
+            std::io::ErrorKind::TimedOut
+        )));
 
         assert!(!is_slot_refusal(&PeerError::Wire(
             super::super::wire::WireError::BadChecksum
@@ -292,21 +454,188 @@ mod tests {
         assert!(!is_slot_refusal(&PeerError::ProtocolTooOld(170_002)));
     }
 
+    fn connect_error(kind: std::io::ErrorKind) -> PeerError {
+        PeerError::Connect {
+            addr: "203.0.113.1:8233".to_owned(),
+            source: std::io::Error::from(kind),
+        }
+    }
+
+    /// A peer that never answers is not a peer that said no. Both the
+    /// handshake timeout and the operating system's own connect timeout are
+    /// silence, wherever in the exchange they happen.
+    #[test]
+    fn silence_is_recognised_as_a_timeout() {
+        assert!(is_timeout(&PeerError::Timeout {
+            what: "a version".to_owned()
+        }));
+        assert!(is_timeout(&connect_error(std::io::ErrorKind::TimedOut)));
+        assert!(is_timeout(&PeerError::Io(std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        ))));
+
+        assert!(!is_timeout(&PeerError::Closed));
+        assert!(!is_timeout(&connect_error(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+    }
+
+    /// The tally is what the message is built from, so each failure has to
+    /// land in exactly one bucket, and a refusal from a Sovright node has to
+    /// be remembered as such.
+    #[test]
+    fn each_failure_lands_in_exactly_one_bucket() {
+        let mut tally = FailureTally::default();
+        tally.record("203.0.113.1:8233", &PeerError::Closed);
+        tally.record(
+            "203.0.113.2:8233",
+            &PeerError::Timeout {
+                what: "a version".to_owned(),
+            },
+        );
+        tally.record("203.0.113.3:8233", &PeerError::ProtocolTooOld(170_002));
+        tally.record(SOVRIGHT_MAINNET_NODES[0], &PeerError::Closed);
+        // A fallback node that stayed silent did not refuse, and must not be
+        // reported as being at capacity.
+        tally.record(
+            SOVRIGHT_MAINNET_NODES[1],
+            &PeerError::Timeout {
+                what: "a version".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            tally,
+            FailureTally {
+                refused: 2,
+                timed_out: 2,
+                other: 1,
+                fallback_refused: 1,
+            }
+        );
+    }
+
+    fn all_failed(tried: usize, tally: FailureTally) -> String {
+        tally.into_error(tried).to_string()
+    }
+
     /// The failure message is the only thing a stuck user sees, so it has to
     /// say what happened and whether retrying is worth it.
     #[test]
     fn the_all_refused_error_explains_itself() {
-        let err = PoolError::AllPeersRefused {
-            tried: 38,
-            refused: 35,
-            other: 3,
-        }
-        .to_string();
+        let err = all_failed(
+            38,
+            FailureTally {
+                refused: 33,
+                timed_out: 2,
+                other: 3,
+                fallback_refused: 0,
+            },
+        );
         assert!(err.contains("38"));
-        assert!(err.contains("35"));
+        assert!(err.contains("33"));
+        assert!(err.contains("2 timed out"), "timeouts are reported: {err}");
         assert!(
-            err.contains("retrying"),
+            err.contains("retrying usually succeeds"),
             "a capacity refusal is routine and the user should be told to retry"
+        );
+        assert!(
+            !err.contains("blocked"),
+            "a couple of slow peers is not evidence of a blocked port: {err}"
+        );
+    }
+
+    /// A network that drops outbound 8233 fails every attempt by timeout.
+    /// Telling that user the network is busy and to retry sends them round
+    /// in circles; nothing will change until they change network.
+    #[test]
+    fn a_blocked_port_is_not_reported_as_a_busy_network() {
+        let err = all_failed(
+            34,
+            FailureTally {
+                refused: 0,
+                timed_out: 34,
+                other: 0,
+                fallback_refused: 0,
+            },
+        );
+        assert!(err.contains("34 of 34"), "{err}");
+        assert!(err.contains("8233"), "{err}");
+        assert!(err.contains("blocked"), "{err}");
+        assert!(!err.contains("retrying usually succeeds"), "{err}");
+        assert!(!err.contains("34 of 34 peers refused"), "{err}");
+
+        // Mostly silence, with a stray refusal, is still the blocked-port
+        // picture rather than the busy-network one.
+        let mostly = all_failed(
+            34,
+            FailureTally {
+                refused: 3,
+                timed_out: 30,
+                other: 1,
+                fallback_refused: 0,
+            },
+        );
+        assert!(mostly.contains("blocked"), "{mostly}");
+        assert!(!mostly.contains("retrying usually succeeds"), "{mostly}");
+    }
+
+    /// The report this was written for: 34 of 34 refused, the four Sovright
+    /// nodes among them, for two days. "Retrying usually succeeds" rests on
+    /// the fallback having room; once it has refused too, the promise is
+    /// false and the user needs a route that does not depend on luck.
+    #[test]
+    fn the_retry_promise_is_withdrawn_when_the_fallback_also_refused() {
+        let err = all_failed(
+            34,
+            FailureTally {
+                refused: 34,
+                timed_out: 0,
+                other: 0,
+                fallback_refused: 4,
+            },
+        );
+        assert!(err.contains("34 of 34"), "{err}");
+        assert!(!err.contains("retrying usually succeeds"), "{err}");
+        assert!(err.contains("fallback"), "{err}");
+        assert!(err.contains("at capacity"), "{err}");
+        assert!(
+            err.contains("--peer host:port"),
+            "the way out has to be named: {err}"
+        );
+    }
+
+    /// Retrying is only routine advice for refusals. If nothing refused,
+    /// whatever went wrong is not the busy-network case.
+    #[test]
+    fn retrying_is_not_promised_when_nothing_refused() {
+        let err = all_failed(
+            12,
+            FailureTally {
+                refused: 0,
+                timed_out: 2,
+                other: 10,
+                fallback_refused: 0,
+            },
+        );
+        assert!(!err.contains("retrying usually succeeds"), "{err}");
+    }
+
+    /// A scan that never reached a peer has not broadcast anything. It was
+    /// once reported as "broadcast failed", which sent a user looking for a
+    /// transaction that did not exist.
+    #[test]
+    fn a_failed_connection_is_not_called_a_broadcast_failure() {
+        let err = crate::error::ZeckError::from(FailureTally::default().into_error(0));
+        assert!(
+            matches!(err, crate::error::ZeckError::PeerConnection(_)),
+            "got {err:?}"
+        );
+        let text = err.to_string();
+        assert!(!text.contains("broadcast"), "{text}");
+        assert!(
+            text.starts_with("could not reach the Zcash network"),
+            "{text}"
         );
     }
 
