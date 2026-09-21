@@ -1051,6 +1051,9 @@ pub async fn start_sprout_scan(
                     "target": tick.target,
                     "notesFound": tick.notes_found,
                     "joinsplitsSeen": tick.joinsplits_seen,
+                    // Null while scanning; the core's own sentence while it
+                    // waits for a peer, so the GUI and CLI cannot drift.
+                    "peerWait": tick.peer_wait.map(|wait| wait.to_string()),
                 }),
             );
         },
@@ -1123,6 +1126,9 @@ pub async fn sweep_sprout_from_scan(
                     "target": tick.target,
                     "notesFound": tick.notes_found,
                     "joinsplitsSeen": tick.joinsplits_seen,
+                    // Null while scanning; the core's own sentence while it
+                    // waits for a peer, so the GUI and CLI cannot drift.
+                    "peerWait": tick.peer_wait.map(|wait| wait.to_string()),
                 }),
             );
         },
