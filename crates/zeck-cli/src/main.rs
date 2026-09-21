@@ -672,6 +672,14 @@ async fn scan_sprout(
         peers,
         &checkpoint,
         |tick| {
+            // A wait for a peer is printed every time it is announced, not
+            // rate-limited with the rest: the core already spaces these out,
+            // and they arrive precisely when nothing else is being printed,
+            // which is when silence would read as a hang.
+            if let Some(wait) = tick.peer_wait {
+                eprintln!("  {wait}");
+                return;
+            }
             // Rate-limited: a tick per batch would scroll a six-hour scan
             // off the screen and tell the user nothing extra.
             if last_report.elapsed().as_secs() >= 5 {

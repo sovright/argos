@@ -1000,6 +1000,13 @@ $("sprout-scan-run").addEventListener("click", runSproutScan);
       const p = event.payload;
       const pct = p.target ? (p.height / p.target) * 100 : 0;
       $("sprout-scan-bar").value = pct;
+      // Waiting for a peer, not scanning. The bar keeps the scan's position
+      // and the line says why nothing is moving, so a busy network does not
+      // look like a hung app. The sentence comes from the backend.
+      if (p.peerWait) {
+        setStatus("sprout-scan-status", `${p.peerWait} Safe to stop; progress is saved.`, "");
+        return;
+      }
       setStatus(
         "sprout-scan-status",
         `Scanning ${p.height.toLocaleString()} / ${p.target.toLocaleString()} ` +

@@ -13,6 +13,9 @@
 //! - A peer serves one inbound connection per source IP per ~119 seconds, so
 //!   a lost connection must be replaced by a *different* peer. Retrying the
 //!   same one is guaranteed to fail and looks identical to a dead network.
+//!   When *every* candidate refuses there is no different peer to move to, so
+//!   the scan waits that window out and makes another pass, for a bounded
+//!   time, rather than failing after one (`acquire_with_retry`).
 //! - A `getdata` naming a whole header page is accepted and never answered,
 //!   so block requests are batched small.
 //! - Peers refuse the overwhelming majority of inbound connections outright,
@@ -75,11 +78,20 @@
 //! starting a multi-hour download again — which is exactly what the cost
 //! warning promises will not happen.
 
-use std::path::{Path, PathBuf};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::{
     error::{ZeckError, ZeckResult},
-    p2p::{block::joinsplits_in_block, peer::Peer, pool::connect_to_any, wire::P2pNetwork},
+    p2p::{
+        block::joinsplits_in_block,
+        peer::Peer,
+        pool::{connect_to_any, PoolError, PEER_RECONNECT_DELAY},
+        wire::P2pNetwork,
+    },
     sprout_scan::{ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner},
 };
 use zcash_protocol::consensus::BranchId;
@@ -118,6 +130,91 @@ const CHECKPOINT_EVERY: u64 = 500;
 /// Sprout range fails with an explanation instead of spinning forever.
 const MAX_EMPTY_REPLIES: u32 = 8;
 
+/// How long the scan keeps trying to find a peer before it gives up.
+///
+/// One pass over the candidates takes seconds, and used to be the whole
+/// attempt. A user lost two days to that: all 34 candidates refused, every
+/// time, while the fallback nodes were healthy and simply had every inbound
+/// slot taken. Slots on a full node churn constantly, so the fix is to still
+/// be asking when one frees — not to ask harder.
+///
+/// A quarter of an hour because the unit of retry is fixed from outside: no
+/// address may be re-dialled within [`PEER_RECONNECT_DELAY`], so this buys
+/// six to eight passes, each against freshly resolved seeds and a fresh state
+/// of every node's slot table. Much shorter leaves two or three tries, which
+/// is barely better than one. Much longer stops being persistence and becomes
+/// a scan that says nothing is wrong to someone whose network is actually
+/// blocking port 8233 — against a scan measured in hours, fifteen minutes is
+/// what a person will leave running unattended and still come back to.
+pub const PEER_ACQUISITION_BUDGET: Duration = Duration::from_secs(15 * 60);
+
+/// How often a wait is re-announced while it runs.
+///
+/// Two minutes behind one unchanging line looks exactly like a hang, which is
+/// the impression the retry exists to remove. Often enough to read as a
+/// countdown, rarely enough that the CLI does not scroll.
+const WAIT_NOTICE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How many consecutive times seed resolution may fail before the scan stops.
+///
+/// A DNS failure is a different fault from a busy network and must not
+/// inherit its patience. Nothing about it improves by waiting out a peer's
+/// reconnect window, because no peer was dialled; and its usual cause — no
+/// internet, or DNS blocked — is something the user has to fix, so holding it
+/// behind fifteen minutes of "retrying" would hide the one message that tells
+/// them so. It is not failed instantly either: hours into a scan, a laptop
+/// waking or Wi-Fi re-associating produces exactly this error for a few
+/// seconds, and that should not cost the run. Hence a few quick tries, and
+/// then the DNS error itself, unchanged.
+const SEED_RETRY_LIMIT: u32 = 3;
+
+/// The pause between those tries. No reconnect window applies — a failed
+/// resolution never reached a peer.
+const SEED_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Why the scan is waiting for a peer rather than scanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerWaitReason {
+    /// Every candidate refused a connection slot. Routine on a busy network.
+    AllPeersBusy,
+    /// The DNS seeds would not resolve. Usually this machine's connection.
+    SeedsUnresolved,
+}
+
+/// The scan is alive, has no peer, and is waiting before trying again.
+///
+/// Carried on [`ScanTick`] so it reaches the CLI and the GUI through the
+/// progress callback they already listen to, rather than a second channel
+/// each would have to learn about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerWait {
+    pub reason: PeerWaitReason,
+    /// The number of the attempt that follows this wait; the first is 1, so
+    /// this is never below 2.
+    pub next_attempt: u32,
+    pub retry_in: Duration,
+}
+
+/// The wording lives here so both surfaces say the same thing.
+impl std::fmt::Display for PeerWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = self.retry_in.as_secs();
+        let attempt = self.next_attempt;
+        match self.reason {
+            PeerWaitReason::AllPeersBusy => write!(
+                f,
+                "Every Zcash peer is busy, which is normal and passes. Retrying in \
+                 {secs}s (attempt {attempt})."
+            ),
+            PeerWaitReason::SeedsUnresolved => write!(
+                f,
+                "Could not look up any Zcash peers (DNS). Check the internet connection. \
+                 Retrying in {secs}s (attempt {attempt})."
+            ),
+        }
+    }
+}
+
 /// Progress, reported often enough that a multi-hour run never looks stalled.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanTick {
@@ -125,6 +222,10 @@ pub struct ScanTick {
     pub target: u32,
     pub notes_found: usize,
     pub joinsplits_seen: u64,
+    /// Set when this tick reports a wait for a peer rather than blocks
+    /// scanned. The other fields still hold the scan's position, so a surface
+    /// that ignores this shows stale-but-true progress, never garbage.
+    pub peer_wait: Option<PeerWait>,
 }
 
 /// Where a scan's checkpoint lives for a given key set.
@@ -229,7 +330,43 @@ pub async fn run_sprout_scan(
     let mut height = first_scan_height(cursor);
     let mut since_checkpoint = 0u64;
 
-    let peer = connect_peer(network, extra_peers, &[]).await?;
+    // A scan that is already complete has nothing to fetch, so it must not
+    // ask for a peer. The GUI's sweep re-runs a finished scan purely to get
+    // its notes back; connecting first made that depend on a free slot it
+    // never used, and now that acquisition is persistent it would have sat
+    // out the whole budget before sweeping funds it already held.
+    if height >= target {
+        save_checkpoint(&scanner, checkpoint_file)?;
+        return scanner
+            .finish()
+            .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")));
+    }
+
+    // A wait is reported as a tick at the scan's current position, so the
+    // surfaces hear about it through the callback they already have.
+    let waiting_tick = |scanner: &SproutScanner, height: u32, wait: PeerWait| {
+        let p = scanner.progress();
+        ScanTick {
+            height,
+            target,
+            notes_found: p.notes_found,
+            joinsplits_seen: p.joinsplits_seen,
+            peer_wait: Some(wait),
+        }
+    };
+
+    let peer = connect_peer(network, extra_peers, &[], |wait| {
+        progress(waiting_tick(&scanner, height, wait));
+    })
+    .await?;
+
+    // The fetcher below is a spawned task and cannot call `progress`, which
+    // is neither `Send` nor its to share. Its waits come back over this and
+    // are replayed into the callback by the consumer. Unbounded because a
+    // notice is a few bytes sent a handful of times per wait, and because a
+    // bounded send would have the fetcher's retry timing depend on how busy
+    // the consumer is.
+    let (wait_tx, mut wait_rx) = tokio::sync::mpsc::unbounded_channel::<PeerWait>();
 
     // Fetching runs one page ahead of scanning.
     //
@@ -257,8 +394,14 @@ pub async fn run_sprout_scan(
         bound,
         network,
         peers: extra_peers.to_vec(),
+        waits: wait_tx,
     };
-    let fetch_task = tokio::spawn(async move {
+    // Aborted when this future is dropped, not only when it finishes.
+    // Dropping the scan is how it is cancelled, and a detached fetcher would
+    // otherwise outlive the cancel by however long it had left to wait for a
+    // peer — up to the whole acquisition budget, holding sockets open for a
+    // scan nobody is running.
+    let fetch_task = AbortOnDrop(tokio::spawn(async move {
         while fetcher.fetched < fetcher.target {
             match fetcher.next_page().await {
                 Ok(None) => continue,
@@ -277,10 +420,21 @@ pub async fn run_sprout_scan(
                 }
             }
         }
-    });
+    }));
 
     while height < target {
-        let Some(page) = rx.recv().await else {
+        // Waits first: a notice still queued when its page arrives is stale,
+        // and replaying it before the page means the scanning tick below is
+        // what is left on screen, not a wait that has already ended.
+        let page = tokio::select! {
+            biased;
+            Some(wait) = wait_rx.recv() => {
+                progress(waiting_tick(&scanner, height, wait));
+                continue;
+            }
+            page = rx.recv() => page,
+        };
+        let Some(page) = page else {
             break;
         };
         let page = page?;
@@ -339,6 +493,7 @@ pub async fn run_sprout_scan(
             target,
             notes_found: p.notes_found,
             joinsplits_seen: p.joinsplits_seen,
+            peer_wait: None,
         });
     }
 
@@ -346,7 +501,7 @@ pub async fn run_sprout_scan(
     // Dropping the receiver already makes the next `send` fail and the task
     // return, but abort it explicitly so a peer connection is not held open
     // for however long the current request takes to time out.
-    fetch_task.abort();
+    drop(fetch_task);
 
     save_checkpoint(&scanner, checkpoint_file)?;
 
@@ -376,9 +531,24 @@ struct PageFetcher {
     bound: crate::p2p::wire::SproutScanBound,
     network: P2pNetwork,
     peers: Vec<String>,
+    /// Where a wait for a peer is announced; see `run_sprout_scan`.
+    waits: tokio::sync::mpsc::UnboundedSender<PeerWait>,
 }
 
 impl PageFetcher {
+    /// Replace the peer, announcing any wait that takes.
+    ///
+    /// A failed send means the consumer has gone, and the page send that
+    /// follows will notice that and end the task; nothing to do about it here.
+    async fn reconnect(&mut self) -> ZeckResult<()> {
+        let waits = &self.waits;
+        self.peer = connect_peer(self.network, &self.peers, &[], |wait| {
+            let _ = waits.send(wait);
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Rotate to another peer, charging this failure against the budget.
     ///
     /// One implementation of the retry rule, which existed three times over,
@@ -389,7 +559,7 @@ impl PageFetcher {
     /// Reconnecting to the same peer would be refused for the next two minutes
     /// regardless, so a rotation always takes a different one.
     async fn rotate(&mut self, exhausted: String) -> ZeckResult<Option<Page>> {
-        self.peer = connect_peer(self.network, &self.peers, &[]).await?;
+        self.reconnect().await?;
         self.empty_replies += 1;
         if self.empty_replies > MAX_EMPTY_REPLIES {
             return Err(ZeckError::Broadcast(exhausted));
@@ -442,7 +612,7 @@ impl PageFetcher {
                     .await;
             }
             Err(_) => {
-                self.peer = connect_peer(self.network, &self.peers, &[]).await?;
+                self.reconnect().await?;
                 return Ok(None);
             }
         };
@@ -503,7 +673,7 @@ impl PageFetcher {
         let mut blocks = match self.peer.get_blocks(&hashes).await {
             Ok(b) => b,
             Err(_) => {
-                self.peer = connect_peer(self.network, &self.peers, &[]).await?;
+                self.reconnect().await?;
                 return Ok(None);
             }
         };
@@ -598,14 +768,132 @@ pub fn discard_checkpoint(path: &Path) {
 /// claim about rotating away from a refusing peer fiction. `connect_to_any`
 /// races a fresh batch each round, so a peer inside its 119-second window
 /// simply loses the race rather than being excluded by name.
+///
+/// That holds *within* a pass. Across passes there is still no list, because
+/// none is needed: when a whole pass is refused, [`acquire_with_retry`] waits
+/// out the reconnect window before the next one, so by the time any address
+/// is dialled again every peer has forgotten the last attempt. The window is
+/// respected by the clock rather than by bookkeeping per address.
+///
+/// `on_wait` hears about each such wait, so the caller can show that the scan
+/// is alive and waiting on purpose.
 async fn connect_peer(
     network: P2pNetwork,
     extra: &[String],
     _prior: &[String],
+    on_wait: impl FnMut(PeerWait),
 ) -> ZeckResult<Peer> {
-    connect_to_any(network, extra, 4)
+    // Regtest gets no patience. Its only candidates are the addresses the
+    // caller named, there is no public capacity to free up, and a refusal
+    // means the node is down — which a test should learn at once, not after
+    // a quarter of an hour.
+    let budget = if matches!(network, P2pNetwork::Regtest) {
+        Duration::ZERO
+    } else {
+        PEER_ACQUISITION_BUDGET
+    };
+    // `connect_to_any` resolves the seeds itself, so each pass re-resolves
+    // them. That matters: the seeders rotate what they hand out, so a later
+    // pass is not just the same refusals again but partly different peers.
+    acquire_with_retry(budget, || connect_to_any(network, extra, 4), on_wait)
         .await
         .map_err(ZeckError::from)
+}
+
+/// Keep making passes at the network until one yields a peer or `budget` is
+/// spent.
+///
+/// Generic over the dial so the policy — which is all timing — can be tested
+/// under a paused clock with no network, and over `T` for the same reason.
+///
+/// # The two retryable faults are not treated alike
+///
+/// *Every peer refused* is the routine one, and is retried for the whole
+/// budget, one pass per [`PEER_RECONNECT_DELAY`]. Sooner would be worse than
+/// useless: a peer drops a second connection from the same address inside
+/// that window silently and before the handshake, so an eager retry is
+/// guaranteed to fail and indistinguishable from a dead network. The wait
+/// starts when the pass *ends*, so every address in it — first round or
+/// last — has had at least the full window.
+///
+/// *No seed resolved* gets [`SEED_RETRY_LIMIT`] quick tries and then fails
+/// as itself; see that constant for why. The count is of consecutive
+/// failures, so a blip hours into a scan does not inherit strikes from one
+/// hours earlier.
+///
+/// Anything else is returned untouched. The match is on the two variants
+/// this policy understands with a catch-all beside them, so a fault added to
+/// [`PoolError`] later fails fast by default rather than being silently
+/// waited on.
+///
+/// # Cancellation
+///
+/// Nothing here outlives its caller: the waits are plain sleeps in this
+/// future, so dropping it stops the retry mid-wait.
+async fn acquire_with_retry<T, F, Fut>(
+    budget: Duration,
+    mut dial: F,
+    mut on_wait: impl FnMut(PeerWait),
+) -> Result<T, PoolError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, PoolError>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut next_attempt = 1u32;
+    let mut seed_failures = 0u32;
+
+    loop {
+        let err = match dial().await {
+            Ok(found) => return Ok(found),
+            Err(err) => err,
+        };
+        next_attempt += 1;
+
+        let (reason, delay) = match &err {
+            // Only if the wait fits: a wait that ends past the budget would
+            // make the bound a suggestion.
+            PoolError::AllPeersRefused { .. }
+                if started.elapsed() + PEER_RECONNECT_DELAY <= budget =>
+            {
+                seed_failures = 0;
+                (PeerWaitReason::AllPeersBusy, PEER_RECONNECT_DELAY)
+            }
+            PoolError::NoSeedsResolved(_)
+                if seed_failures + 1 < SEED_RETRY_LIMIT
+                    && started.elapsed() + SEED_RETRY_DELAY <= budget =>
+            {
+                seed_failures += 1;
+                (PeerWaitReason::SeedsUnresolved, SEED_RETRY_DELAY)
+            }
+            _ => return Err(err),
+        };
+
+        // Slept in slices so the wait can be re-announced as a countdown.
+        let mut remaining = delay;
+        while !remaining.is_zero() {
+            on_wait(PeerWait {
+                reason,
+                next_attempt,
+                retry_in: remaining,
+            });
+            let slice = remaining.min(WAIT_NOTICE_INTERVAL);
+            tokio::time::sleep(slice).await;
+            remaining -= slice;
+        }
+    }
+}
+
+/// Aborts a spawned task when dropped.
+///
+/// A `JoinHandle` detaches on drop, which is the wrong default for a task
+/// that only makes sense while its parent future is alive.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +953,250 @@ mod tests {
             first_scan_height(Some(just_below_the_first_checkpoint)),
             419_200
         );
+    }
+
+    fn all_refused() -> PoolError {
+        PoolError::AllPeersRefused {
+            tried: 34,
+            refused: 34,
+            timed_out: 0,
+            other: 0,
+            fallback_refused: 4,
+        }
+    }
+
+    /// The failure this exists for: every candidate refused, the user's scan
+    /// died after one pass lasting seconds, and the nodes were healthy the
+    /// whole time — merely full. A later pass must be made, and no address
+    /// may be re-dialled inside the window in which its refusal is
+    /// guaranteed.
+    ///
+    /// Time is paused, so the two-minute waits cost nothing and the spacing
+    /// can be asserted exactly rather than slept through.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_pass_is_retried_after_the_reconnect_window() {
+        let mut dialled_at = Vec::new();
+        let mut notices = Vec::new();
+        let result = acquire_with_retry(
+            PEER_ACQUISITION_BUDGET,
+            || {
+                dialled_at.push(tokio::time::Instant::now());
+                let pass = dialled_at.len();
+                async move {
+                    if pass < 3 {
+                        Err(all_refused())
+                    } else {
+                        Ok(pass)
+                    }
+                }
+            },
+            |wait| notices.push(wait),
+        )
+        .await;
+
+        assert_eq!(result.expect("the third pass finds a peer"), 3);
+        for pair in dialled_at.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= PEER_RECONNECT_DELAY,
+                "a pass {:?} after the last re-dials peers that must refuse",
+                pair[1] - pair[0]
+            );
+        }
+        assert!(notices
+            .iter()
+            .all(|w| w.reason == PeerWaitReason::AllPeersBusy));
+        assert!(notices.iter().any(|w| w.next_attempt == 2));
+        assert!(notices.iter().any(|w| w.next_attempt == 3));
+    }
+
+    /// Persistent, not infinite: a network that never answers must end in the
+    /// refusal error, inside the budget, rather than spin for ever.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_gives_up_inside_its_budget() {
+        let started = tokio::time::Instant::now();
+        let mut passes = 0u32;
+        let err = acquire_with_retry(
+            PEER_ACQUISITION_BUDGET,
+            || {
+                passes += 1;
+                async { Err::<(), _>(all_refused()) }
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("nothing ever answers");
+
+        assert!(matches!(err, PoolError::AllPeersRefused { .. }));
+        assert!(passes > 1, "one pass is the behaviour being replaced");
+        assert!(
+            started.elapsed() <= PEER_ACQUISITION_BUDGET,
+            "gave up after {:?}, past the budget",
+            started.elapsed()
+        );
+        // The bound is only meaningful if it leaves room for several windows.
+        assert!(PEER_ACQUISITION_BUDGET >= PEER_RECONNECT_DELAY * 5);
+    }
+
+    /// A DNS failure is this machine's fault, not the network being busy.
+    /// Sitting on it for a quarter of an hour would hide "you are offline"
+    /// behind a message about busy peers, so it gets a few quick tries and
+    /// then surfaces as itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_dns_failure_is_retried_briefly_and_stays_a_dns_failure() {
+        let started = tokio::time::Instant::now();
+        let mut passes = 0u32;
+        let mut notices = Vec::new();
+        let err = acquire_with_retry(
+            PEER_ACQUISITION_BUDGET,
+            || {
+                passes += 1;
+                async { Err::<(), _>(PoolError::NoSeedsResolved("dns down".to_owned())) }
+            },
+            |wait| notices.push(wait),
+        )
+        .await
+        .expect_err("DNS never comes back");
+
+        assert!(matches!(err, PoolError::NoSeedsResolved(_)));
+        assert_eq!(passes, SEED_RETRY_LIMIT);
+        assert!(
+            started.elapsed() < PEER_RECONNECT_DELAY,
+            "a DNS fault must not be waited on like a busy network"
+        );
+        assert!(!notices.is_empty());
+        assert!(notices
+            .iter()
+            .all(|w| w.reason == PeerWaitReason::SeedsUnresolved));
+    }
+
+    /// Two minutes of one unchanging line is indistinguishable from a hang,
+    /// so a wait is reported as a countdown.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_is_reported_as_a_countdown() {
+        let mut passes = 0u32;
+        let mut notices = Vec::new();
+        let _ = acquire_with_retry(
+            PEER_ACQUISITION_BUDGET,
+            || {
+                passes += 1;
+                let pass = passes;
+                async move {
+                    if pass == 1 {
+                        Err(all_refused())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |wait| notices.push(wait),
+        )
+        .await;
+
+        assert!(notices.len() > 1, "one notice per wait is a frozen screen");
+        assert_eq!(notices[0].retry_in, PEER_RECONNECT_DELAY);
+        assert!(notices.windows(2).all(|w| w[1].retry_in < w[0].retry_in));
+        assert!(notices.iter().all(|w| w.next_attempt == 2));
+    }
+
+    /// Regtest passes no budget: the only candidate is the node the caller
+    /// named, and if that is down no amount of waiting frees a slot.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_budget_a_refusal_fails_at_once() {
+        let started = tokio::time::Instant::now();
+        let mut passes = 0u32;
+        let err = acquire_with_retry(
+            Duration::ZERO,
+            || {
+                passes += 1;
+                async { Err::<(), _>(all_refused()) }
+            },
+            |_| panic!("nothing to wait for, so nothing to announce"),
+        )
+        .await
+        .expect_err("refused");
+        assert!(matches!(err, PoolError::AllPeersRefused { .. }));
+        assert_eq!(passes, 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// The wording both surfaces show. It has to say that Argos is waiting on
+    /// purpose, for how long, and that this is not the first try.
+    #[test]
+    fn a_wait_notice_says_what_is_happening_and_for_how_long() {
+        let text = PeerWait {
+            reason: PeerWaitReason::AllPeersBusy,
+            next_attempt: 2,
+            retry_in: PEER_RECONNECT_DELAY,
+        }
+        .to_string();
+        assert!(text.contains("busy"), "{text}");
+        assert!(text.contains("119s"), "{text}");
+        assert!(text.contains("attempt 2"), "{text}");
+
+        let dns = PeerWait {
+            reason: PeerWaitReason::SeedsUnresolved,
+            next_attempt: 2,
+            retry_in: SEED_RETRY_DELAY,
+        }
+        .to_string();
+        assert!(dns.contains("DNS"), "{dns}");
+        assert!(!dns.contains("busy"), "a DNS fault is not a busy network");
+    }
+
+    /// Dropping the scan is how it is cancelled — Ctrl-C in the CLI, quitting
+    /// the app. The fetcher is a spawned task, which outlives a dropped
+    /// future unless something aborts it; left alone it would now sit in a
+    /// peer wait for up to the whole budget after the user had walked away.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_scan_stops_a_fetcher_that_is_waiting() {
+        let alive = std::sync::Arc::new(());
+        let held = alive.clone();
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            let _held = held;
+            tokio::time::sleep(PEER_ACQUISITION_BUDGET).await;
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(std::sync::Arc::strong_count(&alive), 2);
+
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            std::sync::Arc::strong_count(&alive),
+            1,
+            "the task must be gone, not sleeping out its wait"
+        );
+    }
+
+    /// A finished checkpoint needs no peer. The GUI's sweep re-runs a
+    /// completed scan to get its notes back; demanding a connection first
+    /// made that depend on a free slot it never used, and with persistent
+    /// retry would have made it wait out the budget for nothing.
+    #[tokio::test]
+    async fn a_finished_scan_does_not_need_a_peer() {
+        let network = P2pNetwork::Testnet;
+        let target = network.sprout_scan_bound().loop_limit();
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner
+            .scan_block_at(&[], [0xCD; 32], target - 1)
+            .expect("an empty block");
+
+        let dir = std::env::temp_dir().join("argos-scan-finished-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("finished.checkpoint");
+        save_checkpoint(&scanner, &path).unwrap();
+
+        // The only peer offered is an address nothing listens on, and the
+        // scan must still succeed: only a run that never dials can.
+        let result = run_sprout_scan(
+            &[[0x11; 32]],
+            network,
+            &["127.0.0.1:1".to_owned()],
+            &path,
+            |_| {},
+        )
+        .await;
+        discard_checkpoint(&path);
+        assert!(result.expect("finishes offline").notes.is_empty());
     }
 
     #[tokio::test]
