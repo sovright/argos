@@ -346,6 +346,28 @@
                   placeholder="Leave blank to use the Sprout keys already in your wallet file"></textarea>
                 <button id="sprout-scan-check" type="button">Check keys</button>
                 <ul id="sprout-scan-addresses" class="session-list"></ul>
+
+                <!-- The escape hatch for when every public peer is full.
+                     Collapsed, because almost nobody needs it; the CLI's
+                     equivalent is `scan-sprout --peer`. -->
+                <details id="sprout-scan-advanced">
+                  <summary>Advanced: use your own Zcash node</summary>
+                  <label for="sprout-scan-peers">
+                    Custom peers (<code>host:port</code>, one per line or comma-separated, up to 8)
+                  </label>
+                  <textarea id="sprout-scan-peers" rows="2" spellcheck="false"
+                    autocomplete="off" placeholder="Leave blank to use public peers"></textarea>
+                  <p class="muted">
+                    Leave this empty normally. Use it if Argos reports that all peers are busy
+                    and you run or trust a Zcash node (zebrad or zcashd, port 8233). These peers
+                    are tried first, before the public ones. A peer can see which blocks Argos
+                    requests. On mainnet it cannot forge history, because every block header is
+                    checked for proof of work and the chain is pinned to known block hashes;
+                    testnet has no pinned hashes, so only use a testnet node you trust. Your
+                    keys are never sent to any peer.
+                  </p>
+                </details>
+
                 <button id="sprout-scan-run" type="button">Start scan</button>
                 <p id="sprout-scan-status" class="status-line"></p>
                 <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
