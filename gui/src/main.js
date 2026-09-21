@@ -831,6 +831,12 @@ function sproutScanKeys() {
 // Custom P2P peers, for when every public peer's inbound slots are full.
 // A light mirror of `parse_custom_peers` in the backend, which is the
 // authority: this only catches the obvious typo before a connection attempt.
+//
+// Deliberately approximate, and only ever in one direction: it must never
+// refuse an entry the backend would accept, because the user would then be
+// blocked by the weaker of the two checks. It may let through things the
+// backend refuses (a leading `-`, an empty label such as `node..example`);
+// those come back as the backend's own, more specific error.
 const MAX_CUSTOM_PEERS = 8;
 
 function sproutScanPeers() {
@@ -840,7 +846,7 @@ function sproutScanPeers() {
     .filter(Boolean);
   const peers = [...new Set(entries)];
   for (const peer of peers) {
-    const match = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})$/.exec(peer);
+    const match = /^(\[[0-9a-f:.]+\]|[a-z0-9._-]+):(\d+)$/.exec(peer);
     const port = match ? Number(match[2]) : 0;
     if (!match || port < 1 || port > 65535) {
       throw new Error(
