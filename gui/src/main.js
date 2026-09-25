@@ -372,6 +372,8 @@ let walletFile = null;
 // wallet object, including when the same path is reopened with a new password.
 let walletOpenGeneration = 0;
 let sproutPreviewWallet = null;
+// Independent of the selected wallet: reopening must not permit a second sweep.
+let sproutSweepSource = null;
 
 function renderWalletSummary(summary) {
   const list = $("wallet-summary-list");
@@ -514,7 +516,7 @@ async function showSproutSweep() {
     if (preview.params_present) {
       $("sprout-sweep-params").textContent = "";
       sproutPreviewWallet = source;
-      $("sprout-sweep-run").disabled = false;
+      $("sprout-sweep-run").disabled = sproutSweepSource !== null;
     } else {
       $("sprout-sweep-params").textContent =
         `Sprout proving parameters are missing. Download the 725 MB file to ` +
@@ -531,6 +533,8 @@ async function showSproutSweep() {
 }
 
 async function runSproutSweep() {
+  if (sproutSweepSource) return;
+  const source = walletFile;
   const destination = $("sprout-destination").value.trim();
   if (!destination) {
     setStatus("sprout-sweep-status", "Enter a destination address first.", "error");
@@ -546,6 +550,7 @@ async function runSproutSweep() {
     return;
   }
 
+  sproutSweepSource = source;
   const button = $("sprout-sweep-run");
   button.disabled = true;
   $("sprout-sweep-results").innerHTML = "";
@@ -557,12 +562,14 @@ async function runSproutSweep() {
 
   try {
     const report = await invoke("execute_sprout_sweep", {
-      path: walletFile.path,
-      passphrase: walletFile.passphrase,
+      path: source.path,
+      passphrase: source.passphrase,
       destination,
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       network: $("network-select").value,
     });
+
+    if (walletFile !== source) return;
 
     const list = $("sprout-sweep-results");
     for (const sent of report.sent) {
@@ -600,8 +607,14 @@ async function runSproutSweep() {
       list.appendChild(li);
     }
   } catch (err) {
+    if (walletFile !== source) return;
     setStatus("sprout-sweep-status", `✗ ${err}`, "error");
     button.disabled = false;
+  } finally {
+    sproutSweepSource = null;
+    if (walletFile !== source) {
+      button.disabled = !walletFile || sproutPreviewWallet !== walletFile;
+    }
   }
 }
 
@@ -781,7 +794,9 @@ $("sprout-sweep-run").addEventListener("click", runSproutSweep);
 (async () => {
   try {
     await listen("sprout-sweep-progress", (event) => {
-      setStatus("sprout-sweep-status", `${event.payload}…`, "");
+      if (sproutSweepSource && walletFile === sproutSweepSource) {
+        setStatus("sprout-sweep-status", `${event.payload}…`, "");
+      }
     });
   } catch (_) {
     // No event channel: the final result still reports.

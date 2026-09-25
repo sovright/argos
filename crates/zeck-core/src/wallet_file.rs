@@ -1,43 +1,72 @@
-//! Bounded reads of untrusted wallet files, shared by desktop and CLI imports.
+//! Read-only wallet loading shared by desktop and CLI imports.
 
+use secrecy::Zeroize;
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, Read},
+    ops::Deref,
     path::Path,
 };
 
-/// Limit the raw wallet allocation before parsing. Larger backups must be
-/// handled separately rather than risking exhaustion of the recovery process.
-pub const MAX_WALLET_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Raw wallet bytes may contain plaintext spending keys. Keep them in one
+/// allocation and scrub that allocation on success and on read errors.
+/// Deliberately has no Debug or Clone implementation.
+pub struct WalletFileBytes(Vec<u8>);
 
-pub fn read_wallet_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+impl Deref for WalletFileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for WalletFileBytes {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+pub fn read_wallet_file(path: impl AsRef<Path>) -> io::Result<WalletFileBytes> {
+    let path = path.as_ref();
+    // Check before opening so a selected FIFO does not block waiting for a writer.
+    require_regular(&fs::metadata(path)?)?;
     let file = File::open(path)?;
+    // Check the opened handle too, in case the path changed before open.
     let metadata = file.metadata()?;
+    require_regular(&metadata)?;
+    read_sized(file, metadata.len())
+}
+
+fn require_regular(metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "wallet must be a regular file",
         ));
     }
-    if metadata.len() > MAX_WALLET_FILE_BYTES {
-        return Err(too_large(MAX_WALLET_FILE_BYTES));
-    }
-    // Metadata alone is insufficient: the file can grow after this check.
-    read_limited(file, MAX_WALLET_FILE_BYTES)
+    Ok(())
 }
 
-fn too_large(limit: u64) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("wallet file exceeds the {limit}-byte safety limit"),
-    )
-}
-
-fn read_limited(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(too_large(limit));
+fn read_sized(mut reader: impl Read, size: u64) -> io::Result<WalletFileBytes> {
+    let size = usize::try_from(size)
+        .map_err(|_| io::Error::other("wallet is too large for this platform"))?;
+    let mut bytes = WalletFileBytes(Vec::new());
+    bytes
+        .0
+        .try_reserve_exact(size)
+        .map_err(|_| io::Error::other("not enough memory to read this wallet"))?;
+    bytes.0.resize(size, 0);
+    reader.read_exact(&mut bytes.0)?;
+    // Never grow a secret-bearing buffer: reallocation would leave an
+    // unscrubbed copy behind. Ask for a stable backup if the file grows.
+    let mut extra = [0u8; 1];
+    let result = reader.read(&mut extra);
+    extra.zeroize();
+    if result? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wallet changed while reading; retry with a stable backup",
+        ));
     }
     Ok(bytes)
 }
@@ -45,71 +74,50 @@ fn read_limited(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
-    fn reads_regular_files_and_rejects_oversized_sparse_files() {
-        let path = std::env::temp_dir().join(format!(
-            "argos-wallet-read-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        // Remove the synthetic file even if an assertion fails.
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        let _cleanup = Cleanup(path.clone());
+    fn reads_regular_files_without_modification() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut file, b"synthetic wallet").unwrap();
-        assert_eq!(read_wallet_file(&path).unwrap(), b"synthetic wallet");
-        file.set_len(MAX_WALLET_FILE_BYTES + 1).unwrap();
         assert_eq!(
-            read_wallet_file(&path).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
+            &*read_wallet_file(file.path()).unwrap(),
+            b"synthetic wallet"
         );
     }
 
     #[test]
-    fn accepts_bytes_up_to_the_limit_without_modification() {
-        for bytes in [b"".as_slice(), b"wallet", b"12345678"] {
-            assert_eq!(read_limited(Cursor::new(bytes), 8).unwrap(), bytes);
-        }
+    fn accepts_regular_wallet_larger_than_the_removed_ceiling() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let len = 256 * 1024 * 1024 + 1;
+        file.as_file().set_len(len).unwrap();
+        assert_eq!(read_wallet_file(file.path()).unwrap().len() as u64, len);
     }
 
     #[test]
-    fn rejects_oversized_input_instead_of_returning_truncated_wallet() {
-        let error = read_limited(Cursor::new(b"123456789"), 8).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    fn rejects_growth_without_returning_a_truncated_wallet() {
+        assert!(read_sized(std::io::Cursor::new(b"12345"), 4).is_err());
     }
 
     #[test]
-    fn stops_reading_after_the_limit_even_if_input_keeps_growing() {
-        let mut reader = Cursor::new(vec![0; 1024]);
-        assert!(read_limited(&mut reader, 8).is_err());
-        assert_eq!(reader.position(), 9);
+    fn rejects_shrinking_file_and_preserves_read_errors() {
+        let result = read_sized(std::io::Cursor::new(b"123"), 4);
+        assert!(matches!(result, Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof));
     }
 
     #[test]
-    fn preserves_read_failures() {
-        struct Broken;
-        impl Read for Broken {
-            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "fixture"))
-            }
-        }
-        assert_eq!(
-            read_limited(Broken, 8).unwrap_err().kind(),
-            io::ErrorKind::PermissionDenied
-        );
+    fn reads_empty_file() {
+        assert!(read_sized(std::io::empty(), 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_wallet_file(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_device_without_reading_it() {
+        assert!(read_wallet_file("/dev/zero").is_err());
     }
 }
