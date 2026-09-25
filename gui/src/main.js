@@ -386,9 +386,12 @@ function renderWalletSummary(summary) {
       "Seed phrase",
       summary.has_mnemonic
         ? "recovered — this wallet scans like a typed seed phrase"
-        : "none (keys are stored individually, not HD-derived)",
+        : "not recovered from this file",
     ],
   ];
+  if (summary.diagnostics.length > 0) {
+    rows.push(["Recovery coverage", "partial — some records could not be read; recovered keys and balances may be incomplete. Keep the original wallet file."]);
+  }
   for (const [label, value] of rows) {
     const li = document.createElement("li");
     li.textContent = `${label}: ${value}`;
@@ -550,17 +553,17 @@ async function runSproutSweep() {
     return;
   }
 
-  sproutSweepSource = source;
   const button = $("sprout-sweep-run");
-  button.disabled = true;
-  $("sprout-sweep-results").innerHTML = "";
-  setStatus(
-    "sprout-sweep-status",
-    "Proving… this takes a few minutes per note and cannot be interrupted safely.",
-    "",
-  );
-
   try {
+    sproutSweepSource = source;
+    button.disabled = true;
+    $("sprout-sweep-results").innerHTML = "";
+    setStatus(
+      "sprout-sweep-status",
+      "Proving… this takes a few minutes per note and cannot be interrupted safely.",
+      "",
+    );
+
     const report = await invoke("execute_sprout_sweep", {
       path: source.path,
       passphrase: source.passphrase,
