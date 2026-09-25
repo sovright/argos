@@ -28,6 +28,23 @@ pub enum ImportDiagnostic {
 
     #[error("skipped {record_type} record: decryption failed ({reason})")]
     DecryptionFailed { record_type: String, reason: String },
+
+    /// An HD seed Argos does not recover. Kept apart from `UnknownRecord`
+    /// because it is the one skip that can hide an entire key tree: any
+    /// address derived from it that the file does not also store as an
+    /// individual key is invisible to the scan.
+    #[error(
+        "skipped {record_type} record: this is the wallet's HD seed, which Argos \
+         does not recover — keys derived from it are only covered if the file \
+         also stores them individually"
+    )]
+    UnrecoveredSeed { record_type: String },
+}
+
+impl ImportDiagnostic {
+    pub fn is_unrecovered_seed(&self) -> bool {
+        matches!(self, Self::UnrecoveredSeed { .. })
+    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// zcashd wallet with a Sprout address, a Sapling address, and transparent
-/// keys — and, importantly, no HD seed. Written by a real `zcashd`; see
+/// keys. Written by a real `zcashd` v6.20.0, so it also holds a 5.x
+/// `mnemonicphrase` HD seed, which Argos does not recover. See
 /// `tests/regtest/fixtures/README.md`.
 const SPROUT_PLAINTEXT: &str = "sprout-plaintext.dat";
 
@@ -77,6 +78,35 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     assert!(
         stdout.contains("not yet recoverable"),
         "the report must not imply Sprout funds are spendable, got:\n{stdout}"
+    );
+}
+
+/// A zcashd 5.x wallet's seed is skipped, and the report must say so rather
+/// than claim the keys were never HD-derived or that every record was read
+/// (#225).
+#[test]
+fn inspect_wallet_does_not_hide_an_unrecovered_seed() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for false_claim in ["not HD-derived", "Every record in this file was read"] {
+        assert!(
+            !stdout.contains(false_claim),
+            "report claims {false_claim:?} for a wallet holding a seed:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("Seed phrase       not recovered from this file"),
+        "got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("this file holds an HD seed that Argos does not recover"),
+        "the coverage notice must name the seed, got:\n{stdout}"
     );
 }
 

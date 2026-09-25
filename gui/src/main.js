@@ -389,8 +389,10 @@ function renderWalletSummary(summary) {
         : "not recovered from this file",
     ],
   ];
-  if (summary.diagnostics.length > 0) {
-    rows.push(["Recovery coverage", "partial — some records could not be read; recovered keys and balances may be incomplete. Keep the original wallet file."]);
+  // Graded in argos-core, which the CLI prints verbatim: a lost seed and a
+  // skipped record of unknown type must not read as the same warning.
+  if (summary.coverage_notice) {
+    rows.push(["Recovery coverage", summary.coverage_notice]);
   }
   for (const [label, value] of rows) {
     const li = document.createElement("li");
@@ -638,15 +640,38 @@ function noteUncoveredSproutKeys(summary) {
   renderSproutUncoveredBanners();
 }
 
+/// The import's own coverage caveat, carried to the same screens for the
+/// same reason. Only set when the skipped records may hold funds; a skipped
+/// record of unknown type is noted on the import screen alone. Unlike the
+/// Sprout count, a Sprout sweep does not clear it.
+let partialImportNotice = null;
+
+function notePartialImport(summary) {
+  partialImportNotice = summary.coverage_may_hide_funds ? summary.coverage_notice : null;
+  renderSproutUncoveredBanners();
+}
+
+function forgetWalletCaveats() {
+  uncoveredSproutKeys = 0;
+  partialImportNotice = null;
+  renderSproutUncoveredBanners();
+}
+
 function renderSproutUncoveredBanners() {
   const tail = `Open it on the wallet screen to recover Sprout funds separately.`;
-  const text =
-    uncoveredSproutKeys > 0
-      ? `This total does not include Sprout funds. Your wallet file holds ` +
+  const parts = [];
+  if (uncoveredSproutKeys > 0) {
+    parts.push(
+      `This total does not include Sprout funds. Your wallet file holds ` +
         `${uncoveredSproutKeys} Sprout key(s), which this scan and sweep do not ` +
         `cover. Keep the original wallet file — it is the only copy of those keys. ` +
-        tail
-      : "";
+        tail,
+    );
+  }
+  if (partialImportNotice) {
+    parts.push(`This total may not be your whole balance. ${partialImportNotice}`);
+  }
+  const text = parts.join(" ");
   for (const id of [
     "scan-sprout-uncovered",
     "complete-sprout-uncovered",
@@ -655,7 +680,7 @@ function renderSproutUncoveredBanners() {
     const el = $(id);
     if (!el) continue;
     el.textContent = text;
-    el.hidden = uncoveredSproutKeys === 0;
+    el.hidden = text === "";
   }
 }
 
@@ -663,6 +688,8 @@ async function openWalletFile() {
   const generation = ++walletOpenGeneration;
   walletFile = null;
   sproutPreviewWallet = null;
+  // The previous file's caveats must not outlive it, even if this open fails.
+  forgetWalletCaveats();
   $("wallet-summary").hidden = true;
   $("wallet-next").disabled = true;
   $("wallet-sprout-sweep").hidden = true;
@@ -719,6 +746,7 @@ async function openWalletFile() {
     // Carried forward so every later screen can say what the totals leave
     // out. Recorded at open time because the summary is not in scope later.
     noteUncoveredSproutKeys(summary);
+    notePartialImport(summary);
     $("wallet-next").disabled = false;
     setStatus("wallet-status", "✓ Wallet file read.", "success");
   } catch (err) {
@@ -1243,6 +1271,7 @@ document.addEventListener("address-match-recovery", async (event) => {
     ++walletOpenGeneration;
     sproutPreviewWallet = null;
     walletFile = null;
+    forgetWalletCaveats();
     $("wallet-passphrase").value = "";
     $("sapling-scan-keys").value = "";
     $("sapling-key-addresses").replaceChildren();

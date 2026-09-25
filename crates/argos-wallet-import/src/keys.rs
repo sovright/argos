@@ -168,6 +168,69 @@ impl ImportedKeys {
     pub fn total_keys(&self) -> usize {
         self.transparent.len() + self.sapling.len() + self.sprout.len()
     }
+
+    /// How much of the file's key material this import is known to cover,
+    /// graded by the worst diagnostic.
+    pub fn coverage(&self) -> ImportCoverage {
+        self.diagnostics
+            .iter()
+            .map(|d| match d {
+                ImportDiagnostic::UnrecoveredSeed { .. } => ImportCoverage::SeedNotRecovered,
+                ImportDiagnostic::UnparseableRecord { .. }
+                | ImportDiagnostic::DecryptionFailed { .. } => ImportCoverage::KeysUnread,
+                ImportDiagnostic::UnknownRecord { .. } => ImportCoverage::UnknownRecordsSkipped,
+            })
+            .max()
+            .unwrap_or(ImportCoverage::Complete)
+    }
+}
+
+/// Graded, so a skipped record of an unrecognised type does not raise the
+/// same alarm as a lost seed: a warning people learn to ignore is worse
+/// than none. Ordered from least to most severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImportCoverage {
+    /// Every record that can hold a key was read.
+    Complete,
+    /// Only records of unrecognised types were skipped. They may hold
+    /// nothing of value, but we cannot say so.
+    UnknownRecordsSkipped,
+    /// A record known to hold key material could not be read or decrypted.
+    KeysUnread,
+    /// The wallet's HD seed was not recovered, so a whole key tree may be
+    /// missing.
+    SeedNotRecovered,
+}
+
+impl ImportCoverage {
+    /// One user-facing sentence, shared by the CLI and GUI so the two
+    /// cannot describe the same file differently. `None` when complete.
+    pub fn notice(self) -> Option<&'static str> {
+        match self {
+            Self::Complete => None,
+            Self::UnknownRecordsSkipped => Some(
+                "Some records of a type Argos does not recognise were skipped. They \
+                 are listed with the other diagnostics; if any held keys, those keys \
+                 exist only in the original wallet file.",
+            ),
+            Self::KeysUnread => Some(
+                "Incomplete — some key records could not be read, so recovered keys \
+                 and balances may be missing funds. Keep the original wallet file.",
+            ),
+            Self::SeedNotRecovered => Some(
+                "Incomplete — this file holds an HD seed that Argos does not recover. \
+                 Keys derived from it are only covered if the file also stores them \
+                 individually, so balances may be missing funds. Keep the original \
+                 wallet file.",
+            ),
+        }
+    }
+
+    /// Whether the notice must follow the user to the totals and the
+    /// delete-workspace screen, not just the import summary.
+    pub fn may_hide_funds(self) -> bool {
+        self >= Self::KeysUnread
+    }
 }
 
 // Manual, redacted impl rather than `#[derive(Debug)]` — needed so
@@ -194,5 +257,59 @@ impl std::fmt::Debug for ImportedKeys {
             )
             .field("diagnostics", &self.diagnostics)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn with(diagnostics: Vec<ImportDiagnostic>) -> ImportedKeys {
+        ImportedKeys {
+            diagnostics,
+            ..ImportedKeys::default()
+        }
+    }
+
+    fn unknown() -> ImportDiagnostic {
+        ImportDiagnostic::UnknownRecord {
+            record_type: "cscript".to_owned(),
+        }
+    }
+
+    #[test]
+    fn coverage_is_graded_by_the_worst_diagnostic() {
+        assert_eq!(with(vec![]).coverage(), ImportCoverage::Complete);
+        assert_eq!(
+            with(vec![unknown()]).coverage(),
+            ImportCoverage::UnknownRecordsSkipped
+        );
+        let unread = ImportDiagnostic::UnparseableRecord {
+            record_type: "key".to_owned(),
+            reason: "truncated".to_owned(),
+        };
+        assert_eq!(
+            with(vec![unknown(), unread.clone()]).coverage(),
+            ImportCoverage::KeysUnread
+        );
+        let seed = ImportDiagnostic::UnrecoveredSeed {
+            record_type: "hdseed".to_owned(),
+        };
+        assert_eq!(
+            with(vec![seed, unread, unknown()]).coverage(),
+            ImportCoverage::SeedNotRecovered
+        );
+    }
+
+    #[test]
+    fn only_a_possible_loss_of_funds_is_carried_to_later_screens() {
+        assert_eq!(ImportCoverage::Complete.notice(), None);
+        assert!(!ImportCoverage::UnknownRecordsSkipped.may_hide_funds());
+        assert!(ImportCoverage::KeysUnread.may_hide_funds());
+        assert!(ImportCoverage::SeedNotRecovered.may_hide_funds());
+        // The seed notice must not be the generic one: it names the seed.
+        let seed = ImportCoverage::SeedNotRecovered.notice().unwrap();
+        assert!(seed.contains("HD seed"));
+        assert_ne!(Some(seed), ImportCoverage::KeysUnread.notice());
     }
 }
