@@ -294,8 +294,8 @@ fn command_requires_tos(command: &Commands) -> bool {
 /// (T-S6 in the threat model). We attempt an unencrypted read first so an
 /// unencrypted wallet is never asked for a passphrase it does not have.
 fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read wallet file {}", path.display()))?;
+    let bytes = argos_core::wallet_file::read_wallet_file(path)
+        .with_context(|| format!("failed to read wallet file {}", path.display()))?;
 
     match argos_wallet_import::import_wallet_file(&bytes, None) {
         Ok(mut keys) => {

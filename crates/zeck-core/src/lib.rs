@@ -11,6 +11,7 @@ pub mod imported_sweep;
 pub mod key_source;
 pub mod lightwalletd;
 pub mod models;
+pub mod wallet_file;
 // Transfer-based funding for the regtest harness. Test-only: a released
 // binary must contain no code that spends from a hardcoded seed.
 #[cfg(feature = "argos-network")]

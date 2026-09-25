@@ -443,7 +443,8 @@ pub async fn inspect_wallet_file(
     // match against a backup. Optional so an older frontend still works,
     // defaulting to mainnet as everything else here does.
     let network_name = network.unwrap_or_else(|| "mainnet".to_owned());
-    let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
+    let bytes = argos_core::wallet_file::read_wallet_file(&path)
+        .map_err(|err| format!("could not read {path}: {err}"))?;
     let keys =
         match argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref()) {
             Ok(keys) => keys,
@@ -542,7 +543,8 @@ pub async fn start_scan_from_wallet_file(
     // `--wallet-file` + `--sapling-key-file` combination.
     let mut keys = match &config.path {
         Some(path) => {
-            let bytes = fs::read(path).map_err(|err| format!("could not read {path}: {err}"))?;
+            let bytes = argos_core::wallet_file::read_wallet_file(path)
+                .map_err(|err| format!("could not read {path}: {err}"))?;
             argos_core::argos_wallet_import::import_wallet_file(&bytes, config.passphrase.as_ref())
                 .map_err(|err| err.to_string())?
         }
@@ -805,7 +807,8 @@ pub async fn preview_sprout_sweep(
 ) -> Result<SproutSweepPreview, String> {
     ensure_tos_accepted(&app)?;
 
-    let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
+    let bytes = argos_core::wallet_file::read_wallet_file(&path)
+        .map_err(|err| format!("could not read {path}: {err}"))?;
     let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
         .map_err(|err| err.to_string())?;
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
@@ -869,7 +872,8 @@ pub async fn execute_sprout_sweep(
         _ => argos_core::ZeckNetwork::Mainnet,
     };
 
-    let bytes = fs::read(&path).map_err(|err| format!("could not read {path}: {err}"))?;
+    let bytes = argos_core::wallet_file::read_wallet_file(&path)
+        .map_err(|err| format!("could not read {path}: {err}"))?;
     let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
         .map_err(|err| err.to_string())?;
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
@@ -984,7 +988,8 @@ fn collect_scan_keys(
     }
 
     if let Some(path) = path {
-        let bytes = fs::read(path).map_err(|err| format!("could not read {path}: {err}"))?;
+        let bytes = argos_core::wallet_file::read_wallet_file(path)
+            .map_err(|err| format!("could not read {path}: {err}"))?;
         let mut wallet = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
             .map_err(|err| err.to_string())?;
         // Drop any Sprout key that does not control its stored address before
