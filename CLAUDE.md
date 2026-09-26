@@ -93,8 +93,13 @@ and `start_scan` is a seed-phrase wrapper over it.
 **What import can and cannot do.** A decrypted ZecWallet Lite wallet
 recovers a BIP-39 mnemonic, so it re-enters the ordinary HD pipeline and
 scans and sweeps exactly like a typed seed phrase. A zcashd `wallet.dat`
-holds flat, individually-stored keys with no HD seed; the scanner
-enumerates HD-derived account slots, so it has nothing to walk.
+is recovered from its flat, individually-stored keys only. It usually *does*
+hold an HD seed (`hdseed`/`chdseed` before 5.0, `mnemonicphrase`/
+`cmnemonicphrase` from 5.0), but Argos does not recover it: the parser
+reports it as `ImportDiagnostic::UnrecoveredSeed`, and
+`ImportedKeys::coverage()` grades that as the most severe case so the CLI
+and GUI say balances may be missing, on the import summary and again beside
+the totals. Never describe these wallets as "not HD-derived" (#225).
 
 **A Sapling spending key can also arrive as text**, with no wallet file at
 all: `argos_core::sapling_key` decodes zcashd's bech32

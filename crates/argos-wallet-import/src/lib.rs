@@ -34,7 +34,7 @@ pub mod zcashd;
 pub mod zwl;
 
 pub use error::{ImportDiagnostic, ImportError};
-pub use keys::{ImportedKeys, Provenance, SaplingKey};
+pub use keys::{ImportCoverage, ImportedKeys, Provenance, SaplingKey};
 pub use sniff::{sniff, WalletFormat};
 
 use secrecy::SecretString;

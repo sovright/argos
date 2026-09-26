@@ -27,16 +27,21 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   $("network-select").value = "mainnet";
   const previews = [];
   let onProgress;
+  let failStatus = false;
   const context = vm.createContext({
     listen: async (name, callback) => { assert.equal(name, "sprout-sweep-progress"); onProgress = callback; },
     $, document: { createElement: element },
     fmt: (value) => String(value),
-    setStatus: (id, text) => { $(id).textContent = text; },
+    setStatus: (id, text) => {
+      if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
+      $(id).textContent = text;
+    },
     invoke: (command, args) => intercept(command, args, async () => {
       if (command === "inspect_wallet_file") return {
         needs_passphrase: false, transparent_keys: 0, sapling_keys: 0,
         sprout_keys: 1, has_mnemonic: false, sprout_spendable_notes: 1,
         sprout_spendable_zatoshis: 100000, sprout_addresses: [], diagnostics: [],
+        coverage_notice: null, coverage_may_hide_funds: false,
       };
       if (command === "preview_sprout_sweep") {
         previews.push({ ...args });
@@ -58,6 +63,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   vm.runInContext(source.slice(progressStart, source.indexOf("// ─── Typed Sapling keys", progressStart)), context);
   return {
     $, previews,
+    failNextStatus: () => { failStatus = true; },
     progress: (payload) => onProgress({ payload }),
     sweep: () => vm.runInContext("runSproutSweep()", context),
     async open(path, passphrase = "") {
@@ -246,4 +252,87 @@ test("current wallet sweep still shows its transaction and clears its own warnin
   assert.equal(h.$("sprout-sweep-run").disabled, true);
   await h.open("/fixture/new.dat");
   assert.equal(h.$("sprout-sweep-results").children.length, 0);
+});
+
+test("synchronous status failure before proving cannot strand the sweep lock", async () => {
+  let executions = 0;
+  const h = harness((command, args, fallback) => {
+    if (command !== "execute_sprout_sweep") return fallback();
+    executions++;
+    return Promise.resolve({ sent: [], skipped: [], total_swept: 0, error: null });
+  });
+  await h.open("/fixture/wallet.dat");
+  h.$("sprout-destination").value = "fixture-destination";
+  h.failNextStatus();
+  await h.sweep().catch(() => {});
+  assert.equal(executions, 0);
+  await h.open("/fixture/wallet.dat");
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+  await h.sweep();
+  assert.equal(executions, 1);
+});
+
+const SEED_NOTICE = "Incomplete — this file holds an HD seed that Argos does not recover.";
+const UNKNOWN_NOTICE = "Some records of a type Argos does not recognise were skipped.";
+const LATER_SCREENS = ["scan-sprout-uncovered", "complete-sprout-uncovered", "delete-sprout-uncovered"];
+
+function withCoverage(coverage_notice, coverage_may_hide_funds) {
+  return async (command, args, fallback) => {
+    const response = await fallback();
+    return command === "inspect_wallet_file"
+      ? { ...response, diagnostics: ["fixture diagnostic"], coverage_notice, coverage_may_hide_funds }
+      : response;
+  };
+}
+
+function summaryRows(h) {
+  return h.$("wallet-summary-list").children.map((row) => row.textContent);
+}
+
+test("an unrecovered seed is shown at import and carried to the totals and delete screens", async () => {
+  const h = harness(withCoverage(SEED_NOTICE, true));
+  await h.open("/fixture/zcashd5.dat");
+  assert.ok(summaryRows(h).includes("Seed phrase: not recovered from this file"));
+  assert.ok(summaryRows(h).includes(`Recovery coverage: ${SEED_NOTICE}`));
+  for (const id of LATER_SCREENS) {
+    assert.equal(h.$(id).hidden, false, id);
+    assert.match(h.$(id).textContent, /HD seed that Argos does not recover/, id);
+  }
+});
+
+test("sweeping the file's Sprout notes does not clear the partial-import warning", async () => {
+  const h = harness(async (command, args, fallback) => command === "execute_sprout_sweep"
+    ? { sent: [{ txid: "fixture-tx", value_swept: 90000 }], skipped: [], total_swept: 90000, error: null }
+    : withCoverage(SEED_NOTICE, true)(command, args, fallback));
+  await h.open("/fixture/zcashd5.dat");
+  // The preview is requested without being awaited; let it land.
+  await new Promise(setImmediate);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  assert.match(h.$("sprout-sweep-status").textContent, /Swept 90000/);
+  for (const id of LATER_SCREENS) {
+    assert.equal(h.$(id).hidden, false, id);
+    assert.doesNotMatch(h.$(id).textContent, /Sprout key\(s\)/, id);
+    assert.match(h.$(id).textContent, /HD seed/, id);
+  }
+});
+
+test("a skipped record of unknown type is noted at import but not carried forward", async () => {
+  const h = harness(withCoverage(UNKNOWN_NOTICE, false));
+  await h.open("/fixture/cscript.dat");
+  assert.ok(summaryRows(h).includes(`Recovery coverage: ${UNKNOWN_NOTICE}`));
+  for (const id of LATER_SCREENS) assert.doesNotMatch(h.$(id).textContent, /recognise/, id);
+});
+
+test("a complete read shows no coverage row, and replaces an earlier partial warning", async () => {
+  let partial = true;
+  const h = harness(async (command, args, fallback) => partial
+    ? withCoverage(SEED_NOTICE, true)(command, args, fallback)
+    : fallback());
+  await h.open("/fixture/zcashd5.dat");
+  partial = false;
+  await h.open("/fixture/wallet.dat");
+  assert.ok(summaryRows(h).includes("Seed phrase: not recovered from this file"));
+  assert.equal(summaryRows(h).some((row) => row.startsWith("Recovery coverage:")), false);
+  for (const id of LATER_SCREENS) assert.doesNotMatch(h.$(id).textContent, /HD seed/, id);
 });

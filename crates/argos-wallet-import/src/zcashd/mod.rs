@@ -89,6 +89,34 @@ mod tests {
         assert!(keys.total_keys() > 0);
     }
 
+    /// zcashd 5.0+ keeps its HD seed in `mnemonicphrase` (plaintext) or
+    /// `cmnemonicphrase` (encrypted). Argos does not recover it, so the
+    /// user must be told — these used to be skipped with no diagnostic at
+    /// all, which made the wallet read as completely recovered.
+    #[test]
+    fn a_zcashd_5_wallet_reports_its_unrecovered_seed() {
+        let pass = SecretString::new("argos-test-passphrase".to_owned());
+        for (name, passphrase) in [
+            ("modern-plaintext", None),
+            ("sprout-plaintext", None),
+            ("modern-encrypted", Some(&pass)),
+            ("sprout-encrypted", Some(&pass)),
+        ] {
+            let keys = import_zcashd(&read(name), passphrase).unwrap();
+            let seeds = keys
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_unrecovered_seed())
+                .count();
+            assert_eq!(seeds, 1, "{name}: expected one unrecovered-seed diagnostic");
+            assert_eq!(
+                keys.coverage(),
+                crate::keys::ImportCoverage::SeedNotRecovered,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn a_truncated_wallet_recovers_what_it_can() {
         match import_zcashd(&read("sprout-plaintext-truncated"), None) {

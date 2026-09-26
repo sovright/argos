@@ -455,6 +455,7 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
     } else {
         keys.sapling.len()
     };
+    warn_about_partial_import(keys);
     if uncovered_sapling == 0 && keys.sprout.is_empty() {
         return;
     }
@@ -481,6 +482,23 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
     eprintln!("    Any balance reported below excludes those pools entirely.");
     eprintln!("    Keep the original wallet file: those keys exist only there.");
     eprintln!();
+}
+
+/// Repeat, before any balance appears, that the import itself may be
+/// incomplete. `inspect-wallet` says it once; a user who goes straight to
+/// `scan` would otherwise read a total with nothing attached to it.
+fn warn_about_partial_import(keys: &ImportedKeys) {
+    let coverage = keys.coverage();
+    if !coverage.may_hide_funds() {
+        return;
+    }
+    if let Some(notice) = coverage.notice() {
+        eprintln!();
+        eprintln!("  ⚠ THIS WALLET FILE WAS ONLY PARTLY RECOVERED");
+        eprintln!("    {notice}");
+        eprintln!("    Run `inspect-wallet` to see which records were skipped.");
+        eprintln!();
+    }
 }
 
 /// Recover Sprout notes from a wallet file and move them to Sapling.
@@ -946,7 +964,7 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
         if keys.mnemonic.is_some() {
             "recovered"
         } else {
-            "none (keys are stored individually, not HD-derived)"
+            "not recovered from this file"
         }
     );
     println!();
@@ -1000,15 +1018,20 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     // Never summarized away: an unread record means key material that
     // still exists only in the original file, and the user is the only
     // one who can act on that.
-    if keys.diagnostics.is_empty() {
-        println!("Every record in this file was read.");
-    } else {
-        println!("{} record(s) could not be read:", keys.diagnostics.len());
-        for diagnostic in &keys.diagnostics {
-            println!("  {diagnostic}");
+    // "Every record" would be false: bookkeeping records with no key
+    // material are skipped by design.
+    match keys.coverage().notice() {
+        None => println!("Every record that can hold a key was read."),
+        Some(notice) => {
+            println!("Recovery coverage: {notice}");
+            println!();
+            println!("{} record(s) could not be read:", keys.diagnostics.len());
+            for diagnostic in &keys.diagnostics {
+                println!("  {diagnostic}");
+            }
+            println!();
+            println!("Keep the original wallet file. Anything listed above exists only there.");
         }
-        println!();
-        println!("Keep the original wallet file. Anything listed above exists only there.");
     }
     println!();
 
@@ -1288,6 +1311,10 @@ async fn main() -> Result<()> {
             // together, so only Sprout is left uncovered — but it still
             // must be said before any balance appears.
             warn_about_uncovered_pools(keys, true);
+        } else if matches!(cli.command, Commands::Scan | Commands::Sweep { .. }) {
+            // A seed-bearing wallet (ZWL) covers every pool, but records it
+            // could not decrypt can still hide funds.
+            warn_about_partial_import(keys);
         }
     }
 

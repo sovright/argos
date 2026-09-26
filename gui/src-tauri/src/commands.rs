@@ -301,6 +301,13 @@ pub struct WalletFileSummary {
     /// Records the parser could not read. Surfaced because a wallet that
     /// silently drops records looks identical to one that had nothing.
     pub diagnostics: Vec<String>,
+    /// How much of the file this import covers, in the same words the CLI
+    /// prints. `None` when every record that can hold a key was read.
+    pub coverage_notice: Option<String>,
+    /// True when the skipped records may hold funds (an unread key record or
+    /// an unrecovered HD seed), so the notice must follow the user to the
+    /// totals and the delete-workspace screen.
+    pub coverage_may_hide_funds: bool,
     /// True when the file is encrypted and the supplied passphrase (or its
     /// absence) could not open it.
     pub needs_passphrase: bool,
@@ -466,6 +473,8 @@ pub async fn inspect_wallet_file(
                     has_mnemonic: false,
                     transparent_only: false,
                     diagnostics: Vec::new(),
+                    coverage_notice: None,
+                    coverage_may_hide_funds: false,
                     needs_passphrase: true,
                 });
             }
@@ -493,6 +502,8 @@ pub async fn inspect_wallet_file(
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
         diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
+        coverage_notice: keys.coverage().notice().map(str::to_owned),
+        coverage_may_hide_funds: keys.coverage().may_hide_funds(),
         needs_passphrase: false,
     })
 }
