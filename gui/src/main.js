@@ -386,7 +386,7 @@ function renderWalletSummary(summary) {
       "Seed phrase",
       summary.has_mnemonic
         ? "recovered — this wallet scans like a typed seed phrase"
-        : "not recovered from this file",
+        : summary.seed_note || "not recovered from this file",
     ],
   ];
   // Graded in argos-core, which the CLI prints verbatim: a lost seed and a

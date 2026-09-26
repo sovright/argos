@@ -295,6 +295,10 @@ pub struct WalletFileSummary {
     /// True when the file yielded a BIP-39 mnemonic, which means it re-enters
     /// the ordinary HD pipeline and scans and sweeps like a typed seed.
     pub has_mnemonic: bool,
+    /// The "Seed phrase" line for a zcashd 5.x seed verified against its
+    /// fingerprint and key chain, in the CLI's words. Its keys are read from
+    /// the file individually, not derived. `None` when there is no such seed.
+    pub seed_note: Option<String>,
     /// True when the file has no Sapling keys, so recovery goes down the
     /// transparent-only path (ZIP-316 gives it no UFVK to anchor an account).
     pub transparent_only: bool,
@@ -471,6 +475,7 @@ pub async fn inspect_wallet_file(
                     sprout_issues: Vec::new(),
                     sprout_scan_warning: Vec::new(),
                     has_mnemonic: false,
+                    seed_note: None,
                     transparent_only: false,
                     diagnostics: Vec::new(),
                     coverage_notice: None,
@@ -499,6 +504,7 @@ pub async fn inspect_wallet_file(
         sprout_issues: sprout.sprout_issues,
         sprout_scan_warning: sprout.sprout_scan_warning,
         has_mnemonic: keys.mnemonic.is_some(),
+        seed_note: keys.verified_seed_note().map(str::to_owned),
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
         diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),

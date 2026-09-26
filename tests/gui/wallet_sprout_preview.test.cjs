@@ -41,7 +41,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
         needs_passphrase: false, transparent_keys: 0, sapling_keys: 0,
         sprout_keys: 1, has_mnemonic: false, sprout_spendable_notes: 1,
         sprout_spendable_zatoshis: 100000, sprout_addresses: [], diagnostics: [],
-        coverage_notice: null, coverage_may_hide_funds: false,
+        coverage_notice: null, coverage_may_hide_funds: false, seed_note: null,
       };
       if (command === "preview_sprout_sweep") {
         previews.push({ ...args });
@@ -335,4 +335,14 @@ test("a complete read shows no coverage row, and replaces an earlier partial war
   assert.ok(summaryRows(h).includes("Seed phrase: not recovered from this file"));
   assert.equal(summaryRows(h).some((row) => row.startsWith("Recovery coverage:")), false);
   for (const id of LATER_SCREENS) assert.doesNotMatch(h.$(id).textContent, /HD seed/, id);
+});
+
+test("a verified zcashd seed is described in the backend's words", async () => {
+  const note = "verified — every key it derived is read from this file";
+  const h = harness(async (command, args, fallback) => {
+    const response = await fallback();
+    return command === "inspect_wallet_file" ? { ...response, seed_note: note } : response;
+  });
+  await h.open("/fixture/zcashd5.dat");
+  assert.ok(summaryRows(h).includes(`Seed phrase: ${note}`));
 });

@@ -148,6 +148,13 @@ pub struct ImportedKeys {
     /// individually. Deriving keys from it is `argos-core`'s job, not this
     /// crate's: see the module docs on `zwl` for why.
     pub mnemonic: Option<SecretString>,
+    /// True when a zcashd 5.x seed decoded, matched the fingerprint zcashd
+    /// stored it under, and matched the wallet's `mnemonichdchain`. It is
+    /// *not* placed in `mnemonic`: zcashd stores its keys under the legacy
+    /// account `0x7FFFFFFF`, which the HD scan never enumerates, so routing
+    /// the wallet down the HD path would drop them. Verification is what
+    /// lets the import say whether the stored keys are the whole story.
+    pub seed_verified: bool,
     /// Everything we could not read. Never empty silently — always shown
     /// to the user with counts.
     pub diagnostics: Vec<ImportDiagnostic>,
@@ -169,6 +176,27 @@ impl ImportedKeys {
         self.transparent.len() + self.sapling.len() + self.sprout.len()
     }
 
+    /// The "Seed phrase" line for a verified zcashd seed, shared by the CLI
+    /// and GUI. Claims the stored keys are complete only when the seed's own
+    /// records say so.
+    pub fn verified_seed_note(&self) -> Option<&'static str> {
+        if !self.seed_verified {
+            return None;
+        }
+        let seed_keys_missing = self.diagnostics.iter().any(|d| {
+            matches!(
+                d,
+                ImportDiagnostic::UnscannedSeedAccounts { .. }
+                    | ImportDiagnostic::MissingDerivedKeys { .. }
+            )
+        });
+        Some(if seed_keys_missing {
+            "verified — but not every key it derived is in this file (see Recovery coverage)"
+        } else {
+            "verified — every key it derived is read from this file"
+        })
+    }
+
     /// How much of the file's key material this import is known to cover,
     /// graded by the worst diagnostic.
     pub fn coverage(&self) -> ImportCoverage {
@@ -176,8 +204,12 @@ impl ImportedKeys {
             .iter()
             .map(|d| match d {
                 ImportDiagnostic::UnrecoveredSeed { .. } => ImportCoverage::SeedNotRecovered,
+                ImportDiagnostic::UnscannedSeedAccounts { .. } => {
+                    ImportCoverage::SeedAccountsNotScanned
+                }
                 ImportDiagnostic::UnparseableRecord { .. }
-                | ImportDiagnostic::DecryptionFailed { .. } => ImportCoverage::KeysUnread,
+                | ImportDiagnostic::DecryptionFailed { .. }
+                | ImportDiagnostic::MissingDerivedKeys { .. } => ImportCoverage::KeysUnread,
                 ImportDiagnostic::UnknownRecord { .. } => ImportCoverage::UnknownRecordsSkipped,
             })
             .max()
@@ -197,8 +229,11 @@ pub enum ImportCoverage {
     UnknownRecordsSkipped,
     /// A record known to hold key material could not be read or decrypted.
     KeysUnread,
-    /// The wallet's HD seed was not recovered, so a whole key tree may be
-    /// missing.
+    /// The seed is verified, but unified accounts derived from it hold
+    /// keys the file does not store, so they are not scanned.
+    SeedAccountsNotScanned,
+    /// The wallet's HD seed could not be verified, so a whole key tree may
+    /// be missing.
     SeedNotRecovered,
 }
 
@@ -217,8 +252,14 @@ impl ImportCoverage {
                 "Incomplete — some key records could not be read, so recovered keys \
                  and balances may be missing funds. Keep the original wallet file.",
             ),
+            Self::SeedAccountsNotScanned => Some(
+                "Incomplete — this wallet created unified accounts from its seed \
+                 (z_getnewaccount). Their keys are not stored in the file and Argos \
+                 does not scan them, so balances may be missing funds. Keep the \
+                 original wallet file.",
+            ),
             Self::SeedNotRecovered => Some(
-                "Incomplete — this file holds an HD seed that Argos does not recover. \
+                "Incomplete — this file holds an HD seed that Argos could not verify. \
                  Keys derived from it are only covered if the file also stores them \
                  individually, so balances may be missing funds. Keep the original \
                  wallet file.",
@@ -294,6 +335,7 @@ mod coverage_tests {
         );
         let seed = ImportDiagnostic::UnrecoveredSeed {
             record_type: "hdseed".to_owned(),
+            reason: "pre-5.0 seed".to_owned(),
         };
         assert_eq!(
             with(vec![seed, unread, unknown()]).coverage(),
@@ -302,10 +344,25 @@ mod coverage_tests {
     }
 
     #[test]
+    fn a_verified_seed_claims_completeness_only_when_its_records_agree() {
+        let mut keys = with(vec![unknown()]);
+        assert_eq!(keys.verified_seed_note(), None);
+        keys.seed_verified = true;
+        assert!(keys
+            .verified_seed_note()
+            .unwrap()
+            .contains("every key it derived"));
+        keys.diagnostics
+            .push(ImportDiagnostic::UnscannedSeedAccounts { accounts: 1 });
+        assert!(keys.verified_seed_note().unwrap().contains("not every key"));
+    }
+
+    #[test]
     fn only_a_possible_loss_of_funds_is_carried_to_later_screens() {
         assert_eq!(ImportCoverage::Complete.notice(), None);
         assert!(!ImportCoverage::UnknownRecordsSkipped.may_hide_funds());
         assert!(ImportCoverage::KeysUnread.may_hide_funds());
+        assert!(ImportCoverage::SeedAccountsNotScanned.may_hide_funds());
         assert!(ImportCoverage::SeedNotRecovered.may_hide_funds());
         // The seed notice must not be the generic one: it names the seed.
         let seed = ImportCoverage::SeedNotRecovered.notice().unwrap();

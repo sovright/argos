@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 /// zcashd wallet with a Sprout address, a Sapling address, and transparent
 /// keys. Written by a real `zcashd` v6.20.0, so it also holds a 5.x
-/// `mnemonicphrase` HD seed, which Argos does not recover. See
+/// `mnemonicphrase` HD seed, which Argos verifies but does not scan from. See
 /// `tests/regtest/fixtures/README.md`.
 const SPROUT_PLAINTEXT: &str = "sprout-plaintext.dat";
 
@@ -81,11 +81,12 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     );
 }
 
-/// A zcashd 5.x wallet's seed is skipped, and the report must say so rather
-/// than claim the keys were never HD-derived or that every record was read
-/// (#225).
+/// A zcashd 5.x wallet's seed is verified, and because the wallet never
+/// created a unified account, the report may say the stored keys are the
+/// whole story — but must not claim the keys were never HD-derived (#225),
+/// nor that the seed is what the scan uses (#229).
 #[test]
-fn inspect_wallet_does_not_hide_an_unrecovered_seed() {
+fn inspect_wallet_reports_a_verified_seed() {
     let path = fixture(SPROUT_PLAINTEXT);
     let out = argos(&[
         "--wallet-file",
@@ -94,20 +95,18 @@ fn inspect_wallet_does_not_hide_an_unrecovered_seed() {
     ]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for false_claim in ["not HD-derived", "Every record in this file was read"] {
-        assert!(
-            !stdout.contains(false_claim),
-            "report claims {false_claim:?} for a wallet holding a seed:\n{stdout}"
-        );
+    for false_claim in ["not HD-derived", "has no HD seed"] {
+        assert!(!stdout.contains(false_claim), "got:\n{stdout}");
     }
     assert!(
-        stdout.contains("Seed phrase       not recovered from this file"),
+        stdout.contains("Seed phrase       verified — every key it derived is read from this file"),
         "got:\n{stdout}"
     );
     assert!(
-        stdout.contains("this file holds an HD seed that Argos does not recover"),
-        "the coverage notice must name the seed, got:\n{stdout}"
+        stdout.contains("Every record that can hold a key was read."),
+        "got:\n{stdout}"
     );
+    assert!(!stdout.contains("Recovery coverage"), "got:\n{stdout}");
 }
 
 /// A seedless wallet is *scanned*, not refused.

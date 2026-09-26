@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod encrypted;
 pub mod plaintext;
 pub mod records;
+pub mod seed;
 pub mod sprout;
 
 pub use crypto::{derive_master_key, find_mkey, MasterKey, MkeyRecord};
@@ -39,14 +40,21 @@ pub fn import_zcashd(
     collect_plaintext(&pairs, &mut out);
     collect_sprout_notes(&pairs, &mut out);
 
-    if let Some(mkey) = find_mkey(&pairs) {
-        // Encrypted wallet: without a passphrase the encrypted records are
-        // unreachable, and reporting partial plaintext results would let a
-        // user believe they had recovered everything.
-        let passphrase = passphrase.ok_or(ImportError::WrongPassphrase)?;
-        let master = derive_master_key(passphrase, &mkey)?;
-        collect_encrypted(&pairs, &master, &mut out);
-    }
+    let master = match find_mkey(&pairs) {
+        Some(mkey) => {
+            // Encrypted wallet: without a passphrase the encrypted records
+            // are unreachable, and reporting partial plaintext results would
+            // let a user believe they had recovered everything.
+            let passphrase = passphrase.ok_or(ImportError::WrongPassphrase)?;
+            let master = derive_master_key(passphrase, &mkey)?;
+            collect_encrypted(&pairs, &master, &mut out);
+            Some(master)
+        }
+        None => None,
+    };
+    // Last: it compares the seed's key counters against every key the
+    // passes above recovered, decrypted ones included.
+    seed::assess_seed(&pairs, master.as_ref(), &mut out);
 
     Ok(out)
 }
@@ -90,11 +98,12 @@ mod tests {
     }
 
     /// zcashd 5.0+ keeps its HD seed in `mnemonicphrase` (plaintext) or
-    /// `cmnemonicphrase` (encrypted). Argos does not recover it, so the
-    /// user must be told — these used to be skipped with no diagnostic at
-    /// all, which made the wallet read as completely recovered.
+    /// `cmnemonicphrase` (encrypted). Every golden wallet's seed must decode,
+    /// match the fingerprint zcashd stored it under, and — because none of
+    /// them ever created a unified account and every legacy key the seed
+    /// derived is stored — leave the import complete rather than warned.
     #[test]
-    fn a_zcashd_5_wallet_reports_its_unrecovered_seed() {
+    fn a_zcashd_5_wallets_seed_is_verified_and_its_coverage_is_complete() {
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         for (name, passphrase) in [
             ("modern-plaintext", None),
@@ -103,17 +112,21 @@ mod tests {
             ("sprout-encrypted", Some(&pass)),
         ] {
             let keys = import_zcashd(&read(name), passphrase).unwrap();
-            let seeds = keys
-                .diagnostics
-                .iter()
-                .filter(|d| d.is_unrecovered_seed())
-                .count();
-            assert_eq!(seeds, 1, "{name}: expected one unrecovered-seed diagnostic");
+            assert!(keys.seed_verified, "{name}: seed was not verified");
+            assert!(
+                keys.diagnostics.is_empty(),
+                "{name}: unexpected diagnostics {:?}",
+                keys.diagnostics
+            );
             assert_eq!(
                 keys.coverage(),
-                crate::keys::ImportCoverage::SeedNotRecovered,
+                crate::keys::ImportCoverage::Complete,
                 "{name}"
             );
+            // Verified is not "used for derivation": routing a zcashd wallet
+            // down the HD path would drop every key it stores under the
+            // legacy account, which the HD scan never enumerates.
+            assert!(keys.mnemonic.is_none(), "{name}: mnemonic must stay unset");
         }
     }
 
