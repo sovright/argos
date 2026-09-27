@@ -4,7 +4,7 @@
 //! An ordinary Argos scan talks to lightwalletd and streams compact blocks —
 //! a few hundred megabytes, minutes. A Sprout scan cannot use lightwalletd at
 //! all (compact blocks carry no JoinSplits), so it downloads **full** blocks
-//! straight from the p2p network, from genesis to Canopy.
+//! straight from the p2p network, from genesis to the chain tip.
 //!
 //! Presenting that as an ordinary scan would be a straightforward lie about a
 //! multi-hour, multi-gigabyte operation, and the person on the other end is
@@ -19,29 +19,33 @@
 //!
 //! # What is exact and what is not
 //!
-//! The block count is exact and fixed forever: ZIP 211 disables adding value
-//! to the Sprout pool at Canopy, so no Sprout note exists at or above that
-//! height and the range never grows.
+//! Neither figure is exact, and both grow with the chain. ZIP 211 only stops
+//! new value entering Sprout at Canopy; JoinSplits after it still spend and
+//! create Sprout notes, so the scan reads to the tip and the range is the
+//! whole chain.
 //!
-//! The download size is an estimate, and is labelled as one everywhere it is
-//! shown. It is not measured here because measuring it would itself require
-//! downloading the chain. Callers report real figures as the scan proceeds;
-//! this is only what we can honestly say beforehand.
+//! For mainnet both numbers are anchored to one measurement of the real
+//! chain rather than a per-block guess: the average block grew roughly
+//! tenfold after Canopy, so any single mean is badly wrong somewhere. They
+//! are still labelled estimates everywhere they are shown. Callers report
+//! real figures as the scan proceeds.
 
 use crate::p2p::wire::P2pNetwork;
 
-/// Rough average size of a mainnet block across the Sprout range.
-///
-/// Deliberately coarse. Early blocks are tiny and Sapling-era blocks are far
-/// larger, so a single average is only good enough to tell someone whether
-/// this is a coffee break or an overnight job — which is the actual decision
-/// they are making.
+/// Mainnet height and total chain size, measured together: blockchair's
+/// `/zcash/stats`, 2026-09-27 (`best_block_height`, `blockchain_size`).
+const MAINNET_MEASURED_HEIGHT: u32 = 3_497_638;
+const MAINNET_MEASURED_BYTES: u64 = 275_761_641_867;
+
+/// Rough average block size, for blocks past the measurement and for
+/// networks with no measurement. Deliberately coarse: good enough to tell a
+/// coffee break from an overnight job, which is the decision being made.
 const APPROX_MEAN_BLOCK_BYTES: u64 = 25_000;
 
 /// What a Sprout scan will cost the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SproutScanCost {
-    /// Exact: every block from 1 up to Canopy activation.
+    /// Every block from 1 to the chain tip, as last measured.
     pub blocks: u32,
     /// Approximate total network transfer.
     pub approx_download_bytes: u64,
@@ -70,16 +74,27 @@ fn human_bytes(bytes: u64) -> String {
 
 impl SproutScanCost {
     pub fn for_network(network: P2pNetwork) -> Self {
-        // `loop_limit` would be `u32::MAX` for a chain-tip scan, which as a
-        // cost estimate is meaningless — it quoted 4.3 billion blocks. There
-        // is no honest figure to give when the range is not known in advance.
-        let blocks = match network.sprout_scan_bound() {
-            crate::p2p::wire::SproutScanBound::UpTo(height) => height,
-            crate::p2p::wire::SproutScanBound::ChainTip => 0,
+        // Regtest's minimum tip is 0: its chain is whatever the test built,
+        // and there is no honest figure to quote for it.
+        let (blocks, approx_download_bytes) = match network {
+            P2pNetwork::Mainnet => {
+                let blocks = network
+                    .sprout_scan_minimum_tip()
+                    .max(MAINNET_MEASURED_HEIGHT);
+                let beyond = u64::from(blocks - MAINNET_MEASURED_HEIGHT);
+                (
+                    blocks,
+                    MAINNET_MEASURED_BYTES + beyond * APPROX_MEAN_BLOCK_BYTES,
+                )
+            }
+            P2pNetwork::Testnet | P2pNetwork::Regtest => {
+                let blocks = network.sprout_scan_minimum_tip();
+                (blocks, u64::from(blocks) * APPROX_MEAN_BLOCK_BYTES)
+            }
         };
         Self {
             blocks,
-            approx_download_bytes: u64::from(blocks) * APPROX_MEAN_BLOCK_BYTES,
+            approx_download_bytes,
             // The Sprout tree is ~32 bytes per node over a depth-29 tree plus
             // a checkpoint; hundreds of megabytes is a generous ceiling.
             approx_disk_bytes: 500_000_000,
@@ -105,8 +120,10 @@ impl SproutScanCost {
             String::new(),
             format!(
                 "Sprout notes are invisible to the light-wallet servers Argos normally \
-                 uses, so this reads full blocks directly from the Zcash network: all \
-                 {} blocks from the start of the chain to Canopy.",
+                 uses, so this reads full blocks directly from the Zcash network: every \
+                 block from the start of the chain to its tip, at least {} blocks. \
+                 Sprout notes can be created and spent after Canopy, so stopping \
+                 earlier would miss them.",
                 thousands(self.blocks)
             ),
             String::new(),
@@ -120,7 +137,7 @@ impl SproutScanCost {
                 "  Disk space         under {} (blocks are not kept)",
                 self.disk_human()
             ),
-            "  Time               hours, not minutes".to_owned(),
+            "  Time               likely days".to_owned(),
             String::new(),
             "The scan saves its progress, so you can stop it and resume later without \
              downloading everything again."
@@ -149,10 +166,13 @@ fn thousands(n: u32) -> String {
 mod tests {
     use super::*;
 
+    /// The scan runs to the tip, not to Canopy: Sprout JoinSplits continue
+    /// after it, so the count is the whole chain as last measured.
     #[test]
-    fn the_mainnet_block_count_is_the_canopy_bound() {
+    fn the_mainnet_block_count_is_the_whole_chain() {
         let cost = SproutScanCost::for_network(P2pNetwork::Mainnet);
-        assert_eq!(cost.blocks, 1_046_400);
+        assert!(cost.blocks > 1_046_400, "must not stop at Canopy");
+        assert!(cost.blocks >= MAINNET_MEASURED_HEIGHT);
     }
 
     /// The numbers must be big enough to actually deter a casual click.
@@ -162,8 +182,8 @@ mod tests {
     fn the_download_estimate_is_reported_in_gigabytes() {
         let cost = SproutScanCost::for_network(P2pNetwork::Mainnet);
         assert!(
-            cost.approx_download_bytes > 10_000_000_000,
-            "a full-block sweep of the Sprout range is tens of GB"
+            cost.approx_download_bytes > 200_000_000_000,
+            "the whole chain is hundreds of GB, and saying less is the lie this warns against"
         );
         assert!(cost.download_human().ends_with(" GB"));
         assert_ne!(cost.download_human(), "0 GB");
@@ -186,7 +206,15 @@ mod tests {
         let text = SproutScanCost::for_network(P2pNetwork::Mainnet)
             .warning_lines()
             .join("\n");
-        assert!(text.contains("hours"), "must set a time expectation");
+        assert!(text.contains("days"), "must set a time expectation");
+        assert!(
+            text.contains("tip"),
+            "must say the scan runs to the chain tip"
+        );
+        assert!(
+            !text.contains("to Canopy"),
+            "the scan no longer stops at Canopy"
+        );
         assert!(text.contains("Disk space"), "must state disk use");
         assert!(text.contains("Network transfer"), "must state transfer");
         assert!(
@@ -198,8 +226,8 @@ mod tests {
             "must say progress is saved, or a user will not dare start"
         );
         assert!(
-            text.contains("1,046,400"),
-            "the exact block count is the most concrete fact available"
+            text.contains("3,497,638"),
+            "the measured block count is the most concrete fact available"
         );
     }
 

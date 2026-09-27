@@ -180,7 +180,7 @@
             <div class="guide-section">
               <h3>Sprout Recovery</h3>
               <p>Sprout support is included in Argos. A ZecWallet Lite seed alone cannot recreate these independently generated keys; use a zcashd <code>wallet.dat</code> or standalone <code>SK…</code>/<code>ST…</code> key.</p>
-              <p>If the wallet file contains cached note data and a witness, Argos can sweep it immediately. Otherwise recovery needs a resumable full-block scan from genesis to Canopy. On mainnet that is 1,046,400 blocks, roughly 26 GB transferred, under 500 MB retained, and hours of work.</p>
+              <p>If the wallet file contains cached note data and a witness, Argos can sweep it immediately. Otherwise recovery needs a resumable full-block scan from genesis to the chain tip — Sprout notes are still created and spent after Canopy, so it cannot stop there. On mainnet that is about 3.5 million blocks, roughly 280 GB transferred, under 500 MB retained, and likely days of work.</p>
               <p>Sprout funds land in a Sapling receiver, even when you provide a Unified Address. They cannot reach Orchard in the same transaction; move them from Sapling to Orchard afterward from your own wallet if desired. Keep the original file and the private scan checkpoint until every transaction is confirmed.</p>
             </div>
 

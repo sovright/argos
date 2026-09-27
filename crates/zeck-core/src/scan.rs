@@ -1780,7 +1780,7 @@ pub(crate) async fn run_wallet_sync_with_retry(
     }
 }
 
-async fn probe_valid_lightwalletd_endpoints(
+pub(crate) async fn probe_valid_lightwalletd_endpoints(
     raw: &str,
     network: crate::models::ZeckNetwork,
 ) -> ZeckResult<(

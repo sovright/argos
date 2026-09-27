@@ -44,14 +44,18 @@
 //!    walk provably starts at genesis;
 //! 2. every header in a page links to its predecessor;
 //! 3. every page links to the previous page's last hash;
-//! 4. four checkpoint hashes must match at fixed heights.
+//! 4. the pinned checkpoint hashes must match at fixed heights, and past the
+//!    last of them the [`TipAnchor`] learned from lightwalletd must match
+//!    at its height.
 //!
 //! Together those pin both ends of every segment. Forging blocks between
-//! two checkpoints requires the forged chain's last `prev_hash` to equal the
-//! real block before the next checkpoint — which requires that real block,
-//! which requires its real work. No block from genesis to Canopy can be
+//! two pinned points requires the forged chain's last `prev_hash` to equal
+//! the real block before the next one — which requires that real block,
+//! which requires its real work. No block from genesis to the anchor can be
 //! inserted, omitted or substituted without breaking a hash link to a
-//! pinned point.
+//! pinned point. The last hundred blocks, above the anchor, rest on the
+//! peer; so does everything past the last checkpoint when no anchor could
+//! be had, and the user is told so.
 //!
 //! Implementing ZIP 208's averaging window and damping would therefore buy
 //! nothing here, while being easy to get subtly wrong — and a wrong
@@ -65,11 +69,13 @@
 //! deliberately corrupted solution required to fail, so neither pass can
 //! mean the verifier simply accepts everything.
 //!
-//! The checkpoint file is likewise unauthenticated: it carries no MAC, and
-//! its `last_height` alone decides whether the scan is finished. Editing
-//! that one field to the target makes a scan "complete" instantly. It is
-//! now checked against the requested key set and the network's range, which
-//! catches the accidental cases, but not a deliberately edited file.
+//! The checkpoint file is likewise unauthenticated: it carries no MAC. A scan
+//! is never finished by its checkpoint alone — every run continues to the
+//! tip — but an edited cursor still skips the blocks it claims were read.
+//! It is checked against the requested key set, which catches the
+//! accidental case of the wrong wallet, but not a deliberately edited file.
+//! A checkpoint from another network fails on its first page, because no
+//! peer on this network recognises its block cursor.
 //!
 //! # Checkpointing
 //!
@@ -88,8 +94,8 @@ use crate::{
     error::{ZeckError, ZeckResult},
     p2p::{
         block::joinsplits_in_block,
-        peer::Peer,
-        pool::{connect_to_any, PoolError, PEER_RECONNECT_DELAY},
+        peer::{Peer, READ_TIMEOUT},
+        pool::{connect_to_any_except, PoolError, PEER_RECONNECT_DELAY},
         wire::P2pNetwork,
     },
     sprout_scan::{ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner},
@@ -122,7 +128,7 @@ fn first_scan_height(cursor: Option<ScanCursor>) -> u32 {
 /// Every batch would be safest and every thousand cheapest. This is sized so
 /// an interrupted scan loses at most a few seconds of work while the file is
 /// rewritten rarely enough not to matter.
-const CHECKPOINT_EVERY: u64 = 500;
+pub const CHECKPOINT_EVERY: u64 = 500;
 
 /// How many peers may return nothing before the scan gives up.
 ///
@@ -173,12 +179,20 @@ const SEED_RETRY_LIMIT: u32 = 3;
 const SEED_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Why the scan is waiting for a peer rather than scanning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerWaitReason {
     /// Every candidate refused a connection slot. Routine on a busy network.
     AllPeersBusy,
     /// The DNS seeds would not resolve. Usually this machine's connection.
     SeedsUnresolved,
+    /// A peer accepted the connection and then answered nothing for a full
+    /// read timeout. zcashd does exactly this with `getheaders` while it is
+    /// in initial block download, which is how a user pointing `--peer` at
+    /// their own still-syncing node saw Argos reconnect every thirty seconds
+    /// forever and print nothing. `peer` is named so a user with several
+    /// custom peers knows which to check; `named_by_user` says whether it was
+    /// one of theirs, because only then is there something to go and check.
+    PeerSilent { peer: String, named_by_user: bool },
 }
 
 /// The scan is alive, has no peer, and is waiting before trying again.
@@ -186,7 +200,7 @@ pub enum PeerWaitReason {
 /// Carried on [`ScanTick`] so it reaches the CLI and the GUI through the
 /// progress callback they already listen to, rather than a second channel
 /// each would have to learn about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerWait {
     pub reason: PeerWaitReason,
     /// The number of the attempt that follows this wait; the first is 1, so
@@ -200,7 +214,7 @@ impl std::fmt::Display for PeerWait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let secs = self.retry_in.as_secs();
         let attempt = self.next_attempt;
-        match self.reason {
+        match &self.reason {
             PeerWaitReason::AllPeersBusy => write!(
                 f,
                 "Every Zcash peer is busy, which is normal and passes. Retrying in \
@@ -211,14 +225,42 @@ impl std::fmt::Display for PeerWait {
                 "Could not look up any Zcash peers (DNS). Check the internet connection. \
                  Retrying in {secs}s (attempt {attempt})."
             ),
+            // Worded for both surfaces: the CLI's --peer and the GUI's
+            // "Custom peers" box name the same thing.
+            PeerWaitReason::PeerSilent {
+                peer,
+                named_by_user: true,
+            } => write!(
+                f,
+                "{peer}, a Zcash node you chose, accepted a connection but sent nothing \
+                 for {}s. A zcashd node in initial block download (still syncing, or with \
+                 a newest block more than a day old) behaves like this; check it with \
+                 `zcash-cli getblockchaininfo`. Skipping it for about {} minutes and trying \
+                 another peer (attempt {attempt}).",
+                READ_TIMEOUT.as_secs(),
+                PEER_RECONNECT_DELAY.as_secs().div_ceil(60)
+            ),
+            PeerWaitReason::PeerSilent {
+                peer,
+                named_by_user: false,
+            } => write!(
+                f,
+                "The Zcash peer {peer} accepted a connection but sent nothing for {}s. \
+                 Skipping it for about {} minutes and trying another peer (attempt \
+                 {attempt}).",
+                READ_TIMEOUT.as_secs(),
+                PEER_RECONNECT_DELAY.as_secs().div_ceil(60)
+            ),
         }
     }
 }
 
 /// Progress, reported often enough that a multi-hour run never looks stalled.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ScanTick {
     pub height: u32,
+    /// The best-known chain tip, for display. The scan has no fixed end — it
+    /// runs until a peer reports the tip — so this can grow as it goes.
     pub target: u32,
     pub notes_found: usize,
     pub joinsplits_seen: u64,
@@ -248,14 +290,96 @@ pub fn checkpoint_path(data_dir: &Path, spending_keys: &[[u8; 32]]) -> PathBuf {
     data_dir.join(format!("sprout-scan-{fingerprint}.checkpoint"))
 }
 
-/// Run a Sprout scan to completion, resuming from `checkpoint_file` if present.
+/// A block near the chain tip, learned from lightwalletd rather than from
+/// the peer serving the scan.
 ///
-/// `extra_peers` is tried before any DNS seed, so a caller with its own node
-/// never depends on the public network.
+/// The pinned checkpoints fix the chain up to the last of them. Past it,
+/// nothing did: the difficulty adjustment is deliberately not validated, so
+/// a hostile peer could serve a cheap fabricated tail and hide every later
+/// spend, making a migrated note read as spendable. Requiring the scan's
+/// block at this height to be *this* block pins that last stretch to a
+/// second, independent source.
+///
+/// A resumed scan already past the anchor's height cannot check it — that
+/// only happens when the previous run ended within the last hundred blocks —
+/// and must still reach the anchor's height before it may stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TipAnchor {
+    pub height: u32,
+    /// Wire byte order — what lightwalletd's `CompactBlock.hash` carries,
+    /// and what the checkpoints are compared in.
+    pub hash: [u8; 32],
+}
+
+/// How far below lightwalletd's tip the anchor sits: past any reorg, so an
+/// honest peer and an honest lightwalletd cannot disagree about it.
+pub const TIP_ANCHOR_DEPTH: u32 = 100;
+
+/// Ask lightwalletd for a [`TipAnchor`].
+///
+/// Refuses a server on the wrong network: an anchor from another chain would
+/// reject every honest peer.
+pub async fn independent_tip_anchor(
+    network: crate::ZeckNetwork,
+    lightwalletd_url: &str,
+) -> ZeckResult<TipAnchor> {
+    use zcash_client_backend::proto::service::BlockId;
+
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    let tip = u32::try_from(info.block_height).map_err(|_| {
+        ZeckError::Lightwalletd(format!("implausible chain height {}", info.block_height))
+    })?;
+    let height = tip.saturating_sub(TIP_ANCHOR_DEPTH);
+    let block = client
+        .get_block(BlockId {
+            height: u64::from(height),
+            hash: vec![],
+        })
+        .await
+        .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+        .into_inner();
+    let hash = <[u8; 32]>::try_from(block.hash.as_slice()).map_err(|_| {
+        ZeckError::Lightwalletd(format!(
+            "lightwalletd returned a {}-byte block hash",
+            block.hash.len()
+        ))
+    })?;
+    Ok(TipAnchor { height, hash })
+}
+
+/// What to tell the user when no [`TipAnchor`] could be had, in the words
+/// both surfaces show.
+pub fn unconfirmed_tip_warning(network: P2pNetwork, reason: &str) -> String {
+    format!(
+        "Could not confirm the chain tip with lightwalletd ({reason}). The scan still \
+         runs to the tip its peer reports, but blocks past height {} are then only as \
+         trustworthy as that peer.",
+        network.sprout_scan_minimum_tip()
+    )
+}
+
+/// Run a Sprout scan to the chain tip, resuming from `checkpoint_file` if
+/// present.
+///
+/// `extra_peers` are raced alongside the DNS seeds, first in line.
+///
+/// `tip_anchor` is a block learned independently of any peer — see
+/// [`independent_tip_anchor`]. The scan must reach it, and the peer's block
+/// at that height must be that block, exactly as for a pinned checkpoint.
+/// Pass `None` when there is none: the network's minimum tip still applies,
+/// but the stretch past the last pinned checkpoint is then only as
+/// trustworthy as the peer.
+///
+/// A saved scan is never "finished": resuming one catches up from where it
+/// stopped to the current tip, so a note spent since the last run is not
+/// offered as spendable.
 pub async fn run_sprout_scan(
     spending_keys: &[[u8; 32]],
     network: P2pNetwork,
     extra_peers: &[String],
+    tip_anchor: Option<TipAnchor>,
     checkpoint_file: &Path,
     mut progress: impl FnMut(ScanTick),
 ) -> ZeckResult<SproutScanResult> {
@@ -265,15 +389,24 @@ pub async fn run_sprout_scan(
         ));
     }
 
-    let bound = network.sprout_scan_bound();
-    let target = bound.loop_limit();
+    // `fetched` counts blocks, so reaching the anchor's height means having
+    // fetched one past it.
+    let floor = tip_anchor
+        .map_or(0, |anchor| anchor.height.saturating_add(1))
+        .max(network.sprout_scan_minimum_tip());
 
     // Resume if we can. A checkpoint that will not load is reported rather
     // than silently discarded: starting a six-hour scan over because a file
     // was quietly ignored is worse than stopping to say so.
     let mut scanner = match std::fs::read(checkpoint_file) {
         Ok(bytes) => {
-            let checkpoint = SproutScanCheckpoint::from_bytes(bytes);
+            // Checked after the scanner loads, so a corrupt file is still
+            // reported as corrupt rather than as the wrong network.
+            let (tag, body) = match bytes.as_slice() {
+                [NETWORK_TAGGED, tag, body @ ..] => (Some(*tag), body.to_vec()),
+                _ => (None, bytes),
+            };
+            let checkpoint = SproutScanCheckpoint::from_bytes(body);
             let resumed = SproutScanner::resume(&checkpoint).map_err(|err| {
                 ZeckError::TransactionBuild(format!(
                     "the scan checkpoint at {} could not be read ({err}). Delete it to \
@@ -300,17 +433,17 @@ pub async fn run_sprout_scan(
                 )));
             }
 
-            // And for this network. A completed mainnet checkpoint carries a
-            // last_height past the testnet target, so resuming it under
-            // testnet would skip the loop entirely and hand back mainnet
-            // notes as a finished testnet scan.
-            if resumed.progress().last_height > target {
+            let other_network = match tag {
+                Some(tag) => tag != network_tag(network),
+                None => legacy_scan_end(network)
+                    .is_some_and(|end| resumed.progress().last_height >= end),
+            };
+            if other_network {
                 return Err(ZeckError::TransactionBuild(format!(
-                    "the scan checkpoint at {} reaches height {}, past this network's \
-                     Sprout range ({target}). It was almost certainly made on a different \
-                     network.",
-                    checkpoint_file.display(),
-                    resumed.progress().last_height
+                    "the scan checkpoint at {} was made on a different network. Resuming \
+                     it here would report that chain's notes as this one's. Point \
+                     --data-dir somewhere else, or delete the file.",
+                    checkpoint_file.display()
                 )));
             }
             resumed
@@ -330,25 +463,13 @@ pub async fn run_sprout_scan(
     let mut height = first_scan_height(cursor);
     let mut since_checkpoint = 0u64;
 
-    // A scan that is already complete has nothing to fetch, so it must not
-    // ask for a peer. The GUI's sweep re-runs a finished scan purely to get
-    // its notes back; connecting first made that depend on a free slot it
-    // never used, and now that acquisition is persistent it would have sat
-    // out the whole budget before sweeping funds it already held.
-    if height >= target {
-        save_checkpoint(&scanner, checkpoint_file)?;
-        return scanner
-            .finish()
-            .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")));
-    }
-
     // A wait is reported as a tick at the scan's current position, so the
     // surfaces hear about it through the callback they already have.
     let waiting_tick = |scanner: &SproutScanner, height: u32, wait: PeerWait| {
         let p = scanner.progress();
         ScanTick {
             height,
-            target,
+            target: floor.max(height),
             notes_found: p.notes_found,
             joinsplits_seen: p.joinsplits_seen,
             peer_wait: Some(wait),
@@ -359,6 +480,9 @@ pub async fn run_sprout_scan(
         progress(waiting_tick(&scanner, height, wait));
     })
     .await?;
+    // Only for display: the peer's own claim is a better guess at the tip
+    // than the floor, and never below where the scan already is.
+    let mut target = floor.max(peer.peer_height).max(height);
 
     // The fetcher below is a spawned task and cannot call `progress`, which
     // is neither `Send` nor its to share. Its waits come back over this and
@@ -384,16 +508,20 @@ pub async fn run_sprout_scan(
     //
     // Capacity 1: at most one page sits between fetch and scan, and
     // `get_blocks` already bounds a page by `MAX_BLOCKS_BYTES`.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ZeckResult<Page>>(1);
+    // `Ok(None)` is the fetcher saying it reached the chain tip. The channel
+    // closing without it means the fetcher died, and must not read as done:
+    // a scan that stops early reports spent notes as spendable.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ZeckResult<Option<Page>>>(1);
     let mut fetcher = PageFetcher {
         peer,
         locator,
         empty_replies: 0,
         fetched: height,
-        target,
-        bound,
+        floor,
         network,
         peers: extra_peers.to_vec(),
+        silent: Vec::new(),
+        silence_exclusion: PEER_RECONNECT_DELAY,
         waits: wait_tx,
     };
     // Aborted when this future is dropped, not only when it finishes.
@@ -402,15 +530,17 @@ pub async fn run_sprout_scan(
     // peer — up to the whole acquisition budget, holding sockets open for a
     // scan nobody is running.
     let fetch_task = AbortOnDrop(tokio::spawn(async move {
-        while fetcher.fetched < fetcher.target {
+        loop {
             match fetcher.next_page().await {
                 Ok(None) => continue,
-                // Empty page: the chain ended (see `PageFetcher::next_page`).
-                // Dropping the sender ends the consumer's loop.
-                Ok(Some(page)) if page.is_empty() => return,
+                // Empty page: the chain tip (see `PageFetcher::next_page`).
+                Ok(Some(page)) if page.is_empty() => {
+                    let _ = tx.send(Ok(None)).await;
+                    return;
+                }
                 Ok(Some(page)) => {
                     fetcher.fetched += page.len() as u32;
-                    if tx.send(Ok(page)).await.is_err() {
+                    if tx.send(Ok(Some(page))).await.is_err() {
                         return;
                     }
                 }
@@ -422,7 +552,7 @@ pub async fn run_sprout_scan(
         }
     }));
 
-    while height < target {
+    loop {
         // Waits first: a notice still queued when its page arrives is stale,
         // and replaying it before the page means the scanning tick below is
         // what is left on screen, not a wait that has already ended.
@@ -434,10 +564,26 @@ pub async fn run_sprout_scan(
             }
             page = rx.recv() => page,
         };
+        // Every early exit saves first. The messages say "progress is saved",
+        // and between checkpoints (every CHECKPOINT_EVERY blocks) that was
+        // untrue: a scan stopped by a silent peer at height 1 left no file.
+        let Some(page) = page else {
+            save_before_stopping(&scanner, network, checkpoint_file);
+            return Err(ZeckError::Broadcast(format!(
+                "the block download stopped unexpectedly at height {height}, before \
+                 reaching the chain tip. Progress is saved; re-run to continue."
+            )));
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(err) => {
+                save_before_stopping(&scanner, network, checkpoint_file);
+                return Err(err);
+            }
+        };
         let Some(page) = page else {
             break;
         };
-        let page = page?;
 
         // Already in header order, and already complete: `next_page`
         // assembles the page in the order the headers came in and treats a
@@ -446,17 +592,16 @@ pub async fn run_sprout_scan(
         // position. Re-deriving a hash list and a lookup map here only undid
         // that work.
         for (hash, block) in &page {
-            if height >= target {
-                break;
-            }
-
             // A pinned block must be the block we were handed. This is what
             // makes a fabricated chain pointless: cheap forged headers link
             // to each other fine, but they cannot reproduce a real mainnet
             // hash at a real height without doing the work. Checked against
             // this block's own height, before the counter advances — the
             // checkpoints are keyed by true heights (genesis = 0).
-            if let Some(expected) = crate::p2p::wire::checkpoint_at(network, height) {
+            let expected = crate::p2p::wire::checkpoint_at(network, height).or(tip_anchor
+                .filter(|anchor| anchor.height == height)
+                .map(|anchor| anchor.hash));
+            if let Some(expected) = expected {
                 if *hash != expected {
                     return Err(ZeckError::Broadcast(format!(
                         "the chain this peer served does not match Zcash at height \
@@ -467,8 +612,9 @@ pub async fn run_sprout_scan(
                 }
             }
 
-            // The branch id only affects how the transaction parses, and
-            // every Sprout-bearing transaction predates Canopy.
+            // The branch id is only consulted for pre-v5 transactions, whose
+            // encoding it does not change; v5 carries its own. Sprout
+            // JoinSplits exist only in v2-v4, before and after Canopy alike.
             let joinsplits = joinsplits_in_block(block, BranchId::Canopy).map_err(|err| {
                 ZeckError::TransactionBuild(format!("block at height {height}: {err}"))
             })?;
@@ -483,10 +629,11 @@ pub async fn run_sprout_scan(
         }
 
         if since_checkpoint >= CHECKPOINT_EVERY {
-            save_checkpoint(&scanner, checkpoint_file)?;
+            save_checkpoint(&scanner, network, checkpoint_file)?;
             since_checkpoint = 0;
         }
 
+        target = target.max(height);
         let p = scanner.progress();
         progress(ScanTick {
             height,
@@ -497,13 +644,11 @@ pub async fn run_sprout_scan(
         });
     }
 
-    // The consumer may finish before the fetcher (target reached mid-page).
-    // Dropping the receiver already makes the next `send` fail and the task
-    // return, but abort it explicitly so a peer connection is not held open
-    // for however long the current request takes to time out.
+    // The fetcher has already returned after reporting the tip; dropping it
+    // is only to be certain no connection outlives the scan.
     drop(fetch_task);
 
-    save_checkpoint(&scanner, checkpoint_file)?;
+    save_checkpoint(&scanner, network, checkpoint_file)?;
 
     scanner
         .finish()
@@ -527,10 +672,19 @@ struct PageFetcher {
     /// How far the *fetcher* has read. Distinct from the consumer's `height`,
     /// which is the authority for checkpoints and tree positions.
     fetched: u32,
-    target: u32,
-    bound: crate::p2p::wire::SproutScanBound,
+    /// Below this, an empty reply is not the tip. See `run_sprout_scan`.
+    floor: u32,
     network: P2pNetwork,
     peers: Vec<String>,
+    /// Peers that accepted a connection and then answered nothing, each with
+    /// the time it may be dialled again. Such a peer handshakes fastest of
+    /// all, so without this it wins every reconnect and is asked forever. Not
+    /// permanent: one stall on the only node a user can reach must not cost
+    /// them the rest of an hours-long scan.
+    silent: Vec<(String, tokio::time::Instant)>,
+    /// How long a silent peer is skipped. `PEER_RECONNECT_DELAY` outside
+    /// tests: the node would refuse an earlier redial from this IP anyway.
+    silence_exclusion: Duration,
     /// Where a wait for a peer is announced; see `run_sprout_scan`.
     waits: tokio::sync::mpsc::UnboundedSender<PeerWait>,
 }
@@ -540,9 +694,18 @@ impl PageFetcher {
     ///
     /// A failed send means the consumer has gone, and the page send that
     /// follows will notice that and end the task; nothing to do about it here.
+    ///
+    /// The current connection is closed first. Assigning the new peer would
+    /// drop it only after the replacement had been dialled and handshaken, and
+    /// a Zebra node — the fallback nodes are always candidates — drops a
+    /// second connection from an IP it already has one from, so the scan
+    /// would be refused by the very node it was using. If no replacement is
+    /// found the closed peer is never used again: every caller ends the scan
+    /// on this error.
     async fn reconnect(&mut self) -> ZeckResult<()> {
+        self.peer.close().await;
         let waits = &self.waits;
-        self.peer = connect_peer(self.network, &self.peers, &[], |wait| {
+        self.peer = connect_peer(self.network, &self.peers, &self.silent, |wait| {
             let _ = waits.send(wait);
         })
         .await?;
@@ -567,11 +730,75 @@ impl PageFetcher {
         Ok(None)
     }
 
+    /// Handle a request that failed.
+    ///
+    /// Every failure is charged against the same budget as an empty reply,
+    /// which resets only once a whole page has been delivered. It used to be
+    /// free, and then reset after `getheaders` but before `getdata`, so a
+    /// peer that answers headers and never delivers bodies — a node in
+    /// initial block download — could keep the scan retrying forever.
+    ///
+    /// Only genuine silence (`PeerError::Silent`) is announced as such and
+    /// skips the peer for a while. A peer that sent too much, or kept
+    /// talking without answering, is working, and is rotated away from
+    /// without being told it is in initial block download.
+    async fn on_request_failure(
+        &mut self,
+        err: crate::p2p::peer::PeerError,
+        height: u32,
+    ) -> ZeckResult<Option<Page>> {
+        if !matches!(err, crate::p2p::peer::PeerError::Silent { .. }) {
+            let last = format!("{err}");
+            return self
+                .rotate(format!(
+                    "{} attempts in a row to fetch blocks from height {height} failed; the \
+                     most recent: {last}. Progress is saved; re-run to continue.",
+                    self.empty_replies + 1
+                ))
+                .await;
+        }
+        let peer = self.peer.dialled_as().to_owned();
+        let named_by_user = self.peers.contains(&peer);
+        let until = tokio::time::Instant::now() + self.silence_exclusion;
+        self.silent.retain(|(addr, _)| *addr != peer);
+        self.silent.push((peer.clone(), until));
+        self.empty_replies += 1;
+        let _ = self.waits.send(PeerWait {
+            reason: PeerWaitReason::PeerSilent {
+                peer: peer.clone(),
+                named_by_user,
+            },
+            next_attempt: self.empty_replies + 1,
+            retry_in: Duration::ZERO,
+        });
+        if self.empty_replies > MAX_EMPTY_REPLIES {
+            return Err(ZeckError::Broadcast(silence_explained(
+                height,
+                self.empty_replies,
+                &peer,
+                named_by_user,
+            )));
+        }
+        match self.reconnect().await {
+            Ok(()) => Ok(None),
+            // The pool's own reason leads: it is what actually stopped the
+            // scan, and may be this machine's connection rather than the peer.
+            Err(err) => Err(ZeckError::Broadcast(format!(
+                "no other Zcash peer could be reached from height {height}: {}. This \
+                 began when {peer} stopped answering.{} Progress is saved; re-run to \
+                 continue.",
+                // The pool's sentence ends in its own full stop.
+                err.to_string().trim_end_matches('.'),
+                own_node_hint(named_by_user)
+            ))),
+        }
+    }
+
     /// Fetch and validate one page of blocks.
     ///
     /// `Ok(None)` means "this peer was no good; a new one is connected, try
-    /// again" — the caller loops. An empty page means the chain ended, which
-    /// only happens when the scan has no fixed bound. Every check that decides
+    /// again" — the caller loops. An empty page means the chain tip was
+    /// reached (see `empty_reply_is_chain_tip`). Every check that decides
     /// whether a page may be scanned at all lives here: proof of work,
     /// continuity with the locator, and the internal linkage of the page.
     ///
@@ -580,42 +807,38 @@ impl PageFetcher {
     /// on the true height, so this cannot affect where a commitment lands.
     async fn next_page(&mut self) -> ZeckResult<Option<Page>> {
         let height = self.fetched;
-        let target = self.target;
 
         let headers = match self.peer.get_headers(&[self.locator]).await {
             Ok(h) if !h.is_empty() => h,
-            // NOT a clean end of chain when the scan has a fixed bound.
-            // `target` is then a pre-Canopy height every synced peer has, so
-            // an empty reply below it means this peer cannot serve us —
-            // under-synced, on another chain, or lying. Treating that as
-            // completion is the worst failure here: a tree truncated at a
-            // block boundary is a *genuine historical tree state*, so
-            // witnesses still verify and spend, but nullifiers published after
-            // the cut were never collected and a spent note gets offered as
-            // spendable.
-            //
-            // Where there is no fixed bound, the chain tip is the only
-            // possible ending and this reply is it. Matched on the variant
-            // rather than on a sentinel height, so no `target` arriving at
-            // `u32::MAX` by another route can disable the rule above.
+            // Only the tip if every tip height we know of has been reached;
+            // see `empty_reply_is_chain_tip` for why stopping short is the
+            // worst failure here.
             Ok(_) => {
-                if self.bound.ends_at_chain_tip() {
+                if crate::p2p::wire::empty_reply_is_chain_tip(
+                    height,
+                    self.floor,
+                    self.peer.peer_height,
+                ) {
                     return Ok(Some(Vec::new()));
                 }
+                let floor = self.floor.max(self.peer.peer_height);
                 return self
                     .rotate(format!(
-                        "no peer would serve blocks past height {height} of {target}. The \
-                         scan is incomplete and its results would be wrong, so it stops \
-                         here rather than reporting a balance it cannot stand behind. \
-                         Progress is saved; re-run to continue."
+                        "no peer would serve blocks past height {height}, but the chain \
+                         reaches at least {floor}. The scan is incomplete and its results \
+                         would be wrong, so it stops here rather than reporting a balance \
+                         it cannot stand behind. Progress is saved; re-run to continue."
                     ))
                     .await;
             }
-            Err(_) => {
-                self.reconnect().await?;
-                return Ok(None);
-            }
+            Err(err) => return self.on_request_failure(err, height).await,
         };
+
+        // An honest page is at most MAX_PAGE_BLOCKS; a hostile `headers` reply
+        // can list thousands, and every one named here is a body fetched
+        // into memory. The rest simply arrive on the next page.
+        let mut headers = headers;
+        headers.truncate(crate::p2p::peer::MAX_PAGE_BLOCKS);
 
         // Every header must carry its own proof of work. With the checkpoints
         // bounding where a forgery can start, this bounds how cheaply one can
@@ -667,15 +890,10 @@ impl PageFetcher {
                 ))
                 .await;
         }
-        self.empty_replies = 0;
-
         let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
         let mut blocks = match self.peer.get_blocks(&hashes).await {
             Ok(b) => b,
-            Err(_) => {
-                self.reconnect().await?;
-                return Ok(None);
-            }
+            Err(err) => return self.on_request_failure(err, height).await,
         };
 
         // Assembled in header order, so the consumer receives the page already
@@ -699,7 +917,36 @@ impl PageFetcher {
         }
 
         self.locator = *hashes.last().expect("non-empty");
+        // Only here, with a whole page in hand: resetting any earlier let a
+        // peer that answers `getheaders` but never `getdata` reset the budget
+        // between every failure, so it never ran out.
+        self.empty_replies = 0;
         Ok(Some(page))
+    }
+}
+
+/// Why a scan stopped after its failure budget ran out, the last failure
+/// being silence. Says only what is known: the count covers every kind of
+/// failure, and only the most recent is known to have been silence.
+fn silence_explained(height: u32, attempts: u32, peer: &str, named_by_user: bool) -> String {
+    format!(
+        "{attempts} attempts in a row to fetch blocks from height {height} failed; the most \
+         recent, {peer}, accepted a connection and then sent nothing for {}s.{} Progress is \
+         saved; re-run to continue.",
+        READ_TIMEOUT.as_secs(),
+        own_node_hint(named_by_user)
+    )
+}
+
+/// The initial-block-download hint, offered only when the silent peer is one
+/// the user chose: only then is there a node of theirs to go and check.
+fn own_node_hint(named_by_user: bool) -> &'static str {
+    if named_by_user {
+        " If that is your own zcashd node, it may be in initial block download (still \
+         syncing, or with a newest block more than a day old); check it with `zcash-cli \
+         getblockchaininfo`, or leave it out to use public peers."
+    } else {
+        ""
     }
 }
 
@@ -712,7 +959,7 @@ impl PageFetcher {
 /// umask, the same treatment the recovery report gets. Callers should say so
 /// to the user before pointing them at the path, and delete it once the
 /// funds are swept.
-fn save_checkpoint(scanner: &SproutScanner, path: &Path) -> ZeckResult<()> {
+fn save_checkpoint(scanner: &SproutScanner, network: P2pNetwork, path: &Path) -> ZeckResult<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -725,11 +972,51 @@ fn save_checkpoint(scanner: &SproutScanner, path: &Path) -> ZeckResult<()> {
     // would put spend-capable bytes in a world-readable inode and then
     // rename that inode into place.
     let _ = std::fs::remove_file(&tmp);
-    write_private(&tmp, scanner.checkpoint().as_bytes())?;
+    let mut bytes = vec![NETWORK_TAGGED, network_tag(network)];
+    bytes.extend_from_slice(scanner.checkpoint().as_bytes());
+    write_private(&tmp, &bytes)?;
     std::fs::rename(&tmp, path).map_err(|err| {
         ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}"))
     })?;
     Ok(())
+}
+
+/// Save on the way out of a failed scan, so the saved-progress claim in its
+/// error holds. A failure to save is logged, not raised: the scan's own
+/// error is the one the user needs to see.
+fn save_before_stopping(scanner: &SproutScanner, network: P2pNetwork, path: &Path) {
+    if let Err(err) = save_checkpoint(scanner, network, path) {
+        tracing::warn!("could not save the Sprout scan checkpoint while stopping: {err}");
+    }
+}
+
+/// Leads a checkpoint file that records its network, followed by that
+/// network's tag and then the scanner's own bytes. Distinct from every
+/// `SproutScanner` checkpoint version, so the two cannot be mistaken.
+///
+/// The scanner itself stays network-agnostic; the network is this module's
+/// to know, so it is recorded here. Needed since the scan stopped having a
+/// fixed end: a cursor from a longer chain used to be caught by exceeding
+/// this network's range, and now could read as the tip of a shorter one.
+const NETWORK_TAGGED: u8 = 0xA5;
+
+fn network_tag(network: P2pNetwork) -> u8 {
+    match network {
+        P2pNetwork::Mainnet => 1,
+        P2pNetwork::Testnet => 2,
+        P2pNetwork::Regtest => 3,
+    }
+}
+
+/// Where each network's scan used to stop. Every checkpoint without a
+/// network tag was written by one of those scans, so its cursor cannot be
+/// past this height on the network that wrote it.
+const fn legacy_scan_end(network: P2pNetwork) -> Option<u32> {
+    match network {
+        P2pNetwork::Mainnet => Some(1_046_400),
+        P2pNetwork::Testnet => Some(1_028_500),
+        P2pNetwork::Regtest => None,
+    }
 }
 
 /// Create at 0600 and write, so a spend-capable file is never briefly
@@ -780,7 +1067,7 @@ pub fn discard_checkpoint(path: &Path) {
 async fn connect_peer(
     network: P2pNetwork,
     extra: &[String],
-    _prior: &[String],
+    excluded: &[(String, tokio::time::Instant)],
     on_wait: impl FnMut(PeerWait),
 ) -> ZeckResult<Peer> {
     // Regtest gets no patience. Its only candidates are the addresses the
@@ -795,9 +1082,25 @@ async fn connect_peer(
     // `connect_to_any` resolves the seeds itself, so each pass re-resolves
     // them. That matters: the seeders rotate what they hand out, so a later
     // pass is not just the same refusals again but partly different peers.
-    acquire_with_retry(budget, || connect_to_any(network, extra, 4), on_wait)
-        .await
-        .map_err(ZeckError::from)
+    //
+    // Exclusions are re-read on every pass, so a silent peer whose skip has
+    // expired is back in the running during a long wait rather than only on
+    // the next reconnect.
+    acquire_with_retry(
+        budget,
+        || {
+            let now = tokio::time::Instant::now();
+            let active: Vec<String> = excluded
+                .iter()
+                .filter(|(_, until)| now < *until)
+                .map(|(addr, _)| addr.clone())
+                .collect();
+            async move { connect_to_any_except(network, extra, &active, 4).await }
+        },
+        on_wait,
+    )
+    .await
+    .map_err(ZeckError::from)
 }
 
 /// Keep making passes at the network until one yields a peer or `budget` is
@@ -873,7 +1176,7 @@ where
         let mut remaining = delay;
         while !remaining.is_zero() {
             on_wait(PeerWait {
-                reason,
+                reason: reason.clone(),
                 next_attempt,
                 retry_in: remaining,
             });
@@ -899,6 +1202,317 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that completes the handshake and then answers nothing — what
+    /// a zcashd node in initial block download does with `getheaders`. It
+    /// advertises a height well past anything a regtest scan would need, as
+    /// the reporter's node did.
+    async fn silent_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(answer_handshake_only(stream));
+            }
+        });
+        addr
+    }
+
+    /// Complete the handshake on `stream` and ignore everything after it,
+    /// returning once the client has closed the connection.
+    async fn answer_handshake_only(mut stream: tokio::net::TcpStream) {
+        use crate::p2p::wire::{encode_message, encode_version};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut header = [0u8; 24];
+        while stream.read_exact(&mut header).await.is_ok() {
+            let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            if header[4..11] == *b"version" {
+                let version = encode_version(170_160, "/MagicBean:6.20.0/", 3_500_000, 1, 0);
+                let _ = stream
+                    .write_all(&encode_message(P2pNetwork::Regtest, "version", &version))
+                    .await;
+                let _ = stream
+                    .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
+                    .await;
+            }
+            // Everything else, `getheaders` included, is ignored.
+        }
+    }
+
+    /// A peer that notes, for each connection after the first, whether the
+    /// one before it had already been closed when this one arrived — the
+    /// fact Zebra's one-inbound-connection-per-IP rule turns on.
+    ///
+    /// "Already closed" allows a short grace for the close to be read, so the
+    /// check measures the order of close and dial rather than which task the
+    /// scheduler happened to run first. Without the fix the old connection
+    /// stays open until the new handshake completes, which this peer holds
+    /// back until the grace has expired, so no grace can hide the bug.
+    async fn one_connection_per_ip_peer() -> (String, std::sync::Arc<std::sync::Mutex<Vec<bool>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut previous: Option<tokio::sync::oneshot::Receiver<()>> = None;
+            while let Ok((stream, _)) = listener.accept().await {
+                if let Some(closed) = previous.take() {
+                    let was_closed = tokio::time::timeout(Duration::from_millis(500), closed)
+                        .await
+                        .is_ok();
+                    record.lock().unwrap().push(was_closed);
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                previous = Some(rx);
+                tokio::spawn(async move {
+                    answer_handshake_only(stream).await;
+                    let _ = tx.send(());
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The reported failure: "Every Zcash peer is busy" after every page.
+    ///
+    /// Zebra keeps one inbound connection per IP and drops a second one after
+    /// the handshake. The Sovright fallback nodes are always candidates, so a
+    /// replacement dialled while the current connection is still open is very
+    /// likely to reach the node already in use, which then refuses it as a
+    /// duplicate. The current connection must be closed before any dial.
+    #[tokio::test]
+    async fn reconnect_closes_the_current_connection_before_dialling() {
+        let (addr, seen) = one_connection_per_ip_peer().await;
+        let peers = vec![addr];
+        let peer = connect_peer(P2pNetwork::Regtest, &peers, &[], |_| {})
+            .await
+            .unwrap();
+        let (waits, _waits_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut fetcher = PageFetcher {
+            peer,
+            locator: [0; 32],
+            empty_replies: 0,
+            fetched: 0,
+            floor: 0,
+            network: P2pNetwork::Regtest,
+            peers,
+            silent: Vec::new(),
+            silence_exclusion: PEER_RECONNECT_DELAY,
+            waits,
+        };
+
+        fetcher.reconnect().await.unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true],
+            "the old connection was still open when its replacement was dialled"
+        );
+    }
+
+    /// The reported failure: Argos connected to the user's own node every
+    /// thirty seconds, forever, printing nothing. A silent peer must be
+    /// named in the progress, dropped, and — when nothing else is left —
+    /// end the scan with an explanation rather than spin.
+    #[tokio::test]
+    async fn a_peer_that_never_answers_is_reported_and_not_asked_again() {
+        let peer = silent_peer().await;
+        // Per process: two `cargo test` runs on one machine must not delete
+        // each other's checkpoint mid-run.
+        let dir = std::env::temp_dir().join(format!(
+            "argos-scan-silent-peer-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silent.checkpoint");
+        discard_checkpoint(&path);
+
+        let mut notices = Vec::new();
+        let outcome = tokio::time::timeout(
+            READ_TIMEOUT * 3,
+            run_sprout_scan(
+                &[[0x11; 32]],
+                P2pNetwork::Regtest,
+                std::slice::from_ref(&peer),
+                None,
+                &path,
+                |tick| {
+                    if let Some(wait) = tick.peer_wait {
+                        notices.push(wait);
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("a silent peer must not stall the scan indefinitely");
+        // The error says progress is saved, so a file must exist even
+        // though the scan stopped before its first CHECKPOINT_EVERY blocks.
+        let saved = path.exists();
+        discard_checkpoint(&path);
+
+        let err = outcome.expect_err("a scan whose only peer is silent cannot succeed");
+        let text = err.to_string();
+        assert!(text.contains("stopped answering"), "{text}");
+        assert!(text.contains(&peer), "the silent peer is named: {text}");
+        assert!(text.contains("initial block download"), "{text}");
+        assert!(
+            saved,
+            "an aborted scan must leave the checkpoint it claims to"
+        );
+        assert!(
+            notices.iter().any(|w| w.reason
+                == PeerWaitReason::PeerSilent {
+                    peer: peer.clone(),
+                    named_by_user: true
+                }),
+            "the silence must reach the progress callback: {notices:?}"
+        );
+    }
+
+    /// The budget must actually run out. With one candidate the scan ended
+    /// through "no other peer", so the budget itself was never reached and
+    /// setting it to u32::MAX failed no test. Ten silent peers exhaust it.
+    #[tokio::test]
+    async fn the_failure_budget_runs_out_across_silent_peers() {
+        let mut peers = Vec::new();
+        for _ in 0..(MAX_EMPTY_REPLIES + 2) {
+            peers.push(silent_peer().await);
+        }
+        let dir =
+            std::env::temp_dir().join(format!("argos-scan-budget-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("budget.checkpoint");
+        discard_checkpoint(&path);
+
+        let mut silences = 0u32;
+        let outcome = tokio::time::timeout(
+            READ_TIMEOUT * (MAX_EMPTY_REPLIES + 4),
+            run_sprout_scan(
+                &[[0x11; 32]],
+                P2pNetwork::Regtest,
+                &peers,
+                None,
+                &path,
+                |tick| {
+                    if matches!(
+                        tick.peer_wait.map(|w| w.reason),
+                        Some(PeerWaitReason::PeerSilent { .. })
+                    ) {
+                        silences += 1;
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("the budget must end the scan");
+        discard_checkpoint(&path);
+
+        let text = outcome.expect_err("every peer is silent").to_string();
+        assert_eq!(silences, MAX_EMPTY_REPLIES + 1, "{text}");
+        assert!(
+            text.contains(&format!("{} attempts in a row", MAX_EMPTY_REPLIES + 1)),
+            "{text}"
+        );
+        // Only the last failure is known to be silence; the count is not
+        // claimed to be N silent peers.
+        assert!(text.contains("the most recent"), "{text}");
+    }
+
+    /// A silent peer is skipped for a while, not for the rest of the run:
+    /// a user whose only reachable node stalls once must get it back.
+    #[tokio::test]
+    async fn a_silent_peer_is_dialled_again_once_its_skip_expires() {
+        let peer = silent_peer().await;
+        let peers = vec![peer.clone()];
+        let now = tokio::time::Instant::now();
+
+        let skipped = [(peer.clone(), now + Duration::from_secs(60))];
+        assert!(
+            connect_peer(P2pNetwork::Regtest, &peers, &skipped, |_| {})
+                .await
+                .is_err(),
+            "while its skip lasts the peer is not dialled"
+        );
+
+        let expired = [(peer.clone(), now - Duration::from_millis(1))];
+        connect_peer(P2pNetwork::Regtest, &peers, &expired, |_| {})
+            .await
+            .expect("an expired skip admits the peer again");
+    }
+
+    /// A peer that sent too much, or kept talking without answering, is
+    /// working: it is rotated away from, but not skipped, and not reported
+    /// as silent or in initial block download.
+    #[tokio::test]
+    async fn a_failure_that_is_not_silence_neither_skips_nor_blames_the_peer() {
+        let peer = silent_peer().await;
+        let peers = vec![peer.clone()];
+        let first = connect_peer(P2pNetwork::Regtest, &peers, &[], |_| {})
+            .await
+            .unwrap();
+        let (waits, mut waits_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut fetcher = PageFetcher {
+            peer: first,
+            locator: [0; 32],
+            empty_replies: 0,
+            fetched: 0,
+            floor: 0,
+            network: P2pNetwork::Regtest,
+            peers,
+            silent: Vec::new(),
+            silence_exclusion: PEER_RECONNECT_DELAY,
+            waits,
+        };
+
+        let outcome = fetcher
+            .on_request_failure(crate::p2p::peer::PeerError::Oversized { mb: 400 }, 0)
+            .await
+            .expect("one failure is within the budget");
+        assert!(outcome.is_none(), "rotate and try again");
+        assert!(
+            fetcher.silent.is_empty(),
+            "not skipped: {:?}",
+            fetcher.silent
+        );
+        assert_eq!(fetcher.empty_replies, 1, "but charged");
+        assert!(waits_rx.try_recv().is_err(), "and not announced as silence");
+    }
+
+    #[test]
+    fn a_silent_peer_notice_says_why_and_what_happens_next() {
+        let named = PeerWait {
+            reason: PeerWaitReason::PeerSilent {
+                peer: "127.0.0.1:8233".to_owned(),
+                named_by_user: true,
+            },
+            next_attempt: 2,
+            retry_in: Duration::ZERO,
+        }
+        .to_string();
+        // Names the node, and words it for both surfaces: the GUI has no
+        // --peer flag, only a "Custom peers" box.
+        assert!(named.contains("127.0.0.1:8233"), "{named}");
+        assert!(!named.contains("--peer"), "{named}");
+        assert!(named.contains("initial block download"), "{named}");
+        assert!(named.contains("Skipping it for about"), "{named}");
+
+        let public = PeerWait {
+            reason: PeerWaitReason::PeerSilent {
+                peer: "203.0.113.9:8233".to_owned(),
+                named_by_user: false,
+            },
+            next_attempt: 2,
+            retry_in: Duration::ZERO,
+        }
+        .to_string();
+        assert!(public.contains("203.0.113.9:8233"), "{public}");
+        assert!(!public.contains("initial block download"), "{public}");
+    }
 
     /// Two different key sets must never share a checkpoint. Resuming into
     /// the wrong tree would produce a valid-looking scan that finds nothing,
@@ -1167,36 +1781,86 @@ mod tests {
         );
     }
 
-    /// A finished checkpoint needs no peer. The GUI's sweep re-runs a
-    /// completed scan to get its notes back; demanding a connection first
-    /// made that depend on a free slot it never used, and with persistent
-    /// retry would have made it wait out the budget for nothing.
+    /// A checkpoint records its network, so resuming one elsewhere is
+    /// refused before any peer is asked — its cursor would otherwise read as
+    /// the tip of a shorter chain and hand back the other network's notes.
     #[tokio::test]
-    async fn a_finished_scan_does_not_need_a_peer() {
-        let network = P2pNetwork::Testnet;
-        let target = network.sprout_scan_bound().loop_limit();
+    async fn a_checkpoint_from_another_network_is_refused() {
         let mut scanner = SproutScanner::new(&[[0x11; 32]]);
         scanner
-            .scan_block_at(&[], [0xCD; 32], target - 1)
+            .scan_block_at(&[], [0xCD; 32], 2_000_000)
+            .expect("an empty block");
+        let dir = std::env::temp_dir().join("argos-scan-network-tag-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mainnet.checkpoint");
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+
+        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Testnet, &[], None, &path, |_| {})
+            .await
+            .expect_err("a mainnet checkpoint must not resume on testnet");
+        discard_checkpoint(&path);
+        assert!(err.to_string().contains("different network"), "{err}");
+    }
+
+    /// Checkpoints written before files recorded a network came from
+    /// Canopy-bounded scans, so one past this network's Canopy height was
+    /// made elsewhere — the rule that used to guard every resume.
+    #[tokio::test]
+    async fn an_untagged_checkpoint_past_this_networks_canopy_is_refused() {
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner
+            .scan_block_at(&[], [0xCD; 32], 1_046_399)
+            .expect("an empty block");
+        let dir = std::env::temp_dir().join("argos-scan-legacy-network-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.checkpoint");
+        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
+
+        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Testnet, &[], None, &path, |_| {})
+            .await
+            .expect_err("mainnet's Canopy height is past testnet's");
+        discard_checkpoint(&path);
+        assert!(err.to_string().contains("different network"), "{err}");
+    }
+
+    /// A scan saved at the old Canopy end is not finished. It used to be
+    /// returned offline as a complete result, which is how a note migrated
+    /// after Canopy came back as spendable. Resuming must go on to the tip,
+    /// so it reaches for a peer instead of returning.
+    #[tokio::test]
+    async fn a_scan_saved_at_canopy_catches_up_instead_of_finishing() {
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner
+            .scan_block_at(&[], [0xCD; 32], 1_046_399)
             .expect("an empty block");
 
-        let dir = std::env::temp_dir().join("argos-scan-finished-test");
+        let dir = std::env::temp_dir().join("argos-scan-canopy-resume-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("finished.checkpoint");
-        save_checkpoint(&scanner, &path).unwrap();
+        let path = dir.join("canopy.checkpoint");
+        // Written as every existing checkpoint was — before files recorded
+        // their network — because those are the scans this must continue.
+        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
 
-        // The only peer offered is an address nothing listens on, and the
-        // scan must still succeed: only a run that never dials can.
-        let result = run_sprout_scan(
-            &[[0x11; 32]],
-            network,
-            &["127.0.0.1:1".to_owned()],
-            &path,
-            |_| {},
+        // Nothing listens on the only peer offered, so a run that goes on
+        // to fetch can only still be waiting for a connection — or fail
+        // for want of one. What it must not do is hand back a result.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_sprout_scan(
+                &[[0x11; 32]],
+                P2pNetwork::Mainnet,
+                &["127.0.0.1:1".to_owned()],
+                None,
+                &path,
+                |_| {},
+            ),
         )
         .await;
         discard_checkpoint(&path);
-        assert!(result.expect("finishes offline").notes.is_empty());
+        assert!(
+            !matches!(outcome, Ok(Ok(_))),
+            "a scan saved at Canopy must not be reported as complete"
+        );
     }
 
     #[tokio::test]
@@ -1205,6 +1869,7 @@ mod tests {
             &[],
             P2pNetwork::Regtest,
             &[],
+            None,
             Path::new("/tmp/argos/none.checkpoint"),
             |_| {},
         )
@@ -1222,7 +1887,7 @@ mod tests {
         let path = dir.join("corrupt.checkpoint");
         std::fs::write(&path, b"not a checkpoint").unwrap();
 
-        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Regtest, &[], &path, |_| {})
+        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Regtest, &[], None, &path, |_| {})
             .await
             .expect_err("a corrupt checkpoint must not be ignored");
         let text = err.to_string();

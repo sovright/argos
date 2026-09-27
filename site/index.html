@@ -479,9 +479,10 @@
             <p>
               Lightwalletd compact blocks omit the encrypted data needed to find Sprout notes.
               When a wallet file has no cached note witness, Argos must trial-decrypt every
-              historical JoinSplit by reading full blocks from genesis to Canopy. On mainnet that
-              means 1,046,400 blocks and roughly 26 GB of transfer. Progress is saved, blocks are
-              discarded after processing, and the scan can resume later.
+              historical JoinSplit by reading full blocks from genesis to the chain tip. It cannot
+              stop at Canopy, because Sprout notes are still created and spent after it. On mainnet
+              that means about 3.5 million blocks and roughly 280 GB of transfer. Progress is saved,
+              blocks are discarded after processing, and the scan can resume later.
             </p>
           </details>
           <details>

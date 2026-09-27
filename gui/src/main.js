@@ -1004,15 +1004,20 @@ async function runSproutScan() {
       passphrase: walletFile ? walletFile.passphrase : null,
       network: $("network-select").value,
       dataDir: $("data-dir").value.trim(),
+      // Only to confirm the chain tip independently of the peer; the scan
+      // itself reads blocks from the p2p network.
+      lightwalletdUrl: $("lightwalletd-url").value.trim(),
       peers,
     });
     $("sprout-scan-bar").hidden = true;
+    // The core's own sentence, so the GUI and CLI give the same caveat.
+    const caveat = report.tip_warning ? ` ${report.tip_warning}` : "";
     setStatus(
       "sprout-scan-status",
-      report.notes_found > 0
+      (report.notes_found > 0
         ? `✓ Found ${report.notes_found} note(s), ${fmt(report.total_zatoshis)}. ` +
           `${report.spent_notes} already spent.`
-        : `Scan complete. No unspent Sprout notes were found for these keys.`,
+        : `Scan complete. No unspent Sprout notes were found for these keys.`) + caveat,
       report.notes_found > 0 ? "success" : "",
     );
     // Found money needs somewhere to go.
@@ -1027,8 +1032,8 @@ async function runSproutScan() {
 
 /// Sweep what the scan found.
 ///
-/// Resuming a finished scan is instant — the checkpoint is already at the
-/// target — so this is a button rather than another six hours.
+/// Resuming a saved scan only catches up from its checkpoint to the current
+/// tip, so this is a button rather than another full scan.
 async function runSproutScanSweep() {
   const destination = $("sprout-scan-destination").value.trim();
   if (!destination) {
@@ -1136,13 +1141,13 @@ $("sprout-scan-run").addEventListener("click", runSproutScan);
       // and the line says why nothing is moving, so a busy network does not
       // look like a hung app. The sentence comes from the backend.
       if (p.peerWait) {
-        setStatus("sprout-scan-status", `${p.peerWait} Safe to stop; progress is saved.`, "");
+        setStatus("sprout-scan-status", `${p.peerWait} Safe to stop; progress is saved every 500 blocks.`, "");
         return;
       }
       setStatus(
         "sprout-scan-status",
         `Scanning ${p.height.toLocaleString()} / ${p.target.toLocaleString()} ` +
-          `(${pct.toFixed(1)}%) — ${p.notesFound} note(s) found. Safe to stop; progress is saved.`,
+          `(${pct.toFixed(1)}%) — ${p.notesFound} note(s) found. Safe to stop; progress is saved every 500 blocks.`,
         "",
       );
     });
@@ -1625,7 +1630,9 @@ phrase, or clear the seed phrase to scan the pasted key.",
       handle = await invoke("start_matched_recovery", {
         searchId: matched.searchId,
         matchId: matched.matchId,
-        config: matchedConfig,
+        // The backend refuses a memo this sweep cannot send before scanning;
+        // the sweep screen has no memo field to remove it from afterwards.
+        config: { ...matchedConfig, sweep_memo: state.memo },
       });
       state.matchedRecovery = null;
       clearMatchedRecoveryUi();
@@ -1641,6 +1648,8 @@ phrase, or clear the seed phrase to scan the pasted key.",
           path: walletFile ? walletFile.path : null,
           passphrase: walletFile ? walletFile.passphrase : null,
           sapling_keys: typedSaplingKeys,
+          // Checked against the key source before the scan starts.
+          sweep_memo: state.memo,
         },
       });
     } else {
@@ -2150,6 +2159,9 @@ function renderSweepProposal(proposal) {
     preview.textContent =
       `Estimated donation: ${fmt(donated)} · Net to you: ${fmt(net)}. ` +
       "This is an estimate — the donation is computed per-account at the real network fee when the sweep runs, and may be lower (or 0) if your funds are spread across several small accounts. The actual donated amount is shown when the sweep completes.";
+  } else if (proposal.donation_note && state.donationEnabled && $("donate-enabled").checked) {
+    // This route can never include a donation, whatever the fee.
+    preview.textContent = proposal.donation_note;
   } else if (state.donationEnabled && $("donate-enabled").checked && state.scanConfig?.network !== "testnet") {
     // The proposal estimate uses a fixed ZIP-317 floor; execution uses the
     // real fee. Right at the donation threshold the two can disagree by a
@@ -2212,6 +2224,7 @@ $("execute-sweep").addEventListener("click", async () => {
       outcome.total_donation_zatoshis || 0,
       donationRate,
       outcome.error,
+      outcome.donation_note,
     );
     goTo("complete");
   } catch (err) {
@@ -2223,7 +2236,7 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
-function renderCompleteScreen(results, skipped, donated, donationRate, error) {
+function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote) {
   $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
   if (state.retainedAddressSearchId) {
     state.addressMatchRecoveryLocked = false;
@@ -2347,7 +2360,9 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error) {
     donationEl.textContent = `Donated ${fmt(donated)} to the Argos project — thank you for supporting Zcash recovery.`;
   } else if (donationRequested && broadcast > 0) {
     donationEl.hidden = false;
-    donationEl.textContent =
+    // A route that never sends a donation says so itself; the fee-threshold
+    // reason below is true only on the seed-phrase route.
+    donationEl.textContent = donationNote ||
       "No donation was sent: at the real network fee, each account's share fell below the 0.001 ZEC minimum, so your full balance went to your address.";
   } else {
     donationEl.hidden = true;

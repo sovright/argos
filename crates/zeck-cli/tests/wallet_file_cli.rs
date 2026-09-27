@@ -465,3 +465,200 @@ fn a_seedless_wallet_and_a_key_file_still_merge() {
         "no key material may be printed back, got: {stdout}"
     );
 }
+
+/// A wallet with no seed phrase sweeps without a memo, and a dropped memo
+/// can lose an exchange deposit. `--memo` is therefore refused, and refused
+/// before the scan: finding out after hours of scanning is not a refusal
+/// anyone would thank us for.
+#[test]
+fn a_seedless_sweep_refuses_a_memo_before_scanning() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("memo"),
+        "sweep",
+        "--destination",
+        "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf",
+        "--memo",
+        "exchange deposit 12345",
+        "--dry-run",
+    ]);
+
+    assert!(
+        !out.status.success(),
+        "a memo that cannot be sent must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("memo") && stderr.contains("seed phrase"),
+        "the refusal must say why, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("scan can take hours"),
+        "the memo must be refused before the scan starts, got:\n{stderr}"
+    );
+}
+
+/// The donation is the same shape of trap with no funds at stake, so it is
+/// reported rather than refused — the GUI sends one by default.
+#[test]
+fn a_seedless_sweep_says_it_sends_no_donation() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("donation"),
+        "sweep",
+        "--destination",
+        "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf",
+        "--donation-rate",
+        "0.10",
+        "--dry-run",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sends no donation"),
+        "a requested donation that will not be sent must be named, got:\n{stderr}"
+    );
+}
+
+/// A real mainnet Sapling address to sweep to, derived from the BIP-39 test
+/// vector rather than copied from anywhere: `show-keys` needs no network.
+fn test_vector_sapling_address(dir: &std::path::Path) -> String {
+    let seed = dir.join("seed.txt");
+    std::fs::write(
+        &seed,
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon art",
+    )
+    .expect("write seed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let out = argos(&[
+        "--seed-file",
+        seed.to_str().expect("utf-8"),
+        "--num-accounts",
+        "1",
+        "show-keys",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("Sapling address")
+                .map(|a| a.trim().to_owned())
+        })
+        .unwrap_or_else(|| panic!("show-keys printed no Sapling address:\n{stdout}"))
+}
+
+/// Reported: `scan-sprout --destination … --lightwalletd-url nonono` started
+/// an hours-long scan whose only use of that server — broadcasting the sweep
+/// — could never work. The address must be refused before the scan, and the
+/// progress line must not claim a checkpoint exists before one is written.
+#[test]
+fn scan_sprout_refuses_an_unusable_server_before_scanning() {
+    let dir = std::env::temp_dir().join(format!("argos-sprout-url-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let destination = test_vector_sapling_address(&dir);
+    let wallet = fixture(SPROUT_PLAINTEXT);
+
+    // Killed at a deadline rather than awaited: a build that does not refuse
+    // goes on to scan mainnet for hours, and a failing test must neither
+    // hang nor load public peers for longer than it takes to fail.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_argos"))
+        .args([
+            "--wallet-file",
+            wallet.to_str().expect("utf-8"),
+            "--data-dir",
+            dir.to_str().expect("utf-8"),
+            "--accept-tos",
+            "--lightwalletd-url",
+            "nonono",
+            "scan-sprout",
+            "--destination",
+            &destination,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("argos binary should run");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().expect("piped"), &mut stderr)
+        .expect("stderr");
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = status.unwrap_or_else(|| {
+        panic!("scan-sprout started scanning instead of refusing the server:\n{stderr}")
+    });
+    assert!(!status.success(), "must refuse, got:\n{stderr}");
+    assert!(
+        stderr.contains("--lightwalletd-url"),
+        "must name the flag:\n{stderr}"
+    );
+    // Matches the banner as it now reads; the old "Progress is saved to"
+    // wording no longer exists anywhere, so asserting its absence guarded
+    // nothing.
+    assert!(
+        !stderr.contains("Progress will be saved to"),
+        "refused before the scan, so the scan's progress banner must not appear:\n{stderr}"
+    );
+}
+
+/// A key-source flag that the chosen command never reads must be refused,
+/// not silently dropped. Now that every top-level flag is `global`, it is
+/// natural to type `argos show-keys --sprout-key-file …` and assume the key
+/// was used.
+#[test]
+fn a_key_source_the_command_would_ignore_is_refused() {
+    let key = key_file("ignored-sprout-key", "SKplaceholder\n");
+    let key = key.to_str().unwrap();
+    for args in [
+        vec!["show-keys", "--sprout-key-file", key],
+        vec!["scan", "--sprout-key-file", key, "--accept-tos"],
+        vec![
+            "sweep-sprout",
+            "--sprout-key-file",
+            key,
+            "--destination",
+            "zs1x",
+            "--accept-tos",
+        ],
+        vec!["scan-sprout", "--seed-file", key, "--accept-tos"],
+        vec!["scan-sprout", "--sapling-key-file", key, "--accept-tos"],
+    ] {
+        let out = argos(&args);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is not used by"),
+            "{args:?}: the refusal must say the flag would be ignored, got:\n{stderr}"
+        );
+    }
+}

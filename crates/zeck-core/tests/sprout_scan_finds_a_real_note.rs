@@ -248,6 +248,7 @@ async fn a_scan_finds_a_note_it_was_never_told_about() {
         &[a_sk],
         P2pNetwork::Regtest,
         &[NODE_P2P.to_owned()],
+        None,
         &checkpoint,
         |tick| {
             if tick.height % 400 == 0 {

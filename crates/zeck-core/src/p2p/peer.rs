@@ -54,7 +54,16 @@ const PROTOCOL_VERSION: u32 = 170_160;
 const USER_AGENT: &str = "/Argos-recovery:1.0/";
 
 /// How long to wait for any single message.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Per message, not per request: a slow link that delivers a block at least
+/// this often never trips it.
+#[cfg(not(test))]
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Unit tests stand up fake peers that go silent on purpose, several per
+/// test; thirty seconds each would make the suite crawl without testing
+/// anything a shorter wait does not.
+#[cfg(test)]
+pub const READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long to wait for the TCP connection itself.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,15 +75,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// that a million-block sweep is not a million round trips.
 const GETDATA_BATCH: usize = 16;
 
+/// The most blocks one page may name. What an honest `headers` reply holds;
+/// a hostile one can list ~14,700, so callers truncate to this before asking
+/// for bodies.
+pub const MAX_PAGE_BLOCKS: usize = 160;
+
+/// Zcash's consensus limit on a block's serialized size.
+const MAX_BLOCK_BYTES: usize = 2_000_000;
+
 /// Ceiling on the block bytes held from one `get_blocks` call.
 ///
-/// Requests are batched at 16, but every batch's bodies accumulate in one
-/// map until the whole page is fetched. A peer answering a maximum-size
-/// `headers` page (~14,700 minimal entries) with maximum-size blocks could
-/// drive that to tens of gigabytes resident before a single block is
-/// parsed. Real Sprout-era blocks average a few kilobytes, so this is far
-/// above anything honest and still bounds the hostile case.
-const MAX_BLOCKS_BYTES: usize = 256 * 1024 * 1024;
+/// Every batch's bodies accumulate in one map until the page is fetched, so
+/// this is what one page may hold resident. Sized for a full page of
+/// maximum-size blocks, because the scan now runs to the chain tip and the
+/// 2022-23 spam era has pages near that: the earlier 256 MB, sized for
+/// Sprout-era blocks of a few kilobytes, refused honest peers there on
+/// every page.
+const MAX_BLOCKS_BYTES: usize = MAX_PAGE_BLOCKS * MAX_BLOCK_BYTES;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
@@ -84,8 +101,21 @@ pub enum PeerError {
         #[source]
         source: std::io::Error,
     },
+    /// Connecting took too long. Only the TCP connect; a peer that connects
+    /// and then says nothing is [`PeerError::Silent`].
     #[error("timed out waiting for {what}")]
     Timeout { what: String },
+    /// The peer sent nothing at all for a full [`READ_TIMEOUT`]. The one
+    /// failure that is genuinely silence — what a zcashd node in initial
+    /// block download does with `getheaders`.
+    #[error("the peer sent nothing for {secs}s while we waited for {what}")]
+    Silent { what: String, secs: u64 },
+    /// The peer kept talking but never sent what was asked for.
+    #[error("the peer never sent {what}; it kept sending other messages")]
+    Unanswered { what: String },
+    /// More block data for one request than any honest reply holds.
+    #[error("the peer sent over {mb} MB of block data for one request")]
+    Oversized { mb: usize },
     #[error("connection closed by the peer")]
     Closed,
     #[error(transparent)]
@@ -106,6 +136,9 @@ pub enum PeerError {
 pub struct Peer {
     stream: TcpStream,
     network: P2pNetwork,
+    /// The candidate string this peer was dialled as, so a caller can
+    /// exclude exactly that candidate from a later pass.
+    dialled_as: String,
     /// The peer's advertised chain height, from its `version`.
     pub peer_height: u32,
 }
@@ -146,10 +179,29 @@ impl Peer {
         let mut peer = Self {
             stream,
             network,
+            dialled_as: addr.to_owned(),
             peer_height: 0,
         };
         peer.handshake().await?;
         Ok(peer)
+    }
+
+    /// The address this peer was dialled as.
+    pub fn dialled_as(&self) -> &str {
+        &self.dialled_as
+    }
+
+    /// Close the connection now, rather than whenever this value is dropped.
+    ///
+    /// A caller replacing this peer must call it before dialling the
+    /// replacement. Zebra keeps one inbound connection per IP and drops a
+    /// second after the handshake, so a connection left open while the next
+    /// is dialled makes the node already in use refuse its own replacement.
+    ///
+    /// Errors are ignored: a connection that cannot be shut down cleanly is
+    /// one the peer has already given up on, which is the goal here.
+    pub async fn close(&mut self) {
+        let _ = self.stream.shutdown().await;
     }
 
     /// Exchange `version`/`verack`.
@@ -218,8 +270,9 @@ impl Peer {
         let mut header_bytes = [0u8; super::wire::HEADER_LEN];
         timeout(READ_TIMEOUT, self.stream.read_exact(&mut header_bytes))
             .await
-            .map_err(|_| PeerError::Timeout {
+            .map_err(|_| PeerError::Silent {
                 what: "a message header".to_owned(),
+                secs: READ_TIMEOUT.as_secs(),
             })?
             .map_err(|err| {
                 if err.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -236,8 +289,9 @@ impl Peer {
         let mut payload = vec![0u8; header.payload_len];
         timeout(READ_TIMEOUT, self.stream.read_exact(&mut payload))
             .await
-            .map_err(|_| PeerError::Timeout {
+            .map_err(|_| PeerError::Silent {
                 what: format!("the {} payload", header.command),
+                secs: READ_TIMEOUT.as_secs(),
             })?
             .map_err(|err| {
                 if err.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -266,7 +320,7 @@ impl Peer {
                 self.send("pong", &payload).await?;
             }
         }
-        Err(PeerError::Timeout {
+        Err(PeerError::Unanswered {
             what: format!("a {wanted} message"),
         })
     }
@@ -319,7 +373,7 @@ impl Peer {
 
             while outstanding > 0 {
                 if budget == 0 {
-                    return Err(PeerError::Timeout {
+                    return Err(PeerError::Unanswered {
                         what: "the blocks this peer was asked for".to_owned(),
                     });
                 }
@@ -333,13 +387,9 @@ impl Peer {
                     continue; // unsolicited relay; not ours to use
                 }
                 held += bytes.len();
-                if held > MAX_BLOCKS_BYTES {
-                    return Err(PeerError::Timeout {
-                        what: format!(
-                            "a reasonable amount of block data (this peer sent over {} MB \
-                             for one request)",
-                            held / 1_000_000
-                        ),
+                if bytes.len() > MAX_BLOCK_BYTES || held > MAX_BLOCKS_BYTES {
+                    return Err(PeerError::Oversized {
+                        mb: held / 1_000_000,
                     });
                 }
                 if blocks.insert(hash, bytes).is_none() && chunk.contains(&hash) {
@@ -391,6 +441,20 @@ mod tests {
 
     fn version_payload(user_agent: &str, start_height: u32) -> Vec<u8> {
         encode_version(PROTOCOL_VERSION, user_agent, start_height, 7, 1_700_000_000)
+    }
+
+    /// The scan now runs through the 2022-23 spam era, whose blocks approach
+    /// the consensus maximum. A full honest page must fit, or every page
+    /// there fails and the scan rotates peers until it gives up.
+    #[test]
+    fn a_full_page_of_maximum_size_blocks_fits_the_byte_cap() {
+        const { assert!(MAX_BLOCKS_BYTES >= MAX_PAGE_BLOCKS * MAX_BLOCK_BYTES) };
+        const {
+            assert!(
+                MAX_PAGE_BLOCKS == 160,
+                "what an honest `headers` reply holds"
+            )
+        };
     }
 
     /// `start_height` sits after a variable-length string, so a fixed offset
