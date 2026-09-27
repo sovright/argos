@@ -623,8 +623,43 @@ fn scan_sprout_refuses_an_unusable_server_before_scanning() {
         stderr.contains("--lightwalletd-url"),
         "must name the flag:\n{stderr}"
     );
+    // Matches the banner as it now reads; the old "Progress is saved to"
+    // wording no longer exists anywhere, so asserting its absence guarded
+    // nothing.
     assert!(
-        !stderr.contains("Progress is saved to"),
-        "refused before the scan, so nothing may claim progress is being saved:\n{stderr}"
+        !stderr.contains("Progress will be saved to"),
+        "refused before the scan, so the scan's progress banner must not appear:\n{stderr}"
     );
+}
+
+/// A key-source flag that the chosen command never reads must be refused,
+/// not silently dropped. Now that every top-level flag is `global`, it is
+/// natural to type `argos show-keys --sprout-key-file …` and assume the key
+/// was used.
+#[test]
+fn a_key_source_the_command_would_ignore_is_refused() {
+    let key = key_file("ignored-sprout-key", "SKplaceholder\n");
+    let key = key.to_str().unwrap();
+    for args in [
+        vec!["show-keys", "--sprout-key-file", key],
+        vec!["scan", "--sprout-key-file", key, "--accept-tos"],
+        vec![
+            "sweep-sprout",
+            "--sprout-key-file",
+            key,
+            "--destination",
+            "zs1x",
+            "--accept-tos",
+        ],
+        vec!["scan-sprout", "--seed-file", key, "--accept-tos"],
+        vec!["scan-sprout", "--sapling-key-file", key, "--accept-tos"],
+    ] {
+        let out = argos(&args);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is not used by"),
+            "{args:?}: the refusal must say the flag would be ignored, got:\n{stderr}"
+        );
+    }
 }

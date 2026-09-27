@@ -346,6 +346,52 @@ fn command_requires_tos(command: &Commands) -> bool {
     false
 }
 
+/// Refuse a key-source flag the chosen command never reads.
+///
+/// Every top-level flag is `global`, so clap accepts
+/// `argos show-keys --sprout-key-file …` and would otherwise run without the
+/// key, leaving the user believing it was checked. Scan-tuning flags
+/// (`--birthday`, `--gap-limit`, …) are deliberately not policed here:
+/// ignoring one cannot misdirect funds, and `show-keys` accepts them for
+/// compatibility.
+fn refuse_unconsumed_key_sources(cli: &Cli) -> Result<()> {
+    let (name, reads_seed, reads_wallet, reads_sapling, reads_sprout) = match &cli.command {
+        Commands::ShowKeys => ("show-keys", true, true, true, false),
+        Commands::InspectWallet => ("inspect-wallet", false, true, true, false),
+        Commands::Scan => ("scan", true, true, true, false),
+        Commands::Sweep { .. } => ("sweep", true, true, true, false),
+        Commands::ScanSprout { .. } => ("scan-sprout", false, true, false, true),
+        Commands::SweepSprout { .. } => ("sweep-sprout", false, true, false, false),
+    };
+    let supplied = [
+        ("--seed-file", cli.seed_file.is_some(), reads_seed),
+        ("--wallet-file", cli.wallet_file.is_some(), reads_wallet),
+        (
+            "--sapling-key-file",
+            cli.sapling_key_file.is_some(),
+            reads_sapling,
+        ),
+        (
+            "--sprout-key-file",
+            cli.sprout_key_file.is_some(),
+            reads_sprout,
+        ),
+    ];
+    for (flag, given, read) in supplied {
+        if given && !read {
+            let hint = if flag == "--sprout-key-file" {
+                " A raw Sprout key is recovered with `argos scan-sprout --sprout-key-file <file>`."
+            } else {
+                ""
+            };
+            bail!(
+                "{flag} is not used by the {name} command, so the key it names would be ignored.{hint}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Read a legacy wallet file into key material.
 ///
 /// The passphrase is prompted for, never taken as a flag: a flag would
@@ -1261,6 +1307,7 @@ fn install_regtest_params_if_requested() -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose)?;
+    refuse_unconsumed_key_sources(&cli)?;
 
     install_regtest_params_if_requested()?;
 
@@ -1386,6 +1433,7 @@ async fn main() -> Result<()> {
         destination,
         memo,
         donation_rate,
+        donor_email,
         ..
     } = &cli.command
     {
@@ -1401,10 +1449,13 @@ async fn main() -> Result<()> {
                     network,
                 )?;
             }
-            if donation_rate.is_some() {
+            // --donor-email only ever labels a donation, so it gets the same
+            // note: nothing it names will be sent.
+            if donation_rate.is_some() || donor_email.is_some() {
                 eprintln!(
-                    "Note: --donation-rate applies only when sweeping from a seed phrase. \
-                     This wallet has none, so this sweep sends no donation."
+                    "Note: a donation (--donation-rate, --donor-email) applies only when \
+                     sweeping from a seed phrase. This wallet has none, so this sweep sends \
+                     no donation."
                 );
             }
         }
