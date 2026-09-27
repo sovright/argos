@@ -39,8 +39,9 @@ use tracing_subscriber::EnvFilter;
     version
 )]
 struct Cli {
-    /// Path to a plain-text file containing the 24-word seed phrase. Must be
-    /// chmod 600 (owner read/write only) on Unix.
+    /// Path to a plain-text file containing the BIP-39 seed phrase (12, 15,
+    /// 18, 21 or 24 words). Must be chmod 600 (owner read/write only) on
+    /// Unix.
     #[arg(long)]
     seed_file: Option<PathBuf>,
 
@@ -100,7 +101,9 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     gap_limit: u32,
 
-    /// First index in the additional complete transparent range for HD seed sources.
+    /// First index in the additional complete transparent range for HD seed
+    /// sources. The range is imported for account 0 only: higher accounts
+    /// get only the addresses the scan derives for them.
     #[arg(long, default_value_t = 0)]
     transparent_index_start: u32,
 
@@ -113,23 +116,24 @@ struct Cli {
     #[arg(long)]
     transparent_change: bool,
 
-    /// Wallet birthday as a block height, for `scan` and `sweep`. Heights
-    /// before Sapling activation (419200 on mainnet, the default) scan from
-    /// Sapling activation, the earliest height lightwalletd can serve.
-    /// `scan-sprout` is not affected: it always scans the Sprout era from
-    /// height 1, including every block before Sapling activation.
+    /// Wallet birthday as a block height, for `scan` and `sweep`. The scan
+    /// starts no earlier than one block past Sapling activation (419201 on
+    /// mainnet), so the default of 419200 and anything below it scan from
+    /// 419201: the activation block itself is not scanned. Overridden by
+    /// --birthday-date and --birthday-auto-detect. `scan-sprout` is not
+    /// affected: it always scans the Sprout era from height 1.
     #[arg(long, default_value_t = 419_200)]
     birthday: u32,
 
     /// Wallet creation date (YYYY-MM-DD). Estimates the birthday height from
-    /// it, using lightwalletd.
+    /// it, using lightwalletd. Overrides --birthday.
     #[arg(long, conflicts_with = "birthday_auto_detect")]
     birthday_date: Option<String>,
 
     /// Probe lightwalletd to auto-detect the wallet birthday from on-chain
     /// history. Overrides --birthday; cannot be combined with
     /// --birthday-date. Needs a seed phrase: --seed-file, or a ZecWallet
-    /// Lite wallet.
+    /// Lite wallet whose seed could be decrypted.
     #[arg(long, conflicts_with = "birthday_date")]
     birthday_auto_detect: bool,
 
@@ -185,8 +189,9 @@ enum Commands {
     /// the seed phrase. Prints no keys; no network needed.
     ShowKeys,
 
-    /// Report what Argos can read out of --wallet-file. Purely local: no
-    /// network, and nothing is written anywhere.
+    /// Report what Argos can read out of --wallet-file and/or
+    /// --sapling-key-file. Purely local: no network, and nothing is written
+    /// anywhere.
     InspectWallet,
 
     /// Scan the blockchain and report balances for derived or imported keys.
@@ -201,15 +206,17 @@ enum Commands {
         #[arg(long)]
         destination: String,
 
-        /// Optional memo attached to shielded outputs (max 512 bytes). Applies
-        /// only when sweeping a seed phrase or a ZecWallet Lite wallet; other
-        /// sources ignore it.
+        /// Optional memo attached to shielded outputs (max 512 bytes). Sent
+        /// only when sweeping from a seed phrase (--seed-file, or a ZecWallet
+        /// Lite wallet whose seed could be decrypted). Any other source sends
+        /// no memo, so the sweep refuses one rather than drop it.
         #[arg(long)]
         memo: Option<String>,
 
         /// Fraction of recovered funds to donate to the project (e.g. 0.10 for
-        /// 10%). Omit to skip. Applies only when sweeping a seed phrase or a
-        /// ZecWallet Lite wallet; other sources ignore it.
+        /// 10%). Omit to skip. Sent only when sweeping from a seed phrase
+        /// (--seed-file, or a ZecWallet Lite wallet whose seed could be
+        /// decrypted) on mainnet. Otherwise no donation is sent.
         #[arg(long)]
         donation_rate: Option<f64>,
 
@@ -217,8 +224,11 @@ enum Commands {
         #[arg(long)]
         donor_email: Option<String>,
 
-        /// Maximum fee in ZEC (e.g. 0.001). The sweep stops with an error
-        /// rather than pay more.
+        /// Maximum total fee in ZEC across the whole sweep (e.g. 0.001).
+        /// Checked before each transaction is broadcast. When the next one
+        /// would take the total over, the sweep stops with an error, but
+        /// transactions already broadcast for earlier accounts cannot be
+        /// recalled.
         #[arg(long, value_parser = parse_zec_to_zatoshis)]
         max_fee: Option<u64>,
 
@@ -238,10 +248,10 @@ enum Commands {
     /// discoverable only by trial-decrypting every JoinSplit, and no Sprout
     /// address index exists anywhere. Expect hours and tens of gigabytes.
     ///
-    /// Scans every block from height 1 through Canopy activation (1,046,400
-    /// on mainnet, 1,028,500 on testnet), so notes received before Sapling
-    /// activation are found too. --birthday
-    /// does not apply: the whole range is always scanned. An interrupted scan
+    /// Scans every block from height 1 up to, but not including, Canopy
+    /// activation (1,046,400 on mainnet, 1,028,500 on testnet), so notes
+    /// received before Sapling activation are found too. --birthday does
+    /// not apply: the whole range is always scanned. An interrupted scan
     /// resumes from its checkpoint under --data-dir.
     ///
     /// A `wallet.dat` almost never needs this — its cached witnesses make
@@ -256,13 +266,17 @@ enum Commands {
 
         /// A Zcash node to fetch blocks from, as `host:port` (zebrad or
         /// zcashd, usually port 8233). Repeatable. Tried alongside the
-        /// public DNS-seed peers rather than instead of them: whichever
-        /// connects first is used.
+        /// public DNS-seed peers rather than instead of them: your peers are
+        /// dialled in the first round, and whichever connects first is used.
+        /// Later rounds try more DNS-seed peers and, on mainnet, four
+        /// fallback nodes run by the Argos project. The peer that serves the
+        /// scan sees which blocks are requested.
         #[arg(long)]
         peer: Vec<String>,
 
         /// Path to sprout-groth16.params (~725 MB). Only needed when sweeping.
-        /// Defaults to $ARGOS_SPROUT_PARAMS, then ~/.zcash-params.
+        /// Defaults to the file named by $ARGOS_SPROUT_PARAMS, then
+        /// ~/.zcash-params/sprout-groth16.params.
         #[arg(long)]
         sprout_params: Option<PathBuf>,
 
@@ -280,12 +294,13 @@ enum Commands {
     SweepSprout {
         /// Bare Sapling address, or a Unified Address with a Sapling receiver.
         /// The value always lands in Sapling because Sprout cannot share a
-        /// transaction with Orchard.
+        /// transaction with Orchard. Broadcast through --lightwalletd-url,
+        /// which must serve --network: the default is a mainnet server.
         #[arg(long)]
         destination: String,
 
-        /// Path to sprout-groth16.params (~725 MB). Defaults to
-        /// $ARGOS_SPROUT_PARAMS, then ~/.zcash-params.
+        /// Path to sprout-groth16.params (~725 MB). Defaults to the file named
+        /// by $ARGOS_SPROUT_PARAMS, then ~/.zcash-params/sprout-groth16.params.
         #[arg(long)]
         sprout_params: Option<PathBuf>,
 
@@ -1300,6 +1315,27 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    // Only the seed-phrase sweep attaches a memo or a donation; the
+    // imported-key and transparent-only sweeps send neither. Say so before
+    // the scan, not after it. A memo is refused outright, because a dropped
+    // exchange-deposit memo can lose the deposit. A donation is only reported.
+    if let Commands::Sweep {
+        memo,
+        donation_rate,
+        ..
+    } = &cli.command
+    {
+        if seed_phrase.is_none() {
+            argos_core::refuse_memo_without_seed(memo.as_deref())?;
+            if donation_rate.is_some() {
+                eprintln!(
+                    "Note: --donation-rate applies only when sweeping from a seed phrase. \
+                     This wallet has none, so this sweep sends no donation."
+                );
+            }
+        }
+    }
 
     // A wallet with no HD seed cannot be scanned as accounts, but its
     // transparent keys can still be recovered directly — no account model

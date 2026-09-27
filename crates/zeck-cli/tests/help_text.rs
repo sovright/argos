@@ -19,10 +19,28 @@ fn help(args: &[&str]) -> String {
 #[test]
 fn top_level_help_matches_behaviour() {
     let h = help(&[]);
-    // scan.rs clamps the birthday to Sapling activation: a lightwalletd scan
-    // cannot see anything earlier, so "0" never meant genesis.
+    // scan.rs clamps the birthday to `sapling_activation_height + 1`, so "0"
+    // never meant genesis -- and the activation block itself is skipped.
     assert!(!h.contains("from genesis"), "{h}");
-    assert!(h.contains("Sapling activation"), "{h}");
+    assert!(h.contains("one block past Sapling activation"), "{h}");
+    assert!(h.contains("419201"), "{h}");
+    assert!(
+        h.contains("the activation block itself is not scanned"),
+        "{h}"
+    );
+    // `resolve_birthday` prefers auto-detect, then the date, then --birthday.
+    assert!(
+        h.contains("Overridden by --birthday-date and --birthday-auto-detect"),
+        "{h}"
+    );
+    // Auto-detect branches on a recovered seed, not on the file type.
+    assert!(h.contains("whose seed could be decrypted"), "{h}");
+    // `Mnemonic::from_phrase` takes every BIP-39 length, not only 24.
+    assert!(!h.contains("24-word"), "{h}");
+    assert!(h.contains("12, 15, 18, 21 or 24 words"), "{h}");
+    // scan.rs imports the complete transparent range only when
+    // `account.index == 0`.
+    assert!(h.contains("account 0 only"), "{h}");
     // ...and must not read as though that clamp applies to Sprout.
     assert!(h.contains("scan-sprout` is not affected"), "{h}");
     // The default server is mainnet whatever --network says, and the
@@ -53,11 +71,19 @@ fn show_keys_help_says_it_prints_addresses_not_keys() {
 #[test]
 fn sweep_help_matches_what_each_route_honours() {
     let h = help(&["sweep"]);
-    // `enforce_max_fee` returns an error; nothing is skipped silently.
+    // `enforce_max_fee` returns an error; nothing is skipped silently. The
+    // cap is cumulative and checked inside the broadcast loop, so earlier
+    // accounts may already be on-chain when it trips.
     assert!(!h.contains("is skipped"), "{h}");
-    // The transparent-only and imported-key routes take only destination
-    // and max fee, so memo and donation apply to seed sources alone.
-    assert!(h.contains("seed phrase or a ZecWallet Lite wallet"), "{h}");
+    assert!(h.contains("Maximum total fee"), "{h}");
+    assert!(h.contains("cannot be recalled"), "{h}");
+    // The seedless routes (`wallet_seed().is_none()`) send neither memo nor
+    // donation: `refuse_memo_without_seed` refuses the memo, and testnet
+    // turns the donation off even with a seed.
+    assert!(!h.contains("seed phrase or a ZecWallet Lite wallet"), "{h}");
+    assert!(h.contains("whose seed could be decrypted"), "{h}");
+    assert!(h.contains("refuses one rather than drop it"), "{h}");
+    assert!(h.contains("on mainnet"), "{h}");
     // `sapling_receiver`: the transparent leg of a seedless wallet (its own
     // route, and inside `imported_sweep`) needs a Sapling receiver.
     assert!(h.contains("Sapling receiver"), "{h}");
@@ -76,8 +102,30 @@ fn scan_sprout_help_does_not_promise_an_exclusive_peer() {
     assert!(h.contains("from height 1"), "{h}");
     assert!(h.contains("before Sapling activation"), "{h}");
     assert!(h.contains("1,046,400") && h.contains("1,028,500"), "{h}");
+    // `SproutScanBound::UpTo` is exclusive.
+    assert!(h.contains("up to, but not including, Canopy"), "{h}");
+    // `resolve_seeds` appends the project's fallback nodes on mainnet.
+    assert!(h.contains("fallback nodes run by the Argos project"), "{h}");
+    // `default_params_path` treats the variable as the file itself.
+    assert!(h.contains("the file named by $ARGOS_SPROUT_PARAMS"), "{h}");
     assert!(h.contains("--birthday does not apply"), "{h}");
     // It also takes --wallet-file, and broadcasts through lightwalletd.
     assert!(h.contains("--wallet-file"), "{h}");
     assert!(h.contains("lightwalletd"), "{h}");
+}
+
+#[test]
+fn sweep_sprout_help_names_the_network_it_broadcasts_to() {
+    // `sweep_sprout_notes` runs `validate_lightwalletd_network`, and the
+    // default server is mainnet.
+    let h = help(&["sweep-sprout"]);
+    assert!(h.contains("must serve --network"), "{h}");
+    assert!(h.contains("the file named by $ARGOS_SPROUT_PARAMS"), "{h}");
+}
+
+#[test]
+fn inspect_wallet_help_names_both_inputs() {
+    // The key-source match accepts a key file alone for inspect-wallet.
+    let h = help(&["inspect-wallet"]);
+    assert!(h.contains("--sapling-key-file"), "{h}");
 }
