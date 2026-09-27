@@ -345,6 +345,26 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
     }))
 }
 
+/// Refuse, before anything is broadcast, a destination a seedless sweep's
+/// transparent leg cannot pay.
+///
+/// The imported sweep sends its Sapling legs first and its transparent leg
+/// last, and only the transparent leg needs a Sapling receiver. An
+/// Orchard-only address used to pass every check up to that point, so the
+/// Sapling legs broadcast and the transparent funds were then left behind.
+/// A key set with no transparent keys has no transparent leg and is not
+/// constrained.
+pub fn refuse_destination_the_transparent_leg_cannot_reach(
+    keys: &argos_wallet_import::ImportedKeys,
+    destination: &str,
+    network: ZeckNetwork,
+) -> ZeckResult<()> {
+    if keys.transparent.is_empty() {
+        return Ok(());
+    }
+    sapling_receiver(destination, network).map(|_| ())
+}
+
 /// Extract the Sapling receiver from a destination address.
 ///
 /// The sweep pays into a Sapling output: a bundle with outputs but no
@@ -934,5 +954,57 @@ mod cumulative_fee_tests {
             check_transparent_fee(3_000, 2, 9_999_999, None).is_ok(),
             "no cap, no limit"
         );
+    }
+}
+
+#[cfg(test)]
+mod seedless_destination_tests {
+    use super::*;
+    use crate::models::ZeckNetwork;
+
+    /// An Orchard-only unified address, built from a key rather than pasted,
+    /// as `destination_tests` does for Sapling.
+    fn orchard_only_ua() -> String {
+        use zcash_address::unified::{Address, Encoding, Receiver};
+        let sk = orchard::keys::SpendingKey::from_bytes([7u8; 32]).expect("a valid spending key");
+        let fvk = orchard::keys::FullViewingKey::from(&sk);
+        let address = fvk.address_at(0u32, orchard::keys::Scope::External);
+        Address::try_from_items(vec![Receiver::Orchard(address.to_raw_address_bytes())])
+            .expect("an Orchard-only unified address is valid under ZIP 316")
+            .encode(&zcash_protocol::consensus::NetworkType::Main)
+    }
+
+    fn with_transparent_key() -> argos_wallet_import::ImportedKeys {
+        argos_wallet_import::ImportedKeys {
+            transparent: vec![argos_wallet_import::keys::TransparentKey {
+                secret: secrecy::Secret::new([1u8; 32]),
+                provenance: argos_wallet_import::Provenance::Standalone,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Reported against #231: an Orchard-only address passes the sweep's
+    /// destination check, the Sapling leg broadcasts, and only then does the
+    /// transparent leg fail — a half-finished sweep with the transparent
+    /// funds stranded. Refused before anything moves instead.
+    #[test]
+    fn a_destination_the_transparent_leg_cannot_reach_is_refused_up_front() {
+        let err = refuse_destination_the_transparent_leg_cannot_reach(
+            &with_transparent_key(),
+            &orchard_only_ua(),
+            ZeckNetwork::Mainnet,
+        )
+        .expect_err("transparent funds cannot reach an Orchard-only address");
+        assert!(err.to_string().contains("Sapling"), "{err}");
+
+        // With no transparent keys there is no transparent leg, and Orchard
+        // is a fine destination for the Sapling legs.
+        refuse_destination_the_transparent_leg_cannot_reach(
+            &argos_wallet_import::ImportedKeys::default(),
+            &orchard_only_ua(),
+            ZeckNetwork::Mainnet,
+        )
+        .expect("no transparent leg, nothing to refuse");
     }
 }

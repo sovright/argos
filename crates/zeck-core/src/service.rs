@@ -454,6 +454,14 @@ impl RecoveryService {
         refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
         if session.runtime.key_source.wallet_seed()?.is_none() {
             if let Some(keys) = session.runtime.key_source.imported_keys() {
+                // Before the Sapling legs broadcast, not after: the
+                // transparent leg is last and is the only one that needs a
+                // Sapling receiver.
+                crate::transparent_recovery::refuse_destination_the_transparent_leg_cannot_reach(
+                    keys,
+                    &request.destination,
+                    session.runtime.network,
+                )?;
                 return sweep_imported_session(&session.runtime, keys, &request).await;
             }
         }
@@ -855,6 +863,9 @@ fn build_seedless_sweep_proposal(
     }
 
     if let Some(account_index) = transparent_account {
+        // Refused in the preview too: its transparent transaction needs a
+        // Sapling receiver the address may not have.
+        crate::transparent_recovery::sapling_receiver(&destination, network)?;
         let fee_zatoshis =
             crate::transparent_recovery::transparent_sweep_fee(network, transparent_utxos)?;
         if transparent_zatoshis <= fee_zatoshis {
@@ -2534,6 +2545,49 @@ mod tests {
             total_zatoshis: 3_000_000,
             has_activity: true,
             status: "ok".to_owned(),
+        }
+    }
+
+    /// The positive half of the memo rules. Every other memo test is a
+    /// refusal, so nothing failed if the seed-phrase route stopped carrying
+    /// the user's memo — or stopped writing the default when none is given,
+    /// which is why `--memo` help now names it.
+    #[test]
+    fn a_seed_route_sweep_carries_the_memo_or_the_default() {
+        let request = |memo: Option<&str>| SweepRequest {
+            destination: derived_destination(),
+            memo: memo.map(str::to_owned),
+            max_fee_zatoshis: None,
+            donation_rate: None,
+            donor_email: None,
+        };
+        let given = build_sweep_proposal(
+            &progress_with_account(seedless_test_account()),
+            request(Some("exchange deposit 8821")),
+            ZeckNetwork::Mainnet,
+            "",
+        )
+        .unwrap();
+        assert!(!given.transactions.is_empty());
+        for tx in &given.transactions {
+            assert_eq!(tx.memo.as_deref(), Some("exchange deposit 8821"), "{tx:?}");
+        }
+
+        for absent in [None, Some("   ")] {
+            let default = build_sweep_proposal(
+                &progress_with_account(seedless_test_account()),
+                request(absent),
+                ZeckNetwork::Mainnet,
+                "",
+            )
+            .unwrap();
+            for tx in &default.transactions {
+                assert_eq!(
+                    tx.memo.as_deref(),
+                    Some(super::RECOVERY_MEMO_DEFAULT),
+                    "{tx:?}"
+                );
+            }
         }
     }
 

@@ -212,8 +212,10 @@ enum Commands {
 
         /// Optional memo attached to shielded outputs (max 512 bytes). Sent
         /// only when sweeping from a seed phrase (--seed-file, or a ZecWallet
-        /// Lite wallet whose seed could be decrypted). Any other source sends
-        /// no memo, so the sweep refuses one rather than drop it.
+        /// Lite wallet whose seed could be decrypted); without --memo, that
+        /// sweep still writes the memo "Argos recovery". Any other source
+        /// sends no memo at all, so the sweep refuses one rather than drop
+        /// it.
         #[arg(long)]
         memo: Option<String>,
 
@@ -1325,6 +1327,7 @@ async fn main() -> Result<()> {
     // the scan, not after it. A memo is refused outright, because a dropped
     // exchange-deposit memo can lose the deposit. A donation is only reported.
     if let Commands::Sweep {
+        destination,
         memo,
         donation_rate,
         ..
@@ -1332,6 +1335,16 @@ async fn main() -> Result<()> {
     {
         if seed_phrase.is_none() {
             argos_core::refuse_memo_without_seed(memo.as_deref())?;
+            // Before the scan: the transparent leg is swept last and needs a
+            // Sapling receiver, so an Orchard-only address would otherwise
+            // be found out after the Sapling legs had already broadcast.
+            if let Some(source) = imported.as_ref() {
+                argos_core::transparent_recovery::refuse_destination_the_transparent_leg_cannot_reach(
+                    source.keys(),
+                    destination,
+                    network,
+                )?;
+            }
             if donation_rate.is_some() {
                 eprintln!(
                     "Note: --donation-rate applies only when sweeping from a seed phrase. \

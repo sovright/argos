@@ -80,8 +80,12 @@ fn sweep_help_matches_what_each_route_honours() {
     // The seedless routes (`wallet_seed().is_none()`) send neither memo nor
     // donation: `refuse_memo_without_seed` refuses the memo, and testnet
     // turns the donation off even with a seed.
-    assert!(!h.contains("seed phrase or a ZecWallet Lite wallet"), "{h}");
     assert!(h.contains("whose seed could be decrypted"), "{h}");
+    // `normalized_memo_text` writes RECOVERY_MEMO_DEFAULT when no memo is
+    // given, so omitting --memo does not mean "no memo" on the seed route —
+    // which matters to anyone sending to an exchange address that must not
+    // carry one.
+    assert!(h.contains("Argos recovery"), "{h}");
     assert!(h.contains("refuses one rather than drop it"), "{h}");
     assert!(h.contains("on mainnet"), "{h}");
     // `sapling_receiver`: the transparent leg of a seedless wallet (its own
@@ -110,7 +114,10 @@ fn scan_sprout_help_does_not_promise_an_exclusive_peer() {
     assert!(h.contains("the file named by $ARGOS_SPROUT_PARAMS"), "{h}");
     assert!(h.contains("--birthday does not apply"), "{h}");
     // It also takes --wallet-file, and broadcasts through lightwalletd.
-    assert!(h.contains("--wallet-file"), "{h}");
+    // Pinned to the prose: with top-level flags global (#232), the option
+    // list names --wallet-file on every subcommand, so a bare
+    // `contains("--wallet-file")` would pass with the sentence deleted.
+    assert!(h.contains("--wallet-file, or both"), "{h}");
     assert!(h.contains("lightwalletd"), "{h}");
 }
 
