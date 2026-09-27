@@ -104,8 +104,13 @@ drop every stored key; `zcashd_seed_covers_stored_keys` in `zeck-core`
 proves this against the fixtures. The chain's counters are what let the
 import say the stored keys are complete: `accountCounter > 0` means
 `z_getnewaccount` unified accounts exist that are never stored and are not
-scanned (`UnscannedSeedAccounts`), and fewer stored keys than the legacy
-counters is `MissingDerivedKeys`. A seed that fails verification, and any
+scanned (`UnscannedSeedAccounts`), and a legacy-chain index with no stored
+key is `MissingDerivedKeys`. That second check is by key *identity*, never
+by count: a derived key counts only if a `key`/`ckey` (or
+`sapzkey`/`csapzkey`) record exists whose `keymeta` (`sapzkeymeta`) names
+exactly its legacy-account keypath under this seed's fingerprint. Counting
+let every `importprivkey` key stand in for a missing derived one, so a
+damaged wallet with imports read as Complete — do not go back to counts. A seed that fails verification, and any
 pre-5.0 `hdseed`/`chdseed`, is `UnrecoveredSeed`. Both encrypted golden
 fixtures still carry a live plaintext `mnemonicphrase` beside
 `cmnemonicphrase` (written by v6.20.0 `encryptwallet`), so the seed of such a
