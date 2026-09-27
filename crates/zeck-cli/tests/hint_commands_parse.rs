@@ -126,10 +126,10 @@ fn every_printed_command_line_parses() {
 
     assert!(
         failures.is_empty(),
-        "these command lines are printed by argos but do not parse:\n\n{}\n\n\
-         A top-level option such as --wallet-file must come before the \
-         subcommand: `argos --wallet-file <path> scan`, not \
-         `argos scan --wallet-file <path>`.",
+        "these command lines are printed by argos but rejected by its parser:\n\n{}\n\n\
+         The clap error under each one says why. A `PLACEHOLDER` value is a `<…>` \
+         from the hint; if the flag takes a number or an enum, give the hint a \
+         real example value instead.",
         failures.join("\n\n")
     );
 }
