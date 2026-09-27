@@ -104,7 +104,9 @@ impl From<pczt::sapling::ParseError> for ProofKeyError {
 /// Does not broadcast. The caller decides that, so a dry run and a real
 /// sweep cannot diverge in how the transaction was built.
 ///
-/// `max_fee_zatoshis` is the user's `--max-fee`. It is enforced twice and
+/// `max_fee_zatoshis` is the user's `--max-fee`, a cap on the whole sweep;
+/// `prior_fee_zatoshis` is what this sweep's earlier transactions already
+/// paid, and each gate checks the two together. It is enforced twice and
 /// never after broadcast: once against the proposal, before any proving
 /// work, and once against the fee actually encoded in the extracted
 /// transaction. The second is the one that matters — the first is the
@@ -119,6 +121,7 @@ pub fn build_imported_sapling_sweep<P>(
     destination: &ZcashAddress,
     prover: &LocalTxProver,
     max_fee_zatoshis: Option<u64>,
+    prior_fee_zatoshis: u64,
 ) -> ZeckResult<Transaction>
 where
     P: zcash_protocol::consensus::Parameters + Clone,
@@ -152,7 +155,7 @@ where
     // long before anything could be broadcast. Same helper the HD sweep
     // path uses, so the two cannot drift on what "over the cap" means.
     let planned_fee_zatoshis = crate::service::proposal_fee_zatoshis(&proposal)?;
-    crate::service::enforce_max_fee(planned_fee_zatoshis, max_fee_zatoshis)?;
+    enforce_cumulative_fee(prior_fee_zatoshis, planned_fee_zatoshis, max_fee_zatoshis)?;
 
     let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
         _,
@@ -318,9 +321,29 @@ where
              fee {actual_fee_zatoshis}; refusing to broadcast"
         )));
     }
-    crate::service::enforce_max_fee(actual_fee_zatoshis, max_fee_zatoshis)?;
+    enforce_cumulative_fee(prior_fee_zatoshis, actual_fee_zatoshis, max_fee_zatoshis)?;
 
     Ok(tx)
+}
+
+/// `--max-fee` is a cap on the whole sweep, as on the HD route: refuse a
+/// transaction whose fee would take what the sweep has paid so far over it.
+/// Checking each transaction against the full cap on its own let a wallet
+/// with several Sapling keys pay several times what the user set.
+pub(crate) fn enforce_cumulative_fee(
+    prior_fee_zatoshis: u64,
+    next_fee_zatoshis: u64,
+    max_fee_zatoshis: Option<u64>,
+) -> ZeckResult<()> {
+    let total = crate::service::checked_fee_total(prior_fee_zatoshis, next_fee_zatoshis)?;
+    match max_fee_zatoshis {
+        Some(cap) if total > cap => Err(ZeckError::MaxFeeExceeded(format!(
+            "the next transaction's fee is {next_fee_zatoshis} zats and this sweep has \
+             already paid {prior_fee_zatoshis}, so the total {total} would exceed the \
+             {cap}-zat cap"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Refuse a fee cap no Sapling sweep could ever satisfy.
@@ -393,6 +416,9 @@ pub struct ImportedSweepOutcome {
     pub transparent_txid: Option<String>,
     pub transparent_zatoshis: u64,
     pub transparent_fee_zatoshis: u64,
+    /// Fees paid by the Sapling transactions already broadcast. The
+    /// transparent leg counts these against `--max-fee`.
+    pub sapling_fee_zatoshis: u64,
     /// As `sapling_leg_completed`, for the transparent pool.
     pub transparent_leg_completed: bool,
 }
@@ -467,6 +493,7 @@ async fn sweep_imported_wallet_into(
                 &runtime.lightwalletd_url,
                 destination,
                 max_fee_zatoshis,
+                outcome.sapling_fee_zatoshis,
             )
             .await?
             {
@@ -593,6 +620,7 @@ async fn sweep_imported_sapling_leg(
                 &recipient,
                 &prover,
                 max_fee_zatoshis,
+                outcome.sapling_fee_zatoshis,
             )
         };
 
@@ -631,6 +659,12 @@ async fn sweep_imported_sapling_leg(
                     )));
                 }
                 outcome.sapling_txids.push(tx.txid().to_string());
+                // Counted only once broadcast: a transaction the node
+                // rejected paid nothing.
+                outcome.sapling_fee_zatoshis = crate::service::checked_fee_total(
+                    outcome.sapling_fee_zatoshis,
+                    transaction_fee_zatoshis(&tx)?,
+                )?;
             }
             Err(err) => {
                 // "Nothing selectable" is the ordinary shape of an account
@@ -908,6 +942,33 @@ mod routing_tests {
             "a transparent-only wallet must be routed to the transparent sweep, which \
              reaches the network; an error from anywhere earlier means it took the \
              account path and was refused before it got there. Got: {rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cumulative_fee_tests {
+    use super::*;
+
+    /// `--max-fee` caps the whole sweep. Each account's transaction used to
+    /// be checked against the full cap on its own, so four accounts at 60%
+    /// of the cap each paid 240% of it with no error.
+    #[test]
+    fn each_account_is_checked_against_what_the_sweep_has_already_paid() {
+        let cap = Some(10_000);
+        assert!(enforce_cumulative_fee(0, 6_000, cap).is_ok());
+        let err = enforce_cumulative_fee(6_000, 6_000, cap)
+            .expect_err("a second 6,000 fee takes the sweep to 12,000, over 10,000");
+        assert!(matches!(err, ZeckError::MaxFeeExceeded(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("already paid 6000"), "{text}");
+        assert!(
+            enforce_cumulative_fee(6_000, 4_000, cap).is_ok(),
+            "exactly at the cap"
+        );
+        assert!(
+            enforce_cumulative_fee(u64::MAX, 1, None).is_err(),
+            "overflow is refused"
         );
     }
 }

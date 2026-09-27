@@ -38,11 +38,14 @@ use tracing_subscriber::EnvFilter;
                   Sprout, and sweeps recovered funds to a modern shielded address.",
     version
 )]
+// Every flag here is `global` so it parses on either side of the
+// subcommand: the printed next-step hints (`argos scan-sprout --wallet-file …`)
+// put it after, and users copy those verbatim.
 struct Cli {
     /// Path to a plain-text file containing the BIP-39 seed phrase (12, 15,
     /// 18, 21 or 24 words). Must be chmod 600 (owner read/write only) on
     /// Unix.
-    #[arg(long)]
+    #[arg(long, global = true)]
     seed_file: Option<PathBuf>,
 
     /// Path to a legacy wallet file to recover keys from: a zcashd
@@ -50,7 +53,7 @@ struct Cli {
     /// writes to this file. If the wallet is encrypted you are prompted
     /// for its passphrase; there is deliberately no flag for it, so it
     /// cannot land in shell history or `ps` output.
-    #[arg(long, conflicts_with = "seed_file")]
+    #[arg(long, global = true, conflicts_with = "seed_file")]
     wallet_file: Option<PathBuf>,
 
     /// File holding a raw Sprout spending key (`SK…` mainnet / `ST…`
@@ -60,7 +63,7 @@ struct Cli {
     /// A file rather than a flag, for the same reason the wallet passphrase
     /// is prompt-only: a spending key passed as an argument lands in shell
     /// history and in `ps` output for every user on the box (T-S6).
-    #[arg(long)]
+    #[arg(long, global = true)]
     sprout_key_file: Option<PathBuf>,
 
     /// File holding Sapling extended spending keys
@@ -73,11 +76,11 @@ struct Cli {
     ///
     /// Combinable with `--wallet-file`: a user may hold a wallet *and* a
     /// paper key for an address that wallet never knew about.
-    #[arg(long, conflicts_with = "seed_file")]
+    #[arg(long, global = true, conflicts_with = "seed_file")]
     sapling_key_file: Option<PathBuf>,
 
     /// Directory for wallet database and block cache.
-    #[arg(long, default_value = "./argos_data")]
+    #[arg(long, global = true, default_value = "./argos_data")]
     data_dir: PathBuf,
 
     /// lightwalletd gRPC endpoint(s). Comma-separated URLs are tried in order.
@@ -86,6 +89,7 @@ struct Cli {
     /// https://testnet.zec.rocks:443.
     #[arg(
         long,
+        global = true,
         visible_alias = "server",
         default_value = argos_core::lightwalletd::DEFAULT_MAINNET_LIGHTWALLETD
     )]
@@ -94,26 +98,26 @@ struct Cli {
     /// Scan exactly this many accounts (overrides --gap-limit). Also how many
     /// accounts show-keys prints (default 20). Seed sources only: an
     /// imported key set is scanned in full, one account per key.
-    #[arg(long)]
+    #[arg(long, global = true)]
     num_accounts: Option<u32>,
 
     /// Stop after this many consecutive empty accounts (ignored when --num-accounts is set).
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, global = true, default_value_t = 20)]
     gap_limit: u32,
 
     /// First index in the additional complete transparent range for HD seed
     /// sources. The range is imported for account 0 only: higher accounts
     /// get only the addresses the scan derives for them.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, global = true, default_value_t = 0)]
     transparent_index_start: u32,
 
     /// Number of indices in the additional complete transparent range,
     /// counted from --transparent-index-start.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, global = true, default_value_t = 1000)]
     transparent_index_count: u32,
 
     /// Also scan the transparent change branch for HD seed sources.
-    #[arg(long)]
+    #[arg(long, global = true)]
     transparent_change: bool,
 
     /// Wallet birthday as a block height, for `scan` and `sweep`. The scan
@@ -122,32 +126,32 @@ struct Cli {
     /// 419201: the activation block itself is not scanned. Overridden by
     /// --birthday-date and --birthday-auto-detect. `scan-sprout` is not
     /// affected: it always scans the Sprout era from height 1.
-    #[arg(long, default_value_t = 419_200)]
+    #[arg(long, global = true, default_value_t = 419_200)]
     birthday: u32,
 
     /// Wallet creation date (YYYY-MM-DD). Estimates the birthday height from
     /// it, using lightwalletd. Overrides --birthday.
-    #[arg(long, conflicts_with = "birthday_auto_detect")]
+    #[arg(long, global = true, conflicts_with = "birthday_auto_detect")]
     birthday_date: Option<String>,
 
     /// Probe lightwalletd to auto-detect the wallet birthday from on-chain
     /// history. Overrides --birthday; cannot be combined with
     /// --birthday-date. Needs a seed phrase: --seed-file, or a ZecWallet
     /// Lite wallet whose seed could be decrypted.
-    #[arg(long, conflicts_with = "birthday_date")]
+    #[arg(long, global = true, conflicts_with = "birthday_date")]
     birthday_auto_detect: bool,
 
     /// Zcash network to use.
-    #[arg(long, value_enum, default_value_t = NetworkArg::Mainnet)]
+    #[arg(long, global = true, value_enum, default_value_t = NetworkArg::Mainnet)]
     network: NetworkArg,
 
     /// Enable debug-level logging from argos-core.
-    #[arg(long)]
+    #[arg(long, global = true)]
     verbose: bool,
 
     /// Accept the Argos Terms of Service non-interactively (for scripted/CI
     /// runs). Records acceptance under --data-dir without prompting.
-    #[arg(long)]
+    #[arg(long, global = true)]
     accept_tos: bool,
 
     #[command(subcommand)]
@@ -208,8 +212,10 @@ enum Commands {
 
         /// Optional memo attached to shielded outputs (max 512 bytes). Sent
         /// only when sweeping from a seed phrase (--seed-file, or a ZecWallet
-        /// Lite wallet whose seed could be decrypted). Any other source sends
-        /// no memo, so the sweep refuses one rather than drop it.
+        /// Lite wallet whose seed could be decrypted); without --memo, that
+        /// sweep still writes the memo "Argos recovery". Any other source
+        /// sends no memo at all, so the sweep refuses one rather than drop
+        /// it.
         #[arg(long)]
         memo: Option<String>,
 
@@ -450,7 +456,7 @@ async fn run_transparent_sweep(
         );
     }
 
-    let outcome = sweep_transparent_only(keys, network, lightwalletd_url, destination, max_fee)
+    let outcome = sweep_transparent_only(keys, network, lightwalletd_url, destination, max_fee, 0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("there was nothing to sweep"))?;
 
@@ -1358,6 +1364,7 @@ async fn main() -> Result<()> {
     // the scan, not after it. A memo is refused outright, because a dropped
     // exchange-deposit memo can lose the deposit. A donation is only reported.
     if let Commands::Sweep {
+        destination,
         memo,
         donation_rate,
         ..
@@ -1365,6 +1372,16 @@ async fn main() -> Result<()> {
     {
         if seed_phrase.is_none() {
             argos_core::refuse_memo_without_seed(memo.as_deref())?;
+            // Before the scan: the transparent leg is swept last and needs a
+            // Sapling receiver, so an Orchard-only address would otherwise
+            // be found out after the Sapling legs had already broadcast.
+            if let Some(source) = imported.as_ref() {
+                argos_core::transparent_recovery::refuse_destination_the_transparent_leg_cannot_reach(
+                    source.keys(),
+                    destination,
+                    network,
+                )?;
+            }
             if donation_rate.is_some() {
                 eprintln!(
                     "Note: --donation-rate applies only when sweeping from a seed phrase. \
@@ -2480,6 +2497,65 @@ mod tests {
             !command_uses_birthday_inputs(&cli.command),
             "show-keys must stay purely local even when global birthday flags are present"
         );
+    }
+
+    /// The Sprout hints print `argos scan-sprout --wallet-file …` and
+    /// `argos sweep-sprout --wallet-file …` as the literal next command.
+    /// A user copies those verbatim, so the flags must parse after the
+    /// subcommand as well as before it.
+    #[test]
+    fn key_source_flags_are_accepted_after_the_subcommand() {
+        let cli = Cli::try_parse_from([
+            "argos",
+            "scan-sprout",
+            "--wallet-file",
+            "wallet.dat",
+            "--destination",
+            "zs1example",
+        ])
+        .expect("the scan-sprout hint must parse as printed");
+        assert_eq!(cli.wallet_file, Some(PathBuf::from("wallet.dat")));
+
+        let cli = Cli::try_parse_from([
+            "argos",
+            "sweep-sprout",
+            "--wallet-file",
+            "wallet.dat",
+            "--destination",
+            "zs1example",
+            "--confirm-sweep",
+        ])
+        .expect("the sweep-sprout hint must parse as printed");
+        assert_eq!(cli.wallet_file, Some(PathBuf::from("wallet.dat")));
+
+        let cli = Cli::try_parse_from([
+            "argos",
+            "scan",
+            "--seed-file",
+            "seed.txt",
+            "--network",
+            "testnet",
+            "--data-dir",
+            "d",
+            "--accept-tos",
+        ])
+        .expect("top-level flags must be accepted after any subcommand");
+        assert_eq!(cli.seed_file, Some(PathBuf::from("seed.txt")));
+        assert!(cli.accept_tos);
+    }
+
+    #[test]
+    fn global_flag_conflicts_still_apply_after_the_subcommand() {
+        let err = Cli::try_parse_from([
+            "argos",
+            "scan",
+            "--seed-file",
+            "seed.txt",
+            "--wallet-file",
+            "wallet.dat",
+        ])
+        .expect_err("--seed-file and --wallet-file must still conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
