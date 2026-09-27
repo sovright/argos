@@ -163,7 +163,12 @@ its notes -- Sprout notes are discoverable solely by trial-decrypting every
 JoinSplit, and no Sprout address index exists anywhere. That scan
 (`sprout_scan` + `p2p`) is wired into both surfaces — `argos scan-sprout`
 and the GUI's scan panel — checkpoints to disk, and resumes from a stored
-block cursor. Its tree is validated against zcashd's own root, and it has
+block cursor. It runs from height 1 to the chain tip on every network. Do
+not bound it at Canopy: ZIP 211 only requires `vpub_old == 0`, so JoinSplits
+after Canopy still spend and create Sprout notes (mainnet has them from
+1,046,418), and stopping early made post-Canopy spends invisible — a
+migrated note read as spendable. Past the last pinned checkpoint the walk is
+tied to a `TipAnchor` from lightwalletd; see `sprout_scan_run`. Its tree is validated against zcashd's own root, and it has
 been driven end to end on regtest: given only a spending key it finds a
 planted note and derives a witness anchoring to the chain's root.
 

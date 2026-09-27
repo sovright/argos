@@ -118,9 +118,12 @@ It is intentionally separate from the ordinary compact-block scan:
 - If all you have is a spending key, or the wallet has no usable note data,
   `scan-sprout` trial-decrypts every historical JoinSplit. Compact blocks do
   not contain those ciphertexts, so this reads full blocks directly from the
-  Zcash P2P network from genesis to Canopy. On mainnet that is 1,046,400
-  blocks, roughly 26 GB of transfer, hours of work, and under 500 MB retained
-  on disk. Progress is checkpointed and resumable.
+  Zcash P2P network from genesis to the chain tip. It does not stop at
+  Canopy: that upgrade only stopped new value entering Sprout, and Sprout
+  notes are still created and spent after it. On mainnet that is about 3.5
+  million blocks, roughly 280 GB of transfer, likely days of work, and under
+  500 MB retained on disk. Progress is checkpointed and resumable, and
+  re-running a finished scan catches up to the new tip.
 
 The Sprout checkpoint is spend-capable: it contains the raw keys, recovered
 note plaintexts, and witnesses needed to resume and sweep. Argos creates it

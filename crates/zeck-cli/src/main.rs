@@ -213,7 +213,13 @@ enum Commands {
     /// For keys with no wallet file behind them — a paper backup, or a
     /// `z_exportkey` string. There is no cheaper route: Sprout notes are
     /// discoverable only by trial-decrypting every JoinSplit, and no Sprout
-    /// address index exists anywhere. Expect hours and tens of gigabytes.
+    /// address index exists anywhere.
+    ///
+    /// Scans every block from height 1 to the chain tip, so notes received
+    /// before Sapling activation are found, and so are Sprout notes created
+    /// or spent after Canopy. Expect days and hundreds of gigabytes of
+    /// download (little disk: blocks are not kept). Re-running resumes from
+    /// the saved checkpoint and catches up to the new tip.
     ///
     /// A `wallet.dat` almost never needs this — its cached witnesses make
     /// `sweep-sprout` work with no scan at all.
@@ -645,6 +651,37 @@ fn collect_sprout_scan_keys(
     Ok(keys)
 }
 
+/// Learn a block near the tip from lightwalletd, for the scan to match.
+///
+/// Best-effort: the Sprout scan does not otherwise need lightwalletd, so a
+/// server that cannot be reached does not stop it. It does weaken it, and
+/// the user is told how.
+async fn sprout_tip_anchor(
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+) -> Option<argos_core::sprout_scan_run::TipAnchor> {
+    match argos_core::sprout_scan_run::independent_tip_anchor(network, lightwalletd_url).await {
+        Ok(anchor) => {
+            eprintln!(
+                "The scan will run to the chain tip, and must pass block {} as lightwalletd \
+                 reports it.",
+                anchor.height
+            );
+            Some(anchor)
+        }
+        Err(err) => {
+            eprintln!(
+                "  ⚠ {}",
+                argos_core::sprout_scan_run::unconfirmed_tip_warning(
+                    network.into(),
+                    &err.to_string()
+                )
+            );
+            None
+        }
+    }
+}
+
 /// Scan the chain for a set of Sprout keys, then optionally sweep what it finds.
 #[allow(clippy::too_many_arguments)]
 async fn scan_sprout(
@@ -677,6 +714,8 @@ async fn scan_sprout(
     println!();
     print_sprout_scan_cost_warning(network);
 
+    let tip_anchor = sprout_tip_anchor(network, lightwalletd_url).await;
+
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
     eprintln!("Progress is saved to {}", checkpoint.display());
     eprintln!("Interrupt with Ctrl-C at any time and re-run to resume.");
@@ -688,6 +727,7 @@ async fn scan_sprout(
         keys,
         p2p_network,
         peers,
+        tip_anchor,
         &checkpoint,
         |tick| {
             // A wait for a peer is printed every time it is announced, not
@@ -794,11 +834,11 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 ///
 /// A Sprout scan cannot use lightwalletd — compact blocks carry no
 /// JoinSplits — so it pulls full blocks from the p2p network for the whole
-/// pre-Canopy chain. Letting that begin without warning would misrepresent a
-/// multi-hour, multi-gigabyte job as an ordinary scan.
+/// chain. Letting that begin without warning would misrepresent a multi-day,
+/// hundreds-of-gigabytes job as an ordinary scan.
 fn print_sprout_scan_cost_warning(network: ZeckNetwork) {
-    // Follows the selected network: quoting mainnet's 1,046,400 blocks and
-    // 26 GB for a testnet scan is simply false.
+    // Follows the selected network: quoting mainnet's figures for a testnet
+    // scan is simply false.
     let cost = SproutScanCost::for_network(network.into());
     eprintln!("  ⚠ RECOVERING THESE NOTES REQUIRES A FULL-BLOCK SCAN");
     eprintln!("    To start one:");
