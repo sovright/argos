@@ -449,9 +449,12 @@ pub async fn sweep_sprout_notes(
     let proving_key = load_params(params_path)?;
     let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
 
-    let (mut client, _endpoint) =
-        crate::lightwalletd::connect_lightwalletd_endpoints_with_retry(lightwalletd_url, None)
-            .await?;
+    // Every other fund-moving path checks that lightwalletd serves the chain
+    // the keys belong to. Without it, the mainnet default under
+    // `--network testnet` would build against the wrong tip and branch id.
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
     let tip = client
         .get_latest_block(ChainSpec {})
         .await

@@ -466,3 +466,69 @@ fn a_seedless_wallet_and_a_key_file_still_merge() {
         "no key material may be printed back, got: {stdout}"
     );
 }
+
+/// A wallet with no seed phrase sweeps without a memo, and a dropped memo
+/// can lose an exchange deposit. `--memo` is therefore refused, and refused
+/// before the scan: finding out after hours of scanning is not a refusal
+/// anyone would thank us for.
+#[test]
+fn a_seedless_sweep_refuses_a_memo_before_scanning() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("memo"),
+        "sweep",
+        "--destination",
+        "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf",
+        "--memo",
+        "exchange deposit 12345",
+        "--dry-run",
+    ]);
+
+    assert!(
+        !out.status.success(),
+        "a memo that cannot be sent must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("memo") && stderr.contains("seed phrase"),
+        "the refusal must say why, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("scan can take hours"),
+        "the memo must be refused before the scan starts, got:\n{stderr}"
+    );
+}
+
+/// The donation is the same shape of trap with no funds at stake, so it is
+/// reported rather than refused — the GUI sends one by default.
+#[test]
+fn a_seedless_sweep_says_it_sends_no_donation() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("donation"),
+        "sweep",
+        "--destination",
+        "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf",
+        "--donation-rate",
+        "0.10",
+        "--dry-run",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sends no donation"),
+        "a requested donation that will not be sent must be named, got:\n{stderr}"
+    );
+}

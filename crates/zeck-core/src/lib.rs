@@ -69,7 +69,7 @@ pub use key_source::{ImportedKeySource, KeySource, KeySourceFingerprint, SeedKey
 /// direct dependency on the parser crate.
 pub use argos_wallet_import;
 pub use models::*;
-pub use service::RecoveryService;
+pub use service::{refuse_memo_without_seed, RecoveryService};
 pub use tos::{
     is_accepted as is_tos_accepted, record_acceptance as record_tos_acceptance, terms_text,
     TosAcceptance, TOS_VERSION,

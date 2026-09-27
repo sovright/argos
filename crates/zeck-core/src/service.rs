@@ -391,6 +391,9 @@ impl RecoveryService {
                 )
             })?;
 
+        if session.runtime.key_source.wallet_seed()?.is_none() {
+            return build_seedless_sweep_proposal(&progress, request, session.runtime.network);
+        }
         build_sweep_proposal(
             &progress,
             request,
@@ -445,6 +448,7 @@ impl RecoveryService {
         // wherever `execute_sweep` is the shared surface.
         if session.runtime.key_source.wallet_seed()?.is_none() {
             if let Some(keys) = session.runtime.key_source.imported_keys() {
+                refuse_memo_without_seed(request.memo.as_deref())?;
                 return sweep_imported_session(&session.runtime, keys, &request).await;
             }
         }
@@ -754,6 +758,42 @@ fn build_sweep_proposal(
         dry_run_default: true,
         warning: Some(warning),
     })
+}
+
+/// Refuse a memo on a sweep that has no seed phrase behind it.
+///
+/// Only the HD sweep attaches a memo. The imported-key and transparent-only
+/// sweeps send none, and a memo dropped silently can lose an exchange
+/// deposit — so the request is refused, not quietly trimmed. A blank memo is
+/// no memo, matching `normalized_memo_text`.
+pub fn refuse_memo_without_seed(memo: Option<&str>) -> ZeckResult<()> {
+    if memo.is_some_and(|memo| !memo.trim().is_empty()) {
+        return Err(ZeckError::InvalidMemo(
+            "a memo can be attached only when sweeping from a seed phrase. This wallet \
+             has no seed phrase, and its sweep sends no memo. Remove the memo, or send \
+             from the destination wallet afterwards if the recipient needs one."
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The proposal for a sweep with no seed phrase behind it.
+///
+/// Such a sweep sends neither a memo nor a donation, so the preview shows
+/// neither: a dry run that promises what the sweep will not deliver is worse
+/// than no dry run.
+fn build_seedless_sweep_proposal(
+    progress: &ScanProgress,
+    request: SweepRequest,
+    network: crate::models::ZeckNetwork,
+) -> ZeckResult<SweepProposal> {
+    refuse_memo_without_seed(request.memo.as_deref())?;
+    let mut proposal = build_sweep_proposal(progress, request, network, "")?;
+    for tx in &mut proposal.transactions {
+        tx.memo = None;
+    }
+    Ok(proposal)
 }
 
 async fn execute_sweep_for_session(
@@ -2181,7 +2221,7 @@ mod tests {
     use secrecy::{ExposeSecret, SecretString};
 
     use super::{
-        build_sweep_proposal, is_distinct_lightwalletd_endpoint,
+        build_seedless_sweep_proposal, build_sweep_proposal, is_distinct_lightwalletd_endpoint,
         standalone_transparent_signing_keys,
     };
     use crate::{
@@ -2352,6 +2392,86 @@ mod tests {
         );
         // donation is strictly less than the amount being sent
         assert!(sweep.donation_zatoshis < sweep.net_zatoshis);
+    }
+
+    fn seedless_test_account() -> AccountBalancePreview {
+        AccountBalancePreview {
+            account_index: 0,
+            sapling_address: "zs-test".to_owned(),
+            unified_address: "u-test".to_owned(),
+            transparent_receive_address: "t-recv".to_owned(),
+            transparent_change_address: "t-change".to_owned(),
+            transparent_utxo_count: 0,
+            sapling_zatoshis: 3_000_000,
+            orchard_zatoshis: 0,
+            transparent_zatoshis: 0,
+            total_zatoshis: 3_000_000,
+            has_activity: true,
+            status: "ok".to_owned(),
+        }
+    }
+
+    /// A wallet with no seed phrase sweeps through the imported-key path,
+    /// which sends neither a memo nor a donation. The preview is where a
+    /// careful user checks before committing, so it must not show either.
+    #[test]
+    fn seedless_proposal_shows_no_memo_and_no_donation() {
+        let proposal = build_seedless_sweep_proposal(
+            &progress_with_account(seedless_test_account()),
+            SweepRequest {
+                destination: derived_destination(),
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: Some(0.10),
+                donor_email: None,
+            },
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+
+        assert!(!proposal.transactions.is_empty());
+        for tx in &proposal.transactions {
+            assert_eq!(tx.memo, None, "{tx:?}");
+            assert_eq!(tx.donation_zatoshis, 0, "{tx:?}");
+        }
+        assert_eq!(proposal.total_donation_zatoshis, 0);
+    }
+
+    /// A dropped memo can lose an exchange deposit, so a memo the seedless
+    /// sweep cannot deliver is refused rather than discarded.
+    #[test]
+    fn seedless_proposal_refuses_a_memo() {
+        let err = build_seedless_sweep_proposal(
+            &progress_with_account(seedless_test_account()),
+            SweepRequest {
+                destination: derived_destination(),
+                memo: Some("exchange deposit 12345".to_owned()),
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ZeckError::InvalidMemo(_)), "{err:?}");
+        assert!(err.to_string().contains("seed phrase"), "{err}");
+    }
+
+    #[test]
+    fn seedless_proposal_treats_a_blank_memo_as_none() {
+        build_seedless_sweep_proposal(
+            &progress_with_account(seedless_test_account()),
+            SweepRequest {
+                destination: derived_destination(),
+                memo: Some("   ".to_owned()),
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
     }
 
     #[test]
