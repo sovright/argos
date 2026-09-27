@@ -532,3 +532,35 @@ fn a_seedless_sweep_says_it_sends_no_donation() {
         "a requested donation that will not be sent must be named, got:\n{stderr}"
     );
 }
+
+/// A key-source flag that the chosen command never reads must be refused,
+/// not silently dropped. Now that every top-level flag is `global`, it is
+/// natural to type `argos show-keys --sprout-key-file …` and assume the key
+/// was used.
+#[test]
+fn a_key_source_the_command_would_ignore_is_refused() {
+    let key = key_file("ignored-sprout-key", "SKplaceholder\n");
+    let key = key.to_str().unwrap();
+    for args in [
+        vec!["show-keys", "--sprout-key-file", key],
+        vec!["scan", "--sprout-key-file", key, "--accept-tos"],
+        vec![
+            "sweep-sprout",
+            "--sprout-key-file",
+            key,
+            "--destination",
+            "zs1x",
+            "--accept-tos",
+        ],
+        vec!["scan-sprout", "--seed-file", key, "--accept-tos"],
+        vec!["scan-sprout", "--sapling-key-file", key, "--accept-tos"],
+    ] {
+        let out = argos(&args);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is not used by"),
+            "{args:?}: the refusal must say the flag would be ignored, got:\n{stderr}"
+        );
+    }
+}
