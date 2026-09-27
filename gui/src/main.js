@@ -1004,15 +1004,20 @@ async function runSproutScan() {
       passphrase: walletFile ? walletFile.passphrase : null,
       network: $("network-select").value,
       dataDir: $("data-dir").value.trim(),
+      // Only to confirm the chain tip independently of the peer; the scan
+      // itself reads blocks from the p2p network.
+      lightwalletdUrl: $("lightwalletd-url").value.trim(),
       peers,
     });
     $("sprout-scan-bar").hidden = true;
+    // The core's own sentence, so the GUI and CLI give the same caveat.
+    const caveat = report.tip_warning ? ` ${report.tip_warning}` : "";
     setStatus(
       "sprout-scan-status",
-      report.notes_found > 0
+      (report.notes_found > 0
         ? `✓ Found ${report.notes_found} note(s), ${fmt(report.total_zatoshis)}. ` +
           `${report.spent_notes} already spent.`
-        : `Scan complete. No unspent Sprout notes were found for these keys.`,
+        : `Scan complete. No unspent Sprout notes were found for these keys.`) + caveat,
       report.notes_found > 0 ? "success" : "",
     );
     // Found money needs somewhere to go.
@@ -1027,8 +1032,8 @@ async function runSproutScan() {
 
 /// Sweep what the scan found.
 ///
-/// Resuming a finished scan is instant — the checkpoint is already at the
-/// target — so this is a button rather than another six hours.
+/// Resuming a saved scan only catches up from its checkpoint to the current
+/// tip, so this is a button rather than another full scan.
 async function runSproutScanSweep() {
   const destination = $("sprout-scan-destination").value.trim();
   if (!destination) {

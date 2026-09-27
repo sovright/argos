@@ -950,6 +950,9 @@ pub struct SproutScanReport {
     pub notes_found: usize,
     pub spent_notes: usize,
     pub total_zatoshis: u64,
+    /// Set when the chain tip could not be confirmed with lightwalletd, so
+    /// the results past the last pinned checkpoint rest on the peer alone.
+    pub tip_warning: Option<String>,
 }
 
 /// Check a raw Sprout spending key and report the address it controls.
@@ -1137,6 +1140,7 @@ fn validate_peer(entry: &str) -> Result<(), &'static str> {
 /// the scan checkpoints as it goes — closing the app and reopening resumes
 /// rather than restarting.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_sprout_scan(
     app: AppHandle,
     keys: Vec<String>,
@@ -1144,6 +1148,7 @@ pub async fn start_sprout_scan(
     passphrase: Option<SecretString>,
     network: String,
     data_dir: String,
+    lightwalletd_url: String,
     peers: Vec<String>,
 ) -> Result<SproutScanReport, String> {
     ensure_tos_accepted(&app)?;
@@ -1161,12 +1166,14 @@ pub async fn start_sprout_scan(
     let p2p: argos_core::p2p::wire::P2pNetwork = network.into();
     let dir = PathBuf::from(data_dir);
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
+    let (tip_anchor, tip_warning) = sprout_tip_anchor(network, &lightwalletd_url).await;
 
     let emitter = app.clone();
     let result = argos_core::sprout_scan_run::run_sprout_scan(
         &decoded,
         p2p,
         &peers,
+        tip_anchor,
         &checkpoint,
         move |tick| {
             let _ = emitter.emit(
@@ -1192,15 +1199,38 @@ pub async fn start_sprout_scan(
         notes_found: result.notes.len(),
         spent_notes: result.spent_notes,
         total_zatoshis: result.total_value(),
+        tip_warning,
     })
+}
+
+/// Learn a block near the tip from lightwalletd for the scan to match, and
+/// the caveat to show if that failed. Best-effort, as in the CLI: the scan
+/// runs either way, but the user must know which kind of result they got.
+async fn sprout_tip_anchor(
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+) -> (
+    Option<argos_core::sprout_scan_run::TipAnchor>,
+    Option<String>,
+) {
+    match argos_core::sprout_scan_run::independent_tip_anchor(network, lightwalletd_url).await {
+        Ok(anchor) => (Some(anchor), None),
+        Err(err) => (
+            None,
+            Some(argos_core::sprout_scan_run::unconfirmed_tip_warning(
+                network.into(),
+                &err.to_string(),
+            )),
+        ),
+    }
 }
 
 /// Sweep the notes a scan found.
 ///
-/// Resuming a finished scan is instant — the checkpoint's cursor is already
-/// at the target, so `run_sprout_scan` skips its loop and goes straight to
-/// producing the notes. That is what makes this cheap enough to be a button
-/// rather than another six hours.
+/// Resuming a saved scan is a short catch-up, not a rescan: it continues from
+/// the checkpoint to the current tip, which is what makes this cheap enough
+/// to be a button. It does need a peer, and it is also what stops a note
+/// spent since the scan from being swept (and rejected) as if it were live.
 ///
 /// Without it, a scan that found funds after six hours was a dead end: the
 /// wallet-file sweep re-reads the file and cannot see scan-found notes, so
@@ -1238,11 +1268,13 @@ pub async fn sweep_sprout_from_scan(
         );
     }
 
+    let (tip_anchor, _) = sprout_tip_anchor(net, &lightwalletd_url).await;
     let emitter = app.clone();
     let result = argos_core::sprout_scan_run::run_sprout_scan(
         &decoded,
         p2p,
         &peers,
+        tip_anchor,
         &checkpoint,
         move |tick| {
             let _ = emitter.emit(

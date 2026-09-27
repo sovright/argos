@@ -44,14 +44,18 @@
 //!    walk provably starts at genesis;
 //! 2. every header in a page links to its predecessor;
 //! 3. every page links to the previous page's last hash;
-//! 4. four checkpoint hashes must match at fixed heights.
+//! 4. the pinned checkpoint hashes must match at fixed heights, and past the
+//!    last of them the [`TipAnchor`] learned from lightwalletd must match
+//!    at its height.
 //!
 //! Together those pin both ends of every segment. Forging blocks between
-//! two checkpoints requires the forged chain's last `prev_hash` to equal the
-//! real block before the next checkpoint — which requires that real block,
-//! which requires its real work. No block from genesis to Canopy can be
+//! two pinned points requires the forged chain's last `prev_hash` to equal
+//! the real block before the next one — which requires that real block,
+//! which requires its real work. No block from genesis to the anchor can be
 //! inserted, omitted or substituted without breaking a hash link to a
-//! pinned point.
+//! pinned point. The last hundred blocks, above the anchor, rest on the
+//! peer; so does everything past the last checkpoint when no anchor could
+//! be had, and the user is told so.
 //!
 //! Implementing ZIP 208's averaging window and damping would therefore buy
 //! nothing here, while being easy to get subtly wrong — and a wrong
@@ -65,11 +69,13 @@
 //! deliberately corrupted solution required to fail, so neither pass can
 //! mean the verifier simply accepts everything.
 //!
-//! The checkpoint file is likewise unauthenticated: it carries no MAC, and
-//! its `last_height` alone decides whether the scan is finished. Editing
-//! that one field to the target makes a scan "complete" instantly. It is
-//! now checked against the requested key set and the network's range, which
-//! catches the accidental cases, but not a deliberately edited file.
+//! The checkpoint file is likewise unauthenticated: it carries no MAC. A scan
+//! is never finished by its checkpoint alone — every run continues to the
+//! tip — but an edited cursor still skips the blocks it claims were read.
+//! It is checked against the requested key set, which catches the
+//! accidental case of the wrong wallet, but not a deliberately edited file.
+//! A checkpoint from another network fails on its first page, because no
+//! peer on this network recognises its block cursor.
 //!
 //! # Checkpointing
 //!
@@ -219,6 +225,8 @@ impl std::fmt::Display for PeerWait {
 #[derive(Debug, Clone, Copy)]
 pub struct ScanTick {
     pub height: u32,
+    /// The best-known chain tip, for display. The scan has no fixed end — it
+    /// runs until a peer reports the tip — so this can grow as it goes.
     pub target: u32,
     pub notes_found: usize,
     pub joinsplits_seen: u64,
@@ -248,14 +256,96 @@ pub fn checkpoint_path(data_dir: &Path, spending_keys: &[[u8; 32]]) -> PathBuf {
     data_dir.join(format!("sprout-scan-{fingerprint}.checkpoint"))
 }
 
-/// Run a Sprout scan to completion, resuming from `checkpoint_file` if present.
+/// A block near the chain tip, learned from lightwalletd rather than from
+/// the peer serving the scan.
 ///
-/// `extra_peers` is tried before any DNS seed, so a caller with its own node
-/// never depends on the public network.
+/// The pinned checkpoints fix the chain up to the last of them. Past it,
+/// nothing did: the difficulty adjustment is deliberately not validated, so
+/// a hostile peer could serve a cheap fabricated tail and hide every later
+/// spend, making a migrated note read as spendable. Requiring the scan's
+/// block at this height to be *this* block pins that last stretch to a
+/// second, independent source.
+///
+/// A resumed scan already past the anchor's height cannot check it — that
+/// only happens when the previous run ended within the last hundred blocks —
+/// and must still reach the anchor's height before it may stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TipAnchor {
+    pub height: u32,
+    /// Wire byte order — what lightwalletd's `CompactBlock.hash` carries,
+    /// and what the checkpoints are compared in.
+    pub hash: [u8; 32],
+}
+
+/// How far below lightwalletd's tip the anchor sits: past any reorg, so an
+/// honest peer and an honest lightwalletd cannot disagree about it.
+pub const TIP_ANCHOR_DEPTH: u32 = 100;
+
+/// Ask lightwalletd for a [`TipAnchor`].
+///
+/// Refuses a server on the wrong network: an anchor from another chain would
+/// reject every honest peer.
+pub async fn independent_tip_anchor(
+    network: crate::ZeckNetwork,
+    lightwalletd_url: &str,
+) -> ZeckResult<TipAnchor> {
+    use zcash_client_backend::proto::service::BlockId;
+
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    let tip = u32::try_from(info.block_height).map_err(|_| {
+        ZeckError::Lightwalletd(format!("implausible chain height {}", info.block_height))
+    })?;
+    let height = tip.saturating_sub(TIP_ANCHOR_DEPTH);
+    let block = client
+        .get_block(BlockId {
+            height: u64::from(height),
+            hash: vec![],
+        })
+        .await
+        .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+        .into_inner();
+    let hash = <[u8; 32]>::try_from(block.hash.as_slice()).map_err(|_| {
+        ZeckError::Lightwalletd(format!(
+            "lightwalletd returned a {}-byte block hash",
+            block.hash.len()
+        ))
+    })?;
+    Ok(TipAnchor { height, hash })
+}
+
+/// What to tell the user when no [`TipAnchor`] could be had, in the words
+/// both surfaces show.
+pub fn unconfirmed_tip_warning(network: P2pNetwork, reason: &str) -> String {
+    format!(
+        "Could not confirm the chain tip with lightwalletd ({reason}). The scan still \
+         runs to the tip its peer reports, but blocks past height {} are then only as \
+         trustworthy as that peer.",
+        network.sprout_scan_minimum_tip()
+    )
+}
+
+/// Run a Sprout scan to the chain tip, resuming from `checkpoint_file` if
+/// present.
+///
+/// `extra_peers` are raced alongside the DNS seeds, first in line.
+///
+/// `tip_anchor` is a block learned independently of any peer — see
+/// [`independent_tip_anchor`]. The scan must reach it, and the peer's block
+/// at that height must be that block, exactly as for a pinned checkpoint.
+/// Pass `None` when there is none: the network's minimum tip still applies,
+/// but the stretch past the last pinned checkpoint is then only as
+/// trustworthy as the peer.
+///
+/// A saved scan is never "finished": resuming one catches up from where it
+/// stopped to the current tip, so a note spent since the last run is not
+/// offered as spendable.
 pub async fn run_sprout_scan(
     spending_keys: &[[u8; 32]],
     network: P2pNetwork,
     extra_peers: &[String],
+    tip_anchor: Option<TipAnchor>,
     checkpoint_file: &Path,
     mut progress: impl FnMut(ScanTick),
 ) -> ZeckResult<SproutScanResult> {
@@ -265,15 +355,24 @@ pub async fn run_sprout_scan(
         ));
     }
 
-    let bound = network.sprout_scan_bound();
-    let target = bound.loop_limit();
+    // `fetched` counts blocks, so reaching the anchor's height means having
+    // fetched one past it.
+    let floor = tip_anchor
+        .map_or(0, |anchor| anchor.height.saturating_add(1))
+        .max(network.sprout_scan_minimum_tip());
 
     // Resume if we can. A checkpoint that will not load is reported rather
     // than silently discarded: starting a six-hour scan over because a file
     // was quietly ignored is worse than stopping to say so.
     let mut scanner = match std::fs::read(checkpoint_file) {
         Ok(bytes) => {
-            let checkpoint = SproutScanCheckpoint::from_bytes(bytes);
+            // Checked after the scanner loads, so a corrupt file is still
+            // reported as corrupt rather than as the wrong network.
+            let (tag, body) = match bytes.as_slice() {
+                [NETWORK_TAGGED, tag, body @ ..] => (Some(*tag), body.to_vec()),
+                _ => (None, bytes),
+            };
+            let checkpoint = SproutScanCheckpoint::from_bytes(body);
             let resumed = SproutScanner::resume(&checkpoint).map_err(|err| {
                 ZeckError::TransactionBuild(format!(
                     "the scan checkpoint at {} could not be read ({err}). Delete it to \
@@ -300,17 +399,17 @@ pub async fn run_sprout_scan(
                 )));
             }
 
-            // And for this network. A completed mainnet checkpoint carries a
-            // last_height past the testnet target, so resuming it under
-            // testnet would skip the loop entirely and hand back mainnet
-            // notes as a finished testnet scan.
-            if resumed.progress().last_height > target {
+            let other_network = match tag {
+                Some(tag) => tag != network_tag(network),
+                None => legacy_scan_end(network)
+                    .is_some_and(|end| resumed.progress().last_height >= end),
+            };
+            if other_network {
                 return Err(ZeckError::TransactionBuild(format!(
-                    "the scan checkpoint at {} reaches height {}, past this network's \
-                     Sprout range ({target}). It was almost certainly made on a different \
-                     network.",
-                    checkpoint_file.display(),
-                    resumed.progress().last_height
+                    "the scan checkpoint at {} was made on a different network. Resuming \
+                     it here would report that chain's notes as this one's. Point \
+                     --data-dir somewhere else, or delete the file.",
+                    checkpoint_file.display()
                 )));
             }
             resumed
@@ -330,25 +429,13 @@ pub async fn run_sprout_scan(
     let mut height = first_scan_height(cursor);
     let mut since_checkpoint = 0u64;
 
-    // A scan that is already complete has nothing to fetch, so it must not
-    // ask for a peer. The GUI's sweep re-runs a finished scan purely to get
-    // its notes back; connecting first made that depend on a free slot it
-    // never used, and now that acquisition is persistent it would have sat
-    // out the whole budget before sweeping funds it already held.
-    if height >= target {
-        save_checkpoint(&scanner, checkpoint_file)?;
-        return scanner
-            .finish()
-            .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")));
-    }
-
     // A wait is reported as a tick at the scan's current position, so the
     // surfaces hear about it through the callback they already have.
     let waiting_tick = |scanner: &SproutScanner, height: u32, wait: PeerWait| {
         let p = scanner.progress();
         ScanTick {
             height,
-            target,
+            target: floor.max(height),
             notes_found: p.notes_found,
             joinsplits_seen: p.joinsplits_seen,
             peer_wait: Some(wait),
@@ -359,6 +446,9 @@ pub async fn run_sprout_scan(
         progress(waiting_tick(&scanner, height, wait));
     })
     .await?;
+    // Only for display: the peer's own claim is a better guess at the tip
+    // than the floor, and never below where the scan already is.
+    let mut target = floor.max(peer.peer_height).max(height);
 
     // The fetcher below is a spawned task and cannot call `progress`, which
     // is neither `Send` nor its to share. Its waits come back over this and
@@ -384,14 +474,16 @@ pub async fn run_sprout_scan(
     //
     // Capacity 1: at most one page sits between fetch and scan, and
     // `get_blocks` already bounds a page by `MAX_BLOCKS_BYTES`.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ZeckResult<Page>>(1);
+    // `Ok(None)` is the fetcher saying it reached the chain tip. The channel
+    // closing without it means the fetcher died, and must not read as done:
+    // a scan that stops early reports spent notes as spendable.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ZeckResult<Option<Page>>>(1);
     let mut fetcher = PageFetcher {
         peer,
         locator,
         empty_replies: 0,
         fetched: height,
-        target,
-        bound,
+        floor,
         network,
         peers: extra_peers.to_vec(),
         waits: wait_tx,
@@ -402,15 +494,17 @@ pub async fn run_sprout_scan(
     // peer — up to the whole acquisition budget, holding sockets open for a
     // scan nobody is running.
     let fetch_task = AbortOnDrop(tokio::spawn(async move {
-        while fetcher.fetched < fetcher.target {
+        loop {
             match fetcher.next_page().await {
                 Ok(None) => continue,
-                // Empty page: the chain ended (see `PageFetcher::next_page`).
-                // Dropping the sender ends the consumer's loop.
-                Ok(Some(page)) if page.is_empty() => return,
+                // Empty page: the chain tip (see `PageFetcher::next_page`).
+                Ok(Some(page)) if page.is_empty() => {
+                    let _ = tx.send(Ok(None)).await;
+                    return;
+                }
                 Ok(Some(page)) => {
                     fetcher.fetched += page.len() as u32;
-                    if tx.send(Ok(page)).await.is_err() {
+                    if tx.send(Ok(Some(page))).await.is_err() {
                         return;
                     }
                 }
@@ -422,7 +516,7 @@ pub async fn run_sprout_scan(
         }
     }));
 
-    while height < target {
+    loop {
         // Waits first: a notice still queued when its page arrives is stale,
         // and replaying it before the page means the scanning tick below is
         // what is left on screen, not a wait that has already ended.
@@ -435,9 +529,14 @@ pub async fn run_sprout_scan(
             page = rx.recv() => page,
         };
         let Some(page) = page else {
+            return Err(ZeckError::Broadcast(format!(
+                "the block download stopped unexpectedly at height {height}, before \
+                 reaching the chain tip. Progress is saved; re-run to continue."
+            )));
+        };
+        let Some(page) = page? else {
             break;
         };
-        let page = page?;
 
         // Already in header order, and already complete: `next_page`
         // assembles the page in the order the headers came in and treats a
@@ -446,17 +545,16 @@ pub async fn run_sprout_scan(
         // position. Re-deriving a hash list and a lookup map here only undid
         // that work.
         for (hash, block) in &page {
-            if height >= target {
-                break;
-            }
-
             // A pinned block must be the block we were handed. This is what
             // makes a fabricated chain pointless: cheap forged headers link
             // to each other fine, but they cannot reproduce a real mainnet
             // hash at a real height without doing the work. Checked against
             // this block's own height, before the counter advances — the
             // checkpoints are keyed by true heights (genesis = 0).
-            if let Some(expected) = crate::p2p::wire::checkpoint_at(network, height) {
+            let expected = crate::p2p::wire::checkpoint_at(network, height).or(tip_anchor
+                .filter(|anchor| anchor.height == height)
+                .map(|anchor| anchor.hash));
+            if let Some(expected) = expected {
                 if *hash != expected {
                     return Err(ZeckError::Broadcast(format!(
                         "the chain this peer served does not match Zcash at height \
@@ -467,8 +565,9 @@ pub async fn run_sprout_scan(
                 }
             }
 
-            // The branch id only affects how the transaction parses, and
-            // every Sprout-bearing transaction predates Canopy.
+            // The branch id is only consulted for pre-v5 transactions, whose
+            // encoding it does not change; v5 carries its own. Sprout
+            // JoinSplits exist only in v2-v4, before and after Canopy alike.
             let joinsplits = joinsplits_in_block(block, BranchId::Canopy).map_err(|err| {
                 ZeckError::TransactionBuild(format!("block at height {height}: {err}"))
             })?;
@@ -483,10 +582,11 @@ pub async fn run_sprout_scan(
         }
 
         if since_checkpoint >= CHECKPOINT_EVERY {
-            save_checkpoint(&scanner, checkpoint_file)?;
+            save_checkpoint(&scanner, network, checkpoint_file)?;
             since_checkpoint = 0;
         }
 
+        target = target.max(height);
         let p = scanner.progress();
         progress(ScanTick {
             height,
@@ -497,13 +597,11 @@ pub async fn run_sprout_scan(
         });
     }
 
-    // The consumer may finish before the fetcher (target reached mid-page).
-    // Dropping the receiver already makes the next `send` fail and the task
-    // return, but abort it explicitly so a peer connection is not held open
-    // for however long the current request takes to time out.
+    // The fetcher has already returned after reporting the tip; dropping it
+    // is only to be certain no connection outlives the scan.
     drop(fetch_task);
 
-    save_checkpoint(&scanner, checkpoint_file)?;
+    save_checkpoint(&scanner, network, checkpoint_file)?;
 
     scanner
         .finish()
@@ -527,8 +625,8 @@ struct PageFetcher {
     /// How far the *fetcher* has read. Distinct from the consumer's `height`,
     /// which is the authority for checkpoints and tree positions.
     fetched: u32,
-    target: u32,
-    bound: crate::p2p::wire::SproutScanBound,
+    /// Below this, an empty reply is not the tip. See `run_sprout_scan`.
+    floor: u32,
     network: P2pNetwork,
     peers: Vec<String>,
     /// Where a wait for a peer is announced; see `run_sprout_scan`.
@@ -570,8 +668,8 @@ impl PageFetcher {
     /// Fetch and validate one page of blocks.
     ///
     /// `Ok(None)` means "this peer was no good; a new one is connected, try
-    /// again" — the caller loops. An empty page means the chain ended, which
-    /// only happens when the scan has no fixed bound. Every check that decides
+    /// again" — the caller loops. An empty page means the chain tip was
+    /// reached (see `empty_reply_is_chain_tip`). Every check that decides
     /// whether a page may be scanned at all lives here: proof of work,
     /// continuity with the locator, and the internal linkage of the page.
     ///
@@ -580,34 +678,27 @@ impl PageFetcher {
     /// on the true height, so this cannot affect where a commitment lands.
     async fn next_page(&mut self) -> ZeckResult<Option<Page>> {
         let height = self.fetched;
-        let target = self.target;
 
         let headers = match self.peer.get_headers(&[self.locator]).await {
             Ok(h) if !h.is_empty() => h,
-            // NOT a clean end of chain when the scan has a fixed bound.
-            // `target` is then a pre-Canopy height every synced peer has, so
-            // an empty reply below it means this peer cannot serve us —
-            // under-synced, on another chain, or lying. Treating that as
-            // completion is the worst failure here: a tree truncated at a
-            // block boundary is a *genuine historical tree state*, so
-            // witnesses still verify and spend, but nullifiers published after
-            // the cut were never collected and a spent note gets offered as
-            // spendable.
-            //
-            // Where there is no fixed bound, the chain tip is the only
-            // possible ending and this reply is it. Matched on the variant
-            // rather than on a sentinel height, so no `target` arriving at
-            // `u32::MAX` by another route can disable the rule above.
+            // Only the tip if every tip height we know of has been reached;
+            // see `empty_reply_is_chain_tip` for why stopping short is the
+            // worst failure here.
             Ok(_) => {
-                if self.bound.ends_at_chain_tip() {
+                if crate::p2p::wire::empty_reply_is_chain_tip(
+                    height,
+                    self.floor,
+                    self.peer.peer_height,
+                ) {
                     return Ok(Some(Vec::new()));
                 }
+                let floor = self.floor.max(self.peer.peer_height);
                 return self
                     .rotate(format!(
-                        "no peer would serve blocks past height {height} of {target}. The \
-                         scan is incomplete and its results would be wrong, so it stops \
-                         here rather than reporting a balance it cannot stand behind. \
-                         Progress is saved; re-run to continue."
+                        "no peer would serve blocks past height {height}, but the chain \
+                         reaches at least {floor}. The scan is incomplete and its results \
+                         would be wrong, so it stops here rather than reporting a balance \
+                         it cannot stand behind. Progress is saved; re-run to continue."
                     ))
                     .await;
             }
@@ -712,7 +803,7 @@ impl PageFetcher {
 /// umask, the same treatment the recovery report gets. Callers should say so
 /// to the user before pointing them at the path, and delete it once the
 /// funds are swept.
-fn save_checkpoint(scanner: &SproutScanner, path: &Path) -> ZeckResult<()> {
+fn save_checkpoint(scanner: &SproutScanner, network: P2pNetwork, path: &Path) -> ZeckResult<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -725,11 +816,42 @@ fn save_checkpoint(scanner: &SproutScanner, path: &Path) -> ZeckResult<()> {
     // would put spend-capable bytes in a world-readable inode and then
     // rename that inode into place.
     let _ = std::fs::remove_file(&tmp);
-    write_private(&tmp, scanner.checkpoint().as_bytes())?;
+    let mut bytes = vec![NETWORK_TAGGED, network_tag(network)];
+    bytes.extend_from_slice(scanner.checkpoint().as_bytes());
+    write_private(&tmp, &bytes)?;
     std::fs::rename(&tmp, path).map_err(|err| {
         ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}"))
     })?;
     Ok(())
+}
+
+/// Leads a checkpoint file that records its network, followed by that
+/// network's tag and then the scanner's own bytes. Distinct from every
+/// `SproutScanner` checkpoint version, so the two cannot be mistaken.
+///
+/// The scanner itself stays network-agnostic; the network is this module's
+/// to know, so it is recorded here. Needed since the scan stopped having a
+/// fixed end: a cursor from a longer chain used to be caught by exceeding
+/// this network's range, and now could read as the tip of a shorter one.
+const NETWORK_TAGGED: u8 = 0xA5;
+
+fn network_tag(network: P2pNetwork) -> u8 {
+    match network {
+        P2pNetwork::Mainnet => 1,
+        P2pNetwork::Testnet => 2,
+        P2pNetwork::Regtest => 3,
+    }
+}
+
+/// Where each network's scan used to stop. Every checkpoint without a
+/// network tag was written by one of those scans, so its cursor cannot be
+/// past this height on the network that wrote it.
+const fn legacy_scan_end(network: P2pNetwork) -> Option<u32> {
+    match network {
+        P2pNetwork::Mainnet => Some(1_046_400),
+        P2pNetwork::Testnet => Some(1_028_500),
+        P2pNetwork::Regtest => None,
+    }
 }
 
 /// Create at 0600 and write, so a spend-capable file is never briefly
@@ -1167,36 +1289,86 @@ mod tests {
         );
     }
 
-    /// A finished checkpoint needs no peer. The GUI's sweep re-runs a
-    /// completed scan to get its notes back; demanding a connection first
-    /// made that depend on a free slot it never used, and with persistent
-    /// retry would have made it wait out the budget for nothing.
+    /// A checkpoint records its network, so resuming one elsewhere is
+    /// refused before any peer is asked — its cursor would otherwise read as
+    /// the tip of a shorter chain and hand back the other network's notes.
     #[tokio::test]
-    async fn a_finished_scan_does_not_need_a_peer() {
-        let network = P2pNetwork::Testnet;
-        let target = network.sprout_scan_bound().loop_limit();
+    async fn a_checkpoint_from_another_network_is_refused() {
         let mut scanner = SproutScanner::new(&[[0x11; 32]]);
         scanner
-            .scan_block_at(&[], [0xCD; 32], target - 1)
+            .scan_block_at(&[], [0xCD; 32], 2_000_000)
+            .expect("an empty block");
+        let dir = std::env::temp_dir().join("argos-scan-network-tag-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mainnet.checkpoint");
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+
+        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Testnet, &[], None, &path, |_| {})
+            .await
+            .expect_err("a mainnet checkpoint must not resume on testnet");
+        discard_checkpoint(&path);
+        assert!(err.to_string().contains("different network"), "{err}");
+    }
+
+    /// Checkpoints written before files recorded a network came from
+    /// Canopy-bounded scans, so one past this network's Canopy height was
+    /// made elsewhere — the rule that used to guard every resume.
+    #[tokio::test]
+    async fn an_untagged_checkpoint_past_this_networks_canopy_is_refused() {
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner
+            .scan_block_at(&[], [0xCD; 32], 1_046_399)
+            .expect("an empty block");
+        let dir = std::env::temp_dir().join("argos-scan-legacy-network-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.checkpoint");
+        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
+
+        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Testnet, &[], None, &path, |_| {})
+            .await
+            .expect_err("mainnet's Canopy height is past testnet's");
+        discard_checkpoint(&path);
+        assert!(err.to_string().contains("different network"), "{err}");
+    }
+
+    /// A scan saved at the old Canopy end is not finished. It used to be
+    /// returned offline as a complete result, which is how a note migrated
+    /// after Canopy came back as spendable. Resuming must go on to the tip,
+    /// so it reaches for a peer instead of returning.
+    #[tokio::test]
+    async fn a_scan_saved_at_canopy_catches_up_instead_of_finishing() {
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner
+            .scan_block_at(&[], [0xCD; 32], 1_046_399)
             .expect("an empty block");
 
-        let dir = std::env::temp_dir().join("argos-scan-finished-test");
+        let dir = std::env::temp_dir().join("argos-scan-canopy-resume-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("finished.checkpoint");
-        save_checkpoint(&scanner, &path).unwrap();
+        let path = dir.join("canopy.checkpoint");
+        // Written as every existing checkpoint was — before files recorded
+        // their network — because those are the scans this must continue.
+        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
 
-        // The only peer offered is an address nothing listens on, and the
-        // scan must still succeed: only a run that never dials can.
-        let result = run_sprout_scan(
-            &[[0x11; 32]],
-            network,
-            &["127.0.0.1:1".to_owned()],
-            &path,
-            |_| {},
+        // Nothing listens on the only peer offered, so a run that goes on
+        // to fetch can only still be waiting for a connection — or fail
+        // for want of one. What it must not do is hand back a result.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_sprout_scan(
+                &[[0x11; 32]],
+                P2pNetwork::Mainnet,
+                &["127.0.0.1:1".to_owned()],
+                None,
+                &path,
+                |_| {},
+            ),
         )
         .await;
         discard_checkpoint(&path);
-        assert!(result.expect("finishes offline").notes.is_empty());
+        assert!(
+            !matches!(outcome, Ok(Ok(_))),
+            "a scan saved at Canopy must not be reported as complete"
+        );
     }
 
     #[tokio::test]
@@ -1205,6 +1377,7 @@ mod tests {
             &[],
             P2pNetwork::Regtest,
             &[],
+            None,
             Path::new("/tmp/argos/none.checkpoint"),
             |_| {},
         )
@@ -1222,7 +1395,7 @@ mod tests {
         let path = dir.join("corrupt.checkpoint");
         std::fs::write(&path, b"not a checkpoint").unwrap();
 
-        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Regtest, &[], &path, |_| {})
+        let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Regtest, &[], None, &path, |_| {})
             .await
             .expect_err("a corrupt checkpoint must not be ignored");
         let text = err.to_string();

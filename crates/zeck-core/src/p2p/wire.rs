@@ -65,33 +65,22 @@ impl From<crate::ZeckNetwork> for P2pNetwork {
     }
 }
 
-/// Where a Sprout scan stops — see [`P2pNetwork::sprout_scan_bound`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SproutScanBound {
-    /// Stop below this height (exclusive): Canopy activation.
-    UpTo(u32),
-    /// No fixed height; the chain tip ends the scan, and an empty reply from
-    /// a peer therefore means "done" rather than "this peer is lying".
-    ChainTip,
-}
-
-impl SproutScanBound {
-    /// The exclusive height the walk must not pass.
-    ///
-    /// `u32::MAX` for [`Self::ChainTip`], which is correct as a loop bound —
-    /// but only the loop may treat it that way. Anything deciding *policy*
-    /// must match on the variant instead.
-    pub const fn loop_limit(self) -> u32 {
-        match self {
-            Self::UpTo(height) => height,
-            Self::ChainTip => u32::MAX,
-        }
-    }
-
-    /// Whether reaching the end of the served chain is a normal ending.
-    pub const fn ends_at_chain_tip(self) -> bool {
-        matches!(self, Self::ChainTip)
-    }
+/// Whether an empty `headers` reply is the honest end of the chain.
+///
+/// An empty reply is how a peer says "nothing after your locator", which at
+/// the tip is the truth and anywhere else is a peer that is under-synced, on
+/// another chain, or lying. Treating the second kind as completion is the
+/// worst failure this scan has: a tree cut at a block boundary is a genuine
+/// historical tree state, so its witnesses still verify, but every nullifier
+/// published after the cut is missing and a spent note is offered as
+/// spendable.
+///
+/// So the reply ends the scan only at or past both `floor` — a tip height
+/// learned independently of this peer — and the height the peer itself
+/// advertised when it connected. Falling short of its own claim is a peer
+/// contradicting itself.
+pub const fn empty_reply_is_chain_tip(fetched: u32, floor: u32, peer_height: u32) -> bool {
+    fetched >= floor && fetched >= peer_height
 }
 
 impl P2pNetwork {
@@ -103,25 +92,26 @@ impl P2pNetwork {
         }
     }
 
-    /// Where a Sprout scan stops.
+    /// The lowest height a Sprout scan may accept as the chain tip when it
+    /// knows nothing else.
     ///
-    /// Mainnet and testnet stop at Canopy activation: ZIP 211 forbids adding
-    /// to the Sprout pool from there on, so no Sprout note is ever created at
-    /// or above it. Regtest activates Canopy wherever its config says, so
-    /// there is no such height and the scan runs to the chain tip.
+    /// The scan has no fixed end. ZIP 211 stops new value *entering* Sprout
+    /// at Canopy — `vpub_old` must be zero — but a JoinSplit may still spend
+    /// Sprout notes and create new ones, and mainnet carries them after
+    /// Canopy. Stopping there missed those notes and, worse, every later
+    /// spend of an earlier one, so a migrated note read as spendable.
     ///
-    /// Returned as a type rather than as `u32::MAX`. The sentinel decided
-    /// whether the "an empty reply means a lying or under-synced peer" rule
-    /// applied — the most safety-bearing check in the scan — via an integer
-    /// comparison three layers below where the decision belonged, so any
-    /// future `target` reaching `u32::MAX` by another route would have
-    /// silently disabled peer-honesty enforcement on mainnet. It also made
-    /// `SproutScanCost` quote `u32::MAX` blocks for regtest.
-    pub const fn sprout_scan_bound(self) -> SproutScanBound {
+    /// Mainnet uses its highest pinned checkpoint: a height the real chain is
+    /// proven to reach. Testnet uses its Canopy activation, which any synced
+    /// testnet node is long past. Regtest chains are built by the test that
+    /// scans them, so only the peer can say where they end. Callers raise
+    /// this with a tip learned from another source (lightwalletd) whenever
+    /// they can.
+    pub const fn sprout_scan_minimum_tip(self) -> u32 {
         match self {
-            Self::Mainnet => SproutScanBound::UpTo(1_046_400),
-            Self::Testnet => SproutScanBound::UpTo(1_028_500),
-            Self::Regtest => SproutScanBound::ChainTip,
+            Self::Mainnet => MAINNET_CHECKPOINTS[MAINNET_CHECKPOINTS.len() - 1].0,
+            Self::Testnet => 1_028_500,
+            Self::Regtest => 0,
         }
     }
 }
@@ -601,22 +591,36 @@ mod tests {
         assert!(decode_headers(&payload).is_err());
     }
 
-    /// ZIP 211 is what makes this scan finite; if the bound were ever wrong
-    /// the scanner would either miss notes or run forever.
+    /// ZIP 211 does not make the scan finite. It forbids new value entering
+    /// Sprout (`vpub_old` must be zero), not Sprout outputs: JoinSplits after
+    /// Canopy still spend Sprout notes and create new ones, and mainnet has
+    /// them from height 1,046,418 on. So the scan runs to the chain tip on
+    /// every network, and what varies is only the height below which an
+    /// empty reply cannot be the tip.
     #[test]
-    fn the_sprout_scan_range_ends_at_canopy() {
-        assert_eq!(
-            P2pNetwork::Mainnet.sprout_scan_bound(),
-            SproutScanBound::UpTo(1_046_400)
-        );
-        assert_eq!(
-            P2pNetwork::Testnet.sprout_scan_bound(),
-            SproutScanBound::UpTo(1_028_500)
-        );
-        // The variant, not the number, is what gates the peer-honesty rule.
-        assert!(!P2pNetwork::Mainnet.sprout_scan_bound().ends_at_chain_tip());
-        assert!(!P2pNetwork::Testnet.sprout_scan_bound().ends_at_chain_tip());
-        assert!(P2pNetwork::Regtest.sprout_scan_bound().ends_at_chain_tip());
+    fn the_sprout_scan_runs_to_the_chain_tip_and_past_canopy() {
+        assert!(P2pNetwork::Mainnet.sprout_scan_minimum_tip() > 1_046_400);
+        assert!(P2pNetwork::Testnet.sprout_scan_minimum_tip() >= 1_028_500);
+        assert_eq!(P2pNetwork::Regtest.sprout_scan_minimum_tip(), 0);
+    }
+
+    /// The mainnet minimum tip is the highest pinned block: a height the
+    /// scan can prove the real chain reaches, rather than a guess.
+    #[test]
+    fn the_mainnet_minimum_tip_is_the_last_checkpoint() {
+        let last = MAINNET_CHECKPOINTS.last().expect("pins exist").0;
+        assert_eq!(P2pNetwork::Mainnet.sprout_scan_minimum_tip(), last);
+    }
+
+    /// Whether an empty `headers` reply is the honest end of the chain.
+    #[test]
+    fn an_empty_reply_ends_the_scan_only_at_or_past_every_known_tip() {
+        // At or past both the independent floor and the peer's own claim.
+        assert!(empty_reply_is_chain_tip(3_500_000, 3_499_990, 3_500_000));
+        // Below the independent floor: under-synced, lying, or on a fork.
+        assert!(!empty_reply_is_chain_tip(3_400_000, 3_499_990, 3_400_000));
+        // Below what this peer itself advertised: it contradicts itself.
+        assert!(!empty_reply_is_chain_tip(3_499_995, 3_499_990, 3_500_000));
     }
 
     #[test]
@@ -652,7 +656,8 @@ mod tests {
 ///
 /// # Provenance
 ///
-/// Read from a fully-synced mainnet Zebra node (chain height 3,444,596,
+/// The rows through Canopy were read from a fully-synced mainnet Zebra node
+/// (chain height 3,444,596,
 /// `verificationprogress` 0.9999997) via `getblockhash`. The heights are the
 /// documented network-upgrade activations — Sapling, Blossom, Heartwood,
 /// Canopy — chosen so anyone can verify these against a public block
@@ -693,6 +698,34 @@ const MAINNET_CHECKPOINTS: &[(u32, &str)] = &[
         1_046_400,
         "00000000002038016f976744c369dce7419fca30e7171dfac703af5e5f7ad1d4",
     ),
+    // Past Canopy, where the scan now continues (Sprout JoinSplits do too).
+    // NU5, NU6, NU6.1, NU6.2, NU6.3 activations. Provenance differs from the
+    // rows above: each hash was read from two independent explorers
+    // (blockchair's API and mainnet.zcashexplorer.app), then confirmed on the
+    // chain itself — a mainnet peer served the block for that hash, its
+    // coinbase encodes exactly this height (BIP 34), and a proof-of-work-
+    // valid chain continues from it. `post_canopy_checkpoints_are_real`
+    // repeats that check.
+    (
+        1_687_104,
+        "0000000000d723156d9b65ffcf4984da7a19675ed7e2f06d9e5d5188af087bf8",
+    ),
+    (
+        2_726_400,
+        "000000000032935a403a29822df72549d9a201e08cfbd5b3c770bb0d66615247",
+    ),
+    (
+        3_146_400,
+        "0000000000b98a7d8f390793fa113bf6755935f0c14ea817af07d2c16f2c3ef4",
+    ),
+    (
+        3_364_600,
+        "0000000000806344c408a4cfdf472f4132c632edbdc24cf2f3f672061da8b865",
+    ),
+    (
+        3_428_143,
+        "00000000001a8b54bbde4e8996373417a6b33ee2bd984bcf02882e5d8128d761",
+    ),
 ];
 
 /// The expected block hash at `height`, in wire order, if one is pinned.
@@ -730,16 +763,11 @@ mod checkpoint_tests {
         assert!(checkpoint_at(P2pNetwork::Mainnet, 419_201).is_none());
     }
 
-    /// Every checkpoint must sit inside the range a scan actually walks, or
-    /// it can never fire and provides no protection at all.
+    /// Ascending, so the last one is the highest — which is what
+    /// `sprout_scan_minimum_tip` relies on.
     #[test]
-    fn every_checkpoint_is_within_the_sprout_scan_range() {
-        for (height, _) in MAINNET_CHECKPOINTS {
-            assert!(
-                *height <= P2pNetwork::Mainnet.sprout_scan_bound().loop_limit(),
-                "checkpoint at {height} is past the scan's end and would never be checked"
-            );
-        }
+    fn checkpoints_are_in_height_order() {
+        assert!(MAINNET_CHECKPOINTS.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     /// Reversal is easy to get backwards, and a reversed checkpoint would
