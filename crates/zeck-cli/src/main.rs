@@ -291,6 +291,82 @@ fn command_requires_tos(command: &Commands) -> bool {
     false
 }
 
+/// Refuse a key-source flag the chosen command never reads.
+///
+/// Every top-level flag is `global`, so clap accepts
+/// `argos show-keys --sprout-key-file …` and would otherwise run without the
+/// key, leaving the user believing it was checked. Scan-tuning flags
+/// (`--birthday`, `--gap-limit`, …) are deliberately not policed here:
+/// ignoring one cannot misdirect funds, and `show-keys` accepts them for
+/// compatibility.
+fn refuse_unconsumed_key_sources(cli: &Cli) -> Result<()> {
+    let (name, reads_seed, reads_wallet, reads_sapling, reads_sprout) = match &cli.command {
+        Commands::ShowKeys => ("show-keys", true, true, true, false),
+        Commands::InspectWallet => ("inspect-wallet", false, true, true, false),
+        Commands::Scan => ("scan", true, true, true, false),
+        Commands::Sweep { .. } => ("sweep", true, true, true, false),
+        Commands::ScanSprout { .. } => ("scan-sprout", false, true, false, true),
+        Commands::SweepSprout { .. } => ("sweep-sprout", false, true, false, false),
+    };
+    let supplied = [
+        ("--seed-file", cli.seed_file.is_some(), reads_seed),
+        ("--wallet-file", cli.wallet_file.is_some(), reads_wallet),
+        (
+            "--sapling-key-file",
+            cli.sapling_key_file.is_some(),
+            reads_sapling,
+        ),
+        (
+            "--sprout-key-file",
+            cli.sprout_key_file.is_some(),
+            reads_sprout,
+        ),
+    ];
+    for (flag, given, read) in supplied {
+        if given && !read {
+            let hint = if flag == "--sprout-key-file" {
+                " A raw Sprout key is recovered with `argos scan-sprout --sprout-key-file <file>`."
+            } else {
+                ""
+            };
+            bail!(
+                "{flag} is not used by `argos {name}`, so the key it names would be ignored.{hint}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse sweep options a seedless wallet's sweep would silently drop.
+///
+/// The imported-key and transparent-only routes build their transactions
+/// without a memo or a donation output. Sweeping anyway loses the memo — an
+/// exchange deposit memo among them — with no warning, so refuse before any
+/// scan starts.
+fn refuse_options_a_seedless_sweep_drops(command: &Commands) -> Result<()> {
+    if let Commands::Sweep {
+        memo,
+        donation_rate,
+        donor_email,
+        ..
+    } = command
+    {
+        for (flag, given) in [
+            ("--memo", memo.is_some()),
+            ("--donation-rate", donation_rate.is_some()),
+            ("--donor-email", donor_email.is_some()),
+        ] {
+            if given {
+                bail!(
+                    "{flag} is not applied when sweeping a wallet with no seed phrase \
+                     (imported or transparent-only keys). Re-run without it."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read a legacy wallet file into key material.
 ///
 /// The passphrase is prompted for, never taken as a flag: a flag would
@@ -1153,6 +1229,7 @@ fn install_regtest_params_if_requested() -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose)?;
+    refuse_unconsumed_key_sources(&cli)?;
 
     install_regtest_params_if_requested()?;
 
@@ -1276,6 +1353,9 @@ async fn main() -> Result<()> {
     // sense for an HD scan.
     if let Some(source) = imported.as_ref() {
         let keys = source.keys();
+        if keys.mnemonic.is_none() {
+            refuse_options_a_seedless_sweep_drops(&cli.command)?;
+        }
         if is_transparent_only(keys) {
             match &cli.command {
                 Commands::Scan => {

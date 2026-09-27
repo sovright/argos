@@ -466,3 +466,91 @@ fn a_seedless_wallet_and_a_key_file_still_merge() {
         "no key material may be printed back, got: {stdout}"
     );
 }
+
+/// A seedless sweep never receives `--memo` or `--donation-rate`: the
+/// imported-key and transparent-only routes build their transactions without
+/// either. Accepting them and sweeping anyway is how an exchange deposit
+/// memo goes missing, so both routes must refuse up front — before any scan
+/// or network access (the lightwalletd URL here is unreachable on purpose).
+#[test]
+fn a_seedless_sweep_refuses_a_memo_it_would_drop() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let key = key_file("memo-sapling-key", TEST_SAPLING_KEY_MAINNET);
+    let destination = "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf";
+
+    for (key_flag, key_path, extra) in [
+        ("--wallet-file", path.to_str().unwrap(), ["--memo", "12345"]),
+        (
+            "--sapling-key-file",
+            key.to_str().unwrap(),
+            ["--memo", "12345"],
+        ),
+        (
+            "--wallet-file",
+            path.to_str().unwrap(),
+            ["--donation-rate", "0.01"],
+        ),
+    ] {
+        let dir = scratch_dir("memo");
+        let mut args = vec![
+            key_flag,
+            key_path,
+            "--accept-tos",
+            "--lightwalletd-url",
+            "https://127.0.0.1:1",
+            "--data-dir",
+            &dir,
+            "sweep",
+            "--destination",
+            destination,
+        ];
+        args.extend(extra);
+        let out = argos(&args);
+
+        assert!(
+            !out.status.success(),
+            "{key_flag} {extra:?} must be refused"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("{} is not applied", extra[0])),
+            "the refusal must name the dropped flag, got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("lightwalletd") && !stderr.contains("SPROUT FUNDS ARE NOT COVERED"),
+            "the refusal must come before the scan starts, got:\n{stderr}"
+        );
+    }
+}
+
+/// A key-source flag that the chosen command never reads must be refused,
+/// not silently dropped. Now that every top-level flag is `global`, it is
+/// natural to type `argos show-keys --sprout-key-file …` and assume the key
+/// was used.
+#[test]
+fn a_key_source_the_command_would_ignore_is_refused() {
+    let key = key_file("ignored-sprout-key", "SKplaceholder\n");
+    let key = key.to_str().unwrap();
+    for args in [
+        vec!["show-keys", "--sprout-key-file", key],
+        vec!["scan", "--sprout-key-file", key, "--accept-tos"],
+        vec![
+            "sweep-sprout",
+            "--sprout-key-file",
+            key,
+            "--destination",
+            "zs1x",
+            "--accept-tos",
+        ],
+        vec!["scan-sprout", "--seed-file", key, "--accept-tos"],
+        vec!["scan-sprout", "--sapling-key-file", key, "--accept-tos"],
+    ] {
+        let out = argos(&args);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is not used by"),
+            "{args:?}: the refusal must say the flag would be ignored, got:\n{stderr}"
+        );
+    }
+}
