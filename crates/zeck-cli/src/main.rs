@@ -451,7 +451,7 @@ async fn run_transparent_sweep(
         );
     }
 
-    let outcome = sweep_transparent_only(keys, network, lightwalletd_url, destination, max_fee)
+    let outcome = sweep_transparent_only(keys, network, lightwalletd_url, destination, max_fee, 0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("there was nothing to sweep"))?;
 

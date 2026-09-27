@@ -228,52 +228,23 @@ pub struct TransparentSweepPlan {
     pub output_zatoshis: u64,
 }
 
-/// Cost a sweep of every supplied UTXO into a single shielded output.
+/// The ZIP-317 fee for sweeping `input_count` P2PKH inputs into a single
+/// Sapling output — the transaction `sweep_transparent_only` builds.
 ///
-/// Sweeping *everything* into *one* output is what makes this costable in
-/// advance: there is no change, so the fee depends only on the input count.
-///
-/// Returns `None` when the wallet holds nothing. Returns an error when the
-/// balance cannot cover its own fee — the honest answer for dust, rather
-/// than building a transaction the network will reject.
-pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
+/// One function for the plan and the preview, so the fee a user is shown
+/// before the scan finishes is the fee the builder charges.
+fn zip317_sweep_fee<P: zcash_protocol::consensus::Parameters>(
     params: &P,
     target_height: zcash_protocol::consensus::BlockHeight,
-    utxos: &[TransparentUtxo],
-) -> ZeckResult<Option<TransparentSweepPlan>> {
+    input_count: usize,
+) -> ZeckResult<u64> {
     use zcash_primitives::transaction::fees::{zip317::FeeRule, FeeRule as _};
 
-    if utxos.is_empty() {
-        return Ok(None);
-    }
-
-    let total: u64 = utxos.iter().fold(0u64, |acc, u| {
-        acc.saturating_add(u64::from(u.txout.value()))
-    });
-
-    // Every input is P2PKH — these keys came from `key`/`ckey` records,
-    // which store pubkeys, not scripts.
-    let input_sizes = utxos
-        .iter()
-        .map(|utxo| {
-            // Every imported key is P2PKH, so every input is standard-sized.
-            // Asserted rather than assumed: if a non-P2PKH address ever
-            // reaches here the fee is computed for the wrong input size, and
-            // while `add_transparent_p2pkh_input` and the runtime fee guard
-            // would both catch it, they would catch it as a confusing
-            // downstream failure rather than a broken invariant. Raised in
-            // review of #187.
-            debug_assert!(
-                matches!(
-                    utxo.address,
-                    zcash_transparent::address::TransparentAddress::PublicKeyHash(_)
-                ),
-                "transparent recovery assumes P2PKH inputs; got {:?}",
-                utxo.address
-            );
-            zcash_primitives::transaction::fees::transparent::InputSize::STANDARD_P2PKH
-        })
-        .collect::<Vec<_>>();
+    let input_sizes = std::iter::repeat_n(
+        zcash_primitives::transaction::fees::transparent::InputSize::STANDARD_P2PKH,
+        input_count,
+    )
+    .collect::<Vec<_>>();
 
     // A Sapling bundle pads its outputs to `MIN_SHIELDED_OUTPUTS` for
     // privacy, so the single output we add is billed as more than one. Ask
@@ -298,7 +269,62 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
             0,
         )
         .map_err(|err| ZeckError::Wallet(format!("computing the ZIP-317 fee failed: {err:?}")))?;
-    let fee = u64::from(fee);
+    Ok(u64::from(fee))
+}
+
+/// [`zip317_sweep_fee`] for a preview, which has a network but no chain tip.
+/// ZIP-317's standard rule does not vary by height past NU5, so NU5
+/// activation stands in for it.
+pub fn transparent_sweep_fee(network: ZeckNetwork, input_count: usize) -> ZeckResult<u64> {
+    use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
+    let params = crate::workspace::consensus_network(network);
+    let height = params
+        .activation_height(NetworkUpgrade::Nu5)
+        .ok_or_else(|| {
+            ZeckError::Internal("NU5 has no activation height on this network".to_owned())
+        })?;
+    zip317_sweep_fee(&params, height, input_count)
+}
+
+/// Cost a sweep of every supplied UTXO into a single shielded output.
+///
+/// Sweeping *everything* into *one* output is what makes this costable in
+/// advance: there is no change, so the fee depends only on the input count.
+///
+/// Returns `None` when the wallet holds nothing. Returns an error when the
+/// balance cannot cover its own fee — the honest answer for dust, rather
+/// than building a transaction the network will reject.
+pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
+    params: &P,
+    target_height: zcash_protocol::consensus::BlockHeight,
+    utxos: &[TransparentUtxo],
+) -> ZeckResult<Option<TransparentSweepPlan>> {
+    if utxos.is_empty() {
+        return Ok(None);
+    }
+
+    let total: u64 = utxos.iter().fold(0u64, |acc, u| {
+        acc.saturating_add(u64::from(u.txout.value()))
+    });
+
+    // Every input is P2PKH — these keys came from `key`/`ckey` records,
+    // which store pubkeys, not scripts. Asserted rather than assumed: if a
+    // non-P2PKH address ever reaches here the fee is computed for the wrong
+    // input size, and while `add_transparent_p2pkh_input` and the runtime
+    // fee guard would both catch it, they would catch it as a confusing
+    // downstream failure rather than a broken invariant. Raised in review of
+    // #187.
+    for utxo in utxos {
+        debug_assert!(
+            matches!(
+                utxo.address,
+                zcash_transparent::address::TransparentAddress::PublicKeyHash(_)
+            ),
+            "transparent recovery assumes P2PKH inputs; got {:?}",
+            utxo.address
+        );
+    }
+    let fee = zip317_sweep_fee(params, target_height, utxos.len())?;
 
     let Some(output) = total.checked_sub(fee).filter(|out| *out > 0) else {
         // An economic condition, not a misconfiguration: nothing the user
@@ -497,11 +523,40 @@ pub async fn scan_transparent_only(
     Ok(summarize(&utxos, keys.len(), chain_tip, network))
 }
 
+/// Refuse a transparent sweep whose fee, with what the sweep has already
+/// paid, is over `--max-fee`.
+pub(crate) fn check_transparent_fee(
+    fee_zatoshis: u64,
+    input_count: usize,
+    prior_fee_zatoshis: u64,
+    max_fee_zatoshis: Option<u64>,
+) -> ZeckResult<()> {
+    let total = crate::service::checked_fee_total(prior_fee_zatoshis, fee_zatoshis)?;
+    match max_fee_zatoshis {
+        Some(cap) if total > cap && prior_fee_zatoshis == 0 => {
+            Err(ZeckError::MaxFeeExceeded(format!(
+                "the sweep needs a {fee_zatoshis} zatoshi fee for {input_count} input(s), \
+                 above the {cap} zatoshi limit. Nothing was signed or broadcast."
+            )))
+        }
+        Some(cap) if total > cap => Err(ZeckError::MaxFeeExceeded(format!(
+            "the transparent sweep needs a {fee_zatoshis} zatoshi fee for {input_count} \
+             input(s); with {prior_fee_zatoshis} already paid by this sweep's earlier \
+             transactions the total is {total}, above the {cap} zatoshi limit. Nothing was \
+             signed or broadcast for it."
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Sweep every spendable transparent UTXO into one shielded output at
 /// `destination`.
 ///
 /// `max_fee_zatoshis` is checked before anything is signed, so a fee the
-/// caller considers unacceptable costs nothing.
+/// caller considers unacceptable costs nothing. It caps the whole sweep:
+/// `prior_fee_zatoshis` is what the caller's earlier transactions in the
+/// same sweep already paid (the Sapling leg of an imported wallet), and 0
+/// when this is the only transaction.
 ///
 /// Broadcasts. Returns once lightwalletd has accepted the transaction into
 /// the mempool — acceptance is not confirmation, and the caller must say so.
@@ -511,6 +566,7 @@ pub async fn sweep_transparent_only(
     lightwalletd_url: &str,
     destination: &str,
     max_fee_zatoshis: Option<u64>,
+    prior_fee_zatoshis: u64,
 ) -> ZeckResult<Option<TransparentSweepOutcome>> {
     use zcash_client_backend::proto::service::RawTransaction;
     use zcash_proofs::prover::LocalTxProver;
@@ -535,15 +591,12 @@ pub async fn sweep_transparent_only(
         return Ok(None);
     };
 
-    if let Some(max_fee) = max_fee_zatoshis {
-        if plan.fee_zatoshis > max_fee {
-            return Err(ZeckError::InvalidConfig(format!(
-                "the sweep needs a {} zatoshi fee for {} input(s), above the {max_fee} \
-                 zatoshi limit. Nothing was signed or broadcast.",
-                plan.fee_zatoshis, plan.input_count
-            )));
-        }
-    }
+    check_transparent_fee(
+        plan.fee_zatoshis,
+        plan.input_count,
+        prior_fee_zatoshis,
+        max_fee_zatoshis,
+    )?;
 
     let prover = LocalTxProver::bundled();
     let tx = build_sweep_transaction(
@@ -859,6 +912,27 @@ mod destination_tests {
             matches!(err, ZeckError::DestinationMustBeUnified),
             "a t-address is refused for not being unified, not for anything about \
              networks or receivers; got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cumulative_fee_tests {
+    use super::*;
+
+    /// The transparent leg of an imported sweep runs after its Sapling
+    /// transactions, and must count what they already paid.
+    #[test]
+    fn the_transparent_leg_counts_fees_already_paid() {
+        assert!(check_transparent_fee(3_000, 2, 0, Some(5_000)).is_ok());
+        let err = check_transparent_fee(3_000, 2, 4_000, Some(5_000))
+            .expect_err("4,000 already paid plus 3,000 is over 5,000");
+        let text = err.to_string();
+        assert!(text.contains("4000 already paid"), "{text}");
+        assert!(text.contains("Nothing was signed"), "{text}");
+        assert!(
+            check_transparent_fee(3_000, 2, 9_999_999, None).is_ok(),
+            "no cap, no limit"
         );
     }
 }
