@@ -748,4 +748,142 @@ mod tests {
             .expect_err("regtest with no address cannot connect");
         assert!(matches!(err, PoolError::AllPeersRefused { tried: 0, .. }));
     }
+
+    /// What a fake peer saw of one inbound connection.
+    #[derive(Debug)]
+    struct Closed {
+        /// The listener's address, which is what the client dialled.
+        peer: String,
+        /// Whether the client sent `verack`, i.e. finished its half of the
+        /// handshake and was about to return a `Peer`.
+        handshaken: bool,
+    }
+
+    /// How a fake peer behaves once it has read our `version`.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Complete the handshake straight away.
+        Now,
+        /// Never answer, so the client is left mid-handshake.
+        Never,
+    }
+
+    /// A Zebra stand-in that reports when each connection closes.
+    ///
+    /// The close is the thing being measured: Zebra frees a source IP's
+    /// single inbound slot only when it sees the connection end, so a close
+    /// that never arrives is the leak.
+    async fn reporting_peer(
+        answer: Answer,
+        closed: tokio::sync::mpsc::UnboundedSender<Closed>,
+    ) -> String {
+        use crate::p2p::wire::{encode_message, encode_version};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = addr.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let closed = closed.clone();
+                let peer = peer.clone();
+                tokio::spawn(async move {
+                    let mut handshaken = false;
+                    let mut header = [0u8; 24];
+                    // Read until the client goes away. EOF and reset both
+                    // count: either one frees Zebra's slot.
+                    while stream.read_exact(&mut header).await.is_ok() {
+                        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+                        let mut payload = vec![0u8; len];
+                        if stream.read_exact(&mut payload).await.is_err() {
+                            break;
+                        }
+                        if header[4..11] == *b"version" && matches!(answer, Answer::Now) {
+                            let version = encode_version(170_160, "/Zebra:2.5.0/", 3_500_000, 1, 0);
+                            let _ = stream
+                                .write_all(&encode_message(
+                                    P2pNetwork::Regtest,
+                                    "version",
+                                    &version,
+                                ))
+                                .await;
+                            let _ = stream
+                                .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
+                                .await;
+                        }
+                        if header[4..10] == *b"verack" {
+                            handshaken = true;
+                        }
+                    }
+                    let _ = closed.send(Closed { peer, handshaken });
+                });
+            }
+        });
+        addr
+    }
+
+    /// Every connection the race did not keep must close promptly.
+    ///
+    /// Zebra allows one inbound connection per source IP and remembers the
+    /// attempt for [`PEER_RECONNECT_DELAY`]. A losing connection left open —
+    /// whether it had already finished its handshake or was still waiting on
+    /// one — holds that node's only slot for this user, and the next
+    /// reconnect is refused as "every peer is busy". Several peers answer at
+    /// once here so that losers finish their handshakes too, alongside two
+    /// that never answer and so are cut off mid-handshake. Only the winner
+    /// may still be open a second after the race returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn losing_connections_are_closed_as_soon_as_the_race_is_won() {
+        let (tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
+        let mut candidates = Vec::new();
+        for _ in 0..6 {
+            candidates.push(reporting_peer(Answer::Now, tx.clone()).await);
+        }
+        for _ in 0..2 {
+            candidates.push(reporting_peer(Answer::Never, tx.clone()).await);
+        }
+        drop(tx);
+
+        let winner = connect_to_any_except(P2pNetwork::Regtest, &candidates, &[], 1)
+            .await
+            .expect("a peer that answers wins the race");
+        let won_at = tokio::time::Instant::now();
+
+        let mut losers = Vec::new();
+        while losers.len() < candidates.len() - 1 {
+            match tokio::time::timeout_at(won_at + Duration::from_secs(1), closed.recv()).await {
+                Ok(Some(close)) => losers.push(close),
+                Ok(None) => unreachable!("the listeners outlive the test"),
+                Err(_) => break,
+            }
+        }
+        eprintln!(
+            "{} losers closed within 1 s, {} of them after a completed handshake",
+            losers.len(),
+            losers.iter().filter(|l| l.handshaken).count()
+        );
+
+        let still_open: Vec<&String> = candidates
+            .iter()
+            .filter(|c| *c != winner.dialled_as() && !losers.iter().any(|l| &l.peer == *c))
+            .collect();
+        assert!(
+            still_open.is_empty(),
+            "losing connections still open a second after the race: {still_open:?} \
+             (closed: {losers:?})"
+        );
+        assert!(
+            losers.iter().all(|l| l.peer != winner.dialled_as()),
+            "the winner itself must stay connected: {losers:?}"
+        );
+
+        // The winner is released the same way when its owner lets it go.
+        let kept = winner.dialled_as().to_owned();
+        drop(winner);
+        let last = tokio::time::timeout(Duration::from_secs(1), closed.recv())
+            .await
+            .expect("the winner closes once dropped")
+            .expect("a close report");
+        assert_eq!(last.peer, kept);
+    }
 }
