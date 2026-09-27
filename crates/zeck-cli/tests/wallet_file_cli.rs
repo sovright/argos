@@ -467,60 +467,70 @@ fn a_seedless_wallet_and_a_key_file_still_merge() {
     );
 }
 
-/// A seedless sweep never receives `--memo` or `--donation-rate`: the
-/// imported-key and transparent-only routes build their transactions without
-/// either. Accepting them and sweeping anyway is how an exchange deposit
-/// memo goes missing, so both routes must refuse up front — before any scan
-/// or network access (the lightwalletd URL here is unreachable on purpose).
+/// A wallet with no seed phrase sweeps without a memo, and a dropped memo
+/// can lose an exchange deposit. `--memo` is therefore refused, and refused
+/// before the scan: finding out after hours of scanning is not a refusal
+/// anyone would thank us for.
 #[test]
-fn a_seedless_sweep_refuses_a_memo_it_would_drop() {
+fn a_seedless_sweep_refuses_a_memo_before_scanning() {
     let path = fixture(SPROUT_PLAINTEXT);
-    let key = key_file("memo-sapling-key", TEST_SAPLING_KEY_MAINNET);
-    let destination = "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf";
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("memo"),
+        "sweep",
+        "--destination",
+        "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf",
+        "--memo",
+        "exchange deposit 12345",
+        "--dry-run",
+    ]);
 
-    for (key_flag, key_path, extra) in [
-        ("--wallet-file", path.to_str().unwrap(), ["--memo", "12345"]),
-        (
-            "--sapling-key-file",
-            key.to_str().unwrap(),
-            ["--memo", "12345"],
-        ),
-        (
-            "--wallet-file",
-            path.to_str().unwrap(),
-            ["--donation-rate", "0.01"],
-        ),
-    ] {
-        let dir = scratch_dir("memo");
-        let mut args = vec![
-            key_flag,
-            key_path,
-            "--accept-tos",
-            "--lightwalletd-url",
-            "https://127.0.0.1:1",
-            "--data-dir",
-            &dir,
-            "sweep",
-            "--destination",
-            destination,
-        ];
-        args.extend(extra);
-        let out = argos(&args);
+    assert!(
+        !out.status.success(),
+        "a memo that cannot be sent must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("memo") && stderr.contains("seed phrase"),
+        "the refusal must say why, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("scan can take hours"),
+        "the memo must be refused before the scan starts, got:\n{stderr}"
+    );
+}
 
-        assert!(
-            !out.status.success(),
-            "{key_flag} {extra:?} must be refused"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains(&format!("{} is not applied", extra[0])),
-            "the refusal must name the dropped flag, got:\n{stderr}"
-        );
-        assert!(
-            !stderr.contains("lightwalletd") && !stderr.contains("SPROUT FUNDS ARE NOT COVERED"),
-            "the refusal must come before the scan starts, got:\n{stderr}"
-        );
-    }
+/// The donation is the same shape of trap with no funds at stake, so it is
+/// reported rather than refused — the GUI sends one by default.
+#[test]
+fn a_seedless_sweep_says_it_sends_no_donation() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("donation"),
+        "sweep",
+        "--destination",
+        "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf",
+        "--donation-rate",
+        "0.10",
+        "--dry-run",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sends no donation"),
+        "a requested donation that will not be sent must be named, got:\n{stderr}"
+    );
 }
 
 /// A key-source flag that the chosen command never reads must be refused,

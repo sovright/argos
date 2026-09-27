@@ -440,6 +440,11 @@ pub struct SkippedSweepAccount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepProposal {
     pub transactions: Vec<ProposedTx>,
+    /// Set when this route can never send a donation, saying why — so a
+    /// zero donation is not explained as a fee threshold it has nothing to
+    /// do with.
+    #[serde(default)]
+    pub donation_note: Option<String>,
     pub skipped_accounts: Vec<SkippedSweepAccount>,
     pub total_send_zatoshis: u64,
     pub total_fee_zatoshis: u64,
@@ -485,6 +490,9 @@ pub struct TxBroadcastResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepOutcome {
     pub transactions: Vec<TxBroadcastResult>,
+    /// As on [`SweepProposal`].
+    #[serde(default)]
+    pub donation_note: Option<String>,
     /// Accounts that held a balance but moved nothing because every spendable
     /// note was below the ZIP-317 fee floor (only dust UTXOs, or funds outside
     /// the shieldable receivers). The sweep skipped them and continued with the
