@@ -54,6 +54,7 @@ struct Cli {
 
     /// File holding a raw Sprout spending key (`SK…` mainnet / `ST…`
     /// testnet), one per line, for a key with no wallet file behind it.
+    /// Read only by `scan-sprout`.
     ///
     /// A file rather than a flag, for the same reason the wallet passphrase
     /// is prompt-only: a spending key passed as an argument lands in shell
@@ -79,6 +80,9 @@ struct Cli {
     data_dir: PathBuf,
 
     /// lightwalletd gRPC endpoint(s). Comma-separated URLs are tried in order.
+    /// Each must be https://, or http:// to localhost. The default is a
+    /// mainnet server: with --network testnet, pass a testnet one such as
+    /// https://testnet.zec.rocks:443.
     #[arg(
         long,
         visible_alias = "server",
@@ -86,7 +90,9 @@ struct Cli {
     )]
     lightwalletd_url: String,
 
-    /// Scan exactly this many accounts (overrides --gap-limit).
+    /// Scan exactly this many accounts (overrides --gap-limit). Also how many
+    /// accounts show-keys prints (default 20). Seed sources only: an
+    /// imported key set is scanned in full, one account per key.
     #[arg(long)]
     num_accounts: Option<u32>,
 
@@ -98,7 +104,8 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     transparent_index_start: u32,
 
-    /// Number of indices in the additional complete transparent range (default: 0–999).
+    /// Number of indices in the additional complete transparent range,
+    /// counted from --transparent-index-start.
     #[arg(long, default_value_t = 1000)]
     transparent_index_count: u32,
 
@@ -106,16 +113,22 @@ struct Cli {
     #[arg(long)]
     transparent_change: bool,
 
-    /// Wallet birthday as a block height. Use 0 for a full scan from genesis.
+    /// Wallet birthday as a block height. Heights before Sapling activation
+    /// (419200 on mainnet, the default) scan from Sapling activation, the
+    /// earliest height lightwalletd can serve. Sprout is scanned separately
+    /// by `scan-sprout`.
     #[arg(long, default_value_t = 419_200)]
     birthday: u32,
 
-    /// Wallet creation date (YYYY-MM-DD). Estimates birthday height automatically.
+    /// Wallet creation date (YYYY-MM-DD). Estimates the birthday height from
+    /// it, using lightwalletd.
     #[arg(long, conflicts_with = "birthday_auto_detect")]
     birthday_date: Option<String>,
 
-    /// Probe lightwalletd to auto-detect the wallet birthday from on-chain history.
-    /// Supersedes --birthday and --birthday-date. Requires --lightwalletd-url.
+    /// Probe lightwalletd to auto-detect the wallet birthday from on-chain
+    /// history. Overrides --birthday; cannot be combined with
+    /// --birthday-date. Needs a seed phrase: --seed-file, or a ZecWallet
+    /// Lite wallet.
     #[arg(long, conflicts_with = "birthday_date")]
     birthday_auto_detect: bool,
 
@@ -167,7 +180,8 @@ fn transparent_scan_config(
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Derive and display all account keys and addresses (no network needed).
+    /// Derive and display each account's addresses and derivation paths from
+    /// the seed phrase. Prints no keys; no network needed.
     ShowKeys,
 
     /// Report what Argos can read out of --wallet-file. Purely local: no
@@ -179,15 +193,22 @@ enum Commands {
 
     /// Scan and then sweep recovered funds to a Unified Address.
     Sweep {
-        /// Destination Unified Address (must include Orchard or Sapling receiver).
+        /// Destination Unified Address (must include an Orchard or Sapling
+        /// receiver). Transparent funds from a wallet file with no seed phrase
+        /// are swept into Sapling, so that destination needs a Sapling
+        /// receiver.
         #[arg(long)]
         destination: String,
 
-        /// Optional memo attached to shielded outputs (max 512 bytes).
+        /// Optional memo attached to shielded outputs (max 512 bytes). Applies
+        /// only when sweeping a seed phrase or a ZecWallet Lite wallet; other
+        /// sources ignore it.
         #[arg(long)]
         memo: Option<String>,
 
-        /// Fraction of recovered funds to donate to the project (e.g. 0.10 for 10%). Omit to skip.
+        /// Fraction of recovered funds to donate to the project (e.g. 0.10 for
+        /// 10%). Omit to skip. Applies only when sweeping a seed phrase or a
+        /// ZecWallet Lite wallet; other sources ignore it.
         #[arg(long)]
         donation_rate: Option<f64>,
 
@@ -195,7 +216,8 @@ enum Commands {
         #[arg(long)]
         donor_email: Option<String>,
 
-        /// Maximum fee in ZEC (e.g. 0.001). Sweep is skipped if estimated fee exceeds this.
+        /// Maximum fee in ZEC (e.g. 0.001). The sweep stops with an error
+        /// rather than pay more.
         #[arg(long, value_parser = parse_zec_to_zatoshis)]
         max_fee: Option<u64>,
 
@@ -210,24 +232,30 @@ enum Commands {
 
     /// Find Sprout notes for wallet or standalone keys by scanning the chain.
     ///
-    /// For keys with no wallet file behind them — a paper backup, or a
-    /// `z_exportkey` string. There is no cheaper route: Sprout notes are
+    /// Takes keys from --sprout-key-file (a paper backup, or a `z_exportkey`
+    /// string), --wallet-file, or both. There is no cheaper route: Sprout notes are
     /// discoverable only by trial-decrypting every JoinSplit, and no Sprout
     /// address index exists anywhere. Expect hours and tens of gigabytes.
     ///
     /// A `wallet.dat` almost never needs this — its cached witnesses make
     /// `sweep-sprout` work with no scan at all.
     ScanSprout {
-        /// Destination Sapling address to sweep to once the scan finishes.
-        /// Omit to scan and report without moving anything.
+        /// Bare Sapling address, or a Unified Address with a Sapling receiver,
+        /// to sweep to once the scan finishes. Omit to scan and report
+        /// without moving anything. The sweep is broadcast through
+        /// --lightwalletd-url.
         #[arg(long)]
         destination: Option<String>,
 
-        /// A peer to use instead of the DNS seeds, as `host:port`. Repeatable.
+        /// A Zcash node to fetch blocks from, as `host:port` (zebrad or
+        /// zcashd, usually port 8233). Repeatable. Tried alongside the
+        /// public DNS-seed peers rather than instead of them: whichever
+        /// connects first is used.
         #[arg(long)]
         peer: Vec<String>,
 
-        /// Path to sprout-groth16.params. Only needed when sweeping.
+        /// Path to sprout-groth16.params (~725 MB). Only needed when sweeping.
+        /// Defaults to $ARGOS_SPROUT_PARAMS, then ~/.zcash-params.
         #[arg(long)]
         sprout_params: Option<PathBuf>,
 
