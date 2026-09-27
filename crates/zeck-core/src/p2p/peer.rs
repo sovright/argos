@@ -161,6 +161,19 @@ impl Peer {
         &self.dialled_as
     }
 
+    /// Close the connection now, rather than whenever this value is dropped.
+    ///
+    /// A caller replacing this peer must call it before dialling the
+    /// replacement. Zebra keeps one inbound connection per IP and drops a
+    /// second after the handshake, so a connection left open while the next
+    /// is dialled makes the node already in use refuse its own replacement.
+    ///
+    /// Errors are ignored: a connection that cannot be shut down cleanly is
+    /// one the peer has already given up on, which is the goal here.
+    pub async fn close(&mut self) {
+        let _ = self.stream.shutdown().await;
+    }
+
     /// Exchange `version`/`verack`.
     ///
     /// The nonce exists to let a node recognise a connection to itself. This

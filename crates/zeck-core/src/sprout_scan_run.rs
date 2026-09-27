@@ -671,7 +671,16 @@ impl PageFetcher {
     ///
     /// A failed send means the consumer has gone, and the page send that
     /// follows will notice that and end the task; nothing to do about it here.
+    ///
+    /// The current connection is closed first. Assigning the new peer would
+    /// drop it only after the replacement had been dialled and handshaken, and
+    /// a Zebra node — the fallback nodes are always candidates — drops a
+    /// second connection from an IP it already has one from, so the scan
+    /// would be refused by the very node it was using. If no replacement is
+    /// found the closed peer is never used again: every caller ends the scan
+    /// on this error.
     async fn reconnect(&mut self) -> ZeckResult<()> {
+        self.peer.close().await;
         let waits = &self.waits;
         self.peer = connect_peer(self.network, &self.peers, &self.silent, |wait| {
             let _ = waits.send(wait);
@@ -1121,41 +1130,110 @@ mod tests {
     /// advertises a height well past anything a regtest scan would need, as
     /// the reporter's node did.
     async fn silent_peer() -> String {
-        use crate::p2p::wire::{encode_message, encode_version};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut header = [0u8; 24];
-                    while stream.read_exact(&mut header).await.is_ok() {
-                        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-                        let mut payload = vec![0u8; len];
-                        if stream.read_exact(&mut payload).await.is_err() {
-                            return;
-                        }
-                        if header[4..11] == *b"version" {
-                            let version =
-                                encode_version(170_160, "/MagicBean:6.20.0/", 3_500_000, 1, 0);
-                            let _ = stream
-                                .write_all(&encode_message(
-                                    P2pNetwork::Regtest,
-                                    "version",
-                                    &version,
-                                ))
-                                .await;
-                            let _ = stream
-                                .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
-                                .await;
-                        }
-                        // Everything else, `getheaders` included, is ignored.
-                    }
-                });
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(answer_handshake_only(stream));
             }
         });
         addr
+    }
+
+    /// Complete the handshake on `stream` and ignore everything after it,
+    /// returning once the client has closed the connection.
+    async fn answer_handshake_only(mut stream: tokio::net::TcpStream) {
+        use crate::p2p::wire::{encode_message, encode_version};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut header = [0u8; 24];
+        while stream.read_exact(&mut header).await.is_ok() {
+            let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            if header[4..11] == *b"version" {
+                let version = encode_version(170_160, "/MagicBean:6.20.0/", 3_500_000, 1, 0);
+                let _ = stream
+                    .write_all(&encode_message(P2pNetwork::Regtest, "version", &version))
+                    .await;
+                let _ = stream
+                    .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
+                    .await;
+            }
+            // Everything else, `getheaders` included, is ignored.
+        }
+    }
+
+    /// A peer that notes, for each connection after the first, whether the
+    /// one before it had already been closed when this one arrived — the
+    /// fact Zebra's one-inbound-connection-per-IP rule turns on.
+    ///
+    /// "Already closed" allows a short grace for the close to be read, so the
+    /// check measures the order of close and dial rather than which task the
+    /// scheduler happened to run first. Without the fix the old connection
+    /// stays open until the new handshake completes, which this peer holds
+    /// back until the grace has expired, so no grace can hide the bug.
+    async fn one_connection_per_ip_peer() -> (String, std::sync::Arc<std::sync::Mutex<Vec<bool>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut previous: Option<tokio::sync::oneshot::Receiver<()>> = None;
+            while let Ok((stream, _)) = listener.accept().await {
+                if let Some(closed) = previous.take() {
+                    let was_closed = tokio::time::timeout(Duration::from_millis(500), closed)
+                        .await
+                        .is_ok();
+                    record.lock().unwrap().push(was_closed);
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                previous = Some(rx);
+                tokio::spawn(async move {
+                    answer_handshake_only(stream).await;
+                    let _ = tx.send(());
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The reported failure: "Every Zcash peer is busy" after every page.
+    ///
+    /// Zebra keeps one inbound connection per IP and drops a second one after
+    /// the handshake. The Sovright fallback nodes are always candidates, so a
+    /// replacement dialled while the current connection is still open is very
+    /// likely to reach the node already in use, which then refuses it as a
+    /// duplicate. The current connection must be closed before any dial.
+    #[tokio::test]
+    async fn reconnect_closes_the_current_connection_before_dialling() {
+        let (addr, seen) = one_connection_per_ip_peer().await;
+        let peers = vec![addr];
+        let peer = connect_peer(P2pNetwork::Regtest, &peers, &[], |_| {})
+            .await
+            .unwrap();
+        let (waits, _waits_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut fetcher = PageFetcher {
+            peer,
+            locator: [0; 32],
+            empty_replies: 0,
+            fetched: 0,
+            floor: 0,
+            network: P2pNetwork::Regtest,
+            peers,
+            silent: Vec::new(),
+            waits,
+        };
+
+        fetcher.reconnect().await.unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true],
+            "the old connection was still open when its replacement was dialled"
+        );
     }
 
     /// The reported failure: Argos connected to the user's own node every
