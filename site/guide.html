@@ -252,6 +252,25 @@
                 recovery again.
               </p>
             </details>
+            <details open>
+              <summary>The sweep said it completed, but nothing arrived at my destination</summary>
+              <p>
+                Check your Argos version. Sweeping transparent funds takes two steps: Argos
+                shields the funds, then sends the shielded balance to your destination address.
+                In versions before <strong>1.3.0</strong>, the wait between those two steps could
+                give up and skip the send while still reporting the sweep as complete.
+              </p>
+              <p>
+                Your funds were never at risk. They are shielded in the same wallet, under the
+                keys derived from your seed phrase — nothing left your control and nothing moved
+                to anyone else. The recovery report for an affected sweep shows a shielding
+                transaction but no sweep transaction.
+              </p>
+              <p>
+                <a href="index.html#download">Download 1.3.0</a> and run the recovery again. The
+                sweep picks up the shielded balance and sends it to your destination.
+              </p>
+            </details>
             <details>
               <summary>The seed validation fails</summary>
               <p>
