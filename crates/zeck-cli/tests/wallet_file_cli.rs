@@ -533,6 +533,105 @@ fn a_seedless_sweep_says_it_sends_no_donation() {
     );
 }
 
+/// A real mainnet Sapling address to sweep to, derived from the BIP-39 test
+/// vector rather than copied from anywhere: `show-keys` needs no network.
+fn test_vector_sapling_address(dir: &std::path::Path) -> String {
+    let seed = dir.join("seed.txt");
+    std::fs::write(
+        &seed,
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon art",
+    )
+    .expect("write seed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let out = argos(&[
+        "--seed-file",
+        seed.to_str().expect("utf-8"),
+        "--num-accounts",
+        "1",
+        "show-keys",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("Sapling address")
+                .map(|a| a.trim().to_owned())
+        })
+        .unwrap_or_else(|| panic!("show-keys printed no Sapling address:\n{stdout}"))
+}
+
+/// Reported: `scan-sprout --destination … --lightwalletd-url nonono` started
+/// an hours-long scan whose only use of that server — broadcasting the sweep
+/// — could never work. The address must be refused before the scan, and the
+/// progress line must not claim a checkpoint exists before one is written.
+#[test]
+fn scan_sprout_refuses_an_unusable_server_before_scanning() {
+    let dir = std::env::temp_dir().join(format!("argos-sprout-url-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let destination = test_vector_sapling_address(&dir);
+    let wallet = fixture(SPROUT_PLAINTEXT);
+
+    // Killed at a deadline rather than awaited: a build that does not refuse
+    // goes on to scan mainnet for hours, and a failing test must neither
+    // hang nor load public peers for longer than it takes to fail.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_argos"))
+        .args([
+            "--wallet-file",
+            wallet.to_str().expect("utf-8"),
+            "--data-dir",
+            dir.to_str().expect("utf-8"),
+            "--accept-tos",
+            "--lightwalletd-url",
+            "nonono",
+            "scan-sprout",
+            "--destination",
+            &destination,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("argos binary should run");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().expect("piped"), &mut stderr)
+        .expect("stderr");
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = status.unwrap_or_else(|| {
+        panic!("scan-sprout started scanning instead of refusing the server:\n{stderr}")
+    });
+    assert!(!status.success(), "must refuse, got:\n{stderr}");
+    assert!(
+        stderr.contains("--lightwalletd-url"),
+        "must name the flag:\n{stderr}"
+    );
+    // Matches the banner as it now reads; the old "Progress is saved to"
+    // wording no longer exists anywhere, so asserting its absence guarded
+    // nothing.
+    assert!(
+        !stderr.contains("Progress will be saved to"),
+        "refused before the scan, so the scan's progress banner must not appear:\n{stderr}"
+    );
+}
+
 /// A key-source flag that the chosen command never reads must be refused,
 /// not silently dropped. Now that every top-level flag is `global`, it is
 /// natural to type `argos show-keys --sprout-key-file …` and assume the key

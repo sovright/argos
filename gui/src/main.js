@@ -1141,13 +1141,13 @@ $("sprout-scan-run").addEventListener("click", runSproutScan);
       // and the line says why nothing is moving, so a busy network does not
       // look like a hung app. The sentence comes from the backend.
       if (p.peerWait) {
-        setStatus("sprout-scan-status", `${p.peerWait} Safe to stop; progress is saved.`, "");
+        setStatus("sprout-scan-status", `${p.peerWait} Safe to stop; progress is saved every 500 blocks.`, "");
         return;
       }
       setStatus(
         "sprout-scan-status",
         `Scanning ${p.height.toLocaleString()} / ${p.target.toLocaleString()} ` +
-          `(${pct.toFixed(1)}%) — ${p.notesFound} note(s) found. Safe to stop; progress is saved.`,
+          `(${pct.toFixed(1)}%) — ${p.notesFound} note(s) found. Safe to stop; progress is saved every 500 blocks.`,
         "",
       );
     });

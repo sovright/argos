@@ -800,6 +800,19 @@ async fn scan_sprout(
     // would be the worst possible time to find out.
     if let Some(dest) = destination {
         argos_core::sprout_sweep::parse_sapling_destination(dest, network)?;
+        // The sweep is broadcast through lightwalletd, after the scan. A
+        // server address that cannot work is otherwise found out only then,
+        // hours in — as a user who passed `--lightwalletd-url nonono` would
+        // have.
+        argos_core::lightwalletd::validated_lightwalletd_endpoints(lightwalletd_url).map_err(
+            |err| {
+                anyhow::anyhow!(
+                    "--destination sweeps through --lightwalletd-url once the scan finishes, \
+                     and that server address cannot work ({err}). Fix it before scanning, or \
+                     drop --destination to scan and report only."
+                )
+            },
+        )?;
     }
 
     println!();
@@ -816,7 +829,13 @@ async fn scan_sprout(
     let tip_anchor = sprout_tip_anchor(network, lightwalletd_url).await;
 
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
-    eprintln!("Progress is saved to {}", checkpoint.display());
+    // Worded for what exists: nothing is written until the first
+    // checkpoint, and a scan that has not started must not look saved.
+    eprintln!(
+        "Progress will be saved to {} (first written after {} blocks).",
+        checkpoint.display(),
+        argos_core::sprout_scan_run::CHECKPOINT_EVERY
+    );
     eprintln!("Interrupt with Ctrl-C at any time and re-run to resume.");
     eprintln!();
 
