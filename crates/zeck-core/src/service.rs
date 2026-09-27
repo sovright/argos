@@ -391,6 +391,7 @@ impl RecoveryService {
                 )
             })?;
 
+        refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
         if session.runtime.key_source.wallet_seed()?.is_none() {
             return build_seedless_sweep_proposal(&progress, request, session.runtime.network);
         }
@@ -446,9 +447,21 @@ impl RecoveryService {
         // here rather than in a front-end so the CLI and the GUI cannot
         // diverge on which key sources are spendable — the branch belongs
         // wherever `execute_sweep` is the shared surface.
+        // Refused at the same level as in `propose_sweep`, not inside the
+        // imported-keys branch: a seedless source that does not override
+        // `imported_keys` would otherwise be refused at propose and accepted
+        // here.
+        refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
         if session.runtime.key_source.wallet_seed()?.is_none() {
             if let Some(keys) = session.runtime.key_source.imported_keys() {
-                refuse_memo_without_seed(request.memo.as_deref())?;
+                // Before the Sapling legs broadcast, not after: the
+                // transparent leg is last and is the only one that needs a
+                // Sapling receiver.
+                crate::transparent_recovery::refuse_destination_the_transparent_leg_cannot_reach(
+                    keys,
+                    &request.destination,
+                    session.runtime.network,
+                )?;
                 return sweep_imported_session(&session.runtime, keys, &request).await;
             }
         }
@@ -757,26 +770,50 @@ fn build_sweep_proposal(
         total_donation_zatoshis,
         dry_run_default: true,
         warning: Some(warning),
+        donation_note: None,
     })
 }
 
 /// Refuse a memo on a sweep that has no seed phrase behind it.
 ///
-/// Only the HD sweep attaches a memo. The imported-key and transparent-only
-/// sweeps send none, and a memo dropped silently can lose an exchange
-/// deposit — so the request is refused, not quietly trimmed. A blank memo is
-/// no memo, matching `normalized_memo_text`.
+/// Only the HD sweep attaches a memo. The imported-key, transparent-only and
+/// matched-address sweeps send none, and a memo dropped silently can lose an
+/// exchange deposit — so the request is refused, not quietly trimmed.
+///
+/// A blank memo is not refused because the user has asked for nothing: it is
+/// what the memo field holds when left empty. (On the HD route a blank memo
+/// is replaced by the default `RECOVERY_MEMO_DEFAULT` in
+/// `normalized_memo_text`; a seedless sweep sends none at all.)
 pub fn refuse_memo_without_seed(memo: Option<&str>) -> ZeckResult<()> {
     if memo.is_some_and(|memo| !memo.trim().is_empty()) {
+        // Worded for the sweep, not the wallet: a matched-address recovery
+        // takes this route although its user has just typed a seed phrase.
         return Err(ZeckError::InvalidMemo(
-            "a memo can be attached only when sweeping from a seed phrase. This wallet \
-             has no seed phrase, and its sweep sends no memo. Remove the memo, or send \
+            "a memo can be attached only to a full recovery from a seed phrase. This recovery \
+             sweeps individual keys (an imported wallet, standalone keys, or a single \
+             matched address), and that sweep sends no memo. Remove the memo, or send \
              from the destination wallet afterwards if the recipient needs one."
                 .to_owned(),
         ));
     }
     Ok(())
 }
+
+/// [`refuse_memo_without_seed`], asked of the key source that will be swept.
+///
+/// The one predicate for "can this sweep carry a memo": the GUI asks it
+/// before scanning, `propose_sweep` and `execute_sweep` ask it again.
+pub fn refuse_memo_for_key_source(source: &dyn KeySource, memo: Option<&str>) -> ZeckResult<()> {
+    if source.wallet_seed()?.is_some() {
+        return Ok(());
+    }
+    refuse_memo_without_seed(memo)
+}
+
+/// Why a seedless sweep shows no donation, for both surfaces to show in
+/// place of the fee-threshold explanation, which is false for this route.
+pub const SEEDLESS_DONATION_NOTE: &str = "This sweep sends no donation: only a full recovery \
+     from a seed phrase can include one, so your full balance goes to your address.";
 
 /// The proposal for a sweep with no seed phrase behind it.
 ///
@@ -789,10 +826,101 @@ fn build_seedless_sweep_proposal(
     network: crate::models::ZeckNetwork,
 ) -> ZeckResult<SweepProposal> {
     refuse_memo_without_seed(request.memo.as_deref())?;
-    let mut proposal = build_sweep_proposal(progress, request, network, "")?;
+
+    // Modelled on what `sweep_imported_wallet` actually sends, not on the HD
+    // sweep. Each imported Sapling account is swept in its own send-max
+    // transaction, which is the HD model's final step, so that estimate is
+    // reused for the shielded balance alone. Transparent funds go to the
+    // destination in one direct transaction (`transparent_recovery`); the HD
+    // model instead shielded them to the recovered wallet first, showing a
+    // hop that never happens and charging two fees for it.
+    let mut shielded_only = progress.clone();
+    let mut transparent_zatoshis = 0u64;
+    let mut transparent_utxos = 0usize;
+    let mut transparent_account = None;
+    for account in &mut shielded_only.accounts {
+        if account.transparent_zatoshis > 0 {
+            transparent_account.get_or_insert(account.account_index);
+        }
+        transparent_zatoshis = transparent_zatoshis
+            .checked_add(account.transparent_zatoshis)
+            .ok_or_else(|| {
+                ZeckError::Internal("transparent balance overflowed the supported range".to_owned())
+            })?;
+        transparent_utxos += account.transparent_utxo_count as usize;
+        account.total_zatoshis = account
+            .total_zatoshis
+            .saturating_sub(account.transparent_zatoshis);
+        account.transparent_zatoshis = 0;
+        account.transparent_utxo_count = 0;
+    }
+
+    let max_fee_zatoshis = request.max_fee_zatoshis;
+    let destination = validate_destination_address(&request.destination, network)?.encoded;
+    let mut proposal = build_sweep_proposal(&shielded_only, request, network, "")?;
     for tx in &mut proposal.transactions {
         tx.memo = None;
     }
+
+    if let Some(account_index) = transparent_account {
+        // Refused in the preview too: its transparent transaction needs a
+        // Sapling receiver the address may not have.
+        crate::transparent_recovery::sapling_receiver(&destination, network)?;
+        let fee_zatoshis =
+            crate::transparent_recovery::transparent_sweep_fee(network, transparent_utxos)?;
+        if transparent_zatoshis <= fee_zatoshis {
+            proposal.skipped_accounts.push(SkippedSweepAccount {
+                account_index,
+                gross_zatoshis: transparent_zatoshis,
+                reason: format!(
+                    "Transparent balance is too small to cover the {fee_zatoshis}-zat network fee to move it."
+                ),
+            });
+        } else {
+            let net_zatoshis = transparent_zatoshis - fee_zatoshis;
+            let add = |total: u64, value: u64| {
+                total.checked_add(value).ok_or_else(|| {
+                    ZeckError::Internal("sweep proposal overflowed the supported range".to_owned())
+                })
+            };
+            proposal.total_send_zatoshis = add(proposal.total_send_zatoshis, transparent_zatoshis)?;
+            proposal.total_fee_zatoshis = add(proposal.total_fee_zatoshis, fee_zatoshis)?;
+            proposal.net_received_zatoshis = add(proposal.net_received_zatoshis, net_zatoshis)?;
+            proposal.transactions.push(ProposedTx {
+                kind: ProposedTxKind::SweepShielded,
+                source_account: account_index,
+                destination,
+                gross_zatoshis: transparent_zatoshis,
+                fee_zatoshis,
+                net_zatoshis,
+                donation_zatoshis: 0,
+                note: format!(
+                    "Estimated sweep of {transparent_utxos} transparent UTXO(s) straight to your \
+                     destination's Sapling receiver, in one transaction."
+                ),
+                memo: None,
+            });
+        }
+        // `build_sweep_proposal` checked the cap before this transaction
+        // existed; check the whole sweep again now that it does.
+        enforce_max_fee(proposal.total_fee_zatoshis, max_fee_zatoshis).map_err(|_| {
+            ZeckError::MaxFeeExceeded(format!(
+                "estimated fee {} zats exceeds limit {} zats",
+                proposal.total_fee_zatoshis,
+                max_fee_zatoshis.unwrap_or_default()
+            ))
+        })?;
+    }
+
+    if proposal.net_received_zatoshis > 0 {
+        proposal.warning = Some(
+            "This dry-run proposal uses the balances from the completed scan. A wallet without \
+             a seed phrase is swept one imported Sapling key per transaction, and its \
+             transparent funds in one more, each straight to your destination."
+                .to_owned(),
+        );
+    }
+    proposal.donation_note = Some(SEEDLESS_DONATION_NOTE.to_owned());
     Ok(proposal)
 }
 
@@ -1183,6 +1311,7 @@ fn assemble_sweep_outcome(
             skipped_accounts,
             total_donation_zatoshis,
             error: None,
+            donation_note: None,
         }),
         Err(err) => {
             if results.is_empty() {
@@ -1193,6 +1322,7 @@ fn assemble_sweep_outcome(
                     skipped_accounts,
                     total_donation_zatoshis,
                     error: Some(err.to_string()),
+                    donation_note: None,
                 })
             }
         }
@@ -1991,7 +2121,10 @@ pub(crate) fn proposal_fee_zatoshis<NoteRef>(
     })
 }
 
-fn checked_fee_total(prior_fee_zatoshis: u64, next_fee_zatoshis: u64) -> ZeckResult<u64> {
+pub(crate) fn checked_fee_total(
+    prior_fee_zatoshis: u64,
+    next_fee_zatoshis: u64,
+) -> ZeckResult<u64> {
     prior_fee_zatoshis
         .checked_add(next_fee_zatoshis)
         .ok_or_else(|| ZeckError::Internal("fee total overflowed the supported range".to_owned()))
@@ -2214,6 +2347,10 @@ fn assemble_imported_sweep_outcome(
         0,
         sweep_result,
     )
+    .map(|mut assembled| {
+        assembled.donation_note = Some(SEEDLESS_DONATION_NOTE.to_owned());
+        assembled
+    })
 }
 
 #[cfg(test)]
@@ -2411,6 +2548,122 @@ mod tests {
         }
     }
 
+    /// The positive half of the memo rules. Every other memo test is a
+    /// refusal, so nothing failed if the seed-phrase route stopped carrying
+    /// the user's memo — or stopped writing the default when none is given,
+    /// which is why `--memo` help now names it.
+    #[test]
+    fn a_seed_route_sweep_carries_the_memo_or_the_default() {
+        let request = |memo: Option<&str>| SweepRequest {
+            destination: derived_destination(),
+            memo: memo.map(str::to_owned),
+            max_fee_zatoshis: None,
+            donation_rate: None,
+            donor_email: None,
+        };
+        let given = build_sweep_proposal(
+            &progress_with_account(seedless_test_account()),
+            request(Some("exchange deposit 8821")),
+            ZeckNetwork::Mainnet,
+            "",
+        )
+        .unwrap();
+        assert!(!given.transactions.is_empty());
+        for tx in &given.transactions {
+            assert_eq!(tx.memo.as_deref(), Some("exchange deposit 8821"), "{tx:?}");
+        }
+
+        for absent in [None, Some("   ")] {
+            let default = build_sweep_proposal(
+                &progress_with_account(seedless_test_account()),
+                request(absent),
+                ZeckNetwork::Mainnet,
+                "",
+            )
+            .unwrap();
+            for tx in &default.transactions {
+                assert_eq!(
+                    tx.memo.as_deref(),
+                    Some(super::RECOVERY_MEMO_DEFAULT),
+                    "{tx:?}"
+                );
+            }
+        }
+    }
+
+    /// Transparent funds in a seedless wallet go to the destination in one
+    /// transaction (`transparent_recovery`), never shielded to the
+    /// recovered wallet first. The preview used the HD model — a shield to
+    /// the account's own address, then a sweep — so it showed a hop that
+    /// never happens and charged two fees, which could refuse a sweep whose
+    /// real fee was under `--max-fee`.
+    #[test]
+    fn seedless_transparent_funds_are_previewed_as_one_direct_sweep() {
+        let mut account = seedless_test_account();
+        account.sapling_zatoshis = 0;
+        account.transparent_zatoshis = 5_000_000;
+        account.transparent_utxo_count = 3;
+        account.total_zatoshis = 5_000_000;
+        let real_fee = crate::transparent_recovery::transparent_sweep_fee(ZeckNetwork::Mainnet, 3)
+            .expect("fee");
+
+        let proposal = build_seedless_sweep_proposal(
+            &progress_with_account(account),
+            SweepRequest {
+                destination: derived_destination(),
+                memo: None,
+                // Room for the one real transaction, not for a shield plus
+                // a sweep on top of it.
+                max_fee_zatoshis: Some(real_fee),
+                donation_rate: None,
+                donor_email: None,
+            },
+            ZeckNetwork::Mainnet,
+        )
+        .expect("the real fee is within the cap");
+
+        assert_eq!(
+            proposal.transactions.len(),
+            1,
+            "{:?}",
+            proposal.transactions
+        );
+        let tx = &proposal.transactions[0];
+        assert!(
+            !matches!(tx.kind, ProposedTxKind::ShieldTransparent),
+            "{tx:?}"
+        );
+        assert_eq!(
+            tx.destination,
+            derived_destination(),
+            "straight to the destination"
+        );
+        assert_eq!(tx.fee_zatoshis, real_fee);
+        assert_eq!(tx.net_zatoshis, 5_000_000 - real_fee);
+        assert_eq!(proposal.total_fee_zatoshis, real_fee);
+    }
+
+    #[test]
+    fn a_seedless_preview_still_refuses_a_cap_below_the_real_fee() {
+        let mut account = seedless_test_account();
+        account.transparent_zatoshis = 5_000_000;
+        account.transparent_utxo_count = 3;
+        account.total_zatoshis = 8_000_000;
+        let err = build_seedless_sweep_proposal(
+            &progress_with_account(account),
+            SweepRequest {
+                destination: derived_destination(),
+                memo: None,
+                max_fee_zatoshis: Some(1),
+                donation_rate: None,
+                donor_email: None,
+            },
+            ZeckNetwork::Mainnet,
+        )
+        .expect_err("no sweep fits a 1-zat cap");
+        assert!(matches!(err, ZeckError::MaxFeeExceeded(_)), "{err:?}");
+    }
+
     /// A wallet with no seed phrase sweeps through the imported-key path,
     /// which sends neither a memo nor a donation. The preview is where a
     /// careful user checks before committing, so it must not show either.
@@ -2456,6 +2709,50 @@ mod tests {
 
         assert!(matches!(err, ZeckError::InvalidMemo(_)), "{err:?}");
         assert!(err.to_string().contains("seed phrase"), "{err}");
+    }
+
+    /// The GUI selects a 10% donation by default, and a seedless sweep can
+    /// send none. Without being told why, its preview said the donation
+    /// "may be included or skipped depending on the fee" and its complete
+    /// screen blamed the 0.001 ZEC minimum — both false for this route.
+    #[test]
+    fn seedless_proposal_says_why_no_donation_is_sent() {
+        let proposal = build_seedless_sweep_proposal(
+            &progress_with_account(seedless_test_account()),
+            SweepRequest {
+                destination: derived_destination(),
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: Some(0.10),
+                donor_email: None,
+            },
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let note = proposal
+            .donation_note
+            .expect("a seedless proposal says why");
+        assert!(note.contains("seed phrase"), "{note}");
+        assert!(
+            !note.contains("minimum"),
+            "not a fee-threshold story: {note}"
+        );
+    }
+
+    #[test]
+    fn an_imported_sweep_outcome_says_why_no_donation_was_sent() {
+        let outcome = crate::service::assemble_imported_sweep_outcome(
+            crate::imported_sweep::ImportedSweepOutcome {
+                sapling_txids: vec!["txid".to_owned()],
+                sapling_leg_completed: true,
+                transparent_leg_completed: true,
+                ..Default::default()
+            },
+            Ok(()),
+        )
+        .unwrap();
+        assert_eq!(outcome.total_donation_zatoshis, 0);
+        assert!(outcome.donation_note.is_some());
     }
 
     #[test]
@@ -2668,6 +2965,7 @@ mod tests {
                 transparent_zatoshis: 0,
                 transparent_fee_zatoshis: 0,
                 transparent_leg_completed: true,
+                sapling_fee_zatoshis: 0,
             },
             Err(ZeckError::Broadcast(
                 "the node rejected the Sapling sweep: account 2".to_owned(),
@@ -3092,5 +3390,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ZeckError::InvalidConfig(_)));
+    }
+}
+
+#[cfg(test)]
+mod memo_refusal_tests {
+    use super::*;
+    use crate::key_source::{ImportedKeySource, SeedKeySource};
+    use secrecy::SecretString;
+
+    const SEED: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                        abandon abandon abandon abandon abandon abandon abandon abandon \
+                        abandon abandon abandon abandon abandon abandon abandon art";
+
+    /// One predicate for "can this sweep carry a memo", asked of the key
+    /// source: the GUI asks it before scanning, and propose and execute ask
+    /// it again, so the three cannot disagree.
+    #[test]
+    fn only_a_seed_source_may_carry_a_memo() {
+        let seeded = SeedKeySource::new(SecretString::new(SEED.to_owned()));
+        let seedless = ImportedKeySource::new(argos_wallet_import::ImportedKeys::default());
+
+        assert!(refuse_memo_for_key_source(&seeded, Some("exchange deposit 8821")).is_ok());
+        assert!(refuse_memo_for_key_source(&seedless, None).is_ok());
+        assert!(
+            refuse_memo_for_key_source(&seedless, Some("   ")).is_ok(),
+            "blank is no memo"
+        );
+
+        let err = refuse_memo_for_key_source(&seedless, Some("exchange deposit 8821"))
+            .expect_err("a seedless sweep sends no memo");
+        let text = err.to_string();
+        // Worded for the sweep, not the wallet: a matched-address recovery
+        // is seedless here although its user has just typed a seed phrase.
+        assert!(!text.contains("has no seed phrase"), "{text}");
+        assert!(text.contains("sends no memo"), "{text}");
     }
 }

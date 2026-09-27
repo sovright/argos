@@ -182,6 +182,10 @@ pub struct MatchedScanConfigInput {
     pub transparent_scan: Option<argos_core::TransparentScanConfig>,
     #[serde(default)]
     pub label: Option<String>,
+    /// As on `WalletFileScanInput`. A matched-address sweep never sends a
+    /// memo, so a non-blank one is always refused here.
+    #[serde(default)]
+    pub sweep_memo: Option<String>,
 }
 
 #[tauri::command]
@@ -221,6 +225,8 @@ pub async fn start_matched_recovery(
     let key_source =
         argos_core::prepare_match_recovery(seed.expose_secret(), config.network, coordinates)
             .map_err(|err| err.to_string())?;
+    argos_core::refuse_memo_for_key_source(key_source.as_ref(), config.sweep_memo.as_deref())
+        .map_err(|err| err.to_string())?;
     let handle = state
         .service
         .start_scan_from_key_source(
@@ -530,6 +536,11 @@ pub struct WalletFileScanInput {
     pub transparent_scan: Option<argos_core::TransparentScanConfig>,
     #[serde(default)]
     pub label: Option<String>,
+    /// The memo the user entered for the sweep. Checked before the scan, so
+    /// a memo this key source's sweep cannot send is refused now rather than
+    /// after hours of scanning, from a screen that cannot edit it.
+    #[serde(default)]
+    pub sweep_memo: Option<String>,
 }
 
 /// Scan a legacy wallet file's keys.
@@ -587,6 +598,8 @@ pub async fn start_scan_from_wallet_file(
 
     let key_source: Arc<dyn argos_core::KeySource> =
         Arc::new(argos_core::ImportedKeySource::new(keys));
+    argos_core::refuse_memo_for_key_source(key_source.as_ref(), config.sweep_memo.as_deref())
+        .map_err(|err| err.to_string())?;
 
     let handle = state
         .service

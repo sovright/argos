@@ -446,15 +446,20 @@ pub async fn sweep_sprout_notes(
     use zcash_client_backend::proto::service::{ChainSpec, RawTransaction};
 
     let (sapling_dest, destination_kind) = parse_sapling_destination_kind(destination, network)?;
-    let proving_key = load_params(params_path)?;
-    let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
 
     // Every other fund-moving path checks that lightwalletd serves the chain
     // the keys belong to. Without it, the mainnet default under
     // `--network testnet` would build against the wrong tip and branch id.
-    let (mut client, _endpoint, info) =
-        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
-    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    //
+    // The prober the scan uses, which moves past an endpoint on the wrong
+    // chain to the next one, so a comma-separated list is honoured here as
+    // it is everywhere else. And before the proving parameters: a wrong
+    // server should be reported in seconds, not after ~725 MB is read.
+    let (mut client, _endpoint, _info) =
+        crate::scan::probe_valid_lightwalletd_endpoints(lightwalletd_url, network).await?;
+
+    let proving_key = load_params(params_path)?;
+    let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
     let tip = client
         .get_latest_block(ChainSpec {})
         .await
@@ -687,6 +692,31 @@ mod tests {
         assert_ne!(
             DestinationKind::BareSapling,
             DestinationKind::SaplingReceiverOfUnified
+        );
+    }
+
+    /// The server is checked before ~725 MB of proving parameters are read,
+    /// so a wrong `--lightwalletd-url` is reported in seconds, not minutes.
+    #[tokio::test]
+    async fn the_server_is_checked_before_the_parameters_are_loaded() {
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let destination =
+            crate::sapling_key::default_sapling_address(&extsk, crate::ZeckNetwork::Mainnet);
+        let err = sweep_sprout_notes(
+            &[note(1_000_000)],
+            crate::ZeckNetwork::Mainnet,
+            "nonono",
+            &destination,
+            Path::new("/nonexistent/sprout-groth16.params"),
+            [0u8; 512],
+            |_| {},
+        )
+        .await
+        .expect_err("neither the server nor the parameters are usable");
+        let text = err.to_string();
+        assert!(
+            !text.contains("proving parameters"),
+            "the server must be refused first: {text}"
         );
     }
 
