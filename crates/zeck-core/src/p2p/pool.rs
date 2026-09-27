@@ -382,10 +382,26 @@ pub async fn connect_to_any(
     extra: &[String],
     max_rounds: usize,
 ) -> Result<Peer, PoolError> {
+    connect_to_any_except(network, extra, &[], max_rounds).await
+}
+
+/// [`connect_to_any`], never dialling an address in `excluded`.
+///
+/// For peers already found to accept a connection and then answer nothing.
+/// Such a peer completes the handshake fastest of all — typically the user's
+/// own node on localhost — so without this it wins every reconnect race and
+/// the scan asks it again forever.
+pub async fn connect_to_any_except(
+    network: P2pNetwork,
+    extra: &[String],
+    excluded: &[String],
+    max_rounds: usize,
+) -> Result<Peer, PoolError> {
     let mut candidates: Vec<String> = extra.to_vec();
     if !matches!(network, P2pNetwork::Regtest) {
         candidates.extend(resolve_seeds(network).await?);
     }
+    candidates.retain(|candidate| !excluded.contains(candidate));
 
     let mut tried = 0;
     let mut tally = FailureTally::default();
@@ -422,6 +438,25 @@ pub async fn connect_to_any(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer the scan has already found silent must not be dialled again:
+    /// it answers the handshake fastest, so it would otherwise win every
+    /// reconnect race. With it excluded, a regtest pass has nothing to try.
+    #[tokio::test]
+    async fn an_excluded_address_is_not_dialled() {
+        let err = connect_to_any_except(
+            P2pNetwork::Regtest,
+            &["127.0.0.1:1".to_owned()],
+            &["127.0.0.1:1".to_owned()],
+            1,
+        )
+        .await
+        .expect_err("nothing is left to dial");
+        assert!(
+            matches!(err, PoolError::AllPeersRefused { tried: 0, .. }),
+            "the excluded address must not even be tried: {err:?}"
+        );
+    }
 
     /// The distinction the error message depends on. A peer declining a slot
     /// is routine; a checksum failure means something is rewriting our

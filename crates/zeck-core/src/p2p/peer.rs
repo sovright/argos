@@ -54,7 +54,7 @@ const PROTOCOL_VERSION: u32 = 170_160;
 const USER_AGENT: &str = "/Argos-recovery:1.0/";
 
 /// How long to wait for any single message.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for the TCP connection itself.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -106,6 +106,9 @@ pub enum PeerError {
 pub struct Peer {
     stream: TcpStream,
     network: P2pNetwork,
+    /// The candidate string this peer was dialled as, so a caller can
+    /// exclude exactly that candidate from a later pass.
+    dialled_as: String,
     /// The peer's advertised chain height, from its `version`.
     pub peer_height: u32,
 }
@@ -146,10 +149,16 @@ impl Peer {
         let mut peer = Self {
             stream,
             network,
+            dialled_as: addr.to_owned(),
             peer_height: 0,
         };
         peer.handshake().await?;
         Ok(peer)
+    }
+
+    /// The address this peer was dialled as.
+    pub fn dialled_as(&self) -> &str {
+        &self.dialled_as
     }
 
     /// Exchange `version`/`verack`.

@@ -94,8 +94,8 @@ use crate::{
     error::{ZeckError, ZeckResult},
     p2p::{
         block::joinsplits_in_block,
-        peer::Peer,
-        pool::{connect_to_any, PoolError, PEER_RECONNECT_DELAY},
+        peer::{Peer, READ_TIMEOUT},
+        pool::{connect_to_any_except, PoolError, PEER_RECONNECT_DELAY},
         wire::P2pNetwork,
     },
     sprout_scan::{ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner},
@@ -128,7 +128,7 @@ fn first_scan_height(cursor: Option<ScanCursor>) -> u32 {
 /// Every batch would be safest and every thousand cheapest. This is sized so
 /// an interrupted scan loses at most a few seconds of work while the file is
 /// rewritten rarely enough not to matter.
-const CHECKPOINT_EVERY: u64 = 500;
+pub const CHECKPOINT_EVERY: u64 = 500;
 
 /// How many peers may return nothing before the scan gives up.
 ///
@@ -185,6 +185,14 @@ pub enum PeerWaitReason {
     AllPeersBusy,
     /// The DNS seeds would not resolve. Usually this machine's connection.
     SeedsUnresolved,
+    /// A peer accepted the connection and then answered nothing for a full
+    /// read timeout. zcashd does exactly this with `getheaders` while it is
+    /// in initial block download, which is how a user pointing `--peer` at
+    /// their own still-syncing node saw Argos reconnect every thirty seconds
+    /// forever and print nothing. `named_by_user` says whether it was one of
+    /// their `--peer` addresses, because only then is there something for
+    /// them to go and check.
+    PeerSilent { named_by_user: bool },
 }
 
 /// The scan is alive, has no peer, and is waiting before trying again.
@@ -216,6 +224,26 @@ impl std::fmt::Display for PeerWait {
                 f,
                 "Could not look up any Zcash peers (DNS). Check the internet connection. \
                  Retrying in {secs}s (attempt {attempt})."
+            ),
+            PeerWaitReason::PeerSilent {
+                named_by_user: true,
+            } => write!(
+                f,
+                "The Zcash node you named with --peer accepted a connection but did not \
+                 answer a block request within {}s. A zcashd node in initial block \
+                 download (still syncing, or with a newest block more than a day old) \
+                 ignores these requests; check it with `zcash-cli getblockchaininfo`. It \
+                 will not be asked again this run. Trying another peer (attempt {attempt}).",
+                READ_TIMEOUT.as_secs()
+            ),
+            PeerWaitReason::PeerSilent {
+                named_by_user: false,
+            } => write!(
+                f,
+                "A Zcash peer accepted a connection but did not answer a block request \
+                 within {}s. It will not be asked again this run. Trying another peer \
+                 (attempt {attempt}).",
+                READ_TIMEOUT.as_secs()
             ),
         }
     }
@@ -486,6 +514,7 @@ pub async fn run_sprout_scan(
         floor,
         network,
         peers: extra_peers.to_vec(),
+        silent: Vec::new(),
         waits: wait_tx,
     };
     // Aborted when this future is dropped, not only when it finishes.
@@ -629,6 +658,10 @@ struct PageFetcher {
     floor: u32,
     network: P2pNetwork,
     peers: Vec<String>,
+    /// Peers that accepted a connection and then answered nothing. Never
+    /// dialled again this run: such a peer handshakes fastest of all, so it
+    /// would otherwise win every reconnect and be asked forever.
+    silent: Vec<String>,
     /// Where a wait for a peer is announced; see `run_sprout_scan`.
     waits: tokio::sync::mpsc::UnboundedSender<PeerWait>,
 }
@@ -640,7 +673,7 @@ impl PageFetcher {
     /// follows will notice that and end the task; nothing to do about it here.
     async fn reconnect(&mut self) -> ZeckResult<()> {
         let waits = &self.waits;
-        self.peer = connect_peer(self.network, &self.peers, &[], |wait| {
+        self.peer = connect_peer(self.network, &self.peers, &self.silent, |wait| {
             let _ = waits.send(wait);
         })
         .await?;
@@ -663,6 +696,55 @@ impl PageFetcher {
             return Err(ZeckError::Broadcast(exhausted));
         }
         Ok(None)
+    }
+
+    /// Handle a request this peer let time out, or failed some other way.
+    ///
+    /// Every failure is charged against the same budget as an empty reply,
+    /// which resets on any good page. It used to be free: the fetcher simply
+    /// reconnected, so a peer that never answered kept the scan reconnecting
+    /// every thirty seconds indefinitely, with nothing on screen.
+    ///
+    /// Silence is also announced, and the peer is not dialled again this
+    /// run. If no other peer is left, the scan ends with the likely cause
+    /// rather than the pool's bare "no peer" error.
+    async fn on_request_failure(
+        &mut self,
+        err: crate::p2p::peer::PeerError,
+        height: u32,
+    ) -> ZeckResult<Option<Page>> {
+        if !matches!(err, crate::p2p::peer::PeerError::Timeout { .. }) {
+            return self
+                .rotate(format!(
+                    "peers kept failing block requests from height {height} (last: {err}). \
+                     Progress is saved; re-run to continue."
+                ))
+                .await;
+        }
+        let addr = self.peer.dialled_as().to_owned();
+        let named_by_user = self.peers.contains(&addr);
+        self.silent.push(addr);
+        self.empty_replies += 1;
+        let _ = self.waits.send(PeerWait {
+            reason: PeerWaitReason::PeerSilent { named_by_user },
+            next_attempt: self.empty_replies + 1,
+            retry_in: Duration::ZERO,
+        });
+        if self.empty_replies > MAX_EMPTY_REPLIES {
+            return Err(ZeckError::Broadcast(silence_explained(
+                height,
+                &format!("{} peers in a row", self.empty_replies),
+                "",
+            )));
+        }
+        match self.reconnect().await {
+            Ok(()) => Ok(None),
+            Err(err) => Err(ZeckError::Broadcast(silence_explained(
+                height,
+                "the only peer that would connect",
+                &format!(" No other peer was available: {err}"),
+            ))),
+        }
     }
 
     /// Fetch and validate one page of blocks.
@@ -702,10 +784,7 @@ impl PageFetcher {
                     ))
                     .await;
             }
-            Err(_) => {
-                self.reconnect().await?;
-                return Ok(None);
-            }
+            Err(err) => return self.on_request_failure(err, height).await,
         };
 
         // Every header must carry its own proof of work. With the checkpoints
@@ -763,10 +842,7 @@ impl PageFetcher {
         let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
         let mut blocks = match self.peer.get_blocks(&hashes).await {
             Ok(b) => b,
-            Err(_) => {
-                self.reconnect().await?;
-                return Ok(None);
-            }
+            Err(err) => return self.on_request_failure(err, height).await,
         };
 
         // Assembled in header order, so the consumer receives the page already
@@ -792,6 +868,20 @@ impl PageFetcher {
         self.locator = *hashes.last().expect("non-empty");
         Ok(Some(page))
     }
+}
+
+/// Why a scan stopped on peers that answer nothing, in the words both
+/// surfaces show. `who` names the peers; `detail` is appended as-is.
+fn silence_explained(height: u32, who: &str, detail: &str) -> String {
+    format!(
+        "no peer would answer block requests from height {height}: {who} accepted a \
+         connection and then did not answer for {}s. A zcashd node in initial block \
+         download (still syncing, or with a newest block more than a day old) does this. \
+         If you passed --peer with your own node, check it with `zcash-cli \
+         getblockchaininfo` and let it finish syncing, or drop --peer to use public \
+         peers. Progress is saved; re-run to continue.{detail}",
+        READ_TIMEOUT.as_secs()
+    )
 }
 
 /// Write a checkpoint.
@@ -902,7 +992,7 @@ pub fn discard_checkpoint(path: &Path) {
 async fn connect_peer(
     network: P2pNetwork,
     extra: &[String],
-    _prior: &[String],
+    excluded: &[String],
     on_wait: impl FnMut(PeerWait),
 ) -> ZeckResult<Peer> {
     // Regtest gets no patience. Its only candidates are the addresses the
@@ -917,9 +1007,13 @@ async fn connect_peer(
     // `connect_to_any` resolves the seeds itself, so each pass re-resolves
     // them. That matters: the seeders rotate what they hand out, so a later
     // pass is not just the same refusals again but partly different peers.
-    acquire_with_retry(budget, || connect_to_any(network, extra, 4), on_wait)
-        .await
-        .map_err(ZeckError::from)
+    acquire_with_retry(
+        budget,
+        || connect_to_any_except(network, extra, excluded, 4),
+        on_wait,
+    )
+    .await
+    .map_err(ZeckError::from)
 }
 
 /// Keep making passes at the network until one yields a peer or `budget` is
@@ -1021,6 +1115,118 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that completes the handshake and then answers nothing — what
+    /// a zcashd node in initial block download does with `getheaders`. It
+    /// advertises a height well past anything a regtest scan would need, as
+    /// the reporter's node did.
+    async fn silent_peer() -> String {
+        use crate::p2p::wire::{encode_message, encode_version};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut header = [0u8; 24];
+                    while stream.read_exact(&mut header).await.is_ok() {
+                        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+                        let mut payload = vec![0u8; len];
+                        if stream.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        if header[4..11] == *b"version" {
+                            let version =
+                                encode_version(170_160, "/MagicBean:6.20.0/", 3_500_000, 1, 0);
+                            let _ = stream
+                                .write_all(&encode_message(
+                                    P2pNetwork::Regtest,
+                                    "version",
+                                    &version,
+                                ))
+                                .await;
+                            let _ = stream
+                                .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
+                                .await;
+                        }
+                        // Everything else, `getheaders` included, is ignored.
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// The reported failure: Argos connected to the user's own node every
+    /// thirty seconds, forever, printing nothing. A silent peer must be
+    /// named in the progress, dropped, and — when nothing else is left —
+    /// end the scan with an explanation rather than spin.
+    #[tokio::test]
+    async fn a_peer_that_never_answers_is_reported_and_not_asked_again() {
+        let peer = silent_peer().await;
+        let dir = std::env::temp_dir().join("argos-scan-silent-peer-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silent.checkpoint");
+        discard_checkpoint(&path);
+
+        let mut notices = Vec::new();
+        let outcome = tokio::time::timeout(
+            READ_TIMEOUT * 3,
+            run_sprout_scan(
+                &[[0x11; 32]],
+                P2pNetwork::Regtest,
+                &[peer],
+                None,
+                &path,
+                |tick| {
+                    if let Some(wait) = tick.peer_wait {
+                        notices.push(wait);
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("a silent peer must not stall the scan indefinitely");
+        discard_checkpoint(&path);
+
+        let err = outcome.expect_err("a scan whose only peer is silent cannot succeed");
+        let text = err.to_string();
+        assert!(text.contains("did not answer"), "{text}");
+        assert!(text.contains("initial block download"), "{text}");
+        assert!(
+            notices.iter().any(|w| w.reason
+                == PeerWaitReason::PeerSilent {
+                    named_by_user: true
+                }),
+            "the silence must reach the progress callback: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_silent_peer_notice_says_why_and_what_happens_next() {
+        let named = PeerWait {
+            reason: PeerWaitReason::PeerSilent {
+                named_by_user: true,
+            },
+            next_attempt: 2,
+            retry_in: Duration::ZERO,
+        }
+        .to_string();
+        assert!(named.contains("--peer"), "{named}");
+        assert!(named.contains("initial block download"), "{named}");
+        assert!(named.contains("not be asked again"), "{named}");
+
+        let public = PeerWait {
+            reason: PeerWaitReason::PeerSilent {
+                named_by_user: false,
+            },
+            next_attempt: 2,
+            retry_in: Duration::ZERO,
+        }
+        .to_string();
+        assert!(!public.contains("--peer"), "{public}");
+    }
 
     /// Two different key sets must never share a checkpoint. Resuming into
     /// the wrong tree would produce a valid-looking scan that finds nothing,
