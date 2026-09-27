@@ -662,3 +662,51 @@ fn a_key_source_the_command_would_ignore_is_refused() {
         );
     }
 }
+
+/// The seed diagnostics are not unread records: printing a missing derived
+/// key or an unscanned account under "record(s) could not be read" — and
+/// closing with "anything listed above exists only there" — told the user
+/// something false about both.
+#[test]
+fn seed_diagnostics_are_not_listed_as_unread_records() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let mut bytes = std::fs::read(&path).expect("fixture");
+    // Point the chain at an unknown future version: the seed can no longer
+    // be verified, so a seed diagnostic is printed, and no record is unread.
+    let chain = bytes
+        .windows(4)
+        .zip(0..)
+        .find_map(|(w, i)| {
+            (w == [1, 0, 0, 0] && bytes.get(i + 4..i + 36) == Some(&SEED_FP_SPROUT_PLAINTEXT))
+                .then_some(i)
+        })
+        .expect("the mnemonichdchain value starts with version 1 and the seed fingerprint");
+    bytes[chain] = 9;
+    let dir = std::env::temp_dir().join(format!("argos-seed-heading-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let wallet = dir.join("wallet.dat");
+    std::fs::write(&wallet, &bytes).expect("write wallet");
+
+    let out = argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("utf-8"),
+        "inspect-wallet",
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("version 9"),
+        "the seed diagnostic is shown:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("could not be read"),
+        "a seed diagnostic is not an unread record:\n{stdout}"
+    );
+}
+
+/// `sprout-plaintext.dat`'s seed fingerprint, as it appears in its
+/// `mnemonichdchain` value.
+const SEED_FP_SPROUT_PLAINTEXT: [u8; 32] = [
+    0x7d, 0xd4, 0xe7, 0xc1, 0x66, 0xbd, 0x35, 0x66, 0x5e, 0x7e, 0xd1, 0xcf, 0x9f, 0x56, 0x19, 0xcf,
+    0x3d, 0x37, 0x0f, 0x1d, 0xe0, 0x00, 0x78, 0x59, 0x18, 0xb1, 0x54, 0x43, 0xdd, 0x37, 0xcf, 0xa2,
+];

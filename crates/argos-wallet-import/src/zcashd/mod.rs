@@ -34,7 +34,7 @@ pub fn import_zcashd(
     bytes: &[u8],
     passphrase: Option<&SecretString>,
 ) -> Result<ImportedKeys, ImportError> {
-    let pairs = bdb::walk(bytes)?;
+    let pairs = Records(bdb::walk(bytes)?);
     let mut out = ImportedKeys::default();
 
     collect_plaintext(&pairs, &mut out);
@@ -52,11 +52,39 @@ pub fn import_zcashd(
         }
         None => None,
     };
-    // Last: it compares the seed's key counters against every key the
-    // passes above recovered, decrypted ones included.
+    // Last, over the records themselves: coverage is judged by key
+    // identity (key records and their metadata), not by what the passes
+    // above happened to recover.
     seed::assess_seed(&pairs, master.as_ref(), &mut out);
 
     Ok(out)
+}
+
+/// The walked records, scrubbed when dropped — on every exit, including the
+/// early one for a missing passphrase.
+///
+/// They hold the plaintext `mnemonicphrase` (which zcashd v6.20.0 leaves in
+/// place even after `encryptwallet`) and, for an unencrypted wallet, every
+/// raw key. The parsed keys the caller keeps are wrapped in `Secret`; these
+/// copies were otherwise left in freed heap for the life of the process.
+struct Records(Vec<(Vec<u8>, Vec<u8>)>);
+
+impl std::ops::Deref for Records {
+    type Target = [(Vec<u8>, Vec<u8>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for Records {
+    fn drop(&mut self) {
+        use secrecy::Zeroize;
+        for (key, value) in &mut self.0 {
+            key.zeroize();
+            value.zeroize();
+        }
+    }
 }
 
 #[cfg(test)]

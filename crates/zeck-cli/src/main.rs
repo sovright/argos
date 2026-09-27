@@ -589,6 +589,18 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
     eprintln!();
 }
 
+/// Findings about the wallet's HD seed, as opposed to records that failed to
+/// read.
+fn is_seed_diagnostic(diagnostic: &argos_core::argos_wallet_import::ImportDiagnostic) -> bool {
+    use argos_core::argos_wallet_import::ImportDiagnostic;
+    matches!(
+        diagnostic,
+        ImportDiagnostic::UnrecoveredSeed { .. }
+            | ImportDiagnostic::UnscannedSeedAccounts { .. }
+            | ImportDiagnostic::MissingDerivedKeys { .. }
+    )
+}
+
 /// Repeat, before any balance appears, that the import itself may be
 /// incomplete. `inspect-wallet` says it once; a user who goes straight to
 /// `scan` would otherwise read a total with nothing attached to it.
@@ -597,7 +609,7 @@ fn warn_about_partial_import(keys: &ImportedKeys) {
     if !coverage.may_hide_funds() {
         return;
     }
-    if let Some(notice) = coverage.notice() {
+    if let Some(notice) = keys.coverage_notice() {
         eprintln!();
         eprintln!("  ⚠ THIS WALLET FILE WAS ONLY PARTLY RECOVERED");
         eprintln!("    {notice}");
@@ -1181,17 +1193,38 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     // one who can act on that.
     // "Every record" would be false: bookkeeping records with no key
     // material are skipped by design.
-    match keys.coverage().notice() {
+    match keys.coverage_notice() {
         None => println!("Every record that can hold a key was read."),
         Some(notice) => {
             println!("Recovery coverage: {notice}");
             println!();
-            println!("{} record(s) could not be read:", keys.diagnostics.len());
-            for diagnostic in &keys.diagnostics {
-                println!("  {diagnostic}");
+            // Two different kinds of finding, printed apart. A record that
+            // could not be read exists only in the file; a note about the
+            // seed (an unscanned account, keys its chain derived that the
+            // file lacks) is not a record that failed to read, and calling
+            // it one told the user something false about both.
+            let (unread, seed): (Vec<_>, Vec<_>) = keys
+                .diagnostics
+                .iter()
+                .partition(|d| !is_seed_diagnostic(d));
+            if !unread.is_empty() {
+                println!("{} record(s) could not be read:", unread.len());
+                for diagnostic in &unread {
+                    println!("  {diagnostic}");
+                }
+                println!();
             }
-            println!();
-            println!("Keep the original wallet file. Anything listed above exists only there.");
+            if !seed.is_empty() {
+                println!("About this wallet's seed:");
+                for diagnostic in &seed {
+                    println!("  {diagnostic}");
+                }
+                println!();
+            }
+            println!(
+                "Keep the original wallet file: it is the only copy of these records and of \
+                 its seed."
+            );
         }
     }
     println!();

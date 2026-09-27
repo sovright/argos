@@ -202,18 +202,28 @@ impl ImportedKeys {
     pub fn coverage(&self) -> ImportCoverage {
         self.diagnostics
             .iter()
-            .map(|d| match d {
-                ImportDiagnostic::UnrecoveredSeed { .. } => ImportCoverage::SeedNotRecovered,
-                ImportDiagnostic::UnscannedSeedAccounts { .. } => {
-                    ImportCoverage::SeedAccountsNotScanned
-                }
-                ImportDiagnostic::UnparseableRecord { .. }
-                | ImportDiagnostic::DecryptionFailed { .. }
-                | ImportDiagnostic::MissingDerivedKeys { .. } => ImportCoverage::KeysUnread,
-                ImportDiagnostic::UnknownRecord { .. } => ImportCoverage::UnknownRecordsSkipped,
-            })
+            .map(ImportCoverage::of)
             .max()
             .unwrap_or(ImportCoverage::Complete)
+    }
+
+    /// Every distinct way this import is incomplete, most severe first, in
+    /// the words both surfaces show. `None` when complete.
+    ///
+    /// Not just the worst grade: two failure modes neither of which is worse
+    /// than the other — unscanned unified accounts and an unreadable key
+    /// record — call for different things, and saying only one hid the
+    /// other.
+    pub fn coverage_notice(&self) -> Option<String> {
+        let mut grades: Vec<ImportCoverage> =
+            self.diagnostics.iter().map(ImportCoverage::of).collect();
+        grades.sort_unstable_by(|a, b| b.cmp(a));
+        grades.dedup();
+        let notices: Vec<&str> = grades
+            .into_iter()
+            .filter_map(ImportCoverage::notice)
+            .collect();
+        (!notices.is_empty()).then(|| notices.join(" "))
     }
 }
 
@@ -229,6 +239,9 @@ pub enum ImportCoverage {
     UnknownRecordsSkipped,
     /// A record known to hold key material could not be read or decrypted.
     KeysUnread,
+    /// The file's own seed chain says keys were derived that it does not
+    /// hold — a truncated or damaged wallet. Not "unread": they are absent.
+    DerivedKeysMissing,
     /// The seed is verified, but unified accounts derived from it hold
     /// keys the file does not store, so they are not scanned.
     SeedAccountsNotScanned,
@@ -238,6 +251,17 @@ pub enum ImportCoverage {
 }
 
 impl ImportCoverage {
+    fn of(diagnostic: &ImportDiagnostic) -> Self {
+        match diagnostic {
+            ImportDiagnostic::UnrecoveredSeed { .. } => Self::SeedNotRecovered,
+            ImportDiagnostic::UnscannedSeedAccounts { .. } => Self::SeedAccountsNotScanned,
+            ImportDiagnostic::MissingDerivedKeys { .. } => Self::DerivedKeysMissing,
+            ImportDiagnostic::UnparseableRecord { .. }
+            | ImportDiagnostic::DecryptionFailed { .. } => Self::KeysUnread,
+            ImportDiagnostic::UnknownRecord { .. } => Self::UnknownRecordsSkipped,
+        }
+    }
+
     /// One user-facing sentence, shared by the CLI and GUI so the two
     /// cannot describe the same file differently. `None` when complete.
     pub fn notice(self) -> Option<&'static str> {
@@ -251,6 +275,11 @@ impl ImportCoverage {
             Self::KeysUnread => Some(
                 "Incomplete — some key records could not be read, so recovered keys \
                  and balances may be missing funds. Keep the original wallet file.",
+            ),
+            Self::DerivedKeysMissing => Some(
+                "Incomplete — this wallet's own records say its seed derived keys that \
+                 are not in this file, so balances may be missing funds. Keep the \
+                 original wallet file.",
             ),
             Self::SeedAccountsNotScanned => Some(
                 "Incomplete — this wallet created unified accounts from its seed \
@@ -355,6 +384,38 @@ mod coverage_tests {
         keys.diagnostics
             .push(ImportDiagnostic::UnscannedSeedAccounts { accounts: 1 });
         assert!(keys.verified_seed_note().unwrap().contains("not every key"));
+    }
+
+    /// Two failure modes neither of which is worse than the other must both
+    /// be said. Taking only the most severe hid "some key records could not
+    /// be read" behind the unified-account sentence.
+    #[test]
+    fn every_distinct_failure_mode_is_reported() {
+        let keys = with(vec![
+            ImportDiagnostic::UnscannedSeedAccounts { accounts: 2 },
+            ImportDiagnostic::UnparseableRecord {
+                record_type: "key".to_owned(),
+                reason: "truncated".to_owned(),
+            },
+        ]);
+        let notice = keys.coverage_notice().expect("incomplete");
+        assert!(notice.contains("unified accounts"), "{notice}");
+        assert!(notice.contains("could not be read"), "{notice}");
+    }
+
+    /// Keys the seed derived that the file does not hold were never "read":
+    /// their notice says what the file's own records show.
+    #[test]
+    fn missing_derived_keys_are_not_called_unread_records() {
+        let keys = with(vec![ImportDiagnostic::MissingDerivedKeys {
+            pool: "Sapling".to_owned(),
+            expected: 2,
+            found: 1,
+        }]);
+        assert_eq!(keys.coverage(), ImportCoverage::DerivedKeysMissing);
+        let notice = keys.coverage_notice().unwrap();
+        assert!(!notice.contains("could not be read"), "{notice}");
+        assert!(keys.coverage().may_hide_funds());
     }
 
     #[test]

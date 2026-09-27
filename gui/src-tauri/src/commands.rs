@@ -514,7 +514,7 @@ pub async fn inspect_wallet_file(
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
         diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
-        coverage_notice: keys.coverage().notice().map(str::to_owned),
+        coverage_notice: keys.coverage_notice(),
         coverage_may_hide_funds: keys.coverage().may_hide_funds(),
         needs_passphrase: false,
     })
