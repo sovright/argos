@@ -365,7 +365,7 @@ fn is_slot_refusal(err: &PeerError) -> bool {
 /// one.
 fn is_timeout(err: &PeerError) -> bool {
     match err {
-        PeerError::Timeout { .. } => true,
+        PeerError::Timeout { .. } | PeerError::Silent { .. } => true,
         PeerError::Io(io) | PeerError::Connect { source: io, .. } => {
             io.kind() == std::io::ErrorKind::TimedOut
         }
