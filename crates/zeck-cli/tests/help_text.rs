@@ -23,6 +23,8 @@ fn top_level_help_matches_behaviour() {
     // cannot see anything earlier, so "0" never meant genesis.
     assert!(!h.contains("from genesis"), "{h}");
     assert!(h.contains("Sapling activation"), "{h}");
+    // ...and must not read as though that clamp applies to Sprout.
+    assert!(h.contains("scan-sprout` is not affected"), "{h}");
     // The default server is mainnet whatever --network says, and the
     // lightwalletd chain-name check then refuses it for testnet.
     assert!(h.contains("https://testnet.zec.rocks:443"), "{h}");
@@ -68,6 +70,13 @@ fn scan_sprout_help_does_not_promise_an_exclusive_peer() {
     let h = help(&["scan-sprout"]);
     assert!(!h.contains("instead of the DNS seeds"), "{h}");
     assert!(h.contains("alongside"), "{h}");
+    // `first_scan_height` starts a fresh walk at 1 and `sprout_scan_bound`
+    // ends it at Canopy: the pre-Sapling era is covered, and no birthday
+    // narrows it.
+    assert!(h.contains("from height 1"), "{h}");
+    assert!(h.contains("before Sapling activation"), "{h}");
+    assert!(h.contains("1,046,400") && h.contains("1,028,500"), "{h}");
+    assert!(h.contains("--birthday does not apply"), "{h}");
     // It also takes --wallet-file, and broadcasts through lightwalletd.
     assert!(h.contains("--wallet-file"), "{h}");
     assert!(h.contains("lightwalletd"), "{h}");

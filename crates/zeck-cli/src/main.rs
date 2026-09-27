@@ -113,10 +113,11 @@ struct Cli {
     #[arg(long)]
     transparent_change: bool,
 
-    /// Wallet birthday as a block height. Heights before Sapling activation
-    /// (419200 on mainnet, the default) scan from Sapling activation, the
-    /// earliest height lightwalletd can serve. Sprout is scanned separately
-    /// by `scan-sprout`.
+    /// Wallet birthday as a block height, for `scan` and `sweep`. Heights
+    /// before Sapling activation (419200 on mainnet, the default) scan from
+    /// Sapling activation, the earliest height lightwalletd can serve.
+    /// `scan-sprout` is not affected: it always scans the Sprout era from
+    /// height 1, including every block before Sapling activation.
     #[arg(long, default_value_t = 419_200)]
     birthday: u32,
 
@@ -236,6 +237,12 @@ enum Commands {
     /// string), --wallet-file, or both. There is no cheaper route: Sprout notes are
     /// discoverable only by trial-decrypting every JoinSplit, and no Sprout
     /// address index exists anywhere. Expect hours and tens of gigabytes.
+    ///
+    /// Scans every block from height 1 through Canopy activation (1,046,400
+    /// on mainnet, 1,028,500 on testnet), so notes received before Sapling
+    /// activation are found too. --birthday
+    /// does not apply: the whole range is always scanned. An interrupted scan
+    /// resumes from its checkpoint under --data-dir.
     ///
     /// A `wallet.dat` almost never needs this — its cached witnesses make
     /// `sweep-sprout` work with no scan at all.
