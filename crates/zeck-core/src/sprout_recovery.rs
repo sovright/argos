@@ -194,10 +194,13 @@ pub struct SpentSproutNote {
 pub enum SpentEvidence {
     /// A transaction in this wallet file, recorded as mined, spent it.
     Wallet { txid: [u8; 32] },
-    /// A full-block scan saw its nullifier on chain at or below this height.
-    /// The spending transaction is not recorded — the scan keeps nullifiers,
-    /// not where they came from — but the spend is a fact of the chain.
-    Chain { scanned_to: u32 },
+    /// A full-block scan saw its nullifier on chain at or below this height,
+    /// in `txid` — the transaction a user can look up on an explorer. `None`
+    /// only for a scan checkpointed before revealing txids were recorded.
+    Chain {
+        scanned_to: u32,
+        txid: Option<[u8; 32]>,
+    },
 }
 
 /// What a full-block scan established about spends: every nullifier it saw
@@ -205,8 +208,13 @@ pub enum SpentEvidence {
 /// [`crate::sprout_scan_run::chain_spends`].
 #[derive(Debug, Clone, Default)]
 pub struct ChainSpends {
-    pub nullifiers: HashSet<[u8; 32]>,
+    /// Every nullifier the scan saw, with the transaction that revealed it
+    /// where the checkpoint recorded one.
+    pub nullifiers: std::collections::HashMap<[u8; 32], Option<[u8; 32]>>,
     pub scanned_to: u32,
+    /// Whether the scan reached the chain tip. One that stopped early covers
+    /// only up to `scanned_to`, and must not read as an all-clear.
+    pub complete: bool,
 }
 
 /// The outcome of scanning a wallet for spendable Sprout notes.
@@ -228,6 +236,13 @@ pub struct SproutRecovery {
     /// Notes an earlier run of the sweep already broadcast, with its txid.
     /// Taken out of `notes` by [`SproutRecovery::drop_already_swept`].
     pub already_swept: Vec<(JsOutPoint, String)>,
+    /// What looking for a full-block scan found, when it is worth saying:
+    /// where it looked and found none, a scan that stopped early, or one
+    /// that could not be used. Set by the surfaces from
+    /// [`crate::sprout_scan_run::chain_spends_for_wallet`]; shown first.
+    pub chain_notice: Option<String>,
+    /// Whether the scan consulted reached the chain tip.
+    pub chain_complete: bool,
     /// Transaction records the wallet file holds but Argos could not read.
     /// Notes they received are missing, and spends they made are unseen.
     pub unreadable_transactions: usize,
@@ -296,6 +311,13 @@ impl SproutRecovery {
     pub fn spent_status(&self) -> String {
         match self.chain_checked_to {
             None => SPENT_STATUS_IS_THE_FILES.to_owned(),
+            Some(height) if !self.chain_complete => format!(
+                "Spent status comes from this wallet's full-block scan up to height {height}, \
+                 where it stopped before reaching the chain tip, and from the wallet file's \
+                 own history after it. A note spent after that height from another copy of \
+                 this wallet still appears here; the network refuses it at sweep, and Argos \
+                 skips it and carries on. Running the scan again brings it up to date."
+            ),
             Some(height) => format!(
                 "Spent status comes from this wallet's full-block scan up to height {height}, \
                  and from the wallet file's own history after it. A note spent after that \
@@ -309,7 +331,7 @@ impl SproutRecovery {
     /// Why the Sprout total is what it is, one sentence per line. Shared so
     /// the CLI and the GUI cannot describe one file differently.
     pub fn accounting_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = self.chain_notice.iter().cloned().collect();
         let (by_wallet, by_chain): (Vec<_>, Vec<_>) = self
             .spent
             .iter()
@@ -329,12 +351,19 @@ impl SproutRecovery {
             ));
         }
         if let Some(height) = self.chain_checked_to {
-            if by_chain.is_empty() {
+            if !self.chain_complete {
                 lines.push(format!(
-                    "Checked against this wallet's full-block scan up to height {height}: \
-                     it found no other spends on chain."
+                    "This wallet's full-block scan stopped at height {height}, before reaching \
+                     the chain tip. Spends it saw are counted; spends after that height are \
+                     not, so this is not an all-clear. Running the scan again resumes it."
                 ));
-            } else {
+            }
+            if by_chain.is_empty() && self.chain_complete {
+                lines.push(format!(
+                    "Checked against this wallet's full-block scan, which reached the chain \
+                     tip at height {height}: it found no other spends on chain."
+                ));
+            } else if !by_chain.is_empty() {
                 lines.push(format!(
                     "{} note(s), {} in all, that this file shows as unspent were spent on \
                      chain — found by this wallet's full-block scan up to height {height}. \
@@ -503,6 +532,7 @@ pub fn recover_spendable_sprout_notes_with_chain(
     let ctx = RecoveryContext::new(keys, chain);
     let mut out = SproutRecovery {
         chain_checked_to: chain.map(|c| c.scanned_to),
+        chain_complete: chain.is_some_and(|c| c.complete),
         unreadable_transactions: count_unreadable_transactions(keys),
         ..Default::default()
     };
@@ -704,14 +734,17 @@ impl<'a> RecoveryContext<'a> {
                 spent_in: SpentEvidence::Wallet { txid: *txid },
             }));
         }
-        if let Some(chain) = self.chain.filter(|c| c.nullifiers.contains(&nullifier)) {
-            return Ok(Recovered::Spent(SpentSproutNote {
-                outpoint,
-                value: note.value,
-                spent_in: SpentEvidence::Chain {
-                    scanned_to: chain.scanned_to,
-                },
-            }));
+        if let Some(chain) = self.chain {
+            if let Some(txid) = chain.nullifiers.get(&nullifier) {
+                return Ok(Recovered::Spent(SpentSproutNote {
+                    outpoint,
+                    value: note.value,
+                    spent_in: SpentEvidence::Chain {
+                        scanned_to: chain.scanned_to,
+                        txid: *txid,
+                    },
+                }));
+            }
         }
         // Worth no more than the fee to move it: the sweep would skip it
         // anyway, so it is not counted as spendable.
@@ -1171,8 +1204,12 @@ mod tests {
 
     fn chain_with(nullifiers: &[[u8; 32]], scanned_to: u32) -> ChainSpends {
         ChainSpends {
-            nullifiers: nullifiers.iter().copied().collect(),
+            nullifiers: nullifiers
+                .iter()
+                .map(|nf| (*nf, Some([0xC4; 32])))
+                .collect(),
             scanned_to,
+            complete: true,
         }
     }
 
@@ -1189,7 +1226,8 @@ mod tests {
         assert_eq!(
             recovered.spent[0].spent_in,
             SpentEvidence::Chain {
-                scanned_to: 3_000_000
+                scanned_to: 3_000_000,
+                txid: Some([0xC4; 32]),
             }
         );
         assert_eq!(recovered.chain_checked_to, Some(3_000_000));
@@ -1217,6 +1255,56 @@ mod tests {
         assert!(recovered.notes.is_empty());
         assert!(recovered.unconfirmed_spends.is_empty());
         assert_eq!(recovered.spent.len(), 1);
+    }
+
+    /// Kristi's #240 finding 7: when both the wallet and the scan saw the
+    /// spend, the wallet's record wins, because it names the spending
+    /// transaction the user can check. Swapping the two checks must fail.
+    #[test]
+    fn a_spend_both_saw_keeps_the_wallets_txid() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+        let nf = sprout::prf_nf(&a_sk, &[0x11u8; 32]);
+
+        let recovered =
+            recover_spendable_sprout_notes_with_chain(&keys, Some(&chain_with(&[nf], 3_000_000)));
+        assert_eq!(
+            recovered.spent[0].spent_in,
+            SpentEvidence::Wallet { txid: [0xAB; 32] }
+        );
+    }
+
+    /// Finding 3: a scan that stopped before the tip must not read as an
+    /// all-clear. It says where it stopped.
+    #[test]
+    fn a_scan_that_stopped_early_says_so() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let mut chain = chain_with(&[], 300_000);
+        chain.complete = false;
+        let recovered = recover_spendable_sprout_notes_with_chain(&keys, Some(&chain));
+        let lines = recovered.accounting_lines().join(" ");
+        assert!(
+            lines.contains("300000") && lines.contains("before reaching the chain tip"),
+            "{lines}"
+        );
+        assert!(!lines.contains("found no other spends on chain"), "{lines}");
+        assert!(recovered
+            .spent_status()
+            .contains("before reaching the chain tip"));
+    }
+
+    /// A lookup's own notice — where it looked, or why it could not use what
+    /// it found — comes first, so an unused scan is never silent.
+    #[test]
+    fn the_scan_lookup_notice_leads_the_accounting() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let mut recovered = recover_spendable_sprout_notes(&keys);
+        recovered.chain_notice = Some("No full-block scan was found at /x".into());
+        assert_eq!(
+            recovered.accounting_lines()[0],
+            "No full-block scan was found at /x"
+        );
     }
 
     /// Absence from the scan is not proof of anything: the scan stops at the

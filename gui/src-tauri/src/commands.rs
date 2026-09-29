@@ -978,9 +978,16 @@ pub async fn execute_sprout_sweep(
 
     let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
     if recovered.notes.is_empty() {
-        return Err(
-            "no spendable Sprout notes could be recovered from this wallet file".to_owned(),
-        );
+        // Said by cause: a file Argos could not read, and a wallet whose
+        // notes the file or the scan show as spent, need different next steps.
+        return Err(if recovered.nothing_left_to_sweep() {
+            "nothing is left to sweep: every Sprout note in this wallet file is spent (by the \
+             file's own record, or by this wallet's full-block scan), already swept, or worth \
+             less than the fee"
+                .to_owned()
+        } else {
+            "no spendable Sprout notes could be recovered from this wallet file".to_owned()
+        });
     }
 
     let params_path = argos_core::sprout_sweep::default_params_path();
@@ -1246,7 +1253,11 @@ pub async fn start_sprout_scan(
     let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
 
     let p2p: argos_core::p2p::wire::P2pNetwork = network.into();
-    let dir = PathBuf::from(data_dir);
+    // Blank resolves to the app default, as it does for inspection, preview
+    // and sweep — a blank field must not write a CWD-relative checkpoint that
+    // those then never find.
+    let dir = resolve_data_dir(&app, Some(&data_dir))
+        .ok_or_else(|| "could not resolve the data directory".to_owned())?;
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
     let (tip_anchor, tip_warning) = sprout_tip_anchor(network, &lightwalletd_url).await;
 
@@ -1341,7 +1352,11 @@ pub async fn sweep_sprout_from_scan(
         .map_err(|err| err.to_string())?;
 
     let p2p: argos_core::p2p::wire::P2pNetwork = net.into();
-    let dir = PathBuf::from(data_dir);
+    // Blank resolves to the app default, as it does for inspection, preview
+    // and sweep — a blank field must not write a CWD-relative checkpoint that
+    // those then never find.
+    let dir = resolve_data_dir(&app, Some(&data_dir))
+        .ok_or_else(|| "could not resolve the data directory".to_owned())?;
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
     if !checkpoint.exists() {
         return Err(
@@ -1443,17 +1458,15 @@ fn recover_with_scan(
 ) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
     let dir = resolve_data_dir(app, data_dir);
-    let chain = match &dir {
-        Some(dir) if !spending_keys.is_empty() => {
-            match argos_core::sprout_scan_run::chain_spends(dir, network.into(), &spending_keys) {
-                Ok(chain) => chain,
-                Err(err) => {
-                    tracing::warn!("not using the Sprout scan checkpoint: {err}");
-                    None
-                }
-            }
-        }
-        _ => None,
+    // The lookup's notice is shown on the wallet screen, not logged: a scan
+    // that exists but cannot be used must not look like no scan at all.
+    let (chain, mut notice) = match &dir {
+        Some(dir) => argos_core::sprout_scan_run::chain_spends_for_wallet(
+            dir,
+            network.into(),
+            &spending_keys,
+        ),
+        None => (None, None),
     };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
@@ -1464,9 +1477,13 @@ fn recover_with_scan(
     if let Some(dir) = dir.filter(|_| !spending_keys.is_empty()) {
         match argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &spending_keys).load() {
             Ok(swept) => recovered.drop_already_swept(&swept),
-            Err(err) => tracing::warn!("not using the sweep journal: {err}"),
+            Err(err) => {
+                let line = format!("Not using the sweep journal: {err}");
+                notice = Some(notice.map_or(line.clone(), |n| format!("{n} {line}")));
+            }
         }
     }
+    recovered.chain_notice = notice;
     recovered
 }
 

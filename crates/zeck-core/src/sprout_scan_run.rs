@@ -466,12 +466,77 @@ pub fn chain_spends(
     Ok(
         match lookup_chain_spends(data_dir, network, spending_keys)? {
             ChainSpendsLookup::Found(evidence) => Some(crate::sprout_recovery::ChainSpends {
-                nullifiers: evidence.spent.into_keys().collect(),
+                nullifiers: evidence.spent,
                 scanned_to: evidence.scanned_to,
+                complete: evidence.complete,
             }),
             ChainSpendsLookup::NotFound { .. } | ChainSpendsLookup::NothingScanned { .. } => None,
         },
     )
+}
+
+/// What a wallet file's surfaces need from the scan: its evidence, and a
+/// sentence whenever the user should know something about it.
+///
+/// One helper for the CLI and the GUI, so both look for exactly the key set
+/// the scan fingerprints (sorted and deduplicated, via [`scan_key_set`]) and
+/// both explain themselves the same way. It never fails: a checkpoint that
+/// cannot be used is reported in the notice, and the wallet file's own
+/// record stands. The notice says where it looked when no scan was found,
+/// that a scan stopped before the tip, or why one could not be used — never
+/// silence, which read the same as never having scanned.
+pub fn chain_spends_for_wallet(
+    data_dir: &Path,
+    network: P2pNetwork,
+    wallet_keys: &[[u8; 32]],
+) -> (Option<crate::sprout_recovery::ChainSpends>, Option<String>) {
+    let keys = scan_key_set(wallet_keys, &[]);
+    if keys.is_empty() {
+        return (None, None);
+    }
+    match lookup_chain_spends(data_dir, network, &keys) {
+        Ok(ChainSpendsLookup::Found(evidence)) => {
+            let notice = (!evidence.complete).then(|| {
+                format!(
+                    "Using this wallet's full-block scan ({}), which stopped at height {} \
+                     before reaching the chain tip.",
+                    evidence.path.display(),
+                    evidence.scanned_to
+                )
+            });
+            (
+                Some(crate::sprout_recovery::ChainSpends {
+                    nullifiers: evidence.spent,
+                    scanned_to: evidence.scanned_to,
+                    complete: evidence.complete,
+                }),
+                notice,
+            )
+        }
+        Ok(ChainSpendsLookup::NotFound { path }) => (
+            None,
+            Some(format!(
+                "No full-block scan of this wallet's Sprout keys was found (looked for {}), so \
+                 spent status is the wallet file's own record.",
+                path.display()
+            )),
+        ),
+        Ok(ChainSpendsLookup::NothingScanned { path }) => (
+            None,
+            Some(format!(
+                "A full-block scan of these keys was started ({}) but has not read a block \
+                 yet, so spent status is the wallet file's own record.",
+                path.display()
+            )),
+        ),
+        Err(err) => (
+            None,
+            Some(format!(
+                "Not using the full-block scan checkpoint: {err} Spent status is the wallet \
+                 file's own record."
+            )),
+        ),
+    }
 }
 
 /// The exact key set a scan runs with: a wallet file's Sprout keys and any
@@ -1964,6 +2029,39 @@ mod tests {
         );
     }
 
+    /// Kristi's #240 findings 1, 2 and 4: both surfaces look up the scan
+    /// through one helper, keyed exactly as the scan fingerprints its keys,
+    /// and it always says what it found — never an unexplained silence.
+    #[test]
+    fn a_wallets_scan_lookup_always_explains_itself() {
+        let dir = std::env::temp_dir().join(format!("argos-lookup-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys = [[0x21; 32]];
+
+        let (chain, notice) = chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &keys);
+        assert!(chain.is_none());
+        let notice = notice.expect("no scan must be said, with where it looked");
+        assert!(notice.contains(&dir.display().to_string()), "{notice}");
+
+        // A duplicated key in the wallet names the same checkpoint the scan
+        // wrote for the deduplicated set.
+        let mut scanner = SproutScanner::new(&keys);
+        scanner.scan_block_at(&[], [0xCD; 32], 300_000).unwrap();
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &checkpoint_path(&dir, &keys)).unwrap();
+        let (chain, notice) =
+            chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &[keys[0], keys[0]]);
+        let chain = chain.expect("the duplicate must not hide the scan");
+        assert!(!chain.complete);
+        assert!(notice.unwrap().contains("before reaching the chain tip"));
+
+        // Unusable evidence is said, not swallowed.
+        let (chain, notice) = chain_spends_for_wallet(&dir, P2pNetwork::Testnet, &keys);
+        assert!(chain.is_none());
+        assert!(notice.unwrap().contains("different network"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn joinsplit_revealing(nf: [u8; 32]) -> argos_wallet_import::keys::SproutJoinSplit {
         argos_wallet_import::keys::SproutJoinSplit {
             txid: [0x71; 32],
@@ -2032,8 +2130,8 @@ mod tests {
         let chain = chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
             .unwrap()
             .expect("a checkpoint exists for these keys");
-        assert!(chain.nullifiers.contains(&[0x99; 32]));
-        assert!(chain.nullifiers.contains(&[0x72; 32]));
+        assert!(chain.nullifiers.contains_key(&[0x99; 32]));
+        assert!(chain.nullifiers.contains_key(&[0x72; 32]));
         assert_eq!(chain.scanned_to, 2_000_000);
     }
 

@@ -719,13 +719,22 @@ fn inspect_wallet_consults_a_scan_of_the_same_keys() {
         "{}",
         String::from_utf8_lossy(&with_scan.stderr)
     );
+    // This checkpoint never reached the tip, so it must be named as a scan
+    // that stopped — never as an all-clear (#240 review, finding 3).
+    let with = with.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        with.contains("full-block scan up to height 2000000"),
-        "the scan must be found and named:\n{with}"
+        with.contains("stopped at height 2000000")
+            && with.contains("before reaching the chain tip"),
+        "the scan must be found, and said to have stopped early:\n{with}"
     );
     let without = String::from_utf8_lossy(&without_scan.stdout);
+    let without = without.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        !without.contains("full-block scan up to height"),
+        !without.contains("stopped at height"),
         "no scan, no claim of one:\n{without}"
+    );
+    assert!(
+        without.contains("No full-block scan of this wallet's Sprout keys was found"),
+        "and it must say where it looked (finding 2):\n{without}"
     );
 }

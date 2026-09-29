@@ -988,9 +988,13 @@ fn print_sprout_accounting(
             for n in &recovered.spent {
                 let by = match &n.spent_in {
                     SpentEvidence::Wallet { txid } => format!("spent in {}", display_txid(txid)),
-                    SpentEvidence::Chain { scanned_to } => {
-                        format!("spent on chain (scan to height {scanned_to})")
-                    }
+                    SpentEvidence::Chain {
+                        txid: Some(txid), ..
+                    } => format!("spent on chain in {}", display_txid(txid)),
+                    SpentEvidence::Chain {
+                        scanned_to,
+                        txid: None,
+                    } => format!("spent on chain (scan to height {scanned_to})"),
                 };
                 println!(
                     "    {}:{}:{}  {}  {by}",
@@ -1039,17 +1043,11 @@ fn recover_with_scan(
     data_dir: &Path,
 ) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
-    let chain = if spending_keys.is_empty() {
-        None
-    } else {
-        match argos_core::sprout_scan_run::chain_spends(data_dir, network.into(), &spending_keys) {
-            Ok(chain) => chain,
-            Err(err) => {
-                eprintln!("Not using the Sprout scan checkpoint: {err}");
-                None
-            }
-        }
-    };
+    let (chain, mut notice) = argos_core::sprout_scan_run::chain_spends_for_wallet(
+        data_dir,
+        network.into(),
+        &spending_keys,
+    );
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
         chain.as_ref(),
@@ -1057,9 +1055,13 @@ fn recover_with_scan(
     if !spending_keys.is_empty() {
         match argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys).load() {
             Ok(swept) => recovered.drop_already_swept(&swept),
-            Err(err) => eprintln!("Not using the sweep journal: {err}"),
+            Err(err) => {
+                let line = format!("Not using the sweep journal: {err}");
+                notice = Some(notice.map_or(line.clone(), |n| format!("{n} {line}")));
+            }
         }
     }
+    recovered.chain_notice = notice;
     recovered
 }
 
