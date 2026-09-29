@@ -179,19 +179,30 @@ impl ImportedKeys {
     pub fn coverage(&self) -> ImportCoverage {
         self.diagnostics
             .iter()
-            .map(|d| match d {
-                ImportDiagnostic::UnrecoveredSeed { .. } => ImportCoverage::SeedNotRecovered,
-                // A transaction holds note data, never keys: every key was
-                // still read, and the full-block scan recovers the notes.
-                ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx" => {
-                    ImportCoverage::SproutNoteDataUnread
-                }
-                ImportDiagnostic::UnparseableRecord { .. }
-                | ImportDiagnostic::DecryptionFailed { .. } => ImportCoverage::KeysUnread,
-                ImportDiagnostic::UnknownRecord { .. } => ImportCoverage::UnknownRecordsSkipped,
-            })
+            .map(ImportCoverage::of)
             .max()
             .unwrap_or(ImportCoverage::Complete)
+    }
+
+    /// Every distinct coverage caveat, most severe first, with the call to
+    /// action once at the end — not only the worst one. A file with both
+    /// unknown records and an unreadable transaction must say both.
+    pub fn coverage_notice(&self) -> Option<String> {
+        let mut grades: Vec<ImportCoverage> =
+            self.diagnostics.iter().map(ImportCoverage::of).collect();
+        grades.sort_unstable_by(|a, b| b.cmp(a));
+        grades.dedup();
+        let may_hide_funds = grades.iter().any(|g| g.may_hide_funds());
+        let mut notices: Vec<&str> = grades
+            .into_iter()
+            .filter_map(ImportCoverage::notice)
+            .collect();
+        // Once, after every notice, rather than at the end of each: joining
+        // two notices would otherwise print the same call to action twice.
+        if may_hide_funds {
+            notices.push(KEEP_THE_FILE);
+        }
+        (!notices.is_empty()).then(|| notices.join(" "))
     }
 }
 
@@ -216,7 +227,25 @@ pub enum ImportCoverage {
     SeedNotRecovered,
 }
 
+/// The call to action that follows any caveat that may hide funds.
+const KEEP_THE_FILE: &str = "Keep the original wallet file.";
+
 impl ImportCoverage {
+    /// How much one diagnostic costs coverage.
+    pub fn of(diagnostic: &ImportDiagnostic) -> Self {
+        match diagnostic {
+            ImportDiagnostic::UnrecoveredSeed { .. } => Self::SeedNotRecovered,
+            // A transaction holds note data, never keys: every key was
+            // still read, and the full-block scan recovers the notes.
+            ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx" => {
+                Self::SproutNoteDataUnread
+            }
+            ImportDiagnostic::UnparseableRecord { .. }
+            | ImportDiagnostic::DecryptionFailed { .. } => Self::KeysUnread,
+            ImportDiagnostic::UnknownRecord { .. } => Self::UnknownRecordsSkipped,
+        }
+    }
+
     /// One user-facing sentence, shared by the CLI and GUI so the two
     /// cannot describe the same file differently. `None` when complete.
     pub fn notice(self) -> Option<&'static str> {
@@ -234,13 +263,12 @@ impl ImportCoverage {
             ),
             Self::KeysUnread => Some(
                 "Incomplete — some key records could not be read, so recovered keys \
-                 and balances may be missing funds. Keep the original wallet file.",
+                 and balances may be missing funds.",
             ),
             Self::SeedNotRecovered => Some(
                 "Incomplete — this file holds an HD seed that Argos does not recover. \
                  Keys derived from it are only covered if the file also stores them \
-                 individually, so balances may be missing funds. Keep the original \
-                 wallet file.",
+                 individually, so balances may be missing funds.",
             ),
         }
     }
@@ -318,6 +346,43 @@ mod coverage_tests {
             ImportCoverage::KeysUnread,
             "a real key record still is"
         );
+    }
+
+    /// Kristi's round-5 finding 9, second half: a file with both unknown
+    /// records and an unreadable transaction showed only the higher grade's
+    /// notice, dropping the other caveat. Every distinct one is shown, most
+    /// severe first, and the call to action once.
+    #[test]
+    fn every_distinct_caveat_is_shown_and_the_call_to_action_once() {
+        let keys = with(vec![
+            unknown(),
+            ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".to_owned(),
+                reason: "x".to_owned(),
+            },
+            ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".to_owned(),
+                reason: "y".to_owned(),
+            },
+        ]);
+        let notice = keys.coverage_notice().unwrap();
+        let sprout = ImportCoverage::SproutNoteDataUnread.notice().unwrap();
+        let unknown_notice = ImportCoverage::UnknownRecordsSkipped.notice().unwrap();
+        assert!(
+            notice.contains(sprout) && notice.contains(unknown_notice),
+            "{notice}"
+        );
+        assert!(
+            notice.find(sprout) < notice.find(unknown_notice),
+            "most severe first: {notice}"
+        );
+        assert_eq!(notice.matches(sprout).count(), 1, "one notice per grade");
+        assert_eq!(
+            notice.matches("Keep the original wallet file").count(),
+            1,
+            "{notice}"
+        );
+        assert!(with(vec![]).coverage_notice().is_none());
     }
 
     fn unknown() -> ImportDiagnostic {

@@ -597,11 +597,10 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
 /// incomplete. `inspect-wallet` says it once; a user who goes straight to
 /// `scan` would otherwise read a total with nothing attached to it.
 fn warn_about_partial_import(keys: &ImportedKeys) {
-    let coverage = keys.coverage();
-    if !coverage.may_hide_funds() {
+    if !keys.coverage().may_hide_funds() {
         return;
     }
-    if let Some(notice) = coverage.notice() {
+    if let Some(notice) = keys.coverage_notice() {
         eprintln!();
         eprintln!("  ⚠ THIS WALLET FILE WAS ONLY PARTLY RECOVERED");
         eprintln!("    {notice}");
@@ -1052,7 +1051,7 @@ fn recover_with_scan(
     );
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
-        chain.as_ref(),
+        chain.as_deref(),
     );
     if !spending_keys.is_empty() {
         match argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys).load() {
@@ -1393,7 +1392,7 @@ fn print_wallet_inspection(
     // one who can act on that.
     // "Every record" would be false: bookkeeping records with no key
     // material are skipped by design.
-    match keys.coverage().notice() {
+    match keys.coverage_notice() {
         None => println!("Every record that can hold a key was read."),
         Some(notice) => {
             println!("Recovery coverage: {notice}");

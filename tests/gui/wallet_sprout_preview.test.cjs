@@ -67,6 +67,19 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     progress: (payload) => onProgress({ payload }),
     sweep: () => vm.runInContext("runSproutSweep()", context),
     peek: (expr) => vm.runInContext(expr, context),
+    // The scan-sweep handler lives outside the slices above; load it on its
+    // own, with its two input helpers stubbed only if not already present.
+    scanSweep() {
+      const start = source.indexOf("async function runSproutScanSweep()");
+      const end = source.indexOf("\n}\n", start) + 3;
+      vm.runInContext(source.slice(start, end), context);
+      for (const helper of ["sproutScanPeers", "sproutScanKeys"]) {
+        if (vm.runInContext(`typeof ${helper}`, context) !== "function") {
+          vm.runInContext(`function ${helper}() { return []; }`, context);
+        }
+      }
+      return vm.runInContext("runSproutScanSweep()", context);
+    },
     async open(path, passphrase = "") {
       $("wallet-path").value = path;
       $("wallet-passphrase").value = passphrase;
@@ -533,4 +546,22 @@ test("a fully spent wallet quotes the scan's cost beside the offer", async () =>
   await h.open("/fixture/spent.dat");
   assert.equal(h.$("wallet-sprout-scan-cost").hidden, false);
   assert.deepEqual(texts(h.$("wallet-sprout-scan-cost")), ["Network transfer roughly 276 GB"]);
+});
+
+// Round-5 finding 4, at the call site: the scan-sweep handler cleared the
+// "keep the original wallet file" caveat unconditionally. It must follow
+// the same rule as the wallet-file sweep.
+test("the scan sweep keeps the caveat when a note was refused", async () => {
+  for (const [rejected, kept] of [[[], false], [["note bb:0:1 was refused"], true]]) {
+    const h = harness(async (command, args, fallback) =>
+      command === "sweep_sprout_from_scan"
+        ? { sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected, error: null }
+        : fallback());
+    h.peek("uncoveredSproutKeys = 1");
+    h.$("sprout-scan-destination").value = "fixture-destination";
+    h.$("sprout-scan-confirm").checked = true;
+    await h.scanSweep();
+    assert.equal(h.peek("uncoveredSproutKeys") > 0, kept, `rejected=${rejected.length}`);
+    if (kept) assert.match(h.$("sprout-scan-status").textContent, /1 note\(s\) refused/);
+  }
 });

@@ -228,6 +228,14 @@ it saw as spent (`SpentEvidence::Chain`). The rule is one-way: absence from
 the scan proves nothing, since the wallet may have spent after the height
 the scan reached, so a spend the wallet recorded still stands.
 
+Surfaces look the scan up only through `chain_spends_for_wallet`. With no
+checkpoint for exactly the wallet's keys it uses one whose key set is a
+strict superset (a scan run with keys typed in beside the wallet's) — never
+a mere overlap: holding every one of the wallet's `a_sk` is what makes a
+planted checkpoint self-defeating. Parsed evidence is cached in
+`ChainSpendsCache`, keyed by path and network and validated by size and
+mtime, because the GUI asks twice per wallet open.
+
 Sprout sweeps are journaled. `sprout_sweep::SweepJournal`
 (`sprout-sweep-<fingerprint>.journal`, beside the checkpoint, same
 key-set fingerprint, `0600`) gets one line per broadcast — note outpoint

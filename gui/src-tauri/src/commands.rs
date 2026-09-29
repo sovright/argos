@@ -580,7 +580,7 @@ pub async fn inspect_wallet_file(
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
         diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
-        coverage_notice: keys.coverage().notice().map(str::to_owned),
+        coverage_notice: keys.coverage_notice(),
         coverage_may_hide_funds: keys.coverage().may_hide_funds(),
         needs_passphrase: false,
     })
@@ -1478,7 +1478,7 @@ fn recover_with_scan(
     };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
-        chain.as_ref(),
+        chain.as_deref(),
     );
     // A note an earlier, interrupted sweep already broadcast is taken out of
     // the plan, so the count shown and the proofs run are for what is left.
