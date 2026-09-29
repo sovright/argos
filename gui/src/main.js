@@ -644,6 +644,14 @@ async function runSproutSweep() {
       li.textContent = reason;
       list.appendChild(li);
     }
+    for (const held of report.already_held ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent =
+        `${fmt(held.value_swept)} — ${held.txid}: the node already holds this transaction. ` +
+        `Not counted as swept until it is mined; if it never is, sweeping again retries it.`;
+      list.appendChild(li);
+    }
     for (const warning of report.warnings ?? []) {
       const li = document.createElement("li");
       li.className = "muted";
@@ -718,7 +726,8 @@ function sweepLeftNothingBehind(report) {
     (report.sent ?? []).length > 0 &&
     !report.error &&
     (report.rejected ?? []).length === 0 &&
-    (report.skipped ?? []).length === 0
+    (report.skipped ?? []).length === 0 &&
+    (report.already_held ?? []).length === 0
   );
 }
 
@@ -1188,6 +1197,14 @@ async function runSproutScanSweep() {
       const li = document.createElement("li");
       li.className = "muted";
       li.textContent = reason;
+      list.appendChild(li);
+    }
+    for (const held of report.already_held ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent =
+        `${fmt(held.value_swept)} — ${held.txid}: the node already holds this transaction. ` +
+        `Not counted as swept until it is mined; if it never is, sweeping again retries it.`;
       list.appendChild(li);
     }
     for (const warning of report.warnings ?? []) {

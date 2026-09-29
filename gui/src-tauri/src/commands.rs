@@ -948,6 +948,9 @@ pub struct SproutSweepReport {
     /// Notes the network refused. The sweep carried on past each; nothing
     /// moved for them and no fee was paid.
     pub rejected: Vec<String>,
+    /// Transactions the node said it already holds, not yet counted as
+    /// swept; if one never mines, a later run retries its note.
+    pub already_held: Vec<SproutSweepResult>,
     /// Did not stop anything, but the user should know — a broadcast that
     /// could not be written to the sweep journal.
     pub warnings: Vec<String>,
@@ -1034,6 +1037,14 @@ pub async fn execute_sprout_sweep(
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
         rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        already_held: outcome
+            .already_held
+            .iter()
+            .map(|h| SproutSweepResult {
+                txid: h.txid.clone(),
+                value_swept: h.value_swept,
+            })
+            .collect(),
         warnings: outcome.warnings,
         error: outcome.error,
     })
@@ -1437,6 +1448,14 @@ pub async fn sweep_sprout_from_scan(
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
         rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        already_held: outcome
+            .already_held
+            .iter()
+            .map(|h| SproutSweepResult {
+                txid: h.txid.clone(),
+                value_swept: h.value_swept,
+            })
+            .collect(),
         warnings: outcome.warnings,
         error: outcome.error,
     })

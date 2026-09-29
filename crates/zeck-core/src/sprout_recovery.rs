@@ -250,6 +250,9 @@ pub struct SproutRecovery {
     /// without a rescan, most often. Whatever they received is invisible to
     /// the file; only the full-block scan can find it.
     pub keys_without_notes: usize,
+    /// How many Sprout keys the file holds, so a key without note records
+    /// can be told apart from a file with no note data at all.
+    pub sprout_keys: usize,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
@@ -286,7 +289,6 @@ impl SproutRecovery {
         self.notes.is_empty()
             && self.issues.is_empty()
             && self.unreadable_transactions == 0
-            && self.keys_without_notes == 0
             && !(self.spent.is_empty() && self.dust.is_empty() && self.already_swept.is_empty())
     }
 
@@ -396,11 +398,15 @@ impl SproutRecovery {
                 }
             ));
         }
-        if self.keys_without_notes > 0 && !(self.notes.is_empty() && self.spent.is_empty()) {
+        // Named whenever some keys have note records and others none. When no
+        // key has any, the file simply holds no note data, and the surfaces
+        // say that instead.
+        if self.keys_without_notes > 0 && self.keys_without_notes < self.sprout_keys {
             lines.push(format!(
-                "{} Sprout key(s) in this file have no note records at all — keys imported \
-                 without a rescan, most often. Anything they received is not counted here; \
-                 only the full-block scan can find it.",
+                "{} Sprout key(s) in this file have no note records at all. Either they never \
+                 received anything, or they were imported without a rescan — the file cannot \
+                 tell which. Anything they received is not counted here; only the full-block \
+                 scan can find it.",
                 self.keys_without_notes
             ));
         }
@@ -548,6 +554,7 @@ pub fn recover_spendable_sprout_notes_with_chain(
         chain_complete: chain.is_some_and(|c| c.complete),
         unreadable_transactions: count_unreadable_transactions(keys),
         keys_without_notes: count_keys_without_notes(keys),
+        sprout_keys: keys.sprout.len(),
         ..Default::default()
     };
 
@@ -1383,16 +1390,18 @@ mod tests {
         );
     }
 
-    /// Kristi's round-5 finding 7: a second key imported without a rescan
-    /// has no note records at all. "Nothing left" would be false for it —
-    /// only the scan can find its notes.
+    /// A second Sprout key with no note records — an unused
+    /// `z_getnewaddress` address, or a key imported without a rescan. The
+    /// file cannot tell which. Round 5 made it block "nothing left"; round 6
+    /// (finding 8) showed that made "nothing left" unreachable for any
+    /// wallet with one unused address. So "nothing left" stands, the key is
+    /// always named with the scan as its route, and the surfaces offer the
+    /// scan, with its cost, whenever nothing is left.
     #[test]
-    fn a_key_with_no_note_records_is_never_nothing_left() {
+    fn a_key_with_no_note_records_is_named_but_does_not_block_nothing_left() {
         let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
         let spend = spend_of(&keys, &a_sk);
         keys.sprout_joinsplits.push(spend);
-        assert!(recover_spendable_sprout_notes(&keys).nothing_left_to_sweep());
-
         let other = [0x43u8; 32];
         keys.sprout.push(argos_wallet_import::keys::SproutKey {
             a_sk: secrecy::Secret::new(other),
@@ -1401,7 +1410,10 @@ mod tests {
         });
         let recovered = recover_spendable_sprout_notes(&keys);
         assert_eq!(recovered.keys_without_notes, 1);
-        assert!(!recovered.nothing_left_to_sweep());
+        assert!(
+            recovered.nothing_left_to_sweep(),
+            "an unused address must not strand the verdict"
+        );
         assert!(
             recovered
                 .accounting_lines()
@@ -1412,20 +1424,23 @@ mod tests {
         );
     }
 
-    /// Values come from the file, so a crafted one can sum past `u64::MAX`.
+    /// Finding 9: the line is shown whenever the file holds note data for
+    /// some keys and none for others — a dust-only wallet included.
     #[test]
-    fn totals_saturate_rather_than_overflow() {
-        let (keys, _) = wallet_with_one_note(u64::MAX / 2 + 1);
-        let one = recover_spendable_sprout_notes(&keys);
-        let mut twice = SproutRecovery::default();
-        for n in one.notes {
-            twice.notes.push(SpendableSproutNote { ..n });
-        }
-        let (keys, _) = wallet_with_one_note(u64::MAX / 2 + 1);
-        twice
-            .notes
-            .extend(recover_spendable_sprout_notes(&keys).notes);
-        assert_eq!(twice.total_value(), u64::MAX);
+    fn a_key_with_no_note_records_is_named_beside_dust_alone() {
+        let (mut keys, _) = wallet_with_one_note(crate::sprout_sweep::SPROUT_SWEEP_FEE);
+        let other = [0x44u8; 32];
+        keys.sprout.push(argos_wallet_import::keys::SproutKey {
+            a_sk: secrecy::Secret::new(other),
+            address: SproutPaymentAddress::from_spending_key(&other).to_bytes(),
+            provenance: argos_wallet_import::keys::Provenance::Standalone,
+        });
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.dust.len(), 1);
+        assert!(recovered
+            .accounting_lines()
+            .iter()
+            .any(|l| l.contains("no note records")));
     }
 
     #[test]

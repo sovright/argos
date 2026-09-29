@@ -465,9 +465,6 @@ pub struct ChainEvidence {
     pub complete: bool,
 }
 
-/// Read a checkpoint's chain evidence. Validates the layout end to end —
-/// version, every length, no trailing bytes — but does not parse the tree or
-/// the witnesses, whose correctness no spent verdict depends on.
 /// The key set a checkpoint was made for, read from its header alone.
 ///
 /// Everything a caller needs to decide whether a checkpoint covers a wallet,
@@ -487,6 +484,9 @@ pub fn read_spending_keys(bytes: &[u8]) -> Result<Vec<[u8; 32]>, CheckpointError
     Ok(keys)
 }
 
+/// Read a checkpoint's chain evidence. Validates the layout end to end —
+/// version, every length, no trailing bytes — but does not parse the tree or
+/// the witnesses, whose correctness no spent verdict depends on.
 pub fn read_chain_evidence(
     checkpoint: &SproutScanCheckpoint,
 ) -> Result<ChainEvidence, CheckpointError> {

@@ -497,8 +497,29 @@ pub struct ChainSpendsCache {
 struct CacheEntry {
     path: PathBuf,
     network: u8,
-    stamp: (u64, Option<std::time::SystemTime>),
+    stamp: Stamp,
     spends: std::sync::Arc<crate::sprout_recovery::ChainSpends>,
+}
+
+/// What identifies one version of a checkpoint file without parsing it:
+/// its size, its mtime, and its last bytes. The tail is where the cursor
+/// and the completion byte live, so a re-save that changes only those — a
+/// scan finishing, with no new nullifiers and so the same length — is seen
+/// even where mtimes are too coarse to tell two saves apart.
+type Stamp = (u64, Option<std::time::SystemTime>, Vec<u8>);
+
+/// How much of a checkpoint's end goes into its [`Stamp`].
+const STAMP_TAIL: u64 = 64;
+
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    use std::io::{Read, Seek, SeekFrom};
+    let meta = std::fs::metadata(path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(meta.len().saturating_sub(STAMP_TAIL)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    Some((meta.len(), meta.modified().ok(), tail))
 }
 
 /// A few wallets' worth: the GUI works on one at a time.
@@ -533,14 +554,12 @@ impl ChainSpendsCache {
     ) -> ZeckResult<CachedLookup> {
         let path = checkpoint_path(data_dir, spending_keys);
         let tag = network_tag(network);
-        let stamp = std::fs::metadata(&path)
-            .ok()
-            .map(|m| (m.len(), m.modified().ok()));
-        if let Some(stamp) = stamp {
+        let stamp = stamp_of(&path);
+        if let Some(stamp) = &stamp {
             let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(hit) = entries
                 .iter()
-                .find(|e| e.path == path && e.network == tag && e.stamp == stamp)
+                .find(|e| e.path == path && e.network == tag && &e.stamp == stamp)
             {
                 return Ok(CachedLookup::Found(hit.spends.clone(), path));
             }
@@ -665,12 +684,22 @@ pub fn chain_spends_for_wallet(
         Ok(CachedLookup::NotFound(path)) => {
             // A scan of more keys than the wallet holds, if one covers them
             // all: the most complete, then the furthest along.
+            // A covering checkpoint that cannot be used is kept and
+            // reported: hours of scan work must not read as absent.
+            let mut unusable = Vec::new();
             let best = scans_covering(data_dir, network, &keys)
                 .into_iter()
                 .filter_map(
                     |wider| match CHAIN_SPENDS_CACHE.lookup(data_dir, network, &wider) {
                         Ok(CachedLookup::Found(spends, path)) => Some((spends, path, wider.len())),
-                        _ => None,
+                        Ok(_) => None,
+                        Err(err) => {
+                            unusable.push(format!(
+                                "{} ({err})",
+                                checkpoint_path(data_dir, &wider).display()
+                            ));
+                            None
+                        }
                     },
                 )
                 .max_by_key(|(spends, _, _)| (spends.complete, spends.scanned_to));
@@ -687,6 +716,14 @@ pub fn chain_spends_for_wallet(
                     }
                     (Some(spends), Some(notice))
                 }
+                None if !unusable.is_empty() => (
+                    None,
+                    Some(format!(
+                        "A full-block scan covering this wallet's Sprout keys was found but could \
+                         not be used: {}. Spent status is the wallet file's own record.",
+                        unusable.join("; ")
+                    )),
+                ),
                 None => (
                     None,
                     Some(format!(
@@ -2321,6 +2358,64 @@ mod tests {
             .unwrap();
         assert!(!std::sync::Arc::ptr_eq(&first, &third));
         assert_eq!(third.scanned_to, 3_000_001);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kristi's round-6 finding 12: a finished scan re-saves its checkpoint
+    /// with only the completion byte changed — the same length, and within
+    /// one mtime tick. The cache must not keep serving "incomplete".
+    #[test]
+    fn the_cache_sees_a_rewrite_of_the_same_length() {
+        let dir = fresh_dir("cache-same-len");
+        let keys = [[0x36; 32]];
+        let path = write_scan(&dir, &keys, 3_000_000, false);
+        let cache = ChainSpendsCache::default();
+        let before = cache
+            .load(&dir, P2pNetwork::Mainnet, &keys)
+            .unwrap()
+            .unwrap();
+        assert!(!before.complete);
+        let meta = std::fs::metadata(&path).unwrap();
+        let (len, mtime) = (meta.len(), meta.modified().unwrap());
+
+        write_scan(&dir, &keys, 3_000_000, true);
+        // A filesystem with coarse timestamps gives both saves the same
+        // mtime; model that directly rather than rely on this one's.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "same length by design"
+        );
+        let after = cache
+            .load(&dir, P2pNetwork::Mainnet, &keys)
+            .unwrap()
+            .unwrap();
+        assert!(after.complete, "the finished scan must be seen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 11: a covering checkpoint that cannot be used is reported as
+    /// such, not as "no scan found" — hours of scan work must not look absent.
+    #[test]
+    fn an_unusable_covering_scan_is_reported_not_hidden() {
+        let dir = fresh_dir("covering-broken");
+        let (a, b) = ([0x37; 32], [0x38; 32]);
+        let path = write_scan(&dir, &[a, b], 3_000_000, true);
+        // Damage the body, past the header the covering search reads.
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
+
+        let (chain, notice) = chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &[a]);
+        assert!(chain.is_none());
+        let notice = notice.unwrap();
+        assert!(notice.contains("could not be used"), "{notice}");
+        assert!(notice.contains(&path.display().to_string()), "{notice}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

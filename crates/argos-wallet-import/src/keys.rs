@@ -177,19 +177,28 @@ impl ImportedKeys {
     /// How much of the file's key material this import is known to cover,
     /// graded by the worst diagnostic.
     pub fn coverage(&self) -> ImportCoverage {
+        self.grades().max().unwrap_or(ImportCoverage::Complete)
+    }
+
+    /// Each diagnostic's cost to coverage, for this wallet. An unreadable
+    /// transaction costs only Sprout note data — every other pool is scanned
+    /// from the chain — so it costs nothing to a wallet with no Sprout keys.
+    fn grades(&self) -> impl Iterator<Item = ImportCoverage> + '_ {
         self.diagnostics
             .iter()
-            .map(ImportCoverage::of)
-            .max()
-            .unwrap_or(ImportCoverage::Complete)
+            .map(|d| match ImportCoverage::of(d) {
+                ImportCoverage::SproutNoteDataUnread if self.sprout.is_empty() => {
+                    ImportCoverage::Complete
+                }
+                grade => grade,
+            })
     }
 
     /// Every distinct coverage caveat, most severe first, with the call to
     /// action once at the end — not only the worst one. A file with both
     /// unknown records and an unreadable transaction must say both.
     pub fn coverage_notice(&self) -> Option<String> {
-        let mut grades: Vec<ImportCoverage> =
-            self.diagnostics.iter().map(ImportCoverage::of).collect();
+        let mut grades: Vec<ImportCoverage> = self.grades().collect();
         grades.sort_unstable_by(|a, b| b.cmp(a));
         grades.dedup();
         let may_hide_funds = grades.iter().any(|g| g.may_hide_funds());
@@ -318,6 +327,17 @@ mod coverage_tests {
         }
     }
 
+    /// [`with`], for a wallet that holds a Sprout key.
+    fn with_sprout(diagnostics: Vec<ImportDiagnostic>) -> ImportedKeys {
+        let mut keys = with(diagnostics);
+        keys.sprout.push(SproutKey {
+            a_sk: secrecy::Secret::new([1; 32]),
+            address: [2; 64],
+            provenance: Provenance::Standalone,
+        });
+        keys
+    }
+
     /// Kristi's F9 on #239: a `tx` record holds note data, not keys. One old
     /// unwalkable transaction must not raise a key-loss banner that follows
     /// the user to every screen.
@@ -327,7 +347,7 @@ mod coverage_tests {
             record_type: "tx".to_owned(),
             reason: "could not be read".to_owned(),
         };
-        let coverage = with(vec![tx.clone()]).coverage();
+        let coverage = with_sprout(vec![tx.clone()]).coverage();
         assert_eq!(coverage, ImportCoverage::SproutNoteDataUnread);
         // Round-5 finding 9: a note received in an unreadable transaction is
         // uncounted money, so the caveat follows the user to the totals and
@@ -342,7 +362,7 @@ mod coverage_tests {
             reason: "truncated".to_owned(),
         };
         assert_eq!(
-            with(vec![tx, zkey]).coverage(),
+            with_sprout(vec![tx, zkey]).coverage(),
             ImportCoverage::KeysUnread,
             "a real key record still is"
         );
@@ -354,7 +374,7 @@ mod coverage_tests {
     /// severe first, and the call to action once.
     #[test]
     fn every_distinct_caveat_is_shown_and_the_call_to_action_once() {
-        let keys = with(vec![
+        let keys = with_sprout(vec![
             unknown(),
             ImportDiagnostic::UnparseableRecord {
                 record_type: "tx".to_owned(),
@@ -383,6 +403,21 @@ mod coverage_tests {
             "{notice}"
         );
         assert!(with(vec![]).coverage_notice().is_none());
+    }
+
+    /// Kristi's round-6 finding 7: an unreadable transaction costs only
+    /// Sprout note data, and every other pool is scanned from the chain. A
+    /// wallet with no Sprout keys must not be told it was partly recovered —
+    /// a caveat that would sit beside Delete workspace for no reason.
+    #[test]
+    fn an_unreadable_transaction_is_no_caveat_without_sprout_keys() {
+        let keys = with(vec![ImportDiagnostic::UnparseableRecord {
+            record_type: "tx".to_owned(),
+            reason: "x".to_owned(),
+        }]);
+        assert!(keys.sprout.is_empty());
+        assert_eq!(keys.coverage(), ImportCoverage::Complete);
+        assert!(keys.coverage_notice().is_none());
     }
 
     fn unknown() -> ImportDiagnostic {

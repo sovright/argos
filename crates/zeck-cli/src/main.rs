@@ -1094,18 +1094,43 @@ fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSwee
     for warning in &outcome.warnings {
         eprintln!("  warning: {warning}");
     }
+    if !outcome.already_held.is_empty() {
+        println!();
+        println!(
+            "  The node already holds {} of these transaction(s). They are not counted as swept",
+            outcome.already_held.len()
+        );
+        println!("  until they are mined; if one never is, running the sweep again retries it:");
+        for held in &outcome.already_held {
+            println!("    {} — {}", format_zec(held.value_swept), held.txid);
+        }
+    }
     if !outcome.rejected.is_empty() {
         println!();
         println!(
             "  The network refused {} note(s). Nothing moved for these, and no fee was paid:",
             outcome.rejected.len()
         );
-        // Each with its own cause and remedy: a spent note, a stale witness
-        // and an evicted transaction call for different next steps, so no
-        // single sentence may speak for the whole list.
+        // One line per note, then each kind's cause and remedy once: a
+        // spent note, a stale witness and an evicted transaction call for
+        // different next steps, but a heavily refused run must not print a
+        // paragraph per note.
         for r in &outcome.rejected {
-            for (i, line) in wrap_text(&r.to_string(), 74).iter().enumerate() {
-                println!("    {}{line}", if i == 0 { "" } else { "  " });
+            println!("    {}", r.summary());
+        }
+        let mut kinds: Vec<(
+            argos_core::sprout_sweep::Refusal,
+            argos_core::sprout_sweep::NoteSource,
+        )> = Vec::new();
+        for r in &outcome.rejected {
+            if !kinds.contains(&(r.kind, r.source)) {
+                kinds.push((r.kind, r.source));
+            }
+        }
+        for (kind, source) in kinds {
+            println!();
+            for line in wrap_text(kind.explanation(source), 74) {
+                println!("  {line}");
             }
         }
     }

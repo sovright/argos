@@ -529,6 +529,8 @@ test("the caveat is cleared only by a sweep that left nothing behind", () => {
     [{ ...clean, error: "stopped" }, false],
     [{ ...clean, rejected: ["r"] }, false],
     [{ ...clean, skipped: ["s"] }, false],
+    // Round 6: held by the node but not mined is not "left nothing behind".
+    [{ ...clean, already_held: [{ txid: "h", value_swept: 1 }] }, false],
   ];
   for (const [report, expected] of cases) {
     assert.equal(h.peek(`sweepLeftNothingBehind(${JSON.stringify(report)})`), expected, JSON.stringify(report));
