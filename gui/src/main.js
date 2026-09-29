@@ -455,7 +455,14 @@ function renderWalletSummary(summary) {
         " worth less than the fee to move it. That is the file's record; the" +
         " full-block scan below checks it against the chain.";
       // Still offered: a spend recorded against a block later reorged out
-      // reads exactly like this, and only the scan can tell.
+      // reads exactly like this, and only the scan can tell — with its cost,
+      // as everywhere the scan is offered.
+      for (const line of summary.sprout_scan_warning || []) {
+        const p = document.createElement("p");
+        p.textContent = line === "" ? "\u00a0" : line;
+        sproutScanCost.appendChild(p);
+      }
+      sproutScanCost.hidden = sproutScanCost.childElementCount === 0;
       $("sprout-scan-panel").hidden = false;
     } else {
       if (summary.sprout_history_read) {
@@ -637,6 +644,14 @@ async function runSproutSweep() {
       li.textContent = reason;
       list.appendChild(li);
     }
+    for (const held of report.already_held ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent =
+        `${fmt(held.value_swept)} — ${held.txid}: the node already holds this transaction. ` +
+        `Not counted as swept until it is mined; if it never is, sweeping again retries it.`;
+      list.appendChild(li);
+    }
     for (const warning of report.warnings ?? []) {
       const li = document.createElement("li");
       li.className = "muted";
@@ -668,7 +683,7 @@ async function runSproutSweep() {
     // learn to ignore is worse than none — but only clear it when the sweep
     // actually finished, since a partial one leaves notes behind, and a
     // refused note may not have been spent at all.
-    if (!report.error && refused === 0 && skipped === 0) {
+    if (sweepLeftNothingBehind(report)) {
       uncoveredSproutKeys = 0;
       renderSproutUncoveredBanners();
     }
@@ -700,6 +715,21 @@ async function runSproutSweep() {
 /// total as their entire balance — and then use the Delete workspace button
 /// sitting on that same screen, discarding the only copy of the keys.
 let uncoveredSproutKeys = 0;
+
+/// Whether a Sprout sweep left nothing behind, so the "keep the original
+/// wallet file" caveat may go. Shared by both sweep handlers so they cannot
+/// drift: it goes only if something was sent and nothing stopped the sweep,
+/// was refused, or was skipped — a refused note may not be spent at all, and
+/// a sweep that sent nothing moved nothing.
+function sweepLeftNothingBehind(report) {
+  return (
+    (report.sent ?? []).length > 0 &&
+    !report.error &&
+    (report.rejected ?? []).length === 0 &&
+    (report.skipped ?? []).length === 0 &&
+    (report.already_held ?? []).length === 0
+  );
+}
 
 function noteUncoveredSproutKeys(summary) {
   // Only counts as uncovered if the file's own notes were not already
@@ -1169,6 +1199,14 @@ async function runSproutScanSweep() {
       li.textContent = reason;
       list.appendChild(li);
     }
+    for (const held of report.already_held ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent =
+        `${fmt(held.value_swept)} — ${held.txid}: the node already holds this transaction. ` +
+        `Not counted as swept until it is mined; if it never is, sweeping again retries it.`;
+      list.appendChild(li);
+    }
     for (const warning of report.warnings ?? []) {
       const li = document.createElement("li");
       li.className = "muted";
@@ -1195,13 +1233,17 @@ async function runSproutScanSweep() {
       list.appendChild(li);
       setStatus("sprout-scan-status", "✗ The sweep did not finish.", "error");
     } else {
+      const refused = (report.rejected ?? []).length;
       setStatus(
         "sprout-scan-status",
-        `✓ Swept ${fmt(report.total_swept)} to ${destination}.`,
+        `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
+          (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
         "success",
       );
-      uncoveredSproutKeys = 0;
-      renderSproutUncoveredBanners();
+      if (sweepLeftNothingBehind(report)) {
+        uncoveredSproutKeys = 0;
+        renderSproutUncoveredBanners();
+      }
     }
   } catch (err) {
     setStatus("sprout-scan-status", `✗ ${err}`, "error");

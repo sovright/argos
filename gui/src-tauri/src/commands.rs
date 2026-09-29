@@ -420,8 +420,9 @@ fn compute_sprout_summary(
     let recovered = recover_with_scan(app, keys, network_from(network_name), data_dir);
     let SproutScreen {
         nothing_left,
-        needs_scan,
+        needs_scan: _,
         history_read,
+        quote_scan_cost,
     } = sprout_screen(!keys.sprout.is_empty(), &recovered);
     let mut accounting = recovered.accounting_lines();
     accounting.extend(argos_core::sprout_recovery::unreadable_transactions_warning(keys));
@@ -450,7 +451,7 @@ fn compute_sprout_summary(
             .map(|f| f.to_string())
             .chain(recovered.issues.iter().map(|i| i.to_string()))
             .collect(),
-        sprout_scan_warning: if needs_scan {
+        sprout_scan_warning: if quote_scan_cost {
             argos_core::sprout_scan_cost::SproutScanCost::for_network(
                 network_from(network_name).into(),
             )
@@ -473,9 +474,12 @@ struct SproutScreen {
     /// Nothing spendable came out of the file, and something might still be
     /// found from the chain.
     needs_scan: bool,
-    /// Some of the file's note data was read — so "this file holds no note
-    /// data" would be false, even when nothing is spendable.
+    /// The file holds note data — read, or present but unreadable — so
+    /// "this file holds no note data" would be false, even when nothing is
+    /// spendable.
     history_read: bool,
+    /// The scan is offered, so its cost must be quoted beside it.
+    quote_scan_cost: bool,
 }
 
 fn sprout_screen(
@@ -483,12 +487,16 @@ fn sprout_screen(
     recovered: &argos_core::sprout_recovery::SproutRecovery,
 ) -> SproutScreen {
     let nothing_left = has_keys && recovered.nothing_left_to_sweep();
+    let needs_scan = has_keys && recovered.notes.is_empty() && !nothing_left;
     SproutScreen {
         nothing_left,
-        needs_scan: has_keys && recovered.notes.is_empty() && !nothing_left,
+        needs_scan,
+        // A fully spent wallet is still offered the scan, as a check.
+        quote_scan_cost: needs_scan || nothing_left,
         history_read: !(recovered.spent.is_empty()
             && recovered.dust.is_empty()
-            && recovered.already_swept.is_empty()),
+            && recovered.already_swept.is_empty()
+            && recovered.unreadable_transactions == 0),
     }
 }
 
@@ -572,7 +580,7 @@ pub async fn inspect_wallet_file(
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
         diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
-        coverage_notice: keys.coverage().notice().map(str::to_owned),
+        coverage_notice: keys.coverage_notice(),
         coverage_may_hide_funds: keys.coverage().may_hide_funds(),
         needs_passphrase: false,
     })
@@ -940,6 +948,9 @@ pub struct SproutSweepReport {
     /// Notes the network refused. The sweep carried on past each; nothing
     /// moved for them and no fee was paid.
     pub rejected: Vec<String>,
+    /// Transactions the node said it already holds, not yet counted as
+    /// swept; if one never mines, a later run retries its note.
+    pub already_held: Vec<SproutSweepResult>,
     /// Did not stop anything, but the user should know — a broadcast that
     /// could not be written to the sweep journal.
     pub warnings: Vec<String>,
@@ -1026,6 +1037,14 @@ pub async fn execute_sprout_sweep(
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
         rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        already_held: outcome
+            .already_held
+            .iter()
+            .map(|h| SproutSweepResult {
+                txid: h.txid.clone(),
+                value_swept: h.value_swept,
+            })
+            .collect(),
         warnings: outcome.warnings,
         error: outcome.error,
     })
@@ -1429,6 +1448,14 @@ pub async fn sweep_sprout_from_scan(
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
         rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        already_held: outcome
+            .already_held
+            .iter()
+            .map(|h| SproutSweepResult {
+                txid: h.txid.clone(),
+                value_swept: h.value_swept,
+            })
+            .collect(),
         warnings: outcome.warnings,
         error: outcome.error,
     })
@@ -1470,7 +1497,7 @@ fn recover_with_scan(
     };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
-        chain.as_ref(),
+        chain.as_deref(),
     );
     // A note an earlier, interrupted sweep already broadcast is taken out of
     // the plan, so the count shown and the proofs run are for what is left.
@@ -2112,7 +2139,20 @@ mod tests {
 
         // No Sprout keys: nothing to say.
         let screen = sprout_screen(false, &empty);
-        assert!(!screen.needs_scan && !screen.nothing_left);
+        assert!(!screen.needs_scan && !screen.nothing_left && !screen.quote_scan_cost);
+
+        // Round-5 finding 8: note data that exists but could not be read is
+        // still note data — the file does hold it.
+        let unread = SproutRecovery {
+            unreadable_transactions: 2,
+            ..Default::default()
+        };
+        assert!(sprout_screen(true, &unread).history_read);
+
+        // Finding 6: wherever the scan is offered, its cost is quoted —
+        // including a fully spent wallet, where it is offered as a check.
+        assert!(sprout_screen(true, &spent).quote_scan_cost);
+        assert!(sprout_screen(true, &empty).quote_scan_cost);
     }
 
     use super::*;

@@ -203,9 +203,13 @@ nullifiers — zcashd keeps expired `z_sendmany`s forever, and treating them
 as spends hides a live note with no way back, which is worse than a
 phantom balance. What the file cannot see (spends from another copy of the
 wallet) is handled at the sweep: every note is tried, and a refusal about
-the note itself — a spent nullifier or an unknown anchor, classified from
-the node's reject reason by `classify_refusal`, never from `error_code`
-alone — is recorded and carried past, however many come in a row.
+the note itself — a spent nullifier, an unknown anchor, or a ZIP-401
+eviction, classified from the node's reject reason by `classify_refusal`,
+never from `error_code` alone — is recorded and carried past. Spent-note
+refusals never stop it, however many come in a row; unknown-anchor ones do
+after `UNKNOWN_ANCHOR_BREAKER` in a row while nothing has been accepted,
+since that pattern is the server, not the notes. A node saying it already
+has this exact transaction (`txn-already-known` and kin) counts as sent.
 Everything else stops the sweep, because it would repeat for every
 remaining note at the cost of a proving run each: `-10`/`-28` (node not
 ready, by code), expiry, any unrecognised reason, a build failure (the
@@ -223,6 +227,14 @@ key checks as resume, via the shared `load_checkpoint`), and
 it saw as spent (`SpentEvidence::Chain`). The rule is one-way: absence from
 the scan proves nothing, since the wallet may have spent after the height
 the scan reached, so a spend the wallet recorded still stands.
+
+Surfaces look the scan up only through `chain_spends_for_wallet`. With no
+checkpoint for exactly the wallet's keys it uses one whose key set is a
+strict superset (a scan run with keys typed in beside the wallet's) — never
+a mere overlap: holding every one of the wallet's `a_sk` is what makes a
+planted checkpoint self-defeating. Parsed evidence is cached in
+`ChainSpendsCache`, keyed by path and network and validated by size and
+mtime, because the GUI asks twice per wallet open.
 
 Sprout sweeps are journaled. `sprout_sweep::SweepJournal`
 (`sprout-sweep-<fingerprint>.journal`, beside the checkpoint, same

@@ -597,11 +597,10 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
 /// incomplete. `inspect-wallet` says it once; a user who goes straight to
 /// `scan` would otherwise read a total with nothing attached to it.
 fn warn_about_partial_import(keys: &ImportedKeys) {
-    let coverage = keys.coverage();
-    if !coverage.may_hide_funds() {
+    if !keys.coverage().may_hide_funds() {
         return;
     }
-    if let Some(notice) = coverage.notice() {
+    if let Some(notice) = keys.coverage_notice() {
         eprintln!();
         eprintln!("  ⚠ THIS WALLET FILE WAS ONLY PARTLY RECOVERED");
         eprintln!("    {notice}");
@@ -642,6 +641,8 @@ async fn sweep_sprout(
         println!("Nothing is left to sweep: every Sprout note this file records was spent by");
         println!("the wallet itself or is worth less than the fee to move it.");
         println!("To check that against the chain: argos scan-sprout --wallet-file <this file>");
+        println!();
+        print_sprout_scan_cost_warning(network);
         return Ok(());
     }
 
@@ -1050,7 +1051,7 @@ fn recover_with_scan(
     );
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
-        chain.as_ref(),
+        chain.as_deref(),
     );
     if !spending_keys.is_empty() {
         match argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys).load() {
@@ -1093,24 +1094,45 @@ fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSwee
     for warning in &outcome.warnings {
         eprintln!("  warning: {warning}");
     }
+    if !outcome.already_held.is_empty() {
+        println!();
+        println!(
+            "  The node already holds {} of these transaction(s). They are not counted as swept",
+            outcome.already_held.len()
+        );
+        println!("  until they are mined; if one never is, running the sweep again retries it:");
+        for held in &outcome.already_held {
+            println!("    {} — {}", format_zec(held.value_swept), held.txid);
+        }
+    }
     if !outcome.rejected.is_empty() {
         println!();
         println!(
             "  The network refused {} note(s). Nothing moved for these, and no fee was paid:",
             outcome.rejected.len()
         );
+        // One line per note, then each kind's cause and remedy once: a
+        // spent note, a stale witness and an evicted transaction call for
+        // different next steps, but a heavily refused run must not print a
+        // paragraph per note.
         for r in &outcome.rejected {
-            println!(
-                "    {}:{}:{}  {}  — {}",
-                display_txid(&r.outpoint.txid),
-                r.outpoint.js_index,
-                r.outpoint.output_index,
-                format_zec(r.value),
-                r.reason
-            );
+            println!("    {}", r.summary());
         }
-        println!("  The usual cause is a note spent from another copy of this wallet.");
-        println!("  `argos scan-sprout` checks every note against the chain.");
+        let mut kinds: Vec<(
+            argos_core::sprout_sweep::Refusal,
+            argos_core::sprout_sweep::NoteSource,
+        )> = Vec::new();
+        for r in &outcome.rejected {
+            if !kinds.contains(&(r.kind, r.source)) {
+                kinds.push((r.kind, r.source));
+            }
+        }
+        for (kind, source) in kinds {
+            println!();
+            for line in wrap_text(kind.explanation(source), 74) {
+                println!("  {line}");
+            }
+        }
     }
     if let Some(error) = &outcome.error {
         println!();
@@ -1276,6 +1298,9 @@ fn print_sprout_inspection(
                 "  To check that against the chain: argos scan-sprout --wallet-file <this file>"
             );
             println!();
+            // Quoted wherever the scan is offered: it is a multi-day,
+            // hundreds-of-gigabytes run, and that must be known up front.
+            print_sprout_scan_cost_warning(network);
             return;
         }
         if recovered.notes.is_empty() {
@@ -1392,7 +1417,7 @@ fn print_wallet_inspection(
     // one who can act on that.
     // "Every record" would be false: bookkeeping records with no key
     // material are skipped by design.
-    match keys.coverage().notice() {
+    match keys.coverage_notice() {
         None => println!("Every record that can hold a key was read."),
         Some(notice) => {
             println!("Recovery coverage: {notice}");

@@ -465,6 +465,25 @@ pub struct ChainEvidence {
     pub complete: bool,
 }
 
+/// The key set a checkpoint was made for, read from its header alone.
+///
+/// Everything a caller needs to decide whether a checkpoint covers a wallet,
+/// without parsing a spent set that runs to hundreds of megabytes. `bytes`
+/// may be only a prefix of the checkpoint, as long as it reaches the keys.
+pub fn read_spending_keys(bytes: &[u8]) -> Result<Vec<[u8; 32]>, CheckpointError> {
+    let mut r = codec::Reader::new(bytes);
+    read_version(&mut r)?;
+    r.bytes().ok_or(CheckpointError::Corrupt)?; // tree
+    let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
+    let mut keys = Vec::new();
+    for _ in 0..key_count {
+        keys.push(r.array32().ok_or(CheckpointError::Corrupt)?);
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
+}
+
 /// Read a checkpoint's chain evidence. Validates the layout end to end —
 /// version, every length, no trailing bytes — but does not parse the tree or
 /// the witnesses, whose correctness no spent verdict depends on.
