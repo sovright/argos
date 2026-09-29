@@ -202,11 +202,18 @@ non-null, `nIndex != -1`). Never count an unmined transaction's
 nullifiers — zcashd keeps expired `z_sendmany`s forever, and treating them
 as spends hides a live note with no way back, which is worse than a
 phantom balance. What the file cannot see (spends from another copy of the
-wallet) is handled at the sweep: every note is tried, and a refused note
-is recorded and skipped, never a reason to stop — however many come in a
-row. A note that fails to build is skipped the same way. Only a transport
-error stops the sweep, because it cannot say whether that transaction
-landed.
+wallet) is handled at the sweep: every note is tried, and a refusal about
+the note itself — a spent nullifier or an unknown anchor, classified from
+the node's reject reason by `classify_refusal`, never from `error_code`
+alone — is recorded and carried past, however many come in a row.
+Everything else stops the sweep, because it would repeat for every
+remaining note at the cost of a proving run each: `-10`/`-28` (node not
+ready, by code), expiry, any unrecognised reason, a build failure (the
+post-proof failures are about the destination and bundle, not the note),
+and a transport error (which cannot say whether the transaction landed).
+The tip, expiry height and branch id are read before every note. The loop
+is `run_sweep`, generic over `SweepNode`, and is tested with a scripted
+node — keep new sweep behaviour behind it and tested that way.
 
 A full-block scan of the same keys outranks the file for every spend it
 saw. `sprout_scan_run::chain_spends` reads the checkpoint `scan-sprout`
