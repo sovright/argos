@@ -641,6 +641,7 @@ async fn sweep_sprout(
     if recovered.nothing_left_to_sweep() {
         println!("Nothing is left to sweep: every Sprout note this file records was spent by");
         println!("the wallet itself or is worth less than the fee to move it.");
+        println!("To check that against the chain: argos scan-sprout --wallet-file <this file>");
         return Ok(());
     }
 
@@ -710,7 +711,10 @@ async fn sweep_sprout(
         lightwalletd_url,
         destination,
         &params_path,
-        Some(&journal),
+        argos_core::sprout_sweep::SweepOptions {
+            source: argos_core::sprout_sweep::NoteSource::WalletFile,
+            journal: Some(&journal),
+        },
         |msg| eprintln!("  {msg}"),
     )
     .await?;
@@ -942,7 +946,10 @@ async fn scan_sprout(
         lightwalletd_url,
         destination,
         &params_path,
-        Some(&journal),
+        argos_core::sprout_sweep::SweepOptions {
+            source: argos_core::sprout_sweep::NoteSource::Scan,
+            journal: Some(&journal),
+        },
         |msg| eprintln!("  {msg}"),
     )
     .await?;
@@ -988,6 +995,23 @@ fn print_sprout_accounting(
             }
         } else {
             println!("  List them with `{list_with}`.");
+        }
+    }
+    // Every note the total leaves out can be found again by outpoint, not
+    // only the spent ones.
+    if show_spent {
+        for (what, outpoints) in [
+            ("worth less than the fee", &recovered.dust),
+            ("with an unconfirmed spend", &recovered.unconfirmed_spends),
+        ] {
+            for o in outpoints {
+                println!(
+                    "    {}:{}:{}  {what}",
+                    display_txid(&o.txid),
+                    o.js_index,
+                    o.output_index
+                );
+            }
         }
     }
     if let Some(warning) = argos_core::sprout_recovery::unreadable_transactions_warning(keys) {
@@ -1228,10 +1252,20 @@ fn print_sprout_inspection(
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
         let recovered = recover_with_scan(keys, network, data_dir);
-        print_sprout_accounting(keys, &recovered, show_spent, "argos inspect-wallet");
+        print_sprout_accounting(
+            keys,
+            &recovered,
+            show_spent,
+            "argos inspect-wallet --show-spent",
+        );
         if recovered.nothing_left_to_sweep() {
             println!("  Nothing is left to sweep: every Sprout note this file records was spent");
             println!("  by the wallet itself or is worth less than the fee to move it.");
+            // Still offered: the verdict is the file's, and a spend recorded
+            // against a block later reorged out would read exactly like this.
+            println!(
+                "  To check that against the chain: argos scan-sprout --wallet-file <this file>"
+            );
             println!();
             return;
         }
