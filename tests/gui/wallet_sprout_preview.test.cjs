@@ -438,3 +438,27 @@ test("the Sprout caveat survives a sweep in which any note was refused", async (
     assert.equal(h.peek("uncoveredSproutKeys") > 0, kept, `rejected=${rejected.length}`);
   }
 });
+
+// #239 round 4, findings 5 and 6: a sweep that stopped shows why, and does
+// not clear the "keep the original wallet file" caveat; neither does one
+// that skipped any note.
+test("a sweep that stopped or skipped a note says so and keeps the caveat", async () => {
+  for (const [report, stopped] of [
+    [{ sent: [], total_swept: 0, skipped: [], rejected: [], error: "note 1 of 3 could not be built: bad bundle" }, true],
+    [{ sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: ["note 2 of 2: below the fee"], rejected: [], error: null }, false],
+  ]) {
+    const h = harness(async (command, args, fallback) =>
+      command === "execute_sprout_sweep" ? report : fallback());
+    await h.open("/fixture/first.dat");
+    await flush();
+    h.peek("uncoveredSproutKeys = 1");
+    h.$("sprout-destination").value = "fixture-destination";
+    await h.sweep();
+    const status = h.$("sprout-sweep-status").textContent;
+    if (stopped) {
+      assert.match(status, /did not finish: note 1 of 3 could not be built/);
+      assert.doesNotMatch(status, /✓/);
+    }
+    assert.ok(h.peek("uncoveredSproutKeys") > 0, "the caveat must survive");
+  }
+});

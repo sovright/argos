@@ -595,7 +595,15 @@ pub enum Refusal {
     Other,
 }
 
-pub fn classify_refusal(reason: &str) -> Refusal {
+/// zcashd's `RPC_CLIENT_IN_INITIAL_DOWNLOAD` and `RPC_IN_WARMUP`: the node
+/// cannot judge any transaction yet. Decided by code alone, before any
+/// message is read — whatever it says, every note would meet the same answer.
+const NODE_NOT_READY: [i32; 2] = [-10, -28];
+
+pub fn classify_refusal(code: i32, reason: &str) -> Refusal {
+    if NODE_NOT_READY.contains(&code) {
+        return Refusal::Other;
+    }
     let r = reason.to_ascii_lowercase();
     let any = |needles: &[&str]| needles.iter().any(|n| r.contains(n));
     if any(&[
@@ -748,13 +756,19 @@ pub(crate) async fn run_sweep(
         progress(format!("proving {label}"));
         let built = match build(note, expiry, branch_id) {
             Ok(built) => built,
-            // About this note alone — its witness, its value — so it is
-            // recorded and the rest are still tried.
+            // Not skipped: the build failures that come after proving — the
+            // fee cross-check, the Sapling output, the bundle — are about the
+            // destination and the transaction shape, not this note, so every
+            // remaining note would pay a proving run to fail the same way.
+            // Note-specific problems (a bad witness, a value below the fee)
+            // are caught before this point, without proving.
             Err(err) => {
-                outcome
-                    .skipped
-                    .push(format!("{label}: could not be built: {err}"));
-                continue;
+                outcome.error = Some(format!(
+                    "{label} could not be built: {err}. Nothing was sent for it. The sweep \
+                     stopped rather than prove the remaining notes into the same failure; \
+                     notes swept before it are listed above."
+                ));
+                return outcome;
             }
         };
 
@@ -779,7 +793,7 @@ pub(crate) async fn run_sweep(
                 message
             };
             progress(format!("{label} was refused: {reason}"));
-            match classify_refusal(&reason) {
+            match classify_refusal(code, &reason) {
                 kind @ (Refusal::Spent | Refusal::UnknownAnchor) => {
                     record_rejection(&mut outcome, note, kind, source, reason);
                     continue;
@@ -806,6 +820,9 @@ pub(crate) async fn run_sweep(
             }
         }
 
+        // Reported now, not only in the returned outcome: a sweep killed
+        // partway must already have shown every txid it broadcast.
+        progress(format!("swept {label} in {}", built.txid));
         outcome.total_swept = outcome.total_swept.saturating_add(built.value_swept);
         outcome.sent.push(SentSweep {
             txid: built.txid,
@@ -933,6 +950,80 @@ mod tests {
         (outcome, expiries)
     }
 
+    /// [`run`], with a builder that fails every note and the progress lines.
+    fn run_failing_build(
+        notes: &[SpendableSproutNote],
+        node: &mut ScriptedNode,
+    ) -> (SproutSweepOutcome, usize, Vec<String>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut built = 0;
+        let mut lines = Vec::new();
+        let outcome = runtime.block_on(run_sweep(
+            notes,
+            node,
+            crate::ZeckNetwork::Mainnet,
+            |_: &SpendableSproutNote, _: BlockHeight, _| {
+                built += 1;
+                Err(ZeckError::TransactionBuild(
+                    "the Sapling bundle has no output".into(),
+                ))
+            },
+            NoteSource::WalletFile,
+            |line| lines.push(line),
+        ));
+        (outcome, built, lines)
+    }
+
+    /// Kristi's round-4 finding 1 on #239: the build failures that come
+    /// after proving are about the fee, the destination or the bundle, not
+    /// the note — so carrying on proves every remaining note into the same
+    /// failure. A build failure stops the sweep, and says so.
+    #[test]
+    fn a_build_failure_stops_the_sweep() {
+        let mut node = ScriptedNode::new(vec![]);
+        let (outcome, built, _) =
+            run_failing_build(&notes(&[1_000_000, 2_000_000, 3_000_000]), &mut node);
+        assert_eq!(built, 1, "no second proving run");
+        let error = outcome
+            .error
+            .expect("the sweep did not finish, and must say so");
+        assert!(error.contains("could not be built"), "{error}");
+        assert!(outcome.skipped.is_empty());
+    }
+
+    /// Finding 7: an accepted broadcast is reported the moment it happens,
+    /// so a sweep killed partway has already shown every txid it sent.
+    #[test]
+    fn every_broadcast_is_reported_as_it_happens() {
+        let mut node = ScriptedNode::new(vec![Ok((0, "x")), Ok((0, "y"))]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut lines = Vec::new();
+        runtime.block_on(run_sweep(
+            &notes(&[1_000_000, 2_000_000]),
+            &mut node,
+            crate::ZeckNetwork::Mainnet,
+            |note: &SpendableSproutNote, _: BlockHeight, _| {
+                Ok(BuiltSproutSweep {
+                    txid: format!("sweep-of-{}", note.note.value),
+                    raw: Vec::new(),
+                    value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                })
+            },
+            NoteSource::WalletFile,
+            |line| lines.push(line),
+        ));
+        for txid in ["sweep-of-1000000", "sweep-of-2000000"] {
+            assert!(
+                lines.iter().any(|l| l.contains(txid)),
+                "{txid} not reported: {lines:?}"
+            );
+        }
+    }
+
     fn notes(values: &[u64]) -> Vec<SpendableSproutNote> {
         values.iter().map(|v| note(*v)).collect()
     }
@@ -1001,6 +1092,28 @@ mod tests {
             let error = outcome.error.expect("stopping must say why");
             assert!(error.contains(message), "{error}");
             assert!(!error.contains("another copy"), "{error}");
+        }
+    }
+
+    /// `-10`/`-28` mean the node cannot judge anything yet. The code alone
+    /// decides it, even if the message happens to read like a spend.
+    #[test]
+    fn a_node_that_is_not_ready_stops_the_sweep_whatever_it_says() {
+        for code in [-10, -28] {
+            assert_eq!(
+                classify_refusal(code, "bad-txns-sprout-duplicate-nullifier"),
+                Refusal::Other
+            );
+            let mut node =
+                ScriptedNode::new(vec![Ok((code, "sprout double-spend: duplicate nullifier"))]);
+            let (outcome, expiries) = run(
+                &notes(&[1_000_000, 2_000_000]),
+                &mut node,
+                NoteSource::WalletFile,
+            );
+            assert_eq!(expiries.len(), 1, "code {code}: no second proving run");
+            assert!(outcome.rejected.is_empty());
+            assert!(outcome.error.is_some());
         }
     }
 

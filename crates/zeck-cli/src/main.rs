@@ -719,6 +719,10 @@ async fn sweep_sprout(
         println!("These funds are in the Sapling receiver of that unified address.");
         println!("To finish moving them to Orchard, shield them from your own wallet.");
     }
+    // Non-zero, so a script cannot read a sweep that stopped partway as done.
+    if outcome.error.is_some() {
+        bail!("the Sprout sweep did not finish; see above");
+    }
     Ok(())
 }
 
@@ -940,6 +944,9 @@ async fn scan_sprout(
     }
     report_sprout_skips_and_errors(&outcome);
     println!("Swept {} to {destination}", format_zec(outcome.total_swept));
+    if outcome.error.is_some() {
+        bail!("the Sprout sweep did not finish; see above");
+    }
     Ok(())
 }
 

@@ -634,18 +634,30 @@ async function runSproutSweep() {
     }
 
     const refused = (report.rejected ?? []).length;
-    setStatus(
-      "sprout-sweep-status",
-      `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
-        (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
-      "success",
-    );
+    const skipped = (report.skipped ?? []).length;
+    // A sweep that stopped partway is shown as stopped, with the reason —
+    // never as a green tick over what did go through.
+    if (report.error) {
+      setStatus(
+        "sprout-sweep-status",
+        `✗ The sweep did not finish: ${report.error} Swept ${fmt(report.total_swept)} ` +
+          `before it stopped.`,
+        "error",
+      );
+    } else {
+      setStatus(
+        "sprout-sweep-status",
+        `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
+          (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
+        "success",
+      );
+    }
     // Those funds have moved, so the later screens should stop warning
     // about them. Left standing it would become noise, and a warning people
     // learn to ignore is worse than none — but only clear it when the sweep
     // actually finished, since a partial one leaves notes behind, and a
     // refused note may not have been spent at all.
-    if (!report.error && refused === 0) {
+    if (!report.error && refused === 0 && skipped === 0) {
       uncoveredSproutKeys = 0;
       renderSproutUncoveredBanners();
     }
