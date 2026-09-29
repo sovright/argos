@@ -248,7 +248,7 @@ impl ImportCoverage {
     /// Whether the notice must follow the user to the totals and the
     /// delete-workspace screen, not just the import summary.
     pub fn may_hide_funds(self) -> bool {
-        self >= Self::KeysUnread
+        self >= Self::SproutNoteDataUnread
     }
 }
 
@@ -301,7 +301,10 @@ mod coverage_tests {
         };
         let coverage = with(vec![tx.clone()]).coverage();
         assert_eq!(coverage, ImportCoverage::SproutNoteDataUnread);
-        assert!(!coverage.may_hide_funds());
+        // Round-5 finding 9: a note received in an unreadable transaction is
+        // uncounted money, so the caveat follows the user to the totals and
+        // the delete-workspace screen — worded as note data, not keys.
+        assert!(coverage.may_hide_funds());
         let notice = coverage.notice().unwrap();
         assert!(notice.contains("transaction"), "{notice}");
         assert!(!notice.contains("key records"), "{notice}");

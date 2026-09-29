@@ -339,7 +339,18 @@ impl std::fmt::Display for RejectedSweep {
                 "The node does not recognise the root of the witness the scan built. Running \
                  the scan again from its checkpoint rebuilds it against the current chain."
             ),
-            (_, NoteSource::WalletFile) => write!(
+            (Refusal::Evicted, _) => write!(
+                f,
+                "The node dropped this transaction under its mempool limits. It says nothing \
+                 about the note, which is unspent as far as is known; running the sweep again \
+                 retries it."
+            ),
+            (Refusal::AlreadyAccepted | Refusal::Expired | Refusal::Other, _) => write!(
+                f,
+                "This is not a refusal the sweep carries past; it is recorded here only as \
+                 the node's own words."
+            ),
+            (Refusal::Spent, NoteSource::WalletFile) => write!(
                 f,
                 "The network says it is already spent, though this wallet file shows it \
                  unspent — most likely it was spent from another copy of this wallet. The \
@@ -347,7 +358,7 @@ impl std::fmt::Display for RejectedSweep {
                  in the app) confirms that from the chain, and a sweep run after it skips \
                  every note the scan saw spent."
             ),
-            (_, _) => write!(
+            (Refusal::Spent, NoteSource::Scan) => write!(
                 f,
                 "The network says it is already spent. The scan saw it unspent up to the \
                  height it reached, so it was spent since the scan — or an earlier sweep \
@@ -691,8 +702,11 @@ impl SweepNode for Lightwalletd {
         self.0
             .get_latest_block(ChainSpec {})
             .await
-            .map(|r| r.into_inner().height as u32)
             .map_err(|err| err.to_string())
+            .and_then(|r| {
+                let height = r.into_inner().height;
+                u32::try_from(height).map_err(|_| format!("implausible chain tip {height}"))
+            })
     }
 
     async fn send(&mut self, raw: Vec<u8>) -> Result<(i32, String), String> {
@@ -729,6 +743,12 @@ pub enum Refusal {
     /// The node does not know the tree root the note's witness proves
     /// against — the witness, not the note, is the problem.
     UnknownAnchor,
+    /// The node already holds this exact transaction — in its mempool or
+    /// its chain. Not a refusal at all: the funds moved.
+    AlreadyAccepted,
+    /// The node dropped this transaction under its mempool limits (ZIP-401).
+    /// About this one transaction; a later run retries it.
+    Evicted,
     /// The transaction's expiry height had passed by the time it arrived.
     Expired,
     /// Anything else: the node's state, or the transaction as a whole.
@@ -747,6 +767,16 @@ pub fn classify_refusal(code: i32, reason: &str) -> Refusal {
     let r = reason.to_ascii_lowercase();
     let any = |needles: &[&str]| needles.iter().any(|n| r.contains(n));
     if any(&[
+        "txn-already-in-mempool",
+        "txn-already-known",
+        "transaction already in block chain",
+        "transaction already exists in mempool",
+        "transaction was committed to the best chain",
+    ]) {
+        Refusal::AlreadyAccepted
+    } else if any(&["zip-401 denial of service limits"]) {
+        Refusal::Evicted
+    } else if any(&[
         "bad-txns-sprout-duplicate-nullifier",
         "sprout double-spend",
         "already spent some of its inputs",
@@ -770,6 +800,18 @@ pub fn classify_refusal(code: i32, reason: &str) -> Refusal {
 /// transaction may still be mined. Read per note, so a long sweep never
 /// builds against a tip that has moved on.
 const EXPIRY_DELTA: u32 = 40;
+
+/// Unknown-anchor refusals in a row, with nothing yet accepted, after which
+/// the sweep stops.
+///
+/// An unknown anchor is normally about one note's witness. But a server that
+/// knows no Sprout anchor at all — pruned, on a fork, on another chain —
+/// answers that way for every note, and each answer costs a proving run.
+/// Until something has been accepted there is no evidence the server can
+/// judge Sprout anchors, so a short run of these stops it and names the
+/// server. Spent-note refusals never count: those are genuinely per note, and
+/// the sweep tries every one.
+const UNKNOWN_ANCHOR_BREAKER: usize = 3;
 
 /// Prove and broadcast a sweep of every recoverable note.
 ///
@@ -859,6 +901,7 @@ pub(crate) async fn run_sweep(
 ) -> SproutSweepOutcome {
     let mut outcome = SproutSweepOutcome::default();
     let total = notes.len();
+    let mut unknown_anchor_run = 0usize;
     // A safety net under the callers, which drop journaled notes before
     // planning: whatever reaches here, a note already broadcast is never
     // proved again.
@@ -911,8 +954,18 @@ pub(crate) async fn run_sweep(
                 return outcome;
             }
         };
+        // A height within the expiry delta of `u32::MAX` is no real chain;
+        // building against it would wrap the expiry and pick a branch id
+        // from nonsense.
+        let Some(expiry) = tip.checked_add(EXPIRY_DELTA) else {
+            outcome.error = Some(format!(
+                "the server reported an implausible chain tip ({tip}) before {label}. Nothing \
+                 was sent for it; check the lightwalletd server."
+            ));
+            return outcome;
+        };
         let branch_id = branch_id_for_height(network, tip);
-        let expiry = BlockHeight::from_u32(tip + EXPIRY_DELTA);
+        let expiry = BlockHeight::from_u32(expiry);
 
         progress(format!("proving {label}"));
         let built = match build(note, expiry, branch_id) {
@@ -955,8 +1008,26 @@ pub(crate) async fn run_sweep(
             };
             progress(format!("{label} was refused: {reason}"));
             match classify_refusal(code, &reason) {
-                kind @ (Refusal::Spent | Refusal::UnknownAnchor) => {
+                // This exact transaction is already in the node's mempool or
+                // chain: it was accepted, and is counted as sent below.
+                Refusal::AlreadyAccepted => {}
+                kind @ (Refusal::Spent | Refusal::UnknownAnchor | Refusal::Evicted) => {
                     record_rejection(&mut outcome, note, kind, source, reason);
+                    unknown_anchor_run = match kind {
+                        Refusal::UnknownAnchor => unknown_anchor_run + 1,
+                        _ => 0,
+                    };
+                    if outcome.sent.is_empty() && unknown_anchor_run >= UNKNOWN_ANCHOR_BREAKER {
+                        outcome.error = Some(format!(
+                            "the server refused the first {unknown_anchor_run} notes because it \
+                             does not recognise their witnesses' tree roots, and has accepted \
+                             none. That points at the lightwalletd server (pruned, on a fork, or \
+                             on another chain) rather than the notes. The sweep stopped rather \
+                             than prove every remaining note into the same answer; try another \
+                             lightwalletd server."
+                        ));
+                        return outcome;
+                    }
                     continue;
                 }
                 Refusal::Expired => {
@@ -1207,7 +1278,7 @@ mod tests {
     impl SweepNode for ScriptedNode {
         async fn tip(&mut self) -> Result<u32, String> {
             let tip = self.tip;
-            self.tip += self.blocks_per_note;
+            self.tip = self.tip.saturating_add(self.blocks_per_note);
             Ok(tip)
         }
         async fn send(&mut self, _raw: Vec<u8>) -> Result<(i32, String), String> {
@@ -1443,6 +1514,95 @@ mod tests {
             assert!(error.contains("expir"), "{error}");
             assert!(!error.contains("another copy"), "{error}");
         }
+    }
+
+    /// Kristi's round-5 finding 10: a node saying it already has this exact
+    /// transaction means it was accepted — the funds moved. Counted as sent,
+    /// never as a stop. Strings checked against zcashd and Zebra source.
+    #[test]
+    fn a_transaction_the_node_already_has_counts_as_sent() {
+        for known in [
+            "txn-already-in-mempool",
+            "txn-already-known",
+            "transaction already in block chain",
+            "transaction already exists in mempool",
+            "transaction was committed to the best chain",
+        ] {
+            let mut node = ScriptedNode::new(vec![Ok((-27, known)), Ok((0, "ok"))]);
+            let (outcome, _) = run(
+                &notes(&[1_000_000, 2_000_000]),
+                &mut node,
+                NoteSource::WalletFile,
+            );
+            assert_eq!(outcome.sent.len(), 2, "{known}");
+            assert!(
+                outcome.rejected.is_empty() && outcome.error.is_none(),
+                "{known}"
+            );
+        }
+    }
+
+    /// Eviction under ZIP-401 limits is about one transaction: record it and
+    /// carry on; a later run retries it.
+    #[test]
+    fn an_evicted_transaction_is_recorded_and_the_sweep_carries_on() {
+        let evicted =
+            "transaction evicted from the mempool due to ZIP-401 denial of service limits";
+        let mut node = ScriptedNode::new(vec![Ok((-26, evicted)), Ok((0, "ok"))]);
+        let (outcome, _) = run(
+            &notes(&[1_000_000, 2_000_000]),
+            &mut node,
+            NoteSource::WalletFile,
+        );
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].kind, Refusal::Evicted);
+        assert!(
+            outcome.rejected[0].to_string().contains("retries"),
+            "{}",
+            outcome.rejected[0]
+        );
+        assert_eq!(outcome.sent.len(), 1);
+    }
+
+    /// Finding 5: a server that knows no Sprout anchor refuses every note the
+    /// same way. With nothing accepted yet, a short run of those stops the
+    /// sweep and names the server — spent refusals never do.
+    #[test]
+    fn a_server_that_knows_no_anchor_stops_the_sweep_early() {
+        let anchor = "bad-txns-sprout-unknown-anchor";
+        let replies = (0..10).map(|_| Ok((-26, anchor))).collect();
+        let mut node = ScriptedNode::new(replies);
+        let values: Vec<u64> = (0..10).map(|i| 1_000_000 + i).collect();
+        let (outcome, expiries) = run(&notes(&values), &mut node, NoteSource::WalletFile);
+        assert_eq!(expiries.len(), UNKNOWN_ANCHOR_BREAKER);
+        let error = outcome.error.expect("it must stop and say why");
+        assert!(error.contains("lightwalletd"), "{error}");
+    }
+
+    /// Once anything has been accepted the server evidently knows Sprout
+    /// anchors, so an unknown anchor is about that note's witness.
+    #[test]
+    fn after_an_accepted_note_an_unknown_anchor_is_about_the_note() {
+        let anchor = "bad-txns-sprout-unknown-anchor";
+        let mut replies = vec![Ok((0, "ok"))];
+        replies.extend((0..5).map(|_| Ok((-26, anchor))));
+        let mut node = ScriptedNode::new(replies);
+        let values: Vec<u64> = (0..6).map(|i| 1_000_000 + i).collect();
+        let (outcome, expiries) = run(&notes(&values), &mut node, NoteSource::WalletFile);
+        assert_eq!(expiries.len(), 6);
+        assert_eq!(outcome.rejected.len(), 5);
+        assert!(outcome.error.is_none());
+    }
+
+    /// Finding 13: a tip within the expiry delta of `u32::MAX` is not a real
+    /// chain. It stops the sweep before anything is built against it.
+    #[test]
+    fn an_implausible_tip_stops_the_sweep_before_building() {
+        let mut node = ScriptedNode::new(vec![]);
+        node.tip = u32::MAX - 10;
+        let (outcome, expiries) = run(&notes(&[1_000_000]), &mut node, NoteSource::WalletFile);
+        assert!(expiries.is_empty());
+        assert!(outcome.error.unwrap().contains("implausible"));
     }
 
     /// A transport failure cannot say whether the transaction landed.

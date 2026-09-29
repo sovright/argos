@@ -642,6 +642,8 @@ async fn sweep_sprout(
         println!("Nothing is left to sweep: every Sprout note this file records was spent by");
         println!("the wallet itself or is worth less than the fee to move it.");
         println!("To check that against the chain: argos scan-sprout --wallet-file <this file>");
+        println!();
+        print_sprout_scan_cost_warning(network);
         return Ok(());
     }
 
@@ -1099,18 +1101,14 @@ fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSwee
             "  The network refused {} note(s). Nothing moved for these, and no fee was paid:",
             outcome.rejected.len()
         );
+        // Each with its own cause and remedy: a spent note, a stale witness
+        // and an evicted transaction call for different next steps, so no
+        // single sentence may speak for the whole list.
         for r in &outcome.rejected {
-            println!(
-                "    {}:{}:{}  {}  — {}",
-                display_txid(&r.outpoint.txid),
-                r.outpoint.js_index,
-                r.outpoint.output_index,
-                format_zec(r.value),
-                r.reason
-            );
+            for (i, line) in wrap_text(&r.to_string(), 74).iter().enumerate() {
+                println!("    {}{line}", if i == 0 { "" } else { "  " });
+            }
         }
-        println!("  The usual cause is a note spent from another copy of this wallet.");
-        println!("  `argos scan-sprout` checks every note against the chain.");
     }
     if let Some(error) = &outcome.error {
         println!();
@@ -1276,6 +1274,9 @@ fn print_sprout_inspection(
                 "  To check that against the chain: argos scan-sprout --wallet-file <this file>"
             );
             println!();
+            // Quoted wherever the scan is offered: it is a multi-day,
+            // hundreds-of-gigabytes run, and that must be known up front.
+            print_sprout_scan_cost_warning(network);
             return;
         }
         if recovered.notes.is_empty() {

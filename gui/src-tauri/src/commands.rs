@@ -420,8 +420,9 @@ fn compute_sprout_summary(
     let recovered = recover_with_scan(app, keys, network_from(network_name), data_dir);
     let SproutScreen {
         nothing_left,
-        needs_scan,
+        needs_scan: _,
         history_read,
+        quote_scan_cost,
     } = sprout_screen(!keys.sprout.is_empty(), &recovered);
     let mut accounting = recovered.accounting_lines();
     accounting.extend(argos_core::sprout_recovery::unreadable_transactions_warning(keys));
@@ -450,7 +451,7 @@ fn compute_sprout_summary(
             .map(|f| f.to_string())
             .chain(recovered.issues.iter().map(|i| i.to_string()))
             .collect(),
-        sprout_scan_warning: if needs_scan {
+        sprout_scan_warning: if quote_scan_cost {
             argos_core::sprout_scan_cost::SproutScanCost::for_network(
                 network_from(network_name).into(),
             )
@@ -473,9 +474,12 @@ struct SproutScreen {
     /// Nothing spendable came out of the file, and something might still be
     /// found from the chain.
     needs_scan: bool,
-    /// Some of the file's note data was read — so "this file holds no note
-    /// data" would be false, even when nothing is spendable.
+    /// The file holds note data — read, or present but unreadable — so
+    /// "this file holds no note data" would be false, even when nothing is
+    /// spendable.
     history_read: bool,
+    /// The scan is offered, so its cost must be quoted beside it.
+    quote_scan_cost: bool,
 }
 
 fn sprout_screen(
@@ -483,12 +487,16 @@ fn sprout_screen(
     recovered: &argos_core::sprout_recovery::SproutRecovery,
 ) -> SproutScreen {
     let nothing_left = has_keys && recovered.nothing_left_to_sweep();
+    let needs_scan = has_keys && recovered.notes.is_empty() && !nothing_left;
     SproutScreen {
         nothing_left,
-        needs_scan: has_keys && recovered.notes.is_empty() && !nothing_left,
+        needs_scan,
+        // A fully spent wallet is still offered the scan, as a check.
+        quote_scan_cost: needs_scan || nothing_left,
         history_read: !(recovered.spent.is_empty()
             && recovered.dust.is_empty()
-            && recovered.already_swept.is_empty()),
+            && recovered.already_swept.is_empty()
+            && recovered.unreadable_transactions == 0),
     }
 }
 
@@ -2112,7 +2120,20 @@ mod tests {
 
         // No Sprout keys: nothing to say.
         let screen = sprout_screen(false, &empty);
-        assert!(!screen.needs_scan && !screen.nothing_left);
+        assert!(!screen.needs_scan && !screen.nothing_left && !screen.quote_scan_cost);
+
+        // Round-5 finding 8: note data that exists but could not be read is
+        // still note data — the file does hold it.
+        let unread = SproutRecovery {
+            unreadable_transactions: 2,
+            ..Default::default()
+        };
+        assert!(sprout_screen(true, &unread).history_read);
+
+        // Finding 6: wherever the scan is offered, its cost is quoted —
+        // including a fully spent wallet, where it is offered as a check.
+        assert!(sprout_screen(true, &spent).quote_scan_cost);
+        assert!(sprout_screen(true, &empty).quote_scan_cost);
     }
 
     use super::*;

@@ -503,3 +503,34 @@ test("a sweep that stopped or skipped a note says so and keeps the caveat", asyn
     assert.ok(h.peek("uncoveredSproutKeys") > 0, "the caveat must survive");
   }
 });
+
+// Round-5 findings 3 and 4: one rule for both sweep handlers. The caveat
+// goes only when something was sent and nothing stopped, was refused, or
+// was skipped.
+test("the caveat is cleared only by a sweep that left nothing behind", () => {
+  const h = harness();
+  const clean = { sent: [{ txid: "a" }], error: null, rejected: [], skipped: [] };
+  const cases = [
+    [clean, true],
+    [{ ...clean, sent: [] }, false],
+    [{ ...clean, error: "stopped" }, false],
+    [{ ...clean, rejected: ["r"] }, false],
+    [{ ...clean, skipped: ["s"] }, false],
+  ];
+  for (const [report, expected] of cases) {
+    assert.equal(h.peek(`sweepLeftNothingBehind(${JSON.stringify(report)})`), expected, JSON.stringify(report));
+  }
+});
+
+// Finding 6: a fully spent wallet is offered the scan, so it is quoted the
+// scan's cost too.
+test("a fully spent wallet quotes the scan's cost beside the offer", async () => {
+  const h = harness(inspected({
+    sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
+    sprout_history_read: true, sprout_accounting: ["2 note(s) were spent"],
+    sprout_scan_warning: ["Network transfer roughly 276 GB"], sprout_issues: [],
+  }));
+  await h.open("/fixture/spent.dat");
+  assert.equal(h.$("wallet-sprout-scan-cost").hidden, false);
+  assert.deepEqual(texts(h.$("wallet-sprout-scan-cost")), ["Network transfer roughly 276 GB"]);
+});

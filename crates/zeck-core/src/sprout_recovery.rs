@@ -246,6 +246,10 @@ pub struct SproutRecovery {
     /// Transaction records the wallet file holds but Argos could not read.
     /// Notes they received are missing, and spends they made are unseen.
     pub unreadable_transactions: usize,
+    /// Sprout keys with no note record in the file at all — a key imported
+    /// without a rescan, most often. Whatever they received is invisible to
+    /// the file; only the full-block scan can find it.
+    pub keys_without_notes: usize,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
@@ -282,6 +286,7 @@ impl SproutRecovery {
         self.notes.is_empty()
             && self.issues.is_empty()
             && self.unreadable_transactions == 0
+            && self.keys_without_notes == 0
             && !(self.spent.is_empty() && self.dust.is_empty() && self.already_swept.is_empty())
     }
 
@@ -389,6 +394,14 @@ impl SproutRecovery {
                 } else {
                     String::new()
                 }
+            ));
+        }
+        if self.keys_without_notes > 0 && !(self.notes.is_empty() && self.spent.is_empty()) {
+            lines.push(format!(
+                "{} Sprout key(s) in this file have no note records at all — keys imported \
+                 without a rescan, most often. Anything they received is not counted here; \
+                 only the full-block scan can find it.",
+                self.keys_without_notes
             ));
         }
         if !self.dust.is_empty() {
@@ -534,6 +547,7 @@ pub fn recover_spendable_sprout_notes_with_chain(
         chain_checked_to: chain.map(|c| c.scanned_to),
         chain_complete: chain.is_some_and(|c| c.complete),
         unreadable_transactions: count_unreadable_transactions(keys),
+        keys_without_notes: count_keys_without_notes(keys),
         ..Default::default()
     };
 
@@ -613,6 +627,14 @@ fn cached_witness_height(blob: &[u8]) -> i32 {
         Some(&[a, b, c, d]) => i32::from_le_bytes([a, b, c, d]),
         _ => i32::MIN,
     }
+}
+
+fn count_keys_without_notes(keys: &ImportedKeys) -> usize {
+    let with_notes: HashSet<[u8; 64]> = keys.sprout_notes.iter().map(|n| n.address).collect();
+    keys.sprout
+        .iter()
+        .filter(|k| !with_notes.contains(&k.address))
+        .count()
 }
 
 fn count_unreadable_transactions(keys: &ImportedKeys) -> usize {
@@ -1356,6 +1378,35 @@ mod tests {
                 .accounting_lines()
                 .iter()
                 .any(|l| l.contains("earlier run") && l.contains("dd44")),
+            "{:?}",
+            recovered.accounting_lines()
+        );
+    }
+
+    /// Kristi's round-5 finding 7: a second key imported without a rescan
+    /// has no note records at all. "Nothing left" would be false for it —
+    /// only the scan can find its notes.
+    #[test]
+    fn a_key_with_no_note_records_is_never_nothing_left() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+        assert!(recover_spendable_sprout_notes(&keys).nothing_left_to_sweep());
+
+        let other = [0x43u8; 32];
+        keys.sprout.push(argos_wallet_import::keys::SproutKey {
+            a_sk: secrecy::Secret::new(other),
+            address: SproutPaymentAddress::from_spending_key(&other).to_bytes(),
+            provenance: argos_wallet_import::keys::Provenance::Standalone,
+        });
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.keys_without_notes, 1);
+        assert!(!recovered.nothing_left_to_sweep());
+        assert!(
+            recovered
+                .accounting_lines()
+                .iter()
+                .any(|l| l.contains("no note records")),
             "{:?}",
             recovered.accounting_lines()
         );
