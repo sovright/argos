@@ -738,3 +738,31 @@ fn inspect_wallet_consults_a_scan_of_the_same_keys() {
         "and it must say where it looked (finding 2):\n{without}"
     );
 }
+
+/// With stdout captured — as here, or redirected to a file — a scan must
+/// still say on stderr how it ended. A user ran a 149-minute scan with
+/// stdout redirected, saw nothing on the terminal, and asked whether that
+/// meant no funds were found.
+#[test]
+fn a_scan_says_how_it_ended_on_stderr_when_stdout_is_captured() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("fixture path is UTF-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("summary"),
+        "scan",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Scan did not finish") || stderr.contains("Scan finished"),
+        "the ending must be said on stderr, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("written to stdout"),
+        "and where the full result went:\n{stderr}"
+    );
+}
