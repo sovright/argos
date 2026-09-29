@@ -776,6 +776,7 @@ mod tests {
     async fn reporting_peer(
         answer: Answer,
         closed: tokio::sync::mpsc::UnboundedSender<Closed>,
+        accepted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> String {
         use crate::p2p::wire::{encode_message, encode_version};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -785,6 +786,10 @@ mod tests {
         let peer = addr.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                // Recorded on accept, before anything else: a candidate the
+                // race never reached opened nothing, holds no Zebra slot,
+                // and so has nothing to close.
+                accepted.lock().unwrap().push(peer.clone());
                 let closed = closed.clone();
                 let peer = peer.clone();
                 tokio::spawn(async move {
@@ -844,12 +849,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn losing_connections_are_closed_as_soon_as_the_race_is_won() {
         let (tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut candidates = Vec::new();
         for _ in 0..6 {
-            candidates.push(reporting_peer(Answer::Now, tx.clone()).await);
+            candidates.push(reporting_peer(Answer::Now, tx.clone(), accepted.clone()).await);
         }
         for _ in 0..2 {
-            candidates.push(reporting_peer(Answer::Never, tx.clone()).await);
+            candidates.push(reporting_peer(Answer::Never, tx.clone(), accepted.clone()).await);
         }
         drop(tx);
 
@@ -873,14 +879,27 @@ mod tests {
             losers.iter().filter(|l| l.handshaken).count()
         );
 
+        // Only a connection the fake peer actually accepted can be left open.
+        // Under load the race can be won before every attempt is scheduled;
+        // those are aborted before they dial, which is correct, and were
+        // being reported here as leaks.
+        let accepted = accepted.lock().unwrap().clone();
+        let never_dialled: Vec<&String> = candidates
+            .iter()
+            .filter(|c| !accepted.contains(c))
+            .collect();
         let still_open: Vec<&String> = candidates
             .iter()
-            .filter(|c| *c != winner.dialled_as() && !losers.iter().any(|l| &l.peer == *c))
+            .filter(|c| {
+                *c != winner.dialled_as()
+                    && accepted.contains(c)
+                    && !losers.iter().any(|l| &l.peer == *c)
+            })
             .collect();
         assert!(
             still_open.is_empty(),
             "losing connections still open {LOSER_CLOSE_DEADLINE:?} after the race: {still_open:?} \
-             (closed: {losers:?})"
+             (closed: {losers:?}; never dialled, so nothing to close: {never_dialled:?})"
         );
         assert!(
             losers.iter().all(|l| l.peer != winner.dialled_as()),
