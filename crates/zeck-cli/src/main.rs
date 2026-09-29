@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use argos_core::{
-    argos_wallet_import::{self, ImportedKeys},
+    argos_wallet_import::{self, ImportDiagnostic, ImportedKeys},
     derive_accounts, detect_birthday, estimate_birthday_from_date,
     imported::{encode_transparent_address, imported_transparent_keys},
     transparent_recovery::{scan_transparent_only, sweep_transparent_only, TransparentScanReport},
@@ -627,6 +627,9 @@ async fn sweep_sprout(
             recovered.spent.len()
         );
     }
+    if let Some(warning) = unreadable_transactions_warning(keys) {
+        eprintln!("{warning}");
+    }
 
     if recovered.notes.is_empty() {
         eprintln!("No spendable Sprout notes could be recovered from this wallet file.");
@@ -925,6 +928,26 @@ async fn scan_sprout(
     Ok(())
 }
 
+/// Spent status comes from the nullifiers of the wallet's own transactions,
+/// so a transaction record that could not be read hides the spends it holds.
+/// Said beside the Sprout total, where it changes what the number means.
+fn unreadable_transactions_warning(keys: &ImportedKeys) -> Option<String> {
+    let unread = keys
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx")
+        })
+        .count();
+    (unread > 0).then(|| {
+        format!(
+            "Warning: {unread} transaction record(s) in this file could not be read. A note \
+             one of them spent would be counted here as unspent, so treat this total as an \
+             upper bound. A sweep of such a note is rejected by the network and stops the sweep."
+        )
+    })
+}
+
 /// Print notes that did not move, and any partial failure.
 ///
 /// Both were previously dropped on the floor. A user seeing a smaller total
@@ -1088,6 +1111,15 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
                 recovered.spent.len(),
                 format_zec(recovered.spent.iter().map(|n| n.value).sum())
             );
+        }
+        if recovered.zero_value > 0 {
+            println!(
+                "  {} zero-value note(s) (zcashd's change) were left out.",
+                recovered.zero_value
+            );
+        }
+        if let Some(warning) = unreadable_transactions_warning(keys) {
+            println!("  {warning}");
         }
         if recovered.notes.is_empty() {
             println!("  No spendable Sprout notes were recovered from this file.");

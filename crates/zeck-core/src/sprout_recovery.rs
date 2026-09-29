@@ -194,6 +194,9 @@ pub struct SproutRecovery {
     pub notes: Vec<SpendableSproutNote>,
     /// Notes whose nullifier a JoinSplit in this same wallet reveals.
     pub spent: Vec<SpentSproutNote>,
+    /// Unspent notes worth nothing — zcashd's zero-value change. Left out of
+    /// `notes`: each would cost the sweep a JoinSplit and move no value.
+    pub zero_value: usize,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
@@ -359,6 +362,10 @@ pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
                 outpoint,
                 value: note.value,
             });
+            continue;
+        }
+        if note.value == 0 {
+            out.zero_value += 1;
             continue;
         }
 
@@ -596,6 +603,20 @@ mod tests {
         let recovered = recover_spendable_sprout_notes(&keys);
         assert_eq!(recovered.notes.len(), 1);
         assert!(recovered.spent.is_empty());
+    }
+
+    /// zcashd pays zero-value change back to the wallet. Offering those to
+    /// the sweep costs a JoinSplit and its fee each, and moves nothing.
+    #[test]
+    fn a_zero_value_note_is_counted_but_not_offered() {
+        let (keys, _) = wallet_with_one_note(0);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert!(
+            recovered.notes.is_empty(),
+            "nothing to move, so nothing to spend"
+        );
+        assert_eq!(recovered.zero_value, 1);
+        assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
     }
 
     #[test]

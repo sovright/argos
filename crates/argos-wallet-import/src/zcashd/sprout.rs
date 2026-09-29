@@ -33,6 +33,7 @@
 //! skipped, per the partial-recovery principle, rather than guessed at.
 
 use crate::{
+    error::ImportDiagnostic,
     keys::{ImportedKeys, JsOutPoint, SproutJoinSplit, SproutNoteData},
     zcashd::records::{compact_size, parse_record_key},
 };
@@ -428,8 +429,34 @@ pub fn collect_sprout_notes(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys
         let Ok(txid) = <[u8; 32]>::try_from(rec.rest.as_slice()) else {
             continue;
         };
-        let _ = extract_sprout_notes(value, txid, out);
+        // v5 cannot carry a JoinSplit (`read_v5` has no Sprout bundle), so
+        // it holds nothing this walk wants. Refusing it is not a failure.
+        if is_v5_or_later(value) {
+            continue;
+        }
+        // Reported, never dropped. A transaction that cannot be walked takes
+        // its nullifiers with it, and every note it spent then reads as
+        // unspent — the Sprout total grows with no sign anything is wrong.
+        if extract_sprout_notes(value, txid, out).is_none() {
+            let shown: String = txid.iter().rev().map(|b| format!("{b:02x}")).collect();
+            out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".to_owned(),
+                reason: format!(
+                    "transaction {shown} could not be read, so any Sprout note it \
+                     received or spent is unaccounted for"
+                ),
+            });
+        }
     }
+}
+
+/// Whether a `tx` record is a v5 (NU5) or later transaction.
+fn is_v5_or_later(value: &[u8]) -> bool {
+    let Some(&[a, b, c, d]) = value.get(..4) else {
+        return false;
+    };
+    let header = u32::from_le_bytes([a, b, c, d]);
+    header & 0x8000_0000 != 0 && header & 0x7fff_ffff >= 5
 }
 
 #[cfg(test)]
@@ -849,5 +876,48 @@ mod tests {
             "a record that fails to walk must not leave JoinSplits behind"
         );
         assert!(out.sprout_notes.is_empty());
+        // ...and it must say so: the nullifiers it held are gone, so any
+        // note it spent would otherwise read as unspent with no warning.
+        match out.diagnostics.as_slice() {
+            [ImportDiagnostic::UnparseableRecord {
+                record_type,
+                reason,
+            }] => {
+                assert_eq!(record_type, "tx");
+                assert!(reason.contains(&"44".repeat(32)), "{reason}");
+            }
+            other => panic!("expected one tx diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_v5_transaction_is_skipped_not_reported() {
+        let mut value = 0x8000_0005u32.to_le_bytes().to_vec();
+        value.extend_from_slice(&[0xAA; 40]);
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+        key.extend_from_slice(&[0x45; 32]);
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[(key, value)], &mut out);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// Every real `tx` record in the golden wallets walks: none may be
+    /// reported, or the diagnostic above would be noise on every import.
+    #[test]
+    fn the_golden_wallets_report_no_unreadable_transactions() {
+        for name in [
+            "sprout-plaintext.dat",
+            "sprout-encrypted.dat",
+            "modern-plaintext.dat",
+            "modern-encrypted.dat",
+        ] {
+            let bytes = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
+            let pairs = crate::bdb::walk(&bytes).unwrap();
+            let mut out = ImportedKeys::default();
+            collect_sprout_notes(&pairs, &mut out);
+            assert!(out.diagnostics.is_empty(), "{name}: {:?}", out.diagnostics);
+        }
     }
 }
