@@ -589,18 +589,6 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
     eprintln!();
 }
 
-/// Findings about the wallet's HD seed, as opposed to records that failed to
-/// read.
-fn is_seed_diagnostic(diagnostic: &argos_core::argos_wallet_import::ImportDiagnostic) -> bool {
-    use argos_core::argos_wallet_import::ImportDiagnostic;
-    matches!(
-        diagnostic,
-        ImportDiagnostic::UnrecoveredSeed { .. }
-            | ImportDiagnostic::UnscannedSeedAccounts { .. }
-            | ImportDiagnostic::MissingDerivedKeys { .. }
-    )
-}
-
 /// Repeat, before any balance appears, that the import itself may be
 /// incomplete. `inspect-wallet` says it once; a user who goes straight to
 /// `scan` would otherwise read a total with nothing attached to it.
@@ -1203,10 +1191,8 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
             // seed (an unscanned account, keys its chain derived that the
             // file lacks) is not a record that failed to read, and calling
             // it one told the user something false about both.
-            let (unread, seed): (Vec<_>, Vec<_>) = keys
-                .diagnostics
-                .iter()
-                .partition(|d| !is_seed_diagnostic(d));
+            let (unread, seed): (Vec<_>, Vec<_>) =
+                keys.diagnostics.iter().partition(|d| !d.is_about_seed());
             if !unread.is_empty() {
                 println!("{} record(s) could not be read:", unread.len());
                 for diagnostic in &unread {

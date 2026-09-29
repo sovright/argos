@@ -183,6 +183,10 @@ impl ImportedKeys {
         if !self.seed_verified {
             return None;
         }
+        let another_seed = self
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, ImportDiagnostic::UnrecoveredSeed { .. }));
         let seed_keys_missing = self.diagnostics.iter().any(|d| {
             matches!(
                 d,
@@ -190,8 +194,13 @@ impl ImportedKeys {
                     | ImportDiagnostic::MissingDerivedKeys { .. }
             )
         });
+        // The completeness claim covers the whole file, so a second seed
+        // Argos could not verify withdraws it as surely as a missing key.
         Some(if seed_keys_missing {
             "verified — but not every key it derived is in this file (see Recovery coverage)"
+        } else if another_seed {
+            "verified — but this file also holds a seed Argos could not verify (see Recovery \
+             coverage)"
         } else {
             "verified — every key it derived is read from this file"
         })
@@ -219,13 +228,23 @@ impl ImportedKeys {
             self.diagnostics.iter().map(ImportCoverage::of).collect();
         grades.sort_unstable_by(|a, b| b.cmp(a));
         grades.dedup();
-        let notices: Vec<&str> = grades
+        let may_hide_funds = grades.iter().any(|g| g.may_hide_funds());
+        let mut notices: Vec<&str> = grades
             .into_iter()
             .filter_map(ImportCoverage::notice)
             .collect();
+        // Once, after every notice, rather than at the end of each: joining
+        // two notices used to print the same call to action twice.
+        if may_hide_funds {
+            notices.push(KEEP_THE_FILE);
+        }
         (!notices.is_empty()).then(|| notices.join(" "))
     }
 }
+
+/// What to do about any notice that may hide funds; appended once by
+/// [`ImportedKeys::coverage_notice`].
+const KEEP_THE_FILE: &str = "Keep the original wallet file.";
 
 /// Graded, so a skipped record of an unrecognised type does not raise the
 /// same alarm as a lost seed: a warning people learn to ignore is worse
@@ -234,6 +253,9 @@ impl ImportedKeys {
 pub enum ImportCoverage {
     /// Every record that can hold a key was read.
     Complete,
+    /// Complete as far as can be checked, beside a pre-5.0 seed whose
+    /// individually stored keys have no counters to check them against.
+    LegacySeedUnchecked,
     /// Only records of unrecognised types were skipped. They may hold
     /// nothing of value, but we cannot say so.
     UnknownRecordsSkipped,
@@ -259,14 +281,22 @@ impl ImportCoverage {
             ImportDiagnostic::UnparseableRecord { .. }
             | ImportDiagnostic::DecryptionFailed { .. } => Self::KeysUnread,
             ImportDiagnostic::UnknownRecord { .. } => Self::UnknownRecordsSkipped,
+            ImportDiagnostic::UncheckedLegacySeed { .. } => Self::LegacySeedUnchecked,
         }
     }
 
     /// One user-facing sentence, shared by the CLI and GUI so the two
-    /// cannot describe the same file differently. `None` when complete.
+    /// cannot describe the same file differently. `None` when complete. The
+    /// call to action is not part of it: [`ImportedKeys::coverage_notice`]
+    /// adds it once.
     pub fn notice(self) -> Option<&'static str> {
         match self {
             Self::Complete => None,
+            Self::LegacySeedUnchecked => Some(
+                "This wallet also holds a pre-5.0 HD seed. zcashd stored every key it \
+                 derived individually and those were read, but Argos cannot check that \
+                 none is missing.",
+            ),
             Self::UnknownRecordsSkipped => Some(
                 "Some records of a type Argos does not recognise were skipped. They \
                  are listed with the other diagnostics; if any held keys, those keys \
@@ -274,24 +304,21 @@ impl ImportCoverage {
             ),
             Self::KeysUnread => Some(
                 "Incomplete — some key records could not be read, so recovered keys \
-                 and balances may be missing funds. Keep the original wallet file.",
+                 and balances may be missing funds.",
             ),
             Self::DerivedKeysMissing => Some(
                 "Incomplete — this wallet's own records say its seed derived keys that \
-                 are not in this file, so balances may be missing funds. Keep the \
-                 original wallet file.",
+                 are not in this file, so balances may be missing funds.",
             ),
             Self::SeedAccountsNotScanned => Some(
                 "Incomplete — this wallet created unified accounts from its seed \
                  (z_getnewaccount). Their keys are not stored in the file and Argos \
-                 does not scan them, so balances may be missing funds. Keep the \
-                 original wallet file.",
+                 does not scan them, so balances may be missing funds.",
             ),
             Self::SeedNotRecovered => Some(
                 "Incomplete — this file holds an HD seed that Argos could not verify. \
                  Keys derived from it are only covered if the file also stores them \
-                 individually, so balances may be missing funds. Keep the original \
-                 wallet file.",
+                 individually, so balances may be missing funds.",
             ),
         }
     }
@@ -416,6 +443,42 @@ mod coverage_tests {
         let notice = keys.coverage_notice().unwrap();
         assert!(!notice.contains("could not be read"), "{notice}");
         assert!(keys.coverage().may_hide_funds());
+    }
+
+    /// A verified seed does not make the file complete when it also holds a
+    /// seed Argos could not verify: the note must not say "every key".
+    #[test]
+    fn an_unverified_second_seed_withdraws_the_completeness_claim() {
+        let mut keys = with(vec![ImportDiagnostic::UnrecoveredSeed {
+            record_type: "mnemonicphrase".to_owned(),
+            reason: "a second seed in this file, which Argos could not verify".to_owned(),
+        }]);
+        keys.seed_verified = true;
+        let note = keys.verified_seed_note().unwrap();
+        assert!(!note.contains("every key it derived is read"), "{note}");
+    }
+
+    /// Each notice used to end with the same call to action, so two failure
+    /// modes printed it twice in one line.
+    #[test]
+    fn the_call_to_action_is_said_once() {
+        let keys = with(vec![
+            ImportDiagnostic::UnscannedSeedAccounts { accounts: 2 },
+            ImportDiagnostic::UnparseableRecord {
+                record_type: "key".to_owned(),
+                reason: "truncated".to_owned(),
+            },
+        ]);
+        let notice = keys.coverage_notice().unwrap();
+        assert_eq!(
+            notice.matches("Keep the original wallet file").count(),
+            1,
+            "{notice}"
+        );
+        assert!(
+            notice.ends_with("Keep the original wallet file."),
+            "{notice}"
+        );
     }
 
     #[test]

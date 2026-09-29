@@ -473,15 +473,21 @@ function renderWalletSummary(summary) {
     }
   }
 
-  const diagnostics = $("wallet-diagnostics");
-  const diagList = $("wallet-diagnostics-list");
-  diagList.innerHTML = "";
-  diagnostics.hidden = summary.diagnostics.length === 0;
-  for (const entry of summary.diagnostics) {
-    const li = document.createElement("li");
-    li.textContent = entry;
-    diagList.appendChild(li);
-  }
+  // Two blocks, as the CLI prints them: findings about the seed (unified
+  // accounts, keys its chain says are missing) were read fine and are not
+  // "records that could not be read".
+  const renderList = (blockId, listId, entries) => {
+    const list = $(listId);
+    list.innerHTML = "";
+    $(blockId).hidden = entries.length === 0;
+    for (const entry of entries) {
+      const li = document.createElement("li");
+      li.textContent = entry;
+      list.appendChild(li);
+    }
+  };
+  renderList("wallet-seed-diagnostics", "wallet-seed-diagnostics-list", summary.seed_diagnostics || []);
+  renderList("wallet-diagnostics", "wallet-diagnostics-list", summary.diagnostics);
 
   $("wallet-summary").hidden = false;
 }

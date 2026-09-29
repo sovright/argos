@@ -311,6 +311,9 @@ pub struct WalletFileSummary {
     /// Records the parser could not read. Surfaced because a wallet that
     /// silently drops records looks identical to one that had nothing.
     pub diagnostics: Vec<String>,
+    /// Findings about the wallet's HD seed. Kept apart from `diagnostics`:
+    /// they were read fine, and listing them as unread records is false.
+    pub seed_diagnostics: Vec<String>,
     /// How much of the file this import covers, in the same words the CLI
     /// prints. `None` when every record that can hold a key was read.
     pub coverage_notice: Option<String>,
@@ -484,6 +487,7 @@ pub async fn inspect_wallet_file(
                     seed_note: None,
                     transparent_only: false,
                     diagnostics: Vec::new(),
+                    seed_diagnostics: Vec::new(),
                     coverage_notice: None,
                     coverage_may_hide_funds: false,
                     needs_passphrase: true,
@@ -513,7 +517,18 @@ pub async fn inspect_wallet_file(
         seed_note: keys.verified_seed_note().map(str::to_owned),
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
-        diagnostics: keys.diagnostics.iter().map(|d| d.to_string()).collect(),
+        diagnostics: keys
+            .diagnostics
+            .iter()
+            .filter(|d| !d.is_about_seed())
+            .map(|d| d.to_string())
+            .collect(),
+        seed_diagnostics: keys
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_about_seed())
+            .map(|d| d.to_string())
+            .collect(),
         coverage_notice: keys.coverage_notice(),
         coverage_may_hide_funds: keys.coverage().may_hide_funds(),
         needs_passphrase: false,

@@ -346,3 +346,44 @@ test("a verified zcashd seed is described in the backend's words", async () => {
   await h.open("/fixture/zcashd5.dat");
   assert.ok(summaryRows(h).includes(`Seed phrase: ${note}`));
 });
+
+// Review round 2 on #230: the CLI lists seed findings under their own
+// heading because calling "this wallet has 2 unified accounts" an unread
+// record is false. The GUI must say the same thing about the same file.
+test("seed findings are not listed as records that could not be read", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command !== "inspect_wallet_file") return fallback();
+    return {
+      needs_passphrase: false, transparent_keys: 3, sapling_keys: 1,
+      sprout_keys: 0, has_mnemonic: false, sprout_spendable_notes: 0,
+      sprout_spendable_zatoshis: 0, sprout_addresses: [],
+      diagnostics: ["skipped unparseable key record: truncated"],
+      seed_diagnostics: ["this wallet has 2 unified account(s) derived from its seed"],
+      coverage_notice: "Incomplete", coverage_may_hide_funds: true, seed_note: null,
+    };
+  });
+  await h.open("/fixture/seed.dat");
+  const texts = (id) => h.$(id).children.map((li) => li.textContent);
+  assert.deepEqual(texts("wallet-diagnostics-list"), ["skipped unparseable key record: truncated"]);
+  assert.deepEqual(texts("wallet-seed-diagnostics-list"), [
+    "this wallet has 2 unified account(s) derived from its seed",
+  ]);
+  assert.equal(h.$("wallet-diagnostics").hidden, false);
+  assert.equal(h.$("wallet-seed-diagnostics").hidden, false);
+});
+
+test("a wallet with only seed findings shows no unread-records block", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command !== "inspect_wallet_file") return fallback();
+    return {
+      needs_passphrase: false, transparent_keys: 3, sapling_keys: 1,
+      sprout_keys: 0, has_mnemonic: false, sprout_spendable_notes: 0,
+      sprout_spendable_zatoshis: 0, sprout_addresses: [], diagnostics: [],
+      seed_diagnostics: ["the wallet's seed derived 101 transparent (change) key(s) but only 91 are stored in this file"],
+      coverage_notice: "Incomplete", coverage_may_hide_funds: true, seed_note: null,
+    };
+  });
+  await h.open("/fixture/seed-only.dat");
+  assert.equal(h.$("wallet-diagnostics").hidden, true);
+  assert.equal(h.$("wallet-seed-diagnostics").hidden, false);
+});

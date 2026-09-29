@@ -80,15 +80,8 @@ pub fn assess_seed(
     master: Option<&MasterKey>,
     out: &mut ImportedKeys,
 ) {
-    use std::collections::HashSet;
-
-    let mut plain = Vec::new();
-    let mut crypted = Vec::new();
-    let mut chain = None;
+    let mut records = SeedRecords::default();
     let mut pre_5_0_seed = None;
-    let mut transparent_records = HashSet::new();
-    let mut sapling_records = HashSet::new();
-    let mut metadata = Vec::new();
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             continue;
@@ -97,33 +90,77 @@ pub fn assess_seed(
             kind @ ("hdseed" | "chdseed") => {
                 pre_5_0_seed.get_or_insert(kind.to_owned());
             }
-            "mnemonicphrase" => plain.push((rec.rest, value.as_slice())),
-            "cmnemonicphrase" => crypted.push((rec.rest, value.as_slice())),
-            "mnemonichdchain" => chain = Some(value.as_slice()),
+            "mnemonicphrase" => records.plain.push((rec.rest, value.as_slice())),
+            "cmnemonicphrase" => records.crypted.push((rec.rest, value.as_slice())),
+            "mnemonichdchain" => records.chain = Some(value.as_slice()),
             "key" | "ckey" => {
-                transparent_records.insert(rec.rest);
+                records.transparent.insert(rec.rest);
             }
             "sapzkey" | "csapzkey" => {
-                sapling_records.insert(rec.rest);
+                records.sapling.insert(rec.rest);
             }
-            "keymeta" => metadata.push((false, rec.rest, value.as_slice())),
-            "sapzkeymeta" => metadata.push((true, rec.rest, value.as_slice())),
+            "keymeta" => records.metadata.push((false, rec.rest, value.as_slice())),
+            "sapzkeymeta" => records.metadata.push((true, rec.rest, value.as_slice())),
             _ => {}
         }
     }
 
-    // A raw pre-5.0 seed: no phrase and no counters to check against, so it
-    // can only be reported — once, however many records carry it. zcashd
-    // keeps it when a wallet is upgraded to 5.x, so it can sit beside a
-    // verified 5.x seed; keys derived from it before the upgrade were
-    // stored individually, but without its chain that cannot be checked.
+    assess_mnemonic_seed(&records, master, out);
+
+    // A raw pre-5.0 seed has no phrase and no counters to check against, so
+    // it is reported once, however many records carry it. zcashd 5.0 keeps
+    // it when it adds a mnemonic, and every key 4.x derived from it was
+    // stored individually. Beside a verified 5.x seed that is said without
+    // claiming funds may be missing; with no verified seed it stays the
+    // unverifiable seed it is.
     if let Some(record_type) = pre_5_0_seed {
-        out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
-            record_type,
-            reason: "a pre-5.0 zcashd seed, which Argos does not verify".to_owned(),
+        out.diagnostics.push(if out.seed_verified {
+            ImportDiagnostic::UncheckedLegacySeed { record_type }
+        } else {
+            ImportDiagnostic::UnrecoveredSeed {
+                record_type,
+                reason: "a pre-5.0 zcashd seed, which Argos does not verify".to_owned(),
+            }
         });
     }
-    if plain.is_empty() && crypted.is_empty() {
+}
+
+/// The records `assess_seed` reads, collected in one pass.
+#[derive(Default)]
+struct SeedRecords<'a> {
+    plain: Vec<(Vec<u8>, &'a [u8])>,
+    crypted: Vec<(Vec<u8>, &'a [u8])>,
+    chain: Option<&'a [u8]>,
+    transparent: std::collections::HashSet<Vec<u8>>,
+    sapling: std::collections::HashSet<Vec<u8>>,
+    /// `(is_sapling, record key after the type, value)`.
+    metadata: Vec<(bool, Vec<u8>, &'a [u8])>,
+}
+
+/// Verify the 5.x seed, and grade coverage from its chain record.
+///
+/// The phrase is needed only to *prove* the seed. The chain record names the
+/// seed's fingerprint and every counter on its own, so whenever it parses and
+/// no phrase verifies, coverage is still graded from it: a wallet that lost
+/// its phrase record and keys with it must not read as Complete.
+fn assess_mnemonic_seed(records: &SeedRecords, master: Option<&MasterKey>, out: &mut ImportedKeys) {
+    use std::collections::HashSet;
+
+    let chain = records.chain.map(parse_chain);
+    if records.plain.is_empty() && records.crypted.is_empty() {
+        match chain {
+            None => {}
+            Some(Ok(chain)) => {
+                out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
+                    record_type: "mnemonicphrase".to_owned(),
+                    reason: "its seed phrase record is missing, though its key chain \
+                             record is present"
+                        .to_owned(),
+                });
+                check_coverage(&chain, &chain.seed_fp, records, out);
+            }
+            Some(Err(why)) => push_chain_failure(out, &why),
+        }
         return;
     }
 
@@ -136,10 +173,16 @@ pub fn assess_seed(
     let mut crypted_failure = None;
     let mut plain_failure = None;
     let mut unverified = Vec::new();
-    for (record_type, fp_bytes, value) in crypted
+    for (record_type, fp_bytes, value) in records
+        .crypted
         .iter()
         .map(|(fp, v)| ("cmnemonicphrase", fp, *v))
-        .chain(plain.iter().map(|(fp, v)| ("mnemonicphrase", fp, *v)))
+        .chain(
+            records
+                .plain
+                .iter()
+                .map(|(fp, v)| ("mnemonicphrase", fp, *v)),
+        )
     {
         match verify_record(record_type, fp_bytes, value, master) {
             Ok(fp) => {
@@ -164,6 +207,9 @@ pub fn assess_seed(
             record_type: record_type.to_owned(),
             reason: reason.to_owned(),
         });
+        if let Some(Ok(chain)) = chain {
+            check_coverage(&chain, &chain.seed_fp, records, out);
+        }
         return;
     };
     // A failed record under the verified seed's own fingerprint is the other
@@ -180,13 +226,25 @@ pub fn assess_seed(
 
     // Without the chain there is nothing to say the stored keys are all of
     // them, so a verified phrase alone is not enough.
-    let chain = match chain.map(parse_chain) {
+    let chain = match chain {
         Some(Ok(chain)) if chain.seed_fp == seed_fp => chain,
         Some(Ok(_)) => return push_chain_failure(out, "it belongs to a different seed"),
         Some(Err(why)) => return push_chain_failure(out, &why),
         None => return push_chain_failure(out, "it is missing"),
     };
     out.seed_verified = true;
+    check_coverage(&chain, &seed_fp, records, out);
+}
+
+/// Report what `chain` says was derived from the seed `seed_fp` that the
+/// file does not hold.
+fn check_coverage(
+    chain: &HdChain,
+    seed_fp: &[u8; 32],
+    records: &SeedRecords,
+    out: &mut ImportedKeys,
+) {
+    use std::collections::HashSet;
 
     if chain.account_counter > 0 {
         out.diagnostics
@@ -198,24 +256,26 @@ pub fn assess_seed(
     // The derived keys actually present: metadata naming this seed and a
     // legacy-account keypath, backed by a key record under the same key.
     let mut present: HashSet<(Chain, u32)> = HashSet::new();
-    for (sapling, rest, value) in &metadata {
+    for (sapling, rest, value) in &records.metadata {
         let Some((keypath, fp)) = parse_key_metadata(value) else {
             continue;
         };
-        if fp != seed_fp {
+        if &fp != seed_fp {
             continue;
         }
         let backed = if *sapling {
-            sapling_records.contains(rest)
+            records.sapling.contains(rest)
         } else {
-            transparent_records.contains(rest)
+            records.transparent.contains(rest)
         };
         if let (true, Some(position)) = (backed, legacy_position(&keypath, *sapling)) {
             present.insert(position);
         }
     }
     // Each chain against its own counter: a surplus on one must not cover a
-    // shortfall on another.
+    // shortfall on another. Counted over the keys present, never by walking
+    // `0..expected`: the counter comes from the file, and walking it let a
+    // crafted chain record stall the import for minutes.
     for (chain_kind, pool, expected) in [
         (
             Chain::External,
@@ -229,8 +289,9 @@ pub fn assess_seed(
         ),
         (Chain::Sapling, "Sapling", chain.legacy_sapling),
     ] {
-        let found = (0..expected)
-            .filter(|index| present.contains(&(chain_kind, *index)))
+        let found = present
+            .iter()
+            .filter(|(kind, index)| *kind == chain_kind && *index < expected)
             .count();
         let found = u64::try_from(found).unwrap_or(u64::MAX);
         if found < u64::from(expected) {
@@ -753,6 +814,132 @@ mod tests {
         let rec = |kind: &str| record(kind, &[0x01; 32], &[0x02; 40]);
         let out = assess(&[rec("hdseed"), rec("chdseed"), rec("hdseed")], None);
         assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
+    }
+
+    /// Round 2 on #230, the blocker. The phrase is only needed to *prove*
+    /// the seed; the chain record alone names the seed and every counter.
+    /// With the phrase lost and keys gone too, the file graded Complete.
+    #[test]
+    fn a_lost_phrase_record_does_not_hide_missing_keys() {
+        let mut p = pairs("modern-plaintext");
+        p.retain(|r| !is("mnemonicphrase")(r));
+        let out = assess(&p, None);
+        assert!(!out.seed_verified);
+        assert_eq!(out.coverage(), ImportCoverage::SeedNotRecovered);
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| matches!(d, ImportDiagnostic::MissingDerivedKeys { .. })),
+            "nothing else is damaged: {:?}",
+            out.diagnostics
+        );
+
+        // Kristi's reproduction: the phrase, the Sapling key and ten
+        // transparent keys gone, the chain record intact.
+        let lost: Vec<Vec<u8>> = keys_at(&p, "keymeta", "/2147483647'/1/")
+            .into_iter()
+            .take(10)
+            .collect();
+        assert_eq!(lost.len(), 10);
+        p.retain(|r| !is("sapzkey")(r));
+        p.retain(|(k, _)| {
+            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
+        });
+        let out = assess(&p, None);
+        assert_ne!(out.coverage(), ImportCoverage::Complete);
+        assert_eq!(out.coverage(), ImportCoverage::SeedNotRecovered);
+        for (want_pool, want_expected, want_found) in [("change", 101, 91), ("Sapling", 1, 0)] {
+            assert!(
+                out.diagnostics.iter().any(|d| matches!(
+                    d,
+                    ImportDiagnostic::MissingDerivedKeys { pool, expected, found }
+                        if pool.contains(want_pool) && *expected == want_expected && *found == want_found
+                )),
+                "{want_pool}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// The counters come from the file. Walking `0..counter` let twelve
+    /// bytes of a crafted chain record wedge the import for minutes.
+    #[test]
+    fn a_huge_counter_is_not_walked() {
+        let mut p = pairs("modern-plaintext");
+        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            v[48..60].fill(0xFF);
+        }
+        let started = std::time::Instant::now();
+        let out = assess(&p, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+        let missing = out
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    ImportDiagnostic::MissingDerivedKeys { expected, .. } if *expected == u64::from(u32::MAX)
+                )
+            })
+            .count();
+        assert_eq!(missing, 3, "{:?}", out.diagnostics);
+    }
+
+    /// A key whose metadata names a legacy-account path under a *different*
+    /// seed is not a derivation of this one — two seeds in one file, or keys
+    /// copied in from another wallet — and must not stand in for one.
+    #[test]
+    fn a_derived_keypath_under_another_seed_does_not_count() {
+        let mut p = pairs("modern-plaintext");
+        let target = keys_at(&p, "keymeta", "/2147483647'/1/")
+            .into_iter()
+            .next()
+            .expect("a change key");
+        for (k, v) in p.iter_mut() {
+            let Some(r) = parse_record_key(k) else {
+                continue;
+            };
+            if r.record_type == "keymeta" && r.rest == target {
+                // version(4) + create_time(8) + CompactSize(len) + keypath,
+                // then the seed fingerprint.
+                let fp_at = 12 + 1 + usize::from(v[12]);
+                v[fp_at] ^= 0xFF;
+            }
+        }
+        let out = assess(&p, None);
+        assert!(out.seed_verified);
+        assert!(
+            out.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::MissingDerivedKeys { pool, expected: 101, found: 100 } if pool.contains("change")
+            )),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// zcashd 5.0 keeps a wallet's pre-5.0 `hdseed` when it adds a mnemonic.
+    /// Beside a verified 5.x seed whose chain checks out, that is not a
+    /// reason to say funds may be missing: every key 4.x derived from it was
+    /// stored individually and has been read.
+    #[test]
+    fn a_pre_5_0_seed_beside_a_verified_seed_does_not_claim_missing_funds() {
+        let mut p = pairs("modern-plaintext");
+        p.push(record("hdseed", &[0x01; 32], &[0x02; 40]));
+        let out = assess(&p, None);
+        assert!(out.seed_verified, "{:?}", out.diagnostics);
+        assert_eq!(
+            only_diagnostic(&out),
+            &ImportDiagnostic::UncheckedLegacySeed {
+                record_type: "hdseed".to_owned()
+            }
+        );
+        assert!(!out.coverage().may_hide_funds(), "{:?}", out.coverage());
+        assert_ne!(out.coverage(), ImportCoverage::Complete, "still said");
     }
 
     #[test]

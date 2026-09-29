@@ -60,6 +60,33 @@ pub enum ImportDiagnostic {
         expected: u64,
         found: u64,
     },
+
+    /// A pre-5.0 seed (`hdseed`/`chdseed`) kept beside a verified 5.x seed.
+    /// zcashd 5.0 keeps the old seed when it adds a mnemonic, and every key
+    /// 4.x derived from it was stored individually and read — but it has no
+    /// counters, so that cannot be checked. Said, without claiming funds may
+    /// be missing.
+    #[error(
+        "this wallet also holds a pre-5.0 HD seed ({record_type}). zcashd stored every \
+         key it derived individually, and those were read, but Argos cannot check \
+         that none is missing"
+    )]
+    UncheckedLegacySeed { record_type: String },
+}
+
+impl ImportDiagnostic {
+    /// Findings about the wallet's HD seed, as opposed to records that failed
+    /// to read. Both surfaces list them apart: calling "this wallet has 2
+    /// unified accounts" an unread record tells the user something false.
+    pub fn is_about_seed(&self) -> bool {
+        matches!(
+            self,
+            Self::UnrecoveredSeed { .. }
+                | Self::UnscannedSeedAccounts { .. }
+                | Self::MissingDerivedKeys { .. }
+                | Self::UncheckedLegacySeed { .. }
+        )
+    }
 }
 
 #[cfg(test)]
