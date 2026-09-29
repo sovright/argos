@@ -298,6 +298,15 @@ pub struct WalletFileSummary {
     /// What a full-block Sprout scan would cost, in the user's terms.
     /// Rendered from `argos-core` so the GUI and CLI cannot drift.
     pub sprout_scan_warning: Vec<String>,
+    /// Why the Sprout total is what it is — notes the wallet spent, dust,
+    /// unconfirmed spends, unreadable transactions. From `argos-core`, the
+    /// same sentences the CLI prints.
+    pub sprout_accounting: Vec<String>,
+    /// Every Sprout note was spent by the wallet itself or is dust. Not a
+    /// case for the full-block scan, and must not be presented as one.
+    pub sprout_nothing_left: bool,
+    /// The limit of reading spends from a file, shown before a sweep.
+    pub sprout_spent_status: String,
     /// True when the file yielded a BIP-39 mnemonic, which means it re-enters
     /// the ordinary HD pipeline and scans and sweeps like a typed seed.
     pub has_mnemonic: bool,
@@ -383,6 +392,8 @@ struct SproutSummary {
     sprout_spendable_zatoshis: u64,
     sprout_issues: Vec<String>,
     sprout_scan_warning: Vec<String>,
+    sprout_accounting: Vec<String>,
+    sprout_nothing_left: bool,
 }
 
 /// Compute the Sprout summary for a wallet. Body is verbatim the logic that
@@ -401,7 +412,10 @@ fn compute_sprout_summary(
     let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(keys);
 
     let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(keys);
-    let needs_scan = !keys.sprout.is_empty() && recovered.notes.is_empty();
+    let nothing_left = recovered.nothing_left_to_sweep();
+    let needs_scan = !keys.sprout.is_empty() && recovered.notes.is_empty() && !nothing_left;
+    let mut accounting = recovered.accounting_lines();
+    accounting.extend(argos_core::sprout_recovery::unreadable_transactions_warning(keys));
 
     SproutSummary {
         sprout_keys: keys.sprout.len(),
@@ -435,6 +449,8 @@ fn compute_sprout_summary(
         } else {
             Vec::new()
         },
+        sprout_accounting: accounting,
+        sprout_nothing_left: nothing_left,
     }
 }
 
@@ -476,6 +492,9 @@ pub async fn inspect_wallet_file(
                     sprout_spendable_zatoshis: 0,
                     sprout_issues: Vec::new(),
                     sprout_scan_warning: Vec::new(),
+                    sprout_accounting: Vec::new(),
+                    sprout_nothing_left: false,
+                    sprout_spent_status: String::new(),
                     has_mnemonic: false,
                     transparent_only: false,
                     diagnostics: Vec::new(),
@@ -504,6 +523,9 @@ pub async fn inspect_wallet_file(
         sprout_spendable_zatoshis: sprout.sprout_spendable_zatoshis,
         sprout_issues: sprout.sprout_issues,
         sprout_scan_warning: sprout.sprout_scan_warning,
+        sprout_accounting: sprout.sprout_accounting,
+        sprout_nothing_left: sprout.sprout_nothing_left,
+        sprout_spent_status: argos_core::sprout_recovery::SPENT_STATUS_IS_THE_FILES.to_owned(),
         has_mnemonic: keys.mnemonic.is_some(),
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
@@ -870,6 +892,9 @@ pub struct SproutSweepReport {
     /// a user seeing less than expected needs to know which notes stayed
     /// behind.
     pub skipped: Vec<String>,
+    /// Notes the network refused. The sweep carried on past each; nothing
+    /// moved for them and no fee was paid.
+    pub rejected: Vec<String>,
     /// Set when the sweep stopped partway. `sent` still lists what was
     /// broadcast before it did — those funds have moved.
     pub error: Option<String>,
@@ -938,6 +963,7 @@ pub async fn execute_sprout_sweep(
         landed_in_unified_sapling: outcome.destination_kind
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
+        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
         error: outcome.error,
     })
 }
@@ -1327,6 +1353,7 @@ pub async fn sweep_sprout_from_scan(
         landed_in_unified_sapling: outcome.destination_kind
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
+        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
         error: outcome.error,
     })
 }

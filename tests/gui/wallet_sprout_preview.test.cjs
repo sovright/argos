@@ -336,3 +336,57 @@ test("a complete read shows no coverage row, and replaces an earlier partial war
   assert.equal(summaryRows(h).some((row) => row.startsWith("Recovery coverage:")), false);
   for (const id of LATER_SCREENS) assert.doesNotMatch(h.$(id).textContent, /HD seed/, id);
 });
+
+// #239 review: a wallet whose Sprout notes were all spent must not be told
+// it needs a multi-day scan for note data it does in fact hold.
+function inspected(overrides) {
+  return async (command, args, fallback) => {
+    if (command === "inspect_wallet_file") return { ...(await fallback()), ...overrides };
+    return fallback();
+  };
+}
+const texts = (el) => el.children.map((c) => c.textContent);
+
+test("a wallet that spent every Sprout note says so and offers no scan", async () => {
+  const h = harness(inspected({
+    sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
+    sprout_accounting: ["257 note(s) were spent by the wallet itself"],
+    sprout_scan_warning: [], sprout_issues: [],
+  }));
+  await h.open("/fixture/spent.dat");
+  const headline = h.$("wallet-sprout-headline").textContent;
+  assert.doesNotMatch(headline, /scan/i);
+  assert.match(headline, /no Sprout funds are left/i);
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+  assert.equal(h.$("wallet-sprout-sweep").hidden, true);
+  assert.deepEqual(h.previews, []);
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), ["257 note(s) were spent by the wallet itself"]);
+});
+
+test("a recoverable wallet shows why its total is what it is, and the file's limit", async () => {
+  const h = harness(inspected({
+    sprout_accounting: ["3 note(s) were spent"],
+    sprout_spent_status: "Spent status comes from this wallet file's own history.",
+  }));
+  await h.open("/fixture/some-spent.dat");
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), ["3 note(s) were spent"]);
+  assert.equal(h.$("wallet-sprout-accounting").hidden, false);
+  assert.match(h.$("sprout-sweep-spent-status").textContent, /own history/);
+});
+
+test("notes the network refused are listed after a sweep", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "execute_sprout_sweep") return {
+      sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [],
+      rejected: ["note bb:0:1 was refused by the network: spent"], error: null,
+    };
+    return fallback();
+  });
+  await h.open("/fixture/first.dat");
+  await flush();
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  const lines = texts(h.$("sprout-sweep-results"));
+  assert.ok(lines.some((l) => /refused by the network/.test(l)), lines.join("\n"));
+  assert.match(h.$("sprout-sweep-status").textContent, /1 note\(s\) refused/);
+});

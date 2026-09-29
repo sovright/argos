@@ -55,7 +55,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use argos_wallet_import::keys::{ImportedKeys, JsOutPoint, SproutJoinSplit};
+use argos_wallet_import::keys::{ImportedKeys, JsOutPoint, SproutJoinSplit, SproutNoteData};
 use secrecy::ExposeSecret;
 
 use crate::sprout::{self, SproutNotePlaintext, SproutPaymentAddress};
@@ -186,23 +186,120 @@ impl std::fmt::Display for SproutRecoveryIssue {
 pub struct SpentSproutNote {
     pub outpoint: JsOutPoint,
     pub value: u64,
+    /// The transaction, recorded as mined, whose JoinSplit spent it.
+    pub spent_in: [u8; 32],
 }
 
 /// The outcome of scanning a wallet for spendable Sprout notes.
 #[derive(Debug, Default)]
 pub struct SproutRecovery {
     pub notes: Vec<SpendableSproutNote>,
-    /// Notes whose nullifier a JoinSplit in this same wallet reveals.
+    /// Notes spent by a transaction this same wallet recorded as mined.
     pub spent: Vec<SpentSproutNote>,
-    /// Unspent notes worth nothing — zcashd's zero-value change. Left out of
-    /// `notes`: each would cost the sweep a JoinSplit and move no value.
-    pub zero_value: usize,
+    /// Offered in `notes`, though a transaction the wallet never saw mined
+    /// would spend them. If it was mined after all, the sweep is rejected.
+    pub unconfirmed_spends: Vec<JsOutPoint>,
+    /// Unspent notes worth no more than the fee to move one — mostly
+    /// zcashd's zero-value change. Left out of `notes`, because the sweep
+    /// skips them: each would cost a JoinSplit and move nothing.
+    pub dust: Vec<JsOutPoint>,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
 impl SproutRecovery {
+    /// Saturating: every value here came from the wallet file, checked only
+    /// against commitments from the same file, so a crafted one can sum past
+    /// `u64::MAX`.
     pub fn total_value(&self) -> u64 {
-        self.notes.iter().map(|n| n.note.value).sum()
+        self.notes
+            .iter()
+            .fold(0u64, |sum, n| sum.saturating_add(n.note.value))
+    }
+
+    pub fn spent_value(&self) -> u64 {
+        self.spent
+            .iter()
+            .fold(0u64, |sum, n| sum.saturating_add(n.value))
+    }
+}
+
+/// The limit of reading spends from a wallet file, said where a user decides
+/// whether to sweep. One copy, rendered by both surfaces.
+pub const SPENT_STATUS_IS_THE_FILES: &str = "Spent status comes from this wallet file's own \
+     history. A note spent from another copy of this wallet still appears here; the network \
+     refuses it at sweep, and Argos skips it and carries on. The full-block scan \
+     (`argos scan-sprout`, or Scan for Sprout notes in the app) reads spends from the chain \
+     instead.";
+
+impl SproutRecovery {
+    /// Nothing to move, and nothing wrong: every note was spent by the
+    /// wallet itself or is dust. Such a wallet must hear that, not the
+    /// multi-day scan quote meant for keys without note data.
+    pub fn nothing_left_to_sweep(&self) -> bool {
+        self.notes.is_empty()
+            && self.issues.is_empty()
+            && !(self.spent.is_empty() && self.dust.is_empty())
+    }
+
+    /// Why the Sprout total is what it is, one sentence per line. Shared so
+    /// the CLI and the GUI cannot describe one file differently.
+    pub fn accounting_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !self.spent.is_empty() {
+            lines.push(format!(
+                "{} note(s), {} in all, were spent by transactions this wallet file records \
+                 as mined. They are the wallet's history, not a balance, and are left out. \
+                 (Argos 1.4.0 and earlier counted them as spendable; that total was wrong.)",
+                self.spent.len(),
+                zec(self.spent_value())
+            ));
+        }
+        if !self.dust.is_empty() {
+            lines.push(format!(
+                "{} note(s) worth no more than the {} fee to move one are left out.",
+                self.dust.len(),
+                zec(crate::sprout_sweep::SPROUT_SWEEP_FEE)
+            ));
+        }
+        if !self.unconfirmed_spends.is_empty() {
+            lines.push(format!(
+                "{} note(s) have a spend in this file that was never recorded as mined — it \
+                 may have expired. They are offered; if a spend did land, the sweep skips it.",
+                self.unconfirmed_spends.len()
+            ));
+        }
+        lines
+    }
+}
+
+/// Spent status comes from the nullifiers of the wallet's own transactions,
+/// so a transaction record that could not be read hides the spends it holds.
+/// Said beside the Sprout total, where it changes what the number means.
+pub fn unreadable_transactions_warning(keys: &ImportedKeys) -> Option<String> {
+    use argos_wallet_import::ImportDiagnostic;
+    let unread = keys
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx")
+        })
+        .count();
+    (unread > 0).then(|| {
+        format!(
+            "Warning: {unread} transaction record(s) in this file could not be read. A note \
+             one of them spent would be counted here as unspent, so treat this total as an \
+             upper bound. The sweep skips a note the network refuses."
+        )
+    })
+}
+
+/// Zatoshis as ZEC, matching the CLI's `format_zec`.
+fn zec(zatoshis: u64) -> String {
+    let (whole, frac) = (zatoshis / 100_000_000, zatoshis % 100_000_000);
+    if frac == 0 {
+        format!("{whole} ZEC")
+    } else {
+        format!("{whole}.{frac:08} ZEC")
     }
 }
 
@@ -267,79 +364,155 @@ pub fn reject_forged_sprout_keys(keys: &mut ImportedKeys) -> Vec<ForgedSproutKey
 /// zcashd keeps a `CSproutNoteData` for every note it ever received, spent
 /// or not — `spentHeight` is memory-only and never written. Spent status is
 /// therefore recomputed the way zcashd itself does it: a note is spent when
-/// its nullifier, `PRF^nf(a_sk, rho)`, appears in a JoinSplit of any
-/// transaction in the wallet. Derived from the decrypted `rho` rather than
-/// read from the record's cached nullifier, which may be absent and, in a
-/// crafted file, could be anything.
+/// its nullifier, `PRF^nf(a_sk, rho)`, appears in a JoinSplit of a
+/// transaction the wallet recorded as mined. Derived from the decrypted
+/// `rho` rather than read from the record's cached nullifier, which may be
+/// absent and, in a crafted file, could be anything.
+///
+/// A spend the wallet never saw mined — an expired `z_sendmany`, one never
+/// relayed — does not count: treating it as spent would hide a live note
+/// with no way back. The note is offered and listed in
+/// `unconfirmed_spends`; if that spend did land, the network rejects the
+/// sweep of it and the sweep moves on.
 ///
 /// This only sees spends the wallet recorded. A note spent from another
-/// copy of the wallet still reads as unspent here; consensus rejects that
-/// sweep, and only the full-block scan knows every nullifier on chain.
+/// copy of the wallet still reads as unspent here, with the same outcome at
+/// sweep; only the full-block scan knows every nullifier on chain.
 ///
 /// Never fails as a whole: notes that cannot be recovered are reported in
 /// `issues`.
 pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
-    let by_outpoint: HashMap<([u8; 32], u64), &SproutJoinSplit> = keys
-        .sprout_joinsplits
-        .iter()
-        .map(|js| ((js.txid, js.js_index), js))
-        .collect();
-
-    // Keyed by the full 64-byte address, never by `a_pk` alone: a_pk and
-    // pk_enc must come from the same key, and matching on half of the
-    // address would let a wallet holding two keys pair the wrong halves.
-    let keys_by_address: HashMap<[u8; 64], &[u8; 32]> = keys
-        .sprout
-        .iter()
-        .map(|k| (k.address, k.a_sk.expose_secret()))
-        .collect();
-
-    let revealed: HashSet<[u8; 32]> = keys
-        .sprout_joinsplits
-        .iter()
-        .flat_map(|js| js.nullifiers)
-        .collect();
-
+    let ctx = RecoveryContext::new(keys);
     let mut out = SproutRecovery::default();
-    let mut seen = HashSet::new();
 
+    // One note per outpoint, judged by its best record. A file can carry the
+    // same outpoint twice — `bdb::walk` re-emits a record reachable from two
+    // roots — and the first copy may be the damaged one. Taking whichever
+    // came first let a copy with a truncated witness or a foreign address
+    // hide a good copy of a spendable note.
+    let mut order = Vec::new();
+    let mut best: HashMap<([u8; 32], u64, u8), Result<Recovered, SproutRecoveryIssue>> =
+        HashMap::new();
     for note_data in &keys.sprout_notes {
-        let outpoint = note_data.outpoint;
-        // One note, one entry: a repeated record must not count twice.
-        if !seen.insert((outpoint.txid, outpoint.js_index, outpoint.output_index)) {
+        let o = note_data.outpoint;
+        let key = (o.txid, o.js_index, o.output_index);
+        if matches!(best.get(&key), Some(Ok(_))) {
             continue;
         }
+        let result = ctx.recover_one(note_data);
+        match best.get(&key) {
+            None => {
+                order.push(key);
+                best.insert(key, result);
+            }
+            Some(Err(_)) if result.is_ok() => {
+                best.insert(key, result);
+            }
+            Some(_) => {}
+        }
+    }
 
-        let Some(js) = by_outpoint.get(&(outpoint.txid, outpoint.js_index)) else {
-            out.issues
-                .push(SproutRecoveryIssue::MissingJoinSplit { outpoint });
-            continue;
-        };
+    for key in order {
+        match best.remove(&key) {
+            Some(Ok(Recovered::Spendable {
+                note,
+                unconfirmed_spend,
+            })) => {
+                if unconfirmed_spend {
+                    out.unconfirmed_spends.push(note.outpoint);
+                }
+                out.notes.push(*note);
+            }
+            Some(Ok(Recovered::Spent(spent))) => out.spent.push(spent),
+            Some(Ok(Recovered::Dust(outpoint))) => out.dust.push(outpoint),
+            Some(Err(issue)) => out.issues.push(issue),
+            None => {}
+        }
+    }
+    out
+}
+
+/// What one note record resolved to.
+enum Recovered {
+    Spendable {
+        note: Box<SpendableSproutNote>,
+        /// A JoinSplit the wallet never saw mined would spend it.
+        unconfirmed_spend: bool,
+    },
+    Spent(SpentSproutNote),
+    Dust(JsOutPoint),
+}
+
+/// Everything about the wallet one note's recovery consults.
+struct RecoveryContext<'a> {
+    by_outpoint: HashMap<([u8; 32], u64), &'a SproutJoinSplit>,
+    keys_by_address: HashMap<[u8; 64], &'a [u8; 32]>,
+    /// Nullifiers revealed by transactions the wallet recorded as mined,
+    /// with the transaction that revealed each.
+    spent_by: HashMap<[u8; 32], [u8; 32]>,
+    /// Nullifiers revealed only by transactions it never saw mined.
+    unconfirmed: HashSet<[u8; 32]>,
+}
+
+impl<'a> RecoveryContext<'a> {
+    fn new(keys: &'a ImportedKeys) -> Self {
+        let unmined: HashSet<[u8; 32]> = keys.sprout_unconfirmed_txids.iter().copied().collect();
+        let mut spent_by = HashMap::new();
+        let mut unconfirmed = HashSet::new();
+        for js in &keys.sprout_joinsplits {
+            for nf in js.nullifiers {
+                if unmined.contains(&js.txid) {
+                    unconfirmed.insert(nf);
+                } else {
+                    spent_by.entry(nf).or_insert(js.txid);
+                }
+            }
+        }
+        Self {
+            by_outpoint: keys
+                .sprout_joinsplits
+                .iter()
+                .map(|js| ((js.txid, js.js_index), js))
+                .collect(),
+            // Keyed by the full 64-byte address, never by `a_pk` alone: a_pk
+            // and pk_enc must come from the same key, and matching on half of
+            // the address would let a wallet holding two keys pair the wrong
+            // halves.
+            keys_by_address: keys
+                .sprout
+                .iter()
+                .map(|k| (k.address, k.a_sk.expose_secret()))
+                .collect(),
+            spent_by,
+            unconfirmed,
+        }
+    }
+
+    fn recover_one(&self, note_data: &SproutNoteData) -> Result<Recovered, SproutRecoveryIssue> {
+        let outpoint = note_data.outpoint;
+
+        let js = self
+            .by_outpoint
+            .get(&(outpoint.txid, outpoint.js_index))
+            .ok_or(SproutRecoveryIssue::MissingJoinSplit { outpoint })?;
 
         let index = outpoint.output_index;
-        let Some(ciphertext) = js.ciphertexts.get(index as usize) else {
-            out.issues
-                .push(SproutRecoveryIssue::OutputIndexOutOfRange { outpoint, index });
-            continue;
-        };
+        let ciphertext = js
+            .ciphertexts
+            .get(index as usize)
+            .ok_or(SproutRecoveryIssue::OutputIndexOutOfRange { outpoint, index })?;
 
-        let Some(a_sk) = keys_by_address.get(&note_data.address) else {
-            out.issues
-                .push(SproutRecoveryIssue::NoSpendingKey { outpoint });
-            continue;
-        };
+        let a_sk = self
+            .keys_by_address
+            .get(&note_data.address)
+            .ok_or(SproutRecoveryIssue::NoSpendingKey { outpoint })?;
 
         let h_sig = sprout::h_sig(&js.random_seed, &js.nullifiers, &js.joinsplit_pubkey);
-        let note = match sprout::decrypt_note(a_sk, &js.ephemeral_key, ciphertext, &h_sig, index) {
-            Ok(note) => note,
-            Err(err) => {
-                out.issues.push(SproutRecoveryIssue::Undecryptable {
-                    outpoint,
-                    reason: err.to_string(),
-                });
-                continue;
-            }
-        };
+        let note = sprout::decrypt_note(a_sk, &js.ephemeral_key, ciphertext, &h_sig, index)
+            .map_err(|err| SproutRecoveryIssue::Undecryptable {
+                outpoint,
+                reason: err.to_string(),
+            })?;
 
         // Derive the address from the key rather than trusting the 64 bytes
         // stored beside the note: the commitment check below is only
@@ -349,63 +522,54 @@ pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
         let derived = sprout::note_commitment(address.a_pk(), note.value, &note.rho, &note.r);
         let expected = js.commitments[index as usize];
         if derived != expected {
-            out.issues.push(SproutRecoveryIssue::CommitmentMismatch {
+            return Err(SproutRecoveryIssue::CommitmentMismatch {
                 outpoint,
                 expected,
                 derived,
             });
-            continue;
         }
 
-        if revealed.contains(&sprout::prf_nf(a_sk, &note.rho)) {
-            out.spent.push(SpentSproutNote {
+        // After the commitment check, so `rho` is bound to the commitment
+        // before the nullifier derived from it decides anything.
+        let nullifier = sprout::prf_nf(a_sk, &note.rho);
+        if let Some(spent_in) = self.spent_by.get(&nullifier) {
+            return Ok(Recovered::Spent(SpentSproutNote {
                 outpoint,
                 value: note.value,
-            });
-            continue;
+                spent_in: *spent_in,
+            }));
         }
-        if note.value == 0 {
-            out.zero_value += 1;
-            continue;
+        // Worth no more than the fee to move it: the sweep would skip it
+        // anyway, so it is not counted as spendable.
+        if note.value <= crate::sprout_sweep::SPROUT_SWEEP_FEE {
+            return Ok(Recovered::Dust(outpoint));
         }
 
         // Resolved now, not at sweep time: a witness that cannot be read
         // makes the note unspendable, and saying so during recovery is far
         // better than after a 725 MB proving run.
-        let witness =
-            match crate::sprout_witness::IncrementalWitness::parse_cached(&note_data.witness) {
-                Ok(w) => w,
-                Err(err) => {
-                    out.issues.push(SproutRecoveryIssue::UnreadableWitness {
-                        outpoint,
-                        reason: err.to_string(),
-                    });
-                    continue;
-                }
+        let unreadable =
+            |err: crate::sprout_witness::WitnessError| SproutRecoveryIssue::UnreadableWitness {
+                outpoint,
+                reason: err.to_string(),
             };
-        let witness_path = match witness.encode_for_prover() {
-            Ok(path) => path.to_vec(),
-            Err(err) => {
-                out.issues.push(SproutRecoveryIssue::UnreadableWitness {
-                    outpoint,
-                    reason: err.to_string(),
-                });
-                continue;
-            }
-        };
+        let witness = crate::sprout_witness::IncrementalWitness::parse_cached(&note_data.witness)
+            .map_err(unreadable)?;
+        let witness_path = witness.encode_for_prover().map_err(unreadable)?.to_vec();
 
-        out.notes.push(SpendableSproutNote {
-            note,
-            a_sk: **a_sk,
-            address,
-            commitment: derived,
-            anchor: witness.root(),
-            witness_path,
-            outpoint,
-        });
+        Ok(Recovered::Spendable {
+            note: Box::new(SpendableSproutNote {
+                note,
+                a_sk: **a_sk,
+                address,
+                commitment: derived,
+                anchor: witness.root(),
+                witness_path,
+                outpoint,
+            }),
+            unconfirmed_spend: self.unconfirmed.contains(&nullifier),
+        })
     }
-
-    out
 }
 
 #[cfg(test)]
@@ -494,7 +658,7 @@ mod tests {
     /// against fixtures.
     #[test]
     fn a_key_that_does_not_control_its_address_is_rejected() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         assert_eq!(keys.sprout.len(), 1);
 
         // A genuine key, refiled under a different address — exactly what a
@@ -518,7 +682,7 @@ mod tests {
 
     #[test]
     fn genuine_keys_survive_the_check() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         assert!(reject_forged_sprout_keys(&mut keys).is_empty());
         assert_eq!(keys.sprout.len(), 1, "a genuine key must not be dropped");
     }
@@ -561,7 +725,7 @@ mod tests {
     /// every note it had ever received was offered, spent or not.
     #[test]
     fn a_note_the_wallet_spent_is_not_offered_as_spendable() {
-        let (mut keys, a_sk) = wallet_with_one_note(1_000);
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
         let spend = spend_of(&keys, &a_sk);
         keys.sprout_joinsplits.push(spend);
 
@@ -573,7 +737,7 @@ mod tests {
         );
         assert_eq!(recovered.total_value(), 0);
         assert_eq!(recovered.spent.len(), 1, "it must be counted as spent");
-        assert_eq!(recovered.spent[0].value, 1_000);
+        assert_eq!(recovered.spent[0].value, 1_000_000);
         assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
     }
 
@@ -582,7 +746,7 @@ mod tests {
     /// crafted file could set to anything.
     #[test]
     fn spent_is_judged_by_the_derived_nullifier_not_the_cached_one() {
-        let (mut keys, a_sk) = wallet_with_one_note(1_000);
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
         let spend = spend_of(&keys, &a_sk);
         keys.sprout_joinsplits.push(spend);
         keys.sprout_notes[0].nullifier = Some([0xEE; 32]);
@@ -594,7 +758,7 @@ mod tests {
 
     #[test]
     fn an_unrelated_nullifier_does_not_mark_a_note_spent() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         let mut other = keys.sprout_joinsplits[0].clone();
         other.txid = [0xAB; 32];
         other.nullifiers = [[0x01; 32], [0x02; 32]];
@@ -605,36 +769,180 @@ mod tests {
         assert!(recovered.spent.is_empty());
     }
 
-    /// zcashd pays zero-value change back to the wallet. Offering those to
-    /// the sweep costs a JoinSplit and its fee each, and moves nothing.
+    /// zcashd pays zero-value change back to the wallet. A note worth no
+    /// more than the fee is skipped by the sweep, so offering it would quote
+    /// a count and a total the sweep cannot honour.
     #[test]
-    fn a_zero_value_note_is_counted_but_not_offered() {
-        let (keys, _) = wallet_with_one_note(0);
+    fn a_note_worth_no_more_than_the_fee_is_dust_not_spendable() {
+        use crate::sprout_sweep::SPROUT_SWEEP_FEE;
+        for value in [0, SPROUT_SWEEP_FEE] {
+            let (keys, _) = wallet_with_one_note(value);
+            let recovered = recover_spendable_sprout_notes(&keys);
+            assert!(
+                recovered.notes.is_empty(),
+                "{value} zat must not be offered"
+            );
+            assert_eq!(recovered.dust.len(), 1, "{value} zat is dust");
+            assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
+        }
+        let (keys, _) = wallet_with_one_note(SPROUT_SWEEP_FEE + 1);
         let recovered = recover_spendable_sprout_notes(&keys);
-        assert!(
-            recovered.notes.is_empty(),
-            "nothing to move, so nothing to spend"
+        assert_eq!(
+            recovered.notes.len(),
+            1,
+            "one zatoshi over the fee is worth sweeping"
         );
-        assert_eq!(recovered.zero_value, 1);
-        assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
+        assert!(recovered.dust.is_empty());
+    }
+
+    /// Kristi's blocker on #239: zcashd keeps a transaction that expired
+    /// unmined, so its nullifiers are not spends. Treating them as spends
+    /// made a live note invisible, which is worse than the phantom balance.
+    #[test]
+    fn a_spend_the_wallet_never_saw_mined_does_not_hide_the_note() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_unconfirmed_txids.push(spend.txid);
+        keys.sprout_joinsplits.push(spend);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.notes.len(), 1, "a live note must stay on offer");
+        assert!(recovered.spent.is_empty());
+        assert_eq!(
+            recovered.unconfirmed_spends,
+            vec![recovered.notes[0].outpoint],
+            "and it must say an unconfirmed spend exists"
+        );
+    }
+
+    #[test]
+    fn a_spent_note_names_the_transaction_that_spent_it() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.spent[0].spent_in, [0xAB; 32]);
+    }
+
+    /// The direction that would lose money: the file's cached nullifier
+    /// matches a revealed one, but the note's real nullifier does not. The
+    /// cached copy must never decide.
+    #[test]
+    fn a_cached_nullifier_matching_a_spend_does_not_mark_the_note_spent() {
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        let mut other = keys.sprout_joinsplits[0].clone();
+        other.txid = [0xAB; 32];
+        other.nullifiers = [[0x01; 32], [0xEE; 32]];
+        keys.sprout_joinsplits.push(other);
+        keys.sprout_notes[0].nullifier = Some([0xEE; 32]);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.notes.len(), 1);
+        assert!(recovered.spent.is_empty());
+    }
+
+    /// Kristi's probes on #239: a damaged copy of a record filed before the
+    /// good copy of the same outpoint must not hide the good one. Before
+    /// dedup existed both cases recovered the note; first-wins lost it.
+    #[test]
+    fn a_damaged_duplicate_does_not_hide_a_good_one() {
+        type Spoil = fn(&mut SproutNoteData);
+        let damage: [(&str, Spoil); 2] = [
+            ("truncated witness", |n| n.witness.truncate(3)),
+            ("foreign address", |n| n.address = [0x5A; 64]),
+        ];
+        for (what, spoil) in damage {
+            let (mut keys, _) = wallet_with_one_note(1_000_000);
+            let mut bad = keys.sprout_notes[0].clone();
+            spoil(&mut bad);
+            keys.sprout_notes.insert(0, bad);
+
+            let recovered = recover_spendable_sprout_notes(&keys);
+            assert_eq!(recovered.notes.len(), 1, "{what}: the good copy must win");
+            assert!(
+                recovered.issues.is_empty(),
+                "{what}: {:?}",
+                recovered.issues
+            );
+        }
+    }
+
+    #[test]
+    fn a_duplicate_with_no_good_copy_is_reported_once() {
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        keys.sprout_notes[0].witness.truncate(3);
+        let again = keys.sprout_notes[0].clone();
+        keys.sprout_notes.push(again);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert!(recovered.notes.is_empty());
+        assert_eq!(recovered.issues.len(), 1, "{:?}", recovered.issues);
+    }
+
+    /// A wallet that spent everything is told so, and is not sent to the
+    /// multi-day scan; one with issues still is.
+    #[test]
+    fn a_fully_spent_wallet_has_nothing_left_and_says_why() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert!(recovered.nothing_left_to_sweep());
+        let lines = recovered.accounting_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("0.01000000 ZEC"), "{}", lines[0]);
+        assert!(lines[0].contains("not a balance"), "{}", lines[0]);
+
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        keys.sprout_notes[0].witness.truncate(3);
+        assert!(!recover_spendable_sprout_notes(&keys).nothing_left_to_sweep());
+    }
+
+    #[test]
+    fn an_unreadable_transaction_turns_the_total_into_an_upper_bound() {
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        assert!(unreadable_transactions_warning(&keys).is_none());
+        keys.diagnostics
+            .push(argos_wallet_import::ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".into(),
+                reason: "x".into(),
+            });
+        let warning = unreadable_transactions_warning(&keys).unwrap();
+        assert!(warning.contains("upper bound"), "{warning}");
+    }
+
+    /// Values come from the file, so a crafted one can sum past `u64::MAX`.
+    #[test]
+    fn totals_saturate_rather_than_overflow() {
+        let (keys, _) = wallet_with_one_note(u64::MAX / 2 + 1);
+        let one = recover_spendable_sprout_notes(&keys);
+        let mut twice = SproutRecovery::default();
+        for n in one.notes {
+            twice.notes.push(SpendableSproutNote { ..n });
+        }
+        let (keys, _) = wallet_with_one_note(u64::MAX / 2 + 1);
+        twice
+            .notes
+            .extend(recover_spendable_sprout_notes(&keys).notes);
+        assert_eq!(twice.total_value(), u64::MAX);
     }
 
     #[test]
     fn a_note_listed_twice_is_counted_once() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         let again = keys.sprout_notes[0].clone();
         keys.sprout_notes.push(again);
 
         let recovered = recover_spendable_sprout_notes(&keys);
         assert_eq!(recovered.notes.len(), 1);
-        assert_eq!(recovered.total_value(), 1_000);
+        assert_eq!(recovered.total_value(), 1_000_000);
     }
 
     /// The check that separates "decrypts" from "spendable". A note whose
     /// commitment does not match the chain must never reach the builder.
     #[test]
     fn a_note_whose_commitment_disagrees_is_rejected_not_returned() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         keys.sprout_joinsplits[0].commitments[0] = [0xFF; 32];
 
         let recovered = recover_spendable_sprout_notes(&keys);
@@ -651,7 +959,7 @@ mod tests {
 
     #[test]
     fn a_note_with_no_matching_key_is_reported_not_dropped_silently() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         keys.sprout.clear();
 
         let recovered = recover_spendable_sprout_notes(&keys);
@@ -665,7 +973,7 @@ mod tests {
 
     #[test]
     fn a_note_whose_joinsplit_is_absent_is_reported() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         keys.sprout_joinsplits.clear();
 
         let recovered = recover_spendable_sprout_notes(&keys);
@@ -682,7 +990,7 @@ mod tests {
     /// different bugs and should not be confused.
     #[test]
     fn the_wrong_spending_key_fails_to_decrypt() {
-        let (mut keys, _) = wallet_with_one_note(1_000);
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
         let wrong = [0x01u8; 32];
         // Keep the address the note is filed under, so the join still
         // matches and only the key is wrong.
@@ -708,7 +1016,7 @@ mod tests {
     /// One unrecoverable note must not suppress a recoverable one.
     #[test]
     fn a_bad_note_does_not_hide_a_good_one() {
-        let (mut keys, _) = wallet_with_one_note(5_000);
+        let (mut keys, _) = wallet_with_one_note(5_000_000);
         let mut orphan = keys.sprout_notes[0].clone();
         orphan.outpoint.js_index = 99; // no such JoinSplit
         keys.sprout_notes.push(orphan);
@@ -716,7 +1024,7 @@ mod tests {
         let recovered = recover_spendable_sprout_notes(&keys);
 
         assert_eq!(recovered.notes.len(), 1, "the good note still comes back");
-        assert_eq!(recovered.total_value(), 5_000);
+        assert_eq!(recovered.total_value(), 5_000_000);
         assert_eq!(recovered.issues.len(), 1);
     }
 }

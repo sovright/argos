@@ -245,12 +245,22 @@ fn skip_transaction_body(
 }
 
 /// Walk past `CMerkleTx`'s own fields (`hashBlock`, `vMerkleBranch`,
-/// `nIndex`), which follow the `CTransaction` body.
-fn skip_merkle_tx_tail(c: &mut Cursor) -> Option<()> {
-    c.skip(32)?; // hashBlock
+/// `nIndex`), which follow the `CTransaction` body, and say whether the
+/// wallet recorded the transaction as mined.
+///
+/// The test is zcashd's own (`GetDepthInMainChainINTERNAL`): a null
+/// `hashBlock` or `nIndex == -1` is depth zero. It is the wallet's record,
+/// not the chain's — a transaction mined while the node was down still
+/// reads as unmined — so it only decides what to trust, never what exists.
+fn read_merkle_tx_tail(c: &mut Cursor) -> Option<bool> {
+    let hash_block = c.take(32)?;
     let n_branch = usize::try_from(c.compact_size()?).ok()?;
     c.skip(n_branch.checked_mul(32)?)?; // vMerkleBranch: Vec<uint256>
-    c.skip(4) // nIndex
+    let &[a, b, c3, d] = c.take(4)? else {
+        return None;
+    };
+    let n_index = i32::from_le_bytes([a, b, c3, d]);
+    Some(hash_block.iter().any(|&x| x != 0) && n_index != -1)
 }
 
 fn read_var_string(c: &mut Cursor) -> Option<()> {
@@ -327,7 +337,7 @@ fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) ->
     let mut joinsplits = Vec::new();
     let mut notes = Vec::new();
     skip_transaction_body(&mut c, txid, &mut joinsplits)?;
-    skip_merkle_tx_tail(&mut c)?;
+    let mined = read_merkle_tx_tail(&mut c)?;
 
     // vUnused (formerly vtxPrev): always empty in every wallet this crate
     // has seen. A nonzero count means either an ancient wallet format
@@ -387,6 +397,9 @@ fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) ->
         }
     }
 
+    if !mined && !joinsplits.is_empty() {
+        out.sprout_unconfirmed_txids.push(txid);
+    }
     out.sprout_notes.append(&mut notes);
     out.sprout_joinsplits.append(&mut joinsplits);
     Some(())
@@ -888,6 +901,59 @@ mod tests {
             }
             other => panic!("expected one tx diagnostic, got {other:?}"),
         }
+    }
+
+    /// A v4 `tx` record holding one JoinSplit, followed by a `CMerkleTx`
+    /// tail with the given `hashBlock` and `nIndex`, and an empty wallet
+    /// tail (no vUnused, no mapValue, no notes).
+    fn tx_record_with_tail(
+        txid: [u8; 32],
+        hash_block: [u8; 32],
+        n_index: i32,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut value = Vec::new();
+        value.extend_from_slice(&0x8000_0004u32.to_le_bytes());
+        value.extend_from_slice(&[0x89, 0xBB, 0x09, 0x00]);
+        value.push(0x00); // n_vin
+        value.push(0x00); // n_vout
+        value.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        value.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
+        value.extend_from_slice(&0i64.to_le_bytes()); // valueBalanceSapling
+        value.push(0x00);
+        value.push(0x00);
+        value.push(0x01); // n_js = 1
+        value.extend_from_slice(&js_description_bytes(true));
+        value.extend_from_slice(&[0x7E; 32]); // joinSplitPubKey
+        value.extend_from_slice(&[0x7F; 64]); // joinSplitSig
+        value.extend_from_slice(&hash_block);
+        value.push(0x00); // vMerkleBranch
+        value.extend_from_slice(&n_index.to_le_bytes());
+        value.push(0x00); // vUnused
+        value.push(0x00); // mapValue
+        value.push(0x00); // mapSproutNoteData
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+        key.extend_from_slice(&txid);
+        (key, value)
+    }
+
+    /// zcashd writes a transaction before relaying it and fills in
+    /// `hashBlock`/`nIndex` only once it is mined. One that expired or was
+    /// never relayed keeps a null `hashBlock` forever; its nullifiers are
+    /// not spends, and must not be treated as proof its inputs are gone.
+    #[test]
+    fn a_transaction_the_wallet_never_saw_mined_is_marked_unconfirmed() {
+        let mined = tx_record_with_tail([0x51; 32], [0x0B; 32], 3);
+        let never_mined = tx_record_with_tail([0x52; 32], [0u8; 32], 0);
+        let unindexed = tx_record_with_tail([0x53; 32], [0x0B; 32], -1);
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[mined, never_mined, unindexed], &mut out);
+
+        assert_eq!(out.sprout_joinsplits.len(), 3, "{:?}", out.diagnostics);
+        let mut unconfirmed = out.sprout_unconfirmed_txids.clone();
+        unconfirmed.sort_unstable();
+        assert_eq!(unconfirmed, vec![[0x52; 32], [0x53; 32]]);
     }
 
     #[test]

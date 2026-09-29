@@ -413,6 +413,19 @@ function renderWalletSummary(summary) {
   sproutScanCost.hidden = true;
   sproutScanCost.innerHTML = "";
   sproutDetail.innerHTML = "";
+  // Why the total is what it is: notes the wallet spent, dust, unconfirmed
+  // spends, unreadable transactions. The same argos-core sentences the CLI
+  // prints, shown in every branch below.
+  const sproutAccounting = $("wallet-sprout-accounting");
+  sproutAccounting.innerHTML = "";
+  for (const line of summary.sprout_accounting ?? []) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = line;
+    sproutAccounting.appendChild(p);
+  }
+  sproutAccounting.hidden = sproutAccounting.childElementCount === 0;
+  $("sprout-sweep-spent-status").textContent = summary.sprout_spent_status ?? "";
   // Reset every time: reopening a different wallet file must never leave the
   // previous one's sweep panel, plan or results on screen.
   $("wallet-sprout-sweep").hidden = true;
@@ -433,6 +446,13 @@ function renderWalletSummary(summary) {
         `${fmt(summary.sprout_spendable_zatoshis)}. No scan is needed — the ` +
         `note data was in the wallet file itself.`;
       showSproutSweep();
+    } else if (summary.sprout_nothing_left) {
+      // Not a case for the scan: the file holds the note data, and every
+      // note was spent by the wallet itself or is not worth moving.
+      sproutHeadline.textContent = "No Sprout funds are left in this file.";
+      sproutDetail.textContent =
+        " Every Sprout note it records was spent by the wallet itself, or is" +
+        " worth less than the fee to move it.";
     } else {
       sproutHeadline.textContent = "Sprout funds need a full-block scan.";
       sproutDetail.textContent =
@@ -590,17 +610,28 @@ async function runSproutSweep() {
       li.textContent = `not swept — ${reason}`;
       list.appendChild(li);
     }
+    // Refused notes are listed: the sweep carried on past each, and a user
+    // must be able to see which moved and which did not.
+    for (const reason of report.rejected ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = reason;
+      list.appendChild(li);
+    }
 
+    const refused = (report.rejected ?? []).length;
     setStatus(
       "sprout-sweep-status",
-      `✓ Swept ${fmt(report.total_swept)} to ${destination}.`,
+      `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
+        (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
       "success",
     );
     // Those funds have moved, so the later screens should stop warning
     // about them. Left standing it would become noise, and a warning people
     // learn to ignore is worse than none — but only clear it when the sweep
-    // actually finished, since a partial one leaves notes behind.
-    if (!report.error) {
+    // actually finished, since a partial one leaves notes behind, and a
+    // refused note may not have been spent at all.
+    if (!report.error && refused === 0) {
       uncoveredSproutKeys = 0;
       renderSproutUncoveredBanners();
     }
@@ -1090,6 +1121,14 @@ async function runSproutScanSweep() {
       const li = document.createElement("li");
       li.className = "muted";
       li.textContent = `not swept — ${reason}`;
+      list.appendChild(li);
+    }
+    // Refused notes are listed: the sweep carried on past each, and a user
+    // must be able to see which moved and which did not.
+    for (const reason of report.rejected ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = reason;
       list.appendChild(li);
     }
     if (report.landed_in_unified_sapling) {

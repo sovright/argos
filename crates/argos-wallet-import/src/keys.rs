@@ -142,6 +142,11 @@ pub struct ImportedKeys {
     /// `SproutNoteData::outpoint`. Kept flat rather than nested under the
     /// notes because one JoinSplit's `hSig` covers both of its outputs.
     pub sprout_joinsplits: Vec<SproutJoinSplit>,
+    /// Transactions in `sprout_joinsplits` that the wallet never recorded as
+    /// mined: a null `hashBlock`, or `nIndex == -1`. zcashd writes a
+    /// transaction before relaying it and keeps it after it expires, so
+    /// these nullifiers are not evidence of a spend.
+    pub sprout_unconfirmed_txids: Vec<[u8; 32]>,
     /// A recovered BIP-39 mnemonic, when the source wallet held a seed
     /// rather than (or in addition to) flat key material — currently only
     /// ZWL, whose HD keys are re-derived from this seed rather than stored

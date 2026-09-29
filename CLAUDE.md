@@ -193,6 +193,19 @@ rejects the sweep, so no funds move, but the number is not trustworthy
 until then. The full-block scan derives everything from the chain and is
 immune.
 
+**Spent status on the wallet-file path is the wallet's own record.**
+zcashd keeps a `CSproutNoteData` for every note it ever received
+(`spentHeight` is memory-only), so `recover_spendable_sprout_notes`
+recomputes it: a note is spent when `PRF^nf(a_sk, rho)` appears in a
+JoinSplit of a transaction the wallet recorded as mined (`hashBlock`
+non-null, `nIndex != -1`). Never count an unmined transaction's
+nullifiers — zcashd keeps expired `z_sendmany`s forever, and treating them
+as spends hides a live note with no way back, which is worse than a
+phantom balance. What the file cannot see (spends from another copy of the
+wallet) is handled at the sweep: a refused note is recorded and skipped,
+not a reason to stop, and only a run of refusals stops it
+(`MAX_CONSECUTIVE_REJECTIONS`), pointing at the scan.
+
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
 `transparent_recovery`, because ZIP-316 gives it no UFVK to anchor an

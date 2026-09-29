@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use argos_core::{
-    argos_wallet_import::{self, ImportDiagnostic, ImportedKeys},
+    argos_wallet_import::{self, ImportedKeys},
     derive_accounts, detect_birthday, estimate_birthday_from_date,
     imported::{encode_transparent_address, imported_transparent_keys},
     transparent_recovery::{scan_transparent_only, sweep_transparent_only, TransparentScanReport},
@@ -196,7 +196,12 @@ enum Commands {
     /// Report what Argos can read out of --wallet-file and/or
     /// --sapling-key-file. Purely local: no network, and nothing is written
     /// anywhere.
-    InspectWallet,
+    InspectWallet {
+        /// List each Sprout note the wallet already spent: its outpoint, its
+        /// value, and the transaction that spent it.
+        #[arg(long)]
+        show_spent: bool,
+    },
 
     /// Scan the blockchain and report balances for derived or imported keys.
     Scan,
@@ -357,7 +362,7 @@ fn command_requires_tos(command: &Commands) -> bool {
 fn refuse_unconsumed_key_sources(cli: &Cli) -> Result<()> {
     let (name, reads_seed, reads_wallet, reads_sapling, reads_sprout) = match &cli.command {
         Commands::ShowKeys => ("show-keys", true, true, true, false),
-        Commands::InspectWallet => ("inspect-wallet", false, true, true, false),
+        Commands::InspectWallet { .. } => ("inspect-wallet", false, true, true, false),
         Commands::Scan => ("scan", true, true, true, false),
         Commands::Sweep { .. } => ("sweep", true, true, true, false),
         Commands::ScanSprout { .. } => ("scan-sprout", false, true, false, true),
@@ -621,14 +626,13 @@ async fn sweep_sprout(
     confirm_sweep: bool,
 ) -> Result<()> {
     let recovered = recover_spendable_sprout_notes(keys);
-    if !recovered.spent.is_empty() {
-        eprintln!(
-            "{} Sprout note(s) this wallet already spent are not swept.",
-            recovered.spent.len()
-        );
-    }
-    if let Some(warning) = unreadable_transactions_warning(keys) {
-        eprintln!("{warning}");
+    // stdout, beside the plan: `> plan.txt` must keep the reason the total
+    // is smaller than the wallet's history.
+    print_sprout_accounting(keys, &recovered, false, "argos inspect-wallet --show-spent");
+    if recovered.nothing_left_to_sweep() {
+        println!("Nothing is left to sweep: every Sprout note this file records was spent by");
+        println!("the wallet itself or is worth less than the fee to move it.");
+        return Ok(());
     }
 
     if recovered.notes.is_empty() {
@@ -657,6 +661,12 @@ async fn sweep_sprout(
     // pastes a Unified Address expects the funds in its best pool, and for
     // Sprout that is never Orchard.
     for line in wrap_text(argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING, 76) {
+        println!("  {line}");
+    }
+    println!();
+    // Before the confirmation, where it changes the decision: this is the
+    // one limit that costs proving time rather than showing up in a count.
+    for line in wrap_text(argos_core::sprout_recovery::SPENT_STATUS_IS_THE_FILES, 76) {
         println!("  {line}");
     }
     println!();
@@ -928,24 +938,47 @@ async fn scan_sprout(
     Ok(())
 }
 
-/// Spent status comes from the nullifiers of the wallet's own transactions,
-/// so a transaction record that could not be read hides the spends it holds.
-/// Said beside the Sprout total, where it changes what the number means.
-fn unreadable_transactions_warning(keys: &ImportedKeys) -> Option<String> {
-    let unread = keys
-        .diagnostics
-        .iter()
-        .filter(|d| {
-            matches!(d, ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx")
-        })
-        .count();
-    (unread > 0).then(|| {
-        format!(
-            "Warning: {unread} transaction record(s) in this file could not be read. A note \
-             one of them spent would be counted here as unspent, so treat this total as an \
-             upper bound. A sweep of such a note is rejected by the network and stops the sweep."
-        )
-    })
+/// Why the Sprout total is what it is: notes the wallet spent, dust,
+/// unconfirmed spends, and unreadable transactions. Shared by inspect-wallet
+/// and sweep-sprout so the two cannot describe one file differently.
+fn print_sprout_accounting(
+    keys: &ImportedKeys,
+    recovered: &argos_core::sprout_recovery::SproutRecovery,
+    show_spent: bool,
+    list_with: &str,
+) {
+    for line in recovered.accounting_lines() {
+        for wrapped in wrap_text(&line, 76) {
+            println!("  {wrapped}");
+        }
+    }
+    if !recovered.spent.is_empty() {
+        if show_spent {
+            for n in &recovered.spent {
+                println!(
+                    "    {}:{}:{}  {}  spent in {}",
+                    display_txid(&n.outpoint.txid),
+                    n.outpoint.js_index,
+                    n.outpoint.output_index,
+                    format_zec(n.value),
+                    display_txid(&n.spent_in)
+                );
+            }
+        } else {
+            println!("  List them with `{list_with}`.");
+        }
+    }
+    if let Some(warning) = argos_core::sprout_recovery::unreadable_transactions_warning(keys) {
+        for line in wrap_text(&warning, 76) {
+            println!("  {line}");
+        }
+    }
+    println!();
+}
+
+/// A txid as explorers show it: byte-reversed hex.
+fn display_txid(txid: &[u8; 32]) -> String {
+    txid.iter().rev().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Print notes that did not move, and any partial failure.
@@ -957,6 +990,25 @@ fn unreadable_transactions_warning(keys: &ImportedKeys) -> Option<String> {
 fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSweepOutcome) {
     for reason in &outcome.skipped {
         println!("  not swept — {reason}");
+    }
+    if !outcome.rejected.is_empty() {
+        println!();
+        println!(
+            "  The network refused {} note(s). Nothing moved for these, and no fee was paid:",
+            outcome.rejected.len()
+        );
+        for r in &outcome.rejected {
+            println!(
+                "    {}:{}:{}  {}  — {}",
+                display_txid(&r.outpoint.txid),
+                r.outpoint.js_index,
+                r.outpoint.output_index,
+                format_zec(r.value),
+                r.reason
+            );
+        }
+        println!("  The usual cause is a note spent from another copy of this wallet.");
+        println!("  `argos scan-sprout` checks every note against the chain.");
     }
     if let Some(error) = &outcome.error {
         println!();
@@ -1079,7 +1131,7 @@ fn print_sprout_next_steps() {
     );
 }
 
-fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
+fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent: bool) {
     if !keys.sprout.is_empty() {
         println!("Sprout addresses:");
         for key in &keys.sprout {
@@ -1102,24 +1154,12 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
         let recovered = recover_spendable_sprout_notes(keys);
-        // Said first and in both branches: without it a wallet that spent
-        // everything reads as a failure to recover, and one that spent most
-        // of it gives no reason its total is smaller than its history.
-        if !recovered.spent.is_empty() {
-            println!(
-                "  {} note(s) this wallet already spent were left out ({} in all).",
-                recovered.spent.len(),
-                format_zec(recovered.spent.iter().map(|n| n.value).sum())
-            );
-        }
-        if recovered.zero_value > 0 {
-            println!(
-                "  {} zero-value note(s) (zcashd's change) were left out.",
-                recovered.zero_value
-            );
-        }
-        if let Some(warning) = unreadable_transactions_warning(keys) {
-            println!("  {warning}");
+        print_sprout_accounting(keys, &recovered, show_spent, "argos inspect-wallet");
+        if recovered.nothing_left_to_sweep() {
+            println!("  Nothing is left to sweep: every Sprout note this file records was spent");
+            println!("  by the wallet itself or is worth less than the fee to move it.");
+            println!();
+            return;
         }
         if recovered.notes.is_empty() {
             println!("  No spendable Sprout notes were recovered from this file.");
@@ -1142,6 +1182,10 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
             );
             println!("  These were recovered from this file alone — no scan needed.");
             println!();
+            for line in wrap_text(argos_core::sprout_recovery::SPENT_STATUS_IS_THE_FILES, 74) {
+                println!("  {line}");
+            }
+            println!();
             // The literal next command. A user following a guide will not
             // read --help, and a terminal state that names no next step is
             // where people give up with their funds still stranded.
@@ -1159,7 +1203,7 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
 /// This is the only useful thing it can do with a zcashd `wallet.dat`
 /// today, so it must be honest about the difference between "found a
 /// key" and "can move the funds".
-fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
+fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent: bool) {
     println!("━━━ Recovered key material ━━━");
     println!("  Transparent keys  {}", keys.transparent.len());
     println!("  Sapling keys      {}", keys.sapling.len());
@@ -1219,7 +1263,7 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     // The Sprout address list and spendability verdict live in a helper to
     // keep this function to one screen; the key/note counts above come from
     // the parser, and this adds what the recovery path can say about them.
-    print_sprout_inspection(keys, network);
+    print_sprout_inspection(keys, network, show_spent);
 
     // Never summarized away: an unread record means key material that
     // still exists only in the original file, and the user is the only
@@ -1424,7 +1468,7 @@ async fn main() -> Result<()> {
             let phrase = keys.mnemonic.clone();
             // `inspect-wallet` prints a fuller version of this below, so
             // don't say it twice.
-            if !matches!(cli.command, Commands::InspectWallet) {
+            if !matches!(cli.command, Commands::InspectWallet { .. }) {
                 eprintln!(
                     "Imported {} key(s) from {}.",
                     keys.total_keys(),
@@ -1448,7 +1492,7 @@ async fn main() -> Result<()> {
             // `show-keys` are unavailable, exactly as for a wallet file with
             // no recoverable mnemonic.
             let keys = load_sapling_key_file(key_path, network)?;
-            if !matches!(cli.command, Commands::InspectWallet) {
+            if !matches!(cli.command, Commands::InspectWallet { .. }) {
                 eprintln!(
                     "Loaded {} Sapling key(s) from {}.",
                     keys.sapling.len(),
@@ -1461,7 +1505,7 @@ async fn main() -> Result<()> {
         (None, None) => {
             // Bail before prompting: an interactive seed prompt for a
             // command that only reads a wallet file is pure confusion.
-            if matches!(cli.command, Commands::InspectWallet) {
+            if matches!(cli.command, Commands::InspectWallet { .. }) {
                 bail!("inspect-wallet needs --wallet-file or --sapling-key-file");
             }
             let phrase = load_seed_phrase(cli.seed_file.clone())?;
@@ -1582,9 +1626,9 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::InspectWallet => {
+        Commands::InspectWallet { show_spent } => {
             let source = imported.expect("--wallet-file is required and was checked above");
-            print_wallet_inspection(source.keys(), network);
+            print_wallet_inspection(source.keys(), network, show_spent);
         }
 
         // Dispatched above, before key-source resolution, so that it never
