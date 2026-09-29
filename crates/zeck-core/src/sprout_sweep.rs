@@ -344,7 +344,8 @@ impl std::fmt::Display for RejectedSweep {
                 "The network says it is already spent, though this wallet file shows it \
                  unspent — most likely it was spent from another copy of this wallet. The \
                  full-block scan (`argos scan-sprout --wallet-file …`, or Scan for Sprout notes \
-                 in the app) confirms that from the chain."
+                 in the app) confirms that from the chain, and a sweep run after it skips \
+                 every note the scan saw spent."
             ),
             (_, _) => write!(
                 f,
@@ -354,6 +355,139 @@ impl std::fmt::Display for RejectedSweep {
             ),
         }
     }
+}
+
+/// A note's outpoint as the journal keys it: txid, JoinSplit, output.
+pub type SweptKey = ([u8; 32], u64, u8);
+
+/// Notes a sweep has broadcast, by outpoint, with the sweep's txid.
+pub type SweptNotes = std::collections::HashMap<SweptKey, String>;
+
+/// The key a note is journaled under.
+pub fn swept_key(outpoint: &argos_wallet_import::keys::JsOutPoint) -> SweptKey {
+    (outpoint.txid, outpoint.js_index, outpoint.output_index)
+}
+
+/// What a sweep has already broadcast, remembered across runs.
+///
+/// A sweep of hundreds of notes runs for hours, one proof per note, and
+/// broadcasts each as it is built. If it is interrupted, the wallet file
+/// still lists every note as unspent, so a re-run would prove each one it
+/// already sent — minutes apiece — only for the network to refuse it as a
+/// double spend. This file remembers instead: one line per broadcast, the
+/// note's outpoint and the sweep's txid, appended and synced the moment the
+/// node accepts it.
+///
+/// Beside the scan checkpoint and named by the same key-set fingerprint.
+/// Created `0600`: it holds no keys, but it links each Sprout note to the
+/// transaction that moved it. Only accepted broadcasts are written — a
+/// refusal may be transient, and the full-block scan settles the rest.
+pub struct SweepJournal {
+    path: std::path::PathBuf,
+}
+
+impl SweepJournal {
+    pub fn for_keys(data_dir: &Path, spending_keys: &[[u8; 32]]) -> Self {
+        let fingerprint = crate::sprout_scan_run::key_set_fingerprint(spending_keys);
+        Self {
+            path: data_dir.join(format!("sprout-sweep-{fingerprint}.journal")),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Every note recorded so far. No file means no sweep has run. A line
+    /// that does not parse — one torn by a crash mid-write — is skipped: the
+    /// worst it costs is that one note proved again and refused.
+    pub fn load(&self) -> ZeckResult<SweptNotes> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(SweptNotes::new()),
+            Err(err) => {
+                return Err(ZeckError::TransactionBuild(format!(
+                    "reading the sweep journal {}: {err}",
+                    self.path.display()
+                )))
+            }
+        };
+        Ok(text.lines().filter_map(parse_journal_line).collect())
+    }
+
+    /// Append one broadcast and sync it before returning.
+    pub fn record(
+        &self,
+        outpoint: &argos_wallet_import::keys::JsOutPoint,
+        sweep_txid: &str,
+    ) -> ZeckResult<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let fail = |err: std::io::Error| {
+            ZeckError::TransactionBuild(format!(
+                "writing the sweep journal {}: {err}",
+                self.path.display()
+            ))
+        };
+        let mut file = options.open(&self.path).map_err(fail)?;
+        let txid: String = outpoint
+            .txid
+            .iter()
+            .rev()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        writeln!(
+            file,
+            "{txid}:{}:{} {sweep_txid}",
+            outpoint.js_index, outpoint.output_index
+        )
+        .map_err(fail)?;
+        file.sync_data().map_err(fail)
+    }
+}
+
+/// `<note txid, explorer order>:<js>:<n> <sweep txid>`.
+fn parse_journal_line(line: &str) -> Option<(SweptKey, String)> {
+    let (outpoint, sweep_txid) = line.split_once(' ')?;
+    let mut parts = outpoint.split(':');
+    let hex = parts.next()?;
+    let js_index = parts.next()?.parse().ok()?;
+    let output_index = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hex.len() != 64 || sweep_txid.is_empty() {
+        return None;
+    }
+    let mut txid = [0u8; 32];
+    for (i, byte) in txid.iter_mut().rev().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(((txid, js_index, output_index), sweep_txid.to_owned()))
+}
+
+/// Count a broadcast the node accepted, and journal it at once so an
+/// interruption after this point never costs this note's proof again.
+fn note_sent(
+    outcome: &mut SproutSweepOutcome,
+    journal: Option<&SweepJournal>,
+    note: &SpendableSproutNote,
+    txid: String,
+    value_swept: u64,
+) {
+    if let Some(journal) = journal {
+        if let Err(err) = journal.record(&note.outpoint, &txid) {
+            outcome.warnings.push(format!(
+                "{txid} was broadcast, but {err}. If this sweep is run again, that note will \
+                 be proved again and the network will refuse it; nothing is lost."
+            ));
+        }
+    }
+    outcome.total_swept = outcome.total_swept.saturating_add(value_swept);
+    outcome.sent.push(SentSweep { txid, value_swept });
 }
 
 /// Record a refused note. Only called for refusals about the note itself;
@@ -393,6 +527,9 @@ pub struct SproutSweepOutcome {
     /// copy of the wallet, which the file cannot know — says nothing about
     /// the notes after it.
     pub rejected: Vec<RejectedSweep>,
+    /// Things worth saying that did not stop anything, such as a broadcast
+    /// that could not be written to the sweep journal.
+    pub warnings: Vec<String>,
     /// What went wrong, when something did.
     ///
     /// Carried in a successful-looking outcome rather than returned as an
@@ -522,9 +659,12 @@ pub enum NoteSource {
 }
 
 /// Everything about a sweep beyond what to sweep and where to send it.
-#[derive(Debug, Clone, Default)]
-pub struct SweepOptions {
+#[derive(Clone, Copy, Default)]
+pub struct SweepOptions<'a> {
     pub source: NoteSource,
+    /// Where accepted broadcasts are recorded, so an interrupted sweep never
+    /// proves a note twice. `None` records nothing.
+    pub journal: Option<&'a SweepJournal>,
 }
 
 /// What the sweep needs from the network: the tip, and a way to broadcast.
@@ -644,7 +784,7 @@ pub async fn sweep_sprout_notes(
     lightwalletd_url: &str,
     destination: &str,
     params_path: &Path,
-    options: SweepOptions,
+    options: SweepOptions<'_>,
     progress: impl FnMut(String),
 ) -> ZeckResult<SproutSweepOutcome> {
     let (sapling_dest, destination_kind) = parse_sapling_destination_kind(destination, network)?;
@@ -681,6 +821,7 @@ pub async fn sweep_sprout_notes(
             )
         },
         options.source,
+        options.journal,
         progress,
     )
     .await;
@@ -713,13 +854,33 @@ pub(crate) async fn run_sweep(
     network: crate::ZeckNetwork,
     mut build: impl FnMut(&SpendableSproutNote, BlockHeight, BranchId) -> ZeckResult<BuiltSproutSweep>,
     source: NoteSource,
+    journal: Option<&SweepJournal>,
     mut progress: impl FnMut(String),
 ) -> SproutSweepOutcome {
     let mut outcome = SproutSweepOutcome::default();
     let total = notes.len();
+    // A safety net under the callers, which drop journaled notes before
+    // planning: whatever reaches here, a note already broadcast is never
+    // proved again.
+    let swept = match journal.map(SweepJournal::load).transpose() {
+        Ok(swept) => swept.unwrap_or_default(),
+        Err(err) => {
+            outcome.error = Some(format!(
+                "{err}. Nothing was sent: without it, notes an earlier run already swept \
+                 would be proved again."
+            ));
+            return outcome;
+        }
+    };
 
     for (index, note) in notes.iter().enumerate() {
         let label = note_label(index, total, note);
+        if let Some(txid) = swept.get(&swept_key(&note.outpoint)) {
+            outcome.skipped.push(format!(
+                "{label}: already swept by an earlier run, in {txid}"
+            ));
+            continue;
+        }
         if note.note.value <= SPROUT_SWEEP_FEE {
             outcome.skipped.push(format!(
                 "{label}: holds {} zatoshi, below the {SPROUT_SWEEP_FEE} zatoshi fee",
@@ -823,11 +984,7 @@ pub(crate) async fn run_sweep(
         // Reported now, not only in the returned outcome: a sweep killed
         // partway must already have shown every txid it broadcast.
         progress(format!("swept {label} in {}", built.txid));
-        outcome.total_swept = outcome.total_swept.saturating_add(built.value_swept);
-        outcome.sent.push(SentSweep {
-            txid: built.txid,
-            value_swept: built.value_swept,
-        });
+        note_sent(&mut outcome, journal, note, built.txid, built.value_swept);
     }
 
     outcome
@@ -882,6 +1039,146 @@ mod tests {
         assert_eq!(expiries.len(), 50);
         assert_eq!(outcome.rejected.len(), 50);
         assert!(outcome.error.is_none());
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("argos-sweep-journal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn outpoint(n: u8) -> JsOutPoint {
+        JsOutPoint {
+            txid: [n; 32],
+            js_index: 1,
+            output_index: 0,
+        }
+    }
+
+    /// The journal is what stops an interrupted sweep of hundreds of notes
+    /// from re-proving every note it already broadcast: the wallet file
+    /// still lists them as unspent, and only this remembers otherwise.
+    #[test]
+    fn the_journal_remembers_every_broadcast_across_runs() {
+        let dir = temp_dir("roundtrip");
+        let journal = SweepJournal::for_keys(&dir, &[[0x42; 32]]);
+        assert!(journal.load().unwrap().is_empty(), "no sweep yet");
+
+        journal.record(&outpoint(1), "aa11").unwrap();
+        journal.record(&outpoint(2), "bb22").unwrap();
+
+        let again = SweepJournal::for_keys(&dir, &[[0x42; 32]]).load().unwrap();
+        assert_eq!(again.len(), 2);
+        assert_eq!(
+            again.get(&swept_key(&outpoint(1))).map(String::as_str),
+            Some("aa11")
+        );
+        assert_eq!(
+            again.get(&swept_key(&outpoint(2))).map(String::as_str),
+            Some("bb22")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(journal.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "it links Sprout notes to their sweep");
+        }
+    }
+
+    /// Keyed like the scan checkpoint: another wallet's sweep must not make
+    /// this wallet's notes look swept.
+    #[test]
+    fn another_key_sets_journal_is_not_read() {
+        let dir = temp_dir("keys");
+        SweepJournal::for_keys(&dir, &[[0x42; 32]])
+            .record(&outpoint(1), "aa11")
+            .unwrap();
+        assert!(SweepJournal::for_keys(&dir, &[[0x43; 32]])
+            .load()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A line torn by a crash mid-write is skipped: the worst it costs is one
+    /// note proved again and refused, never the whole journal.
+    #[test]
+    fn a_damaged_line_costs_that_line_only() {
+        let dir = temp_dir("damaged");
+        let journal = SweepJournal::for_keys(&dir, &[[0x42; 32]]);
+        journal.record(&outpoint(1), "aa11").unwrap();
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        f.write_all(b"not a journal line\n0101:").unwrap();
+        assert_eq!(journal.load().unwrap().len(), 1);
+    }
+
+    /// Recorded the moment the node accepts it, before the next note is
+    /// proved, so an interruption at any point loses at most that one.
+    #[test]
+    fn a_broadcast_note_is_journaled_as_it_is_sent() {
+        let dir = temp_dir("sent");
+        let journal = SweepJournal::for_keys(&dir, &[[0x42; 32]]);
+        let mut outcome = SproutSweepOutcome::default();
+        let n = note(1_000_000);
+
+        note_sent(&mut outcome, Some(&journal), &n, "cc33".into(), 980_000);
+
+        assert_eq!(outcome.sent.len(), 1);
+        assert_eq!(outcome.total_swept, 980_000);
+        let swept = journal.load().unwrap();
+        assert_eq!(
+            swept.get(&swept_key(&n.outpoint)).map(String::as_str),
+            Some("cc33")
+        );
+    }
+
+    /// The loop itself skips a journaled note, without proving it, and
+    /// journals each note it does send.
+    #[test]
+    fn the_loop_skips_journaled_notes_and_journals_what_it_sends() {
+        let dir = temp_dir("loop");
+        let journal = SweepJournal::for_keys(&dir, &[[0x42; 32]]);
+        let batch = notes(&[1_000_000, 2_000_000]);
+        journal.record(&batch[0].outpoint, "earlier").unwrap();
+
+        let mut node = ScriptedNode::new(vec![Ok((0, "ok"))]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut built = 0;
+        let outcome = runtime.block_on(run_sweep(
+            &batch,
+            &mut node,
+            crate::ZeckNetwork::Mainnet,
+            |note: &SpendableSproutNote, _: BlockHeight, _| {
+                built += 1;
+                Ok(BuiltSproutSweep {
+                    txid: "fresh".into(),
+                    raw: Vec::new(),
+                    value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                })
+            },
+            NoteSource::WalletFile,
+            Some(&journal),
+            |_| {},
+        ));
+        assert_eq!(built, 1, "the journaled note must not be proved");
+        assert!(outcome.skipped[0].contains("already swept by an earlier run, in earlier"));
+        let swept = journal.load().unwrap();
+        assert_eq!(
+            swept
+                .get(&swept_key(&batch[1].outpoint))
+                .map(String::as_str),
+            Some("fresh")
+        );
     }
 
     /// A node that answers from a script: each `send` pops the next reply,
@@ -945,6 +1242,7 @@ mod tests {
                 })
             },
             source,
+            None,
             |_| {},
         ));
         (outcome, expiries)
@@ -971,6 +1269,7 @@ mod tests {
                 ))
             },
             NoteSource::WalletFile,
+            None,
             |line| lines.push(line),
         ));
         (outcome, built, lines)
@@ -1014,6 +1313,7 @@ mod tests {
                 })
             },
             NoteSource::WalletFile,
+            None,
             |line| lines.push(line),
         ));
         for txid in ["sweep-of-1000000", "sweep-of-2000000"] {
@@ -1025,7 +1325,15 @@ mod tests {
     }
 
     fn notes(values: &[u64]) -> Vec<SpendableSproutNote> {
-        values.iter().map(|v| note(*v)).collect()
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut n = note(*v);
+                n.outpoint.txid[0] = i as u8 + 1;
+                n
+            })
+            .collect()
     }
 
     /// Kristi's F2 on #239: one expiry height for a sweep of hundreds of

@@ -78,7 +78,9 @@ function harness(intercept = (_, __, fallback) => fallback()) {
 test("first wallet open displays its Sprout preview without a null-path error", async () => {
   const h = harness();
   await h.open("/fixture/first.dat");
-  assert.deepEqual(h.previews, [{ path: "/fixture/first.dat", passphrase: null }]);
+  assert.deepEqual(h.previews, [{
+    path: "/fixture/first.dat", passphrase: null, network: "mainnet", dataDir: null,
+  }]);
   assert.equal(h.$("wallet-sprout-sweep").hidden, false);
   assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
   assert.equal(h.$("sprout-sweep-status").textContent, "");
@@ -90,7 +92,7 @@ test("opening another wallet previews the new path and passphrase", async () => 
   await h.open("/fixture/first.dat", "fixture-one");
   await h.open("/fixture/second.dat", "fixture-two");
   assert.deepEqual(h.previews.at(-1), {
-    path: "/fixture/second.dat", passphrase: "fixture-two",
+    path: "/fixture/second.dat", passphrase: "fixture-two", network: "mainnet", dataDir: null,
   });
   assert.equal(h.$("sprout-sweep-status").textContent, "");
 });
@@ -389,6 +391,45 @@ test("notes the network refused are listed after a sweep", async () => {
   const lines = texts(h.$("sprout-sweep-results"));
   assert.ok(lines.some((l) => /refused by the network/.test(l)), lines.join("\n"));
   assert.match(h.$("sprout-sweep-status").textContent, /1 note\(s\) refused/);
+});
+
+// The wallet-file path asks a full-block scan of the same keys to settle
+// spends the file cannot see. It must look where the scan panel writes.
+test("the Sprout preview, inspection and sweep look in the scan's data directory", async () => {
+  const seen = {};
+  const h = harness(async (command, args, fallback) => {
+    seen[command] = args.dataDir;
+    if (command === "execute_sprout_sweep") return { sent: [], skipped: [], rejected: [], error: null };
+    return fallback();
+  });
+  h.$("data-dir").value = "/fixture/workspace";
+  await h.open("/fixture/first.dat");
+  await flush();
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  assert.deepEqual(seen, {
+    inspect_wallet_file: "/fixture/workspace",
+    preview_sprout_sweep: "/fixture/workspace",
+    execute_sprout_sweep: "/fixture/workspace",
+  });
+});
+
+// A broadcast that could not be written to the sweep journal is worth
+// saying: a re-run would prove that one note again and see it refused.
+test("a sweep journal warning is shown after the sweep", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "execute_sprout_sweep") return {
+      sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected: [],
+      warnings: ["aa was broadcast, but writing the sweep journal failed"], error: null,
+    };
+    return fallback();
+  });
+  await h.open("/fixture/first.dat");
+  await flush();
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  const lines = texts(h.$("sprout-sweep-results"));
+  assert.ok(lines.some((l) => /sweep journal/.test(l)), lines.join("\n"));
 });
 
 // #239 review F4: a wallet whose notes all read as spent still offers the

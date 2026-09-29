@@ -215,6 +215,26 @@ The tip, expiry height and branch id are read before every note. The loop
 is `run_sweep`, generic over `SweepNode`, and is tested with a scripted
 node — keep new sweep behaviour behind it and tested that way.
 
+A full-block scan of the same keys outranks the file for every spend it
+saw. `sprout_scan_run::chain_spends` reads the checkpoint `scan-sprout`
+leaves in the data directory (same key-set fingerprint, same network and
+key checks as resume, via the shared `load_checkpoint`), and
+`recover_spendable_sprout_notes_with_chain` marks any note whose nullifier
+it saw as spent (`SpentEvidence::Chain`). The rule is one-way: absence from
+the scan proves nothing, since the wallet may have spent after the height
+the scan reached, so a spend the wallet recorded still stands.
+
+Sprout sweeps are journaled. `sprout_sweep::SweepJournal`
+(`sprout-sweep-<fingerprint>.journal`, beside the checkpoint, same
+key-set fingerprint, `0600`) gets one line per broadcast — note outpoint
+and sweep txid — appended and synced the moment the node accepts it. Every
+surface drops journaled notes before planning (`drop_already_swept`), and
+the sweep loop skips them as a safety net, so an interrupted sweep of
+hundreds of notes never re-proves one it already sent. Only accepted
+broadcasts are journaled; a refusal may be transient. Unlike the
+checkpoint, it is not deleted after a successful sweep: it holds no keys,
+and it is what stops a repeat run from proving everything again.
+
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
 `transparent_recovery`, because ZIP-316 gives it no UFVK to anchor an
