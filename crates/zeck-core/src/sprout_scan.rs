@@ -35,7 +35,7 @@
 //! matched at the end. Missing that check would mean offering the user a
 //! balance they cannot move.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use argos_wallet_import::keys::{JsOutPoint, SproutJoinSplit};
 
@@ -129,10 +129,17 @@ pub struct SproutScanner {
     keys: Vec<ScanKey>,
     tree: IncrementalMerkleTree,
     pending: Vec<PendingNote>,
-    /// Every nullifier seen, to tell a live note from a spent one.
-    spent: HashSet<[u8; 32]>,
+    /// Every nullifier seen, to tell a live note from a spent one, with the
+    /// transaction that revealed it. `None` only for nullifiers restored from
+    /// a version-1 checkpoint, which did not record it.
+    spent: HashMap<[u8; 32], Option<[u8; 32]>>,
     progress: SproutScanProgress,
     cursor: ScanCursor,
+    /// The walk reached the chain tip at `cursor` — set by the scan runner
+    /// when the fetcher reports the tip, cleared by any further block. A
+    /// checkpoint left by a scan that stopped early reads `false`, so its
+    /// cursor is never mistaken for full coverage.
+    complete: bool,
 }
 
 impl SproutScanner {
@@ -144,9 +151,10 @@ impl SproutScanner {
                 .collect(),
             tree: IncrementalMerkleTree::default(),
             pending: Vec::new(),
-            spent: HashSet::new(),
+            spent: HashMap::new(),
             progress: SproutScanProgress::default(),
             cursor: ScanCursor::default(),
+            complete: false,
         }
     }
 
@@ -155,19 +163,31 @@ impl SproutScanner {
         (self.progress.blocks_scanned > 0).then_some(self.cursor)
     }
 
-    /// Every nullifier the walk has seen on chain. A note whose nullifier is
-    /// here was spent at or below the cursor, whoever spent it.
-    pub fn spent_nullifiers(&self) -> &HashSet<[u8; 32]> {
+    /// Every nullifier the walk has seen on chain, with the transaction that
+    /// revealed it where known. A note whose nullifier is here was spent at
+    /// or below the cursor, whoever spent it.
+    pub fn spent_nullifiers(&self) -> &HashMap<[u8; 32], Option<[u8; 32]>> {
         &self.spent
     }
 
-    /// The keys this scanner is looking for, sorted.
+    /// Record that the walk reached the chain tip at the current cursor.
+    pub fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+
+    /// Whether the walk ended at the chain tip rather than stopping early.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// The keys this scanner is looking for, sorted and deduplicated.
     ///
     /// Exposed so a resumed checkpoint can be checked against the keys the
     /// caller actually asked about; the file path alone does not prove it.
     pub fn spending_keys(&self) -> Vec<[u8; 32]> {
         let mut keys: Vec<[u8; 32]> = self.keys.iter().map(|k| k.a_sk).collect();
         keys.sort_unstable();
+        keys.dedup();
         keys
     }
 
@@ -203,6 +223,8 @@ impl SproutScanner {
         }
         self.progress.blocks_scanned += 1;
         self.progress.last_height = height;
+        // The tip has moved past wherever a previous run ended.
+        self.complete = false;
         self.cursor = ScanCursor {
             last_block_hash: block_hash,
             last_height: height,
@@ -217,7 +239,7 @@ impl SproutScanner {
         // outputs, though order does not matter here, because the match
         // happens at the end.
         for nf in &js.nullifiers {
-            self.spent.insert(*nf);
+            self.spent.insert(*nf, Some(js.txid));
         }
 
         let h_sig = sprout::h_sig(&js.random_seed, &js.nullifiers, &js.joinsplit_pubkey);
@@ -328,7 +350,7 @@ impl SproutScanner {
         let mut spent_notes = 0usize;
 
         for pending in self.pending {
-            if self.spent.contains(&pending.nullifier) {
+            if self.spent.contains_key(&pending.nullifier) {
                 spent_notes += 1;
                 continue;
             }
@@ -394,7 +416,14 @@ pub struct SproutScanCheckpoint {
 /// Bumped when the layout changes, so a stale file is refused rather than
 /// misread into a wrong tree — which would produce worthless witnesses with
 /// no visible error.
-const CHECKPOINT_VERSION: u8 = 1;
+///
+/// Version 2 records the revealing txid with each nullifier and a trailing
+/// completion byte. Version 1 is still read — a scan measured in hours must
+/// survive an upgrade mid-way — with no txids and `complete = false`.
+const CHECKPOINT_VERSION: u8 = 2;
+
+/// The oldest layout still read.
+const OLDEST_READABLE_VERSION: u8 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
@@ -413,6 +442,117 @@ impl SproutScanCheckpoint {
 
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self { bytes }
+    }
+}
+
+/// What a checkpoint says about the chain, without the scan state needed to
+/// continue it.
+///
+/// The spent set is all a caller asking "was this note spent?" needs. Reading
+/// it through [`SproutScanner::resume`] rebuilds the commitment tree and
+/// every pending witness only to discard them, then the caller clones the
+/// set; on a completed mainnet scan that is the bulk of a large file, parsed
+/// on every wallet open. [`read_chain_evidence`] walks past both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainEvidence {
+    /// Sorted and deduplicated, as [`SproutScanner::spending_keys`].
+    pub spending_keys: Vec<[u8; 32]>,
+    /// Every nullifier seen, with its revealing txid where recorded.
+    pub spent: HashMap<[u8; 32], Option<[u8; 32]>>,
+    /// Where the walk reached; `None` if it scanned nothing.
+    pub cursor: Option<ScanCursor>,
+    /// Whether the walk ended at the chain tip.
+    pub complete: bool,
+}
+
+/// Read a checkpoint's chain evidence. Validates the layout end to end —
+/// version, every length, no trailing bytes — but does not parse the tree or
+/// the witnesses, whose correctness no spent verdict depends on.
+pub fn read_chain_evidence(
+    checkpoint: &SproutScanCheckpoint,
+) -> Result<ChainEvidence, CheckpointError> {
+    let mut r = codec::Reader::new(checkpoint.as_bytes());
+    let version = read_version(&mut r)?;
+    r.bytes().ok_or(CheckpointError::Corrupt)?; // tree
+
+    let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
+    let mut spending_keys = Vec::new();
+    for _ in 0..key_count {
+        spending_keys.push(r.array32().ok_or(CheckpointError::Corrupt)?);
+    }
+    spending_keys.sort_unstable();
+    spending_keys.dedup();
+
+    let pending_count = r.u64().ok_or(CheckpointError::Corrupt)?;
+    for _ in 0..pending_count {
+        // a_sk, value, rho, r
+        r.take(32 + 8 + 32 + 32).ok_or(CheckpointError::Corrupt)?;
+        r.bytes().ok_or(CheckpointError::Corrupt)?; // memo
+                                                    // commitment, nullifier, txid, js_index, output_index
+        r.take(32 + 32 + 32 + 8 + 1)
+            .ok_or(CheckpointError::Corrupt)?;
+        r.bytes().ok_or(CheckpointError::Corrupt)?; // witness
+    }
+
+    let spent = read_spent(&mut r, version)?;
+    let blocks_scanned = r.u64().ok_or(CheckpointError::Corrupt)?;
+    r.take(8 * 4).ok_or(CheckpointError::Corrupt)?; // the rest of the progress
+    let cursor = ScanCursor {
+        last_block_hash: r.array32().ok_or(CheckpointError::Corrupt)?,
+        last_height: u32::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?,
+    };
+    let complete = read_complete(&mut r, version)?;
+    if r.pos != r.bytes.len() {
+        return Err(CheckpointError::Corrupt);
+    }
+
+    Ok(ChainEvidence {
+        spending_keys,
+        spent,
+        cursor: (blocks_scanned > 0).then_some(cursor),
+        complete,
+    })
+}
+
+fn read_version(r: &mut codec::Reader<'_>) -> Result<u8, CheckpointError> {
+    match r.take(1).and_then(|v| v.first().copied()) {
+        Some(v) if (OLDEST_READABLE_VERSION..=CHECKPOINT_VERSION).contains(&v) => Ok(v),
+        Some(_) => Err(CheckpointError::WrongVersion),
+        None => Err(CheckpointError::Corrupt),
+    }
+}
+
+fn read_spent(
+    r: &mut codec::Reader<'_>,
+    version: u8,
+) -> Result<HashMap<[u8; 32], Option<[u8; 32]>>, CheckpointError> {
+    let count = r.u64().ok_or(CheckpointError::Corrupt)?;
+    let mut spent = HashMap::new();
+    for _ in 0..count {
+        let nf = r.array32().ok_or(CheckpointError::Corrupt)?;
+        let txid = if version >= 2 {
+            match r.take(1).and_then(|b| b.first().copied()) {
+                Some(0) => None,
+                Some(1) => Some(r.array32().ok_or(CheckpointError::Corrupt)?),
+                _ => return Err(CheckpointError::Corrupt),
+            }
+        } else {
+            None
+        };
+        spent.insert(nf, txid);
+    }
+    Ok(spent)
+}
+
+fn read_complete(r: &mut codec::Reader<'_>, version: u8) -> Result<bool, CheckpointError> {
+    if version < 2 {
+        return Ok(false);
+    }
+    match r.take(1).and_then(|b| b.first().copied()) {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(CheckpointError::Corrupt),
     }
 }
 
@@ -455,9 +595,15 @@ mod codec {
 impl SproutScanner {
     /// Capture everything needed to resume.
     pub fn checkpoint(&self) -> SproutScanCheckpoint {
+        self.encode(CHECKPOINT_VERSION)
+    }
+
+    /// Write the given layout. Only the current one is written outside
+    /// tests; version 1 exists so its reader stays tested.
+    fn encode(&self, version: u8) -> SproutScanCheckpoint {
         use codec::{put_bytes, put_u64};
 
-        let mut out = vec![CHECKPOINT_VERSION];
+        let mut out = vec![version];
 
         put_bytes(&mut out, &self.tree.to_bytes());
 
@@ -487,8 +633,17 @@ impl SproutScanner {
         // when diagnosing a resume bug.
         let mut spent: Vec<_> = self.spent.iter().collect();
         spent.sort_unstable();
-        for nf in spent {
+        for (nf, txid) in spent {
             out.extend_from_slice(nf);
+            if version >= 2 {
+                match txid {
+                    Some(txid) => {
+                        out.push(1);
+                        out.extend_from_slice(txid);
+                    }
+                    None => out.push(0),
+                }
+            }
         }
 
         put_u64(&mut out, self.progress.blocks_scanned);
@@ -498,6 +653,9 @@ impl SproutScanner {
         put_u64(&mut out, u64::from(self.progress.last_height));
         out.extend_from_slice(&self.cursor.last_block_hash);
         put_u64(&mut out, u64::from(self.cursor.last_height));
+        if version >= 2 {
+            out.push(u8::from(self.complete));
+        }
 
         SproutScanCheckpoint { bytes: out }
     }
@@ -505,12 +663,7 @@ impl SproutScanner {
     /// Rebuild a scanner from a checkpoint.
     pub fn resume(checkpoint: &SproutScanCheckpoint) -> Result<Self, CheckpointError> {
         let mut r = codec::Reader::new(checkpoint.as_bytes());
-
-        match r.take(1).and_then(|v| v.first().copied()) {
-            Some(CHECKPOINT_VERSION) => {}
-            Some(_) => return Err(CheckpointError::WrongVersion),
-            None => return Err(CheckpointError::Corrupt),
-        }
+        let version = read_version(&mut r)?;
 
         let tree = IncrementalMerkleTree::parse(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
 
@@ -564,11 +717,7 @@ impl SproutScanner {
             });
         }
 
-        let spent_count = r.u64().ok_or(CheckpointError::Corrupt)?;
-        let mut spent = HashSet::new();
-        for _ in 0..spent_count {
-            spent.insert(r.array32().ok_or(CheckpointError::Corrupt)?);
-        }
+        let spent = read_spent(&mut r, version)?;
 
         let progress = SproutScanProgress {
             blocks_scanned: r.u64().ok_or(CheckpointError::Corrupt)?,
@@ -585,6 +734,8 @@ impl SproutScanner {
                 .map_err(|_| CheckpointError::Corrupt)?,
         };
 
+        let complete = read_complete(&mut r, version)?;
+
         if r.pos != r.bytes.len() {
             return Err(CheckpointError::Corrupt);
         }
@@ -596,6 +747,7 @@ impl SproutScanner {
             spent,
             progress,
             cursor,
+            complete,
         })
     }
 }
@@ -1019,6 +1171,104 @@ mod tests {
             "the walk position must survive, or the scan cannot continue"
         );
         assert_eq!(resumed.progress().last_height, 12_345);
+    }
+
+    /// Kristi, #240 #10: a chain-proven spend should name a txid the user
+    /// can paste into an explorer, and the JoinSplit carries it.
+    #[test]
+    fn a_spend_seen_on_chain_records_the_transaction_that_revealed_it() {
+        let a_sk = [0x42u8; 32];
+        let (js, _) = joinsplit_paying(&a_sk, 1_000, 0, 60);
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[js], [0xAB; 32], 7).expect("scan");
+
+        let spent = scanner.spent_nullifiers();
+        assert_eq!(spent.get(&[61u8; 32]), Some(&Some([60u8; 32])));
+
+        let resumed = SproutScanner::resume(&scanner.checkpoint()).expect("resume");
+        assert_eq!(resumed.spent_nullifiers(), scanner.spent_nullifiers());
+    }
+
+    /// A real user has a version-1 checkpoint mid-scan. It must still load
+    /// and resume: its nullifiers without txids, and not marked complete.
+    #[test]
+    fn a_version_1_checkpoint_still_resumes() {
+        let a_sk = [0x42u8; 32];
+        let (js, _) = joinsplit_paying(&a_sk, 1_000, 0, 70);
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[js], [0xAB; 32], 9).expect("scan");
+        scanner.mark_complete();
+
+        let v1 = scanner.encode(1);
+        assert_eq!(v1.as_bytes()[0], 1);
+        let resumed = SproutScanner::resume(&v1).expect("a v1 checkpoint resumes");
+        assert_eq!(resumed.cursor(), scanner.cursor());
+        assert_eq!(resumed.progress(), scanner.progress());
+        assert!(
+            !resumed.is_complete(),
+            "v1 recorded no completion, so none is claimed"
+        );
+        assert_eq!(resumed.spent_nullifiers().get(&[71u8; 32]), Some(&None));
+        assert_eq!(resumed.spent_nullifiers().len(), 2);
+
+        let evidence = read_chain_evidence(&v1).expect("v1 reads as evidence");
+        assert!(!evidence.complete);
+        assert_eq!(evidence.spent.get(&[71u8; 32]), Some(&None));
+    }
+
+    /// Kristi, #240 #3: a scan that died early left a valid checkpoint
+    /// indistinguishable from a finished one. Completion is recorded, and
+    /// any further block clears it, because the tip has moved past it.
+    #[test]
+    fn completion_is_recorded_and_cleared_by_another_block() {
+        let a_sk = [0x42u8; 32];
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[], [0xAB; 32], 1).expect("scan");
+        assert!(!scanner.is_complete());
+        scanner.mark_complete();
+
+        let resumed = SproutScanner::resume(&scanner.checkpoint()).expect("resume");
+        assert!(resumed.is_complete());
+        assert!(read_chain_evidence(&scanner.checkpoint()).unwrap().complete);
+
+        scanner.scan_block_at(&[], [0xAC; 32], 2).expect("scan");
+        assert!(
+            !scanner.is_complete(),
+            "a later block means the walk is no longer at its end"
+        );
+    }
+
+    /// Kristi, #240 #9: reading a checkpoint as chain evidence must not
+    /// rebuild the tree and every witness, only to throw them away. It must
+    /// still see exactly what a full resume sees.
+    #[test]
+    fn chain_evidence_matches_a_full_resume() {
+        let a_sk = [0x42u8; 32];
+        let mut scanner = SproutScanner::new(&[a_sk, a_sk]);
+        for seed in 80..84 {
+            let (js, _) = joinsplit_paying(&a_sk, 1_000, 0, seed);
+            scanner
+                .scan_block_at(&[js], [seed; 32], u32::from(seed))
+                .expect("scan");
+        }
+        scanner.mark_complete();
+        let checkpoint = scanner.checkpoint();
+
+        let evidence = read_chain_evidence(&checkpoint).expect("evidence");
+        let resumed = SproutScanner::resume(&checkpoint).expect("resume");
+        assert_eq!(evidence.spending_keys, resumed.spending_keys());
+        assert_eq!(
+            evidence.spending_keys,
+            vec![a_sk],
+            "duplicate keys are one key"
+        );
+        assert_eq!(&evidence.spent, resumed.spent_nullifiers());
+        assert_eq!(evidence.cursor, resumed.cursor());
+        assert!(evidence.complete);
+
+        let mut truncated = checkpoint.as_bytes().to_vec();
+        truncated.pop();
+        assert!(read_chain_evidence(&SproutScanCheckpoint::from_bytes(truncated)).is_err());
     }
 
     #[test]

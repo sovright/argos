@@ -69,13 +69,24 @@
 //! deliberately corrupted solution required to fail, so neither pass can
 //! mean the verifier simply accepts everything.
 //!
-//! The checkpoint file is likewise unauthenticated: it carries no MAC. A scan
-//! is never finished by its checkpoint alone — every run continues to the
-//! tip — but an edited cursor still skips the blocks it claims were read.
-//! It is checked against the requested key set, which catches the
-//! accidental case of the wrong wallet, but not a deliberately edited file.
-//! A checkpoint from another network fails on its first page, because no
-//! peer on this network recognises its block cursor.
+//! The checkpoint file is likewise unauthenticated: it carries no MAC. A
+//! resumed scan always continues to the tip, but an edited cursor still
+//! skips the blocks it claims were read. It is checked against the requested
+//! key set, which catches the accidental case of the wrong wallet, but not a
+//! deliberately edited file. A checkpoint from another network fails on its
+//! first page, because no peer on this network recognises its block cursor.
+//!
+//! The checkpoint is also read with no network contact at all:
+//! [`lookup_chain_spends`] hands its nullifier set to the wallet-file path as
+//! evidence that notes were spent. That consumer is stricter — the network
+//! tag is required, the embedded key set must match, and whether the walk
+//! reached the tip (`complete`) is reported, not assumed. A MAC would still
+//! add nothing against an attacker: marking a note spent needs a checkpoint
+//! holding the wallet's exact spending keys, and the note's nullifier needs
+//! its `a_sk`, which the checkpoint stores in the clear. Whoever can forge
+//! the evidence can already spend the note. The residual is accidental: a
+//! stale or truncated file, which `complete` and `scanned_to` make visible.
+//! See `docs/THREAT_MODEL.md` T-N7.
 //!
 //! # Checkpointing
 //!
@@ -280,7 +291,7 @@ fn load_checkpoint(
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
 ) -> ZeckResult<Option<SproutScanner>> {
-    let Ok(bytes) = std::fs::read(checkpoint_file) else {
+    let Some(bytes) = read_checkpoint_file(checkpoint_file)? else {
         return Ok(None);
     };
     // Checked after the scanner loads, so a corrupt file is still
@@ -331,30 +342,148 @@ fn load_checkpoint(
     Ok(Some(resumed))
 }
 
-/// What a full-block scan of these keys has seen on chain, if one has run.
+/// Read a checkpoint file. `Ok(None)` only when there is no file: any other
+/// failure — permissions, I/O, a directory in its place — is an error, so a
+/// scan that ran for hours never reads as one that never ran.
+fn read_checkpoint_file(path: &Path) -> ZeckResult<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ZeckError::TransactionBuild(format!(
+            "reading the scan checkpoint at {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+/// What a scan checkpoint says about spends on chain, for the wallet-file
+/// path to consult.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanEvidence {
+    /// The checkpoint this came from, so the surfaces can say which.
+    pub path: PathBuf,
+    /// Every nullifier the scan saw, with the transaction that revealed it
+    /// where recorded (checkpoints before version 2 did not).
+    pub spent: std::collections::HashMap<[u8; 32], Option<[u8; 32]>>,
+    /// The height of the last block the scan read.
+    pub scanned_to: u32,
+    /// Whether the scan ended at the chain tip. `false` for one that stopped
+    /// early — a silent peer, an interrupt — whose coverage ends at
+    /// `scanned_to` however complete its file looks.
+    pub complete: bool,
+}
+
+/// The outcome of looking for a scan of a key set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainSpendsLookup {
+    /// No checkpoint at `path`: no scan of exactly these keys has run in this
+    /// data directory.
+    NotFound {
+        path: PathBuf,
+    },
+    /// A checkpoint exists but has not read a block yet.
+    NothingScanned {
+        path: PathBuf,
+    },
+    Found(ScanEvidence),
+}
+
+/// Look for a full-block scan of these keys and read what it saw.
 ///
 /// The wallet-file path only knows the spends its own wallet recorded. A
 /// scan knows every nullifier on chain up to where it reached, so a note
 /// spent from another copy of the wallet — invisible to the file — shows up
 /// here. Read from the checkpoint `scan-sprout` itself resumes, found by the
-/// same key-set fingerprint, so running the scan once is all it takes.
+/// same key-set fingerprint (pass [`scan_key_set`], the set the scan used).
 ///
-/// `Ok(None)` when no scan has run for these keys, or it scanned nothing.
+/// Stricter than resume. Resume re-reads the chain from its cursor, so a
+/// wrong guess costs a refused page; this is a verdict with no network
+/// contact, so it requires the network tag outright rather than inferring
+/// the network from height, and it checks the key set embedded in the file,
+/// not only its name. It reads only the spent set and cursor
+/// ([`crate::sprout_scan::read_chain_evidence`]), never rebuilding the tree or
+/// the witnesses a verdict does not need.
+///
+/// An unreadable, untagged, wrong-network or wrong-key checkpoint is an
+/// error, never `NotFound`.
+pub fn lookup_chain_spends(
+    data_dir: &Path,
+    network: P2pNetwork,
+    spending_keys: &[[u8; 32]],
+) -> ZeckResult<ChainSpendsLookup> {
+    let path = checkpoint_path(data_dir, spending_keys);
+    let Some(bytes) = read_checkpoint_file(&path)? else {
+        return Ok(ChainSpendsLookup::NotFound { path });
+    };
+    let [NETWORK_TAGGED, tag, body @ ..] = bytes.as_slice() else {
+        return Err(ZeckError::TransactionBuild(format!(
+            "the scan checkpoint at {} does not record its network, so its spends \
+             cannot be trusted for this one. It was written by an older Argos; running \
+             the scan again updates it.",
+            path.display()
+        )));
+    };
+    let evidence =
+        crate::sprout_scan::read_chain_evidence(&SproutScanCheckpoint::from_bytes(body.to_vec()))
+            .map_err(|err| {
+            ZeckError::TransactionBuild(format!(
+                "the scan checkpoint at {} could not be read ({err}).",
+                path.display()
+            ))
+        })?;
+    if evidence.spending_keys != scan_key_set(spending_keys, &[]) {
+        return Err(ZeckError::TransactionBuild(format!(
+            "the scan checkpoint at {} was made for a different set of spending keys, \
+             so it says nothing about this wallet's notes.",
+            path.display()
+        )));
+    }
+    if *tag != network_tag(network) {
+        return Err(ZeckError::TransactionBuild(format!(
+            "the scan checkpoint at {} was made on a different network, so its spends \
+             say nothing about this one's notes.",
+            path.display()
+        )));
+    }
+    Ok(match evidence.cursor {
+        None => ChainSpendsLookup::NothingScanned { path },
+        Some(cursor) => ChainSpendsLookup::Found(ScanEvidence {
+            path,
+            spent: evidence.spent,
+            scanned_to: cursor.last_height,
+            complete: evidence.complete,
+        }),
+    })
+}
+
+/// [`lookup_chain_spends`] reduced to the nullifier set, for callers that
+/// need only the verdict. `Ok(None)` when no scan has read a block.
 pub fn chain_spends(
     data_dir: &Path,
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
 ) -> ZeckResult<Option<crate::sprout_recovery::ChainSpends>> {
-    let path = checkpoint_path(data_dir, spending_keys);
-    let Some(scanner) = load_checkpoint(&path, network, spending_keys)? else {
-        return Ok(None);
-    };
-    Ok(scanner
-        .cursor()
-        .map(|cursor| crate::sprout_recovery::ChainSpends {
-            nullifiers: scanner.spent_nullifiers().clone(),
-            scanned_to: cursor.last_height,
-        }))
+    Ok(
+        match lookup_chain_spends(data_dir, network, spending_keys)? {
+            ChainSpendsLookup::Found(evidence) => Some(crate::sprout_recovery::ChainSpends {
+                nullifiers: evidence.spent.into_keys().collect(),
+                scanned_to: evidence.scanned_to,
+            }),
+            ChainSpendsLookup::NotFound { .. } | ChainSpendsLookup::NothingScanned { .. } => None,
+        },
+    )
+}
+
+/// The exact key set a scan runs with: a wallet file's Sprout keys and any
+/// supplied separately, sorted and deduplicated. The checkpoint is named by
+/// this set, so a caller looking for a scan must build it the same way, or a
+/// scan run with an extra `--sprout-key-file`, or over a wallet holding one
+/// key twice, is never found.
+pub fn scan_key_set(wallet_keys: &[[u8; 32]], extra_keys: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut keys: Vec<[u8; 32]> = wallet_keys.iter().chain(extra_keys).copied().collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// Where a scan's checkpoint lives for a given key set.
@@ -375,9 +504,9 @@ pub fn checkpoint_path(data_dir: &Path, spending_keys: &[[u8; 32]]) -> PathBuf {
 pub fn key_set_fingerprint(spending_keys: &[[u8; 32]]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    let mut sorted: Vec<_> = spending_keys.to_vec();
-    sorted.sort_unstable();
-    for key in &sorted {
+    // Deduplicated as well as sorted: [A, A] is the scan of [A], and must
+    // name the same file.
+    for key in &scan_key_set(spending_keys, &[]) {
         h.update(key);
     }
     h.finalize()[..8]
@@ -694,6 +823,10 @@ pub async fn run_sprout_scan(
     // is only to be certain no connection outlives the scan.
     drop(fetch_task);
 
+    // The only place a scan is marked complete: the loop leaves only on the
+    // fetcher's tip signal (`Ok(None)`). Every early exit above saves
+    // without it, so its checkpoint never reads as full coverage.
+    scanner.mark_complete();
     save_checkpoint(&scanner, network, checkpoint_file)?;
 
     scanner
@@ -1845,54 +1978,211 @@ mod tests {
         }
     }
 
+    /// A directory for one test in one process, emptied before use and
+    /// removed after. Two `cargo test` runs on one machine must not share
+    /// or delete each other's files, and a crashed run must not leave one
+    /// behind that fails the next run permanently.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("argos-chain-evidence-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scanned(keys: &[[u8; 32]], nf: [u8; 32], height: u32) -> SproutScanner {
+        let mut scanner = SproutScanner::new(keys);
+        scanner
+            .scan_block_at(&[joinsplit_revealing(nf)], [0xCD; 32], height)
+            .expect("a block with one JoinSplit");
+        scanner
+    }
+
+    fn found(lookup: ChainSpendsLookup) -> ScanEvidence {
+        match lookup {
+            ChainSpendsLookup::Found(evidence) => evidence,
+            other => panic!("expected a scan, got {other:?}"),
+        }
+    }
+
     /// The wallet-file path asks the scan what the chain says about spends.
     /// It must read exactly the checkpoint `scan-sprout` would resume.
     #[test]
     fn chain_spends_reads_what_the_scan_saw_on_chain() {
+        let dir = ScratchDir::new("reads");
         let keys = [[0x11; 32]];
-        let mut scanner = SproutScanner::new(&keys);
-        scanner
-            .scan_block_at(&[joinsplit_revealing([0x99; 32])], [0xCD; 32], 2_000_000)
-            .expect("a block with one JoinSplit");
-        let dir = std::env::temp_dir().join("argos-chain-spends-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = checkpoint_path(&dir, &keys);
-        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(
+            &scanned(&keys, [0x99; 32], 2_000_000),
+            P2pNetwork::Mainnet,
+            &path,
+        )
+        .unwrap();
 
-        let chain = chain_spends(&dir, P2pNetwork::Mainnet, &keys);
-        discard_checkpoint(&path);
-        let chain = chain.unwrap().expect("a checkpoint exists for these keys");
+        let chain = chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+            .unwrap()
+            .expect("a checkpoint exists for these keys");
         assert!(chain.nullifiers.contains(&[0x99; 32]));
         assert!(chain.nullifiers.contains(&[0x72; 32]));
         assert_eq!(chain.scanned_to, 2_000_000);
     }
 
+    /// Kristi, #240 #10: the revealing txid is carried to the caller, so a
+    /// chain-proven spend can be checked in an explorer.
     #[test]
-    fn without_a_scan_there_is_nothing_from_the_chain() {
-        let dir = std::env::temp_dir().join("argos-chain-spends-none-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let chain = chain_spends(&dir, P2pNetwork::Mainnet, &[[0x12; 32]]).unwrap();
-        assert!(chain.is_none());
+    fn the_lookup_names_the_transaction_behind_each_spend() {
+        let dir = ScratchDir::new("txid");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+
+        let evidence = found(lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys).unwrap());
+        assert_eq!(evidence.spent.get(&[0x99; 32]), Some(&Some([0x71; 32])));
+        assert_eq!(evidence.path, path);
+    }
+
+    /// Kristi, #240 #2: no scan must be distinguishable from an unreadable
+    /// one, and the caller must be able to say where it looked.
+    #[test]
+    fn no_scan_is_reported_with_where_it_looked() {
+        let dir = ScratchDir::new("none");
+        let keys = [[0x12; 32]];
+        match lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys).unwrap() {
+            ChainSpendsLookup::NotFound { path } => {
+                assert_eq!(path, checkpoint_path(&dir.0, &keys))
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert!(chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A checkpoint that exists but cannot be read is an error, never "no
+    /// scan": a six-hour scan must not silently read as never having run.
+    #[test]
+    fn an_unreadable_checkpoint_is_an_error_not_no_scan() {
+        let dir = ScratchDir::new("unreadable");
+        let keys = [[0x14; 32]];
+        // A directory where the file should be: reading it fails, and not
+        // with NotFound. Portable, unlike a permission bit root ignores.
+        std::fs::create_dir_all(checkpoint_path(&dir.0, &keys)).unwrap();
+
+        let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+            .expect_err("an unreadable checkpoint must be reported");
+        assert!(
+            err.to_string().contains("reading the scan checkpoint"),
+            "{err}"
+        );
     }
 
     /// The same guard the scan's own resume applies: another chain's
     /// nullifiers would mark this chain's notes spent.
     #[test]
     fn chain_spends_from_another_network_are_refused() {
+        let dir = ScratchDir::new("network");
         let keys = [[0x13; 32]];
-        let mut scanner = SproutScanner::new(&keys);
-        scanner
-            .scan_block_at(&[], [0xCD; 32], 2_000_000)
-            .expect("an empty block");
-        let dir = std::env::temp_dir().join("argos-chain-spends-network-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = checkpoint_path(&dir, &keys);
-        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(
+            &scanned(&keys, [0x99; 32], 2_000_000),
+            P2pNetwork::Mainnet,
+            &path,
+        )
+        .unwrap();
 
-        let result = chain_spends(&dir, P2pNetwork::Testnet, &keys);
-        discard_checkpoint(&path);
-        let err = result.expect_err("a mainnet scan must not answer for testnet");
+        let err = chain_spends(&dir.0, P2pNetwork::Testnet, &keys)
+            .expect_err("a mainnet scan must not answer for testnet");
         assert!(err.to_string().contains("different network"), "{err}");
+    }
+
+    /// Kristi, #240 #5: resume tolerates an untagged checkpoint by a height
+    /// heuristic, because it re-reads the chain anyway. Evidence that marks
+    /// notes spent with no network contact must not.
+    #[test]
+    fn an_untagged_checkpoint_is_not_chain_evidence() {
+        let dir = ScratchDir::new("untagged");
+        let keys = [[0x15; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        std::fs::write(&path, scanned(&keys, [0x99; 32], 5).checkpoint().as_bytes()).unwrap();
+
+        let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+            .expect_err("no network recorded, so no verdict");
+        assert!(
+            err.to_string().contains("does not record its network"),
+            "{err}"
+        );
+    }
+
+    /// Kristi, #240 #8: the embedded key set, not the file name, is what
+    /// ties a checkpoint to a wallet. A file for keys A at keys B's path is
+    /// refused.
+    #[test]
+    fn a_checkpoint_for_other_keys_is_refused_whatever_its_name() {
+        let dir = ScratchDir::new("keyset");
+        let (a, b) = ([[0x16; 32]], [[0x17; 32]]);
+        save_checkpoint(
+            &scanned(&a, [0x99; 32], 5),
+            P2pNetwork::Mainnet,
+            &checkpoint_path(&dir.0, &b),
+        )
+        .unwrap();
+
+        let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &b)
+            .expect_err("keys A's scan must not answer for keys B");
+        assert!(
+            err.to_string().contains("different set of spending"),
+            "{err}"
+        );
+    }
+
+    /// Kristi, #240 #3: a scan that stopped early left a valid checkpoint
+    /// that read as full coverage. The lookup says which it is.
+    #[test]
+    fn an_aborted_scan_is_found_but_not_complete() {
+        let dir = ScratchDir::new("complete");
+        let keys = [[0x18; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut scanner = scanned(&keys, [0x99; 32], 300_000);
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+        let aborted = found(lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys).unwrap());
+        assert!(!aborted.complete);
+        assert_eq!(aborted.scanned_to, 300_000);
+
+        scanner.mark_complete();
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+        let finished = found(lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys).unwrap());
+        assert!(finished.complete);
+    }
+
+    /// Kristi, #240 #1: the scan dedups its keys, so [A, A] and [A] are one
+    /// scan and must name one file.
+    #[test]
+    fn duplicated_keys_name_the_same_checkpoint() {
+        let dir = std::path::Path::new("/x");
+        let (a, b) = ([0x21; 32], [0x22; 32]);
+        assert_eq!(checkpoint_path(dir, &[a, a]), checkpoint_path(dir, &[a]));
+        assert_eq!(
+            checkpoint_path(dir, &[b, a, a]),
+            checkpoint_path(dir, &[a, b])
+        );
+        assert_ne!(checkpoint_path(dir, &[a]), checkpoint_path(dir, &[b]));
+    }
+
+    #[test]
+    fn the_scan_key_set_merges_sorts_and_dedups() {
+        let (a, b, c) = ([0x01; 32], [0x02; 32], [0x03; 32]);
+        assert_eq!(scan_key_set(&[c, a, a], &[b, c]), vec![a, b, c]);
+        assert_eq!(scan_key_set(&[], &[]), Vec::<[u8; 32]>::new());
     }
 
     /// A checkpoint records its network, so resuming one elsewhere is
