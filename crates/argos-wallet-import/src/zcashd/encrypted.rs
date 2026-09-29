@@ -78,7 +78,7 @@ fn sapling_fvfp_iv(fvk: &[u8]) -> [u8; 16] {
 /// caller's to protect — callers wrap it in a `Secret`.
 ///
 /// The IV is not secret: it is derived from a public record identifier.
-fn decrypt(master: &MasterKey, iv: [u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn decrypt(master: &MasterKey, iv: [u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
     let mut buf = ciphertext.to_vec();
     let mut key: [u8; 32] = *master.expose_secret();
     let plain = Aes256CbcDec::new(&key.into(), &iv.into())

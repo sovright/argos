@@ -36,13 +36,6 @@ const IGNORED: &[&str] = &[
     "zkeymeta",
 ];
 
-/// Record types that hold the wallet's HD seed: `hdseed`/`chdseed` for
-/// zcashd 1.1-4.x, `mnemonicphrase`/`cmnemonicphrase` for 5.0+. Argos does
-/// not recover a seed from a `wallet.dat`, and must say so — these are not
-/// bookkeeping, and skipping them quietly made a partially recovered wallet
-/// read as a complete one.
-const SEED_BEARING: &[&str] = &["chdseed", "cmnemonicphrase", "hdseed", "mnemonicphrase"];
-
 fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
     let (len, consumed) = compact_size(value)?;
     let end = consumed.checked_add(usize::try_from(len).ok()?)?;
@@ -163,19 +156,8 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
             // key is available; skip silently here rather than reporting
             // them as unknown.
             "ckey" | "czkey" | "csapzkey" | "mkey" | "hdchain" | "sapzaddr" | "zkeymeta" => {}
-            other if SEED_BEARING.contains(&other) => {
-                // An encrypted 5.x wallet carries both `mnemonicphrase` and
-                // `cmnemonicphrase` for one seed; report the seed once.
-                if !out
-                    .diagnostics
-                    .iter()
-                    .any(ImportDiagnostic::is_unrecovered_seed)
-                {
-                    out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
-                        record_type: other.to_owned(),
-                    });
-                }
-            }
+            // Assessed as a whole, with the master key in hand, by `seed`.
+            other if super::seed::SEED_RECORDS.contains(&other) => {}
             other if IGNORED.contains(&other) => {}
             other => out.diagnostics.push(ImportDiagnostic::UnknownRecord {
                 record_type: other.to_owned(),
@@ -241,25 +223,6 @@ mod tests {
         collect_plaintext(&pairs, &mut out);
         assert!(out.sprout.is_empty());
         assert_eq!(out.diagnostics.len(), 1);
-    }
-
-    #[test]
-    fn seed_bearing_records_are_reported_as_an_unrecovered_seed() {
-        // zcashd 1.1-4.x kept a raw HD seed in `hdseed`/`chdseed`; 5.0+ a
-        // BIP-39 phrase in `mnemonicphrase`/`cmnemonicphrase`. Every one of
-        // them means keys may exist that this file does not store
-        // individually, so none may be skipped quietly.
-        for kind in ["hdseed", "chdseed", "mnemonicphrase", "cmnemonicphrase"] {
-            let mut out = ImportedKeys::default();
-            collect_plaintext(&[record(kind, &[0x01; 32], &[0x02; 40])], &mut out);
-            assert_eq!(
-                out.diagnostics,
-                vec![ImportDiagnostic::UnrecoveredSeed {
-                    record_type: kind.to_owned()
-                }],
-                "{kind}"
-            );
-        }
     }
 
     #[test]

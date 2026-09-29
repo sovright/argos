@@ -29,21 +29,63 @@ pub enum ImportDiagnostic {
     #[error("skipped {record_type} record: decryption failed ({reason})")]
     DecryptionFailed { record_type: String, reason: String },
 
-    /// An HD seed Argos does not recover. Kept apart from `UnknownRecord`
+    /// An HD seed Argos could not verify. Kept apart from `UnknownRecord`
     /// because it is the one skip that can hide an entire key tree: any
     /// address derived from it that the file does not also store as an
     /// individual key is invisible to the scan.
     #[error(
-        "skipped {record_type} record: this is the wallet's HD seed, which Argos \
-         does not recover — keys derived from it are only covered if the file \
-         also stores them individually"
+        "could not verify the wallet's HD seed ({record_type}: {reason}) — keys \
+         derived from it are only covered if the file also stores them individually"
     )]
-    UnrecoveredSeed { record_type: String },
+    UnrecoveredSeed { record_type: String, reason: String },
+
+    /// zcashd 5.x unified accounts (`z_getnewaccount`) are derived from the
+    /// seed on demand and never stored as individual keys, so the flat-key
+    /// scan cannot reach them. The count is the wallet's own
+    /// `mnemonichdchain` account counter.
+    #[error(
+        "this wallet has {accounts} unified account(s) derived from its seed; \
+         their keys are not stored individually and Argos does not scan them"
+    )]
+    UnscannedSeedAccounts { accounts: u32 },
+
+    /// The seed's own counters say more legacy keys were derived than the
+    /// file holds — a truncated or damaged wallet.
+    #[error(
+        "the wallet's seed derived {expected} {pool} key(s) but only {found} \
+         are stored in this file"
+    )]
+    MissingDerivedKeys {
+        pool: String,
+        expected: u64,
+        found: u64,
+    },
+
+    /// A pre-5.0 seed (`hdseed`/`chdseed`) kept beside a verified 5.x seed.
+    /// zcashd 5.0 keeps the old seed when it adds a mnemonic, and every key
+    /// 4.x derived from it was stored individually and read — but it has no
+    /// counters, so that cannot be checked. Said, without claiming funds may
+    /// be missing.
+    #[error(
+        "this wallet also holds a pre-5.0 HD seed ({record_type}). zcashd stored every \
+         key it derived individually, and those were read, but Argos cannot check \
+         that none is missing"
+    )]
+    UncheckedLegacySeed { record_type: String },
 }
 
 impl ImportDiagnostic {
-    pub fn is_unrecovered_seed(&self) -> bool {
-        matches!(self, Self::UnrecoveredSeed { .. })
+    /// Findings about the wallet's HD seed, as opposed to records that failed
+    /// to read. Both surfaces list them apart: calling "this wallet has 2
+    /// unified accounts" an unread record tells the user something false.
+    pub fn is_about_seed(&self) -> bool {
+        matches!(
+            self,
+            Self::UnrecoveredSeed { .. }
+                | Self::UnscannedSeedAccounts { .. }
+                | Self::MissingDerivedKeys { .. }
+                | Self::UncheckedLegacySeed { .. }
+        )
     }
 }
 

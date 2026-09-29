@@ -94,12 +94,28 @@ and `start_scan` is a seed-phrase wrapper over it.
 recovers a BIP-39 mnemonic, so it re-enters the ordinary HD pipeline and
 scans and sweeps exactly like a typed seed phrase. A zcashd `wallet.dat`
 is recovered from its flat, individually-stored keys only. It usually *does*
-hold an HD seed (`hdseed`/`chdseed` before 5.0, `mnemonicphrase`/
-`cmnemonicphrase` from 5.0), but Argos does not recover it: the parser
-reports it as `ImportDiagnostic::UnrecoveredSeed`, and
-`ImportedKeys::coverage()` grades that as the most severe case so the CLI
-and GUI say balances may be missing, on the import summary and again beside
-the totals. Never describe these wallets as "not HD-derived" (#225).
+hold an HD seed, and for 5.0+ (`mnemonicphrase`/`cmnemonicphrase`)
+`zcashd::seed` verifies it — fingerprint, then the `mnemonichdchain` record —
+and sets `ImportedKeys::seed_verified`, but deliberately does **not** put it
+in `ImportedKeys::mnemonic` (#229). Every key zcashd derives for its legacy
+account `0x7FFFFFFF` is also stored individually, and the HD scan only
+enumerates accounts `0..n`, so routing the wallet down the HD path would
+drop every stored key; `zcashd_seed_covers_stored_keys` in `zeck-core`
+proves this against the fixtures. The chain's counters are what let the
+import say the stored keys are complete: `accountCounter > 0` means
+`z_getnewaccount` unified accounts exist that are never stored and are not
+scanned (`UnscannedSeedAccounts`), and a legacy-chain index with no stored
+key is `MissingDerivedKeys`. That second check is by key *identity*, never
+by count: a derived key counts only if a `key`/`ckey` (or
+`sapzkey`/`csapzkey`) record exists whose `keymeta` (`sapzkeymeta`) names
+exactly its legacy-account keypath under this seed's fingerprint. Counting
+let every `importprivkey` key stand in for a missing derived one, so a
+damaged wallet with imports read as Complete — do not go back to counts. A seed that fails verification, and any
+pre-5.0 `hdseed`/`chdseed`, is `UnrecoveredSeed`. Both encrypted golden
+fixtures still carry a live plaintext `mnemonicphrase` beside
+`cmnemonicphrase` (written by v6.20.0 `encryptwallet`), so the seed of such a
+wallet is readable without its passphrase; `seed` prefers the encrypted copy.
+Never describe these wallets as "not HD-derived" (#225).
 
 **A Sapling spending key can also arrive as text**, with no wallet file at
 all: `argos_core::sapling_key` decodes zcashd's bech32

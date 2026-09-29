@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 /// zcashd wallet with a Sprout address, a Sapling address, and transparent
 /// keys. Written by a real `zcashd` v6.20.0, so it also holds a 5.x
-/// `mnemonicphrase` HD seed, which Argos does not recover. See
+/// `mnemonicphrase` HD seed, which Argos verifies but does not scan from. See
 /// `tests/regtest/fixtures/README.md`.
 const SPROUT_PLAINTEXT: &str = "sprout-plaintext.dat";
 
@@ -81,11 +81,12 @@ fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     );
 }
 
-/// A zcashd 5.x wallet's seed is skipped, and the report must say so rather
-/// than claim the keys were never HD-derived or that every record was read
-/// (#225).
+/// A zcashd 5.x wallet's seed is verified, and because the wallet never
+/// created a unified account, the report may say the stored keys are the
+/// whole story — but must not claim the keys were never HD-derived (#225),
+/// nor that the seed is what the scan uses (#229).
 #[test]
-fn inspect_wallet_does_not_hide_an_unrecovered_seed() {
+fn inspect_wallet_reports_a_verified_seed() {
     let path = fixture(SPROUT_PLAINTEXT);
     let out = argos(&[
         "--wallet-file",
@@ -94,20 +95,18 @@ fn inspect_wallet_does_not_hide_an_unrecovered_seed() {
     ]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for false_claim in ["not HD-derived", "Every record in this file was read"] {
-        assert!(
-            !stdout.contains(false_claim),
-            "report claims {false_claim:?} for a wallet holding a seed:\n{stdout}"
-        );
+    for false_claim in ["not HD-derived", "has no HD seed"] {
+        assert!(!stdout.contains(false_claim), "got:\n{stdout}");
     }
     assert!(
-        stdout.contains("Seed phrase       not recovered from this file"),
+        stdout.contains("Seed phrase       verified — every key it derived is read from this file"),
         "got:\n{stdout}"
     );
     assert!(
-        stdout.contains("this file holds an HD seed that Argos does not recover"),
-        "the coverage notice must name the seed, got:\n{stdout}"
+        stdout.contains("Every record that can hold a key was read."),
+        "got:\n{stdout}"
     );
+    assert!(!stdout.contains("Recovery coverage"), "got:\n{stdout}");
 }
 
 /// A seedless wallet is *scanned*, not refused.
@@ -663,3 +662,51 @@ fn a_key_source_the_command_would_ignore_is_refused() {
         );
     }
 }
+
+/// The seed diagnostics are not unread records: printing a missing derived
+/// key or an unscanned account under "record(s) could not be read" — and
+/// closing with "anything listed above exists only there" — told the user
+/// something false about both.
+#[test]
+fn seed_diagnostics_are_not_listed_as_unread_records() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let mut bytes = std::fs::read(&path).expect("fixture");
+    // Point the chain at an unknown future version: the seed can no longer
+    // be verified, so a seed diagnostic is printed, and no record is unread.
+    let chain = bytes
+        .windows(4)
+        .zip(0..)
+        .find_map(|(w, i)| {
+            (w == [1, 0, 0, 0] && bytes.get(i + 4..i + 36) == Some(&SEED_FP_SPROUT_PLAINTEXT))
+                .then_some(i)
+        })
+        .expect("the mnemonichdchain value starts with version 1 and the seed fingerprint");
+    bytes[chain] = 9;
+    let dir = std::env::temp_dir().join(format!("argos-seed-heading-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let wallet = dir.join("wallet.dat");
+    std::fs::write(&wallet, &bytes).expect("write wallet");
+
+    let out = argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("utf-8"),
+        "inspect-wallet",
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("version 9"),
+        "the seed diagnostic is shown:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("could not be read"),
+        "a seed diagnostic is not an unread record:\n{stdout}"
+    );
+}
+
+/// `sprout-plaintext.dat`'s seed fingerprint, as it appears in its
+/// `mnemonichdchain` value.
+const SEED_FP_SPROUT_PLAINTEXT: [u8; 32] = [
+    0x7d, 0xd4, 0xe7, 0xc1, 0x66, 0xbd, 0x35, 0x66, 0x5e, 0x7e, 0xd1, 0xcf, 0x9f, 0x56, 0x19, 0xcf,
+    0x3d, 0x37, 0x0f, 0x1d, 0xe0, 0x00, 0x78, 0x59, 0x18, 0xb1, 0x54, 0x43, 0xdd, 0x37, 0xcf, 0xa2,
+];

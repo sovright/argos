@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod encrypted;
 pub mod plaintext;
 pub mod records;
+pub mod seed;
 pub mod sprout;
 
 pub use crypto::{derive_master_key, find_mkey, MasterKey, MkeyRecord};
@@ -33,22 +34,57 @@ pub fn import_zcashd(
     bytes: &[u8],
     passphrase: Option<&SecretString>,
 ) -> Result<ImportedKeys, ImportError> {
-    let pairs = bdb::walk(bytes)?;
+    let pairs = Records(bdb::walk(bytes)?);
     let mut out = ImportedKeys::default();
 
     collect_plaintext(&pairs, &mut out);
     collect_sprout_notes(&pairs, &mut out);
 
-    if let Some(mkey) = find_mkey(&pairs) {
-        // Encrypted wallet: without a passphrase the encrypted records are
-        // unreachable, and reporting partial plaintext results would let a
-        // user believe they had recovered everything.
-        let passphrase = passphrase.ok_or(ImportError::WrongPassphrase)?;
-        let master = derive_master_key(passphrase, &mkey)?;
-        collect_encrypted(&pairs, &master, &mut out);
-    }
+    let master = match find_mkey(&pairs) {
+        Some(mkey) => {
+            // Encrypted wallet: without a passphrase the encrypted records
+            // are unreachable, and reporting partial plaintext results would
+            // let a user believe they had recovered everything.
+            let passphrase = passphrase.ok_or(ImportError::WrongPassphrase)?;
+            let master = derive_master_key(passphrase, &mkey)?;
+            collect_encrypted(&pairs, &master, &mut out);
+            Some(master)
+        }
+        None => None,
+    };
+    // Last, over the records themselves: coverage is judged by key
+    // identity (key records and their metadata), not by what the passes
+    // above happened to recover.
+    seed::assess_seed(&pairs, master.as_ref(), &mut out);
 
     Ok(out)
+}
+
+/// The walked records, scrubbed when dropped — on every exit, including the
+/// early one for a missing passphrase.
+///
+/// They hold the plaintext `mnemonicphrase` (which zcashd v6.20.0 leaves in
+/// place even after `encryptwallet`) and, for an unencrypted wallet, every
+/// raw key. The parsed keys the caller keeps are wrapped in `Secret`; these
+/// copies were otherwise left in freed heap for the life of the process.
+struct Records(Vec<(Vec<u8>, Vec<u8>)>);
+
+impl std::ops::Deref for Records {
+    type Target = [(Vec<u8>, Vec<u8>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for Records {
+    fn drop(&mut self) {
+        use secrecy::Zeroize;
+        for (key, value) in &mut self.0 {
+            key.zeroize();
+            value.zeroize();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -90,11 +126,12 @@ mod tests {
     }
 
     /// zcashd 5.0+ keeps its HD seed in `mnemonicphrase` (plaintext) or
-    /// `cmnemonicphrase` (encrypted). Argos does not recover it, so the
-    /// user must be told — these used to be skipped with no diagnostic at
-    /// all, which made the wallet read as completely recovered.
+    /// `cmnemonicphrase` (encrypted). Every golden wallet's seed must decode,
+    /// match the fingerprint zcashd stored it under, and — because none of
+    /// them ever created a unified account and every legacy key the seed
+    /// derived is stored — leave the import complete rather than warned.
     #[test]
-    fn a_zcashd_5_wallet_reports_its_unrecovered_seed() {
+    fn a_zcashd_5_wallets_seed_is_verified_and_its_coverage_is_complete() {
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         for (name, passphrase) in [
             ("modern-plaintext", None),
@@ -103,17 +140,21 @@ mod tests {
             ("sprout-encrypted", Some(&pass)),
         ] {
             let keys = import_zcashd(&read(name), passphrase).unwrap();
-            let seeds = keys
-                .diagnostics
-                .iter()
-                .filter(|d| d.is_unrecovered_seed())
-                .count();
-            assert_eq!(seeds, 1, "{name}: expected one unrecovered-seed diagnostic");
+            assert!(keys.seed_verified, "{name}: seed was not verified");
+            assert!(
+                keys.diagnostics.is_empty(),
+                "{name}: unexpected diagnostics {:?}",
+                keys.diagnostics
+            );
             assert_eq!(
                 keys.coverage(),
-                crate::keys::ImportCoverage::SeedNotRecovered,
+                crate::keys::ImportCoverage::Complete,
                 "{name}"
             );
+            // Verified is not "used for derivation": routing a zcashd wallet
+            // down the HD path would drop every key it stores under the
+            // legacy account, which the HD scan never enumerates.
+            assert!(keys.mnemonic.is_none(), "{name}: mnemonic must stay unset");
         }
     }
 

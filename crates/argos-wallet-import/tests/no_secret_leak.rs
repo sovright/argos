@@ -12,6 +12,7 @@
 
 use argos_wallet_import::keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey};
 use argos_wallet_import::zcashd::{derive_master_key, MkeyRecord};
+use argos_wallet_import::ImportDiagnostic;
 use secrecy::{Secret, SecretString};
 
 /// Distinctive byte patterns, so a leak is unambiguous in the rendered
@@ -198,4 +199,148 @@ fn recovered_mnemonic_does_not_leak_through_debug() {
         "sanity check: a plain Debug of the phrase must contain the phrase itself, or this \
          test proves nothing"
     );
+}
+
+/// Each zcashd 5.x golden fixture, whether it is encrypted, and the first
+/// four words of its BIP-39 phrase. Four adjacent words cannot turn up in a
+/// rendering by coincidence, so finding them means the phrase leaked.
+const SEED_FIXTURES: [(&str, bool, &str); 4] = [
+    ("modern-plaintext", false, "almost elegant report wrist"),
+    ("modern-encrypted", true, "salmon gown still zoo"),
+    ("sprout-plaintext", false, "walk protect ticket novel"),
+    ("sprout-encrypted", true, "arch evolve memory trophy"),
+];
+
+fn import_fixture(bytes: &[u8], encrypted: bool) -> ImportedKeys {
+    let pass = SecretString::new(FIXTURE_PASSPHRASE.to_owned());
+    argos_wallet_import::zcashd::import_zcashd(bytes, encrypted.then_some(&pass))
+        .expect("golden fixture must import")
+}
+
+/// Every rendering of an import result a caller could log or show.
+fn renderings(keys: &ImportedKeys) -> Vec<(String, String)> {
+    let mut out = vec![
+        ("ImportedKeys Debug".to_owned(), format!("{keys:?}")),
+        ("mnemonic Debug".to_owned(), format!("{:?}", keys.mnemonic)),
+    ];
+    for (i, d) in keys.diagnostics.iter().enumerate() {
+        out.push((format!("diagnostic {i} Display"), d.to_string()));
+        out.push((format!("diagnostic {i} Debug"), format!("{d:?}")));
+    }
+    out
+}
+
+fn assert_no_phrase(keys: &ImportedKeys, marker: &str, name: &str) {
+    for (what, rendered) in renderings(keys) {
+        assert!(
+            !rendered.contains(marker),
+            "{name}: the seed phrase leaked into the {what}: {rendered}"
+        );
+    }
+}
+
+/// Non-vacuous: the phrase really is in the file, so its absence from the
+/// renderings is the import withholding it rather than never having seen it.
+fn assert_fixture_holds(bytes: &[u8], marker: &str, name: &str) {
+    assert!(
+        bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+        "{name}: the fixture no longer holds its phrase in plaintext, so the leak \
+         checks against it prove nothing"
+    );
+}
+
+#[test]
+fn a_verified_zcashd_seed_does_not_leak_through_any_rendering() {
+    // zcashd 5.x wallets carry a BIP-39 phrase. `import_zcashd` reads it
+    // only to verify the stored keys, then drops it; nothing it returns may
+    // carry the words — not the aggregate, not a diagnostic, not `mnemonic`.
+    for (name, encrypted, marker) in SEED_FIXTURES {
+        let bytes = std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap();
+        assert_fixture_holds(&bytes, marker, name);
+        let keys = import_fixture(&bytes, encrypted);
+        assert!(keys.seed_verified, "{name}: the fixture seed should verify");
+        assert_no_phrase(&keys, marker, name);
+    }
+}
+
+/// Replace the single occurrence of `needle` in `bytes` with `with`,
+/// failing rather than guessing if it is absent or ambiguous.
+fn replace_once(bytes: &mut [u8], needle: &[u8], with: &[u8]) {
+    assert_eq!(needle.len(), with.len());
+    let hits: Vec<usize> = bytes
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, w)| *w == needle)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "needle must occur exactly once in the fixture"
+    );
+    bytes[hits[0]..hits[0] + needle.len()].copy_from_slice(with);
+}
+
+fn unrecovered_seed(keys: &ImportedKeys) -> Vec<&ImportDiagnostic> {
+    keys.diagnostics
+        .iter()
+        .filter(|d| matches!(d, ImportDiagnostic::UnrecoveredSeed { .. }))
+        .collect()
+}
+
+#[test]
+fn a_seed_whose_chain_fails_does_not_leak_through_its_diagnostic() {
+    // The phrase decodes and matches its fingerprint, but the
+    // `mnemonichdchain` record names a different seed. The fingerprint also
+    // keys the `mnemonicphrase` record and sits in every keymeta value, so
+    // flip it only inside the chain: locate the chain's whole 61-byte value,
+    // which occurs exactly once in the file.
+    let (name, _, marker) = SEED_FIXTURES[0];
+    let mut bytes = std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap();
+    let chain = argos_wallet_import::bdb::walk(&bytes)
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| {
+            argos_wallet_import::zcashd::parse_record_key(k)
+                .is_some_and(|r| r.record_type == "mnemonichdchain")
+        })
+        .map(|(_, v)| v)
+        .expect("the fixture has a mnemonichdchain record");
+    let mut tampered = chain.clone();
+    tampered[4] ^= 1; // first byte of the chain's seed fingerprint
+    replace_once(&mut bytes, &chain, &tampered);
+
+    let keys = import_fixture(&bytes, false);
+    assert!(!keys.seed_verified);
+    assert!(
+        matches!(unrecovered_seed(&keys).as_slice(),
+            [ImportDiagnostic::UnrecoveredSeed { record_type, .. }]
+            if record_type == "mnemonichdchain"),
+        "expected one mnemonichdchain UnrecoveredSeed, got: {:?}",
+        keys.diagnostics
+    );
+    assert_no_phrase(&keys, marker, name);
+}
+
+#[test]
+fn a_phrase_that_fails_to_decode_does_not_leak_through_its_diagnostic() {
+    // The failure most tempted to quote the phrase: a word outside the
+    // BIP-39 list. bip0039's error names the offending word, so a reason
+    // built from it would carry phrase text. Mangle the fifth word so the
+    // four-word marker stays intact, and look for the mangled word too.
+    let (name, _, marker) = SEED_FIXTURES[0];
+    let mut bytes = std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap();
+    replace_once(&mut bytes, b"wrist cloth recall", b"wrist clotj recall");
+
+    let keys = import_fixture(&bytes, false);
+    assert!(!keys.seed_verified);
+    assert!(
+        matches!(unrecovered_seed(&keys).as_slice(),
+            [ImportDiagnostic::UnrecoveredSeed { record_type, .. }]
+            if record_type == "mnemonicphrase"),
+        "expected one mnemonicphrase UnrecoveredSeed, got: {:?}",
+        keys.diagnostics
+    );
+    assert_no_phrase(&keys, marker, name);
+    assert_no_phrase(&keys, "clotj", name);
 }

@@ -20,5 +20,8 @@ crates/argos-wallet-import/fuzz/target/
 # would otherwise add megabytes of churn to every fuzz run.
 crates/argos-wallet-import/fuzz/corpus/bdb_walk/*
 !crates/argos-wallet-import/fuzz/corpus/bdb_walk/.gitkeep
+# Same for import_zcashd: its four seeds (the golden fixtures that carry
+# a BIP-39 phrase) are tracked, mutations are not.
+crates/argos-wallet-import/fuzz/corpus/import_zcashd/*
 crates/argos-wallet-import/fuzz/artifacts/
 crates/argos-wallet-import/fuzz/target/
