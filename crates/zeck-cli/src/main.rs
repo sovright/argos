@@ -94,6 +94,14 @@ struct Cli {
     )]
     lightwalletd_url: String,
 
+    /// Blocks downloaded and scanned at a time by `scan` and `sweep`. Trades
+    /// speed for memory: a smaller batch holds fewer blocks and less
+    /// decryption work at once, at the cost of more requests to lightwalletd.
+    /// The default of 1000 suits most machines; on one with little RAM, or
+    /// through the 2022 spam-era blocks, try 200 or 100. Clamped to 10–10000.
+    #[arg(long, global = true, value_name = "BLOCKS")]
+    scan_batch_size: Option<u32>,
+
     /// Scan exactly this many accounts (overrides --gap-limit). Also how many
     /// accounts show-keys prints (default 20). Seed sources only: an
     /// imported key set is scanned in full, one account per key.
@@ -1545,6 +1553,12 @@ fn install_regtest_params_if_requested() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(requested) = cli.scan_batch_size {
+        let used = argos_core::scan::set_sync_batch_size(requested);
+        if used != requested {
+            eprintln!("--scan-batch-size {requested} is out of range; using {used}.");
+        }
+    }
     init_tracing(cli.verbose)?;
     refuse_unconsumed_key_sources(&cli)?;
 
@@ -2801,6 +2815,21 @@ fn powershell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The speed-for-memory knob reaches the scanner.
+    #[test]
+    fn scan_batch_size_is_a_global_flag() {
+        let cli = Cli::try_parse_from(["argos", "--scan-batch-size", "200", "scan"]).unwrap();
+        assert_eq!(cli.scan_batch_size, Some(200));
+        let cli = Cli::try_parse_from(["argos", "scan", "--scan-batch-size", "100"]).unwrap();
+        assert_eq!(
+            cli.scan_batch_size,
+            Some(100),
+            "global: accepted after the subcommand too"
+        );
+        let cli = Cli::try_parse_from(["argos", "scan"]).unwrap();
+        assert_eq!(cli.scan_batch_size, None, "unset keeps the default");
+    }
 
     /// A scan whose stdout went to a file or a pipe must still say on the
     /// terminal that it finished, what it found, and where the rest went. A
