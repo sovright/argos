@@ -202,9 +202,11 @@ non-null, `nIndex != -1`). Never count an unmined transaction's
 nullifiers — zcashd keeps expired `z_sendmany`s forever, and treating them
 as spends hides a live note with no way back, which is worse than a
 phantom balance. What the file cannot see (spends from another copy of the
-wallet) is handled at the sweep: a refused note is recorded and skipped,
-not a reason to stop, and only a run of refusals stops it
-(`MAX_CONSECUTIVE_REJECTIONS`), pointing at the scan.
+wallet) is handled at the sweep: every note is tried, and a refused note
+is recorded and skipped, never a reason to stop — however many come in a
+row. A note that fails to build is skipped the same way. Only a transport
+error stops the sweep, because it cannot say whether that transaction
+landed.
 
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes

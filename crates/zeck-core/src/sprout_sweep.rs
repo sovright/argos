@@ -324,39 +324,15 @@ impl std::fmt::Display for RejectedSweep {
     }
 }
 
-/// Refusals in a row after which the sweep stops.
-///
-/// A refusal is normally about one note, and the sweep moves on. Several in
-/// a row with nothing accepted between them look like something about every
-/// note — a node that will not take these transactions at all — and each one
-/// costs minutes of proving. Three is enough to tell the two apart without
-/// giving up on a wallet that has a short run of notes spent elsewhere.
-pub const MAX_CONSECUTIVE_REJECTIONS: usize = 3;
-
-/// Record a refused note. Returns whether the sweep should stop.
-fn record_rejection(
-    outcome: &mut SproutSweepOutcome,
-    consecutive: &mut usize,
-    note: &SpendableSproutNote,
-    reason: String,
-) -> bool {
+/// Record a refused note. The sweep always carries on: a refusal is about
+/// one note — most often one spent from another copy of the wallet, which
+/// the file cannot know — and every note after it still deserves its try.
+fn record_rejection(outcome: &mut SproutSweepOutcome, note: &SpendableSproutNote, reason: String) {
     outcome.rejected.push(RejectedSweep {
         outpoint: note.outpoint,
         value: note.note.value,
-        reason: reason.clone(),
+        reason,
     });
-    *consecutive += 1;
-    if *consecutive < MAX_CONSECUTIVE_REJECTIONS {
-        return false;
-    }
-    outcome.error = Some(format!(
-        "the network refused {consecutive} notes in a row, most recently: {reason}. The sweep \
-         stopped rather than spend minutes proving each remaining note for the same answer. \
-         If these notes were spent from another copy of this wallet, `argos scan-sprout` \
-         reads spends from the chain rather than from this file, and sweeps only what is \
-         really unspent."
-    ));
-    true
 }
 
 /// The result of sweeping every recoverable note.
@@ -540,7 +516,6 @@ pub async fn sweep_sprout_notes(
         destination_kind: Some(destination_kind),
         ..Default::default()
     };
-    let mut consecutive_rejections = 0;
 
     for (index, note) in notes.iter().enumerate() {
         if note.note.value <= SPROUT_SWEEP_FEE {
@@ -572,9 +547,13 @@ pub async fn sweep_sprout_notes(
             rand_core::OsRng,
         ) {
             Ok(built) => built,
+            // About this note alone — its witness, its value — so it is
+            // recorded and the rest are still tried.
             Err(err) => {
-                outcome.error = Some(format!("note {index} could not be built: {err}"));
-                return Ok(outcome);
+                outcome
+                    .skipped
+                    .push(format!("note {index}: could not be built: {err}"));
+                continue;
             }
         };
 
@@ -609,12 +588,9 @@ pub async fn sweep_sprout_notes(
                 index + 1,
                 notes.len()
             ));
-            if record_rejection(&mut outcome, &mut consecutive_rejections, note, reason) {
-                return Ok(outcome);
-            }
+            record_rejection(&mut outcome, note, reason);
             continue;
         }
-        consecutive_rejections = 0;
 
         outcome.total_swept += built.value_swept;
         outcome.sent.push(SentSweep {
@@ -652,38 +628,23 @@ mod tests {
     use crate::sprout::SproutPaymentAddress;
     use argos_wallet_import::keys::JsOutPoint;
 
-    /// The sweep moves past a refused note instead of stopping, and stops
-    /// only when refusals run together.
+    /// Every note is tried. A refusal is recorded and the sweep moves on,
+    /// however many come in a row: the wallet file cannot know which of its
+    /// notes were spent elsewhere, and giving up after a few would leave
+    /// unspent notes after them unswept.
     #[test]
-    fn a_refused_note_is_recorded_and_the_sweep_moves_on() {
+    fn refusals_never_stop_the_sweep() {
         let mut outcome = SproutSweepOutcome::default();
-        let mut consecutive = 0;
         let n = note(1_000_000);
-
-        assert!(!record_rejection(
-            &mut outcome,
-            &mut consecutive,
-            &n,
-            "spent".into()
-        ));
-        assert_eq!(outcome.rejected.len(), 1);
-        assert_eq!(outcome.rejected[0].value, 1_000_000);
-        assert!(outcome.error.is_none(), "one refusal is about one note");
-    }
-
-    #[test]
-    fn refusals_in_a_row_stop_the_sweep_and_point_at_the_scan() {
-        let mut outcome = SproutSweepOutcome::default();
-        let mut consecutive = 0;
-        let n = note(1_000_000);
-        let mut stopped = false;
-        for _ in 0..MAX_CONSECUTIVE_REJECTIONS {
-            stopped = record_rejection(&mut outcome, &mut consecutive, &n, "refused".into());
+        for _ in 0..50 {
+            record_rejection(&mut outcome, &n, "spent".into());
         }
-        assert!(stopped);
-        let error = outcome.error.expect("stopping must say why");
-        assert!(error.contains("scan-sprout"), "{error}");
-        assert_eq!(outcome.rejected.len(), MAX_CONSECUTIVE_REJECTIONS);
+        assert_eq!(outcome.rejected.len(), 50);
+        assert_eq!(outcome.rejected[0].value, 1_000_000);
+        assert!(
+            outcome.error.is_none(),
+            "a refusal is about one note, never the sweep"
+        );
     }
 
     fn note(value: u64) -> SpendableSproutNote {
