@@ -413,6 +413,19 @@ function renderWalletSummary(summary) {
   sproutScanCost.hidden = true;
   sproutScanCost.innerHTML = "";
   sproutDetail.innerHTML = "";
+  // Why the total is what it is: notes the wallet spent, dust, unconfirmed
+  // spends, unreadable transactions. The same argos-core sentences the CLI
+  // prints, shown in every branch below.
+  const sproutAccounting = $("wallet-sprout-accounting");
+  sproutAccounting.innerHTML = "";
+  for (const line of summary.sprout_accounting ?? []) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = line;
+    sproutAccounting.appendChild(p);
+  }
+  sproutAccounting.hidden = sproutAccounting.childElementCount === 0;
+  $("sprout-sweep-spent-status").textContent = summary.sprout_spent_status ?? "";
   // Reset every time: reopening a different wallet file must never leave the
   // previous one's sweep panel, plan or results on screen.
   $("wallet-sprout-sweep").hidden = true;
@@ -433,11 +446,32 @@ function renderWalletSummary(summary) {
         `${fmt(summary.sprout_spendable_zatoshis)}. No scan is needed — the ` +
         `note data was in the wallet file itself.`;
       showSproutSweep();
-    } else {
-      sproutHeadline.textContent = "Sprout funds need a full-block scan.";
+    } else if (summary.sprout_nothing_left) {
+      // Not a case for the scan: the file holds the note data, and every
+      // note was spent by the wallet itself or is not worth moving.
+      sproutHeadline.textContent = "No Sprout funds are left in this file.";
       sproutDetail.textContent =
-        " This file holds Sprout keys, but not the note data needed to spend" +
-        " them. Keep the original file: these keys exist only there.";
+        " Every Sprout note it records was spent by the wallet itself, or is" +
+        " worth less than the fee to move it. That is the file's record; the" +
+        " full-block scan below checks it against the chain.";
+      // Still offered: a spend recorded against a block later reorged out
+      // reads exactly like this, and only the scan can tell.
+      $("sprout-scan-panel").hidden = false;
+    } else {
+      if (summary.sprout_history_read) {
+        // Some note data was read — spent notes, dust — so saying the file
+        // holds none would contradict the accounting lines beside it.
+        sproutHeadline.textContent = "No spendable Sprout notes were recovered from this file.";
+        sproutDetail.textContent =
+          " Some of its note data could not be used (reasons below). The" +
+          " full-block scan reads from the chain what the file could not." +
+          " Keep the original file: these keys exist only there.";
+      } else {
+        sproutHeadline.textContent = "Sprout funds need a full-block scan.";
+        sproutDetail.textContent =
+          " This file holds Sprout keys, but not the note data needed to spend" +
+          " them. Keep the original file: these keys exist only there.";
+      }
 
       for (const issue of (summary.sprout_issues || []).slice(0, 5)) {
         const p = document.createElement("p");
@@ -590,17 +624,40 @@ async function runSproutSweep() {
       li.textContent = `not swept — ${reason}`;
       list.appendChild(li);
     }
+    // Refused notes are listed: the sweep carried on past each, and a user
+    // must be able to see which moved and which did not.
+    for (const reason of report.rejected ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = reason;
+      list.appendChild(li);
+    }
 
-    setStatus(
-      "sprout-sweep-status",
-      `✓ Swept ${fmt(report.total_swept)} to ${destination}.`,
-      "success",
-    );
+    const refused = (report.rejected ?? []).length;
+    const skipped = (report.skipped ?? []).length;
+    // A sweep that stopped partway is shown as stopped, with the reason —
+    // never as a green tick over what did go through.
+    if (report.error) {
+      setStatus(
+        "sprout-sweep-status",
+        `✗ The sweep did not finish: ${report.error} Swept ${fmt(report.total_swept)} ` +
+          `before it stopped.`,
+        "error",
+      );
+    } else {
+      setStatus(
+        "sprout-sweep-status",
+        `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
+          (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
+        "success",
+      );
+    }
     // Those funds have moved, so the later screens should stop warning
     // about them. Left standing it would become noise, and a warning people
     // learn to ignore is worse than none — but only clear it when the sweep
-    // actually finished, since a partial one leaves notes behind.
-    if (!report.error) {
+    // actually finished, since a partial one leaves notes behind, and a
+    // refused note may not have been spent at all.
+    if (!report.error && refused === 0 && skipped === 0) {
       uncoveredSproutKeys = 0;
       renderSproutUncoveredBanners();
     }
@@ -1090,6 +1147,14 @@ async function runSproutScanSweep() {
       const li = document.createElement("li");
       li.className = "muted";
       li.textContent = `not swept — ${reason}`;
+      list.appendChild(li);
+    }
+    // Refused notes are listed: the sweep carried on past each, and a user
+    // must be able to see which moved and which did not.
+    for (const reason of report.rejected ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = reason;
       list.appendChild(li);
     }
     if (report.landed_in_unified_sapling) {

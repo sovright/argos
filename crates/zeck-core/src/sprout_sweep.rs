@@ -95,8 +95,13 @@ pub fn plan_sweep(notes: &[SpendableSproutNote]) -> ZeckResult<SproutSweepPlan> 
         )));
     }
 
-    let gross: u64 = spendable.iter().map(|n| n.note.value).sum();
-    let fee = SPROUT_SWEEP_FEE * spendable.len() as u64;
+    // Saturating: every value came from the wallet file, checked only
+    // against commitments from the same file, so a crafted one can sum past
+    // `u64::MAX` — and release builds do not check overflow.
+    let gross = spendable
+        .iter()
+        .fold(0u64, |sum, n| sum.saturating_add(n.note.value));
+    let fee = SPROUT_SWEEP_FEE.saturating_mul(spendable.len() as u64);
 
     Ok(SproutSweepPlan {
         notes: spendable.len(),
@@ -297,6 +302,78 @@ pub struct SentSweep {
     pub value_swept: u64,
 }
 
+/// One note the network refused to let the sweep spend.
+#[derive(Debug, Clone)]
+pub struct RejectedSweep {
+    pub outpoint: argos_wallet_import::keys::JsOutPoint,
+    pub value: u64,
+    pub kind: Refusal,
+    pub source: NoteSource,
+    pub reason: String,
+}
+
+impl std::fmt::Display for RejectedSweep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let txid: String = self
+            .outpoint
+            .txid
+            .iter()
+            .rev()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        write!(
+            f,
+            "note {txid}:{}:{} ({} zatoshi) was refused ({}). Nothing moved and no fee was \
+             paid. ",
+            self.outpoint.js_index, self.outpoint.output_index, self.value, self.reason
+        )?;
+        match (self.kind, self.source) {
+            (Refusal::UnknownAnchor, NoteSource::WalletFile) => write!(
+                f,
+                "The node does not recognise the tree root this note's cached witness proves \
+                 against, so the witness in the wallet file is stale or damaged. The full-block \
+                 scan builds a fresh one from the chain."
+            ),
+            (Refusal::UnknownAnchor, _) => write!(
+                f,
+                "The node does not recognise the root of the witness the scan built. Running \
+                 the scan again from its checkpoint rebuilds it against the current chain."
+            ),
+            (_, NoteSource::WalletFile) => write!(
+                f,
+                "The network says it is already spent, though this wallet file shows it \
+                 unspent — most likely it was spent from another copy of this wallet. The \
+                 full-block scan (`argos scan-sprout --wallet-file …`, or Scan for Sprout notes \
+                 in the app) confirms that from the chain."
+            ),
+            (_, _) => write!(
+                f,
+                "The network says it is already spent. The scan saw it unspent up to the \
+                 height it reached, so it was spent since the scan — or an earlier sweep \
+                 already sent it and it is waiting in the mempool."
+            ),
+        }
+    }
+}
+
+/// Record a refused note. Only called for refusals about the note itself;
+/// the sweep then carries on to the next.
+fn record_rejection(
+    outcome: &mut SproutSweepOutcome,
+    note: &SpendableSproutNote,
+    kind: Refusal,
+    source: NoteSource,
+    reason: String,
+) {
+    outcome.rejected.push(RejectedSweep {
+        outpoint: note.outpoint,
+        value: note.note.value,
+        kind,
+        source,
+        reason,
+    });
+}
+
 /// The result of sweeping every recoverable note.
 #[derive(Debug, Clone, Default)]
 pub struct SproutSweepOutcome {
@@ -310,6 +387,12 @@ pub struct SproutSweepOutcome {
     /// user who sees a smaller total than expected needs to know which notes
     /// did not move.
     pub skipped: Vec<String>,
+    /// Notes the network refused, and what it said. The sweep carries on
+    /// past these: a refused transaction moved nothing, each note is its own
+    /// transaction, and the usual cause — the note was spent from another
+    /// copy of the wallet, which the file cannot know — says nothing about
+    /// the notes after it.
+    pub rejected: Vec<RejectedSweep>,
     /// What went wrong, when something did.
     ///
     /// Carried in a successful-looking outcome rather than returned as an
@@ -427,6 +510,127 @@ pub fn branch_id_for_height(network: crate::ZeckNetwork, height: u32) -> BranchI
     BranchId::for_height(&params, BlockHeight::from_u32(height))
 }
 
+/// Where the notes being swept came from. It decides what a refusal means,
+/// and so what the user is told to do about it: a note from the wallet file
+/// was judged unspent by the file's own history, one from the scan by the
+/// chain up to where the scan reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoteSource {
+    #[default]
+    WalletFile,
+    Scan,
+}
+
+/// Everything about a sweep beyond what to sweep and where to send it.
+#[derive(Debug, Clone, Default)]
+pub struct SweepOptions {
+    pub source: NoteSource,
+}
+
+/// What the sweep needs from the network: the tip, and a way to broadcast.
+/// lightwalletd in production; a script in tests, so the loop's decisions —
+/// which refusals it carries on past, which stop it — are exercised rather
+/// than only described.
+pub(crate) trait SweepNode {
+    async fn tip(&mut self) -> Result<u32, String>;
+    /// `Ok((code, message))` is the node's answer, `code == 0` meaning it
+    /// accepted the transaction and `message` then being its txid. `Err` is
+    /// a transport failure, which says nothing about whether it landed.
+    async fn send(&mut self, raw: Vec<u8>) -> Result<(i32, String), String>;
+}
+
+struct Lightwalletd(
+    zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<
+        tonic::transport::Channel,
+    >,
+);
+
+impl SweepNode for Lightwalletd {
+    async fn tip(&mut self) -> Result<u32, String> {
+        use zcash_client_backend::proto::service::ChainSpec;
+        self.0
+            .get_latest_block(ChainSpec {})
+            .await
+            .map(|r| r.into_inner().height as u32)
+            .map_err(|err| err.to_string())
+    }
+
+    async fn send(&mut self, raw: Vec<u8>) -> Result<(i32, String), String> {
+        use zcash_client_backend::proto::service::RawTransaction;
+        self.0
+            .send_transaction(RawTransaction {
+                data: raw,
+                height: 0,
+            })
+            .await
+            .map(|r| {
+                let r = r.into_inner();
+                (r.error_code, r.error_message)
+            })
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// What a refusal says about the note, read from the node's reject reason.
+///
+/// lightwalletd passes the node's RPC error through unchanged, and the code
+/// is too coarse to act on — zcashd's `-26` covers both "this note is spent"
+/// and "this transaction is too big", and Zebra reports every verifier
+/// failure under one legacy code. So the reason text decides. The strings are
+/// zcashd's `ShieldedReqRejectReason` and `AcceptToMemoryPool` reasons and
+/// Zebra's `ValidateContextError` / mempool rejection messages, checked
+/// against their source. Anything unrecognised is treated as being about the
+/// node, which stops the sweep: carrying on past a refusal costs a proving
+/// run, so only a refusal known to be about this note alone is carried past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The note's nullifier is already on chain or in the mempool.
+    Spent,
+    /// The node does not know the tree root the note's witness proves
+    /// against — the witness, not the note, is the problem.
+    UnknownAnchor,
+    /// The transaction's expiry height had passed by the time it arrived.
+    Expired,
+    /// Anything else: the node's state, or the transaction as a whole.
+    Other,
+}
+
+/// zcashd's `RPC_CLIENT_IN_INITIAL_DOWNLOAD` and `RPC_IN_WARMUP`: the node
+/// cannot judge any transaction yet. Decided by code alone, before any
+/// message is read — whatever it says, every note would meet the same answer.
+const NODE_NOT_READY: [i32; 2] = [-10, -28];
+
+pub fn classify_refusal(code: i32, reason: &str) -> Refusal {
+    if NODE_NOT_READY.contains(&code) {
+        return Refusal::Other;
+    }
+    let r = reason.to_ascii_lowercase();
+    let any = |needles: &[&str]| needles.iter().any(|n| r.contains(n));
+    if any(&[
+        "bad-txns-sprout-duplicate-nullifier",
+        "sprout double-spend",
+        "already spent some of its inputs",
+        "nullifiers were revealed",
+    ]) {
+        Refusal::Spent
+    } else if any(&["bad-txns-sprout-unknown-anchor", "unknown sprout anchor"]) {
+        Refusal::UnknownAnchor
+    } else if any(&[
+        "tx-expiring-soon",
+        "tx-overwinter-expired",
+        "reached transaction expiry height",
+    ]) {
+        Refusal::Expired
+    } else {
+        Refusal::Other
+    }
+}
+
+/// How many blocks after the tip read just before building a note its
+/// transaction may still be mined. Read per note, so a long sweep never
+/// builds against a tip that has moved on.
+const EXPIRY_DELTA: u32 = 40;
+
 /// Prove and broadcast a sweep of every recoverable note.
 ///
 /// One transaction per note, because a JoinSplit takes two inputs and
@@ -440,11 +644,9 @@ pub async fn sweep_sprout_notes(
     lightwalletd_url: &str,
     destination: &str,
     params_path: &Path,
-    memo: [u8; 512],
-    mut progress: impl FnMut(String),
+    options: SweepOptions,
+    progress: impl FnMut(String),
 ) -> ZeckResult<SproutSweepOutcome> {
-    use zcash_client_backend::proto::service::{ChainSpec, RawTransaction};
-
     let (sapling_dest, destination_kind) = parse_sapling_destination_kind(destination, network)?;
 
     // Every other fund-moving path checks that lightwalletd serves the chain
@@ -455,28 +657,72 @@ pub async fn sweep_sprout_notes(
     // chain to the next one, so a comma-separated list is honoured here as
     // it is everywhere else. And before the proving parameters: a wrong
     // server should be reported in seconds, not after ~725 MB is read.
-    let (mut client, _endpoint, _info) =
+    let (client, _endpoint, _info) =
         crate::scan::probe_valid_lightwalletd_endpoints(lightwalletd_url, network).await?;
 
     let proving_key = load_params(params_path)?;
     let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
-    let tip = client
-        .get_latest_block(ChainSpec {})
-        .await
-        .map_err(|err| ZeckError::Broadcast(format!("could not reach lightwalletd: {err}")))?
-        .into_inner()
-        .height as u32;
-    let branch_id = branch_id_for_height(network, tip);
 
-    let mut outcome = SproutSweepOutcome {
-        destination_kind: Some(destination_kind),
-        ..Default::default()
-    };
+    let mut node = Lightwalletd(client);
+    let mut outcome = run_sweep(
+        notes,
+        &mut node,
+        network,
+        |note: &SpendableSproutNote, expiry: BlockHeight, branch_id: BranchId| {
+            build_sweep_for_note(
+                note,
+                sapling_dest,
+                branch_id,
+                expiry,
+                &proving_key,
+                &sapling_prover,
+                [0u8; 512],
+                rand_core::OsRng,
+            )
+        },
+        options.source,
+        progress,
+    )
+    .await;
+    outcome.destination_kind = Some(destination_kind);
+    Ok(outcome)
+}
+
+/// A note as a user can find it again: its place in this sweep, from one,
+/// and its outpoint.
+fn note_label(index: usize, total: usize, note: &SpendableSproutNote) -> String {
+    let txid: String = note
+        .outpoint
+        .txid
+        .iter()
+        .rev()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!(
+        "note {} of {total} ({txid}:{}:{})",
+        index + 1,
+        note.outpoint.js_index,
+        note.outpoint.output_index
+    )
+}
+
+/// The sweep's decisions, separated from lightwalletd and the prover.
+pub(crate) async fn run_sweep(
+    notes: &[SpendableSproutNote],
+    node: &mut impl SweepNode,
+    network: crate::ZeckNetwork,
+    mut build: impl FnMut(&SpendableSproutNote, BlockHeight, BranchId) -> ZeckResult<BuiltSproutSweep>,
+    source: NoteSource,
+    mut progress: impl FnMut(String),
+) -> SproutSweepOutcome {
+    let mut outcome = SproutSweepOutcome::default();
+    let total = notes.len();
 
     for (index, note) in notes.iter().enumerate() {
+        let label = note_label(index, total, note);
         if note.note.value <= SPROUT_SWEEP_FEE {
             outcome.skipped.push(format!(
-                "note {index}: holds {} zatoshi, below the {SPROUT_SWEEP_FEE} zatoshi fee",
+                "{label}: holds {} zatoshi, below the {SPROUT_SWEEP_FEE} zatoshi fee",
                 note.note.value
             ));
             continue;
@@ -487,68 +733,104 @@ pub async fn sweep_sprout_notes(
         if !note_is_consistent(note) {
             outcome
                 .skipped
-                .push(format!("note {index}: does not match its own commitment"));
+                .push(format!("{label}: does not match its own commitment"));
             continue;
         }
 
-        progress(format!("proving note {} of {}", index + 1, notes.len()));
-        let built = match build_sweep_for_note(
-            note,
-            sapling_dest,
-            branch_id,
-            BlockHeight::from_u32(tip + 40),
-            &proving_key,
-            &sapling_prover,
-            memo,
-            rand_core::OsRng,
-        ) {
-            Ok(built) => built,
+        // Read for every note, not once: at minutes per proof, a single
+        // expiry height goes stale within the first twenty notes of a large
+        // sweep, and every note after that is refused as expired.
+        let tip = match node.tip().await {
+            Ok(tip) => tip,
             Err(err) => {
-                outcome.error = Some(format!("note {index} could not be built: {err}"));
-                return Ok(outcome);
+                outcome.error = Some(format!(
+                    "could not read the chain tip before {label} ({err}). Nothing was sent \
+                     for it; notes swept before it are listed above."
+                ));
+                return outcome;
+            }
+        };
+        let branch_id = branch_id_for_height(network, tip);
+        let expiry = BlockHeight::from_u32(tip + EXPIRY_DELTA);
+
+        progress(format!("proving {label}"));
+        let built = match build(note, expiry, branch_id) {
+            Ok(built) => built,
+            // Not skipped: the build failures that come after proving — the
+            // fee cross-check, the Sapling output, the bundle — are about the
+            // destination and the transaction shape, not this note, so every
+            // remaining note would pay a proving run to fail the same way.
+            // Note-specific problems (a bad witness, a value below the fee)
+            // are caught before this point, without proving.
+            Err(err) => {
+                outcome.error = Some(format!(
+                    "{label} could not be built: {err}. Nothing was sent for it. The sweep \
+                     stopped rather than prove the remaining notes into the same failure; \
+                     notes swept before it are listed above."
+                ));
+                return outcome;
             }
         };
 
-        let response = match client
-            .send_transaction(RawTransaction {
-                data: built.raw,
-                height: 0,
-            })
-            .await
-        {
-            Ok(r) => r.into_inner(),
+        let (code, message) = match node.send(built.raw).await {
+            Ok(reply) => reply,
             Err(err) => {
                 // A transport failure is not proof the node refused it: the
                 // transaction may already be in the mempool. Say so, rather
                 // than implying nothing happened.
                 outcome.error = Some(format!(
-                    "note {index} could not be confirmed as sent ({err}). It may or may \
-                     not have reached the network — check the destination before retrying, \
-                     because re-sweeping an accepted note is rejected as a double spend."
+                    "{label} could not be confirmed as sent ({err}). It may or may not have \
+                     reached the network — check the destination before retrying, because \
+                     re-sweeping an accepted note is rejected as a double spend."
                 ));
-                return Ok(outcome);
+                return outcome;
             }
         };
-        if response.error_code != 0 {
-            outcome.error = Some(format!(
-                "the node rejected the sweep of note {index}: {}",
-                if response.error_message.is_empty() {
-                    format!("error code {}", response.error_code)
-                } else {
-                    response.error_message
+        if code != 0 {
+            let reason = if message.is_empty() {
+                format!("error code {code}")
+            } else {
+                message
+            };
+            progress(format!("{label} was refused: {reason}"));
+            match classify_refusal(code, &reason) {
+                kind @ (Refusal::Spent | Refusal::UnknownAnchor) => {
+                    record_rejection(&mut outcome, note, kind, source, reason);
+                    continue;
                 }
-            ));
-            return Ok(outcome);
+                Refusal::Expired => {
+                    outcome.error = Some(format!(
+                        "{label} was refused as expired ({reason}). It was built to expire \
+                         {EXPIRY_DELTA} blocks after the tip read just before building it, so \
+                         either proving it took longer than that or the server's chain is \
+                         behind. Nothing was sent for it. The sweep stopped rather than prove \
+                         the remaining notes into the same refusal."
+                    ));
+                    return outcome;
+                }
+                Refusal::Other => {
+                    outcome.error = Some(format!(
+                        "the node refused {label} for a reason that is not about this note: \
+                         {reason}. Nothing was sent for it. The sweep stopped rather than prove \
+                         the remaining notes into the same refusal; notes swept before it are \
+                         listed above."
+                    ));
+                    return outcome;
+                }
+            }
         }
 
-        outcome.total_swept += built.value_swept;
+        // Reported now, not only in the returned outcome: a sweep killed
+        // partway must already have shown every txid it broadcast.
+        progress(format!("swept {label} in {}", built.txid));
+        outcome.total_swept = outcome.total_swept.saturating_add(built.value_swept);
         outcome.sent.push(SentSweep {
             txid: built.txid,
             value_swept: built.value_swept,
         });
     }
 
-    Ok(outcome)
+    outcome
 }
 
 fn random_bytes(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> [u8; 32] {
@@ -576,6 +858,333 @@ mod tests {
     use super::*;
     use crate::sprout::SproutPaymentAddress;
     use argos_wallet_import::keys::JsOutPoint;
+
+    /// Kristi's F5 on #239: the plan printed before confirmation must not
+    /// wrap. Two notes near half of `u64::MAX` saturate rather than show a
+    /// tiny gross.
+    #[test]
+    fn the_plan_saturates_instead_of_wrapping() {
+        let plan = plan_sweep(&[note(u64::MAX / 2 + 1), note(u64::MAX / 2 + 1)]).unwrap();
+        assert_eq!(plan.gross_zatoshis, u64::MAX);
+        assert!(plan.net_zatoshis > u64::MAX / 2);
+    }
+
+    /// Every note is tried: fifty refusals about the notes themselves, and
+    /// every note is still built and sent.
+    #[test]
+    fn refusals_about_notes_never_stop_the_sweep() {
+        let replies = (0..50)
+            .map(|_| Ok((-26, "bad-txns-sprout-duplicate-nullifier")))
+            .collect();
+        let mut node = ScriptedNode::new(replies);
+        let values: Vec<u64> = (0..50).map(|i| 1_000_000 + i).collect();
+        let (outcome, expiries) = run(&notes(&values), &mut node, NoteSource::WalletFile);
+        assert_eq!(expiries.len(), 50);
+        assert_eq!(outcome.rejected.len(), 50);
+        assert!(outcome.error.is_none());
+    }
+
+    /// A node that answers from a script: each `send` pops the next reply,
+    /// and `tip` advances by `blocks_per_note` every time it is asked.
+    struct ScriptedNode {
+        tip: u32,
+        blocks_per_note: u32,
+        replies: std::collections::VecDeque<Result<(i32, String), String>>,
+        sent: usize,
+    }
+
+    impl ScriptedNode {
+        fn new(replies: Vec<Result<(i32, &str), &str>>) -> Self {
+            Self {
+                tip: 3_000_000,
+                blocks_per_note: 25,
+                replies: replies
+                    .into_iter()
+                    .map(|r| r.map(|(c, m)| (c, m.to_owned())).map_err(str::to_owned))
+                    .collect(),
+                sent: 0,
+            }
+        }
+    }
+
+    impl SweepNode for ScriptedNode {
+        async fn tip(&mut self) -> Result<u32, String> {
+            let tip = self.tip;
+            self.tip += self.blocks_per_note;
+            Ok(tip)
+        }
+        async fn send(&mut self, _raw: Vec<u8>) -> Result<(i32, String), String> {
+            self.sent += 1;
+            self.replies
+                .pop_front()
+                .expect("the script ran out: the sweep sent more than the test expected")
+        }
+    }
+
+    /// Run the real loop against a scripted node and a builder that records
+    /// the expiry height it was asked for instead of proving.
+    fn run(
+        notes: &[SpendableSproutNote],
+        node: &mut ScriptedNode,
+        source: NoteSource,
+    ) -> (SproutSweepOutcome, Vec<u32>) {
+        let mut expiries = Vec::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a test runtime");
+        let outcome = runtime.block_on(run_sweep(
+            notes,
+            node,
+            crate::ZeckNetwork::Mainnet,
+            |note: &SpendableSproutNote, expiry: BlockHeight, _branch| {
+                expiries.push(u32::from(expiry));
+                Ok(BuiltSproutSweep {
+                    txid: format!("sweep-of-{}", note.note.value),
+                    raw: Vec::new(),
+                    value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                })
+            },
+            source,
+            |_| {},
+        ));
+        (outcome, expiries)
+    }
+
+    /// [`run`], with a builder that fails every note and the progress lines.
+    fn run_failing_build(
+        notes: &[SpendableSproutNote],
+        node: &mut ScriptedNode,
+    ) -> (SproutSweepOutcome, usize, Vec<String>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut built = 0;
+        let mut lines = Vec::new();
+        let outcome = runtime.block_on(run_sweep(
+            notes,
+            node,
+            crate::ZeckNetwork::Mainnet,
+            |_: &SpendableSproutNote, _: BlockHeight, _| {
+                built += 1;
+                Err(ZeckError::TransactionBuild(
+                    "the Sapling bundle has no output".into(),
+                ))
+            },
+            NoteSource::WalletFile,
+            |line| lines.push(line),
+        ));
+        (outcome, built, lines)
+    }
+
+    /// Kristi's round-4 finding 1 on #239: the build failures that come
+    /// after proving are about the fee, the destination or the bundle, not
+    /// the note — so carrying on proves every remaining note into the same
+    /// failure. A build failure stops the sweep, and says so.
+    #[test]
+    fn a_build_failure_stops_the_sweep() {
+        let mut node = ScriptedNode::new(vec![]);
+        let (outcome, built, _) =
+            run_failing_build(&notes(&[1_000_000, 2_000_000, 3_000_000]), &mut node);
+        assert_eq!(built, 1, "no second proving run");
+        let error = outcome
+            .error
+            .expect("the sweep did not finish, and must say so");
+        assert!(error.contains("could not be built"), "{error}");
+        assert!(outcome.skipped.is_empty());
+    }
+
+    /// Finding 7: an accepted broadcast is reported the moment it happens,
+    /// so a sweep killed partway has already shown every txid it sent.
+    #[test]
+    fn every_broadcast_is_reported_as_it_happens() {
+        let mut node = ScriptedNode::new(vec![Ok((0, "x")), Ok((0, "y"))]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut lines = Vec::new();
+        runtime.block_on(run_sweep(
+            &notes(&[1_000_000, 2_000_000]),
+            &mut node,
+            crate::ZeckNetwork::Mainnet,
+            |note: &SpendableSproutNote, _: BlockHeight, _| {
+                Ok(BuiltSproutSweep {
+                    txid: format!("sweep-of-{}", note.note.value),
+                    raw: Vec::new(),
+                    value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                })
+            },
+            NoteSource::WalletFile,
+            |line| lines.push(line),
+        ));
+        for txid in ["sweep-of-1000000", "sweep-of-2000000"] {
+            assert!(
+                lines.iter().any(|l| l.contains(txid)),
+                "{txid} not reported: {lines:?}"
+            );
+        }
+    }
+
+    fn notes(values: &[u64]) -> Vec<SpendableSproutNote> {
+        values.iter().map(|v| note(*v)).collect()
+    }
+
+    /// Kristi's F2 on #239: one expiry height for a sweep of hundreds of
+    /// notes goes stale within the first twenty, after which every note is
+    /// refused as expired and blamed on a spend. Each note is built against
+    /// the tip as it is when that note is built.
+    #[test]
+    fn each_note_expires_relative_to_the_tip_when_it_is_built() {
+        let mut node = ScriptedNode::new(vec![Ok((0, "a")), Ok((0, "b")), Ok((0, "c"))]);
+        let (outcome, expiries) = run(
+            &notes(&[1_000_000, 2_000_000, 3_000_000]),
+            &mut node,
+            NoteSource::WalletFile,
+        );
+        assert_eq!(outcome.sent.len(), 3);
+        assert_eq!(expiries, vec![3_000_040, 3_000_065, 3_000_090]);
+    }
+
+    /// The headline behaviour, driven through the real loop: a note the
+    /// network says is already spent is recorded and the next is tried.
+    /// Both node implementations' wording, from their source.
+    #[test]
+    fn a_spent_note_is_recorded_and_the_next_one_is_still_swept() {
+        for spent in [
+            "bad-txns-sprout-duplicate-nullifier",
+            "transaction did not pass consensus validation: sprout double-spend: duplicate nullifier: Nullifier(..)",
+            "transaction rejected because another transaction in the mempool has already spent some of its inputs",
+            "bad-txns-sprout-unknown-anchor",
+            "unknown Sprout anchor: Root(..)",
+        ] {
+            let mut node = ScriptedNode::new(vec![Ok((-26, spent)), Ok((0, "ok"))]);
+            let (outcome, _) = run(&notes(&[1_000_000, 2_000_000]), &mut node, NoteSource::WalletFile);
+            assert_eq!(outcome.rejected.len(), 1, "{spent}");
+            assert_eq!(outcome.sent.len(), 1, "{spent}: the next note must still be swept");
+            assert!(outcome.error.is_none(), "{spent}");
+        }
+    }
+
+    /// Kristi's F1 on #239: the node's own state is not a verdict on the
+    /// note. Carrying on would prove every remaining note into the same
+    /// refusal, so these stop, naming what the node said.
+    #[test]
+    fn a_refusal_about_the_node_stops_the_sweep() {
+        for (code, message) in [
+            (-10, "Zcash is downloading blocks..."),
+            (-28, "Loading block index..."),
+            (-26, "bad-txns-oversize"),
+            (
+                -25,
+                "mempool is disabled since synchronization is behind the chain tip",
+            ),
+        ] {
+            let mut node = ScriptedNode::new(vec![Ok((code, message))]);
+            let (outcome, expiries) = run(
+                &notes(&[1_000_000, 2_000_000]),
+                &mut node,
+                NoteSource::WalletFile,
+            );
+            assert_eq!(expiries.len(), 1, "{message}: no second note may be proved");
+            assert!(
+                outcome.rejected.is_empty(),
+                "{message}: not a verdict on the note"
+            );
+            let error = outcome.error.expect("stopping must say why");
+            assert!(error.contains(message), "{error}");
+            assert!(!error.contains("another copy"), "{error}");
+        }
+    }
+
+    /// `-10`/`-28` mean the node cannot judge anything yet. The code alone
+    /// decides it, even if the message happens to read like a spend.
+    #[test]
+    fn a_node_that_is_not_ready_stops_the_sweep_whatever_it_says() {
+        for code in [-10, -28] {
+            assert_eq!(
+                classify_refusal(code, "bad-txns-sprout-duplicate-nullifier"),
+                Refusal::Other
+            );
+            let mut node =
+                ScriptedNode::new(vec![Ok((code, "sprout double-spend: duplicate nullifier"))]);
+            let (outcome, expiries) = run(
+                &notes(&[1_000_000, 2_000_000]),
+                &mut node,
+                NoteSource::WalletFile,
+            );
+            assert_eq!(expiries.len(), 1, "code {code}: no second proving run");
+            assert!(outcome.rejected.is_empty());
+            assert!(outcome.error.is_some());
+        }
+    }
+
+    #[test]
+    fn an_expired_sweep_stops_and_says_so() {
+        for message in [
+            "tx-expiring-soon",
+            "tx-overwinter-expired",
+            "best chain tip has reached transaction expiry height",
+        ] {
+            let mut node = ScriptedNode::new(vec![Ok((-26, message))]);
+            let (outcome, expiries) = run(
+                &notes(&[1_000_000, 2_000_000]),
+                &mut node,
+                NoteSource::WalletFile,
+            );
+            assert_eq!(expiries.len(), 1, "{message}");
+            let error = outcome.error.expect("stopping must say why");
+            assert!(error.contains("expir"), "{error}");
+            assert!(!error.contains("another copy"), "{error}");
+        }
+    }
+
+    /// A transport failure cannot say whether the transaction landed.
+    #[test]
+    fn a_transport_failure_stops_the_sweep() {
+        let mut node = ScriptedNode::new(vec![Err("connection reset")]);
+        let (outcome, expiries) = run(
+            &notes(&[1_000_000, 2_000_000]),
+            &mut node,
+            NoteSource::WalletFile,
+        );
+        assert_eq!(expiries.len(), 1);
+        assert!(outcome
+            .error
+            .unwrap()
+            .contains("may or may not have reached"));
+    }
+
+    /// Kristi's F6: the advice depends on where the notes came from. Notes
+    /// from the chain scan must not be sent back to the chain scan.
+    #[test]
+    fn a_refused_note_is_explained_by_where_it_came_from() {
+        let refused = |source| {
+            let mut node =
+                ScriptedNode::new(vec![Ok((-26, "bad-txns-sprout-duplicate-nullifier"))]);
+            run(&notes(&[1_000_000]), &mut node, source).0.rejected[0].to_string()
+        };
+        let from_file = refused(NoteSource::WalletFile);
+        assert!(from_file.contains("another copy"), "{from_file}");
+        let from_scan = refused(NoteSource::Scan);
+        assert!(!from_scan.contains("scan-sprout"), "{from_scan}");
+        assert!(from_scan.contains("since the scan"), "{from_scan}");
+    }
+
+    /// Notes are numbered from one everywhere a user reads them, and name
+    /// their outpoint (Kristi's F13).
+    #[test]
+    fn a_skipped_note_is_numbered_from_one_and_named() {
+        let mut node = ScriptedNode::new(vec![Ok((0, "ok"))]);
+        let (outcome, _) = run(
+            &notes(&[1_000, 2_000_000]),
+            &mut node,
+            NoteSource::WalletFile,
+        );
+        assert!(
+            outcome.skipped[0].starts_with("note 1 of 2 ("),
+            "{}",
+            outcome.skipped[0]
+        );
+    }
 
     fn note(value: u64) -> SpendableSproutNote {
         let a_sk = [0x42u8; 32];
@@ -708,7 +1317,7 @@ mod tests {
             "nonono",
             &destination,
             Path::new("/nonexistent/sprout-groth16.params"),
-            [0u8; 512],
+            SweepOptions::default(),
             |_| {},
         )
         .await

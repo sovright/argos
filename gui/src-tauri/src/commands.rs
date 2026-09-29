@@ -298,6 +298,17 @@ pub struct WalletFileSummary {
     /// What a full-block Sprout scan would cost, in the user's terms.
     /// Rendered from `argos-core` so the GUI and CLI cannot drift.
     pub sprout_scan_warning: Vec<String>,
+    /// Why the Sprout total is what it is — notes the wallet spent, dust,
+    /// unconfirmed spends, unreadable transactions. From `argos-core`, the
+    /// same sentences the CLI prints.
+    pub sprout_accounting: Vec<String>,
+    /// Every Sprout note was spent by the wallet itself or is dust. Not a
+    /// case for the full-block scan, and must not be presented as one.
+    pub sprout_nothing_left: bool,
+    /// Some of the file's note data was read, even if nothing is spendable.
+    pub sprout_history_read: bool,
+    /// The limit of reading spends from a file, shown before a sweep.
+    pub sprout_spent_status: String,
     /// True when the file yielded a BIP-39 mnemonic, which means it re-enters
     /// the ordinary HD pipeline and scans and sweeps like a typed seed.
     pub has_mnemonic: bool,
@@ -383,6 +394,9 @@ struct SproutSummary {
     sprout_spendable_zatoshis: u64,
     sprout_issues: Vec<String>,
     sprout_scan_warning: Vec<String>,
+    sprout_accounting: Vec<String>,
+    sprout_nothing_left: bool,
+    sprout_history_read: bool,
 }
 
 /// Compute the Sprout summary for a wallet. Body is verbatim the logic that
@@ -401,7 +415,13 @@ fn compute_sprout_summary(
     let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(keys);
 
     let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(keys);
-    let needs_scan = !keys.sprout.is_empty() && recovered.notes.is_empty();
+    let SproutScreen {
+        nothing_left,
+        needs_scan,
+        history_read,
+    } = sprout_screen(!keys.sprout.is_empty(), &recovered);
+    let mut accounting = recovered.accounting_lines();
+    accounting.extend(argos_core::sprout_recovery::unreadable_transactions_warning(keys));
 
     SproutSummary {
         sprout_keys: keys.sprout.len(),
@@ -435,6 +455,34 @@ fn compute_sprout_summary(
         } else {
             Vec::new()
         },
+        sprout_accounting: accounting,
+        sprout_nothing_left: nothing_left,
+        sprout_history_read: history_read,
+    }
+}
+
+/// What the Sprout section of the wallet screen should say.
+#[derive(Debug, PartialEq, Eq)]
+struct SproutScreen {
+    /// Every note was spent by the wallet itself or is dust.
+    nothing_left: bool,
+    /// Nothing spendable came out of the file, and something might still be
+    /// found from the chain.
+    needs_scan: bool,
+    /// Some of the file's note data was read — so "this file holds no note
+    /// data" would be false, even when nothing is spendable.
+    history_read: bool,
+}
+
+fn sprout_screen(
+    has_keys: bool,
+    recovered: &argos_core::sprout_recovery::SproutRecovery,
+) -> SproutScreen {
+    let nothing_left = has_keys && recovered.nothing_left_to_sweep();
+    SproutScreen {
+        nothing_left,
+        needs_scan: has_keys && recovered.notes.is_empty() && !nothing_left,
+        history_read: !(recovered.spent.is_empty() && recovered.dust.is_empty()),
     }
 }
 
@@ -476,6 +524,10 @@ pub async fn inspect_wallet_file(
                     sprout_spendable_zatoshis: 0,
                     sprout_issues: Vec::new(),
                     sprout_scan_warning: Vec::new(),
+                    sprout_accounting: Vec::new(),
+                    sprout_nothing_left: false,
+                    sprout_history_read: false,
+                    sprout_spent_status: String::new(),
                     has_mnemonic: false,
                     transparent_only: false,
                     diagnostics: Vec::new(),
@@ -504,6 +556,10 @@ pub async fn inspect_wallet_file(
         sprout_spendable_zatoshis: sprout.sprout_spendable_zatoshis,
         sprout_issues: sprout.sprout_issues,
         sprout_scan_warning: sprout.sprout_scan_warning,
+        sprout_accounting: sprout.sprout_accounting,
+        sprout_nothing_left: sprout.sprout_nothing_left,
+        sprout_history_read: sprout.sprout_history_read,
+        sprout_spent_status: argos_core::sprout_recovery::SPENT_STATUS_IS_THE_FILES.to_owned(),
         has_mnemonic: keys.mnemonic.is_some(),
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
@@ -870,6 +926,9 @@ pub struct SproutSweepReport {
     /// a user seeing less than expected needs to know which notes stayed
     /// behind.
     pub skipped: Vec<String>,
+    /// Notes the network refused. The sweep carried on past each; nothing
+    /// moved for them and no fee was paid.
+    pub rejected: Vec<String>,
     /// Set when the sweep stopped partway. `sent` still lists what was
     /// broadcast before it did — those funds have moved.
     pub error: Option<String>,
@@ -917,7 +976,9 @@ pub async fn execute_sprout_sweep(
         &lightwalletd_url,
         &destination,
         &params_path,
-        [0u8; 512],
+        argos_core::sprout_sweep::SweepOptions {
+            source: argos_core::sprout_sweep::NoteSource::WalletFile,
+        },
         move |msg| {
             let _ = emitter.emit("sprout-sweep-progress", msg);
         },
@@ -938,6 +999,7 @@ pub async fn execute_sprout_sweep(
         landed_in_unified_sapling: outcome.destination_kind
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
+        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
         error: outcome.error,
     })
 }
@@ -1306,7 +1368,9 @@ pub async fn sweep_sprout_from_scan(
         &lightwalletd_url,
         &destination,
         &params_path,
-        [0u8; 512],
+        argos_core::sprout_sweep::SweepOptions {
+            source: argos_core::sprout_sweep::NoteSource::Scan,
+        },
         move |msg| {
             let _ = emitter.emit("sprout-sweep-progress", msg);
         },
@@ -1327,6 +1391,7 @@ pub async fn sweep_sprout_from_scan(
         landed_in_unified_sapling: outcome.destination_kind
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
+        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
         error: outcome.error,
     })
 }
@@ -1900,6 +1965,56 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    use argos_core::sprout_recovery::{SpentSproutNote, SproutRecovery};
+
+    fn spent_note() -> SpentSproutNote {
+        SpentSproutNote {
+            outpoint: argos_core::argos_wallet_import::keys::JsOutPoint {
+                txid: [1; 32],
+                js_index: 0,
+                output_index: 0,
+            },
+            value: 5,
+            spent_in: [2; 32],
+        }
+    }
+
+    /// Kristi's F7/F8 on #239: what the Sprout screen says is decided here,
+    /// not injected by the frontend test, so it is pinned in Rust.
+    #[test]
+    fn the_sprout_screen_matches_what_recovery_found() {
+        // Keys, no note data at all: the scan is the only route.
+        let empty = SproutRecovery::default();
+        let screen = sprout_screen(true, &empty);
+        assert!(screen.needs_scan && !screen.nothing_left && !screen.history_read);
+
+        // Every note spent by the wallet itself: nothing left, no scan needed.
+        let spent = SproutRecovery {
+            spent: vec![spent_note()],
+            ..Default::default()
+        };
+        let screen = sprout_screen(true, &spent);
+        assert!(screen.nothing_left && !screen.needs_scan && screen.history_read);
+
+        // Spent notes plus one unusable note: a scan is still worth it, but
+        // the file's note data was read, so it must not say otherwise.
+        let mixed = SproutRecovery {
+            spent: vec![spent_note()],
+            issues: vec![
+                argos_core::sprout_recovery::SproutRecoveryIssue::NoSpendingKey {
+                    outpoint: spent_note().outpoint,
+                },
+            ],
+            ..Default::default()
+        };
+        let screen = sprout_screen(true, &mixed);
+        assert!(screen.needs_scan && !screen.nothing_left && screen.history_read);
+
+        // No Sprout keys: nothing to say.
+        let screen = sprout_screen(false, &empty);
+        assert!(!screen.needs_scan && !screen.nothing_left);
+    }
+
     use super::*;
 
     fn peers(entries: &[&str]) -> Result<Vec<String>, String> {

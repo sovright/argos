@@ -66,6 +66,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     failNextStatus: () => { failStatus = true; },
     progress: (payload) => onProgress({ payload }),
     sweep: () => vm.runInContext("runSproutSweep()", context),
+    peek: (expr) => vm.runInContext(expr, context),
     async open(path, passphrase = "") {
       $("wallet-path").value = path;
       $("wallet-passphrase").value = passphrase;
@@ -335,4 +336,129 @@ test("a complete read shows no coverage row, and replaces an earlier partial war
   assert.ok(summaryRows(h).includes("Seed phrase: not recovered from this file"));
   assert.equal(summaryRows(h).some((row) => row.startsWith("Recovery coverage:")), false);
   for (const id of LATER_SCREENS) assert.doesNotMatch(h.$(id).textContent, /HD seed/, id);
+});
+
+// #239 review: a wallet whose Sprout notes were all spent must not be told
+// it needs a multi-day scan for note data it does in fact hold.
+function inspected(overrides) {
+  return async (command, args, fallback) => {
+    if (command === "inspect_wallet_file") return { ...(await fallback()), ...overrides };
+    return fallback();
+  };
+}
+const texts = (el) => el.children.map((c) => c.textContent);
+
+test("a wallet that spent every Sprout note says so instead of asking for note data", async () => {
+  const h = harness(inspected({
+    sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
+    sprout_accounting: ["257 note(s) were spent by the wallet itself"],
+    sprout_scan_warning: [], sprout_issues: [],
+  }));
+  await h.open("/fixture/spent.dat");
+  const headline = h.$("wallet-sprout-headline").textContent;
+  assert.doesNotMatch(headline, /scan/i);
+  assert.match(headline, /no Sprout funds are left/i);
+  assert.equal(h.$("wallet-sprout-sweep").hidden, true);
+  assert.deepEqual(h.previews, []);
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), ["257 note(s) were spent by the wallet itself"]);
+});
+
+test("a recoverable wallet shows why its total is what it is, and the file's limit", async () => {
+  const h = harness(inspected({
+    sprout_accounting: ["3 note(s) were spent"],
+    sprout_spent_status: "Spent status comes from this wallet file's own history.",
+  }));
+  await h.open("/fixture/some-spent.dat");
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), ["3 note(s) were spent"]);
+  assert.equal(h.$("wallet-sprout-accounting").hidden, false);
+  assert.match(h.$("sprout-sweep-spent-status").textContent, /own history/);
+});
+
+test("notes the network refused are listed after a sweep", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "execute_sprout_sweep") return {
+      sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [],
+      rejected: ["note bb:0:1 was refused by the network: spent"], error: null,
+    };
+    return fallback();
+  });
+  await h.open("/fixture/first.dat");
+  await flush();
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  const lines = texts(h.$("sprout-sweep-results"));
+  assert.ok(lines.some((l) => /refused by the network/.test(l)), lines.join("\n"));
+  assert.match(h.$("sprout-sweep-status").textContent, /1 note\(s\) refused/);
+});
+
+// #239 review F4: a wallet whose notes all read as spent still offers the
+// scan. The verdict is the file's, and a spend recorded against a block
+// later reorged out reads exactly the same.
+test("a fully spent wallet still offers the full-block scan", async () => {
+  const h = harness(inspected({
+    sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
+    sprout_history_read: true, sprout_accounting: ["2 note(s) were spent"],
+    sprout_scan_warning: [], sprout_issues: [],
+  }));
+  await h.open("/fixture/spent.dat");
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assert.match(h.$("wallet-sprout-headline").textContent, /no Sprout funds are left/i);
+});
+
+// #239 review F8: spent notes plus one unusable note. The file's note data
+// was read, so the headline must not say it was not.
+test("some notes spent and one unusable does not claim the note data is missing", async () => {
+  const h = harness(inspected({
+    sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: false,
+    sprout_history_read: true, sprout_accounting: ["256 note(s) were spent"],
+    sprout_scan_warning: ["cost"], sprout_issues: ["note x: could not decrypt"],
+  }));
+  await h.open("/fixture/mixed.dat");
+  const said = h.$("wallet-sprout-headline").textContent + h.$("wallet-sprout-detail").textContent;
+  assert.doesNotMatch(said, /not the note data/);
+  assert.match(said, /could not be used/);
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+});
+
+// #239 review F7: a refused note may not have been spent at all, so the
+// "Sprout not covered" caveat must survive a sweep with any refusal.
+test("the Sprout caveat survives a sweep in which any note was refused", async () => {
+  for (const [rejected, kept] of [[[], false], [["note bb:0:1 was refused"], true]]) {
+    const h = harness(async (command, args, fallback) => {
+      if (command === "execute_sprout_sweep") return {
+        sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected, error: null,
+      };
+      return fallback();
+    });
+    await h.open("/fixture/first.dat");
+    await flush();
+    h.peek("uncoveredSproutKeys = 1");
+    h.$("sprout-destination").value = "fixture-destination";
+    await h.sweep();
+    assert.equal(h.peek("uncoveredSproutKeys") > 0, kept, `rejected=${rejected.length}`);
+  }
+});
+
+// #239 round 4, findings 5 and 6: a sweep that stopped shows why, and does
+// not clear the "keep the original wallet file" caveat; neither does one
+// that skipped any note.
+test("a sweep that stopped or skipped a note says so and keeps the caveat", async () => {
+  for (const [report, stopped] of [
+    [{ sent: [], total_swept: 0, skipped: [], rejected: [], error: "note 1 of 3 could not be built: bad bundle" }, true],
+    [{ sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: ["note 2 of 2: below the fee"], rejected: [], error: null }, false],
+  ]) {
+    const h = harness(async (command, args, fallback) =>
+      command === "execute_sprout_sweep" ? report : fallback());
+    await h.open("/fixture/first.dat");
+    await flush();
+    h.peek("uncoveredSproutKeys = 1");
+    h.$("sprout-destination").value = "fixture-destination";
+    await h.sweep();
+    const status = h.$("sprout-sweep-status").textContent;
+    if (stopped) {
+      assert.match(status, /did not finish: note 1 of 3 could not be built/);
+      assert.doesNotMatch(status, /✓/);
+    }
+    assert.ok(h.peek("uncoveredSproutKeys") > 0, "the caveat must survive");
+  }
 });
