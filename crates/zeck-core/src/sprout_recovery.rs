@@ -53,7 +53,7 @@
 //! would produce a proof the network rejects, and the failure would surface
 //! at broadcast with the fee already spent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use argos_wallet_import::keys::{ImportedKeys, JsOutPoint, SproutJoinSplit};
 use secrecy::ExposeSecret;
@@ -178,10 +178,22 @@ impl std::fmt::Display for SproutRecoveryIssue {
     }
 }
 
+/// A note this wallet received and later spent itself.
+///
+/// Kept apart from `issues`: nothing is wrong with it, and a long-lived
+/// wallet has hundreds of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpentSproutNote {
+    pub outpoint: JsOutPoint,
+    pub value: u64,
+}
+
 /// The outcome of scanning a wallet for spendable Sprout notes.
 #[derive(Debug, Default)]
 pub struct SproutRecovery {
     pub notes: Vec<SpendableSproutNote>,
+    /// Notes whose nullifier a JoinSplit in this same wallet reveals.
+    pub spent: Vec<SpentSproutNote>,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
@@ -246,7 +258,20 @@ pub fn reject_forged_sprout_keys(keys: &mut ImportedKeys) -> Vec<ForgedSproutKey
     rejected
 }
 
-/// Decrypt every Sprout note the wallet holds a spending key for.
+/// Decrypt every Sprout note the wallet holds a spending key for, and keep
+/// the ones it has not spent.
+///
+/// zcashd keeps a `CSproutNoteData` for every note it ever received, spent
+/// or not — `spentHeight` is memory-only and never written. Spent status is
+/// therefore recomputed the way zcashd itself does it: a note is spent when
+/// its nullifier, `PRF^nf(a_sk, rho)`, appears in a JoinSplit of any
+/// transaction in the wallet. Derived from the decrypted `rho` rather than
+/// read from the record's cached nullifier, which may be absent and, in a
+/// crafted file, could be anything.
+///
+/// This only sees spends the wallet recorded. A note spent from another
+/// copy of the wallet still reads as unspent here; consensus rejects that
+/// sweep, and only the full-block scan knows every nullifier on chain.
 ///
 /// Never fails as a whole: notes that cannot be recovered are reported in
 /// `issues`.
@@ -266,10 +291,21 @@ pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
         .map(|k| (k.address, k.a_sk.expose_secret()))
         .collect();
 
+    let revealed: HashSet<[u8; 32]> = keys
+        .sprout_joinsplits
+        .iter()
+        .flat_map(|js| js.nullifiers)
+        .collect();
+
     let mut out = SproutRecovery::default();
+    let mut seen = HashSet::new();
 
     for note_data in &keys.sprout_notes {
         let outpoint = note_data.outpoint;
+        // One note, one entry: a repeated record must not count twice.
+        if !seen.insert((outpoint.txid, outpoint.js_index, outpoint.output_index)) {
+            continue;
+        }
 
         let Some(js) = by_outpoint.get(&(outpoint.txid, outpoint.js_index)) else {
             out.issues
@@ -314,6 +350,14 @@ pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
                 outpoint,
                 expected,
                 derived,
+            });
+            continue;
+        }
+
+        if revealed.contains(&sprout::prf_nf(a_sk, &note.rho)) {
+            out.spent.push(SpentSproutNote {
+                outpoint,
+                value: note.value,
             });
             continue;
         }
@@ -494,6 +538,75 @@ mod tests {
             crate::sprout_witness::WITNESS_PATH_SIZE
         );
         assert_eq!(recovered.total_value(), 123_456_789);
+    }
+
+    /// A JoinSplit elsewhere in the wallet that reveals `a_sk`'s nullifier
+    /// for this note: the wallet's own record that the note was spent.
+    fn spend_of(keys: &ImportedKeys, a_sk: &[u8; 32]) -> SproutJoinSplit {
+        let mut spend = keys.sprout_joinsplits[0].clone();
+        spend.txid = [0xAB; 32];
+        spend.nullifiers = [[0x01; 32], sprout::prf_nf(a_sk, &[0x11u8; 32])];
+        spend
+    }
+
+    /// The reported failure: a wallet with a long Sprout history showed
+    /// 796,540 ZEC "spendable" — more than the Sprout pool holds — because
+    /// every note it had ever received was offered, spent or not.
+    #[test]
+    fn a_note_the_wallet_spent_is_not_offered_as_spendable() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(
+            recovered.notes.is_empty(),
+            "a spent note must not be offered"
+        );
+        assert_eq!(recovered.total_value(), 0);
+        assert_eq!(recovered.spent.len(), 1, "it must be counted as spent");
+        assert_eq!(recovered.spent[0].value, 1_000);
+        assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
+    }
+
+    /// The nullifier is derived from the key and the decrypted `rho`, never
+    /// taken from the file's cached copy, which zcashd may leave unset and a
+    /// crafted file could set to anything.
+    #[test]
+    fn spent_is_judged_by_the_derived_nullifier_not_the_cached_one() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+        keys.sprout_notes[0].nullifier = Some([0xEE; 32]);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert!(recovered.notes.is_empty());
+        assert_eq!(recovered.spent.len(), 1);
+    }
+
+    #[test]
+    fn an_unrelated_nullifier_does_not_mark_a_note_spent() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        let mut other = keys.sprout_joinsplits[0].clone();
+        other.txid = [0xAB; 32];
+        other.nullifiers = [[0x01; 32], [0x02; 32]];
+        keys.sprout_joinsplits.push(other);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.notes.len(), 1);
+        assert!(recovered.spent.is_empty());
+    }
+
+    #[test]
+    fn a_note_listed_twice_is_counted_once() {
+        let (mut keys, _) = wallet_with_one_note(1_000);
+        let again = keys.sprout_notes[0].clone();
+        keys.sprout_notes.push(again);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.notes.len(), 1);
+        assert_eq!(recovered.total_value(), 1_000);
     }
 
     /// The check that separates "decrypts" from "spendable". A note whose

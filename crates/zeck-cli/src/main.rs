@@ -621,6 +621,12 @@ async fn sweep_sprout(
     confirm_sweep: bool,
 ) -> Result<()> {
     let recovered = recover_spendable_sprout_notes(keys);
+    if !recovered.spent.is_empty() {
+        eprintln!(
+            "{} Sprout note(s) this wallet already spent are not swept.",
+            recovered.spent.len()
+        );
+    }
 
     if recovered.notes.is_empty() {
         eprintln!("No spendable Sprout notes could be recovered from this wallet file.");
@@ -1073,6 +1079,16 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
         let recovered = recover_spendable_sprout_notes(keys);
+        // Said first and in both branches: without it a wallet that spent
+        // everything reads as a failure to recover, and one that spent most
+        // of it gives no reason its total is smaller than its history.
+        if !recovered.spent.is_empty() {
+            println!(
+                "  {} note(s) this wallet already spent were left out ({} in all).",
+                recovered.spent.len(),
+                format_zec(recovered.spent.iter().map(|n| n.value).sum())
+            );
+        }
         if recovered.notes.is_empty() {
             println!("  No spendable Sprout notes were recovered from this file.");
             if !recovered.issues.is_empty() {
