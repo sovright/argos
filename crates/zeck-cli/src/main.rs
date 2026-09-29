@@ -1689,6 +1689,16 @@ async fn main() -> Result<()> {
                     let report =
                         scan_transparent_only(&resolved, network, &cli.lightwalletd_url).await?;
                     print_transparent_report(&report);
+                    if echo_scan_summary(std::io::stdout().is_terminal()) {
+                        eprintln!();
+                        eprintln!(
+                            "Scan finished: {} funded of {} transparent address(es) checked, {} \
+                             in total. Full results were written to stdout.",
+                            report.funded.len(),
+                            report.addresses_checked,
+                            format_zec(report.total_zatoshis)
+                        );
+                    }
                     return Ok(());
                 }
                 Commands::Sweep {
@@ -1836,6 +1846,14 @@ async fn main() -> Result<()> {
 
             let progress = wait_for_scan(&service, &handle).await?;
             print_scan_result(&progress);
+            if echo_scan_summary(std::io::stdout().is_terminal()) {
+                let totals: Vec<u64> = progress.accounts.iter().map(|a| a.total_zatoshis).collect();
+                eprintln!();
+                eprintln!(
+                    "{}",
+                    scan_summary_line(progress.phase, &totals, progress.error.as_deref())
+                );
+            }
             notify_scan_complete(&progress);
             if progress.phase == ScanPhase::Cancelled {
                 std::process::exit(130);
@@ -2488,6 +2506,41 @@ fn format_discovery(discovery: &ScanDiscovery) -> String {
     )
 }
 
+/// One line for stderr when a scan ends: whether it finished, what it
+/// found, and that the full result is on stdout. Needed because the result
+/// goes to stdout alone — redirect that, and a finished scan looks, on the
+/// terminal, exactly like one that found nothing.
+fn scan_summary_line(phase: ScanPhase, account_totals: &[u64], error: Option<&str>) -> String {
+    match phase {
+        ScanPhase::Complete => {
+            let total = account_totals
+                .iter()
+                .fold(0u64, |sum, v| sum.saturating_add(*v));
+            format!(
+                "Scan finished: {} account(s), {} in total (Sapling, Orchard and transparent; \
+                 Sprout is not scanned here). Full results were written to stdout.",
+                account_totals.len(),
+                format_zec(total)
+            )
+        }
+        ScanPhase::Cancelled => {
+            "Scan cancelled. Progress is saved; re-run the same command to resume. Partial \
+             results were written to stdout."
+                .to_owned()
+        }
+        _ => format!(
+            "Scan did not finish: {}. Details were written to stdout.",
+            error.unwrap_or("no reason was given")
+        ),
+    }
+}
+
+/// Only when stdout is not a terminal: on one, the result is already on
+/// screen and the line would repeat it.
+fn echo_scan_summary(stdout_is_terminal: bool) -> bool {
+    !stdout_is_terminal
+}
+
 fn print_scan_result(progress: &argos_core::ScanProgress) {
     println!("Phase: {:?}", progress.phase);
 
@@ -2723,6 +2776,42 @@ fn powershell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scan whose stdout went to a file or a pipe must still say on the
+    /// terminal that it finished, what it found, and where the rest went. A
+    /// user ran a 149-minute scan with stdout redirected, saw nothing, and
+    /// asked whether that meant no funds.
+    #[test]
+    fn a_finished_scan_says_so_on_stderr_when_stdout_is_elsewhere() {
+        let line = scan_summary_line(ScanPhase::Complete, &[150_000_000, 0, 25_000_000], None);
+        assert!(line.contains("finished"), "{line}");
+        assert!(line.contains("3 account(s)"), "{line}");
+        assert!(line.contains("1.75000000 ZEC"), "{line}");
+        assert!(line.contains("stdout"), "{line}");
+
+        let nothing = scan_summary_line(ScanPhase::Complete, &[0, 0], None);
+        assert!(
+            nothing.contains("0 ZEC"),
+            "a zero total is said, not left to silence: {nothing}"
+        );
+
+        let failed = scan_summary_line(ScanPhase::Error, &[], Some("lightwalletd unreachable"));
+        assert!(
+            failed.contains("did not finish") && failed.contains("lightwalletd unreachable"),
+            "{failed}"
+        );
+
+        let cancelled = scan_summary_line(ScanPhase::Cancelled, &[], None);
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+    }
+
+    /// On a terminal the full result is already on screen; the summary
+    /// would only repeat it.
+    #[test]
+    fn the_summary_is_only_echoed_when_stdout_is_not_a_terminal() {
+        assert!(echo_scan_summary(false));
+        assert!(!echo_scan_summary(true));
+    }
 
     #[test]
     fn one_zatoshi() {
