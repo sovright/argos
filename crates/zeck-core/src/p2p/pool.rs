@@ -776,6 +776,7 @@ mod tests {
     async fn reporting_peer(
         answer: Answer,
         closed: tokio::sync::mpsc::UnboundedSender<Closed>,
+        accepted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> String {
         use crate::p2p::wire::{encode_message, encode_version};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -785,6 +786,10 @@ mod tests {
         let peer = addr.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                // Recorded on accept, before anything else: a candidate the
+                // race never reached opened nothing, holds no Zebra slot,
+                // and so has nothing to close.
+                accepted.lock().unwrap().push(peer.clone());
                 let closed = closed.clone();
                 let peer = peer.clone();
                 tokio::spawn(async move {
@@ -831,16 +836,26 @@ mod tests {
     /// reconnect is refused as "every peer is busy". Several peers answer at
     /// once here so that losers finish their handshakes too, alongside two
     /// that never answer and so are cut off mid-handshake. Only the winner
-    /// may still be open a second after the race returns.
+    /// may still be open once [`LOSER_CLOSE_DEADLINE`] has passed.
+    ///
+    /// The deadline is generous on purpose. The fault this guards against is
+    /// a loser held open until Zebra's reconnect window (about two minutes)
+    /// or until the process exits — not one that takes a little over a
+    /// second on a loaded CI runner, which is what a one-second deadline kept
+    /// failing on.
+    /// Far inside Zebra's ~119 s reconnect window, far outside CI jitter.
+    const LOSER_CLOSE_DEADLINE: Duration = Duration::from_secs(10);
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn losing_connections_are_closed_as_soon_as_the_race_is_won() {
         let (tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut candidates = Vec::new();
         for _ in 0..6 {
-            candidates.push(reporting_peer(Answer::Now, tx.clone()).await);
+            candidates.push(reporting_peer(Answer::Now, tx.clone(), accepted.clone()).await);
         }
         for _ in 0..2 {
-            candidates.push(reporting_peer(Answer::Never, tx.clone()).await);
+            candidates.push(reporting_peer(Answer::Never, tx.clone(), accepted.clone()).await);
         }
         drop(tx);
 
@@ -851,26 +866,40 @@ mod tests {
 
         let mut losers = Vec::new();
         while losers.len() < candidates.len() - 1 {
-            match tokio::time::timeout_at(won_at + Duration::from_secs(1), closed.recv()).await {
+            match tokio::time::timeout_at(won_at + LOSER_CLOSE_DEADLINE, closed.recv()).await {
                 Ok(Some(close)) => losers.push(close),
                 Ok(None) => unreachable!("the listeners outlive the test"),
                 Err(_) => break,
             }
         }
         eprintln!(
-            "{} losers closed within 1 s, {} of them after a completed handshake",
+            "{} losers closed within {:?}, {} of them after a completed handshake",
             losers.len(),
+            LOSER_CLOSE_DEADLINE,
             losers.iter().filter(|l| l.handshaken).count()
         );
 
+        // Only a connection the fake peer actually accepted can be left open.
+        // Under load the race can be won before every attempt is scheduled;
+        // those are aborted before they dial, which is correct, and were
+        // being reported here as leaks.
+        let accepted = accepted.lock().unwrap().clone();
+        let never_dialled: Vec<&String> = candidates
+            .iter()
+            .filter(|c| !accepted.contains(c))
+            .collect();
         let still_open: Vec<&String> = candidates
             .iter()
-            .filter(|c| *c != winner.dialled_as() && !losers.iter().any(|l| &l.peer == *c))
+            .filter(|c| {
+                *c != winner.dialled_as()
+                    && accepted.contains(c)
+                    && !losers.iter().any(|l| &l.peer == *c)
+            })
             .collect();
         assert!(
             still_open.is_empty(),
-            "losing connections still open a second after the race: {still_open:?} \
-             (closed: {losers:?})"
+            "losing connections still open {LOSER_CLOSE_DEADLINE:?} after the race: {still_open:?} \
+             (closed: {losers:?}; never dialled, so nothing to close: {never_dialled:?})"
         );
         assert!(
             losers.iter().all(|l| l.peer != winner.dialled_as()),
@@ -880,7 +909,7 @@ mod tests {
         // The winner is released the same way when its owner lets it go.
         let kept = winner.dialled_as().to_owned();
         drop(winner);
-        let last = tokio::time::timeout(Duration::from_secs(1), closed.recv())
+        let last = tokio::time::timeout(LOSER_CLOSE_DEADLINE, closed.recv())
             .await
             .expect("the winner closes once dropped")
             .expect("a close report");
