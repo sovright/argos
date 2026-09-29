@@ -623,6 +623,12 @@ async function runSproutSweep() {
       li.textContent = reason;
       list.appendChild(li);
     }
+    for (const warning of report.warnings ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = warning;
+      list.appendChild(li);
+    }
 
     const refused = (report.rejected ?? []).length;
     setStatus(
@@ -1135,6 +1141,12 @@ async function runSproutScanSweep() {
       const li = document.createElement("li");
       li.className = "muted";
       li.textContent = reason;
+      list.appendChild(li);
+    }
+    for (const warning of report.warnings ?? []) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = warning;
       list.appendChild(li);
     }
     if (report.landed_in_unified_sapling) {

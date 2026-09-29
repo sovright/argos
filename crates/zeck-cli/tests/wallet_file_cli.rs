@@ -676,8 +676,11 @@ fn inspect_wallet_consults_a_scan_of_the_same_keys() {
     let bytes = std::fs::read(&path).expect("fixture is readable");
     let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
         .expect("the plaintext fixture imports");
-    let spending_keys: Vec<[u8; 32]> =
-        keys.sprout.iter().map(|k| *k.a_sk.expose_secret()).collect();
+    let spending_keys: Vec<[u8; 32]> = keys
+        .sprout
+        .iter()
+        .map(|k| *k.a_sk.expose_secret())
+        .collect();
     assert!(!spending_keys.is_empty(), "the fixture holds Sprout keys");
 
     let dir = scratch_dir("chain-spends");
@@ -711,7 +714,11 @@ fn inspect_wallet_consults_a_scan_of_the_same_keys() {
     let _ = std::fs::remove_file(&checkpoint);
 
     let with = String::from_utf8_lossy(&with_scan.stdout);
-    assert!(with_scan.status.success(), "{}", String::from_utf8_lossy(&with_scan.stderr));
+    assert!(
+        with_scan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_scan.stderr)
+    );
     assert!(
         with.contains("full-block scan up to height 2000000"),
         "the scan must be found and named:\n{with}"

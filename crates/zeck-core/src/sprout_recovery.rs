@@ -225,6 +225,9 @@ pub struct SproutRecovery {
     /// The height a full-block scan of these keys reached, when one was
     /// consulted. Spends at or below it are the chain's word, not the file's.
     pub chain_checked_to: Option<u32>,
+    /// Notes an earlier run of the sweep already broadcast, with its txid.
+    /// Taken out of `notes` by [`SproutRecovery::drop_already_swept`].
+    pub already_swept: Vec<(JsOutPoint, String)>,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
@@ -260,7 +263,27 @@ impl SproutRecovery {
     pub fn nothing_left_to_sweep(&self) -> bool {
         self.notes.is_empty()
             && self.issues.is_empty()
-            && !(self.spent.is_empty() && self.dust.is_empty())
+            && !(self.spent.is_empty() && self.dust.is_empty() && self.already_swept.is_empty())
+    }
+
+    /// Take out every note an earlier sweep already broadcast, per its
+    /// journal. The wallet file cannot know they moved; without this a
+    /// re-run after an interruption re-proves each, minutes apiece, only
+    /// for the network to refuse it.
+    pub fn drop_already_swept(&mut self, swept: &crate::sprout_sweep::SweptNotes) {
+        let mut already = Vec::new();
+        self.notes.retain(
+            |n| match swept.get(&crate::sprout_sweep::swept_key(&n.outpoint)) {
+                Some(txid) => {
+                    already.push((n.outpoint, txid.clone()));
+                    false
+                }
+                None => true,
+            },
+        );
+        self.unconfirmed_spends
+            .retain(|o| !already.iter().any(|(a, _)| a == o));
+        self.already_swept.extend(already);
     }
 
     /// The limit on spent status, as it applies to this result: the file's
@@ -317,6 +340,23 @@ impl SproutRecovery {
                     zec(sum(&by_chain))
                 ));
             }
+        }
+        if !self.already_swept.is_empty() {
+            let mut txids: Vec<&str> = self.already_swept.iter().map(|(_, t)| t.as_str()).collect();
+            txids.sort_unstable();
+            txids.dedup();
+            let shown = txids.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+            let more = txids.len().saturating_sub(3);
+            lines.push(format!(
+                "{} note(s) were already swept by an earlier run of this sweep and are not \
+                 proved again ({shown}{}).",
+                self.already_swept.len(),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
         }
         if !self.dust.is_empty() {
             lines.push(format!(
@@ -1083,6 +1123,32 @@ mod tests {
             recover_spendable_sprout_notes_with_chain(&keys, Some(&chain_with(&[], 3_000_000)));
         let status = with.spent_status();
         assert!(status.contains("3000000"), "{status}");
+    }
+
+    /// A note an earlier, interrupted sweep already broadcast is taken out
+    /// of the plan and named, rather than proved again for minutes only to
+    /// be refused as a double spend.
+    #[test]
+    fn a_note_an_earlier_sweep_broadcast_is_not_offered_again() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let mut recovered = recover_spendable_sprout_notes(&keys);
+        let outpoint = recovered.notes[0].outpoint;
+        let mut swept = crate::sprout_sweep::SweptNotes::new();
+        swept.insert(crate::sprout_sweep::swept_key(&outpoint), "dd44".to_owned());
+
+        recovered.drop_already_swept(&swept);
+
+        assert!(recovered.notes.is_empty());
+        assert_eq!(recovered.already_swept, vec![(outpoint, "dd44".to_owned())]);
+        assert!(recovered.nothing_left_to_sweep());
+        assert!(
+            recovered
+                .accounting_lines()
+                .iter()
+                .any(|l| l.contains("earlier run") && l.contains("dd44")),
+            "{:?}",
+            recovered.accounting_lines()
+        );
     }
 
     /// Values come from the file, so a crafted one can sum past `u64::MAX`.

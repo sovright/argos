@@ -413,3 +413,21 @@ test("the Sprout preview, inspection and sweep look in the scan's data directory
     execute_sprout_sweep: "/fixture/workspace",
   });
 });
+
+// A broadcast that could not be written to the sweep journal is worth
+// saying: a re-run would prove that one note again and see it refused.
+test("a sweep journal warning is shown after the sweep", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "execute_sprout_sweep") return {
+      sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected: [],
+      warnings: ["aa was broadcast, but writing the sweep journal failed"], error: null,
+    };
+    return fallback();
+  });
+  await h.open("/fixture/first.dat");
+  await flush();
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  const lines = texts(h.$("sprout-sweep-results"));
+  assert.ok(lines.some((l) => /sweep journal/.test(l)), lines.join("\n"));
+});

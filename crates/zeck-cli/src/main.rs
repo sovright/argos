@@ -697,13 +697,20 @@ async fn sweep_sprout(
         params_path.display()
     );
 
+    let journal =
+        argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &wallet_sprout_keys(keys));
+    eprintln!(
+        "Each broadcast is recorded in {}, so an interrupted sweep resumes without \
+         proving any note twice.",
+        journal.path().display()
+    );
     let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &recovered.notes,
         network,
         lightwalletd_url,
         destination,
         &params_path,
-        [0u8; 512],
+        Some(&journal),
         |msg| eprintln!("  {msg}"),
     )
     .await?;
@@ -928,13 +935,14 @@ async fn scan_sprout(
     }
 
     let params_path = sprout_params.unwrap_or_else(argos_core::sprout_sweep::default_params_path);
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys);
     let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &result.notes,
         network,
         lightwalletd_url,
         destination,
         &params_path,
-        [0u8; 512],
+        Some(&journal),
         |msg| eprintln!("  {msg}"),
     )
     .await?;
@@ -999,12 +1007,7 @@ fn recover_with_scan(
     network: ZeckNetwork,
     data_dir: &Path,
 ) -> argos_core::sprout_recovery::SproutRecovery {
-    use secrecy::ExposeSecret;
-    let spending_keys: Vec<[u8; 32]> = keys
-        .sprout
-        .iter()
-        .map(|k| *k.a_sk.expose_secret())
-        .collect();
+    let spending_keys = wallet_sprout_keys(keys);
     let chain = if spending_keys.is_empty() {
         None
     } else {
@@ -1016,7 +1019,27 @@ fn recover_with_scan(
             }
         }
     };
-    argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(keys, chain.as_ref())
+    let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
+        keys,
+        chain.as_ref(),
+    );
+    if !spending_keys.is_empty() {
+        match argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys).load() {
+            Ok(swept) => recovered.drop_already_swept(&swept),
+            Err(err) => eprintln!("Not using the sweep journal: {err}"),
+        }
+    }
+    recovered
+}
+
+/// The wallet file's Sprout spending keys, in the form the scan checkpoint
+/// and the sweep journal are keyed by.
+fn wallet_sprout_keys(keys: &ImportedKeys) -> Vec<[u8; 32]> {
+    use secrecy::ExposeSecret;
+    keys.sprout
+        .iter()
+        .map(|k| *k.a_sk.expose_secret())
+        .collect()
 }
 
 /// A txid as explorers show it: byte-reversed hex.
@@ -1033,6 +1056,9 @@ fn display_txid(txid: &[u8; 32]) -> String {
 fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSweepOutcome) {
     for reason in &outcome.skipped {
         println!("  not swept — {reason}");
+    }
+    for warning in &outcome.warnings {
+        eprintln!("  warning: {warning}");
     }
     if !outcome.rejected.is_empty() {
         println!();

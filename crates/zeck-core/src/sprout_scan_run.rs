@@ -364,17 +364,26 @@ pub fn chain_spends(
 /// the wrong keys would hold a valid tree and find nothing, with no
 /// indication why.
 pub fn checkpoint_path(data_dir: &Path, spending_keys: &[[u8; 32]]) -> PathBuf {
+    let fingerprint = key_set_fingerprint(spending_keys);
+    data_dir.join(format!("sprout-scan-{fingerprint}.checkpoint"))
+}
+
+/// A short, stable name for a set of Sprout spending keys: the first eight
+/// bytes of SHA-256 over the sorted keys, so key order does not change it.
+/// Names the scan checkpoint and the sweep journal alike, so both files for
+/// one wallet sit side by side and never collide with another wallet's.
+pub fn key_set_fingerprint(spending_keys: &[[u8; 32]]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    // Sorted, so key order does not change the identity of a scan.
     let mut sorted: Vec<_> = spending_keys.to_vec();
     sorted.sort_unstable();
     for key in &sorted {
         h.update(key);
     }
-    let digest = h.finalize();
-    let fingerprint: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    data_dir.join(format!("sprout-scan-{fingerprint}.checkpoint"))
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A block near the chain tip, learned from lightwalletd rather than from
@@ -996,7 +1005,11 @@ fn own_node_hint(named_by_user: bool) -> &'static str {
 /// umask, the same treatment the recovery report gets. Callers should say so
 /// to the user before pointing them at the path, and delete it once the
 /// funds are swept.
-pub fn save_checkpoint(scanner: &SproutScanner, network: P2pNetwork, path: &Path) -> ZeckResult<()> {
+pub fn save_checkpoint(
+    scanner: &SproutScanner,
+    network: P2pNetwork,
+    path: &Path,
+) -> ZeckResult<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

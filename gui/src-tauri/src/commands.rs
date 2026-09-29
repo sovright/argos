@@ -904,6 +904,9 @@ pub struct SproutSweepReport {
     /// Notes the network refused. The sweep carried on past each; nothing
     /// moved for them and no fee was paid.
     pub rejected: Vec<String>,
+    /// Did not stop anything, but the user should know — a broadcast that
+    /// could not be written to the sweep journal.
+    pub warnings: Vec<String>,
     /// Set when the sweep stopped partway. `sent` still lists what was
     /// broadcast before it did — those funds have moved.
     pub error: Option<String>,
@@ -946,13 +949,16 @@ pub async fn execute_sprout_sweep(
 
     let params_path = argos_core::sprout_sweep::default_params_path();
     let emitter = app.clone();
+    let journal = resolve_data_dir(&app, data_dir.as_deref()).map(|dir| {
+        argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(&keys))
+    });
     let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &recovered.notes,
         network,
         &lightwalletd_url,
         &destination,
         &params_path,
-        [0u8; 512],
+        journal.as_ref(),
         move |msg| {
             let _ = emitter.emit("sprout-sweep-progress", msg);
         },
@@ -974,6 +980,7 @@ pub async fn execute_sprout_sweep(
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
         rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        warnings: outcome.warnings,
         error: outcome.error,
     })
 }
@@ -1336,13 +1343,14 @@ pub async fn sweep_sprout_from_scan(
 
     let params_path = argos_core::sprout_sweep::default_params_path();
     let emitter = app.clone();
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &decoded);
     let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &result.notes,
         net,
         &lightwalletd_url,
         &destination,
         &params_path,
-        [0u8; 512],
+        Some(&journal),
         move |msg| {
             let _ = emitter.emit("sprout-sweep-progress", msg);
         },
@@ -1364,6 +1372,7 @@ pub async fn sweep_sprout_from_scan(
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
         rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        warnings: outcome.warnings,
         error: outcome.error,
     })
 }
@@ -1390,19 +1399,11 @@ fn recover_with_scan(
     network: argos_core::ZeckNetwork,
     data_dir: Option<&str>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
-    use secrecy::ExposeSecret;
-    let spending_keys: Vec<[u8; 32]> = keys
-        .sprout
-        .iter()
-        .map(|k| *k.a_sk.expose_secret())
-        .collect();
-    let dir = match data_dir.map(str::trim).filter(|d| !d.is_empty()) {
-        Some(dir) => Some(PathBuf::from(dir)),
-        None => default_data_dir(app.clone()).ok().map(PathBuf::from),
-    };
-    let chain = match dir {
+    let spending_keys = wallet_sprout_keys(keys);
+    let dir = resolve_data_dir(app, data_dir);
+    let chain = match &dir {
         Some(dir) if !spending_keys.is_empty() => {
-            match argos_core::sprout_scan_run::chain_spends(&dir, network.into(), &spending_keys) {
+            match argos_core::sprout_scan_run::chain_spends(dir, network.into(), &spending_keys) {
                 Ok(chain) => chain,
                 Err(err) => {
                     tracing::warn!("not using the Sprout scan checkpoint: {err}");
@@ -1412,7 +1413,38 @@ fn recover_with_scan(
         }
         _ => None,
     };
-    argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(keys, chain.as_ref())
+    let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
+        keys,
+        chain.as_ref(),
+    );
+    // A note an earlier, interrupted sweep already broadcast is taken out of
+    // the plan, so the count shown and the proofs run are for what is left.
+    if let Some(dir) = dir.filter(|_| !spending_keys.is_empty()) {
+        match argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &spending_keys).load() {
+            Ok(swept) => recovered.drop_already_swept(&swept),
+            Err(err) => tracing::warn!("not using the sweep journal: {err}"),
+        }
+    }
+    recovered
+}
+
+/// The data directory the scan panel writes to: the field, else the app
+/// default.
+fn resolve_data_dir(app: &AppHandle, data_dir: Option<&str>) -> Option<PathBuf> {
+    match data_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => default_data_dir(app.clone()).ok().map(PathBuf::from),
+    }
+}
+
+/// The wallet file's Sprout spending keys, as the checkpoint and the sweep
+/// journal are keyed.
+fn wallet_sprout_keys(keys: &argos_core::argos_wallet_import::ImportedKeys) -> Vec<[u8; 32]> {
+    use secrecy::ExposeSecret;
+    keys.sprout
+        .iter()
+        .map(|k| *k.a_sk.expose_secret())
+        .collect()
 }
 
 #[tauri::command]
