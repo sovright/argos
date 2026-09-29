@@ -663,3 +663,62 @@ fn a_key_source_the_command_would_ignore_is_refused() {
         );
     }
 }
+
+/// A full-block scan of a wallet's keys, run earlier in the same data
+/// directory, is what settles spends the wallet file cannot see — notes
+/// spent from another copy of the wallet. inspect-wallet must find it by
+/// itself, from the checkpoint `scan-sprout` leaves behind, and say it did.
+#[test]
+fn inspect_wallet_consults_a_scan_of_the_same_keys() {
+    use secrecy::ExposeSecret;
+
+    let path = fixture(SPROUT_PLAINTEXT);
+    let bytes = std::fs::read(&path).expect("fixture is readable");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("the plaintext fixture imports");
+    let spending_keys: Vec<[u8; 32]> =
+        keys.sprout.iter().map(|k| *k.a_sk.expose_secret()).collect();
+    assert!(!spending_keys.is_empty(), "the fixture holds Sprout keys");
+
+    let dir = scratch_dir("chain-spends");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut scanner = argos_core::sprout_scan::SproutScanner::new(&spending_keys);
+    scanner
+        .scan_block_at(&[], [0xCD; 32], 2_000_000)
+        .expect("an empty block");
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(dir.as_ref(), &spending_keys);
+    argos_core::sprout_scan_run::save_checkpoint(
+        &scanner,
+        argos_core::p2p::wire::P2pNetwork::Mainnet,
+        &checkpoint,
+    )
+    .expect("checkpoint written");
+
+    let with_scan = argos(&[
+        "--wallet-file",
+        path.to_str().unwrap(),
+        "--data-dir",
+        &dir,
+        "inspect-wallet",
+    ]);
+    let without_scan = argos(&[
+        "--wallet-file",
+        path.to_str().unwrap(),
+        "--data-dir",
+        &scratch_dir("chain-spends-empty"),
+        "inspect-wallet",
+    ]);
+    let _ = std::fs::remove_file(&checkpoint);
+
+    let with = String::from_utf8_lossy(&with_scan.stdout);
+    assert!(with_scan.status.success(), "{}", String::from_utf8_lossy(&with_scan.stderr));
+    assert!(
+        with.contains("full-block scan up to height 2000000"),
+        "the scan must be found and named:\n{with}"
+    );
+    let without = String::from_utf8_lossy(&without_scan.stdout);
+    assert!(
+        !without.contains("full-block scan up to height"),
+        "no scan, no claim of one:\n{without}"
+    );
+}

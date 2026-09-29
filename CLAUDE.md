@@ -206,6 +206,15 @@ wallet) is handled at the sweep: a refused note is recorded and skipped,
 not a reason to stop, and only a run of refusals stops it
 (`MAX_CONSECUTIVE_REJECTIONS`), pointing at the scan.
 
+A full-block scan of the same keys outranks the file for every spend it
+saw. `sprout_scan_run::chain_spends` reads the checkpoint `scan-sprout`
+leaves in the data directory (same key-set fingerprint, same network and
+key checks as resume, via the shared `load_checkpoint`), and
+`recover_spendable_sprout_notes_with_chain` marks any note whose nullifier
+it saw as spent (`SpentEvidence::Chain`). The rule is one-way: absence from
+the scan proves nothing, since the wallet may have spent after the height
+the scan reached, so a spend the wallet recorded still stands.
+
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
 `transparent_recovery`, because ZIP-316 gives it no UFVK to anchor an

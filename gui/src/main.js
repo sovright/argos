@@ -523,6 +523,10 @@ async function showSproutSweep() {
     const preview = await invoke("preview_sprout_sweep", {
       path: source.path,
       passphrase: source.passphrase,
+      network: $("network-select").value,
+      // Where the scan panel keeps its checkpoint: a scan of these keys
+      // settles spends the wallet file cannot see.
+      dataDir: $("data-dir").value.trim() || null,
     });
 
     if (walletFile !== source) return;
@@ -592,6 +596,7 @@ async function runSproutSweep() {
       destination,
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       network: $("network-select").value,
+      dataDir: $("data-dir").value.trim() || null,
     });
 
     if (walletFile !== source) return;
@@ -744,6 +749,7 @@ async function openWalletFile() {
       path,
       passphrase,
       network: $("network-select").value,
+      dataDir: $("data-dir").value.trim() || null,
     });
 
     if (generation !== walletOpenGeneration) return;

@@ -155,6 +155,12 @@ impl SproutScanner {
         (self.progress.blocks_scanned > 0).then_some(self.cursor)
     }
 
+    /// Every nullifier the walk has seen on chain. A note whose nullifier is
+    /// here was spent at or below the cursor, whoever spent it.
+    pub fn spent_nullifiers(&self) -> &HashSet<[u8; 32]> {
+        &self.spent
+    }
+
     /// The keys this scanner is looking for, sorted.
     ///
     /// Exposed so a resumed checkpoint can be checked against the keys the

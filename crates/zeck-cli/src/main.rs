@@ -19,8 +19,7 @@ use argos_core::{
     ScanDiscovery, ScanHandle, ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
 };
 use argos_core::{
-    p2p::wire::P2pNetwork, sprout_recovery::recover_spendable_sprout_notes,
-    sprout_scan_cost::SproutScanCost,
+    p2p::wire::P2pNetwork, sprout_recovery::SpentEvidence, sprout_scan_cost::SproutScanCost,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
@@ -611,6 +610,12 @@ fn warn_about_partial_import(keys: &ImportedKeys) {
     }
 }
 
+/// Whether a sweep may broadcast: `--dry-run` and `--confirm-sweep`.
+struct SweepGate {
+    dry_run: bool,
+    confirm_sweep: bool,
+}
+
 /// Recover Sprout notes from a wallet file and move them to Sapling.
 ///
 /// Thin by design: address parsing, branch-id selection, proving and
@@ -619,13 +624,17 @@ fn warn_about_partial_import(keys: &ImportedKeys) {
 async fn sweep_sprout(
     keys: &ImportedKeys,
     network: ZeckNetwork,
+    data_dir: &Path,
     lightwalletd_url: &str,
     destination: &str,
     sprout_params: Option<PathBuf>,
-    dry_run: bool,
-    confirm_sweep: bool,
+    gate: SweepGate,
 ) -> Result<()> {
-    let recovered = recover_spendable_sprout_notes(keys);
+    let SweepGate {
+        dry_run,
+        confirm_sweep,
+    } = gate;
+    let recovered = recover_with_scan(keys, network, data_dir);
     // stdout, beside the plan: `> plan.txt` must keep the reason the total
     // is smaller than the wallet's history.
     print_sprout_accounting(keys, &recovered, false, "argos inspect-wallet --show-spent");
@@ -666,7 +675,7 @@ async fn sweep_sprout(
     println!();
     // Before the confirmation, where it changes the decision: this is the
     // one limit that costs proving time rather than showing up in a count.
-    for line in wrap_text(argos_core::sprout_recovery::SPENT_STATUS_IS_THE_FILES, 76) {
+    for line in wrap_text(&recovered.spent_status(), 76) {
         println!("  {line}");
     }
     println!();
@@ -955,13 +964,18 @@ fn print_sprout_accounting(
     if !recovered.spent.is_empty() {
         if show_spent {
             for n in &recovered.spent {
+                let by = match &n.spent_in {
+                    SpentEvidence::Wallet { txid } => format!("spent in {}", display_txid(txid)),
+                    SpentEvidence::Chain { scanned_to } => {
+                        format!("spent on chain (scan to height {scanned_to})")
+                    }
+                };
                 println!(
-                    "    {}:{}:{}  {}  spent in {}",
+                    "    {}:{}:{}  {}  {by}",
                     display_txid(&n.outpoint.txid),
                     n.outpoint.js_index,
                     n.outpoint.output_index,
                     format_zec(n.value),
-                    display_txid(&n.spent_in)
                 );
             }
         } else {
@@ -974,6 +988,35 @@ fn print_sprout_accounting(
         }
     }
     println!();
+}
+
+/// Recover the wallet file's Sprout notes, letting a full-block scan of the
+/// same keys — if one has run in this data directory — settle every spend it
+/// saw on chain. The scan is optional; a checkpoint that cannot be used is
+/// reported and the file's own record stands.
+fn recover_with_scan(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    data_dir: &Path,
+) -> argos_core::sprout_recovery::SproutRecovery {
+    use secrecy::ExposeSecret;
+    let spending_keys: Vec<[u8; 32]> = keys
+        .sprout
+        .iter()
+        .map(|k| *k.a_sk.expose_secret())
+        .collect();
+    let chain = if spending_keys.is_empty() {
+        None
+    } else {
+        match argos_core::sprout_scan_run::chain_spends(data_dir, network.into(), &spending_keys) {
+            Ok(chain) => chain,
+            Err(err) => {
+                eprintln!("Not using the Sprout scan checkpoint: {err}");
+                None
+            }
+        }
+    };
+    argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(keys, chain.as_ref())
 }
 
 /// A txid as explorers show it: byte-reversed hex.
@@ -1131,7 +1174,12 @@ fn print_sprout_next_steps() {
     );
 }
 
-fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent: bool) {
+fn print_sprout_inspection(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    show_spent: bool,
+    data_dir: &Path,
+) {
     if !keys.sprout.is_empty() {
         println!("Sprout addresses:");
         for key in &keys.sprout {
@@ -1153,7 +1201,7 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent
         // witness. A wallet with both needs no network at all; a wallet
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
-        let recovered = recover_spendable_sprout_notes(keys);
+        let recovered = recover_with_scan(keys, network, data_dir);
         print_sprout_accounting(keys, &recovered, show_spent, "argos inspect-wallet");
         if recovered.nothing_left_to_sweep() {
             println!("  Nothing is left to sweep: every Sprout note this file records was spent");
@@ -1182,7 +1230,7 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent
             );
             println!("  These were recovered from this file alone — no scan needed.");
             println!();
-            for line in wrap_text(argos_core::sprout_recovery::SPENT_STATUS_IS_THE_FILES, 74) {
+            for line in wrap_text(&recovered.spent_status(), 74) {
                 println!("  {line}");
             }
             println!();
@@ -1203,7 +1251,12 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent
 /// This is the only useful thing it can do with a zcashd `wallet.dat`
 /// today, so it must be honest about the difference between "found a
 /// key" and "can move the funds".
-fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent: bool) {
+fn print_wallet_inspection(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    show_spent: bool,
+    data_dir: &Path,
+) {
     println!("━━━ Recovered key material ━━━");
     println!("  Transparent keys  {}", keys.transparent.len());
     println!("  Sapling keys      {}", keys.sapling.len());
@@ -1263,7 +1316,7 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork, show_spent
     // The Sprout address list and spendability verdict live in a helper to
     // keep this function to one screen; the key/note counts above come from
     // the parser, and this adds what the recovery path can say about them.
-    print_sprout_inspection(keys, network, show_spent);
+    print_sprout_inspection(keys, network, show_spent, data_dir);
 
     // Never summarized away: an unread record means key material that
     // still exists only in the original file, and the user is the only
@@ -1628,7 +1681,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::InspectWallet { show_spent } => {
             let source = imported.expect("--wallet-file is required and was checked above");
-            print_wallet_inspection(source.keys(), network, show_spent);
+            print_wallet_inspection(source.keys(), network, show_spent, &cli.data_dir);
         }
 
         // Dispatched above, before key-source resolution, so that it never
@@ -1650,11 +1703,14 @@ async fn main() -> Result<()> {
             sweep_sprout(
                 source.keys(),
                 network,
+                &cli.data_dir,
                 &cli.lightwalletd_url,
                 &destination,
                 sprout_params,
-                dry_run,
-                confirm_sweep,
+                SweepGate {
+                    dry_run,
+                    confirm_sweep,
+                },
             )
             .await?;
         }

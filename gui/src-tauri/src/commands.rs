@@ -394,14 +394,17 @@ struct SproutSummary {
     sprout_scan_warning: Vec<String>,
     sprout_accounting: Vec<String>,
     sprout_nothing_left: bool,
+    sprout_spent_status: String,
 }
 
 /// Compute the Sprout summary for a wallet. Body is verbatim the logic that
 /// previously lived inline in `inspect_wallet_file`: reject forged keys, then
 /// try to recover notes, then quote the scan cost when a scan would be needed.
 fn compute_sprout_summary(
+    app: &AppHandle,
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
     network_name: &str,
+    data_dir: Option<&str>,
 ) -> SproutSummary {
     // Decrypting the note ciphertexts is what distinguishes a wallet whose
     // Sprout funds are recoverable right now from one that would need the
@@ -411,7 +414,7 @@ fn compute_sprout_summary(
     // stored address must not be counted, shown, or spent with.
     let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(keys);
 
-    let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(keys);
+    let recovered = recover_with_scan(app, keys, network_from(network_name), data_dir);
     let nothing_left = recovered.nothing_left_to_sweep();
     let needs_scan = !keys.sprout.is_empty() && recovered.notes.is_empty() && !nothing_left;
     let mut accounting = recovered.accounting_lines();
@@ -451,6 +454,7 @@ fn compute_sprout_summary(
         },
         sprout_accounting: accounting,
         sprout_nothing_left: nothing_left,
+        sprout_spent_status: recovered.spent_status(),
     }
 }
 
@@ -464,9 +468,11 @@ fn compute_sprout_summary(
 /// a GUI has no equivalent, so the choice is this or no GUI import at all.
 #[tauri::command]
 pub async fn inspect_wallet_file(
+    app: AppHandle,
     path: String,
     passphrase: Option<SecretString>,
     network: Option<String>,
+    data_dir: Option<String>,
 ) -> Result<WalletFileSummary, String> {
     // Needed to encode Sprout addresses in the form the user can actually
     // match against a backup. Optional so an older frontend still works,
@@ -511,7 +517,7 @@ pub async fn inspect_wallet_file(
     // readable. It takes `&mut keys` because rejecting forged Sprout keys
     // must drop them before anything else reads the wallet.
     let mut keys = keys;
-    let sprout = compute_sprout_summary(&mut keys, &network_name);
+    let sprout = compute_sprout_summary(&app, &mut keys, &network_name, data_dir.as_deref());
 
     Ok(WalletFileSummary {
         path,
@@ -525,7 +531,7 @@ pub async fn inspect_wallet_file(
         sprout_scan_warning: sprout.sprout_scan_warning,
         sprout_accounting: sprout.sprout_accounting,
         sprout_nothing_left: sprout.sprout_nothing_left,
-        sprout_spent_status: argos_core::sprout_recovery::SPENT_STATUS_IS_THE_FILES.to_owned(),
+        sprout_spent_status: sprout.sprout_spent_status,
         has_mnemonic: keys.mnemonic.is_some(),
         transparent_only: argos_core::key_source::classify_recovery_route(&keys)
             == argos_core::key_source::RecoveryRoute::TransparentOnly,
@@ -850,6 +856,8 @@ pub async fn preview_sprout_sweep(
     app: AppHandle,
     path: String,
     passphrase: Option<SecretString>,
+    network: Option<String>,
+    data_dir: Option<String>,
 ) -> Result<SproutSweepPreview, String> {
     ensure_tos_accepted(&app)?;
 
@@ -859,7 +867,8 @@ pub async fn preview_sprout_sweep(
         .map_err(|err| err.to_string())?;
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
-    let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
+    let network = network_from(network.as_deref().unwrap_or("mainnet"));
+    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
     let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
 
     let params_path = argos_core::sprout_sweep::default_params_path();
@@ -913,6 +922,7 @@ pub async fn execute_sprout_sweep(
     destination: String,
     lightwalletd_url: String,
     network: String,
+    data_dir: Option<String>,
 ) -> Result<SproutSweepReport, String> {
     ensure_tos_accepted(&app)?;
 
@@ -927,7 +937,7 @@ pub async fn execute_sprout_sweep(
         .map_err(|err| err.to_string())?;
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
-    let recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes(&keys);
+    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
     if recovered.notes.is_empty() {
         return Err(
             "no spendable Sprout notes could be recovered from this wallet file".to_owned(),
@@ -1366,6 +1376,43 @@ fn network_from(name: &str) -> argos_core::ZeckNetwork {
         "testnet" => argos_core::ZeckNetwork::Testnet,
         _ => argos_core::ZeckNetwork::Mainnet,
     }
+}
+
+/// Recover a wallet file's Sprout notes, letting a full-block scan of the
+/// same keys settle every spend it saw on chain. Looks in the data directory
+/// the scan panel writes to (the field, else the app default), so a scan run
+/// from this app is found without asking. The scan is optional: without one,
+/// or with one that cannot be used, the file's own record stands, and the
+/// reason is logged rather than failing the wallet screen.
+fn recover_with_scan(
+    app: &AppHandle,
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    data_dir: Option<&str>,
+) -> argos_core::sprout_recovery::SproutRecovery {
+    use secrecy::ExposeSecret;
+    let spending_keys: Vec<[u8; 32]> = keys
+        .sprout
+        .iter()
+        .map(|k| *k.a_sk.expose_secret())
+        .collect();
+    let dir = match data_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => default_data_dir(app.clone()).ok().map(PathBuf::from),
+    };
+    let chain = match dir {
+        Some(dir) if !spending_keys.is_empty() => {
+            match argos_core::sprout_scan_run::chain_spends(&dir, network.into(), &spending_keys) {
+                Ok(chain) => chain,
+                Err(err) => {
+                    tracing::warn!("not using the Sprout scan checkpoint: {err}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(keys, chain.as_ref())
 }
 
 #[tauri::command]

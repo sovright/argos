@@ -178,7 +178,7 @@ impl std::fmt::Display for SproutRecoveryIssue {
     }
 }
 
-/// A note this wallet received and later spent itself.
+/// A note this wallet received and that has since been spent.
 ///
 /// Kept apart from `issues`: nothing is wrong with it, and a long-lived
 /// wallet has hundreds of these.
@@ -186,8 +186,27 @@ impl std::fmt::Display for SproutRecoveryIssue {
 pub struct SpentSproutNote {
     pub outpoint: JsOutPoint,
     pub value: u64,
-    /// The transaction, recorded as mined, whose JoinSplit spent it.
-    pub spent_in: [u8; 32],
+    pub spent_in: SpentEvidence,
+}
+
+/// How a note is known to be spent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpentEvidence {
+    /// A transaction in this wallet file, recorded as mined, spent it.
+    Wallet { txid: [u8; 32] },
+    /// A full-block scan saw its nullifier on chain at or below this height.
+    /// The spending transaction is not recorded — the scan keeps nullifiers,
+    /// not where they came from — but the spend is a fact of the chain.
+    Chain { scanned_to: u32 },
+}
+
+/// What a full-block scan established about spends: every nullifier it saw
+/// on chain, up to the height it reached. See
+/// [`crate::sprout_scan_run::chain_spends`].
+#[derive(Debug, Clone, Default)]
+pub struct ChainSpends {
+    pub nullifiers: HashSet<[u8; 32]>,
+    pub scanned_to: u32,
 }
 
 /// The outcome of scanning a wallet for spendable Sprout notes.
@@ -203,6 +222,9 @@ pub struct SproutRecovery {
     /// zcashd's zero-value change. Left out of `notes`, because the sweep
     /// skips them: each would cost a JoinSplit and move nothing.
     pub dust: Vec<JsOutPoint>,
+    /// The height a full-block scan of these keys reached, when one was
+    /// consulted. Spends at or below it are the chain's word, not the file's.
+    pub chain_checked_to: Option<u32>,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
@@ -241,18 +263,60 @@ impl SproutRecovery {
             && !(self.spent.is_empty() && self.dust.is_empty())
     }
 
+    /// The limit on spent status, as it applies to this result: the file's
+    /// own history, or the scan's chain view up to its height and the file's
+    /// after it.
+    pub fn spent_status(&self) -> String {
+        match self.chain_checked_to {
+            None => SPENT_STATUS_IS_THE_FILES.to_owned(),
+            Some(height) => format!(
+                "Spent status comes from this wallet's full-block scan up to height {height}, \
+                 and from the wallet file's own history after it. A note spent after that \
+                 height from another copy of this wallet still appears here; the network \
+                 refuses it at sweep, and Argos skips it and carries on. Running the scan \
+                 again brings it up to date."
+            ),
+        }
+    }
+
     /// Why the Sprout total is what it is, one sentence per line. Shared so
     /// the CLI and the GUI cannot describe one file differently.
     pub fn accounting_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        if !self.spent.is_empty() {
+        let (by_wallet, by_chain): (Vec<_>, Vec<_>) = self
+            .spent
+            .iter()
+            .partition(|n| matches!(n.spent_in, SpentEvidence::Wallet { .. }));
+        let sum = |notes: &[&SpentSproutNote]| {
+            notes
+                .iter()
+                .fold(0u64, |sum, n| sum.saturating_add(n.value))
+        };
+        if !by_wallet.is_empty() {
             lines.push(format!(
                 "{} note(s), {} in all, were spent by transactions this wallet file records \
                  as mined. They are the wallet's history, not a balance, and are left out. \
                  (Argos 1.4.0 and earlier counted them as spendable; that total was wrong.)",
-                self.spent.len(),
-                zec(self.spent_value())
+                by_wallet.len(),
+                zec(sum(&by_wallet))
             ));
+        }
+        if let Some(height) = self.chain_checked_to {
+            if by_chain.is_empty() {
+                lines.push(format!(
+                    "Checked against this wallet's full-block scan up to height {height}: \
+                     it found no other spends on chain."
+                ));
+            } else {
+                lines.push(format!(
+                    "{} note(s), {} in all, that this file shows as unspent were spent on \
+                     chain — found by this wallet's full-block scan up to height {height}. \
+                     Most likely they were spent from another copy of the wallet. They are \
+                     left out.",
+                    by_chain.len(),
+                    zec(sum(&by_chain))
+                ));
+            }
         }
         if !self.dust.is_empty() {
             lines.push(format!(
@@ -382,8 +446,26 @@ pub fn reject_forged_sprout_keys(keys: &mut ImportedKeys) -> Vec<ForgedSproutKey
 /// Never fails as a whole: notes that cannot be recovered are reported in
 /// `issues`.
 pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
-    let ctx = RecoveryContext::new(keys);
-    let mut out = SproutRecovery::default();
+    recover_spendable_sprout_notes_with_chain(keys, None)
+}
+
+/// [`recover_spendable_sprout_notes`], with what a full-block scan saw.
+///
+/// The scan outranks the file for any spend it saw: a nullifier on chain
+/// is spent, whatever the wallet recorded — including a spend the wallet
+/// never saw mined, and one made from another copy of the wallet, which the
+/// file cannot know about at all. It does not outrank the file the other way:
+/// a nullifier the scan did not see may have been spent after the height it
+/// reached, so a spend the wallet recorded still stands.
+pub fn recover_spendable_sprout_notes_with_chain(
+    keys: &ImportedKeys,
+    chain: Option<&ChainSpends>,
+) -> SproutRecovery {
+    let ctx = RecoveryContext::new(keys, chain);
+    let mut out = SproutRecovery {
+        chain_checked_to: chain.map(|c| c.scanned_to),
+        ..Default::default()
+    };
 
     // One note per outpoint, judged by its best record. A file can carry the
     // same outpoint twice — `bdb::walk` re-emits a record reachable from two
@@ -452,10 +534,11 @@ struct RecoveryContext<'a> {
     spent_by: HashMap<[u8; 32], [u8; 32]>,
     /// Nullifiers revealed only by transactions it never saw mined.
     unconfirmed: HashSet<[u8; 32]>,
+    chain: Option<&'a ChainSpends>,
 }
 
 impl<'a> RecoveryContext<'a> {
-    fn new(keys: &'a ImportedKeys) -> Self {
+    fn new(keys: &'a ImportedKeys, chain: Option<&'a ChainSpends>) -> Self {
         let unmined: HashSet<[u8; 32]> = keys.sprout_unconfirmed_txids.iter().copied().collect();
         let mut spent_by = HashMap::new();
         let mut unconfirmed = HashSet::new();
@@ -485,6 +568,7 @@ impl<'a> RecoveryContext<'a> {
                 .collect(),
             spent_by,
             unconfirmed,
+            chain,
         }
     }
 
@@ -532,11 +616,20 @@ impl<'a> RecoveryContext<'a> {
         // After the commitment check, so `rho` is bound to the commitment
         // before the nullifier derived from it decides anything.
         let nullifier = sprout::prf_nf(a_sk, &note.rho);
-        if let Some(spent_in) = self.spent_by.get(&nullifier) {
+        if let Some(txid) = self.spent_by.get(&nullifier) {
             return Ok(Recovered::Spent(SpentSproutNote {
                 outpoint,
                 value: note.value,
-                spent_in: *spent_in,
+                spent_in: SpentEvidence::Wallet { txid: *txid },
+            }));
+        }
+        if let Some(chain) = self.chain.filter(|c| c.nullifiers.contains(&nullifier)) {
+            return Ok(Recovered::Spent(SpentSproutNote {
+                outpoint,
+                value: note.value,
+                spent_in: SpentEvidence::Chain {
+                    scanned_to: chain.scanned_to,
+                },
             }));
         }
         // Worth no more than the fee to move it: the sweep would skip it
@@ -821,7 +914,10 @@ mod tests {
         let spend = spend_of(&keys, &a_sk);
         keys.sprout_joinsplits.push(spend);
         let recovered = recover_spendable_sprout_notes(&keys);
-        assert_eq!(recovered.spent[0].spent_in, [0xAB; 32]);
+        assert_eq!(
+            recovered.spent[0].spent_in,
+            SpentEvidence::Wallet { txid: [0xAB; 32] }
+        );
     }
 
     /// The direction that would lose money: the file's cached nullifier
@@ -909,6 +1005,84 @@ mod tests {
             });
         let warning = unreadable_transactions_warning(&keys).unwrap();
         assert!(warning.contains("upper bound"), "{warning}");
+    }
+
+    fn chain_with(nullifiers: &[[u8; 32]], scanned_to: u32) -> ChainSpends {
+        ChainSpends {
+            nullifiers: nullifiers.iter().copied().collect(),
+            scanned_to,
+        }
+    }
+
+    /// The case the wallet file cannot see: the note was spent from another
+    /// copy of the wallet. A full-block scan saw its nullifier on chain.
+    #[test]
+    fn a_spend_the_scan_saw_on_chain_marks_the_note_spent() {
+        let (keys, a_sk) = wallet_with_one_note(1_000_000);
+        let nf = sprout::prf_nf(&a_sk, &[0x11u8; 32]);
+        let chain = chain_with(&[nf], 3_000_000);
+
+        let recovered = recover_spendable_sprout_notes_with_chain(&keys, Some(&chain));
+        assert!(recovered.notes.is_empty(), "the chain says it is spent");
+        assert_eq!(
+            recovered.spent[0].spent_in,
+            SpentEvidence::Chain {
+                scanned_to: 3_000_000
+            }
+        );
+        assert_eq!(recovered.chain_checked_to, Some(3_000_000));
+        let lines = recovered.accounting_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("3000000") && l.contains("on chain")),
+            "{lines:?}"
+        );
+    }
+
+    /// The chain outranks the wallet's "never mined" flag: if the scan saw
+    /// the nullifier, that spend landed.
+    #[test]
+    fn the_chain_settles_a_spend_the_wallet_never_saw_mined() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_unconfirmed_txids.push(spend.txid);
+        keys.sprout_joinsplits.push(spend);
+        let nf = sprout::prf_nf(&a_sk, &[0x11u8; 32]);
+
+        let recovered =
+            recover_spendable_sprout_notes_with_chain(&keys, Some(&chain_with(&[nf], 3_000_000)));
+        assert!(recovered.notes.is_empty());
+        assert!(recovered.unconfirmed_spends.is_empty());
+        assert_eq!(recovered.spent.len(), 1);
+    }
+
+    /// Absence from the scan is not proof of anything: the scan stops at the
+    /// height it reached, and the wallet may have spent after it.
+    #[test]
+    fn a_nullifier_missing_from_the_scan_does_not_undo_a_wallet_spend() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+
+        let recovered =
+            recover_spendable_sprout_notes_with_chain(&keys, Some(&chain_with(&[], 3_000_000)));
+        assert!(recovered.notes.is_empty());
+        assert_eq!(
+            recovered.spent[0].spent_in,
+            SpentEvidence::Wallet { txid: [0xAB; 32] }
+        );
+    }
+
+    #[test]
+    fn with_a_scan_the_limit_names_the_height_it_covers() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let without = recover_spendable_sprout_notes(&keys);
+        assert_eq!(without.spent_status(), SPENT_STATUS_IS_THE_FILES);
+        let with =
+            recover_spendable_sprout_notes_with_chain(&keys, Some(&chain_with(&[], 3_000_000)));
+        let status = with.spent_status();
+        assert!(status.contains("3000000"), "{status}");
     }
 
     /// Values come from the file, so a crafted one can sum past `u64::MAX`.

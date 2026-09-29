@@ -318,7 +318,8 @@ impl std::fmt::Display for RejectedSweep {
             f,
             "note {txid}:{}:{} ({} zatoshi) was refused by the network: {}. Nothing moved \
              and no fee was paid. The usual cause is that it was spent from another copy of \
-             this wallet; the full-block scan checks every note against the chain.",
+             this wallet. After a full-block scan of the same wallet file, the sweep skips \
+             every note the scan saw spent.",
             self.outpoint.js_index, self.outpoint.output_index, self.value, self.reason
         )
     }
@@ -352,9 +353,10 @@ fn record_rejection(
     outcome.error = Some(format!(
         "the network refused {consecutive} notes in a row, most recently: {reason}. The sweep \
          stopped rather than spend minutes proving each remaining note for the same answer. \
-         If these notes were spent from another copy of this wallet, `argos scan-sprout` \
-         reads spends from the chain rather than from this file, and sweeps only what is \
-         really unspent."
+         If these notes were spent from another copy of this wallet, run the full-block \
+         scan on the same wallet file (`argos scan-sprout --wallet-file …`, or Scan for \
+         Sprout notes in the app). It reads spends from the chain, and this sweep, run \
+         again afterwards, skips every note the scan saw spent."
     ));
     true
 }
