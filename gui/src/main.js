@@ -452,12 +452,26 @@ function renderWalletSummary(summary) {
       sproutHeadline.textContent = "No Sprout funds are left in this file.";
       sproutDetail.textContent =
         " Every Sprout note it records was spent by the wallet itself, or is" +
-        " worth less than the fee to move it.";
+        " worth less than the fee to move it. That is the file's record; the" +
+        " full-block scan below checks it against the chain.";
+      // Still offered: a spend recorded against a block later reorged out
+      // reads exactly like this, and only the scan can tell.
+      $("sprout-scan-panel").hidden = false;
     } else {
-      sproutHeadline.textContent = "Sprout funds need a full-block scan.";
-      sproutDetail.textContent =
-        " This file holds Sprout keys, but not the note data needed to spend" +
-        " them. Keep the original file: these keys exist only there.";
+      if (summary.sprout_history_read) {
+        // Some note data was read — spent notes, dust — so saying the file
+        // holds none would contradict the accounting lines beside it.
+        sproutHeadline.textContent = "No spendable Sprout notes were recovered from this file.";
+        sproutDetail.textContent =
+          " Some of its note data could not be used (reasons below). The" +
+          " full-block scan reads from the chain what the file could not." +
+          " Keep the original file: these keys exist only there.";
+      } else {
+        sproutHeadline.textContent = "Sprout funds need a full-block scan.";
+        sproutDetail.textContent =
+          " This file holds Sprout keys, but not the note data needed to spend" +
+          " them. Keep the original file: these keys exist only there.";
+      }
 
       for (const issue of (summary.sprout_issues || []).slice(0, 5)) {
         const p = document.createElement("p");

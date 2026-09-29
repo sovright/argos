@@ -66,6 +66,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     failNextStatus: () => { failStatus = true; },
     progress: (payload) => onProgress({ payload }),
     sweep: () => vm.runInContext("runSproutSweep()", context),
+    peek: (expr) => vm.runInContext(expr, context),
     async open(path, passphrase = "") {
       $("wallet-path").value = path;
       $("wallet-passphrase").value = passphrase;
@@ -347,7 +348,7 @@ function inspected(overrides) {
 }
 const texts = (el) => el.children.map((c) => c.textContent);
 
-test("a wallet that spent every Sprout note says so and offers no scan", async () => {
+test("a wallet that spent every Sprout note says so instead of asking for note data", async () => {
   const h = harness(inspected({
     sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
     sprout_accounting: ["257 note(s) were spent by the wallet itself"],
@@ -357,7 +358,6 @@ test("a wallet that spent every Sprout note says so and offers no scan", async (
   const headline = h.$("wallet-sprout-headline").textContent;
   assert.doesNotMatch(headline, /scan/i);
   assert.match(headline, /no Sprout funds are left/i);
-  assert.equal(h.$("sprout-scan-panel").hidden, true);
   assert.equal(h.$("wallet-sprout-sweep").hidden, true);
   assert.deepEqual(h.previews, []);
   assert.deepEqual(texts(h.$("wallet-sprout-accounting")), ["257 note(s) were spent by the wallet itself"]);
@@ -389,4 +389,52 @@ test("notes the network refused are listed after a sweep", async () => {
   const lines = texts(h.$("sprout-sweep-results"));
   assert.ok(lines.some((l) => /refused by the network/.test(l)), lines.join("\n"));
   assert.match(h.$("sprout-sweep-status").textContent, /1 note\(s\) refused/);
+});
+
+// #239 review F4: a wallet whose notes all read as spent still offers the
+// scan. The verdict is the file's, and a spend recorded against a block
+// later reorged out reads exactly the same.
+test("a fully spent wallet still offers the full-block scan", async () => {
+  const h = harness(inspected({
+    sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
+    sprout_history_read: true, sprout_accounting: ["2 note(s) were spent"],
+    sprout_scan_warning: [], sprout_issues: [],
+  }));
+  await h.open("/fixture/spent.dat");
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assert.match(h.$("wallet-sprout-headline").textContent, /no Sprout funds are left/i);
+});
+
+// #239 review F8: spent notes plus one unusable note. The file's note data
+// was read, so the headline must not say it was not.
+test("some notes spent and one unusable does not claim the note data is missing", async () => {
+  const h = harness(inspected({
+    sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: false,
+    sprout_history_read: true, sprout_accounting: ["256 note(s) were spent"],
+    sprout_scan_warning: ["cost"], sprout_issues: ["note x: could not decrypt"],
+  }));
+  await h.open("/fixture/mixed.dat");
+  const said = h.$("wallet-sprout-headline").textContent + h.$("wallet-sprout-detail").textContent;
+  assert.doesNotMatch(said, /not the note data/);
+  assert.match(said, /could not be used/);
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+});
+
+// #239 review F7: a refused note may not have been spent at all, so the
+// "Sprout not covered" caveat must survive a sweep with any refusal.
+test("the Sprout caveat survives a sweep in which any note was refused", async () => {
+  for (const [rejected, kept] of [[[], false], [["note bb:0:1 was refused"], true]]) {
+    const h = harness(async (command, args, fallback) => {
+      if (command === "execute_sprout_sweep") return {
+        sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected, error: null,
+      };
+      return fallback();
+    });
+    await h.open("/fixture/first.dat");
+    await flush();
+    h.peek("uncoveredSproutKeys = 1");
+    h.$("sprout-destination").value = "fixture-destination";
+    await h.sweep();
+    assert.equal(h.peek("uncoveredSproutKeys") > 0, kept, `rejected=${rejected.length}`);
+  }
 });

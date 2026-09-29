@@ -181,6 +181,11 @@ impl ImportedKeys {
             .iter()
             .map(|d| match d {
                 ImportDiagnostic::UnrecoveredSeed { .. } => ImportCoverage::SeedNotRecovered,
+                // A transaction holds note data, never keys: every key was
+                // still read, and the full-block scan recovers the notes.
+                ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx" => {
+                    ImportCoverage::SproutNoteDataUnread
+                }
                 ImportDiagnostic::UnparseableRecord { .. }
                 | ImportDiagnostic::DecryptionFailed { .. } => ImportCoverage::KeysUnread,
                 ImportDiagnostic::UnknownRecord { .. } => ImportCoverage::UnknownRecordsSkipped,
@@ -200,6 +205,10 @@ pub enum ImportCoverage {
     /// Only records of unrecognised types were skipped. They may hold
     /// nothing of value, but we cannot say so.
     UnknownRecordsSkipped,
+    /// A transaction record could not be read. Every key was, but Sprout
+    /// notes the transaction received or spent are missing from what the
+    /// file alone reports.
+    SproutNoteDataUnread,
     /// A record known to hold key material could not be read or decrypted.
     KeysUnread,
     /// The wallet's HD seed was not recovered, so a whole key tree may be
@@ -217,6 +226,11 @@ impl ImportCoverage {
                 "Some records of a type Argos does not recognise were skipped. They \
                  are listed with the other diagnostics; if any held keys, those keys \
                  exist only in the original wallet file.",
+            ),
+            Self::SproutNoteDataUnread => Some(
+                "Some transaction records could not be read. Every key was read, but \
+                 Sprout notes those transactions received or spent are missing from what \
+                 this file reports; the full-block Sprout scan recovers them from the chain.",
             ),
             Self::KeysUnread => Some(
                 "Incomplete — some key records could not be read, so recovered keys \
@@ -274,6 +288,33 @@ mod coverage_tests {
             diagnostics,
             ..ImportedKeys::default()
         }
+    }
+
+    /// Kristi's F9 on #239: a `tx` record holds note data, not keys. One old
+    /// unwalkable transaction must not raise a key-loss banner that follows
+    /// the user to every screen.
+    #[test]
+    fn an_unreadable_transaction_is_not_graded_as_lost_keys() {
+        let tx = ImportDiagnostic::UnparseableRecord {
+            record_type: "tx".to_owned(),
+            reason: "could not be read".to_owned(),
+        };
+        let coverage = with(vec![tx.clone()]).coverage();
+        assert_eq!(coverage, ImportCoverage::SproutNoteDataUnread);
+        assert!(!coverage.may_hide_funds());
+        let notice = coverage.notice().unwrap();
+        assert!(notice.contains("transaction"), "{notice}");
+        assert!(!notice.contains("key records"), "{notice}");
+
+        let zkey = ImportDiagnostic::UnparseableRecord {
+            record_type: "zkey".to_owned(),
+            reason: "truncated".to_owned(),
+        };
+        assert_eq!(
+            with(vec![tx, zkey]).coverage(),
+            ImportCoverage::KeysUnread,
+            "a real key record still is"
+        );
     }
 
     fn unknown() -> ImportDiagnostic {

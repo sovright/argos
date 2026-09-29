@@ -203,6 +203,9 @@ pub struct SproutRecovery {
     /// zcashd's zero-value change. Left out of `notes`, because the sweep
     /// skips them: each would cost a JoinSplit and move nothing.
     pub dust: Vec<JsOutPoint>,
+    /// Transaction records the wallet file holds but Argos could not read.
+    /// Notes they received are missing, and spends they made are unseen.
+    pub unreadable_transactions: usize,
     pub issues: Vec<SproutRecoveryIssue>,
 }
 
@@ -238,6 +241,7 @@ impl SproutRecovery {
     pub fn nothing_left_to_sweep(&self) -> bool {
         self.notes.is_empty()
             && self.issues.is_empty()
+            && self.unreadable_transactions == 0
             && !(self.spent.is_empty() && self.dust.is_empty())
     }
 
@@ -276,19 +280,14 @@ impl SproutRecovery {
 /// so a transaction record that could not be read hides the spends it holds.
 /// Said beside the Sprout total, where it changes what the number means.
 pub fn unreadable_transactions_warning(keys: &ImportedKeys) -> Option<String> {
-    use argos_wallet_import::ImportDiagnostic;
-    let unread = keys
-        .diagnostics
-        .iter()
-        .filter(|d| {
-            matches!(d, ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx")
-        })
-        .count();
+    let unread = count_unreadable_transactions(keys);
     (unread > 0).then(|| {
         format!(
-            "Warning: {unread} transaction record(s) in this file could not be read. A note \
-             one of them spent would be counted here as unspent, so treat this total as an \
-             upper bound. The sweep skips a note the network refuses."
+            "Warning: {unread} transaction record(s) in this file could not be read. Sprout \
+             notes they received are not counted here, and a note one of them spent would \
+             be counted as unspent — so this total can be wrong in either direction. The \
+             full-block scan reads both from the chain. The sweep skips any note the network \
+             says is already spent."
         )
     })
 }
@@ -383,53 +382,97 @@ pub fn reject_forged_sprout_keys(keys: &mut ImportedKeys) -> Vec<ForgedSproutKey
 /// `issues`.
 pub fn recover_spendable_sprout_notes(keys: &ImportedKeys) -> SproutRecovery {
     let ctx = RecoveryContext::new(keys);
-    let mut out = SproutRecovery::default();
+    let mut out = SproutRecovery {
+        unreadable_transactions: count_unreadable_transactions(keys),
+        ..Default::default()
+    };
 
     // One note per outpoint, judged by its best record. A file can carry the
     // same outpoint twice — `bdb::walk` re-emits a record reachable from two
     // roots — and the first copy may be the damaged one. Taking whichever
     // came first let a copy with a truncated witness or a foreign address
-    // hide a good copy of a spendable note.
+    // hide a good copy of a spendable note. Of two good copies, the one whose
+    // witness zcashd updated later wins: both commit to the same note (the
+    // commitment check binds value, rho and r), so only the witness can
+    // differ, and the fresher one is the likelier to prove. With no good
+    // copy, every distinct problem is kept — different causes, different
+    // remedies.
     let mut order = Vec::new();
-    let mut best: HashMap<([u8; 32], u64, u8), Result<Recovered, SproutRecoveryIssue>> =
-        HashMap::new();
+    let mut best: HashMap<OutpointKey, Judgement> = HashMap::new();
     for note_data in &keys.sprout_notes {
         let o = note_data.outpoint;
         let key = (o.txid, o.js_index, o.output_index);
-        if matches!(best.get(&key), Some(Ok(_))) {
-            continue;
-        }
+        let height = cached_witness_height(&note_data.witness);
         let result = ctx.recover_one(note_data);
-        match best.get(&key) {
-            None => {
+        match (best.get_mut(&key), result) {
+            (None, result) => {
                 order.push(key);
-                best.insert(key, result);
+                best.insert(key, result.map(|r| (r, height)).map_err(|i| vec![i]));
             }
-            Some(Err(_)) if result.is_ok() => {
-                best.insert(key, result);
+            (Some(slot @ Err(_)), Ok(r)) => *slot = Ok((r, height)),
+            (Some(Err(issues)), Err(issue)) => {
+                if !issues.contains(&issue) {
+                    issues.push(issue);
+                }
             }
-            Some(_) => {}
+            (
+                Some(Ok((Recovered::Spendable { .. }, kept))),
+                Ok(r @ Recovered::Spendable { .. }),
+            ) if height > *kept => {
+                best.insert(key, Ok((r, height)));
+            }
+            (Some(Ok(_)), _) => {}
         }
     }
 
     for key in order {
         match best.remove(&key) {
-            Some(Ok(Recovered::Spendable {
-                note,
-                unconfirmed_spend,
-            })) => {
+            Some(Ok((
+                Recovered::Spendable {
+                    note,
+                    unconfirmed_spend,
+                },
+                _,
+            ))) => {
                 if unconfirmed_spend {
                     out.unconfirmed_spends.push(note.outpoint);
                 }
                 out.notes.push(*note);
             }
-            Some(Ok(Recovered::Spent(spent))) => out.spent.push(spent),
-            Some(Ok(Recovered::Dust(outpoint))) => out.dust.push(outpoint),
-            Some(Err(issue)) => out.issues.push(issue),
+            Some(Ok((Recovered::Spent(spent), _))) => out.spent.push(spent),
+            Some(Ok((Recovered::Dust(outpoint), _))) => out.dust.push(outpoint),
+            Some(Err(issues)) => out.issues.extend(issues),
             None => {}
         }
     }
     out
+}
+
+/// A note's outpoint, as notes are deduplicated by it.
+type OutpointKey = ([u8; 32], u64, u8);
+
+/// The best a note's records have produced so far: a recovery and the
+/// cached witness height it came with, or every distinct problem.
+type Judgement = Result<(Recovered, i32), Vec<SproutRecoveryIssue>>;
+
+/// zcashd's `witnessHeight`: the last four bytes of a cached witness blob,
+/// the height the witness was last brought up to. `i32::MIN` when absent,
+/// so a blob without one never outranks one with it.
+fn cached_witness_height(blob: &[u8]) -> i32 {
+    match blob.len().checked_sub(4).and_then(|at| blob.get(at..)) {
+        Some(&[a, b, c, d]) => i32::from_le_bytes([a, b, c, d]),
+        _ => i32::MIN,
+    }
+}
+
+fn count_unreadable_transactions(keys: &ImportedKeys) -> usize {
+    use argos_wallet_import::ImportDiagnostic;
+    keys.diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx")
+        })
+        .count()
 }
 
 /// What one note record resolved to.
@@ -899,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_transaction_turns_the_total_into_an_upper_bound() {
+    fn an_unreadable_transaction_makes_the_total_uncertain_both_ways() {
         let (mut keys, _) = wallet_with_one_note(1_000_000);
         assert!(unreadable_transactions_warning(&keys).is_none());
         keys.diagnostics
@@ -908,7 +951,88 @@ mod tests {
                 reason: "x".into(),
             });
         let warning = unreadable_transactions_warning(&keys).unwrap();
-        assert!(warning.contains("upper bound"), "{warning}");
+        assert!(warning.contains("either direction"), "{warning}");
+    }
+
+    /// A cached witness blob in zcashd's shape: one witness, then the
+    /// `witnessHeight` it was last updated at.
+    fn witness_blob(commitment: [u8; 32], later: &[[u8; 32]], height: i32) -> Vec<u8> {
+        let mut tree = crate::sprout_witness::IncrementalMerkleTree::default();
+        tree.append(commitment).unwrap();
+        let mut witness = crate::sprout_witness::IncrementalWitness::from_tree(tree);
+        for cm in later {
+            witness.append(*cm).unwrap();
+        }
+        let mut blob = vec![0x01u8];
+        blob.extend_from_slice(&witness.to_bytes());
+        blob.extend_from_slice(&height.to_le_bytes());
+        blob
+    }
+
+    /// Kristi's F10 on #239: of two valid copies of one note, the one whose
+    /// cached witness zcashd updated later wins, whichever came first.
+    #[test]
+    fn of_two_good_copies_the_fresher_witness_wins() {
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        let cm = keys.sprout_joinsplits[0].commitments[0];
+        let stale = witness_blob(cm, &[], 100);
+        let fresh = witness_blob(cm, &[[0x31; 32], [0x32; 32]], 250);
+        let fresh_root = crate::sprout_witness::IncrementalWitness::parse_cached(&fresh)
+            .unwrap()
+            .root();
+        keys.sprout_notes[0].witness = fresh;
+        let mut older = keys.sprout_notes[0].clone();
+        older.witness = stale;
+        keys.sprout_notes.insert(0, older);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.notes.len(), 1);
+        assert_eq!(recovered.notes[0].anchor, fresh_root, "the stale copy won");
+    }
+
+    /// Kristi's F11: with no usable copy, each copy's distinct problem is
+    /// reported, not just the first — different causes, different remedies.
+    #[test]
+    fn every_distinct_problem_with_an_unusable_note_is_reported() {
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        let mut foreign = keys.sprout_notes[0].clone();
+        foreign.address = [0x5A; 64];
+        keys.sprout_notes[0].witness.truncate(3);
+        keys.sprout_notes.push(foreign);
+
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert!(recovered.notes.is_empty());
+        assert_eq!(recovered.issues.len(), 2, "{:?}", recovered.issues);
+        assert!(matches!(
+            recovered.issues[0],
+            SproutRecoveryIssue::UnreadableWitness { .. }
+        ));
+        assert!(matches!(
+            recovered.issues[1],
+            SproutRecoveryIssue::NoSpendingKey { .. }
+        ));
+    }
+
+    /// Kristi's F4: an unread transaction may have received notes that were
+    /// never counted, so "nothing left" cannot be claimed while any exist —
+    /// that verdict withdraws the scan, the one thing that could correct it.
+    #[test]
+    fn nothing_is_left_only_when_every_transaction_was_read() {
+        let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
+        let spend = spend_of(&keys, &a_sk);
+        keys.sprout_joinsplits.push(spend);
+        assert!(recover_spendable_sprout_notes(&keys).nothing_left_to_sweep());
+
+        keys.diagnostics
+            .push(argos_wallet_import::ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".into(),
+                reason: "x".into(),
+            });
+        let recovered = recover_spendable_sprout_notes(&keys);
+        assert_eq!(recovered.unreadable_transactions, 1);
+        assert!(!recovered.nothing_left_to_sweep());
+        let warning = unreadable_transactions_warning(&keys).unwrap();
+        assert!(warning.contains("received"), "both directions: {warning}");
     }
 
     /// Values come from the file, so a crafted one can sum past `u64::MAX`.
