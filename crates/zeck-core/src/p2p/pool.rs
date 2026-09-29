@@ -831,7 +831,16 @@ mod tests {
     /// reconnect is refused as "every peer is busy". Several peers answer at
     /// once here so that losers finish their handshakes too, alongside two
     /// that never answer and so are cut off mid-handshake. Only the winner
-    /// may still be open a second after the race returns.
+    /// may still be open once [`LOSER_CLOSE_DEADLINE`] has passed.
+    ///
+    /// The deadline is generous on purpose. The fault this guards against is
+    /// a loser held open until Zebra's reconnect window (about two minutes)
+    /// or until the process exits — not one that takes a little over a
+    /// second on a loaded CI runner, which is what a one-second deadline kept
+    /// failing on.
+    /// Far inside Zebra's ~119 s reconnect window, far outside CI jitter.
+    const LOSER_CLOSE_DEADLINE: Duration = Duration::from_secs(10);
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn losing_connections_are_closed_as_soon_as_the_race_is_won() {
         let (tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
@@ -851,15 +860,16 @@ mod tests {
 
         let mut losers = Vec::new();
         while losers.len() < candidates.len() - 1 {
-            match tokio::time::timeout_at(won_at + Duration::from_secs(1), closed.recv()).await {
+            match tokio::time::timeout_at(won_at + LOSER_CLOSE_DEADLINE, closed.recv()).await {
                 Ok(Some(close)) => losers.push(close),
                 Ok(None) => unreachable!("the listeners outlive the test"),
                 Err(_) => break,
             }
         }
         eprintln!(
-            "{} losers closed within 1 s, {} of them after a completed handshake",
+            "{} losers closed within {:?}, {} of them after a completed handshake",
             losers.len(),
+            LOSER_CLOSE_DEADLINE,
             losers.iter().filter(|l| l.handshaken).count()
         );
 
@@ -869,7 +879,7 @@ mod tests {
             .collect();
         assert!(
             still_open.is_empty(),
-            "losing connections still open a second after the race: {still_open:?} \
+            "losing connections still open {LOSER_CLOSE_DEADLINE:?} after the race: {still_open:?} \
              (closed: {losers:?})"
         );
         assert!(
@@ -880,7 +890,7 @@ mod tests {
         // The winner is released the same way when its owner lets it go.
         let kept = winner.dialled_as().to_owned();
         drop(winner);
-        let last = tokio::time::timeout(Duration::from_secs(1), closed.recv())
+        let last = tokio::time::timeout(LOSER_CLOSE_DEADLINE, closed.recv())
             .await
             .expect("the winner closes once dropped")
             .expect("a close report");
