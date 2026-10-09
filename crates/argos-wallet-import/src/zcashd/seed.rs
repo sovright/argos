@@ -149,7 +149,7 @@ fn assess_mnemonic_seed(records: &SeedRecords, master: Option<&MasterKey>, out: 
     let chain = records.chain.map(parse_chain);
     if records.plain.is_empty() && records.crypted.is_empty() {
         match chain {
-            None => {}
+            None => push_orphaned_derivations(records, out),
             Some(Ok(chain)) => {
                 out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
                     record_type: "mnemonicphrase".to_owned(),
@@ -369,6 +369,32 @@ fn legacy_position(keypath: &str, sapling: bool) -> Option<(Chain, u32)> {
             Some((Chain::Sapling, index.strip_suffix('\'')?.parse().ok()?))
         }
         _ => None,
+    }
+}
+
+/// A file with neither a phrase record nor a chain record can still hold keys
+/// derived from a 5.x seed: their metadata names a legacy-account keypath and
+/// the seed's fingerprint. With no counters the missing keys cannot be
+/// counted, but such a file lost its seed records and must not read as a
+/// seedless, Complete wallet. Reported once per seed, however many keys name
+/// it.
+fn push_orphaned_derivations(records: &SeedRecords, out: &mut ImportedKeys) {
+    let mut seeds = std::collections::BTreeSet::new();
+    for (sapling, _, value) in &records.metadata {
+        let Some((keypath, fp)) = parse_key_metadata(value) else {
+            continue;
+        };
+        if legacy_position(&keypath, *sapling).is_some() {
+            seeds.insert(fp);
+        }
+    }
+    for _ in seeds {
+        out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
+            record_type: "mnemonicphrase".to_owned(),
+            reason: "its seed phrase and key chain records are missing, though keys \
+                     derived from it are present"
+                .to_owned(),
+        });
     }
 }
 
@@ -859,6 +885,59 @@ mod tests {
                 out.diagnostics
             );
         }
+    }
+
+    /// #249. With the chain record lost too there are no counters, but the
+    /// surviving keys' metadata still names the seed: the file lost its seed
+    /// records, and must not read as a seedless, Complete wallet.
+    #[test]
+    fn lost_phrase_and_chain_records_do_not_read_as_complete() {
+        let mut p = pairs("modern-plaintext");
+        p.retain(|r| !is("mnemonicphrase")(r) && !is("mnemonichdchain")(r));
+        let lost: Vec<Vec<u8>> = keys_at(&p, "keymeta", "/2147483647'/1/")
+            .into_iter()
+            .take(10)
+            .collect();
+        assert_eq!(lost.len(), 10);
+        p.retain(|(k, _)| {
+            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
+        });
+        let out = assess(&p, None);
+        assert!(!out.seed_verified);
+        assert_eq!(out.coverage(), ImportCoverage::SeedNotRecovered);
+        // Once for the seed, not once per one of its ~100 surviving keys.
+        assert!(
+            matches!(
+                only_diagnostic(&out),
+                ImportDiagnostic::UnrecoveredSeed { reason, .. }
+                    if reason.contains("key chain records are missing")
+            ),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// Imported and pre-HD keys carry no legacy-account keypath, so a file
+    /// holding only those has no seed to report.
+    #[test]
+    fn keys_without_a_legacy_keypath_do_not_imply_a_seed() {
+        let mut p = pairs("modern-plaintext");
+        p.retain(|r| !is("mnemonicphrase")(r) && !is("mnemonichdchain")(r));
+        let before = p.len();
+        p.retain(|(k, v)| {
+            parse_record_key(k).is_none_or(|r| {
+                !matches!(r.record_type.as_str(), "keymeta" | "sapzkeymeta")
+                    || parse_key_metadata(v).is_none_or(|(path, _)| {
+                        legacy_position(&path, r.record_type == "sapzkeymeta").is_none()
+                    })
+            })
+        });
+        // The fixture's chain counts 104 derived keys (2 external, 101
+        // change, 1 Sapling): their metadata must actually be gone.
+        assert!(before - p.len() > 100, "removed {}", before - p.len());
+        assert!(p.iter().any(is("key")), "the key records themselves remain");
+        let out = assess(&p, None);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
     /// The counters come from the file. Walking `0..counter` let twelve
