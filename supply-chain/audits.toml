@@ -16,6 +16,74 @@ The NEON backend is rewritten from 4-block to 8-block outer batches, following O
 
 No changes to key or nonce handling, counter semantics, or the round function."""
 
+[[audits.ctor]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.2.9 -> 0.8.0"
+notes = """
+Reviewed the complete published source transition: syn/quote procedural implementation replaced by declarative macro parsing and small token-only proc-macro adapters, ctor/dtor split, attribute and feature handling, linker sections and priorities, startup/atexit callbacks, and OnceLock-backed static initialization. Read all Rust source, examples, manifests, and documentation. Archive SHA-256 matches Cargo.lock. No build scripts, network access, environment harvesting, or hidden execution beyond the documented caller-supplied startup/shutdown callbacks. Native aarch64-apple-darwin smoke fixture exercised procedural and declarative ctors, static initialization, and both destructor exports successfully. Windows/Linux/WASM runtime behavior and dynamic-library unload were source-reviewed but not executed. Ordinary lifecycle, linker-retention, and callback safety requirements remain. Detailed evidence: docs/dependency-review-tauri-2026-10.md.
+"""
+
+[[audits.ctor-proc-macro]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+version = "0.0.7"
+notes = """
+Full published-source review of the 111-line proc-macro adapter, manifests and documentation. Only constructs token streams to invoke ctor support macros; optional crate_path is caller-provided Rust syntax. No dependencies, build script, filesystem/network/process access, unsafe code, or host-environment reads. Archive checksum matches Cargo.lock. Exercised in native macOS constructor/static smoke fixture; no blocker found.
+"""
+
+[[audits.dtor]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = """
+Full published Rust-source review including the complete 642-line macro engine (byte-identical to ctor 0.8.0), exports, example, manifests, and documentation. Generated constructors register caller-supplied destructor callbacks with atexit or Apple __cxa_atexit; target linker sections, unsafe boundaries, visibility and feature propagation inspected. No unrelated I/O or build script. Archive checksum matches Cargo.lock. Both direct dtor and ctor re-export destructor callbacks ran in native macOS smoke fixture. Cross-platform behavior and dynamic-library unload remain unexecuted; callback lifecycle safety remains the caller's responsibility. No supply-chain blocker found.
+"""
+
+[[audits.dtor-proc-macro]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+version = "0.0.6"
+notes = """
+Full published-source review of the 116-line proc-macro adapter, manifests and documentation. dtor and __dtor_from_ctor emit token streams invoking the respective crate's declarative dtor parser. Optional crate_path only selects caller-provided Rust syntax. No dependencies, build script, filesystem/network/process access, unsafe code, or environment reads. Archive checksum matches Cargo.lock. Both exports exercised successfully by native macOS smoke fixture; no blocker found.
+"""
+
+[[audits.muda]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.17.1 -> 0.19.3"
+notes = """
+Reviewed published crates.io source delta, manifests, and archive checksums.
+Changes add logical-key accelerators and BSD GTK support, repair Windows menu
+subclass teardown and label-buffer sizing, and retain macOS menu delegates.
+Inspected platform FFI ownership, accelerator parsing/mapping and menu dispatch;
+no new network, secret access, subprocess execution or build script found.
+Seven accelerator unit tests passed on macOS. Windows/Linux/BSD runtime behavior
+was source-reviewed, not executed. This is an automated delta review, not an
+independent human audit or a full audit of the accepted baseline/transitives.
+Details: docs/dependency-review-tauri-2026-10.md.
+"""
+
+[[audits.png]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.18.0-rc -> 0.18.1"
+notes = """
+Reviewed published crates.io source delta and moved filter modules, manifests,
+and archive checksums. Inspected chunk length/CRC/order checks, allocation and
+output-size arithmetic, in-place decompression lookback ownership, progressive
+row handling, Adam7 expansion, Paeth scalar/SIMD filtering, and stream encoder
+completion. Crate retains forbid(unsafe_code); no new network, process execution,
+secret access or build script found. IO remains caller-supplied Read/Write;
+filesystem use is confined to tests and examples. Published-crate library tests:
+75 passed, 8 missing-fixture failures, 1 ignored. After restoring only tests/
+fixtures from the exact published VCS commit, 83 passed, 0 failed, 1 ignored.
+No fuzzing or cross-platform runtime validation. Automated delta review, not proof against all malformed-input
+resource exhaustion or a full audit of baseline/transitive compression crates.
+The baseline is linked by the Google import's 0.17.16 -> 0.18.0-rc audit.
+Details: docs/dependency-review-tauri-2026-10.md.
+"""
+
 [[audits.rustls]]
 who = "OpenAI Codex (automated source review)"
 criteria = "safe-to-deploy"
@@ -27,6 +95,127 @@ who = "OpenAI Codex (automated source review)"
 criteria = "safe-to-deploy"
 delta = "0.103.13 -> 0.103.15"
 notes = "Reviewed the complete published source delta: CRL serial lookup propagates identical errors via ?, AWS-LC FIPS reporting uses try_fips_mode, and ML-DSA exports move to the stable AWS-LC feature. No changes to algorithm identifiers or ring verification bindings. Argos uses ring; optional AWS-LC behavior was inspected but not executed. Review scope and validation limits are documented in docs/dependency-review-rustls-2026-09.md."
+
+[[audits.tao]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.34.8 -> 0.35.3"
+notes = "Reviewed all changed published Rust files, normalized/original manifests and package metadata; inventoried bundled lockfile changes. Reviewed Android per-activity JNI/global-reference routing, intent URL parsing and lifecycle handling, iOS scene creation/retention/delegates, and Linux D-Bus portal theme reads/signals. No new build script, secret collection, command execution or external network endpoint. The new D-Bus traffic is local theme metadata. Non-security Android API/lifecycle concerns and untested mobile behavior are documented in the review report. Source review only; no platform runtime tests; dependency source audits are separate."
+
+[[audits.tauri]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.10.3 -> 2.11.6"
+notes = """
+Automated review of the complete published-crate source delta, including Rust,
+Kotlin, build/manifest/permission changes and bundled JavaScript. Verified both
+archives against the reviewed source. Reviewed remote-origin ACL tightening,
+per-webview channel queues and cleanup, protocol/CSP refactors, filesystem-scope
+events, native menu ownership, and mobile multiwindow/lifecycle APIs. The exact
+extracted channel queue passed isolation, one-shot fetch, wraparound-collision,
+and purge checks. No blocking introduced security issue or malicious behavior
+identified. This is a delta review, not an audit of the prior baseline or its
+independently vetted dependencies. Full Tauri/native-platform tests, fuzzing,
+and concurrency model checking were not performed; platform/runtime thread
+and lifecycle guarantees remain outside this source-level assessment.
+"""
+
+[[audits.tauri-build]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.5.6 -> 2.6.3"
+notes = """
+Reviewed the complete published source delta, both manifests and structured lockfile
+metadata. Changes add developer-controlled Windows resource text/version fields,
+Android file-association manifest generation and lifecycle-process dependency,
+OS-string environment handling, and equivalent feature checking. Android XML
+interpolation assumes trusted build configuration; it is not an input sanitizer.
+No unexpected network, secret access, or command execution was introduced in this
+crate's code. Static automated review only; Android/Windows execution and new
+transitive dependencies were not audited by this entry.
+"""
+
+[[audits.tauri-codegen]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.5.5 -> 2.6.3"
+notes = """
+Reviewed the complete published source delta, both manifests and structured lockfile
+metadata. Asset generation moves to tauri-utils html2/dom_query, retaining the CSP
+modification gates, SHA-256/base64 script hashes and nonce injection policy.
+Reviewed the new html2 implementation alongside the old HTML path. Isolation
+inlining still assumes trusted build assets; no new external fetch or runtime
+permission grant was found. Static automated review only, without browser tests
+or an audit of dom_query internals; dependencies require separate coverage.
+"""
+
+[[audits.tauri-macros]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.5.5 -> 2.6.3"
+notes = """
+Reviewed the complete published source delta, both manifests and structured lockfile
+metadata. Adds explicit developer-selected command renaming through hidden name
+macros while retaining handler dispatch, wrapper bodies and resolved ACL passing.
+Traced CommandItem.name consumers: renamed names gain quotes through stringify!
+in diagnostic paths; built-in scope resolution uses the existing resolved ACL,
+not that diagnostic name. Unused-command filtering still uses Rust names, which
+can remove renamed handlers. No privilege bypass identified. Static automated
+review only; no macro expansion/runtime tests or transitive dependency audit.
+"""
+
+[[audits.tauri-runtime]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.10.1 -> 2.11.3"
+notes = "Reviewed complete published source delta, both manifests, metadata and bundled lockfile dependency inventory. Changes add typed mobile scene/activity/lifecycle APIs, JavaScript evaluation callbacks, Apple content-process termination handlers, and a Windows general-autofill option defaulting to the prior enabled platform behavior; new-window callback drops Sync. No permission bypass, external transmission or build-script change identified. Source review only; no platform tests; tauri-utils and other dependencies require separate coverage."
+
+[[audits.tauri-runtime-wry]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.10.1 -> 2.11.4"
+notes = "Reviewed complete published source delta, both manifests, metadata and bundled lockfile dependency inventory. Traced script callback dispatch, Windows popup creation after wry main-thread dispatch change, mobile lifecycle listener borrow release, activity/scene routing, Windows device-context release, monitor placement, general-autofill propagation and Apple content-process reload fallback. Error-dialog input narrows to static strings. IPC handler removal is an unused argument only; request payload routing is unchanged. No new secret collection or external endpoint. Build script unchanged. Native tests were not run; Apple reload can reset transient frontend state; dependencies audited separately."
+
+[[audits.tauri-utils]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.8.3 -> 2.9.3"
+notes = """
+Reviewed the complete published source delta, both manifests and structured lockfile
+metadata, including all new html2 code, CSP/nonce policy, ACL changes, Android XML
+writes, file-association plist construction, resource iteration and startup binary
+initialization. The HTML port preserves CSP modification gates and trusted-asset
+isolation assumptions. Constructor adaptation keeps existing executable path and
+symlink checks. No unexpected secret access, network destination or permission
+grant found. Edge limitations: conversion of JSON u64 ACL values above i64::MAX
+now wraps to negative i64; Android XML accepts trusted configuration without
+escaping. Argos has no numeric permission scopes or Android file associations in
+the inspected configuration. Static automated review, no platform/browser tests;
+this entry does not audit dom_query, ctor, plist or other dependencies.
+"""
+
+[[audits.tray-icon]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.21.3 -> 0.24.2"
+notes = """
+Reviewed published crates.io source delta, manifests, and archive checksums.
+Changes add BSD/optional GTK support, right-click menu controls and show_menu,
+use borrowed macOS icon/title inputs, and repair Windows notification icon
+structure sizes, visibility persistence and popup-menu event handling.
+Inspected new FFI calls and handle lifetimes; existing GTK icon-file IO is
+unchanged. No new network, secret access, subprocess execution or build script
+found. cargo check --locked --lib passed on macOS with the published crate's
+own lockfile. Other platforms were not executed. Automated delta review only;
+accepted baseline and transitive crates are outside this certification.
+Details: docs/dependency-review-tauri-2026-10.md.
+"""
+
+[[audits.wry]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.54.4 -> 0.55.1"
+notes = "Reviewed all changed published Rust/Kotlin/ProGuard files, public API removals, manifests and metadata; inventoried bundled lockfile changes. Traced per-webview Android IPC/navigation/custom-protocol routing and callback cleanup, recreation handling and protocol timeout changes; inspected Windows popup handling moved to its main-thread dispatcher with COM deferral completion and removal of UnsafeSend. Apple changes adjust callback bounds and iOS autoresizing. Build script is unchanged; inspected Kotlin generation of the new Rust.kt template. No new external endpoint, secret collection or command execution. Android post-destroy queued-message panic risk is noted in the report. Source review only; no native platform execution; dependency audits separate."
 
 [[trusted.bellman]]
 criteria = "safe-to-deploy"
@@ -124,11 +313,60 @@ user-id = 6289 # Jack Grigg (str4d)
 start = "2021-06-03"
 end = "2027-06-26"
 
+[[trusted.libdbus-sys]]
+criteria = "safe-to-deploy"
+user-id = 429 # diwic
+start = "2025-12-11"
+end = "2025-12-12"
+notes = "PR #248 publisher trust for libdbus-sys 0.2.7; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
+
 [[trusted.memuse]]
 criteria = "safe-to-deploy"
 user-id = 6289 # Jack Grigg (str4d)
 start = "2021-09-03"
 end = "2027-06-26"
+
+[[trusted.objc2-cloud-kit]]
+criteria = "safe-to-deploy"
+user-id = 36629 # Mads Marquart (madsmtm)
+start = "2025-10-04"
+end = "2025-10-05"
+notes = "PR #248 publisher trust for objc2-cloud-kit 0.3.2; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
+
+[[trusted.objc2-core-data]]
+criteria = "safe-to-deploy"
+user-id = 36629 # Mads Marquart (madsmtm)
+start = "2025-10-04"
+end = "2025-10-05"
+notes = "PR #248 publisher trust for objc2-core-data 0.3.2; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
+
+[[trusted.objc2-core-image]]
+criteria = "safe-to-deploy"
+user-id = 36629 # Mads Marquart (madsmtm)
+start = "2025-10-04"
+end = "2025-10-05"
+notes = "PR #248 publisher trust for objc2-core-image 0.3.2; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
+
+[[trusted.objc2-core-location]]
+criteria = "safe-to-deploy"
+user-id = 36629 # Mads Marquart (madsmtm)
+start = "2025-10-04"
+end = "2025-10-05"
+notes = "PR #248 publisher trust for objc2-core-location 0.3.2; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
+
+[[trusted.objc2-core-text]]
+criteria = "safe-to-deploy"
+user-id = 36629 # Mads Marquart (madsmtm)
+start = "2025-10-04"
+end = "2025-10-05"
+notes = "PR #248 publisher trust for objc2-core-text 0.3.2; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
+
+[[trusted.objc2-user-notifications]]
+criteria = "safe-to-deploy"
+user-id = 36629 # Mads Marquart (madsmtm)
+start = "2025-10-04"
+end = "2025-10-05"
+notes = "PR #248 publisher trust for objc2-user-notifications 0.3.2; bounded to its publication day. This is publisher trust, not a full source or ABI audit. Maintainer approved on 2026-10-09."
 
 [[trusted.orchard]]
 criteria = "safe-to-deploy"
