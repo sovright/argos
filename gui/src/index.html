@@ -130,7 +130,7 @@
             <div class="guide-section">
               <h3>Before you start</h3>
               <ul>
-                <li><strong>Your recovery source:</strong> a 24-word ZecWallet Lite seed, an original wallet file, or a standalone spending-key backup.</li>
+                <li><strong>Your recovery source:</strong> a ZecWallet Lite seed phrase, an original wallet file, or a standalone spending-key backup.</li>
                 <li><strong>A destination Unified Address</strong> (starts with <code>u1…</code>) from a modern wallet such as ZODL or YWallet. Transparent (t1…) and Sapling (zs…) addresses are not accepted.</li>
                 <li>A stable internet connection. Long scans can reconnect automatically if the server drops — but don't put your machine to sleep mid-scan.</li>
               </ul>
@@ -138,12 +138,12 @@
 
             <div class="guide-section">
               <h3>Step 1 — Welcome</h3>
-              <p>Choose <em>I have my 24-word seed phrase</em> for the ZecWallet Lite HD path, or <em>I have a wallet file</em> to open a ZecWallet Lite/zcashd file or paste a standalone key.</p>
+              <p>Choose <em>I have my seed phrase</em> for the ZecWallet Lite HD path, or <em>I have a wallet file</em> to open a ZecWallet Lite/zcashd file or paste a standalone key.</p>
             </div>
 
             <div class="guide-section">
               <h3>Step 2 — Seed Entry</h3>
-              <p>Paste your full 24-word seed phrase (separated by spaces). Click <em>Validate seed</em> or press Enter — Argos checks the BIP-39 checksum locally. The phrase is blurred by default; toggle <em>Show words on screen</em> if you need to proofread it. Your seed is never transmitted anywhere.</p>
+              <p>Paste your full seed phrase (separated by spaces). Click <em>Validate seed</em> or press Enter — Argos checks the BIP-39 checksum locally. The phrase is blurred by default; toggle <em>Show words on screen</em> if you need to proofread it. Your seed is never transmitted anywhere.</p>
             </div>
 
             <div class="guide-section">
@@ -192,7 +192,7 @@
             <div class="guide-section">
               <h3>Troubleshooting</h3>
               <ul>
-                <li><strong>Seed validation fails:</strong> Check for typos, extra spaces, or missing words. All 24 words must be valid BIP-39 words in the correct order.</li>
+                <li><strong>Seed validation fails:</strong> Check for typos, extra spaces, or missing words. Every word must be a valid BIP-39 word in the correct order.</li>
                 <li><strong>Auto-detect finds no birthday:</strong> Your wallet may have no transparent history. Use the date picker to estimate the birthday manually instead.</li>
                 <li><strong>Scan seems stuck:</strong> Long pauses during the shielded sync are normal — the server may be catching up. Watch the block counter; as long as it's moving, the scan is working.</li>
                 <li><strong>Connection drops:</strong> Argos reconnects automatically up to 10 times. If it keeps failing, try switching the server preset to use a different public node.</li>
@@ -239,7 +239,7 @@
           <div class="card-grid">
             <article class="info-card">
               <h3>Use the backup you have</h3>
-              <p>Recover from a 24-word seed, a wallet file, or a standalone Sapling or Sprout spending key.</p>
+              <p>Recover from a seed phrase, a wallet file, or a standalone Sapling or Sprout spending key.</p>
             </article>
             <article class="info-card">
               <h3>Privacy first</h3>
@@ -251,7 +251,7 @@
             </article>
           </div>
           <div class="actions">
-            <button class="primary" data-next="seed">I have my 24-word seed phrase</button>
+            <button class="primary" data-next="seed">I have my seed phrase</button>
             <button class="secondary" data-next="wallet-file">I have a wallet file</button>
           </div>
           <div class="address-search-entry">
@@ -444,7 +444,7 @@
           <p class="eyebrow">Step 2</p>
           <h2>Enter the seed phrase</h2>
           <p class="lead">
-            Paste the full 24 words. The phrase stays on this machine and is cleared from the UI
+            Paste all 12, 15, 18, 21 or 24 words. The phrase stays on this machine and is cleared from the UI
             after you start a session.
           </p>
           <label class="field">
@@ -841,7 +841,7 @@
         <p class="eyebrow">Resume scan</p>
         <h2 id="resume-modal-title">Resume scan</h2>
         <p class="lead">
-          Enter the 24-word seed phrase that this scan was started with. Argos verifies it matches
+          Enter the seed phrase that this scan was started with. Argos verifies it matches
           before unlocking the saved scan data.
         </p>
         <label class="field">

@@ -34,7 +34,7 @@ Argos now includes the major recovery phases end to end:
 
 | Source | Coverage |
 |---|---|
-| 24-word ZecWallet Lite seed | Derives, scans, and sweeps transparent, Sapling, and Orchard funds across the legacy account layout. ZecWallet Lite did not derive Sprout keys from this seed. |
+| ZecWallet Lite seed phrase (12–24 words) | Derives, scans, and sweeps transparent, Sapling, and Orchard funds across the legacy account layout. ZecWallet Lite did not derive Sprout keys from this seed. |
 | ZecWallet Lite wallet file | Recovers the mnemonic and re-enters the same complete HD recovery path as a typed seed. |
 | zcashd `wallet.dat` | Scans and sweeps every imported transparent and Sapling key. Sprout notes use the separate Sprout workflow described below. |
 | Sapling extended spending key | Scans and sweeps `secret-extended-key-main1…` or `secret-extended-key-test1…` keys without requiring a wallet file. |

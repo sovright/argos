@@ -2152,7 +2152,7 @@ fn load_seed_phrase(seed_file: Option<PathBuf>) -> Result<SecretString> {
     }
 
     let phrase = Password::new()
-        .with_prompt("Enter your 24-word seed phrase")
+        .with_prompt("Enter your seed phrase (12, 15, 18, 21 or 24 words)")
         .allow_empty_password(false)
         .interact()
         .context("failed to read seed phrase from terminal")?;
