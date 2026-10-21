@@ -776,12 +776,26 @@ impl RecoveryService {
                 &imported_indices,
                 &standalone_transparent_balances,
             )?;
-            if !standalone_transparent_indices.is_empty() {
+            // The proposal creates a direct leg only for a positive scanned
+            // standalone balance. An imported key with no UTXOs must not
+            // require a Sapling receiver or enter the direct executor.
+            let has_direct_leg = standalone_transparent_balances
+                .values()
+                .any(|balance| balance.zatoshis > 0);
+            if has_direct_leg {
                 crate::transparent_recovery::sapling_receiver(
                     &request.destination,
                     session.runtime.network,
                 )?;
             }
+            // The scan stores standalone balances by display account, not
+            // individual key. When that aggregate is empty, skip every key;
+            // otherwise let the executor resolve its selected keys' UTXOs.
+            let transparent_indices_to_sweep: &[usize] = if has_direct_leg {
+                &standalone_transparent_indices
+            } else {
+                &[]
+            };
             let transparent_display_index = standalone_transparent_balances
                 .iter()
                 .filter(|(_, balance)| balance.utxo_count > 0)
@@ -792,7 +806,7 @@ impl RecoveryService {
                     &session.runtime,
                     keys,
                     &imported_accounts,
-                    &standalone_transparent_indices,
+                    transparent_indices_to_sweep,
                     transparent_display_index,
                     &request.destination,
                     request.max_fee_zatoshis,
@@ -806,7 +820,7 @@ impl RecoveryService {
                 imported,
                 imported_result,
                 !imported_accounts.is_empty(),
-                !standalone_transparent_indices.is_empty(),
+                has_direct_leg,
             )?;
             if imported_outcome.error.is_some() || hd_indices.is_empty() {
                 return Ok(imported_outcome);
@@ -4296,6 +4310,161 @@ mod tests {
         )
         .expect_err("two individually affordable legs cost 20,000 together");
         assert!(matches!(error, crate::error::ZeckError::MaxFeeExceeded(_)));
+    }
+
+    fn orchard_only_destination() -> String {
+        use zcash_address::unified::{Address, Encoding, Receiver};
+        let sk = orchard::keys::SpendingKey::from_bytes([7u8; 32]).unwrap();
+        let fvk = orchard::keys::FullViewingKey::from(&sk);
+        let address = fvk.address_at(0u32, orchard::keys::Scope::External);
+        Address::try_from_items(vec![Receiver::Orchard(address.to_raw_address_bytes())])
+            .unwrap()
+            .encode(&zcash_protocol::consensus::NetworkType::Main)
+    }
+
+    #[tokio::test]
+    async fn empty_standalone_transparent_key_does_not_block_orchard_hd_execution() {
+        use crate::key_source::ImportedKeySource;
+        use argos_wallet_import::{keys::TransparentKey, ImportedKeys, Provenance};
+        use secrecy::Secret;
+
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let keys = ImportedKeys {
+            mnemonic: Some(SecretString::new(phrase.to_owned())),
+            transparent: vec![TransparentKey {
+                secret: Secret::new([0x42; 32]),
+                provenance: Provenance::Standalone,
+            }],
+            ..Default::default()
+        };
+        let handle = ScanHandle::new();
+        let mut session = reviewed_session(handle.clone(), phrase);
+        session.runtime.key_source = Arc::new(ImportedKeySource::new(keys));
+        session.source_fingerprint = session.runtime.key_source.fingerprint().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        session.runtime.data_dir = tempdir.path().to_owned();
+        let workspace =
+            crate::workspace::RecoveryWorkspace::from_runtime(&session.runtime).unwrap();
+        workspace
+            .initialize_from_source(session.runtime.network, session.runtime.key_source.as_ref())
+            .unwrap();
+        session.workspace_root = workspace.root().to_owned();
+        let derived = derive_accounts(
+            &SecretString::new(phrase.to_owned()),
+            ZeckNetwork::Mainnet,
+            1,
+        )
+        .unwrap()
+        .remove(0);
+        let mut state = session.state.lock().await;
+        state.progress = progress_with_accounts(vec![shielded_account(0, 100_000)]);
+        state.progress.handle = handle.clone();
+        state.standalone_transparent_indices = vec![0];
+        state.standalone_transparent_balances.insert(
+            0,
+            crate::scan::StandaloneTransparentBalance {
+                zatoshis: 0,
+                utxo_count: 0,
+            },
+        );
+        state.tracked_accounts.push(TrackedAccount {
+            wallet_account_id: zcash_client_sqlite::AccountUuid::default(),
+            derived,
+            transparent_receivers: Vec::new(),
+            spend_authority: crate::scan::TrackedSpendAuthority::Hd { zip32_index: 0 },
+            standalone_transparent_receivers: Vec::new(),
+            transparent_key_coordinates: Vec::new(),
+        });
+        let request = SweepRequest {
+            destination: orchard_only_destination(),
+            memo: None,
+            max_fee_zatoshis: None,
+            donation_rate: None,
+            donor_email: None,
+        };
+        let proposal = super::build_combined_sweep_proposal(
+            &state.progress,
+            request.clone(),
+            ZeckNetwork::Mainnet,
+            &[0],
+            &[],
+            &state.standalone_transparent_balances,
+        )
+        .expect("the funded HD leg can propose to Orchard only");
+        assert_eq!(proposal.transactions.len(), 1);
+        let intent =
+            ReviewedSweepIntent::capture_from_state(request.clone(), &session, &state).unwrap();
+        drop(state);
+        let proposal_id = SweepProposalId("orchard-hd-empty-direct".to_owned());
+        session
+            .reviewed_sweeps
+            .lock()
+            .await
+            .insert(proposal_id.clone(), intent);
+        let service = super::RecoveryService::new();
+        service
+            .sessions
+            .write()
+            .await
+            .insert(handle.id.clone(), Arc::new(session));
+
+        // There are no actual wallet notes in this fixture. Execution must
+        // reach the HD wallet path rather than refusing the empty direct leg.
+        let error = service
+            .execute_sweep(&handle, &proposal_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("wallet workspace is unavailable"),
+            "empty direct leg wrongly blocked HD execution: {error}"
+        );
+
+        // A discovered standalone UTXO changes the route: the same
+        // destination must be refused before the imported executor starts.
+        let session = service.session(&handle).await.unwrap();
+        let mut state = session.state.lock().await;
+        state.standalone_transparent_balances.insert(
+            0,
+            crate::scan::StandaloneTransparentBalance {
+                zatoshis: 100_000,
+                utxo_count: 1,
+            },
+        );
+        state.progress.accounts[0].transparent_zatoshis = 100_000;
+        state.progress.accounts[0].transparent_utxo_count = 1;
+        state.progress.accounts[0].total_zatoshis = 200_000;
+        let quoted = super::build_combined_sweep_proposal(
+            &state.progress,
+            request.clone(),
+            ZeckNetwork::Mainnet,
+            &[0],
+            &[],
+            &state.standalone_transparent_balances,
+        );
+        assert!(
+            quoted.is_err(),
+            "funded direct leg cannot quote Orchard only"
+        );
+        let intent = ReviewedSweepIntent::capture_from_state(request, &session, &state).unwrap();
+        drop(state);
+        let funded_id = SweepProposalId("orchard-hd-funded-direct".to_owned());
+        session
+            .reviewed_sweeps
+            .lock()
+            .await
+            .insert(funded_id.clone(), intent);
+        let error = service
+            .execute_sweep(&handle, &funded_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("destination must include an Orchard or Sapling receiver"),
+            "funded direct leg was not refused before execution: {error}"
+        );
     }
 
     #[test]
