@@ -6,49 +6,17 @@
 
 use std::path::Path;
 
+#[path = "common/sprout_note_fixture.rs"]
+mod sprout_note_fixture;
+
 use argos_core::{
     p2p::wire::P2pNetwork,
     sprout_scan::{SproutScanCheckpoint, SproutScanner},
     sprout_scan_run::{run_sprout_scan, TipAnchor},
 };
+use sprout_note_fixture::{plant_sprout_note, rpc, NODE_P2P};
 
-const RPC: &str = "http://127.0.0.1:18242";
-const NODE_P2P: &str = "127.0.0.1:18344";
 const KEY: [u8; 32] = [0x11; 32];
-
-async fn rpc(method: &str, params: serde_json::Value) -> serde_json::Value {
-    use base64::Engine as _;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let host_port = RPC.strip_prefix("http://").unwrap_or(RPC);
-    let body = serde_json::json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params});
-    let payload = serde_json::to_vec(&body).expect("serializable request");
-    let auth = base64::engine::general_purpose::STANDARD.encode("argos-regtest:argos-regtest");
-
-    let mut stream = tokio::net::TcpStream::connect(host_port)
-        .await
-        .unwrap_or_else(|err| panic!("connecting to zcashd at {host_port}: {err}"));
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: Basic {auth}\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        payload.len()
-    );
-    stream.write_all(request.as_bytes()).await.expect("headers");
-    stream.write_all(&payload).await.expect("body");
-
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("response");
-    let text = String::from_utf8_lossy(&raw);
-    let start = text.find("\r\n\r\n").map(|i| i + 4).expect("HTTP headers");
-    let parsed: serde_json::Value = serde_json::from_str(text[start..].trim())
-        .unwrap_or_else(|err| panic!("zcashd {method} returned unparseable JSON: {err}\n{text}"));
-    assert!(
-        parsed.get("error").is_none_or(serde_json::Value::is_null),
-        "zcashd {method} failed: {}",
-        parsed["error"]
-    );
-    parsed.get("result").cloned().expect("RPC result")
-}
 
 fn wire_hash(display_hash: &str) -> [u8; 32] {
     assert_eq!(display_hash.len(), 64, "a block hash has 32 bytes");
@@ -92,11 +60,13 @@ async fn tip() -> (u32, String) {
 #[tokio::test]
 #[ignore = "needs the regtest sprout node; see the module docs"]
 async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
-    // Five fresh empty blocks make the fork depth independent of the node's
-    // pre-existing chain and leave a retained common ancestor.
-    rpc("generate", serde_json::json!([5])).await;
+    // The fixture mines 110 funding blocks, then a funding block and the
+    // JoinSplit block. Two more empty blocks put its commitments exactly
+    // three deep, with well over five fresh blocks in the recent suffix.
+    let planted = plant_sprout_note(KEY).await;
+    rpc("generate", serde_json::json!([2])).await;
     let (old_height, old_tip) = tip().await;
-    assert!(old_height >= 5);
+    assert_eq!(old_height, planted.height + 2);
 
     let dir = tempfile::tempdir().expect("private checkpoint directory");
     let checkpoint = dir.path().join("reorg.checkpoint");
@@ -120,6 +90,11 @@ async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
     assert_eq!(old_cursor.last_block_hash, wire_hash(&old_tip));
     assert!(before.is_complete(), "initial scan reached its tip");
     assert_eq!(before.anchor(), first.anchor, "saved initial anchor");
+    assert_eq!(
+        first.total_value(),
+        planted.value,
+        "planted note was scanned"
+    );
 
     let fork_height = old_height - 2; // This block and two successors are orphaned.
     let orphaned: Vec<[u8; 32]> = {
@@ -139,6 +114,17 @@ async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
         serde_json::json!([display_hash(orphaned[0])]),
     )
     .await;
+    // zcashd returns the invalidated JoinSplit to its mempool. Keep it out
+    // of the replacement blocks so its commitments are genuinely orphaned.
+    assert_eq!(
+        rpc(
+            "prioritisetransaction",
+            serde_json::json!([planted.txid, 0, -1_000_000_000]),
+        )
+        .await,
+        serde_json::json!(true),
+        "deprioritise the orphaned JoinSplit for replacement mining"
+    );
     rpc("generate", serde_json::json!([5])).await;
     let (new_height, new_tip) = tip().await;
     assert_eq!(
@@ -147,6 +133,35 @@ async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
         "replacement branch has five blocks"
     );
     assert_ne!(new_tip, old_tip, "zcashd switched branches");
+    for height in fork_height..=new_height {
+        let hash = rpc("getblockhash", serde_json::json!([height])).await;
+        let block = rpc("getblock", serde_json::json!([hash, 1])).await;
+        assert!(
+            !block["tx"]
+                .as_array()
+                .expect("replacement block transactions")
+                .iter()
+                .any(|txid| txid.as_str() == Some(planted.txid.as_str())),
+            "the planted JoinSplit must not be mined on the replacement branch"
+        );
+    }
+    let tree = rpc(
+        "z_gettreestate",
+        serde_json::json!([new_height.to_string()]),
+    )
+    .await;
+    let node_root = tree["sprout"]["commitments"]["finalRoot"]
+        .as_str()
+        .expect("node's Sprout finalRoot");
+    assert_ne!(
+        display_hash(before.anchor()),
+        node_root,
+        "the invalidated suffix must change the Sprout root"
+    );
+    eprintln!(
+        "[reorg] old Sprout root {}, replacement root {node_root}",
+        display_hash(before.anchor())
+    );
 
     let resumed = run_sprout_scan(
         &[KEY],
@@ -178,14 +193,6 @@ async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
         "no orphan hash may survive in retained locators"
     );
 
-    let tree = rpc(
-        "z_gettreestate",
-        serde_json::json!([new_height.to_string()]),
-    )
-    .await;
-    let node_root = tree["sprout"]["commitments"]["finalRoot"]
-        .as_str()
-        .expect("node's Sprout finalRoot");
     assert_eq!(display_hash(resumed.anchor), node_root);
     assert_eq!(after.anchor(), resumed.anchor, "saved replacement anchor");
 }
