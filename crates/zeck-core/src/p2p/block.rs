@@ -18,6 +18,12 @@
 //! one parser for a structure with one serialization, rather than a second
 //! copy that could drift, and it means upstream still owns all the version
 //! handling.
+//!
+//! Before returning any JoinSplits, this module checks every transaction ID
+//! and its order against the header's `hashMerkleRoot`. Sprout JoinSplits are
+//! v2-v4 effecting data committed by their legacy transaction IDs. NU5+
+//! authorizing data has a separate auth-data/block-commitment boundary; this
+//! helper is not a full modern consensus block verifier.
 
 use argos_wallet_import::keys::SproutJoinSplit;
 use zcash_primitives::transaction::Transaction;
@@ -27,6 +33,7 @@ use super::wire::{read_compact_size, sha256d};
 
 /// Fixed part of a Zcash block header, before the Equihash solution.
 const HEADER_FIXED_LEN: usize = 140;
+const MERKLE_ROOT_RANGE: std::ops::Range<usize> = 36..68;
 
 /// Groth16 JoinSplit proofs are used from transaction version 4 onward;
 /// earlier versions carry the larger PHGR13 proof. The two serializations
@@ -37,6 +44,14 @@ const SAPLING_TX_VERSION: u32 = 4;
 pub enum BlockError {
     #[error("block is truncated or malformed")]
     Malformed,
+    #[error("a block must contain at least its coinbase transaction")]
+    NoTransactions,
+    #[error("a block has {bytes} undeclared trailing bytes after its transactions")]
+    TrailingData { bytes: usize },
+    #[error("the block transaction Merkle tree is mutated by a duplicated sibling pair")]
+    MutatedMerkleTree,
+    #[error("the block transaction Merkle root does not match its header")]
+    MerkleRootMismatch,
     #[error("transaction {index} in this block could not be parsed: {source}")]
     Transaction {
         index: usize,
@@ -68,8 +83,12 @@ pub fn joinsplits_in_block(
     if tx_count > block.len() as u64 {
         return Err(BlockError::Malformed);
     }
+    if tx_count == 0 {
+        return Err(BlockError::NoTransactions);
+    }
 
     let mut out = Vec::new();
+    let mut txids = Vec::new();
     for index in 0..tx_count as usize {
         let rest = block.get(pos..).ok_or(BlockError::Malformed)?;
 
@@ -79,13 +98,14 @@ pub fn joinsplits_in_block(
         let consumed = cursor.position() as usize;
         pos = pos.checked_add(consumed).ok_or(BlockError::Malformed)?;
 
-        let Some(bundle) = tx.sprout_bundle() else {
-            continue;
-        };
-
         let txid: [u8; 32] = tx.txid().as_ref()[..]
             .try_into()
             .map_err(|_| BlockError::Malformed)?;
+        txids.push(txid);
+
+        let Some(bundle) = tx.sprout_bundle() else {
+            continue;
+        };
 
         // The version that produced this transaction decides the proof
         // encoding, and so how long each JoinSplit is on the wire.
@@ -111,7 +131,45 @@ pub fn joinsplits_in_block(
         }
     }
 
+    if pos != block.len() {
+        let bytes = block.len().checked_sub(pos).ok_or(BlockError::Malformed)?;
+        return Err(BlockError::TrailingData { bytes });
+    }
+    if transaction_merkle_root(&txids)? != header_merkle_root(block)? {
+        return Err(BlockError::MerkleRootMismatch);
+    }
+
     Ok(out)
+}
+
+fn header_merkle_root(block: &[u8]) -> Result<[u8; 32], BlockError> {
+    block
+        .get(MERKLE_ROOT_RANGE)
+        .ok_or(BlockError::Malformed)?
+        .try_into()
+        .map_err(|_| BlockError::Malformed)
+}
+
+fn transaction_merkle_root(txids: &[[u8; 32]]) -> Result<[u8; 32], BlockError> {
+    if txids.is_empty() {
+        return Err(BlockError::NoTransactions);
+    }
+
+    let mut level = txids.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::new();
+        for pair in level.chunks(2) {
+            if pair.len() == 2 && pair[0] == pair[1] {
+                return Err(BlockError::MutatedMerkleTree);
+            }
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(&pair[0]);
+            combined[32..].copy_from_slice(pair.get(1).unwrap_or(&pair[0]));
+            next.push(sha256d(&combined));
+        }
+        level = next;
+    }
+    Ok(level[0])
 }
 
 /// The block's own hash, for chaining and progress reporting.
@@ -143,6 +201,171 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_test_transaction(tag: u8) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&2u32.to_le_bytes()); // Sprout v2
+        tx.push(1); // one input
+        tx.extend_from_slice(&[0; 32]); // previous txid
+        tx.extend_from_slice(&u32::MAX.to_le_bytes()); // previous index
+        tx.push(1); // script length
+        tx.push(tag);
+        tx.extend_from_slice(&u32::MAX.to_le_bytes()); // sequence
+        tx.push(1); // one output
+        tx.extend_from_slice(&0i64.to_le_bytes()); // value
+        tx.push(0); // empty output script
+        tx.extend_from_slice(&0u32.to_le_bytes()); // lock time
+        tx.push(0); // empty JoinSplit vector
+        tx
+    }
+
+    fn reference_merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
+        let mut level = txids.to_vec();
+        if level.is_empty() {
+            return [0; 32];
+        }
+        while level.len() > 1 {
+            let mut next = Vec::new();
+            for pair in level.chunks(2) {
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(&pair[0]);
+                combined[32..].copy_from_slice(pair.get(1).unwrap_or(&pair[0]));
+                next.push(sha256d(&combined));
+            }
+            level = next;
+        }
+        level[0]
+    }
+
+    fn test_block(transactions: &[Vec<u8>]) -> Vec<u8> {
+        let txids: Vec<[u8; 32]> = transactions.iter().map(|tx| sha256d(tx)).collect();
+        let mut block = vec![0u8; HEADER_FIXED_LEN];
+        block[36..68].copy_from_slice(&reference_merkle_root(&txids));
+        block.push(0); // empty Equihash solution
+        super::super::wire::write_compact_size(&mut block, transactions.len() as u64);
+        for tx in transactions {
+            block.extend_from_slice(tx);
+        }
+        block
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex"), 16)
+                    .expect("valid hex")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn zero_transaction_body_is_rejected() {
+        let block = test_block(&[]);
+        assert!(matches!(
+            joinsplits_in_block(&block, BranchId::Canopy),
+            Err(BlockError::NoTransactions)
+        ));
+    }
+
+    #[test]
+    fn declared_transactions_must_consume_the_entire_body() {
+        let mut block = test_block(&[legacy_test_transaction(1)]);
+        block.push(0xAA);
+        assert!(matches!(
+            joinsplits_in_block(&block, BranchId::Canopy),
+            Err(BlockError::TrailingData { bytes: 1 })
+        ));
+    }
+
+    #[test]
+    fn transaction_merkle_root_binds_omission_substitution_and_order() {
+        let transactions: Vec<_> = (1..=3).map(legacy_test_transaction).collect();
+        let original = test_block(&transactions);
+        assert!(joinsplits_in_block(&original, BranchId::Canopy).is_ok());
+
+        let modified_bodies = [
+            vec![transactions[0].clone(), transactions[1].clone()],
+            vec![
+                transactions[0].clone(),
+                legacy_test_transaction(4),
+                transactions[2].clone(),
+            ],
+            vec![
+                transactions[0].clone(),
+                transactions[2].clone(),
+                transactions[1].clone(),
+            ],
+        ];
+        for body in modified_bodies {
+            let mut block = original[..HEADER_FIXED_LEN + 1].to_vec();
+            super::super::wire::write_compact_size(&mut block, body.len() as u64);
+            for tx in body {
+                block.extend_from_slice(&tx);
+            }
+            assert!(matches!(
+                joinsplits_in_block(&block, BranchId::Canopy),
+                Err(BlockError::MerkleRootMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_last_transaction_is_rejected_as_a_mutated_merkle_tree() {
+        let transactions: Vec<_> = (1..=3).map(legacy_test_transaction).collect();
+        let txids: Vec<_> = transactions.iter().map(|tx| sha256d(tx)).collect();
+        let mut duplicated_txids = txids.clone();
+        duplicated_txids.push(txids[2]);
+        assert_eq!(
+            reference_merkle_root(&txids),
+            reference_merkle_root(&duplicated_txids)
+        );
+
+        let original = test_block(&transactions);
+        let mut mutated = original[..HEADER_FIXED_LEN + 1].to_vec();
+        super::super::wire::write_compact_size(&mut mutated, 4);
+        for tx in &transactions {
+            mutated.extend_from_slice(tx);
+        }
+        mutated.extend_from_slice(&transactions[2]);
+        assert!(matches!(
+            joinsplits_in_block(&mutated, BranchId::Canopy),
+            Err(BlockError::MutatedMerkleTree)
+        ));
+    }
+
+    #[test]
+    fn zip244_txid_is_used_for_v5_block_merkle_root() {
+        // Zebra v6.2.0 mainnet getblocktemplate coinbase snapshot, recorded independently.
+        const V5_COINBASE_HEX: [&str; 7] = [
+            "050000800a27a726b4d0d6c20000000041be1900010000000000000000000000",
+            "000000000000000000000000000000000000000000ffffffff090341be1904f0",
+            "9fa693ffffffff0480b2e60e0000000017a9147e7e7e7e7e7e7e7e7e7e7e7e7e",
+            "7e7e7e7e7e7e7e87286bee000000000017a914d45cb1adffb5215a42720532a0",
+            "76f02c7c778c908738c94d010000000017a91469a9f95a98fe581b6eb52841ef",
+            "4806dc4402eb908740787d010000000017a914931fec54c1fea86e574462cc32",
+            "013f5400b8912987000000",
+        ];
+        let coinbase = decode_hex(&V5_COINBASE_HEX.concat());
+        let zip244_display =
+            decode_hex("0dd4c87d6aba52431fef01079578826b547a22e444af986368c507918f893e8a");
+        let sha256d_display =
+            decode_hex("f96ec1f0b0b8732dc3fc81bc629bfe6ef437d704f03ef884359ddcb7044f0613");
+        assert_ne!(zip244_display, sha256d_display);
+
+        let mut block = test_block(&[coinbase]);
+        block[36..68].copy_from_slice(&zip244_display.iter().rev().copied().collect::<Vec<_>>());
+        let result = joinsplits_in_block(&block, BranchId::Nu5);
+        assert!(result.is_ok(), "v5 coinbase should parse: {result:?}");
+
+        block[36..68].copy_from_slice(&sha256d_display.iter().rev().copied().collect::<Vec<_>>());
+        assert!(matches!(
+            joinsplits_in_block(&block, BranchId::Nu5),
+            Err(BlockError::MerkleRootMismatch)
+        ));
+    }
 
     /// A block with no transactions at all is malformed — every block has at
     /// least a coinbase — but it must be reported, not panicked on.
@@ -178,7 +401,8 @@ mod tests {
         );
     }
 
-    /// A peer can claim any transaction count; it must not size anything.
+    /// A peer can claim any transaction count; no vector reserves capacity
+    /// from hostile `tx_count`.
     #[test]
     fn a_lying_transaction_count_is_rejected() {
         let mut block = vec![0u8; HEADER_FIXED_LEN];
