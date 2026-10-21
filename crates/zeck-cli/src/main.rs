@@ -370,6 +370,15 @@ enum Commands {
         /// Confirm you understand this is irreversible and broadcast.
         #[arg(long)]
         confirm_sweep: bool,
+
+        /// A Zcash node, as `host:port`, to verify a saved full-block scan
+        /// against before its spends are used. Repeatable, and dialled
+        /// before the public DNS-seed peers. Only contacted when a scan of
+        /// this wallet's keys exists under --data-dir; one pass, so an
+        /// unreachable network fails fast and the wallet file's own record
+        /// is used instead.
+        #[arg(long)]
+        peer: Vec<String>,
     },
 }
 
@@ -700,10 +709,12 @@ struct SweepGate {
 /// Thin by design: address parsing, branch-id selection, proving and
 /// broadcast all live in `argos-core`, because the GUI needs exactly the
 /// same sequence and a second copy here would drift from it.
+#[allow(clippy::too_many_arguments)]
 async fn sweep_sprout(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     data_dir: &Path,
+    peers: &[String],
     lightwalletd_url: &str,
     destination: &str,
     sprout_params: Option<PathBuf>,
@@ -714,7 +725,7 @@ async fn sweep_sprout(
         dry_run,
         confirm_sweep,
     } = gate;
-    let recovered = recover_with_scan(keys, network, data_dir).await;
+    let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Verify(peers)).await;
     // stdout, beside the plan: `> plan.txt` must keep the reason the total
     // is smaller than the wallet's history.
     print_sprout_accounting(keys, &recovered, false, "argos inspect-wallet --show-spent");
@@ -1177,23 +1188,47 @@ fn print_sprout_accounting(
     println!();
 }
 
+/// Whether the wallet-file path may contact peers to verify a saved scan.
+#[derive(Clone, Copy)]
+enum ScanEvidence<'a> {
+    /// No network contact. A saved scan is named, never used.
+    Offline,
+    /// Verify a saved scan against live headers, dialling these peers
+    /// first, before letting its nullifiers settle spends.
+    Verify(&'a [String]),
+}
+
 /// Recover the wallet file's Sprout notes, letting a full-block scan of the
-/// same keys — if one has run in this data directory — settle every spend it
-/// saw on chain. The scan is optional; a checkpoint that cannot be used is
-/// reported and the file's own record stands.
+/// same keys — if one has run in this data directory and `evidence` allows
+/// verifying it — settle every spend it saw on chain. The scan is optional;
+/// a checkpoint that cannot be used is reported and the file's own record
+/// stands.
 async fn recover_with_scan(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     data_dir: &Path,
+    evidence: ScanEvidence<'_>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
-    let (chain, mut notice) = argos_core::sprout_scan_run::chain_spends_for_wallet(
-        data_dir,
-        network.into(),
-        &spending_keys,
-        &[],
-    )
-    .await;
+    let (chain, mut notice) = match evidence {
+        ScanEvidence::Offline => (
+            None,
+            argos_core::sprout_scan_run::wallet_scan_notice_offline(
+                data_dir,
+                network.into(),
+                &spending_keys,
+            ),
+        ),
+        ScanEvidence::Verify(peers) => {
+            argos_core::sprout_scan_run::chain_spends_for_wallet(
+                data_dir,
+                network.into(),
+                &spending_keys,
+                peers,
+            )
+            .await
+        }
+    };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
         chain.as_deref(),
@@ -1455,7 +1490,10 @@ async fn print_sprout_inspection(
         // witness. A wallet with both needs no network at all; a wallet
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
-        let recovered = recover_with_scan(keys, network, data_dir).await;
+        // Inspection makes no network contact: a saved scan is named but
+        // not used, since only live peers can show its cursor survived any
+        // reorganization.
+        let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Offline).await;
         print_sprout_accounting(
             keys,
             &recovered,
@@ -2142,6 +2180,7 @@ async fn main() -> Result<()> {
             sprout_params,
             dry_run,
             confirm_sweep,
+            peer,
         } => {
             let source = imported.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -2153,6 +2192,7 @@ async fn main() -> Result<()> {
                 source.keys(),
                 network,
                 &cli.data_dir,
+                &peer,
                 &cli.lightwalletd_url,
                 &destination,
                 sprout_params,
@@ -3225,7 +3265,8 @@ mod tests {
         )
         .unwrap();
 
-        let recovered = recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir).await;
+        let recovered =
+            recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir, ScanEvidence::Offline).await;
         assert_eq!(
             recovered.notes.len(),
             1,
@@ -3235,7 +3276,7 @@ mod tests {
         assert!(recovered
             .chain_notice
             .unwrap()
-            .contains("will not use its spent-note evidence"));
+            .contains("not verified offline"));
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3257,7 +3298,8 @@ mod tests {
                 provenance: argos_core::argos_wallet_import::keys::Provenance::Standalone,
                 created_at: None,
             });
-        let recovered = recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir).await;
+        let recovered =
+            recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir, ScanEvidence::Offline).await;
         let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
         let notice = recovered.chain_notice.unwrap();
         assert!(
@@ -3270,6 +3312,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// sweep-sprout verifies a saved scan through the user's own peers.
+    #[test]
+    fn sweep_sprout_takes_repeatable_peers() {
+        let cli = Cli::try_parse_from([
+            "argos",
+            "sweep-sprout",
+            "--destination",
+            "zs1x",
+            "--peer",
+            "192.0.2.1:8233",
+            "--peer",
+            "node.example.org:8233",
+        ])
+        .unwrap();
+        let Commands::SweepSprout { peer, .. } = cli.command else {
+            panic!("parsed as sweep-sprout");
+        };
+        assert_eq!(peer, ["192.0.2.1:8233", "node.example.org:8233"]);
+    }
 
     /// The speed-for-memory knob reaches the scanner.
     #[test]

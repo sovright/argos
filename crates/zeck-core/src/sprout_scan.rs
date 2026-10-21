@@ -233,6 +233,12 @@ impl SproutScanner {
         &self.spent
     }
 
+    /// [`Self::spent_nullifiers`], taken by value so a caller done with the
+    /// scanner does not copy a set that can run to millions of entries.
+    pub fn into_spent_nullifiers(self) -> HashMap<[u8; 32], Option<[u8; 32]>> {
+        self.spent
+    }
+
     /// Record that the walk reached the chain tip at the current cursor.
     pub fn mark_complete(&mut self) {
         self.complete = true;

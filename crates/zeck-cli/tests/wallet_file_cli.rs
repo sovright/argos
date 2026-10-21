@@ -882,9 +882,9 @@ const SEED_FP_SPROUT_PLAINTEXT: [u8; 32] = [
     0x3d, 0x37, 0x0f, 0x1d, 0xe0, 0x00, 0x78, 0x59, 0x18, 0xb1, 0x54, 0x43, 0xdd, 0x37, 0xcf, 0xa2,
 ];
 
-/// A saved checkpoint alone cannot settle spends. Inspection must find it,
-/// attempt live verification, and keep the wallet file's own accounting when
-/// verification is unavailable.
+/// A saved checkpoint alone cannot settle spends, and inspection makes no
+/// network contact. It must find the scan, say its evidence was not
+/// verified offline, and keep the wallet file's own accounting.
 #[test]
 fn inspection_refuses_an_unverified_scan_of_the_same_keys() {
     use secrecy::ExposeSecret;
@@ -941,13 +941,14 @@ fn inspection_refuses_an_unverified_scan_of_the_same_keys() {
         "{}",
         String::from_utf8_lossy(&with_scan.stderr)
     );
-    // This synthetic checkpoint has no reachable canonical peer. It must
-    // never be promoted into spent-note evidence merely because it exists.
+    // Inspection never dials a peer, so this synthetic checkpoint is never
+    // promoted into spent-note evidence merely because it exists.
     let with = with.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        with.contains("will not use its spent-note evidence")
+        with.contains("was not verified offline")
+            && with.contains(&checkpoint.display().to_string())
             && with.contains("Spent status is the wallet file's own record"),
-        "the scan must be found and refused without live verification:\n{with}"
+        "the scan must be found and not used without live verification:\n{with}"
     );
     let without = String::from_utf8_lossy(&without_scan.stdout);
     let without = without.split_whitespace().collect::<Vec<_>>().join(" ");

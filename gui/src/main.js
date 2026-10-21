@@ -681,6 +681,9 @@ async function showSproutSweep() {
       // Where the scan panel keeps its checkpoint: a scan of these keys
       // settles spends the wallet file cannot see.
       dataDir: $("data-dir").value.trim() || null,
+      // The scan panel's peers, dialled first when that checkpoint is
+      // verified against live headers. Opening the wallet never dials.
+      peers: sproutScanPeers(),
     });
 
     if (walletFile !== source) return;
@@ -760,6 +763,7 @@ async function runSproutSweep() {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       network: $("network-select").value,
       dataDir: $("data-dir").value.trim() || null,
+      peers: sproutScanPeers(),
     });
 
     if (walletFile !== source) return;

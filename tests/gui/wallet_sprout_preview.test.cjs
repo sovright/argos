@@ -45,6 +45,9 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     listen: async (name, callback) => { assert.equal(name, "sprout-sweep-progress"); onProgress = callback; },
     $, document: { createElement: element },
     fmt: (value) => String(value),
+    // The scan panel's peer field; replaced by the real helper when a test
+    // loads the scan panel.
+    sproutScanPeers: () => ["192.0.2.7:8233"],
     setStatus: (id, text) => {
       if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
       $(id).textContent = text;
@@ -123,11 +126,30 @@ test("first wallet open displays its Sprout preview without a null-path error", 
   await h.open("/fixture/first.dat");
   assert.deepEqual(h.previews, [{
     path: "/fixture/first.dat", passphrase: null, network: "mainnet", dataDir: null,
+    peers: ["192.0.2.7:8233"],
   }]);
   assert.equal(h.$("wallet-sprout-sweep").hidden, false);
   assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
   assert.equal(h.$("sprout-sweep-status").textContent, "");
   assert.equal(h.$("sprout-sweep-run").disabled, false);
+});
+
+test("inspection carries no peers; the preview and the sweep verify through the scan panel's", async () => {
+  const seen = {};
+  const h = harness(async (command, args, fallback) => {
+    seen[command] = { ...args };
+    if (command === "execute_sprout_sweep") return {
+      sent: [], total_swept: 0, skipped: [], rejected: [], warnings: [], error: null,
+    };
+    return fallback();
+  });
+  await h.open("/fixture/peers.dat");
+  await flush();
+  assert.equal("peers" in seen.inspect_wallet_file, false, "opening a wallet never dials");
+  assert.deepEqual(seen.preview_sprout_sweep.peers, ["192.0.2.7:8233"]);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  assert.deepEqual(seen.execute_sprout_sweep.peers, ["192.0.2.7:8233"]);
 });
 
 test("opening another wallet previews the new path and passphrase", async () => {
@@ -136,6 +158,7 @@ test("opening another wallet previews the new path and passphrase", async () => 
   await h.open("/fixture/second.dat", "fixture-two");
   assert.deepEqual(h.previews.at(-1), {
     path: "/fixture/second.dat", passphrase: "fixture-two", network: "mainnet", dataDir: null,
+    peers: ["192.0.2.7:8233"],
   });
   assert.equal(h.$("sprout-sweep-status").textContent, "");
 });
@@ -648,6 +671,7 @@ test("unverified checkpoint notice stays visible while wallet-file preview remai
   assert.equal(h.$("sprout-sweep-run").disabled, false);
   assert.deepEqual(h.previews.at(-1), {
     path: "/fixture/wallet.dat", passphrase: null, network: "mainnet", dataDir: null,
+    peers: ["192.0.2.7:8233"],
   });
 });
 
