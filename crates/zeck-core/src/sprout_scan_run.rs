@@ -1178,12 +1178,16 @@ impl CursorVerifier for NetworkCursorVerifier<'_> {
             tip_anchor: self.tip_anchor,
         };
         let checkpoint_file = self.checkpoint_file;
-        let mut peer = NetworkHeaderPeer {
-            peer: self.peer,
+        let mut dialer = NetworkDialer {
             network: self.network,
             peers: self.peers,
-            silent: Vec::new(),
             waits: self.waits,
+        };
+        let mut peer = RotatingHeaderPeer {
+            conn: self.peer,
+            network: self.network,
+            dialer: &mut dialer,
+            excluded: Vec::new(),
         };
         verify_continuation(&mut peer, &rules, locators, checkpoint_file).await
     }
@@ -1230,44 +1234,44 @@ trait HeaderPeer: Send {
     async fn next_peer(&mut self) -> ZeckResult<()>;
 }
 
-struct NetworkHeaderPeer<'a, 'b> {
-    peer: &'b mut Peer,
-    network: P2pNetwork,
-    peers: &'a [String],
-    silent: Vec<(String, tokio::time::Instant)>,
-    waits: &'b mut Vec<PeerWait>,
+/// One live connection's header answers, validated for proof of work and
+/// linkage. Separate from [`HeaderPeer`] so the rotation policy in
+/// [`RotatingHeaderPeer`] can be tested without a network.
+#[async_trait::async_trait]
+trait HeaderConnection: Send {
+    fn peer_height(&self) -> u32;
+    fn dialled_as(&self) -> &str;
+    async fn validated_headers(
+        &mut self,
+        network: P2pNetwork,
+        locators: &[[u8; 32]],
+    ) -> Result<Vec<crate::p2p::wire::BlockHeader>, String>;
+    async fn close(&mut self);
 }
 
 #[async_trait::async_trait]
-impl HeaderPeer for NetworkHeaderPeer<'_, '_> {
+impl HeaderConnection for Peer {
     fn peer_height(&self) -> u32 {
-        self.peer.peer_height
+        self.peer_height
     }
 
-    fn peer_id(&self) -> String {
-        self.peer.dialled_as().to_owned()
+    fn dialled_as(&self) -> &str {
+        Peer::dialled_as(self)
     }
 
     async fn validated_headers(
         &mut self,
+        network: P2pNetwork,
         locators: &[[u8; 32]],
     ) -> Result<Vec<crate::p2p::wire::BlockHeader>, String> {
-        let headers = match self.peer.get_headers(locators).await {
-            Ok(headers) => headers,
-            Err(err) => {
-                if matches!(err, crate::p2p::peer::PeerError::Silent { .. }) {
-                    self.silent.push((
-                        self.peer.dialled_as().to_owned(),
-                        tokio::time::Instant::now() + PEER_RECONNECT_DELAY,
-                    ));
-                }
-                return Err(err.to_string());
-            }
-        };
+        let headers = self
+            .get_headers(locators)
+            .await
+            .map_err(|err| err.to_string())?;
         let valid_work = headers.len() <= crate::p2p::peer::MAX_PAGE_BLOCKS
             && headers
                 .iter()
-                .all(|h| crate::p2p::wire::verify_header_pow(self.network, h).is_ok());
+                .all(|h| crate::p2p::wire::verify_header_pow(network, h).is_ok());
         let valid_links = headers
             .windows(2)
             .all(|pair| pair[1].prev_hash == pair[0].hash);
@@ -1278,13 +1282,75 @@ impl HeaderPeer for NetworkHeaderPeer<'_, '_> {
         }
     }
 
-    async fn next_peer(&mut self) -> ZeckResult<()> {
-        self.peer.close().await;
+    async fn close(&mut self) {
+        Peer::close(self).await;
+    }
+}
+
+/// Opens a new connection, skipping every address whose exclusion has not
+/// yet expired.
+#[async_trait::async_trait]
+trait PeerDialer<C>: Send {
+    async fn dial(&mut self, excluded: &[(String, tokio::time::Instant)]) -> ZeckResult<C>;
+}
+
+struct NetworkDialer<'a, 'b> {
+    network: P2pNetwork,
+    peers: &'a [String],
+    waits: &'b mut Vec<PeerWait>,
+}
+
+#[async_trait::async_trait]
+impl PeerDialer<Peer> for NetworkDialer<'_, '_> {
+    async fn dial(&mut self, excluded: &[(String, tokio::time::Instant)]) -> ZeckResult<Peer> {
         let waits = &mut *self.waits;
-        *self.peer = connect_peer(self.network, self.peers, &self.silent, |wait| {
-            waits.push(wait)
-        })
-        .await?;
+        connect_peer(self.network, self.peers, excluded, |wait| waits.push(wait)).await
+    }
+}
+
+/// A [`HeaderPeer`] over one connection at a time, moving to another when
+/// asked.
+///
+/// [`verify_continuation`] rotates only away from a peer whose answer it
+/// could not use — a fault, silence, or headers from before every retained
+/// cursor — so the peer being left is excluded for [`PEER_RECONNECT_DELAY`],
+/// whatever it did. Excluding only silent peers let a fast hostile peer win
+/// every reconnection race and spend every attempt by itself.
+struct RotatingHeaderPeer<'a, C, D> {
+    conn: &'a mut C,
+    network: P2pNetwork,
+    dialer: &'a mut D,
+    excluded: Vec<(String, tokio::time::Instant)>,
+}
+
+#[async_trait::async_trait]
+impl<C, D> HeaderPeer for RotatingHeaderPeer<'_, C, D>
+where
+    C: HeaderConnection,
+    D: PeerDialer<C>,
+{
+    fn peer_height(&self) -> u32 {
+        self.conn.peer_height()
+    }
+
+    fn peer_id(&self) -> String {
+        self.conn.dialled_as().to_owned()
+    }
+
+    async fn validated_headers(
+        &mut self,
+        locators: &[[u8; 32]],
+    ) -> Result<Vec<crate::p2p::wire::BlockHeader>, String> {
+        self.conn.validated_headers(self.network, locators).await
+    }
+
+    async fn next_peer(&mut self) -> ZeckResult<()> {
+        self.excluded.push((
+            self.conn.dialled_as().to_owned(),
+            tokio::time::Instant::now() + PEER_RECONNECT_DELAY,
+        ));
+        self.conn.close().await;
+        *self.conn = self.dialer.dial(&self.excluded).await?;
         Ok(())
     }
 }
@@ -2540,6 +2606,140 @@ mod tests {
                 ZeckError::ScanNotReady("live cursor verification is unavailable".to_owned())
             })
         }
+    }
+
+    /// A connection for [`RotatingHeaderPeer`]: a fixed script of answers,
+    /// identified by the address it was dialled as.
+    struct FakeConnection {
+        id: String,
+        replies: std::collections::VecDeque<Result<Vec<crate::p2p::wire::BlockHeader>, String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HeaderConnection for FakeConnection {
+        fn peer_height(&self) -> u32 {
+            0
+        }
+
+        fn dialled_as(&self) -> &str {
+            &self.id
+        }
+
+        async fn validated_headers(
+            &mut self,
+            _network: P2pNetwork,
+            _locators: &[[u8; 32]],
+        ) -> Result<Vec<crate::p2p::wire::BlockHeader>, String> {
+            self.replies
+                .pop_front()
+                .unwrap_or_else(|| Err("script exhausted".to_owned()))
+        }
+
+        async fn close(&mut self) {}
+    }
+
+    /// A pool in which the hostile peer always wins the race: every dial
+    /// returns the first candidate not currently excluded, hostile first.
+    /// The hostile peer answers the same unusable thing every time it is
+    /// asked, so only an exclusion lets the honest peer be reached.
+    struct FastHostilePool {
+        hostile: Result<Vec<crate::p2p::wire::BlockHeader>, String>,
+        honest: Result<Vec<crate::p2p::wire::BlockHeader>, String>,
+        dialled: Vec<String>,
+    }
+
+    impl FastHostilePool {
+        fn connection(&self, id: &str) -> FakeConnection {
+            let reply = if id == "hostile" {
+                self.hostile.clone()
+            } else {
+                self.honest.clone()
+            };
+            FakeConnection {
+                id: id.to_owned(),
+                replies: std::iter::repeat_n(reply, 4).collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PeerDialer<FakeConnection> for FastHostilePool {
+        async fn dial(
+            &mut self,
+            excluded: &[(String, tokio::time::Instant)],
+        ) -> ZeckResult<FakeConnection> {
+            let now = tokio::time::Instant::now();
+            let id = ["hostile", "honest"]
+                .into_iter()
+                .find(|id| !excluded.iter().any(|(a, until)| a == id && now < *until))
+                .ok_or_else(|| ZeckError::Broadcast("every candidate is excluded".to_owned()))?;
+            self.dialled.push(id.to_owned());
+            Ok(self.connection(id))
+        }
+    }
+
+    async fn verify_against_fast_hostile_peer(
+        hostile: Result<Vec<crate::p2p::wire::BlockHeader>, String>,
+    ) -> (ZeckResult<CanonicalContinuation>, Vec<String>) {
+        let mut pool = FastHostilePool {
+            hostile,
+            honest: Ok(vec![hdr(4, 3)]),
+            dialled: Vec::new(),
+        };
+        let mut conn = pool.connection("hostile");
+        let mut peer = RotatingHeaderPeer {
+            conn: &mut conn,
+            network: P2pNetwork::Regtest,
+            dialer: &mut pool,
+            excluded: Vec::new(),
+        };
+        let result = verify_continuation(
+            &mut peer,
+            &regtest_rules(),
+            &three_locators(),
+            Path::new("unused.checkpoint"),
+        )
+        .await;
+        (result, pool.dialled)
+    }
+
+    /// Review of #272, round 2: rotation excluded only silent peers, so a
+    /// fast peer that had just faulted was dialled straight back and could
+    /// exhaust every attempt on its own. Now the peer being rotated away
+    /// from is skipped for `PEER_RECONNECT_DELAY`, whatever it did.
+    #[tokio::test]
+    async fn a_peer_that_faulted_is_not_redialled_before_an_honest_one() {
+        let (result, dialled) =
+            verify_against_fast_hostile_peer(Err("invalid header work".to_owned())).await;
+        assert!(
+            matches!(
+                result,
+                Ok(CanonicalContinuation::Current {
+                    chain_has_more: true
+                })
+            ),
+            "the honest peer settles it: {:?}",
+            result.err()
+        );
+        assert_eq!(dialled, vec!["honest"]);
+    }
+
+    /// The same for a peer that answers from beyond the retained window: one
+    /// such answer must not let it be asked again and again.
+    #[tokio::test]
+    async fn a_peer_that_answered_beyond_the_window_is_not_redialled() {
+        let (result, dialled) = verify_against_fast_hostile_peer(Ok(vec![hdr(9, 8)])).await;
+        assert!(
+            matches!(
+                result,
+                Ok(CanonicalContinuation::Current {
+                    chain_has_more: true
+                })
+            ),
+            "the honest peer settles it: {:?}",
+            result.err()
+        );
+        assert_eq!(dialled, vec!["honest"]);
     }
 
     /// A scripted sequence of peers for [`verify_continuation`]. Headers are
