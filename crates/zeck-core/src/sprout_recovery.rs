@@ -292,26 +292,6 @@ impl SproutRecovery {
             && !(self.spent.is_empty() && self.dust.is_empty() && self.already_swept.is_empty())
     }
 
-    /// Take out every note an earlier sweep already broadcast, per its
-    /// journal. The wallet file cannot know they moved; without this a
-    /// re-run after an interruption re-proves each, minutes apiece, only
-    /// for the network to refuse it.
-    pub fn drop_already_swept(&mut self, swept: &crate::sprout_sweep::SweptNotes) {
-        let mut already = Vec::new();
-        self.notes.retain(
-            |n| match swept.get(&crate::sprout_sweep::swept_key(&n.outpoint)) {
-                Some(txid) => {
-                    already.push((n.outpoint, txid.clone()));
-                    false
-                }
-                None => true,
-            },
-        );
-        self.unconfirmed_spends
-            .retain(|o| !already.iter().any(|(a, _)| a == o));
-        self.already_swept.extend(already);
-    }
-
     /// The limit on spent status, as it applies to this result: the file's
     /// own history, or the scan's chain view up to its height and the file's
     /// after it.
@@ -1363,32 +1343,6 @@ mod tests {
             recover_spendable_sprout_notes_with_chain(&keys, Some(&chain_with(&[], 3_000_000)));
         let status = with.spent_status();
         assert!(status.contains("3000000"), "{status}");
-    }
-
-    /// A note an earlier, interrupted sweep already broadcast is taken out
-    /// of the plan and named, rather than proved again for minutes only to
-    /// be refused as a double spend.
-    #[test]
-    fn a_note_an_earlier_sweep_broadcast_is_not_offered_again() {
-        let (keys, _) = wallet_with_one_note(1_000_000);
-        let mut recovered = recover_spendable_sprout_notes(&keys);
-        let outpoint = recovered.notes[0].outpoint;
-        let mut swept = crate::sprout_sweep::SweptNotes::new();
-        swept.insert(crate::sprout_sweep::swept_key(&outpoint), "dd44".to_owned());
-
-        recovered.drop_already_swept(&swept);
-
-        assert!(recovered.notes.is_empty());
-        assert_eq!(recovered.already_swept, vec![(outpoint, "dd44".to_owned())]);
-        assert!(recovered.nothing_left_to_sweep());
-        assert!(
-            recovered
-                .accounting_lines()
-                .iter()
-                .any(|l| l.contains("earlier run") && l.contains("dd44")),
-            "{:?}",
-            recovered.accounting_lines()
-        );
     }
 
     /// A second Sprout key with no note records — an unused

@@ -222,6 +222,7 @@ pub struct SproutJournalSnapshot {
     by_note: HashMap<SproutNoteId, SproutJournalEntry>,
     by_txid: HashMap<TxId, SproutNoteId>,
     seen_transactions: HashMap<TxId, (SproutNoteId, u64, PreparedTransaction)>,
+    order: Vec<SproutNoteId>,
 }
 
 impl SproutJournalSnapshot {
@@ -234,7 +235,11 @@ impl SproutJournalSnapshot {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &SproutJournalEntry> {
-        self.by_note.values()
+        self.order.iter().filter_map(|id| self.by_note.get(id))
+    }
+
+    pub fn entries_in_journal_order(&self) -> impl Iterator<Item = &SproutJournalEntry> {
+        self.entries()
     }
 
     pub fn ready_for_new_plan(&self, outpoint: &JsOutPoint) -> bool {
@@ -248,8 +253,13 @@ impl SproutJournalSnapshot {
 
     pub fn all_mined_for<'a>(&self, outpoints: impl IntoIterator<Item = &'a JsOutPoint>) -> bool {
         outpoints.into_iter().all(|outpoint| {
-            self.entry_for_note(outpoint)
-                .is_some_and(|entry| entry.state == TxLifecycleState::Mined)
+            self.entry_for_note(outpoint).is_some_and(|entry| {
+                entry.state == TxLifecycleState::Mined
+                    && entry
+                        .observation
+                        .as_ref()
+                        .is_some_and(TxObservation::has_canonical_mined_evidence)
+            })
         })
     }
 
@@ -302,10 +312,12 @@ impl SproutJournalSnapshot {
                         ));
                     }
                     self.by_txid.remove(&existing.txid());
+                    self.order.retain(|existing| *existing != note_id);
                 }
                 self.seen_transactions
                     .insert(tx.txid, (note_id, value_zatoshis, tx.clone()));
                 self.by_txid.insert(tx.txid, note_id);
+                self.order.push(note_id);
                 self.by_note.insert(
                     note_id,
                     SproutJournalEntry {
@@ -400,6 +412,7 @@ impl SproutJournalSnapshot {
                     };
                 }
                 self.by_txid.insert(txid, note_id);
+                self.order.push(note_id);
                 self.by_note.insert(
                     note_id,
                     SproutJournalEntry {
@@ -990,6 +1003,52 @@ mod tests {
     }
 
     #[test]
+    fn all_mined_for_requires_stored_canonical_observation() {
+        use crate::broadcast::{EndpointTxEvidence, TxObservationState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let transaction = fixture();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+
+        snapshot
+            .by_note
+            .get_mut(&note_id(&outpoint()))
+            .unwrap()
+            .state = TxLifecycleState::Mined;
+        assert!(!snapshot.all_mined_for([&outpoint()]));
+
+        let block_hash = vec![0x11; 32];
+        snapshot
+            .by_note
+            .get_mut(&note_id(&outpoint()))
+            .unwrap()
+            .observation = Some(TxObservation {
+            state: TxObservationState::Mined,
+            mined_height: Some(90),
+            expiry_height: transaction.expiry_height,
+            primary_tip: Some(100),
+            secondary_tip: Some(100),
+            evidence: ["a", "b"]
+                .into_iter()
+                .map(|label| EndpointTxEvidence {
+                    operator_id: label.to_owned(),
+                    endpoint: format!("https://{label}.example"),
+                    tip_height: Some(100),
+                    reported_height: Some(90),
+                    block_hash: Some(block_hash.clone()),
+                    tx_in_block: true,
+                })
+                .collect(),
+        });
+        assert!(snapshot.all_mined_for([&outpoint()]));
+    }
+
+    #[test]
     fn v1_accepted_entry_waits_for_a_conservative_expiry_horizon() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
@@ -1420,59 +1479,5 @@ mod tests {
             std::fs::read_to_string(journal.path()).unwrap(),
             format!("{original}{appended}")
         );
-    }
-
-    #[test]
-    fn compatibility_journal_uses_the_same_process_lock() {
-        use std::sync::mpsc;
-        let dir = tempfile::tempdir().unwrap();
-        let current = journal(dir.path());
-        let legacy = crate::sprout_sweep::SweepJournal::for_keys(dir.path(), &[[0x42; 32]]);
-        std::fs::write(legacy.path(), legacy_line(&fixture().txid.to_string())).unwrap();
-        let lock_path =
-            std::path::PathBuf::from(format!("{}.lock.sqlite", current.path().display()));
-        let connection = rusqlite::Connection::open(lock_path).unwrap();
-        connection
-            .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
-            .unwrap();
-        let (sender, receiver) = mpsc::channel();
-        let worker = std::thread::spawn(move || sender.send(legacy.load().is_ok()).unwrap());
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-        connection.execute_batch("COMMIT").unwrap();
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap());
-        worker.join().unwrap();
-        connection
-            .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
-            .unwrap();
-        let record = crate::sprout_sweep::SweepJournal::for_keys(dir.path(), &[[0x42; 32]]);
-        let (sender, receiver) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            sender
-                .send(
-                    record
-                        .record(
-                            &JsOutPoint {
-                                txid: [0x44; 32],
-                                js_index: 1,
-                                output_index: 0,
-                            },
-                            &fixture_with_lock_time(1).txid.to_string(),
-                        )
-                        .is_ok(),
-                )
-                .unwrap()
-        });
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-        connection.execute_batch("COMMIT").unwrap();
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap());
-        worker.join().unwrap();
     }
 }
