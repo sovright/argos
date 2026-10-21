@@ -505,11 +505,13 @@ mod tests {
         assert_ne!(zip244_display, sha256d_display);
 
         let mut block = test_block(&[coinbase]);
-        block[MERKLE_ROOT_RANGE].copy_from_slice(&zip244_display.iter().rev().copied().collect::<Vec<_>>());
+        block[MERKLE_ROOT_RANGE]
+            .copy_from_slice(&zip244_display.iter().rev().copied().collect::<Vec<_>>());
         let result = joinsplits_in_block(&block, BranchId::Nu5);
         assert!(result.is_ok(), "v5 coinbase should parse: {result:?}");
 
-        block[MERKLE_ROOT_RANGE].copy_from_slice(&sha256d_display.iter().rev().copied().collect::<Vec<_>>());
+        block[MERKLE_ROOT_RANGE]
+            .copy_from_slice(&sha256d_display.iter().rev().copied().collect::<Vec<_>>());
         assert!(matches!(
             joinsplits_in_block(&block, BranchId::Nu5),
             Err(BlockError::MerkleRootMismatch)

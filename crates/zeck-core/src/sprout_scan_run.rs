@@ -2229,7 +2229,11 @@ mod tests {
         let (hash, honest, forged) = honest_and_forged_block();
 
         let outcome = fetcher
-            .authenticate_page(&[hash], std::collections::HashMap::from([(hash, forged)]), 10)
+            .authenticate_page(
+                &[hash],
+                std::collections::HashMap::from([(hash, forged)]),
+                10,
+            )
             .await
             .expect("one forged body is within the budget");
         assert!(outcome.is_none(), "the forged page is not handed on");
@@ -2239,15 +2243,25 @@ mod tests {
         assert_eq!(fetcher.locator, [7; 32], "the same page is asked for again");
 
         let page = fetcher
-            .authenticate_page(&[hash], std::collections::HashMap::from([(hash, honest)]), 10)
+            .authenticate_page(
+                &[hash],
+                std::collections::HashMap::from([(hash, honest)]),
+                10,
+            )
             .await
             .expect("the honest body authenticates")
             .expect("and is a page");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].0, hash);
-        assert!(page[0].1.is_empty(), "a coinbase-only block has no JoinSplits");
+        assert!(
+            page[0].1.is_empty(),
+            "a coinbase-only block has no JoinSplits"
+        );
         assert_eq!(fetcher.locator, hash, "the scan moves on past the page");
-        assert_eq!(fetcher.empty_replies, 0, "a delivered page resets the budget");
+        assert_eq!(
+            fetcher.empty_replies, 0,
+            "a delivered page resets the budget"
+        );
     }
 
     /// With no honest peer to be had, the budget still ends the scan, with
@@ -2255,9 +2269,14 @@ mod tests {
     #[tokio::test]
     async fn forged_bodies_from_every_peer_exhaust_the_budget() {
         let peer = silent_peer().await;
-        let first = connect_peer(P2pNetwork::Regtest, std::slice::from_ref(&peer), &[], |_| {})
-            .await
-            .unwrap();
+        let first = connect_peer(
+            P2pNetwork::Regtest,
+            std::slice::from_ref(&peer),
+            &[],
+            |_| {},
+        )
+        .await
+        .unwrap();
         let mut fetcher = fetcher_on(first, vec![peer]);
         let (hash, _, forged) = honest_and_forged_block();
 
@@ -2265,7 +2284,11 @@ mod tests {
         let err = loop {
             attempts += 1;
             match fetcher
-                .authenticate_page(&[hash], std::collections::HashMap::from([(hash, forged.clone())]), 10)
+                .authenticate_page(
+                    &[hash],
+                    std::collections::HashMap::from([(hash, forged.clone())]),
+                    10,
+                )
                 .await
             {
                 Ok(None) => continue,
