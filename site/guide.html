@@ -106,7 +106,7 @@
             <p>
               Argos accepts a 24-word ZecWallet Lite seed, a ZecWallet Lite or zcashd wallet file,
               or a standalone Sapling spending key. It also recovers Sprout from zcashd wallet
-              files; the CLI accepts standalone Sprout keys. You need a trusted computer, internet
+              files or standalone Sprout spending keys. You need a trusted computer, internet
               access, and a modern Zcash destination you control.
             </p>
             <div class="callout">
@@ -141,8 +141,8 @@
             <p>
               Choose <strong>I have my 24-word seed phrase</strong> for the legacy ZecWallet Lite
               HD path, or <strong>I have a wallet file</strong> for a ZecWallet Lite file, zcashd
-              <code>wallet.dat</code>, or standalone Sapling key. A seed recovery does not require
-              a wallet file.
+              <code>wallet.dat</code>, or standalone Sapling or Sprout key. A seed recovery does
+              not require a wallet file.
             </p>
 
             <h3>2a. Seed Entry</h3>
@@ -152,7 +152,7 @@
               session starts.
             </p>
 
-            <h3>2b. Wallet File or Sapling Key</h3>
+            <h3>2b. Wallet File or Spending Key</h3>
             <p>
               Choose, drag, or enter the path to a wallet file. Argos reads the file but never
               modifies it. For an encrypted wallet, enter the passphrase when prompted; it is used
@@ -164,6 +164,12 @@
               more <code>secret-extended-key-main1…</code> or
               <code>secret-extended-key-test1…</code> keys, one per line, and check them before
               continuing. Viewing keys are not accepted because they cannot authorize a sweep.
+            </p>
+            <p>
+              If all you have is a Sprout spending key (<code>SK…</code> on mainnet,
+              <code>ST…</code> on testnet), open <strong>I only have a Sprout spending key</strong>
+              on the same screen. No wallet file is needed; see <a href="#sprout">Sprout
+              recovery</a>.
             </p>
 
             <h3>3. Configure</h3>
@@ -222,8 +228,12 @@
             <p>
               Sprout support is included in normal Argos builds. A ZecWallet Lite seed alone cannot
               reconstruct Sprout keys, because the legacy wallet generated those independently.
-              Use a zcashd <code>wallet.dat</code> or, with the CLI, an <code>SK…</code> mainnet or
-              <code>ST…</code> testnet spending-key file.
+              Use a zcashd <code>wallet.dat</code> or an <code>SK…</code> mainnet or
+              <code>ST…</code> testnet spending key. In the app, a raw key needs no wallet file:
+              on the wallet-file screen, open <strong>I only have a Sprout spending key</strong>,
+              choose the network, paste the keys one per line, and start the scan. The NU7
+              deadline is shown with the panel. The CLI equivalent is
+              <code>argos scan-sprout --sprout-key-file</code>.
             </p>
             <p>
               After opening a wallet file, Argos first checks whether it already contains spendable
