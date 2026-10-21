@@ -705,15 +705,36 @@ async fn verified_checkpoint_lookup<V: CursorVerifier>(
     verifier: &mut V,
     cache: &ChainSpendsCache,
 ) -> ZeckResult<CachedLookup> {
+    verified_checkpoint_lookup_with(data_dir, network, keys, verifier, cache, stamp_of, |_| {})
+        .await
+}
+
+// The two callbacks let tests replace a checkpoint at the exact reconciliation
+// boundary and model an unreadable file stamp without timing or permissions.
+async fn verified_checkpoint_lookup_with<V: CursorVerifier>(
+    data_dir: &Path,
+    network: P2pNetwork,
+    keys: &[[u8; 32]],
+    verifier: &mut V,
+    cache: &ChainSpendsCache,
+    mut read_stamp: impl FnMut(&Path) -> Option<Stamp>,
+    after_reconcile: impl FnOnce(&Path),
+) -> ZeckResult<CachedLookup> {
     let path = checkpoint_path(data_dir, keys);
-    let original_stamp = stamp_of(&path);
+    let unavailable_stamp = || {
+        ZeckError::ScanNotReady(format!(
+            "the scan checkpoint at {} could not be fingerprinted; Argos will not use its spent-note evidence.",
+            path.display()
+        ))
+    };
+    let original_stamp = read_stamp(&path).ok_or_else(unavailable_stamp)?;
     let Some(mut scanner) = load_checkpoint(&path, network, keys)? else {
         return Ok(CachedLookup::NotFound(path));
     };
     if scanner.cursor().is_none() {
         return Ok(CachedLookup::NothingScanned(path));
     }
-    if stamp_of(&path) != original_stamp {
+    if read_stamp(&path).ok_or_else(unavailable_stamp)? != original_stamp {
         return Err(ZeckError::ScanNotReady(format!(
             "the scan checkpoint at {} changed while it was being opened; Argos will not use its spent-note evidence.", path.display()
         )));
@@ -721,22 +742,50 @@ async fn verified_checkpoint_lookup<V: CursorVerifier>(
     let original_cursor = scanner.cursor();
     let original_complete = scanner.is_complete();
     reconcile_cursor(&mut scanner, verifier, network, &path).await?;
-    let verified_stamp = stamp_of(&path);
-    if scanner.cursor() == original_cursor
-        && scanner.is_complete() == original_complete
-        && verified_stamp != original_stamp
-    {
+    after_reconcile(&path);
+    let verified_stamp = read_stamp(&path).ok_or_else(unavailable_stamp)?;
+    let expected =
+        if scanner.cursor() == original_cursor && scanner.is_complete() == original_complete {
+            (original_stamp.0, original_stamp.2)
+        } else {
+            checkpoint_content_fingerprint(&scanner, network)
+        };
+    if (verified_stamp.0, verified_stamp.2) != expected {
         return Err(ZeckError::ScanNotReady(format!(
-            "the scan checkpoint at {} changed during live verification; Argos will not use its spent-note evidence.", path.display()
+            "the scan checkpoint at {} does not match the state established by live verification; Argos will not use its spent-note evidence.", path.display()
         )));
     }
     let lookup = cache.lookup(data_dir, network, keys)?;
-    if stamp_of(&path) != verified_stamp {
+    if let CachedLookup::Found(spends, _) = &lookup {
+        let cursor = scanner.cursor().expect("checked before reconciliation");
+        if spends.scanned_to != cursor.last_height
+            || spends.complete != scanner.is_complete()
+            || &spends.nullifiers != scanner.spent_nullifiers()
+        {
+            return Err(ZeckError::ScanNotReady(format!(
+                "the scan checkpoint at {} changed after live verification; Argos will not use its spent-note evidence.", path.display()
+            )));
+        }
+    }
+    if read_stamp(&path).ok_or_else(unavailable_stamp)? != verified_stamp {
         return Err(ZeckError::ScanNotReady(format!(
             "the scan checkpoint at {} changed after live verification; Argos will not use its spent-note evidence.", path.display()
         )));
     }
     Ok(lookup)
+}
+
+/// The exact bytes `save_checkpoint` emits after a rewind or completion change.
+fn checkpoint_content_fingerprint(scanner: &SproutScanner, network: P2pNetwork) -> (u64, [u8; 32]) {
+    use sha2::Digest;
+    let checkpoint = scanner.checkpoint();
+    let mut hash = sha2::Sha256::new();
+    hash.update([NETWORK_TAGGED, network_tag(network)]);
+    hash.update(checkpoint.as_bytes());
+    (
+        checkpoint.as_bytes().len() as u64 + 2,
+        hash.finalize().into(),
+    )
 }
 
 fn wallet_lookup_result(
@@ -2163,6 +2212,104 @@ mod tests {
         let (second, _) = wallet_evidence_with_fake(&dir.0, &keys, &mut reorg, &cache).await;
         assert!(!second.unwrap().nullifiers.contains_key(&[3; 32]));
         assert_eq!(reorg.seen[0].last_height, 3);
+    }
+
+    #[tokio::test]
+    async fn replacement_after_rewind_cannot_supply_unverified_spends() {
+        let dir = ScratchDir::new("evidence-replaced-after-rewind");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let mut replacement = reorg_scanner();
+        replacement
+            .scan_block_at(&[joinsplit_revealing([0xFA; 32])], [4; 32], 4)
+            .unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::CommonAncestor(ScanCursor {
+                last_block_hash: [2; 32],
+                last_height: 2,
+            })),
+            seen: Vec::new(),
+        };
+        let result = verified_checkpoint_lookup_with(
+            &dir.0,
+            P2pNetwork::Regtest,
+            &keys,
+            &mut verifier,
+            &ChainSpendsCache::default(),
+            stamp_of,
+            |path| save_checkpoint(&replacement, P2pNetwork::Regtest, path).unwrap(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a replacement after reconciliation must not become wallet evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_file_stamp_cannot_authorize_cached_spends() {
+        let dir = ScratchDir::new("evidence-stamp-unavailable");
+        let keys = [[0x11; 32]];
+        save_checkpoint(
+            &reorg_scanner(),
+            P2pNetwork::Regtest,
+            &checkpoint_path(&dir.0, &keys),
+        )
+        .unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::Current {
+                chain_has_more: false,
+            }),
+            seen: Vec::new(),
+        };
+        let result = verified_checkpoint_lookup_with(
+            &dir.0,
+            P2pNetwork::Regtest,
+            &keys,
+            &mut verifier,
+            &ChainSpendsCache::default(),
+            |_| None,
+            |_| {},
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "two unavailable stamps cannot prove checkpoint stability"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_file_cannot_escape_through_a_stale_stamp_read() {
+        let dir = ScratchDir::new("evidence-stale-stamp-read");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let old_stamp = stamp_of(&path).unwrap();
+        let mut replacement = reorg_scanner();
+        replacement
+            .scan_block_at(&[joinsplit_revealing([0xFB; 32])], [4; 32], 4)
+            .unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::Current {
+                chain_has_more: false,
+            }),
+            seen: Vec::new(),
+        };
+        let result = verified_checkpoint_lookup_with(
+            &dir.0,
+            P2pNetwork::Regtest,
+            &keys,
+            &mut verifier,
+            &ChainSpendsCache::default(),
+            |_| Some(old_stamp),
+            |path| save_checkpoint(&replacement, P2pNetwork::Regtest, path).unwrap(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a stale stamp read cannot license replacement nullifiers"
+        );
     }
 
     #[tokio::test]
