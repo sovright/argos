@@ -1299,12 +1299,15 @@ fn consume_page(
             .map(|anchor| anchor.hash));
         if expected.is_some_and(|expected| *hash != expected) {
             save_before_stopping(scanner, network, checkpoint_file);
+            let saved = match scanner.cursor() {
+                Some(cursor) => format!("Progress up to height {} is saved.", cursor.last_height),
+                None => "Nothing had been scanned yet.".to_owned(),
+            };
             return Err(ZeckError::Broadcast(format!(
                 "the chain this peer served does not match Zcash at height {at}. It is \
                  serving a different or fabricated chain, so the scan stops rather than \
-                 search it. Progress up to height {} is saved. Re-run to pick another \
-                 peer, or pass --peer with a node you trust.",
-                height.saturating_sub(1)
+                 search it. {saved} Re-run to pick another peer, or pass --peer with a \
+                 node you trust."
             )));
         }
     }
@@ -3399,5 +3402,35 @@ mod tests {
             !saved.is_complete(),
             "a stopped scan never reads as complete"
         );
+    }
+
+    /// A mismatch on the first page of a fresh scan has nothing before it to
+    /// save, and must not claim "progress up to height 0".
+    #[test]
+    fn a_mismatch_on_the_first_page_does_not_claim_progress() {
+        let dir = ScratchDir::new("mismatch-first-page");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut scanner = SproutScanner::new(&keys);
+        let mut height = 1u32;
+        let anchor = TipAnchor {
+            height: 1,
+            hash: [0xAA; 32],
+        };
+        let forged: Page = vec![([1; 32], Vec::new())];
+        let text = consume_page(
+            &mut scanner,
+            &forged,
+            &mut height,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &path,
+        )
+        .expect_err("a mismatch stops the scan")
+        .to_string();
+        assert!(!text.contains("height 0"), "{text}");
+        assert!(text.contains("Nothing had been scanned yet"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert_eq!(height, 1);
     }
 }
