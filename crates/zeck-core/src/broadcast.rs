@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -47,6 +47,33 @@ pub struct TxObservation {
     pub primary_tip: Option<u32>,
     pub secondary_tip: Option<u32>,
     pub evidence: Vec<EndpointTxEvidence>,
+}
+
+impl TxObservation {
+    /// Expiry needs independent absence after the transaction's expiry height.
+    pub fn is_expired(&self) -> bool {
+        if self.state != TxObservationState::Absent || self.mined_height.is_some() {
+            return false;
+        }
+        let Some(expiry_height) = self.expiry_height else {
+            return false;
+        };
+        if self.evidence.iter().any(|item| {
+            item.tx_in_block || item.reported_height.is_some() || item.block_hash.is_some()
+        }) {
+            return false;
+        }
+        self.evidence
+            .iter()
+            .filter(|item| {
+                !item.operator_id.trim().is_empty()
+                    && item.tip_height.is_some_and(|tip| tip > expiry_height)
+            })
+            .map(|item| item.operator_id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            >= 2
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,11 +261,13 @@ impl DurableBroadcastLog {
                 ..
             } => {
                 let txid = TxId::from_bytes(txid);
-                let existing = self.latest.get_mut(&txid).ok_or_else(|| {
+                let existing = self.latest.get(&txid).ok_or_else(|| {
                     ZeckError::Storage(format!(
                         "state transition without prepared transaction for {txid}"
                     ))
                 })?;
+                validate_transition(existing, state, submission.as_ref(), observation.as_ref())?;
+                let existing = self.latest.get_mut(&txid).expect("checked above");
                 existing.state = state;
                 if let Some(submission) = submission {
                     existing.last_submission = Some(submission);
@@ -252,6 +281,122 @@ impl DurableBroadcastLog {
     }
 }
 
+fn validate_transition(
+    existing: &PersistedTransaction,
+    state: TxLifecycleState,
+    submission: Option<&SubmissionDisposition>,
+    observation: Option<&TxObservation>,
+) -> ZeckResult<()> {
+    let supported = match state {
+        TxLifecycleState::NotSubmitted => {
+            existing.state == TxLifecycleState::NotSubmitted
+                && existing.last_submission.is_none()
+                && existing.observation.is_none()
+                && submission.is_none()
+                && observation.is_none()
+        }
+        TxLifecycleState::SubmissionUnknown => {
+            !matches!(
+                existing.state,
+                TxLifecycleState::Mined | TxLifecycleState::Rejected | TxLifecycleState::Expired
+            ) && observation.is_none()
+                && matches!(
+                    submission,
+                    None | Some(SubmissionDisposition::AmbiguousTransport)
+                        | Some(SubmissionDisposition::AlreadyKnown)
+                )
+        }
+        TxLifecycleState::Pending => {
+            let effective_observation = observation.or(existing.observation.as_ref());
+            let effective_submission = submission.or(existing.last_submission.as_ref());
+            let non_final_observation = matches!(
+                effective_observation.map(|item| &item.state),
+                Some(
+                    TxObservationState::PresentUnmined
+                        | TxObservationState::Absent
+                        | TxObservationState::Reorged
+                        | TxObservationState::Contested
+                        | TxObservationState::Unavailable
+                )
+            );
+            let accepted_or_retryable = matches!(
+                effective_submission,
+                Some(
+                    SubmissionDisposition::Accepted
+                        | SubmissionDisposition::RetryableRejection { .. }
+                )
+            );
+            (non_final_observation || accepted_or_retryable)
+                && !effective_observation.is_some_and(|item| {
+                    item.expiry_height == existing.prepared.expiry_height && item.is_expired()
+                })
+                && !matches!(
+                    submission,
+                    Some(SubmissionDisposition::DeterministicRejection { .. })
+                )
+                && !matches!(
+                    effective_observation.map(|item| &item.state),
+                    Some(TxObservationState::Mined)
+                )
+                && (existing.state != TxLifecycleState::Mined
+                    || matches!(
+                        observation.map(|item| &item.state),
+                        Some(
+                            TxObservationState::Reorged
+                                | TxObservationState::Contested
+                                | TxObservationState::Absent
+                        )
+                    ))
+                && !matches!(
+                    existing.state,
+                    TxLifecycleState::Rejected | TxLifecycleState::Expired
+                )
+        }
+        TxLifecycleState::Mined => {
+            matches!(
+                observation
+                    .or(existing.observation.as_ref())
+                    .map(|item| &item.state),
+                Some(TxObservationState::Mined)
+            ) && !matches!(
+                existing.state,
+                TxLifecycleState::Rejected | TxLifecycleState::Expired
+            ) && !matches!(
+                submission,
+                Some(SubmissionDisposition::DeterministicRejection { .. })
+            )
+        }
+        TxLifecycleState::Rejected => {
+            matches!(
+                submission.or(existing.last_submission.as_ref()),
+                Some(SubmissionDisposition::DeterministicRejection { .. })
+            ) && !matches!(
+                existing.state,
+                TxLifecycleState::Mined | TxLifecycleState::Expired
+            ) && !matches!(
+                observation
+                    .or(existing.observation.as_ref())
+                    .map(|item| &item.state),
+                Some(TxObservationState::Mined)
+            )
+        }
+        TxLifecycleState::Expired => {
+            let effective_observation = observation.or(existing.observation.as_ref());
+            effective_observation.is_some_and(|item| {
+                item.expiry_height == existing.prepared.expiry_height && item.is_expired()
+            }) && existing.state != TxLifecycleState::Rejected
+        }
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(ZeckError::Storage(format!(
+            "unsupported broadcast state {:?} for {} without matching durable evidence",
+            state, existing.prepared.txid
+        )))
+    }
+}
+
 impl BroadcastStore for DurableBroadcastLog {
     fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
         if self.write_failed {
@@ -262,7 +407,16 @@ impl BroadcastStore for DurableBroadcastLog {
         }
         if let Some(existing) = self.latest.get(&tx.txid) {
             if existing.prepared == *tx {
-                return Ok(());
+                let replayed = Self::open(&self.path)?;
+                return if replayed.latest(tx.txid).as_ref() == Some(existing) {
+                    Ok(())
+                } else {
+                    Err(ZeckError::Storage(format!(
+                        "prepared transaction {} is missing or changed in {}",
+                        tx.txid,
+                        self.path.display()
+                    )))
+                };
             }
             return Err(ZeckError::Storage(format!(
                 "conflicting prepared transaction for {}",
@@ -285,11 +439,12 @@ impl BroadcastStore for DurableBroadcastLog {
         submission: Option<&SubmissionDisposition>,
         observation: Option<&TxObservation>,
     ) -> ZeckResult<()> {
-        if !self.latest.contains_key(&txid) {
-            return Err(ZeckError::Storage(format!(
+        let existing = self.latest.get(&txid).ok_or_else(|| {
+            ZeckError::Storage(format!(
                 "state transition without prepared transaction for {txid}"
-            )));
-        }
+            ))
+        })?;
+        validate_transition(existing, state, submission, observation)?;
         self.append_event(BroadcastLogEvent::StateChanged {
             schema_version: BROADCAST_LOG_SCHEMA_VERSION,
             txid: txid.into(),
@@ -467,6 +622,238 @@ mod tests {
             log.transition(txid, TxLifecycleState::SubmissionUnknown, None, None),
             Err(crate::ZeckError::Storage(_))
         ));
+        assert!(matches!(
+            log.persist_prepared(&prepared),
+            Err(crate::ZeckError::Storage(_))
+        ));
+    }
+
+    #[test]
+    fn certainty_bearing_states_require_matching_evidence_before_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([10; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![10],
+            fee_zatoshis: 1,
+            expiry_height: Some(100),
+        })
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        for state in [
+            TxLifecycleState::Pending,
+            TxLifecycleState::Mined,
+            TxLifecycleState::Rejected,
+            TxLifecycleState::Expired,
+        ] {
+            assert!(matches!(
+                log.transition(txid, state, None, None),
+                Err(crate::ZeckError::Storage(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(
+                log.latest(txid).unwrap().state,
+                TxLifecycleState::NotSubmitted
+            );
+        }
+        assert!(matches!(
+            log.transition(
+                txid,
+                TxLifecycleState::SubmissionUnknown,
+                Some(&SubmissionDisposition::Accepted),
+                None
+            ),
+            Err(crate::ZeckError::Storage(_))
+        ));
+    }
+
+    #[test]
+    fn existing_evidence_supports_only_compatible_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([11; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![11],
+            fee_zatoshis: 1,
+            expiry_height: Some(100),
+        })
+        .unwrap();
+        log.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        log.transition(
+            txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+        log.transition(txid, TxLifecycleState::Pending, None, None)
+            .unwrap();
+
+        let mined = TxObservation {
+            state: TxObservationState::Mined,
+            mined_height: Some(90),
+            expiry_height: Some(100),
+            primary_tip: Some(90),
+            secondary_tip: Some(90),
+            evidence: vec![],
+        };
+        log.transition(txid, TxLifecycleState::Mined, None, Some(&mined))
+            .unwrap();
+        log.transition(txid, TxLifecycleState::Mined, None, None)
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            log.transition(txid, TxLifecycleState::Pending, None, None),
+            Err(crate::ZeckError::Storage(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let reorged = TxObservation {
+            state: TxObservationState::Reorged,
+            ..mined
+        };
+        log.transition(txid, TxLifecycleState::Pending, None, Some(&reorged))
+            .unwrap();
+        drop(log);
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .latest(txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::Pending
+        );
+    }
+
+    #[test]
+    fn expiry_needs_two_distinct_absent_operators_beyond_stored_height() {
+        let absent = |operator_id: &str, tip_height, tx_in_block| EndpointTxEvidence {
+            operator_id: operator_id.to_owned(),
+            endpoint: format!("https://{operator_id}.example"),
+            tip_height: Some(tip_height),
+            reported_height: None,
+            block_hash: None,
+            tx_in_block,
+        };
+        let mut observation = TxObservation {
+            state: TxObservationState::Absent,
+            mined_height: None,
+            expiry_height: Some(100),
+            primary_tip: Some(101),
+            secondary_tip: Some(101),
+            evidence: vec![absent("one", 101, false), absent("one", 101, false)],
+        };
+        assert!(!observation.is_expired());
+        observation.evidence[1].operator_id = "two".to_owned();
+        observation.evidence[1].tip_height = Some(100);
+        assert!(!observation.is_expired());
+        observation.evidence[1].tip_height = Some(101);
+        assert!(observation.is_expired());
+        observation.evidence[1].tx_in_block = true;
+        assert!(!observation.is_expired());
+    }
+
+    #[test]
+    fn expired_transition_requires_canonical_evidence_for_prepared_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([12; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![12],
+            fee_zatoshis: 1,
+            expiry_height: Some(100),
+        })
+        .unwrap();
+        let evidence = ["one", "two"]
+            .into_iter()
+            .map(|id| EndpointTxEvidence {
+                operator_id: id.to_owned(),
+                endpoint: format!("https://{id}.example"),
+                tip_height: Some(101),
+                reported_height: None,
+                block_hash: None,
+                tx_in_block: false,
+            })
+            .collect();
+        let mut observation = TxObservation {
+            state: TxObservationState::Absent,
+            mined_height: None,
+            expiry_height: Some(99),
+            primary_tip: Some(101),
+            secondary_tip: Some(101),
+            evidence,
+        };
+        assert!(matches!(
+            log.transition(txid, TxLifecycleState::Expired, None, Some(&observation)),
+            Err(crate::ZeckError::Storage(_))
+        ));
+        observation.expiry_height = Some(100);
+        assert!(matches!(
+            log.transition(txid, TxLifecycleState::Pending, None, Some(&observation)),
+            Err(crate::ZeckError::Storage(_))
+        ));
+        log.transition(txid, TxLifecycleState::Expired, None, Some(&observation))
+            .unwrap();
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .latest(txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::Expired
+        );
+    }
+
+    #[test]
+    fn replay_rejects_unjustified_mined_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([13; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![13],
+            fee_zatoshis: 1,
+            expiry_height: None,
+        })
+        .unwrap();
+        drop(log);
+        let event = serde_json::json!({
+            "kind": "state_changed", "schema_version": 1, "txid": vec![13; 32],
+            "state": "mined", "submission": null, "observation": null
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{event}").unwrap();
+        file.sync_all().unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            DurableBroadcastLog::open(&path),
+            Err(crate::ZeckError::Storage(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn identical_prepare_rejects_deleted_durable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([14; 32]);
+        let prepared = PreparedTransaction {
+            txid,
+            raw_tx: vec![14],
+            fee_zatoshis: 1,
+            expiry_height: None,
+        };
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&prepared).unwrap();
+        fs::remove_file(&path).unwrap();
         assert!(matches!(
             log.persist_prepared(&prepared),
             Err(crate::ZeckError::Storage(_))
