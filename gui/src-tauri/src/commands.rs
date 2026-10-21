@@ -389,10 +389,24 @@ pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> 
 fn drop_and_warn_forged_sprout_keys(
     app: &AppHandle,
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
-) {
-    for forged in argos_core::sprout_recovery::reject_forged_sprout_keys(keys) {
-        let _ = app.emit("sprout-forged-key", forged.to_string());
+) -> Vec<String> {
+    let warnings = drop_forged_sprout_keys(keys);
+    for warning in &warnings {
+        let _ = app.emit("sprout-forged-key", warning);
     }
+    warnings
+}
+
+/// Drop every Sprout key that does not control the address it was filed
+/// under, and say why for each. The rule `inspect` applies, so a review and
+/// the inspection of the same file agree on which keys count.
+fn drop_forged_sprout_keys(
+    keys: &mut argos_core::argos_wallet_import::ImportedKeys,
+) -> Vec<String> {
+    argos_core::sprout_recovery::reject_forged_sprout_keys(keys)
+        .iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 /// The Sprout-derived portion of a `WalletFileSummary`.
@@ -940,6 +954,9 @@ pub struct SproutSweepReport {
     pub error: Option<String>,
 }
 
+/// Strict: an unknown network name is refused, never defaulted, on the
+/// paths that bind a scan or a sweep to a chain. [`network_from`] is the
+/// lenient form, built on this one.
 fn sprout_network(name: &str) -> Result<ZeckNetwork, String> {
     match name {
         "mainnet" => Ok(ZeckNetwork::Mainnet),
@@ -971,10 +988,10 @@ pub async fn propose_wallet_sprout_sweep(
         .map_err(|err| format!("could not read {path}: {err}"))?;
     let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
         .map_err(|err| err.to_string())?;
-    let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(&mut keys);
-    if !forged.is_empty() {
-        return Err("wallet file contains a Sprout key that does not control its stored address; preserve the file and inspect it before sweeping".into());
-    }
+    // As inspect does: a forged key is dropped and named in the review, and
+    // the genuine keys' notes are still swept. A forged key controls no note
+    // of its own, and the commitment check stops it spending anyone else's.
+    let forged_warnings = drop_and_warn_forged_sprout_keys(&app, &mut keys);
     let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
     if recovered.notes.is_empty() {
         return Err(if recovered.nothing_left_to_sweep() {
@@ -987,17 +1004,12 @@ pub async fn propose_wallet_sprout_sweep(
     let journal = resolve_data_dir(&app, data_dir.as_deref()).map(|dir| {
         argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(&keys))
     });
-    use sha2::Digest;
-    let canonical_path = fs::canonicalize(&path)
-        .map_err(|err| format!("could not identify wallet file {path}: {err}"))?;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(canonical_path.to_string_lossy().as_bytes());
-    hasher.update(&*bytes);
-    let digest = hasher.finalize();
-    let source_digest = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    state.reviewed_intent.insert_proposal(
+    // The reviewed notes, with their keys, are held in the proposal (see
+    // `reviewed_intent`'s key-retention note), so execution never re-reads
+    // the file and no file identity needs recording.
+    let mut review = state.reviewed_intent.insert_proposal(
         SproutSweepIntent {
-            source: SproutIntentSource::Wallet(source_digest),
+            source: SproutIntentSource::Wallet,
             notes: recovered.notes,
             destination,
             network,
@@ -1011,7 +1023,9 @@ pub async fn propose_wallet_sprout_sweep(
             fee_zatoshis: plan.fee_zatoshis,
             net_zatoshis: plan.net_zatoshis,
         },
-    )
+    )?;
+    review.warnings = forged_warnings;
+    Ok(review)
 }
 
 async fn execute_reviewed_sprout_sweep(
@@ -1019,7 +1033,7 @@ async fn execute_reviewed_sprout_sweep(
     intent: SproutSweepIntent,
 ) -> Result<SproutSweepReport, String> {
     let source = match &intent.source {
-        SproutIntentSource::Wallet(_) => argos_core::sprout_sweep::NoteSource::WalletFile,
+        SproutIntentSource::Wallet => argos_core::sprout_sweep::NoteSource::WalletFile,
         SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
     };
     let emitter = app.clone();
@@ -1450,6 +1464,9 @@ pub async fn start_sprout_scan(
             })
             .map_err(|err| err.to_string())
         });
+        // Released scans abort this worker (and free its checkpoint) through
+        // the store rather than run on detached for hours.
+        store.attach_worker(&worker_handle, scan_task.abort_handle());
         finish_sprout_scan_task(&store, &worker_handle, scan_task.await);
         if let Ok(snapshot) = store.snapshot(&worker_handle) {
             let _ = app.emit("sprout-scan-complete", snapshot);
@@ -1705,11 +1722,10 @@ pub fn sprout_nu7_warning(network: String, broadcast: bool) -> String {
 // Not gated on `sprout`: `check_sapling_key` is a core-Sapling command and
 // needs this too. It is a plain string-to-enum mapping with no Sprout
 // dependency of its own.
+/// Lenient: anything but "testnet" is mainnet. For display and checks that
+/// cannot move funds; paths that spend use the strict [`sprout_network`].
 fn network_from(name: &str) -> argos_core::ZeckNetwork {
-    match name {
-        "testnet" => argos_core::ZeckNetwork::Testnet,
-        _ => argos_core::ZeckNetwork::Mainnet,
-    }
+    sprout_network(name).unwrap_or(argos_core::ZeckNetwork::Mainnet)
 }
 
 /// Recover a wallet file's Sprout notes, letting a full-block scan of the
@@ -2920,6 +2936,31 @@ mod tests {
         );
     }
 
+    /// Finding 6 on #271: one forged Sprout key used to refuse the whole
+    /// wallet-file sweep while inspect dropped it and warned. The sweep now
+    /// does what inspect does: the genuine keys stay, and the forged one is
+    /// reported in the review rather than silently ignored.
+    #[test]
+    fn a_forged_sprout_key_is_dropped_with_a_warning_and_the_rest_kept() {
+        let bytes =
+            argos_core::wallet_file::read_wallet_file(fixture("sprout-plaintext.dat")).unwrap();
+        let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None).unwrap();
+        let genuine = keys.sprout.len();
+        assert!(genuine > 0, "fixture holds Sprout keys");
+        let a_sk = *keys.sprout[0].a_sk.expose_secret();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: [0xAA; 64],
+                provenance: Provenance::Standalone,
+                created_at: None,
+            });
+        let warnings = super::drop_forged_sprout_keys(&mut keys);
+        assert_eq!(keys.sprout.len(), genuine, "genuine keys are kept");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("does not control"), "{}", warnings[0]);
+    }
+
     /// The scan and the sweep-from-scan must derive the same key set from
     /// the same inputs, or the sweep would look for a checkpoint under a
     /// different fingerprint. (The bound itself is read from the
@@ -3119,11 +3160,11 @@ mod tests {
             }),
         );
         drop(reservation);
-        for i in 0..crate::reviewed_intent::MAX_PROPOSALS {
+        for _ in 0..crate::reviewed_intent::MAX_PROPOSALS {
             store
                 .insert_proposal(
                     SproutSweepIntent {
-                        source: SproutIntentSource::Wallet(format!("wallet-{i}")),
+                        source: SproutIntentSource::Wallet,
                         notes: Vec::new(),
                         destination: "zs-reviewed".into(),
                         network: ZeckNetwork::Mainnet,
