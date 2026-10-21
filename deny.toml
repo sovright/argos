@@ -51,6 +51,17 @@ ignore = [
     "RUSTSEC-2025-0098", # unic-* unmaintained
     "RUSTSEC-2025-0100", # glib VariantStrIter unsoundness (Tauri stack)
 
+    # zbus 5 split `zvariant`, `zbus_names`, and `zvariant_derive` into
+    # standalone crates. zbus 6 merged them back into zbus, so RustSec marks
+    # the standalone crates unmaintained. Both available Linux consumer lines
+    # still require zbus 5: keepawake 0.6.1 and tauri-plugin-opener 2.7.2.
+    # Even the Tauri 3 alpha opener remains on zbus 5. Track both upstream
+    # migrations;
+    # these are maintenance notices, not known vulnerabilities.
+    "RUSTSEC-2026-0370", # zvariant standalone crate unmaintained
+    "RUSTSEC-2026-0371", # zbus_names standalone crate unmaintained
+    "RUSTSEC-2026-0372", # zvariant_derive standalone crate unmaintained
+
     # quick-xml 0.38 DoS advisories (quadratic attribute scan; unbounded
     # namespace-declaration allocation in NsReader). Pulled in transitively by
     # `plist 1.8` <- Tauri; `plist` parses macOS bundle Info.plist files at

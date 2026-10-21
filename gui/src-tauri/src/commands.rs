@@ -613,6 +613,31 @@ pub struct WalletFileScanInput {
     /// after hours of scanning, from a screen that cannot edit it.
     #[serde(default)]
     pub sweep_memo: Option<String>,
+    /// Where the sweep will pay. Checked before the scan for the same reason
+    /// as the memo: the config screen has already collected it, and a
+    /// destination the sweep cannot reach should not cost hours of scanning.
+    pub destination: String,
+}
+
+/// Refuse, before the scan, a destination a seedless sweep cannot pay.
+///
+/// A key set that carries a mnemonic takes the ordinary HD sweep, which has
+/// no transparent-leg constraint, so only a seedless source is checked. This
+/// mirrors the CLI's pre-scan check and the core sweep's own.
+fn refuse_unreachable_sweep_destination(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    destination: &str,
+    network: ZeckNetwork,
+) -> Result<(), String> {
+    if keys.mnemonic.is_some() {
+        return Ok(());
+    }
+    argos_core::transparent_recovery::refuse_destination_the_transparent_leg_cannot_reach(
+        keys,
+        destination,
+        network,
+    )
+    .map_err(|err| err.to_string())
 }
 
 /// Scan a legacy wallet file's keys.
@@ -667,6 +692,10 @@ pub async fn start_scan_from_wallet_file(
             "no keys to scan — open a wallet file or paste a Sapling spending key.".to_owned(),
         );
     }
+
+    // Before the scan, so the check runs on the parsed keys while their
+    // mnemonic is still visible.
+    refuse_unreachable_sweep_destination(&keys, &config.destination, config.network)?;
 
     let key_source: Arc<dyn argos_core::KeySource> =
         Arc::new(argos_core::ImportedKeySource::new(keys));
@@ -2336,6 +2365,8 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::refuse_unreachable_sweep_destination;
+    use argos_core::argos_wallet_import::{keys::TransparentKey, ImportedKeys, Provenance};
     use argos_core::sprout_recovery::{SpentSproutNote, SproutRecovery};
     use secrecy::ExposeSecret;
 
@@ -2346,8 +2377,7 @@ mod tests {
         )
     }
 
-    use argos_core::argos_wallet_import::{ImportedKeys, WalletFormat};
-    use argos_core::ZeckNetwork;
+    use argos_core::argos_wallet_import::WalletFormat;
 
     /// A Sapling extended spending key from the fixed seed `[7u8; 32]`,
     /// controlling no funds; the same constant the CLI tests pin.
@@ -2567,6 +2597,64 @@ mod tests {
         .unwrap();
         assert!(keys.typed.is_empty());
         assert_eq!(keys.all.len(), keys.wallet.as_ref().unwrap().sprout.len());
+    }
+
+    // Orchard-only and Orchard+Sapling mainnet unified addresses. The first
+    // is built from a fixed key in `transparent_recovery`'s tests.
+    const ORCHARD_ONLY_UA: &str =
+        "u1u4zdvtcrjt4cnffw3shrx440754g0mhr4a7fenck686tfr6rdqy9wu5v39ydpgm4ut37qnlh9kpw9fsp8wcwyu2y2r5stjhj0qwfnmrq";
+    const ORCHARD_SAPLING_UA: &str =
+        "u1nvgt6yr35mhc9wdf4wckvl38476vqy96dx3cwkfdwy4jet9300l5v8l2yg27ql7w9qwm0lf8kncnj9nus4mgete06j3cu3mhrqvstg6swvdya6xgzwhh6a9xxdhxkavvvmztqeuaurjtqfk3dzetuzgnu0zjvmdpe8ehvj53sy6yhzxj";
+
+    fn transparent_keys() -> ImportedKeys {
+        ImportedKeys {
+            transparent: vec![TransparentKey {
+                secret: secrecy::Secret::new([1u8; 32]),
+                provenance: Provenance::Standalone,
+                created_at: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The transparent leg of a seedless sweep needs a Sapling receiver. The
+    /// GUI used to find that out only after the scan, so it is refused here.
+    #[test]
+    fn a_seedless_sweep_with_transparent_keys_refuses_an_orchard_only_destination() {
+        let err = refuse_unreachable_sweep_destination(
+            &transparent_keys(),
+            ORCHARD_ONLY_UA,
+            ZeckNetwork::Mainnet,
+        )
+        .expect_err("transparent funds cannot reach an Orchard-only address");
+        assert!(
+            err.contains("Sapling") && !err.contains("not a Zcash address"),
+            "{err}"
+        );
+
+        refuse_unreachable_sweep_destination(
+            &transparent_keys(),
+            ORCHARD_SAPLING_UA,
+            ZeckNetwork::Mainnet,
+        )
+        .expect("a Sapling receiver is reachable");
+    }
+
+    #[test]
+    fn destinations_are_unconstrained_without_a_transparent_leg_or_without_a_seedless_source() {
+        // No transparent keys: only Sapling legs, which Orchard-only can take.
+        refuse_unreachable_sweep_destination(
+            &ImportedKeys::default(),
+            ORCHARD_ONLY_UA,
+            ZeckNetwork::Mainnet,
+        )
+        .expect("no transparent leg, nothing to refuse");
+
+        // A mnemonic takes the HD sweep, which has no such constraint.
+        let mut seeded = transparent_keys();
+        seeded.mnemonic = Some(secrecy::SecretString::new("abandon".to_owned()));
+        refuse_unreachable_sweep_destination(&seeded, ORCHARD_ONLY_UA, ZeckNetwork::Mainnet)
+            .expect("seeded wallets sweep through the HD path");
     }
 
     fn spent_note() -> SpentSproutNote {
@@ -2797,7 +2885,8 @@ mod tests {
             "gap_limit": 20,
             "lightwalletd_url": "https://fixture.invalid",
             "data_dir": "/fixture",
-            "network": "mainnet"
+            "network": "mainnet",
+            "destination": "u1fixture"
         }))
         .expect("wallet-file scan input should deserialize");
         assert_eq!(

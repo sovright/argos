@@ -1891,6 +1891,9 @@ phrase, or clear the seed phrase to scan the pasted key.",
           sapling_keys: typedSaplingKeys,
           // Checked against the key source before the scan starts.
           sweep_memo: state.memo,
+          // Checked before the scan: a seedless sweep's transparent leg
+          // cannot pay an Orchard-only address.
+          destination: state.destination,
         },
       });
     } else {
@@ -1987,7 +1990,13 @@ async function startProgressListeners() {
         ? ` (scanned through block ${d.at_block_height.toLocaleString()})`
         : "";
       div.textContent =
-        `Found ${fmt(d.zatoshis)} on account ${d.account_index} — ${d.pool}${heightHint}. Shielded scan still running — Review & Sweep will unlock when complete.`;
+        `Found ${fmt(d.zatoshis)} on account ${d.account_index} — ${d.pool}${heightHint}. `;
+      // Removed by updateScanUI once the scan ends, so a finished scan never
+      // still claims to be running.
+      const pending = document.createElement("span");
+      pending.className = "discovery-pending";
+      pending.textContent = "Shielded scan still running — Review & Sweep will unlock when complete.";
+      div.appendChild(pending);
       const container = $("scan-discoveries");
       container.appendChild(div);
       container.style.display = "";
@@ -2033,47 +2042,80 @@ function cleanupListeners() {
   state.unlistenDiscovered = null;
 }
 
+// What the scan status row shows, as a pure function of the progress payload.
+//
+// The "Connecting…", "0 / 0" and "Calculating…" placeholders are only replaced
+// by a block scan. A transparent-only wallet has no block scan, so it used to
+// finish as "Complete ✓" next to all three, plus an era hint for the chain tip.
+// Once the scan has ended, anything it never reported reads as "—" instead.
+// `server: null` means leave the field as it is.
+function scanStatusFields(progress, etaState, era, primaryEndpoint) {
+  const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
+  const scanned = Number(progress.blocks_scanned);
+  const total = Number(progress.blocks_total);
+
+  let server = null;
+  let serverTitle = "";
+  const endpoint = progress.server?.endpoint;
+  if (endpoint) {
+    const isFallback = endpoint !== primaryEndpoint;
+    server = endpoint + (isFallback ? " (fallback)" : "");
+    if (isFallback) {
+      serverTitle = "Connected to a fallback server — a different operator can see your scan activity";
+    }
+  } else if (terminal) {
+    server = "—";
+  }
+
+  const progressText = total === 0 && terminal
+    ? "—"
+    : `${scanned.toLocaleString()} / ${total.toLocaleString()}`;
+
+  let barPercent = null;
+  if (progress.phase === "complete") {
+    barPercent = 100;
+  } else if (total > 0) {
+    barPercent = Math.min(100, (scanned / total) * 100);
+  }
+
+  let etaText = "";
+  if (!terminal) {
+    if (etaState.kind === "warmup") etaText = "Calculating…";
+    else if (etaState.kind !== "done") etaText = etaState.text;
+    if (era) etaText = etaText ? `${etaText} · scanning ~${era}` : `scanning ~${era}`;
+  }
+
+  return { terminal, server, serverTitle, progressText, barPercent, etaText };
+}
+
 function updateScanUI(progress) {
   state.lastProgress = progress;
 
   $("scan-phase").textContent = phaseLabel(progress.phase);
 
-  if (progress.server?.endpoint) {
-    const primary = $("lightwalletd-url").value.split(",")[0].trim();
-    const isFallback = progress.server.endpoint !== primary;
-    $("scan-server").textContent = progress.server.endpoint + (isFallback ? " (fallback)" : "");
-    $("scan-server").title = isFallback
-      ? "Connected to a fallback server — a different operator can see your scan activity"
-      : "";
-  }
-
   const scanned = Number(progress.blocks_scanned);
   const total = Number(progress.blocks_total);
-  $("scan-progress-text").textContent =
-    `${scanned.toLocaleString()} / ${total.toLocaleString()}`;
-
-  if (total > 0) {
-    $("scan-progress-bar").style.width =
-      `${Math.min(100, (scanned / total) * 100).toFixed(1)}%`;
-  }
-
   eta.observe(scanned, total);
   // eraHint expects an absolute Zcash chain height. blocks_scanned is a
   // delta from effective_birthday — passing it directly mislabels the era
   // for any wallet whose birthday is past Sapling activation. Use
   // synced_to_height (set by the backend) when available.
   const era = progress.synced_to_height ? eraHint(Number(progress.synced_to_height)) : null;
-  const etaState = eta.estimate();
-  let etaText;
-  if (etaState.kind === "warmup") {
-    etaText = "Calculating…";
-  } else if (etaState.kind === "done") {
-    etaText = "";
-  } else {
-    etaText = etaState.text;
+  const primary = $("lightwalletd-url").value.split(",")[0].trim();
+  const fields = scanStatusFields(progress, eta.estimate(), era, primary);
+
+  if (fields.server !== null) {
+    $("scan-server").textContent = fields.server;
+    $("scan-server").title = fields.serverTitle;
   }
-  if (era) etaText = etaText ? `${etaText} · scanning ~${era}` : `scanning ~${era}`;
-  $("scan-eta").textContent = etaText;
+  $("scan-progress-text").textContent = fields.progressText;
+  if (fields.barPercent !== null) {
+    $("scan-progress-bar").style.width = `${fields.barPercent.toFixed(1)}%`;
+  }
+  $("scan-eta").textContent = fields.etaText;
+  if (fields.terminal) {
+    document.querySelectorAll("#scan-discoveries .discovery-pending").forEach((el) => el.remove());
+  }
 
   if (progress.error) {
     setStatus("scan-message", progress.error, "error");
@@ -2477,53 +2519,79 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
+// The seed-phrase route reports "pending" then "confirmed"; the seedless
+// routes (imported wallet file, pasted Sapling key, transparent-only) report
+// "broadcast" and do not poll for confirmation. Both mean the transaction is
+// on the network and cannot be undone, so they must never read as failed: a
+// user told a sent transaction failed may retry and attempt a double spend.
+function txStatusKind(status) {
+  if (status === "confirmed") return "confirmed";
+  if (status === "pending" || status === "broadcast") return "sent";
+  return "failed";
+}
+
+function txStatusLabel(status) {
+  const kind = txStatusKind(status);
+  if (kind === "confirmed") return "Confirmed";
+  if (kind === "sent") return "Broadcast — awaiting confirmation";
+  return "Failed";
+}
+
+function sweepStatusCounts(results) {
+  const counts = { confirmed: 0, pending: 0, failed: 0, broadcast: 0 };
+  for (const r of results) {
+    const kind = txStatusKind(r.status);
+    if (kind === "confirmed") counts.confirmed += 1;
+    else if (kind === "sent") counts.pending += 1;
+    else counts.failed += 1;
+  }
+  counts.broadcast = counts.confirmed + counts.pending;
+  return counts;
+}
+
+function sweepCompleteSummary(results, error) {
+  const { confirmed, failed, broadcast } = sweepStatusCounts(results);
+  if (error) {
+    // The sweep aborted partway. The transactions below were already
+    // broadcast and are irreversible; the remaining accounts were not swept.
+    // Surface this so the user does not assume nothing was sent and retry
+    // (which would double-broadcast) — audit Issue E.
+    return `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
+      `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
+  }
+  if (results.length === 0) {
+    // Nothing was broadcast because every account with a balance was skipped
+    // (below the fee floor, or transparent funds that couldn't be shielded).
+    // The reasons are listed below — this is NOT a broadcast failure.
+    return "No funds were swept — every account with a balance was skipped (reasons below).";
+  }
+  if (failed === results.length) {
+    return "All transactions failed to broadcast. No funds were moved.";
+  }
+  if (confirmed > 0) {
+    return `${confirmed} transaction${confirmed > 1 ? "s" : ""} confirmed on-chain. Your funds are on their way.`;
+  }
+  return `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
+}
+
 function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote) {
   $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
   if (state.retainedAddressSearchId) {
     state.addressMatchRecoveryLocked = false;
     document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
   }
-  const confirmed = results.filter((r) => r.status === "confirmed").length;
-  const pending = results.filter((r) => r.status === "pending").length;
-  const failed = results.filter((r) => r.status === "failed").length;
-  const broadcast = confirmed + pending;
-
-  if (error) {
-    // The sweep aborted partway. The transactions below were already
-    // broadcast and are irreversible; the remaining accounts were not swept.
-    // Surface this so the user does not assume nothing was sent and retry
-    // (which would double-broadcast) — audit Issue E.
-    $("complete-summary").textContent =
-      `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
-      `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
-  } else if (results.length === 0) {
-    // Nothing was broadcast because every account with a balance was skipped
-    // (below the fee floor, or transparent funds that couldn't be shielded).
-    // The reasons are listed below — this is NOT a broadcast failure.
-    $("complete-summary").textContent =
-      "No funds were swept — every account with a balance was skipped (reasons below).";
-  } else if (failed === results.length) {
-    $("complete-summary").textContent = "All transactions failed to broadcast. No funds were moved.";
-  } else if (confirmed > 0) {
-    $("complete-summary").textContent =
-      `${confirmed} transaction${confirmed > 1 ? "s" : ""} confirmed on-chain. Your funds are on their way.`;
-  } else {
-    $("complete-summary").textContent =
-      `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
-  }
+  const { broadcast } = sweepStatusCounts(results);
+  $("complete-summary").textContent = sweepCompleteSummary(results, error);
 
   const container = $("complete-txids");
   container.innerHTML = "";
   results.forEach((r) => {
     const card = document.createElement("div");
-    card.className = "txid-card" + (r.status === "failed" ? " txid-card--failed" : "");
+    card.className = "txid-card" + (txStatusKind(r.status) === "failed" ? " txid-card--failed" : "");
 
     const label = document.createElement("div");
     label.className = "txid-label";
-    const statusTag = r.status === "confirmed" ? "Confirmed" :
-                      r.status === "pending"   ? "Broadcast — awaiting confirmation" :
-                                                 "Failed";
-    label.textContent = `Account ${r.source_account} · ${statusTag}`;
+    label.textContent = `Account ${r.source_account} · ${txStatusLabel(r.status)}`;
     card.appendChild(label);
 
     if (r.txid) {

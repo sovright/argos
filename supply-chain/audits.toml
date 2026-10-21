@@ -90,11 +90,23 @@ criteria = "safe-to-deploy"
 delta = "0.23.39 -> 0.23.45"
 notes = "Reviewed complete source delta: offered-suite and transport checks, HRR PSK/suite consistency, deframer handshake alignment, signature-scheme filtering, malformed OCSP/ticket handling, ECH authentication and padding, bounded ticket requests, zeroizing DER, and key-log permissions. No new unsafe code or build-script behavior. Optional AWS-LC changes inspected; dependencies audited separately. Source review only; upstream tests not executed. See docs/dependency-review-rustls-2026-09.md."
 
+[[audits.rustls]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.23.45 -> 0.23.46"
+notes = "Reviewed the complete published source delta. The release redacts TLS resumption secrets from Debug, prevents ECH-rejected connections from releasing buffered plaintext, strictly bounds Brotli and zlib certificate decompression, defers key-exchange cache updates until server authentication, and repairs record-limit key updates. Also inspected ECH retry consistency, TLS 1.3 early-data selection, certificate-request context validation, cache sizing, stream error/flush handling, protected CCS rejection, and the optional AWS-LC HPKE sequence fix. No new dependency, unsafe code, build-script behavior, network access, or secret collection was introduced. Automated source review; cross-platform runtime and fuzz testing were not performed."
+
 [[audits.rustls-webpki]]
 who = "OpenAI Codex (automated source review)"
 criteria = "safe-to-deploy"
 delta = "0.103.13 -> 0.103.15"
 notes = "Reviewed the complete published source delta: CRL serial lookup propagates identical errors via ?, AWS-LC FIPS reporting uses try_fips_mode, and ML-DSA exports move to the stable AWS-LC feature. No changes to algorithm identifiers or ring verification bindings. Argos uses ring; optional AWS-LC behavior was inspected but not executed. Review scope and validation limits are documented in docs/dependency-review-rustls-2026-09.md."
+
+[[audits.rustls-webpki]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.103.15 -> 0.103.16"
+notes = "Reviewed the complete published source delta. Certificate-path construction now rejects eight embedded emSign intermediate SPKIs whether they appear as a leaf, intermediate, cross-sign, or trust anchor, returning the new CertDistrusted error. The exact-match checks run before issuer search, cover every selected path node, and include targeted leaf/intermediate/root/cross-sign tests. The package adds only the eight DER fixtures and validation logic; it has no build script or new dependencies. Automated source review; independent malformed-certificate fuzzing was not performed."
 
 [[audits.tao]]
 who = "OpenAI Codex (automated source review)"
@@ -209,6 +221,20 @@ found. cargo check --locked --lib passed on macOS with the published crate's
 own lockfile. Other platforms were not executed. Automated delta review only;
 accepted baseline and transitive crates are outside this certification.
 Details: docs/dependency-review-tauri-2026-10.md.
+"""
+
+[[audits.webpki-roots]]
+who = "OpenAI Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.0.6 -> 1.0.10"
+notes = """
+Reviewed the complete published source delta. This generated Mozilla trust-store
+refresh removes 20 roots, including emSign ECC Root CA - G3, and adds four roots:
+SECOM TLS ECC/RSA Root CA 2024 and Telia EC/RSA TLS Root CA v3. The crate contains
+trust-anchor data only: no unsafe code, build script, runtime I/O, or executable
+logic was added. The manifest raises MSRV from 1.64 to 1.71 and updates a test-only
+dependency. Automated data/source review; independent CA-policy validation and
+cross-platform runtime testing were not performed.
 """
 
 [[audits.wry]]
