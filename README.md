@@ -149,16 +149,41 @@ It is intentionally separate from the ordinary compact-block scan:
 
 The Sprout checkpoint is spend-capable: it contains the raw keys, recovered
 note plaintexts, and witnesses needed to resume and sweep. Argos creates it
-with private permissions on Unix and removes it after a successful sweep.
-Protect it like the original key file and delete any leftover checkpoint only
-after the destination transaction is confirmed.
+with private permissions on Unix. Protect the checkpoint and the original
+wallet or Sprout key until Argos has freshly observed every saved transaction
+as canonically mined. A successful broadcast, a node accepting a transaction,
+or a previously observed mined state is not enough to discard either source.
+
+Before submitting a Sprout transaction, Argos durably journals its exact
+serialized bytes. An accepted submission remains **pending** until independent
+confirmation sources report canonical mined evidence. If submission has an
+unknown outcome, Argos stops before processing later notes: on the next run it
+reconciles that transaction and, while it remains valid, retries the same bytes
+rather than building a different spend. For an absent or unresolved saved
+transaction, Argos builds a replacement only after independent sources
+corroborate absence beyond its expiry height. An eligible transaction that was
+deterministically rejected follows a separate terminal path back to a new plan.
+Keep the wallet or key, checkpoint, and journal available through every retry
+and restart.
+
+Configure confirmation sources with the global option
+`--confirmation-source operator-id=https://host:port`, repeated for distinct,
+independently administered operators. Use a stable operator label; two hosts or
+mirrors run by one operator count as one source and must not be relabelled as
+independent. To reconcile the Sprout journal automatically, rerun the confirmed
+`sweep-sprout` command or confirmed `scan-sprout` sweep with the same keys,
+network, and `--data-dir`; the generic `reconcile` command does not read the
+Sprout journal.
 
 ```bash
 # First see whether the wallet already has spendable note data.
 argos --wallet-file /path/to/wallet.dat inspect-wallet
 
 # Preview a direct wallet-backed Sprout sweep.
-argos --wallet-file /path/to/wallet.dat sweep-sprout \
+argos --wallet-file /path/to/wallet.dat \
+  --confirmation-source operator-a=https://lightwalletd-a.example:443 \
+  --confirmation-source operator-b=https://lightwalletd-b.example:443 \
+  sweep-sprout \
   --destination u1... --dry-run
 
 # Scan one or more standalone keys, then optionally sweep the result.
@@ -208,7 +233,8 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Transparent funds are imported into the wallet workspace using Argos's audited legacy derivation, not modern per-account transparent derivation.
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
-- Broadcasted transactions are polled for confirmation during a bounded wait window. If they are still unmined at the end of that window, Argos reports them as pending instead of pretending they confirmed.
+- Sprout transactions are journaled before submission. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. An absent or unresolved transaction requires independently corroborated absence beyond expiry before rebuilding; an eligible deterministic rejection can return separately to a new plan.
+- Keep the original wallet or Sprout key and the scan checkpoint until Argos reports fresh canonical mined evidence for every saved Sprout transaction.
 - A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
 - A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.
 - The GUI defaults to auto gap-limit mode and can switch to an explicit account count when the user wants an exact scan depth.
