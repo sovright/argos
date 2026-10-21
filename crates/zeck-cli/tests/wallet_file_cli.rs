@@ -76,6 +76,43 @@ fn wallet_network_mismatch_stops_before_lightwalletd() {
     );
 }
 
+#[test]
+fn scan_routes_writer_wallet_seed_with_standalone_key_as_combined() {
+    let mut bytes = std::fs::read(fixture("zwl-mainnet-empty.dat")).unwrap();
+    // Writer fixture: one valid transparent key; keytype at 102..106.
+    // Reclassify that key as an imported standalone key.
+    assert_eq!(&bytes[102..106], &0u32.to_le_bytes());
+    bytes[102..106].copy_from_slice(&1u32.to_le_bytes());
+    let path = temporary_wallet("mixed-writer-key", &bytes);
+    let inspect = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(inspect.status.success());
+    let shown = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        shown.contains("standalone") && shown.contains("combined"),
+        "{shown}"
+    );
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().unwrap(),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("mixed-writer-key"),
+        "scan",
+    ]);
+    assert!(!out.status.success()); // deliberately unreachable lightwalletd
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("127.0.0.1") || stderr.contains("lightwalletd"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot be scanned alongside") && !stderr.contains("nothing to scan"),
+        "{stderr}"
+    );
+}
+
 /// Run `argos` with stdin closed.
 ///
 /// Closing stdin is load-bearing, not tidiness: it means any test that
@@ -137,6 +174,9 @@ fn zwl_with_tkeys(entries: &[(u32, bool, Option<[u8; 32]>, &str)]) -> Vec<u8> {
     bytes.push(0); // no transactions
     bytes.extend_from_slice(&4u64.to_le_bytes());
     bytes.extend_from_slice(b"main");
+    bytes.extend_from_slice(
+        &include_bytes!("../../argos-wallet-import/tests/fixtures/zwl-mainnet-empty.dat")[212..],
+    );
     bytes
 }
 

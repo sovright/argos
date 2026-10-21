@@ -34,7 +34,9 @@ pub enum ImportDiagnostic {
     #[error("skipped unparseable {record_type} record: {reason}")]
     UnparseableRecord { record_type: String, reason: String },
 
-    #[error("skipped unknown record type {record_type}")]
+    // The name comes directly from a BDB record key. Even printable ASCII
+    // could be sensitive material in a damaged type field.
+    #[error("skipped unknown record type")]
     UnknownRecord { record_type: String },
 
     #[error("skipped {record_type} record: decryption failed ({reason})")]
@@ -92,6 +94,24 @@ pub enum ImportDiagnostic {
         format: &'static str,
         reason: &'static str,
     },
+}
+
+#[cfg(test)]
+mod unknown_type_display_tests {
+    use super::ImportDiagnostic;
+
+    #[test]
+    fn unknown_record_type_display_never_echoes_wallet_bytes() {
+        for raw in ["\u{1b}[31msecret", "privateKeyFragment", "name\nsecret"] {
+            let diagnostic = ImportDiagnostic::UnknownRecord {
+                record_type: raw.to_owned(),
+            };
+            let shown = diagnostic.to_string();
+            assert!(shown.contains("unknown record type"), "{shown}");
+            assert!(!shown.contains(raw), "{shown}");
+            assert!(!shown.contains("secret"), "{shown}");
+        }
+    }
 }
 
 // These strings can originate near attacker-controlled wallet bytes. Only

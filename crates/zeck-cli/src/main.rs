@@ -1471,6 +1471,9 @@ fn print_wallet_inspection(
         argos_core::key_source::RecoveryRoute::Hd => {
             println!("Next: run `argos scan --wallet-file <path>` to check these keys for funds.");
         }
+        argos_core::key_source::RecoveryRoute::Combined => {
+            println!("Next: run `argos scan --wallet-file <path>` for one combined scan of the recovered seed and standalone keys. Keep the original wallet file until every recovered balance has been moved and confirmed.");
+        }
         argos_core::key_source::RecoveryRoute::ImportedAccounts => {
             println!(
                 "Next: run `argos scan --wallet-file <path>` to check these keys for funds. \

@@ -253,6 +253,9 @@ pub enum RecoveryRoute {
     /// including a decrypted ZecWallet Lite wallet, which re-enters the
     /// normal pipeline exactly like a typed seed phrase.
     Hd,
+    /// A recovered mnemonic and independently imported spending keys share
+    /// one wallet workspace and must both be registered before completion.
+    Combined,
     /// Seedless with Sapling keys: one imported account per key, with the
     /// transparent keys attached to the first as standalone receivers, so a
     /// single sync covers both pools.
@@ -267,11 +270,22 @@ pub enum RecoveryRoute {
     Nothing,
 }
 
-/// Classify a key set. Order matters: the mnemonic wins, because a wallet
-/// that has one can derive everything else.
+/// Classify a key set by the authority each recovered key needs.
 pub fn classify_recovery_route(keys: &ImportedKeys) -> RecoveryRoute {
     if keys.mnemonic.is_some() {
-        RecoveryRoute::Hd
+        if keys
+            .sapling
+            .iter()
+            .any(|key| key.provenance == argos_wallet_import::Provenance::Standalone)
+            || keys
+                .transparent
+                .iter()
+                .any(|key| key.provenance == argos_wallet_import::Provenance::Standalone)
+        {
+            RecoveryRoute::Combined
+        } else {
+            RecoveryRoute::Hd
+        }
     } else if !keys.sapling.is_empty() {
         RecoveryRoute::ImportedAccounts
     } else if !keys.transparent.is_empty() {
@@ -508,5 +522,24 @@ mod tests {
         let source = ImportedKeySource::new(keys);
 
         assert!(source.wallet_seed().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_seed_and_standalone_key_use_the_combined_route() {
+        use argos_wallet_import::keys::{Provenance, TransparentKey};
+        use secrecy::Secret;
+
+        let mut keys = argos_wallet_import::ImportedKeys {
+            mnemonic: Some(SecretString::new(SEED.to_owned())),
+            ..Default::default()
+        };
+        keys.transparent.push(TransparentKey {
+            secret: Secret::new([0x42; 32]),
+            provenance: Provenance::Standalone,
+        });
+        assert_ne!(classify_recovery_route(&keys), RecoveryRoute::Hd);
+
+        keys.transparent[0].provenance = Provenance::HdDerived;
+        assert_eq!(classify_recovery_route(&keys), RecoveryRoute::Hd);
     }
 }

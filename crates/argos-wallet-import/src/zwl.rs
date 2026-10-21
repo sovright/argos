@@ -23,7 +23,9 @@
 //!                                      versions use a flat secret-key +
 //!                                      address-string pair of vectors)
 //! ... blocks and transactions — structurally skipped to reach the chain
-//!     name; later options, birthday, tree state, and price info are ignored.
+//!     name; the versioned options, birthday, tree-state flags, and price
+//!     info are bounded through EOF. Unsupported nonempty block, Sapling or
+//!     Orchard note, and tree state is reported as incomplete.
 //! ```
 //!
 //! `Vector`, `Optional`, and `CompactSize` above match
@@ -72,9 +74,11 @@
 //!
 //! The network parser is checked against three deterministic, no-funds
 //! wallets written by the upstream ZWL writer, including one with nonempty
-//! transaction metadata. The older key/decryption tests below still use
-//! hand-built streams, so they do not establish compatibility with every
-//! historical wallet layout.
+//! transaction metadata. There is no public no-funds writer fixture here
+//! containing a CompactBlockData or Sapling/Orchard note. These shapes stay
+//! incomplete until a writer-produced fixture verifies their layout. The
+//! older key/decryption tests below still use hand-built streams, so they do
+//! not establish compatibility with every historical wallet layout.
 
 use bip0039::{English, Mnemonic};
 use crypto_secretbox::{aead::Aead, KeyInit, Nonce as SecretboxNonce, XSalsa20Poly1305};
@@ -612,6 +616,25 @@ fn skip_vector(
     Ok(())
 }
 
+fn skip_unverified_history_vector(
+    cur: &mut Cursor,
+    field: &'static str,
+    mut item: impl FnMut(&mut Cursor) -> ZwlReadResult<()>,
+) -> ZwlReadResult<()> {
+    let mut saw_item = false;
+    skip_vector(cur, field, |cur| {
+        saw_item = true;
+        item(cur)
+    })?;
+    if saw_item {
+        return Err(cur.error(
+            field,
+            "nonempty history layout is not verified against an upstream writer fixture",
+        ));
+    }
+    Ok(())
+}
+
 fn skip_bytes_vector(cur: &mut Cursor, field: &'static str) -> ZwlReadResult<()> {
     let len = cur.compact_size(field)?;
     let len = usize::try_from(len).map_err(|_| cur.error(field, "value length limit exceeded"))?;
@@ -716,7 +739,7 @@ fn skip_wallet_tx(cur: &mut Cursor) -> ZwlReadResult<()> {
         cur.skip(8, "txns")?;
     }
     cur.skip(32, "txns")?; // txid
-    skip_vector(cur, "txns", skip_sapling_note)?;
+    skip_unverified_history_vector(cur, "txns", skip_sapling_note)?;
     skip_vector(cur, "txns", skip_utxo)?;
     if version > 22 {
         cur.skip(8, "txns")?;
@@ -737,7 +760,7 @@ fn skip_wallet_tx(cur: &mut Cursor) -> ZwlReadResult<()> {
         skip_vector(cur, "txns", |cur| cur.skip(32, "txns"))?;
     }
     if version > 21 {
-        skip_vector(cur, "txns", skip_orchard_note)?;
+        skip_unverified_history_vector(cur, "txns", skip_orchard_note)?;
         skip_vector(cur, "txns", |cur| cur.skip(32, "txns"))?;
     }
     Ok(())
@@ -752,7 +775,7 @@ fn read_chain_network(
     if !(15..=31).contains(&external_version) {
         return Err(cur.error("txns", "wallet structure could not be read"));
     }
-    skip_vector(cur, "blocks", skip_compact_block)?;
+    skip_unverified_history_vector(cur, "blocks", skip_compact_block)?;
     let txns_version = cur.u64_le("txns")?;
     if txns_version > 21 {
         return Err(cur.error("txns", "wallet structure could not be read"));
@@ -772,12 +795,72 @@ fn read_chain_network(
         usize::try_from(len).map_err(|_| cur.error("chain_name", "value length limit exceeded"))?;
     let name = std::str::from_utf8(cur.take(len, "chain_name")?)
         .map_err(|_| cur.error("chain_name", "wallet structure could not be read"))?;
+    read_wallet_tail(cur, external_version)?;
     Ok(match name {
         "main" | "mainnet" => Some(EmbeddedNetwork::Mainnet),
         "test" | "testnet" => Some(EmbeddedNetwork::Testnet),
         "regtest" => Some(EmbeddedNetwork::Regtest),
         _ => None,
     })
+}
+
+/// The fields following the chain name in the upstream LightWallet writer.
+/// A recognized wallet is complete only if this versioned tail reaches EOF.
+fn read_wallet_tail(cur: &mut Cursor, external_version: u64) -> ZwlReadResult<()> {
+    if external_version > 23 {
+        let options_version = cur.u64_le("wallet_options")?;
+        if options_version > 2 {
+            return Err(cur.error("wallet_options", "wallet structure could not be read"));
+        }
+        if cur.u8("wallet_options")? > 2 {
+            return Err(cur.error("wallet_options", "wallet structure could not be read"));
+        }
+        if options_version > 1 {
+            cur.skip(8, "wallet_options")?; // spam threshold
+        }
+    }
+    cur.skip(8, "birthday")?;
+    if external_version <= 22 && cur.u8("sapling_tree_verified")? > 1 {
+        return Err(cur.error(
+            "sapling_tree_verified",
+            "wallet structure could not be read",
+        ));
+    }
+    if external_version > 21 {
+        // This is a protobuf TreeState vector. Until its semantic layout is
+        // supported here, never claim complete coverage for a nonempty one.
+        if cur
+            .optional("verified_tree", |cur| {
+                skip_bytes_vector(cur, "verified_tree")
+            })?
+            .is_some()
+        {
+            return Err(cur.error("verified_tree", "wallet structure could not be read"));
+        }
+    }
+    if external_version > 13 {
+        let price_version = cur.u64_le("price_info")?;
+        if price_version > 20 {
+            return Err(cur.error("price_info", "wallet structure could not be read"));
+        }
+        cur.optional("price_info", |cur| cur.skip(8, "price_info"))?;
+        cur.skip(8, "price_info")?; // historical retry count
+    }
+    if external_version > 24
+        && cur
+            .optional("orchard_witnesses", |cur| {
+                // The frontier is not yet independently validated here. Mark
+                // nonempty state incomplete without treating its bytes as keys.
+                cur.skip(cur.bytes.len().saturating_sub(cur.pos), "orchard_witnesses")
+            })?
+            .is_some()
+    {
+        return Err(cur.error("orchard_witnesses", "wallet structure could not be read"));
+    }
+    if cur.pos != cur.bytes.len() {
+        return Err(cur.error("wallet_tail", "wallet structure could not be read"));
+    }
+    Ok(())
 }
 
 pub fn import_zwl(
@@ -936,6 +1019,104 @@ mod tests {
     }
 
     #[test]
+    fn upstream_writer_tail_truncations_are_never_complete() {
+        for bytes in [
+            include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat").as_slice(),
+            include_bytes!("../tests/fixtures/zwl-testnet-empty.dat").as_slice(),
+            include_bytes!("../tests/fixtures/zwl-testnet-txn.dat").as_slice(),
+        ] {
+            let full = import_zwl(bytes, None).unwrap();
+            assert_eq!(full.coverage(), crate::keys::ImportCoverage::Complete);
+            for cut in 8..bytes.len() {
+                let imported = import_zwl(&bytes[..cut], None).unwrap();
+                assert_ne!(
+                    imported.coverage(),
+                    crate::keys::ImportCoverage::Complete,
+                    "cut {cut} of {}",
+                    bytes.len()
+                );
+                assert!(
+                    imported
+                        .diagnostics
+                        .iter()
+                        .any(|d| matches!(d, ImportDiagnostic::ContainerDamage { .. })),
+                    "cut {cut} of {}: {:?}",
+                    bytes.len(),
+                    imported.diagnostics
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nonempty_historical_price_tail_is_valid_and_truncation_is_incomplete() {
+        let mut bytes = include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat").to_vec();
+        // Upstream price version 20 begins at byte 238. Replace its absent
+        // optional timestamp with a present u64 timestamp.
+        assert_eq!(bytes[246], 0);
+        bytes[246] = 1;
+        bytes.splice(247..247, 1234u64.to_le_bytes());
+        assert_eq!(
+            import_zwl(&bytes, None).unwrap().coverage(),
+            crate::keys::ImportCoverage::Complete
+        );
+        for cut in 212..bytes.len() {
+            let imported = import_zwl(&bytes[..cut], None).unwrap();
+            assert_ne!(
+                imported.coverage(),
+                crate::keys::ImportCoverage::Complete,
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_bytes_after_writer_tail_are_incomplete() {
+        let mut bytes = include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat").to_vec();
+        bytes.push(0x42);
+        let imported = import_zwl(&bytes, None).unwrap();
+        assert_ne!(imported.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn nonempty_block_history_cannot_be_complete_without_writer_fixture() {
+        let mut bytes = include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat").to_vec();
+        assert_eq!(bytes[190], 0); // writer's empty CompactBlockData vector
+        let mut block = Vec::new();
+        block.extend_from_slice(&419_200u32.to_le_bytes());
+        block.extend_from_slice(&[0u8; 32]);
+        block.extend_from_slice(&[0, 0, 0]); // empty tree
+        block.extend_from_slice(&20u64.to_le_bytes());
+        block.push(0); // empty v20 extra data
+        bytes[190] = 1;
+        bytes.splice(191..191, block);
+        assert_ne!(
+            import_zwl(&bytes, None).unwrap().coverage(),
+            crate::keys::ImportCoverage::Complete
+        );
+    }
+
+    #[test]
+    fn nonempty_sapling_note_history_cannot_be_complete_without_writer_fixture() {
+        let mut bytes = include_bytes!("../tests/fixtures/zwl-testnet-txn.dat").to_vec();
+        assert_eq!(bytes[285], 0); // writer's empty Sapling note vector
+        let mut note = Vec::new();
+        note.extend_from_slice(&20u64.to_le_bytes());
+        note.extend_from_slice(&vec![0u8; EXTFVK_LEN + 11 + 8 + 33]);
+        note.push(0); // no witnesses
+        note.extend_from_slice(&0u64.to_le_bytes()); // spent height
+        note.extend_from_slice(&[0u8; 32]); // diversifier note key
+        note.extend_from_slice(&[0, 0, 0]); // optional outpoints and memo
+        note.extend_from_slice(&[0, 0]); // flags
+        bytes[285] = 1;
+        bytes.splice(286..286, note);
+        assert_ne!(
+            import_zwl(&bytes, None).unwrap().coverage(),
+            crate::keys::ImportCoverage::Complete
+        );
+    }
+
+    #[test]
     fn unsupported_nested_transaction_version_leaves_network_unknown() {
         let mut bytes = include_bytes!("../tests/fixtures/zwl-testnet-txn.dat").to_vec();
         // In the writer fixture, the first WalletTx version begins at 232,
@@ -962,6 +1143,8 @@ mod tests {
         v.extend_from_slice(&21u64.to_le_bytes()); // WalletTxns version
         v.push(0); // no transactions
         v.extend_from_slice(&zwl_string("main"));
+        // Writer-produced v25 options, birthday, tree flags, and price tail.
+        v.extend_from_slice(&include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat")[212..]);
         v
     }
 

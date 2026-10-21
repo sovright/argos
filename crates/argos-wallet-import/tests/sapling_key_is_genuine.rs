@@ -45,10 +45,10 @@
 //! (`src/wallet/walletdb.cpp`) — and `ivk = CRH^ivk(ak, nk)` is derived from
 //! the same viewing key. So the record key is the oracle there.
 //!
-//! The re-derivation uses `sapling-crypto`, a crate this parser does not
-//! depend on and never calls, so the comparison is against an independent
-//! implementation rather than a restatement of the code under test — the
-//! same arrangement `transparent_key_is_genuine.rs` has with `secp256k1`.
+//! The fixture bytes came from zcashd independently of this parser. Both
+//! this test and the parser now use `sapling-crypto` to derive viewing keys,
+//! so the golden bytes, not a separate crypto implementation, are the
+//! external oracle. The mutation tests still prove mismatches are rejected.
 
 use argos_wallet_import::{
     bdb,
