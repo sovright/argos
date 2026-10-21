@@ -7,6 +7,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::reviewed_intent::{
+    ReviewedIntentStore, ReviewedSproutSweep, SproutIntentSource, SproutProposalId,
+    SproutScanHandle, SproutScanProgressEvent, SproutScanSnapshot, SproutSweepIntent,
+    SproutSweepPreviewData,
+};
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
@@ -18,10 +23,10 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-#[derive(Clone)]
 pub struct AppState {
     pub service: RecoveryService,
     pub address_search: argos_core::address_search::AddressSearchService,
+    pub reviewed_intent: ReviewedIntentStore,
 }
 
 #[derive(Deserialize)]
@@ -891,63 +896,6 @@ pub async fn execute_sweep(
     Ok(outcome)
 }
 
-/// What a Sprout sweep would move, before anything is built.
-#[derive(Serialize)]
-pub struct SproutSweepPreview {
-    pub notes: usize,
-    pub gross_zatoshis: u64,
-    pub fee_zatoshis: u64,
-    pub net_zatoshis: u64,
-    /// Whether the Sprout proving parameters are already present. The GUI
-    /// needs this before the user commits: without them the sweep cannot
-    /// start, and a 725 MB download is not something to discover halfway
-    /// through a recovery.
-    pub params_present: bool,
-    pub params_path: String,
-    /// Why the funds land in Sapling and not Orchard. Shown before the user
-    /// commits, because pasting a unified address reasonably creates the
-    /// opposite expectation.
-    pub lands_in_sapling: String,
-}
-
-/// Preview a Sprout sweep.
-///
-/// The wallet file is re-read rather than kept in memory between calls:
-/// holding decrypted Sprout spending keys in the backend for the lifetime
-/// of the app would widen the window in which they can be captured, for no
-/// benefit beyond skipping a file read.
-#[tauri::command]
-pub async fn preview_sprout_sweep(
-    app: AppHandle,
-    path: String,
-    passphrase: Option<SecretString>,
-    network: Option<String>,
-    data_dir: Option<String>,
-) -> Result<SproutSweepPreview, String> {
-    ensure_tos_accepted(&app)?;
-
-    let bytes = argos_core::wallet_file::read_wallet_file(&path)
-        .map_err(|err| format!("could not read {path}: {err}"))?;
-    let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
-        .map_err(|err| err.to_string())?;
-    drop_and_warn_forged_sprout_keys(&app, &mut keys);
-
-    let network = network_from(network.as_deref().unwrap_or("mainnet"));
-    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
-    let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
-
-    let params_path = argos_core::sprout_sweep::default_params_path();
-    Ok(SproutSweepPreview {
-        notes: plan.notes,
-        gross_zatoshis: plan.gross_zatoshis,
-        fee_zatoshis: plan.fee_zatoshis,
-        net_zatoshis: plan.net_zatoshis,
-        params_present: params_path.exists(),
-        params_path: params_path.display().to_string(),
-        lands_in_sapling: argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING.to_owned(),
-    })
-}
-
 /// One broadcast Sprout sweep, for the frontend.
 #[derive(Serialize)]
 pub struct SproutSweepResult {
@@ -959,83 +907,104 @@ pub struct SproutSweepResult {
 pub struct SproutSweepReport {
     pub sent: Vec<SproutSweepResult>,
     pub total_swept: u64,
-    /// True when the destination was a unified address, so the funds landed
-    /// in its Sapling receiver and a further hop is needed for Orchard.
     pub landed_in_unified_sapling: bool,
-    /// Notes that did not move, and why. Surfaced rather than summarised:
-    /// a user seeing less than expected needs to know which notes stayed
-    /// behind.
     pub skipped: Vec<String>,
-    /// Notes the network refused. The sweep carried on past each; nothing
-    /// moved for them and no fee was paid.
     pub rejected: Vec<String>,
-    /// Transactions the node said it already holds, not yet counted as
-    /// swept; if one never mines, a later run retries its note.
     pub already_held: Vec<SproutSweepResult>,
-    /// Did not stop anything, but the user should know — a broadcast that
-    /// could not be written to the sweep journal.
     pub warnings: Vec<String>,
-    /// Set when the sweep stopped partway. `sent` still lists what was
-    /// broadcast before it did — those funds have moved.
     pub error: Option<String>,
 }
 
-/// Prove and broadcast a Sprout sweep.
-///
-/// Progress is emitted as `sprout-sweep-progress` events because proving
-/// takes minutes per note, and a silent multi-minute window is
-/// indistinguishable from a hang.
+fn sprout_network(name: &str) -> Result<ZeckNetwork, String> {
+    match name {
+        "mainnet" => Ok(ZeckNetwork::Mainnet),
+        "testnet" => Ok(ZeckNetwork::Testnet),
+        _ => Err("choose mainnet or testnet".to_owned()),
+    }
+}
+
+/// Recover once and store the exact notes and execution settings reviewed by
+/// the user. No wallet path or passphrase is accepted at execution time.
 #[tauri::command]
-pub async fn execute_sprout_sweep(
+#[allow(clippy::too_many_arguments)]
+pub async fn propose_wallet_sprout_sweep(
     app: AppHandle,
+    state: State<'_, AppState>,
     path: String,
     passphrase: Option<SecretString>,
     destination: String,
     lightwalletd_url: String,
     network: String,
     data_dir: Option<String>,
-) -> Result<SproutSweepReport, String> {
+) -> Result<ReviewedSproutSweep, String> {
     ensure_tos_accepted(&app)?;
-
-    let network = match network.as_str() {
-        "testnet" => argos_core::ZeckNetwork::Testnet,
-        _ => argos_core::ZeckNetwork::Mainnet,
-    };
-
+    let network = sprout_network(&network)?;
+    argos_core::sprout_sweep::parse_sapling_destination(&destination, network)
+        .map_err(|err| err.to_string())?;
     let bytes = argos_core::wallet_file::read_wallet_file(&path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
     let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase.as_ref())
         .map_err(|err| err.to_string())?;
-    drop_and_warn_forged_sprout_keys(&app, &mut keys);
-
+    let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(&mut keys);
+    if !forged.is_empty() {
+        return Err("wallet file contains a Sprout key that does not control its stored address; preserve the file and inspect it before sweeping".into());
+    }
     let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
     if recovered.notes.is_empty() {
-        // Said by cause: a file Argos could not read, and a wallet whose
-        // notes the file or the scan show as spent, need different next steps.
         return Err(if recovered.nothing_left_to_sweep() {
-            "nothing is left to sweep: every Sprout note in this wallet file is spent (by the \
-             file's own record, or by this wallet's full-block scan), already swept, or worth \
-             less than the fee"
-                .to_owned()
+            "nothing is left to sweep: the wallet file or scan shows its Sprout notes spent, already swept, or below the fee".into()
         } else {
-            "no spendable Sprout notes could be recovered from this wallet file".to_owned()
+            "no spendable Sprout notes could be recovered from this wallet file".into()
         });
     }
-
-    let params_path = argos_core::sprout_sweep::default_params_path();
-    let emitter = app.clone();
+    let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
     let journal = resolve_data_dir(&app, data_dir.as_deref()).map(|dir| {
         argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(&keys))
     });
+    use sha2::Digest;
+    let canonical_path = fs::canonicalize(&path)
+        .map_err(|err| format!("could not identify wallet file {path}: {err}"))?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(canonical_path.to_string_lossy().as_bytes());
+    hasher.update(&*bytes);
+    let digest = hasher.finalize();
+    let source_digest = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    state.reviewed_intent.insert_proposal(
+        SproutSweepIntent {
+            source: SproutIntentSource::Wallet(source_digest),
+            notes: recovered.notes,
+            destination,
+            network,
+            lightwalletd_url,
+            journal,
+        },
+        SproutSweepPreviewData {
+            notes: plan.notes,
+            gross_zatoshis: plan.gross_zatoshis,
+            fee_zatoshis: plan.fee_zatoshis,
+            net_zatoshis: plan.net_zatoshis,
+        },
+    )
+}
+
+async fn execute_reviewed_sprout_sweep(
+    app: AppHandle,
+    intent: SproutSweepIntent,
+) -> Result<SproutSweepReport, String> {
+    let source = match &intent.source {
+        SproutIntentSource::Wallet(_) => argos_core::sprout_sweep::NoteSource::WalletFile,
+        SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
+    };
+    let emitter = app.clone();
     let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
-        &recovered.notes,
-        network,
-        &lightwalletd_url,
-        &destination,
-        &params_path,
+        &intent.notes,
+        intent.network,
+        &intent.lightwalletd_url,
+        &intent.destination,
+        &argos_core::sprout_sweep::default_params_path(),
         argos_core::sprout_sweep::SweepOptions {
-            source: argos_core::sprout_sweep::NoteSource::WalletFile,
-            journal: journal.as_ref(),
+            source,
+            journal: intent.journal.as_ref(),
         },
         move |msg| {
             let _ = emitter.emit("sprout-sweep-progress", msg);
@@ -1043,7 +1012,6 @@ pub async fn execute_sprout_sweep(
     )
     .await
     .map_err(|err| err.to_string())?;
-
     Ok(SproutSweepReport {
         sent: outcome
             .sent
@@ -1057,12 +1025,12 @@ pub async fn execute_sprout_sweep(
         landed_in_unified_sapling: outcome.destination_kind
             == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
-        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        rejected: outcome.rejected.iter().map(ToString::to_string).collect(),
         already_held: outcome
             .already_held
-            .iter()
+            .into_iter()
             .map(|h| SproutSweepResult {
-                txid: h.txid.clone(),
+                txid: h.txid,
                 value_swept: h.value_swept,
             })
             .collect(),
@@ -1071,8 +1039,19 @@ pub async fn execute_sprout_sweep(
     })
 }
 
+#[tauri::command]
+pub async fn execute_wallet_sprout_sweep(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    proposal_id: SproutProposalId,
+) -> Result<SproutSweepReport, String> {
+    ensure_tos_accepted(&app)?;
+    let intent = state.reviewed_intent.take_wallet_proposal(&proposal_id)?;
+    execute_reviewed_sprout_sweep(app, intent).await
+}
+
 /// A Sprout scan's outcome, for the frontend.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SproutScanReport {
     pub blocks_scanned: u64,
     pub joinsplits_seen: u64,
@@ -1263,15 +1242,12 @@ fn validate_peer(entry: &str) -> Result<(), &'static str> {
     }
 }
 
-/// Scan the chain for notes belonging to raw Sprout spending keys.
-///
-/// Runs for hours, so progress arrives as `sprout-scan-progress` events and
-/// the scan checkpoints as it goes — closing the app and reopening resumes
-/// rather than restarting.
+/// Start a resumable Sprout scan and return its backend handle immediately.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_sprout_scan(
     app: AppHandle,
+    state: State<'_, AppState>,
     keys: Vec<String>,
     path: Option<String>,
     passphrase: Option<SecretString>,
@@ -1279,61 +1255,92 @@ pub async fn start_sprout_scan(
     data_dir: String,
     lightwalletd_url: String,
     peers: Vec<String>,
-) -> Result<SproutScanReport, String> {
+) -> Result<SproutScanHandle, String> {
     ensure_tos_accepted(&app)?;
-    let network = network_from(&network);
-    // Before the wallet file is read: a mistyped peer should not cost a
-    // passphrase-stretching decrypt to find out about.
+    let network = sprout_network(&network)?;
     let peers = parse_custom_peers(&peers)?;
-
-    // The panel offers to use the wallet file's own keys; it now actually
-    // can. Previously this took typed keys only, so the one user it exists
-    // for — a wallet holding Sprout keys but no note data — was told to
-    // leave the box blank and then refused, with no way to see the keys.
     let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
-
-    let p2p: argos_core::p2p::wire::P2pNetwork = network.into();
-    // Blank resolves to the app default, as it does for inspection, preview
-    // and sweep — a blank field must not write a CWD-relative checkpoint that
-    // those then never find.
     let dir = resolve_data_dir(&app, Some(&data_dir))
         .ok_or_else(|| "could not resolve the data directory".to_owned())?;
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
-    let (tip_anchor, tip_warning) = sprout_tip_anchor(network, &lightwalletd_url).await;
+    let fingerprint = argos_core::sprout_scan_run::key_set_fingerprint(&decoded);
+    let store = state.reviewed_intent.clone();
+    let handle = store.insert_scan(
+        decoded,
+        fingerprint,
+        checkpoint,
+        network,
+        lightwalletd_url,
+        peers,
+    )?;
+    let material = store.scan_material(&handle)?;
+    let worker_handle = handle.clone();
+    tokio::spawn(async move {
+        let (tip_anchor, tip_warning) =
+            sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
+        let emitter = app.clone();
+        let progress_handle = worker_handle.clone();
+        let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
+        let result = argos_core::sprout_scan_run::run_sprout_scan(
+            &material.keys,
+            p2p,
+            &material.peers,
+            tip_anchor,
+            &material.checkpoint,
+            move |tick| {
+                let _ = emitter.emit(
+                    "sprout-scan-progress",
+                    SproutScanProgressEvent {
+                        handle: progress_handle.clone(),
+                        height: tick.height,
+                        target: tick.target,
+                        notes_found: tick.notes_found,
+                        joinsplits_seen: tick.joinsplits_seen,
+                        peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
+                    },
+                );
+            },
+        )
+        .await
+        .map(|result| SproutScanReport {
+            blocks_scanned: result.progress.blocks_scanned,
+            joinsplits_seen: result.progress.joinsplits_seen,
+            notes_found: result.notes.len(),
+            spent_notes: result.spent_notes,
+            total_zatoshis: result.total_value(),
+            tip_warning,
+        })
+        .map_err(|err| err.to_string());
+        store.finish_scan(&worker_handle, result);
+        if let Ok(snapshot) = store.snapshot(&worker_handle) {
+            let _ = app.emit("sprout-scan-complete", snapshot);
+        }
+    });
+    Ok(handle)
+}
 
-    let emitter = app.clone();
-    let result = argos_core::sprout_scan_run::run_sprout_scan(
-        &decoded,
-        p2p,
-        &peers,
-        tip_anchor,
-        &checkpoint,
-        move |tick| {
-            let _ = emitter.emit(
-                "sprout-scan-progress",
-                serde_json::json!({
-                    "height": tick.height,
-                    "target": tick.target,
-                    "notesFound": tick.notes_found,
-                    "joinsplitsSeen": tick.joinsplits_seen,
-                    // Null while scanning; the core's own sentence while it
-                    // waits for a peer, so the GUI and CLI cannot drift.
-                    "peerWait": tick.peer_wait.map(|wait| wait.to_string()),
-                }),
-            );
-        },
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+#[tauri::command]
+pub fn get_sprout_scan(
+    state: State<'_, AppState>,
+    handle: SproutScanHandle,
+) -> Result<SproutScanSnapshot, String> {
+    state.reviewed_intent.snapshot(&handle)
+}
 
-    Ok(SproutScanReport {
-        blocks_scanned: result.progress.blocks_scanned,
-        joinsplits_seen: result.progress.joinsplits_seen,
-        notes_found: result.notes.len(),
-        spent_notes: result.spent_notes,
-        total_zatoshis: result.total_value(),
-        tip_warning,
-    })
+#[tauri::command]
+pub fn release_sprout_scan(
+    state: State<'_, AppState>,
+    handle: SproutScanHandle,
+) -> Result<(), String> {
+    state.reviewed_intent.release_scan(&handle)
+}
+
+#[tauri::command]
+pub fn release_sprout_proposal(
+    state: State<'_, AppState>,
+    proposal_id: SproutProposalId,
+) -> Result<(), String> {
+    state.reviewed_intent.release_proposal(&proposal_id)
 }
 
 /// Learn a block near the tip from lightwalletd for the scan to match, and
@@ -1358,128 +1365,95 @@ async fn sprout_tip_anchor(
     }
 }
 
-/// Sweep the notes a scan found.
-///
-/// Resuming a saved scan is a short catch-up, not a rescan: it continues from
-/// the checkpoint to the current tip, which is what makes this cheap enough
-/// to be a button. It does need a peer, and it is also what stops a note
-/// spent since the scan from being swept (and rejected) as if it were live.
-///
-/// Without it, a scan that found funds after six hours was a dead end: the
-/// wallet-file sweep re-reads the file and cannot see scan-found notes, so
-/// the user was shown money and given nothing to click.
+/// Catch up the exact saved scan and store the resulting notes for review.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn sweep_sprout_from_scan(
+pub async fn propose_sprout_scan_sweep(
     app: AppHandle,
-    keys: Vec<String>,
-    path: Option<String>,
-    passphrase: Option<SecretString>,
+    state: State<'_, AppState>,
+    scan_handle: SproutScanHandle,
     destination: String,
-    network: String,
-    data_dir: String,
-    lightwalletd_url: String,
-    peers: Vec<String>,
-) -> Result<SproutSweepReport, String> {
+) -> Result<ReviewedSproutSweep, String> {
     ensure_tos_accepted(&app)?;
-    let net = network_from(&network);
-    let peers = parse_custom_peers(&peers)?;
-    let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, net)?;
-
-    // Validated before anything else: an address with no Sapling receiver
-    // should fail here, not after the notes are re-derived.
-    argos_core::sprout_sweep::parse_sapling_destination(&destination, net)
-        .map_err(|err| err.to_string())?;
-
-    let p2p: argos_core::p2p::wire::P2pNetwork = net.into();
-    // Blank resolves to the app default, as it does for inspection, preview
-    // and sweep — a blank field must not write a CWD-relative checkpoint that
-    // those then never find.
-    let dir = resolve_data_dir(&app, Some(&data_dir))
-        .ok_or_else(|| "could not resolve the data directory".to_owned())?;
-    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
-    if !checkpoint.exists() {
-        return Err(
-            "no saved scan was found for these keys. Run the scan first — its results are              what this sweeps."
-                .to_owned(),
-        );
+    let snapshot = state.reviewed_intent.snapshot(&scan_handle)?;
+    if !matches!(
+        snapshot.status,
+        crate::reviewed_intent::SproutScanStatus::Completed
+    ) {
+        return Err("wait for the Sprout scan to complete".into());
     }
-
-    let (tip_anchor, _) = sprout_tip_anchor(net, &lightwalletd_url).await;
+    let material = state.reviewed_intent.scan_material(&scan_handle)?;
+    if argos_core::sprout_scan_run::key_set_fingerprint(&material.keys) != material.key_fingerprint
+    {
+        return Err("Sprout scan key identity changed".into());
+    }
+    argos_core::sprout_sweep::parse_sapling_destination(&destination, material.network)
+        .map_err(|err| err.to_string())?;
+    if !material.checkpoint.exists() {
+        return Err("the saved Sprout scan checkpoint is missing; run the scan again".into());
+    }
+    let (tip_anchor, _) = sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
     let emitter = app.clone();
+    let progress_handle = scan_handle.clone();
+    let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
     let result = argos_core::sprout_scan_run::run_sprout_scan(
-        &decoded,
+        &material.keys,
         p2p,
-        &peers,
+        &material.peers,
         tip_anchor,
-        &checkpoint,
+        &material.checkpoint,
         move |tick| {
             let _ = emitter.emit(
                 "sprout-scan-progress",
-                serde_json::json!({
-                    "height": tick.height,
-                    "target": tick.target,
-                    "notesFound": tick.notes_found,
-                    "joinsplitsSeen": tick.joinsplits_seen,
-                    // Null while scanning; the core's own sentence while it
-                    // waits for a peer, so the GUI and CLI cannot drift.
-                    "peerWait": tick.peer_wait.map(|wait| wait.to_string()),
-                }),
+                SproutScanProgressEvent {
+                    handle: progress_handle.clone(),
+                    height: tick.height,
+                    target: tick.target,
+                    notes_found: tick.notes_found,
+                    joinsplits_seen: tick.joinsplits_seen,
+                    peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
+                },
             );
         },
     )
     .await
     .map_err(|err| err.to_string())?;
-
     if result.notes.is_empty() {
-        return Err("the saved scan found no unspent Sprout notes to sweep".to_owned());
+        return Err("the saved scan found no unspent Sprout notes to sweep".into());
     }
-
-    let params_path = argos_core::sprout_sweep::default_params_path();
-    let emitter = app.clone();
-    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &decoded);
-    let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
-        &result.notes,
-        net,
-        &lightwalletd_url,
-        &destination,
-        &params_path,
-        argos_core::sprout_sweep::SweepOptions {
-            source: argos_core::sprout_sweep::NoteSource::Scan,
-            journal: Some(&journal),
+    let plan =
+        argos_core::sprout_sweep::plan_sweep(&result.notes).map_err(|err| err.to_string())?;
+    let dir = material
+        .checkpoint
+        .parent()
+        .ok_or("invalid Sprout checkpoint location")?;
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(dir, &material.keys);
+    state.reviewed_intent.insert_proposal(
+        SproutSweepIntent {
+            source: SproutIntentSource::Scan(scan_handle),
+            notes: result.notes,
+            destination,
+            network: material.network,
+            lightwalletd_url: material.lightwalletd_url,
+            journal: Some(journal),
         },
-        move |msg| {
-            let _ = emitter.emit("sprout-sweep-progress", msg);
+        SproutSweepPreviewData {
+            notes: plan.notes,
+            gross_zatoshis: plan.gross_zatoshis,
+            fee_zatoshis: plan.fee_zatoshis,
+            net_zatoshis: plan.net_zatoshis,
         },
     )
-    .await
-    .map_err(|err| err.to_string())?;
+}
 
-    Ok(SproutSweepReport {
-        sent: outcome
-            .sent
-            .into_iter()
-            .map(|s| SproutSweepResult {
-                txid: s.txid,
-                value_swept: s.value_swept,
-            })
-            .collect(),
-        total_swept: outcome.total_swept,
-        landed_in_unified_sapling: outcome.destination_kind
-            == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
-        skipped: outcome.skipped,
-        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
-        already_held: outcome
-            .already_held
-            .iter()
-            .map(|h| SproutSweepResult {
-                txid: h.txid.clone(),
-                value_swept: h.value_swept,
-            })
-            .collect(),
-        warnings: outcome.warnings,
-        error: outcome.error,
-    })
+#[tauri::command]
+pub async fn execute_sprout_scan_sweep(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    proposal_id: SproutProposalId,
+) -> Result<SproutSweepReport, String> {
+    ensure_tos_accepted(&app)?;
+    let intent = state.reviewed_intent.take_scan_proposal(&proposal_id)?;
+    execute_reviewed_sprout_sweep(app, intent).await
 }
 
 // Not gated on `sprout`: `check_sapling_key` is a core-Sapling command and
@@ -2218,6 +2192,14 @@ mod tests {
             ScanHandle,
             argos_core::SweepProposalId,
         ) -> _ = super::execute_sweep;
+    }
+
+    #[test]
+    fn sprout_execution_authority_contains_only_proposal_id() {
+        let _wallet: fn(AppHandle, State<'static, AppState>, SproutProposalId) -> _ =
+            super::execute_wallet_sprout_sweep;
+        let _scan: fn(AppHandle, State<'static, AppState>, SproutProposalId) -> _ =
+            super::execute_sprout_scan_sweep;
     }
 
     fn spent_note() -> SpentSproutNote {
