@@ -148,9 +148,10 @@
             </div>
 
             <div class="guide-section">
-              <h3>Step 2 — Wallet File or Sapling Key</h3>
+              <h3>Step 2 — Wallet File or Spending Key</h3>
               <p>Choose, drag, or type the path to a ZecWallet Lite wallet or zcashd <code>wallet.dat</code>. Argos opens it read-only. If encrypted, enter the passphrase in the app; it is used in memory and never written to disk. Review the key counts and any unread-record diagnostics before continuing.</p>
               <p>If you have no wallet file, paste one or more <code>secret-extended-key-main1…</code> or <code>secret-extended-key-test1…</code> Sapling spending keys and click <em>Check keys</em>. Viewing keys cannot authorize a sweep and are rejected.</p>
+              <p>If you only have a Sprout spending key (<code>SK…</code> or <code>ST…</code>), open <em>I only have a Sprout spending key</em> on the same screen. No wallet file is needed.</p>
             </div>
 
             <div class="guide-section">
@@ -180,7 +181,7 @@
 
             <div class="guide-section">
               <h3>Sprout Recovery</h3>
-              <p>Sprout support is included in Argos. A ZecWallet Lite seed alone cannot recreate these independently generated keys; use a zcashd <code>wallet.dat</code> or standalone <code>SK…</code>/<code>ST…</code> key.</p>
+              <p>Sprout support is included in Argos. A ZecWallet Lite seed alone cannot recreate these independently generated keys; use a zcashd <code>wallet.dat</code> or standalone <code>SK…</code>/<code>ST…</code> key. With no wallet file, choose <em>I have a wallet file</em> on the welcome screen, then open <em>I only have a Sprout spending key</em>, pick the network and paste the keys.</p>
               <p>If the wallet file contains cached note data and a witness, Argos can sweep it immediately. Otherwise recovery needs a resumable full-block scan from genesis to the chain tip — Sprout notes are still created and spent after Canopy, so it cannot stop there. On mainnet that is about 3.5 million blocks, roughly 280 GB transferred, under 500 MB retained, and likely days of work.</p>
               <p>Sprout funds land in a Sapling receiver, even when you provide a Unified Address. They cannot reach Orchard in the same transaction; move them from Sapling to Orchard afterward from your own wallet if desired. Keep the original file and the private scan checkpoint until every transaction is confirmed.</p>
             </div>
@@ -279,7 +280,8 @@
           <h2>Open a wallet file</h2>
           <p class="lead">
             A zcashd <code>wallet.dat</code> or a ZecWallet Lite wallet. Argos only reads it — the
-            file is never modified, and nothing is sent anywhere.
+            file is never modified, and nothing is sent anywhere. No file? Paste a standalone
+            Sapling or Sprout spending key below instead.
           </p>
 
           <div id="wallet-drop" class="drop-zone">
@@ -337,93 +339,6 @@
               <div id="wallet-sprout-accounting" hidden></div>
               <div id="wallet-sprout-scan-cost" hidden></div>
 
-              <!-- Shown only when the wallet file yielded no spendable notes,
-                   which is the one case a scan can help with. Also accepts a
-                   raw key, for a user who has no wallet file at all. -->
-              <div id="sprout-scan-panel" hidden>
-                <hr />
-                <p><strong>Scan the chain for these notes</strong></p>
-                <label for="sprout-scan-keys">
-                  Sprout spending keys (one per line, <code>SK…</code> or <code>ST…</code>)
-                </label>
-                <textarea id="sprout-scan-keys" rows="3" spellcheck="false"
-                  placeholder="Leave blank to use the Sprout keys already in your wallet file"></textarea>
-                <button id="sprout-scan-check" type="button">Check keys</button>
-                <ul id="sprout-scan-addresses" class="session-list"></ul>
-
-                <!-- The escape hatch for when every public peer is full.
-                     Collapsed, because almost nobody needs it; the CLI's
-                     equivalent is `scan-sprout --peer`. -->
-                <details id="sprout-scan-advanced">
-                  <summary>Advanced: use your own Zcash node</summary>
-                  <label for="sprout-scan-peers">
-                    Custom peers (<code>host:port</code>, one per line or comma-separated, up to 8)
-                  </label>
-                  <textarea id="sprout-scan-peers" rows="2" spellcheck="false"
-                    autocomplete="off" placeholder="Leave blank to use public peers"></textarea>
-                  <p class="muted">
-                    Leave this empty normally. Use it if Argos reports that all peers are busy
-                    and you run or trust a Zcash node (zebrad or zcashd, port 8233). These peers
-                    are tried first, before the public ones. A peer can see which blocks Argos
-                    requests. On mainnet it cannot forge history, because every block header is
-                    checked for proof of work and the chain is pinned to known block hashes;
-                    testnet has no pinned hashes, so only use a testnet node you trust. Your
-                    keys are never sent to any peer.
-                  </p>
-                </details>
-
-                <!-- Mirrors `scan-sprout --no-birthday-skip` / `--birthday`.
-                     A wallet.dat whose Sprout keys are all dated skips
-                     trial decryption before them; the file's times are its
-                     own claim, so the user can always undo the skip. -->
-                <details id="sprout-scan-skip">
-                  <summary>Where decryption starts</summary>
-                  <p class="muted">
-                    If every Sprout key in your wallet file records when it was created, the
-                    scan still reads every block but does not try to decrypt notes in blocks
-                    made before then, which saves hours. Keys pasted above have no creation time,
-                    so with any of them every block is decrypted.
-                  </p>
-                  <label class="checkbox-row">
-                    <input type="checkbox" id="sprout-scan-every-block" />
-                    Decrypt every block (ignore the wallet file's key creation times)
-                  </label>
-                  <label for="sprout-scan-birthday">
-                    Birthday for this scan (optional; can only move the start earlier)
-                  </label>
-                  <input id="sprout-scan-birthday" type="number" min="0" inputmode="numeric"
-                    placeholder="Block height" />
-                </details>
-
-                <button id="sprout-scan-run" type="button">Start scan</button>
-                <p id="sprout-scan-status" class="status-line"></p>
-                <p id="sprout-scan-plan" class="muted"></p>
-                <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
-
-                <!-- Revealed only once a scan has actually found notes. A
-                     scan that finds money and offers nothing to click is
-                     six hours spent to be shown funds you still cannot
-                     reach. -->
-                <div id="sprout-scan-sweep" hidden>
-                  <hr />
-                  <p><strong>Move the funds this scan found</strong></p>
-                  <label for="sprout-scan-destination">Destination address</label>
-                  <input
-                    id="sprout-scan-destination"
-                    type="text"
-                    autocomplete="off"
-                    spellcheck="false"
-                    placeholder="zs1… or a Unified Address with a Sapling receiver"
-                  />
-                  <label class="checkbox-row">
-                    <input type="checkbox" id="sprout-scan-confirm" />
-                    I understand this moves funds and cannot be undone.
-                  </label>
-                  <button id="sprout-scan-sweep-run" type="button">Sweep found funds</button>
-                  <ul id="sprout-scan-sweep-results" class="session-list"></ul>
-                </div>
-              </div>
-
               <!-- Only shown when the wallet file itself yielded spendable
                    notes. Sprout value must land on a Sapling receiver: it
                    leaves the pool through the transparent pool and has to be
@@ -460,6 +375,116 @@
               Any key material in those records still exists only in the original file.
             </div>
           </div>
+
+          <!-- The Sprout full-block scan. Its own block, outside #wallet-summary,
+               because the user who needs it most has no wallet file at all:
+               only a raw SK…/ST… key backup (the CLI's `scan-sprout
+               --sprout-key-file`). A wallet file whose Sprout keys came with
+               no spendable note data opens it automatically and its keys are
+               used when the box is left blank. -->
+          <details id="sprout-scan-entry" class="report-card">
+            <summary id="sprout-scan-entry-label">I only have a Sprout spending key (<code>SK…</code> or <code>ST…</code>)</summary>
+            <!-- Revealed only once its NU7 alert has text: the panel is never
+                 usable without the deadline on screen above it. The alert is
+                 the panel's own, so it is there with or without a wallet
+                 file. -->
+            <div id="sprout-scan-panel" hidden>
+              <p id="sprout-scan-nu7-warning" class="guide-warning" role="alert" hidden></p>
+              <p class="muted">
+                Sprout notes can only be found by reading every block from genesis to today. On
+                mainnet that is about 3.5 million blocks, roughly 280 GB downloaded, and likely
+                days of work. Progress is saved, so the scan can be stopped and resumed. The
+                saved checkpoint holds your spending keys: protect it like the key itself.
+              </p>
+              <!-- The same control as the Network picker on the settings
+                   step, which a user with no wallet file cannot reach from
+                   here. Changing it changes that picker. -->
+              <label for="sprout-scan-network">Network</label>
+              <select id="sprout-scan-network">
+                <option value="mainnet" selected>Mainnet (SK… keys)</option>
+                <option value="testnet">Testnet (ST… keys)</option>
+              </select>
+              <label for="sprout-scan-keys">
+                Sprout spending keys (one per line, <code>SK…</code> or <code>ST…</code>)
+              </label>
+              <textarea id="sprout-scan-keys" rows="3" spellcheck="false"
+                placeholder="SK… (mainnet) or ST… (testnet), one key per line"></textarea>
+              <button id="sprout-scan-check" type="button">Check keys</button>
+              <ul id="sprout-scan-addresses" class="session-list"></ul>
+
+              <!-- The escape hatch for when every public peer is full.
+                   Collapsed, because almost nobody needs it; the CLI's
+                   equivalent is `scan-sprout --peer`. -->
+              <details id="sprout-scan-advanced">
+                <summary>Advanced: use your own Zcash node</summary>
+                <label for="sprout-scan-peers">
+                  Custom peers (<code>host:port</code>, one per line or comma-separated, up to 8)
+                </label>
+                <textarea id="sprout-scan-peers" rows="2" spellcheck="false"
+                  autocomplete="off" placeholder="Leave blank to use public peers"></textarea>
+                <p class="muted">
+                  Leave this empty normally. Use it if Argos reports that all peers are busy
+                  and you run or trust a Zcash node (zebrad or zcashd, port 8233). These peers
+                  are tried first, before the public ones. A peer can see which blocks Argos
+                  requests. On mainnet it cannot forge history, because every block header is
+                  checked for proof of work and the chain is pinned to known block hashes;
+                  testnet has no pinned hashes, so only use a testnet node you trust. Your
+                  keys are never sent to any peer.
+                </p>
+              </details>
+
+              <!-- Mirrors `scan-sprout --no-birthday-skip` / `--birthday`.
+                   A wallet.dat whose Sprout keys are all dated skips
+                   trial decryption before them; the file's times are its
+                   own claim, so the user can always undo the skip. -->
+              <details id="sprout-scan-skip">
+                <summary>Where decryption starts</summary>
+                <p class="muted">
+                  If every Sprout key in your wallet file records when it was created, the
+                  scan still reads every block but does not try to decrypt notes in blocks
+                  made before then, which saves hours. Keys pasted above have no creation time,
+                  so with any of them every block is decrypted.
+                </p>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="sprout-scan-every-block" />
+                  Decrypt every block (ignore the wallet file's key creation times)
+                </label>
+                <label for="sprout-scan-birthday">
+                  Birthday for this scan (optional; can only move the start earlier)
+                </label>
+                <input id="sprout-scan-birthday" type="number" min="0" inputmode="numeric"
+                  placeholder="Block height" />
+              </details>
+
+              <button id="sprout-scan-run" type="button">Start scan</button>
+              <p id="sprout-scan-status" class="status-line"></p>
+              <p id="sprout-scan-plan" class="muted"></p>
+              <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
+
+              <!-- Revealed only once a scan has actually found notes. A
+                   scan that finds money and offers nothing to click is
+                   six hours spent to be shown funds you still cannot
+                   reach. -->
+              <div id="sprout-scan-sweep" hidden>
+                <hr />
+                <p><strong>Move the funds this scan found</strong></p>
+                <label for="sprout-scan-destination">Destination address</label>
+                <input
+                  id="sprout-scan-destination"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="zs1… or a Unified Address with a Sapling receiver"
+                />
+                <label class="checkbox-row">
+                  <input type="checkbox" id="sprout-scan-confirm" />
+                  I understand this moves funds and cannot be undone.
+                </label>
+                <button id="sprout-scan-sweep-run" type="button">Sweep found funds</button>
+                <ul id="sprout-scan-sweep-results" class="session-list"></ul>
+              </div>
+            </div>
+          </details>
 
           <div class="actions split">
             <button class="secondary" data-prev="welcome">Back</button>
