@@ -914,10 +914,8 @@ pub async fn execute_sweep(
 fn sweep_event_names(status: argos_core::TxLifecycleState) -> &'static [&'static str] {
     use argos_core::TxLifecycleState as State;
     match status {
-        State::NotSubmitted | State::Rejected => &["sweep-tx-result"],
-        State::SubmissionUnknown | State::Pending | State::Expired => {
-            &["sweep-tx-result", "sweep-tx-broadcast"]
-        }
+        State::NotSubmitted | State::SubmissionUnknown | State::Rejected => &["sweep-tx-result"],
+        State::Pending | State::Expired => &["sweep-tx-result", "sweep-tx-broadcast"],
         State::Mined => &[
             "sweep-tx-result",
             "sweep-tx-broadcast",
@@ -2290,7 +2288,11 @@ mod tests {
             super::sweep_event_names(State::Rejected),
             &["sweep-tx-result"]
         );
-        for state in [State::SubmissionUnknown, State::Pending, State::Expired] {
+        assert_eq!(
+            super::sweep_event_names(State::SubmissionUnknown),
+            &["sweep-tx-result"]
+        );
+        for state in [State::Pending, State::Expired] {
             assert_eq!(
                 super::sweep_event_names(state),
                 &["sweep-tx-result", "sweep-tx-broadcast"]

@@ -285,3 +285,41 @@ test("legacy failed does not become definite rejection", () => {
   assert.match(h.$("complete-summary").textContent, /may already have moved/i);
   assert.doesNotMatch(h.$("complete-txids").children[0].children[0].textContent, /Rejected/);
 });
+
+test("donation receipt waits for canonical mining", () => {
+  for (const [status, expected] of [
+    ["pending", /awaiting independent confirmation/i],
+    ["expired", /not confirmed.*rescan/i],
+  ]) {
+    const h = screen();
+    h.renderCompleteScreen([result(status)], [], 100000, 0.1, null, null);
+    const copy = h.$("complete-donation").textContent;
+    assert.match(copy, expected, status);
+    assert.doesNotMatch(copy, /Donated /, status);
+  }
+  const zeroPending = screen();
+  zeroPending.renderCompleteScreen([result("pending")], [], 0, 0.1, null, null);
+  assert.doesNotMatch(zeroPending.$("complete-donation").textContent, /No donation was sent|Donated /);
+  for (const status of ["rejected", "not_submitted"]) {
+    const h = screen();
+    h.renderCompleteScreen([result(status)], [], 100000, 0.1, null, null);
+    assert.match(h.$("complete-donation").textContent, /No donation was sent or confirmed/i, status);
+  }
+  const mined = screen();
+  mined.renderCompleteScreen([result("mined")], [], 100000, 0.1, null, null);
+  assert.match(mined.$("complete-donation").textContent, /^Donated 0\.00100000 ZEC/);
+});
+
+test("mixed pending or unknown and expired results give both recovery actions", () => {
+  for (const first of ["pending", "submission_unknown"]) {
+    for (const followUpReviewRequired of [false, true]) {
+      const h = screen();
+      h.renderCompleteScreen([result(first), result("expired")], [], 0, null, null, null,
+        { followUpReviewRequired });
+      const copy = `${h.$("complete-summary").textContent} ${h.$("complete-confirmation-note").textContent}`;
+      assert.match(copy, /reconcile/i, `${first} follow-up=${followUpReviewRequired}`);
+      assert.match(copy, /rescan/i, `${first} follow-up=${followUpReviewRequired}`);
+      assert.doesNotMatch(copy, /every submitted transaction.*mine/i, first);
+    }
+  }
+});

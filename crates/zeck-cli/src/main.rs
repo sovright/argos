@@ -2784,19 +2784,51 @@ fn sweep_donation_line(
     states: &[argos_core::TxLifecycleState],
     donation_note: Option<&str>,
 ) -> Option<String> {
-    donation_rate?;
-    if states.contains(&argos_core::TxLifecycleState::SubmissionUnknown) {
+    use argos_core::TxLifecycleState as State;
+    if donation_rate.is_none() && total_zatoshis == 0 {
+        return None;
+    }
+    if states.contains(&State::SubmissionUnknown) {
         return Some("Donation status and amount are uncertain. Reconcile the transaction txid before reporting a donation total.".to_owned());
+    }
+    if states.contains(&State::Pending) {
+        return Some(format!("Proposed donation: {}. Awaiting independent confirmation; reconcile pending txids before reporting a donated amount.{}", format_zec(total_zatoshis), if states.contains(&State::Expired) { " An expired transaction also requires a rescan." } else { "" }));
+    }
+    if states.contains(&State::Expired) {
+        return Some(format!("Planned donation of {} is not confirmed. The transaction expired; rescan before rebuilding.", format_zec(total_zatoshis)));
+    }
+    if states.contains(&State::Rejected) || states.contains(&State::NotSubmitted) {
+        return Some(
+            if states
+                .iter()
+                .all(|state| matches!(state, State::Rejected | State::NotSubmitted))
+            {
+                "No donation was sent or confirmed; the transaction was rejected or not submitted."
+                    .to_owned()
+            } else {
+                "A donation total is not confirmed for this sweep. Review the rejected or unsubmitted transaction before reporting a donated amount.".to_owned()
+            },
+        );
     }
     if total_zatoshis == 0 {
         if let Some(note) = donation_note {
             return Some(note.to_owned());
         }
+        if states.is_empty() {
+            return Some("No donation was sent; no transaction was submitted.".to_owned());
+        }
+        return Some(
+            "No donation was sent; all listed transactions mined without a donation.".to_owned(),
+        );
     }
-    Some(format!(
-        "Donated to the Argos project: {}",
-        format_zec(total_zatoshis)
-    ))
+    if !states.is_empty() && states.iter().all(|state| *state == State::Mined) {
+        Some(format!(
+            "Donated to the Argos project: {}",
+            format_zec(total_zatoshis)
+        ))
+    } else {
+        Some("Donation total is not confirmed. Review the transaction results before reporting a donated amount.".to_owned())
+    }
 }
 
 fn sweep_completion_guidance_with_skips(
@@ -2822,10 +2854,28 @@ fn sweep_completion_guidance(
 ) -> &'static str {
     use argos_core::TxLifecycleState as State;
     if follow_up_review_required {
+        if states.contains(&State::Expired) && states.contains(&State::SubmissionUnknown) {
+            return "A shielding submission may already have moved; do not retry. Reconcile its txid. Another shielding transaction expired; rescan before rebuilding and review a new proposal before sending shielded funds. Keep the source wallet and recovery workspace.";
+        }
+        if states.contains(&State::Expired) && states.contains(&State::Pending) {
+            return "A shielding transaction is awaiting independent confirmation; reconcile its txid. Another shielding transaction expired; rescan before rebuilding and review a new proposal before sending shielded funds. Keep the source wallet and recovery workspace.";
+        }
+        if states.contains(&State::Expired) {
+            return "A shielding transaction expired. Keep the source wallet and recovery workspace; rescan before rebuilding and review a new proposal before sending shielded funds.";
+        }
         if states.contains(&State::SubmissionUnknown) {
             return "Shielding submission may already have moved. Do not retry. Keep the source wallet and recovery workspace; reconcile the txid, then rescan and review a new proposal after mining.";
         }
+        if states.contains(&State::Pending) {
+            return "Shielding transaction awaits independent confirmation. Keep the source wallet and recovery workspace; reconcile its txid, then rescan and review a new proposal after mining.";
+        }
         return "Shielding stage submitted. Keep the source wallet and recovery workspace. After every shielding transaction mines, rescan and review a new proposal before sending shielded funds.";
+    }
+    if states.contains(&State::Expired) && states.contains(&State::SubmissionUnknown) {
+        return "A submission may already have moved; do not retry. Reconcile its txid. Another transaction expired; rescan before rebuilding. Keep the source wallet and recovery workspace.";
+    }
+    if states.contains(&State::Expired) && states.contains(&State::Pending) {
+        return "A transaction is awaiting independent confirmation; reconcile its txid. Another transaction expired; rescan before rebuilding. Keep the source wallet and recovery workspace.";
     }
     if states.contains(&State::SubmissionUnknown) {
         return "A transaction may already have moved. Do not retry. Keep the source wallet and recovery workspace; reconcile its txid before a new proposal.";
@@ -3068,7 +3118,7 @@ mod tests {
         assert!(uncertain.contains("Donation status and amount are uncertain"));
         assert!(!uncertain.contains("Donated") && !uncertain.contains("No donation"));
         let sent = sweep_donation_line(Some(0.1), 0, &[State::Mined], None).unwrap();
-        assert!(sent.contains("0 ZEC"));
+        assert!(sent.contains("No donation was sent"));
         assert!(sweep_donation_line(None, 0, &[State::Mined], None).is_none());
 
         let skipped = sweep_completion_guidance_with_skips(&[State::Mined], true, false);
@@ -3078,6 +3128,41 @@ mod tests {
             sweep_completion_guidance_with_skips(&[State::Mined], false, false)
                 .contains("Sweep complete")
         );
+    }
+
+    #[test]
+    fn donation_receipt_waits_for_mining_and_mixed_statuses_need_distinct_actions() {
+        use argos_core::TxLifecycleState as State;
+        let pending = sweep_donation_line(Some(0.1), 100_000, &[State::Pending], None).unwrap();
+        assert!(pending
+            .to_lowercase()
+            .contains("awaiting independent confirmation"));
+        assert!(!pending.contains("Donated"));
+        let expired = sweep_donation_line(Some(0.1), 100_000, &[State::Expired], None).unwrap();
+        assert!(expired.contains("not confirmed"));
+        assert!(expired.contains("rescan"));
+        assert!(!expired.contains("Donated"));
+        let zero_pending = sweep_donation_line(Some(0.1), 0, &[State::Pending], None).unwrap();
+        assert!(!zero_pending.contains("No donation was sent"));
+        let rejected = sweep_donation_line(Some(0.1), 100_000, &[State::Rejected], None).unwrap();
+        assert!(rejected.contains("No donation was sent or confirmed"));
+        let mined = sweep_donation_line(Some(0.1), 100_000, &[State::Mined], None).unwrap();
+        assert!(mined.contains("Donated to the Argos project"));
+
+        for states in [
+            vec![State::Pending, State::Expired],
+            vec![State::SubmissionUnknown, State::Expired],
+        ] {
+            for follow_up in [false, true] {
+                let guidance = sweep_completion_guidance(&states, follow_up);
+                assert!(guidance.contains("rescan"), "{guidance}");
+                assert!(guidance.to_lowercase().contains("reconcile"), "{guidance}");
+                assert!(
+                    !guidance.contains("every submitted transaction mines"),
+                    "{guidance}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -2882,7 +2882,7 @@ function sweepStatusCounts(results) {
 
 function sweepCompleteSummary(results, error, followUpReviewRequired = false, skipped = []) {
   const { unknown, pending, mined, expired, rejected } = sweepStatusCounts(results);
-  const walletWarning = "Keep the source wallet and its recovery workspace until every submitted transaction is independently verified as mined.";
+  const walletWarning = "Keep the source wallet and its recovery workspace while transaction results or remaining balances need review.";
   if (error) {
     const atRisk = unknown + pending + mined;
     const sent = atRisk > 0 ? `${atRisk} transaction${atRisk === 1 ? " may" : "s may"} already have moved. ` : "";
@@ -2893,8 +2893,13 @@ function sweepCompleteSummary(results, error, followUpReviewRequired = false, sk
     return "No funds were swept — every account with a balance was skipped (reasons below).";
   }
   if (followUpReviewRequired) {
-    const uncertainty = unknown ? "A shielding transaction may already have moved; do not retry it. " : "";
-    return `Shielding stage submitted. ${uncertainty}${mined ? `${mined} transaction${mined === 1 ? "" : "s"} mined. ` : ""}${walletWarning} Once shielding is mined, rescan and review a new proposal before sending shielded funds.`;
+    const uncertainty = unknown ? "A shielding transaction may already have moved; do not retry it; reconcile its txid. " : "";
+    return `Shielding stage requires follow-up. ${uncertainty}${mined ? `${mined} transaction${mined === 1 ? "" : "s"} mined. ` : ""}${walletWarning}${pending ? " Reconcile pending txids and wait for independent confirmation." : ""}${expired ? " An expired transaction requires a rescan before rebuilding." : ""} Rescan and review a new proposal before sending shielded funds.`;
+  }
+  if (expired && (unknown || pending)) {
+    const uncertain = unknown ? `${unknown} submission${unknown === 1 ? " is" : "s are"} uncertain and may already have moved; do not retry; reconcile the txid. ` : "";
+    const awaiting = pending ? `${pending} transaction${pending === 1 ? " is" : "s are"} awaiting independent confirmation; reconcile the txid. ` : "";
+    return `${uncertain}${awaiting}${expired} transaction${expired === 1 ? " has" : "s have"} expired; rescan before rebuilding. ${walletWarning}`;
   }
   if (unknown) {
     return `${unknown} submission${unknown === 1 ? "" : "s"} uncertain — transaction${unknown === 1 ? " may" : "s may"} already have moved. Do not retry. ${walletWarning}`;
@@ -2916,13 +2921,13 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     state.addressMatchRecoveryLocked = false;
     document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
   }
-  const { broadcast, unknown, pending, expired, rejected } = sweepStatusCounts(results);
+  const { unknown, pending, expired, rejected, not_submitted: notSubmitted } = sweepStatusCounts(results);
   const followUpReviewRequired = !!(completionContext?.outcome?.follow_up_review_required ?? completionContext?.followUpReviewRequired);
   const allMined = !error && !followUpReviewRequired && !(skipped?.length) && results.length > 0 &&
     results.every((r) => txStatusKind(r.status) === "mined");
   $("complete-heading").textContent = allMined ? "Recovery complete" : "Sweep status";
   $("complete-summary").textContent = sweepCompleteSummary(results, error, followUpReviewRequired, skipped);
-  $("complete-confirmation-note").textContent = allMined
+  const confirmationNote = allMined
     ? "Every submitted transaction has independent mining evidence. Verify the destination balance before deleting your recovery workspace."
     : unknown ? "Keep the source wallet and recovery workspace. A submission may already have moved; do not retry it. Reconcile its txid before a new proposal."
     : pending ? "Keep the source wallet and recovery workspace. A pending transaction may still mine; check its txid before a new proposal."
@@ -2931,6 +2936,8 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     : followUpReviewRequired ? "Keep the source wallet and recovery workspace. Rescan and review a new proposal before sending shielded funds."
     : skipped?.length ? "Some balances were not swept. Keep the source wallet and recovery workspace; review the skipped accounts."
     : "No submitted transaction is awaiting confirmation. Review the details before trying again.";
+  $("complete-confirmation-note").textContent = confirmationNote +
+    (expired && (unknown || pending) ? " An expired transaction also requires a rescan before rebuilding." : "");
   $("delete-workspace").disabled = !allMined;
   $("delete-workspace-zone").hidden = !allMined;
   $("restart-flow").textContent = followUpReviewRequired ? "Rescan and review" : "Start over";
@@ -3013,18 +3020,29 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     skippedEl.appendChild(list);
   }
 
-  // Actual donated total (the truth, vs the proposal's estimate). Shown whenever
-  // a donation was requested — including when it came out to 0, so a proposal
-  // estimate that execution couldn't deliver is never silent.
+  // A recorded total is not a donation receipt until every relevant transaction
+  // has independent mining evidence. The outcome does not map donations to txids.
   const donationEl = $("complete-donation");
   const donationRequested = Number.isFinite(donationRate) && donationRate > 0;
-  if (donationRequested && unknown) {
+  const donationRelevant = donationRequested || donated > 0;
+  if (donationRelevant && unknown) {
     donationEl.hidden = false;
     donationEl.textContent = "Donation status and amount are uncertain. A transaction may already have moved; reconcile its txid before reporting a donation total.";
-  } else if (donated > 0) {
+  } else if (donationRelevant && pending) {
+    donationEl.hidden = false;
+    donationEl.textContent = `Proposed donation: ${fmt(donated)}. Awaiting independent confirmation; reconcile pending txids before reporting a donated amount.${expired ? " An expired transaction also requires a rescan." : ""}`;
+  } else if (donationRelevant && expired) {
+    donationEl.hidden = false;
+    donationEl.textContent = `Planned donation of ${fmt(donated)} is not confirmed. The transaction expired; rescan before rebuilding.`;
+  } else if (donationRelevant && (rejected || notSubmitted)) {
+    donationEl.hidden = false;
+    donationEl.textContent = results.every((r) => ["rejected", "not_submitted"].includes(txStatusKind(r.status)))
+      ? "No donation was sent or confirmed; the transaction was rejected or not submitted."
+      : "A donation total is not confirmed for this sweep. Review the rejected or unsubmitted transaction before reporting a donated amount.";
+  } else if (donated > 0 && results.length && results.every((r) => txStatusKind(r.status) === "mined")) {
     donationEl.hidden = false;
     donationEl.textContent = `Donated ${fmt(donated)} to the Argos project — thank you for supporting Zcash recovery.`;
-  } else if (donationRequested && broadcast > 0) {
+  } else if (donationRequested && results.length && results.every((r) => txStatusKind(r.status) === "mined")) {
     donationEl.hidden = false;
     // A route that never sends a donation says so itself; the fee-threshold
     // reason below is true only on the seed-phrase route.
