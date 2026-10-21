@@ -292,6 +292,16 @@ impl ReviewedSweepIntent {
         Ok(())
     }
 
+    fn require_current_quote(&self, current: &SweepProposal) -> ZeckResult<()> {
+        self.require_current_fee(current.total_fee_zatoshis)?;
+        if self.quoted_transactions != current.transactions {
+            return Err(ZeckError::StaleSweepProposal(
+                "ordered sweep transactions changed after review".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn capture_from_state(
         request: SweepRequest,
@@ -742,7 +752,9 @@ impl RecoveryService {
             session.runtime.network,
             &workspace,
         )?;
-        intent.require_current_fee(current_quote.total_fee_zatoshis)?;
+        // Check the ordered legs before entering any signer or submitter. The
+        // same aggregate fee can conceal a changed earlier-leg fee.
+        intent.require_current_quote(&current_quote)?;
         let quoted_transactions = intent.quoted_transactions;
         let request = intent.request;
 
@@ -1284,7 +1296,7 @@ fn build_exact_sweep_proposal(
                         continue;
                     }
                 }
-                if row.sapling_zatoshis.saturating_add(row.orchard_zatoshis) == 0 {
+                if !hd_has_shielded_balance(row)? {
                     if row.total_zatoshis > 0 {
                         skipped_accounts.push(SkippedSweepAccount {
                             account_index: row.account_index,
@@ -2064,8 +2076,32 @@ async fn execute_sweep_for_session(
     )
     .map(|mut outcome| {
         outcome.follow_up_review_required = follow_up_review_required;
+        apply_recorded_shield_follow_up(&mut outcome, &quoted_transactions);
         outcome
     })
+}
+
+fn hd_has_shielded_balance(row: &crate::models::AccountBalancePreview) -> ZeckResult<bool> {
+    row.total_zatoshis
+        .checked_sub(row.transparent_zatoshis)
+        .map(|shielded| shielded > 0)
+        .ok_or_else(|| {
+            ZeckError::Wallet(format!(
+                "account {} transparent balance exceeds its total",
+                row.account_index
+            ))
+        })
+}
+
+fn apply_recorded_shield_follow_up(outcome: &mut SweepOutcome, quote: &[ProposedTx]) {
+    outcome.follow_up_review_required |= outcome.transactions.iter().any(|result| {
+        result.txid.is_some()
+            && result.status.fee_is_at_risk()
+            && quote.iter().any(|tx| {
+                tx.kind == ProposedTxKind::ShieldTransparent
+                    && tx.source_account == result.source_account
+            })
+    });
 }
 
 /// Fold the accumulated broadcast records and the loop's terminal status into a
@@ -3431,6 +3467,133 @@ mod tests {
             super::require_fee_matches(25_000, 20_000),
             Err(ZeckError::FeeQuoteChanged { .. })
         ));
+    }
+
+    fn reviewed_tx(account: u32, kind: ProposedTxKind, fee: u64) -> super::ProposedTx {
+        super::ProposedTx {
+            kind,
+            source_account: account,
+            destination: format!("destination-{account}"),
+            gross_zatoshis: 100_000,
+            fee_zatoshis: fee,
+            net_zatoshis: 100_000 - fee,
+            donation_zatoshis: 0,
+            note: String::new(),
+            memo: None,
+        }
+    }
+
+    fn reviewed_quote(transactions: Vec<super::ProposedTx>) -> super::SweepProposal {
+        let total_fee_zatoshis = transactions.iter().map(|tx| tx.fee_zatoshis).sum();
+        super::SweepProposal {
+            transactions,
+            donation_note: None,
+            skipped_accounts: vec![],
+            total_send_zatoshis: 200_000,
+            total_fee_zatoshis,
+            net_received_zatoshis: 200_000 - total_fee_zatoshis,
+            total_donation_zatoshis: 0,
+            dry_run_default: true,
+            warning: None,
+            follow_up_review_required: false,
+        }
+    }
+
+    #[test]
+    fn equal_total_redistributed_leg_fees_reject_before_route_invocation() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let mut intent =
+            ReviewedSweepIntent::capture(reviewed_request(), &session, &progress).unwrap();
+        let reviewed = reviewed_quote(vec![
+            reviewed_tx(0, ProposedTxKind::SweepShielded, 10_000),
+            reviewed_tx(1, ProposedTxKind::SweepShielded, 20_000),
+        ]);
+        let current = reviewed_quote(vec![
+            reviewed_tx(0, ProposedTxKind::SweepShielded, 20_000),
+            reviewed_tx(1, ProposedTxKind::SweepShielded, 10_000),
+        ]);
+        assert_eq!(reviewed.total_fee_zatoshis, current.total_fee_zatoshis);
+        intent.bind_quote(&reviewed);
+        let mut route_called = false;
+        let result = intent.require_current_quote(&current).map(|_| {
+            route_called = true;
+        });
+        assert!(matches!(result, Err(ZeckError::StaleSweepProposal(_))));
+        assert!(!route_called);
+        let reordered = reviewed_quote(vec![
+            reviewed_tx(1, ProposedTxKind::SweepShielded, 20_000),
+            reviewed_tx(0, ProposedTxKind::SweepShielded, 10_000),
+        ]);
+        assert!(matches!(
+            intent.require_current_quote(&reordered),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        let mut changed_destination = reviewed_quote(vec![
+            reviewed_tx(0, ProposedTxKind::SweepShielded, 10_000),
+            reviewed_tx(1, ProposedTxKind::SweepShielded, 20_000),
+        ]);
+        changed_destination.transactions[0].destination = "different".to_owned();
+        assert!(matches!(
+            intent.require_current_quote(&changed_destination),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+    }
+
+    #[test]
+    fn ironwood_only_preview_enters_real_hd_proposal_path() {
+        let mut row = reviewed_progress(ScanHandle::new()).accounts.remove(0);
+        row.sapling_zatoshis = 0;
+        row.orchard_zatoshis = 0;
+        row.transparent_zatoshis = 0;
+        row.total_zatoshis = 100_000;
+        assert!(super::hd_has_shielded_balance(&row).unwrap());
+        row.total_zatoshis = 0;
+        assert!(!super::hd_has_shielded_balance(&row).unwrap());
+    }
+
+    #[test]
+    fn recorded_shielding_submission_retains_follow_up_after_late_error() {
+        let quote = reviewed_quote(vec![reviewed_tx(
+            2,
+            ProposedTxKind::ShieldTransparent,
+            10_000,
+        )]);
+        let mut result = sample_broadcast_result(2);
+        result.status = crate::models::TxLifecycleState::SubmissionUnknown;
+        result.confirmed_height = None;
+        let mut outcome = super::assemble_sweep_outcome(
+            vec![result],
+            vec![],
+            0,
+            Err(ZeckError::Wallet("confirmation status failed".to_owned())),
+        )
+        .expect("recorded submission must survive the later error");
+        super::apply_recorded_shield_follow_up(&mut outcome, &quote.transactions);
+        assert!(outcome.follow_up_review_required);
+        assert_eq!(outcome.transactions.len(), 1);
+        assert!(outcome.error.is_some());
+        let mut rejected = sample_broadcast_result(2);
+        rejected.status = crate::models::TxLifecycleState::Rejected;
+        let mut rejected_outcome = super::assemble_sweep_outcome(
+            vec![rejected],
+            vec![],
+            0,
+            Err(ZeckError::Broadcast("definite rejection".to_owned())),
+        )
+        .unwrap();
+        super::apply_recorded_shield_follow_up(&mut rejected_outcome, &quote.transactions);
+        assert!(!rejected_outcome.follow_up_review_required);
+        let mut other_account = super::assemble_sweep_outcome(
+            vec![sample_broadcast_result(9)],
+            vec![],
+            0,
+            Err(ZeckError::Wallet("unrelated error".to_owned())),
+        )
+        .unwrap();
+        super::apply_recorded_shield_follow_up(&mut other_account, &quote.transactions);
+        assert!(!other_account.follow_up_review_required);
     }
 
     #[test]

@@ -3740,6 +3740,81 @@ async fn multi_note_shielded_quote_uses_real_zip317_fee() {
     );
 }
 
+/// Post-NU6.3, the account summary includes Ironwood value in `total` but
+/// the public preview has no separate Ironwood field. A fresh account funded
+/// through its Orchard/Ironwood receiver must still reach the HD send builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn ironwood_only_hd_account_quotes_real_send_max() {
+    let harness = RegtestHarness::require();
+    let account_index = 5usize;
+    common::regtest_harness::fund_test_account(account_index as u32, 200_000_000).await;
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some((account_index + 1) as u32),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "Ironwood-only HD quote".into(),
+                transparent_scan: None,
+            },
+            SecretString::new(harness.test_seed().to_owned()),
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => break progress,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("Ironwood scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("Ironwood scan timed out");
+    let row = progress
+        .accounts
+        .iter()
+        .find(|row| row.account_index == account_index as u32)
+        .expect("funded account in scan");
+    assert!(row.total_zatoshis >= 200_000_000);
+    assert_eq!(row.sapling_zatoshis, 0);
+    assert_eq!(row.orchard_zatoshis, 0);
+    assert_eq!(row.transparent_zatoshis, 0);
+
+    let reviewed = service
+        .propose_sweep(
+            &handle,
+            SweepRequest {
+                destination: regtest_encoded_unified_address_at(harness.test_seed(), 6),
+                memo: None,
+                max_fee_zatoshis: None,
+                reviewed_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("Ironwood balance must reach real send-max proposal");
+    let step = reviewed
+        .proposal
+        .transactions
+        .iter()
+        .find(|step| step.source_account == account_index as u32)
+        .expect("Ironwood send-max step");
+    assert_eq!(step.kind, argos_core::models::ProposedTxKind::SweepShielded);
+    assert_eq!(step.fee_zatoshis, reviewed.proposal.total_fee_zatoshis);
+}
+
 /// Regression for automatic transparent range discovery: both a low and a
 /// high receive index must be imported into one normal seed scan and then
 /// consumed by the sweep. This is deliberately independent of address search.

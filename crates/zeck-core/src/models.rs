@@ -418,7 +418,7 @@ pub enum ProposedTxKind {
     SweepShielded,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedTx {
     pub kind: ProposedTxKind,
     pub source_account: u32,
