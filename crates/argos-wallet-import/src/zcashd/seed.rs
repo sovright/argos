@@ -166,7 +166,7 @@ fn assess_mnemonic_seed(records: &SeedRecords, master: Option<&MasterKey>, out: 
                 });
                 check_coverage(&chain, &chain.seed_fp, records, out);
             }
-            Some(Err(why)) => push_chain_failure(out, &why),
+            Some(Err(why)) => push_chain_failure(out, ChainContext::NoPhrase, &why),
         }
         return;
     }
@@ -235,9 +235,15 @@ fn assess_mnemonic_seed(records: &SeedRecords, master: Option<&MasterKey>, out: 
     // them, so a verified phrase alone is not enough.
     let chain = match chain {
         Some(Ok(chain)) if chain.seed_fp == seed_fp => chain,
-        Some(Ok(_)) => return push_chain_failure(out, "it belongs to a different seed"),
-        Some(Err(why)) => return push_chain_failure(out, &why),
-        None => return push_chain_failure(out, "it is missing"),
+        Some(Ok(_)) => {
+            return push_chain_failure(
+                out,
+                ChainContext::SeedDecoded,
+                "it belongs to a different seed",
+            )
+        }
+        Some(Err(why)) => return push_chain_failure(out, ChainContext::SeedDecoded, &why),
+        None => return push_chain_failure(out, ChainContext::SeedDecoded, "it is missing"),
     };
     out.seed_verified = true;
     check_coverage(&chain, &seed_fp, records, out);
@@ -407,10 +413,24 @@ fn push_orphaned_derivations(records: &SeedRecords, out: &mut ImportedKeys) {
     }
 }
 
-fn push_chain_failure(out: &mut ImportedKeys, why: &str) {
+/// What is known about the seed when its chain record fails, so the
+/// diagnostic does not claim a seed decoded when there was none to decode.
+#[derive(Clone, Copy)]
+enum ChainContext {
+    /// A phrase record verified against its fingerprint.
+    SeedDecoded,
+    /// No phrase record exists at all.
+    NoPhrase,
+}
+
+fn push_chain_failure(out: &mut ImportedKeys, context: ChainContext, why: &str) {
+    let lead = match context {
+        ChainContext::SeedDecoded => "the seed decoded, but its key chain record",
+        ChainContext::NoPhrase => "its seed phrase record is missing, and its key chain record",
+    };
     out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
         record_type: "mnemonichdchain".to_owned(),
-        reason: format!("the seed decoded, but its key chain record cannot be trusted: {why}"),
+        reason: format!("{lead} cannot be trusted: {why}"),
     });
 }
 
@@ -1044,5 +1064,49 @@ mod tests {
         let out = assess(&[], None);
         assert!(!out.seed_verified);
         assert!(out.diagnostics.is_empty());
+    }
+
+    /// Review round 3 on #230, finding 2. With no phrase record there is no
+    /// seed to have decoded, so an unreadable chain record must not be
+    /// reported as "the seed decoded, but…".
+    #[test]
+    fn an_unreadable_chain_without_a_phrase_does_not_claim_the_seed_decoded() {
+        let mut p = pairs("modern-plaintext");
+        p.retain(|r| !is("mnemonicphrase")(r));
+        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            v[0] = 2;
+        }
+        let out = assess(&p, None);
+        assert!(!out.seed_verified);
+        let ImportDiagnostic::UnrecoveredSeed {
+            record_type,
+            reason,
+        } = only_diagnostic(&out)
+        else {
+            panic!("{:?}", out.diagnostics);
+        };
+        assert_eq!(record_type, "mnemonichdchain");
+        assert!(!reason.contains("decoded"), "{reason}");
+        assert!(reason.contains("phrase record is missing"), "{reason}");
+        assert!(
+            reason.contains("version 2"),
+            "the cause is still given: {reason}"
+        );
+        assert_eq!(out.coverage(), ImportCoverage::SeedNotRecovered);
+
+        // With a phrase that does verify, the same chain still says so.
+        let mut p = pairs("modern-plaintext");
+        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            v[0] = 2;
+        }
+        let out = assess(&p, None);
+        assert!(
+            matches!(
+                only_diagnostic(&out),
+                ImportDiagnostic::UnrecoveredSeed { reason, .. } if reason.contains("the seed decoded")
+            ),
+            "{:?}",
+            out.diagnostics
+        );
     }
 }
