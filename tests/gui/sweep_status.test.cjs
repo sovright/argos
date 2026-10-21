@@ -162,3 +162,126 @@ test("partially mined outcome does not claim nothing was submitted", () => {
   assert.match(h.$("complete-summary").textContent, /1 transaction mined/i);
   assert.equal(h.$("delete-workspace").disabled, true);
 });
+
+test("auto-derived fee cap refreshes when a later proposal quote rises", async () => {
+  const input = { value: "" };
+  const state = { scanHandle: { id: "scan" }, proposalGeneration: 0,
+    sweepExecutionPending: false, sweepReview: null, proposalPending: false };
+  const calls = [];
+  const totals = [12345, 23456];
+  const context = { state, $: (id) => id === "max-fee-zec" ? input :
+      { checked: false, disabled: false },
+    invalidateSweepReview() { state.proposalGeneration += 1; },
+    setSweepProposalPending() {}, sweepRequestFromForm: () => ({ maxFeeZec: input.value || null }),
+    invoke: async (_command, request) => {
+      calls.push(request.maxFeeZec);
+      return { proposal_id: `review-${calls.length}`, proposal: { total_fee_zatoshis: totals.shift() } };
+    }, renderSweepProposal() {}, setStatus() {} };
+  const { refreshSweepProposal } = loadFunctions(["refreshSweepProposal"], context);
+  await refreshSweepProposal();
+  await refreshSweepProposal();
+  assert.deepEqual(calls, [null, null]);
+  assert.equal(input.value, "0.00023456");
+  assert.equal(state.maxFeeZec, "0.00023456");
+});
+
+test("user override remains an authoritative ceiling on later proposal", async () => {
+  const input = { value: "" };
+  const state = { scanHandle: { id: "scan" }, proposalGeneration: 0,
+    sweepExecutionPending: false, sweepReview: null, proposalPending: false };
+  const calls = [];
+  const context = { state, $: (id) => id === "max-fee-zec" ? input :
+      { checked: false, disabled: false },
+    invalidateSweepReview() { state.proposalGeneration += 1; },
+    setSweepProposalPending() {}, sweepRequestFromForm: () => ({ maxFeeZec: input.value || null }),
+    invoke: async (_command, request) => {
+      calls.push(request.maxFeeZec);
+      return { proposal_id: "reviewed", proposal: { total_fee_zatoshis: 12345 } };
+    }, renderSweepProposal() {}, setStatus() {} };
+  const { refreshSweepProposal } = loadFunctions(["refreshSweepProposal"], context);
+  await refreshSweepProposal();
+  input.value = "0.009";
+  await refreshSweepProposal();
+  assert.deepEqual(calls, [null, "0.009"]);
+  assert.equal(input.value, "0.009");
+});
+
+test("failed refresh clears an obsolete auto-derived fee cap", async () => {
+  const input = { value: "" };
+  const state = { scanHandle: { id: "scan" }, proposalGeneration: 0,
+    sweepExecutionPending: false, sweepReview: null, proposalPending: false };
+  let calls = 0;
+  const context = { state, $: (id) => id === "max-fee-zec" ? input :
+      { checked: false, disabled: false },
+    invalidateSweepReview() { state.proposalGeneration += 1; },
+    setSweepProposalPending() {}, sweepRequestFromForm: () => ({ maxFeeZec: input.value || null }),
+    invoke: async () => {
+      if (++calls === 2) throw new Error("fresh quote unavailable");
+      return { proposal_id: "reviewed", proposal: { total_fee_zatoshis: 12345 } };
+    }, renderSweepProposal() {}, setStatus() {} };
+  const { refreshSweepProposal } = loadFunctions(["refreshSweepProposal"], context);
+  await refreshSweepProposal();
+  await assert.rejects(refreshSweepProposal(), /fresh quote unavailable/);
+  assert.equal(input.value, "");
+  assert.equal(state.maxFeeZec, null);
+});
+
+test("partial abort report includes error, skipped balances, and incomplete status", () => {
+  const h = screen();
+  const outcome = { transactions: [result("pending", "one node accepted")],
+    skipped_accounts: [{ account_index: 4, gross_zatoshis: 500000, reason: "dust" }],
+    total_donation_zatoshis: 0, error: "later account failed", follow_up_review_required: false };
+  h.renderCompleteScreen(outcome.transactions, outcome.skipped_accounts, 0, null,
+    outcome.error, null, { outcome });
+  const report = h.$("save-report").dataset.report;
+  assert.match(report, /Status: Incomplete/i);
+  assert.match(report, /later account failed/);
+  assert.match(report, /Account 4: dust \(0\.00500000 ZEC\)/);
+  assert.doesNotMatch(report, /Status: Recovery complete/i);
+});
+
+test("shield-only report identifies required fresh review", () => {
+  const h = screen();
+  const outcome = { transactions: [result("mined")], skipped_accounts: [],
+    total_donation_zatoshis: 0, error: null, follow_up_review_required: true };
+  h.renderCompleteScreen(outcome.transactions, [], 0, null, null, null, { outcome });
+  const report = h.$("save-report").dataset.report;
+  assert.match(report, /Status: Shielding stage/i);
+  assert.match(report, /Follow-up review required: yes/i);
+  assert.match(report, /rescan and review/i);
+  assert.doesNotMatch(report, /Status: Recovery complete/i);
+});
+
+test("unknown submission keeps donation amount uncertain even when recorded total is zero", () => {
+  const h = screen();
+  h.renderCompleteScreen([result("submission_unknown")], [], 0, 0.1, null, null);
+  assert.match(h.$("complete-donation").textContent, /donation.*uncertain/i);
+  assert.doesNotMatch(h.$("complete-donation").textContent, /No donation was sent|Donated 0/);
+});
+
+test("all mined with skipped balance is incomplete and cannot delete workspace", () => {
+  const h = screen();
+  const skipped = [{ account_index: 2, gross_zatoshis: 100000, reason: "dust" }];
+  h.renderCompleteScreen([result("mined")], skipped, 0, null, null, null);
+  assert.equal(h.$("delete-workspace").disabled, true);
+  assert.doesNotMatch(h.$("complete-summary").textContent, /Recovery complete/);
+  assert.match(h.$("complete-summary").textContent, /skipped|not swept/i);
+});
+
+test("expired rejected and not-submitted messages do not imply future mining", () => {
+  for (const status of ["expired", "rejected", "not_submitted"]) {
+    const h = screen();
+    h.renderCompleteScreen([result(status)], [], 0, null, null, null);
+    const copy = `${h.$("complete-summary").textContent} ${h.$("complete-confirmation-note").textContent}`;
+    assert.doesNotMatch(copy, /until.*mined|may still mine|pending or uncertain/i, status);
+    assert.equal(h.$("delete-workspace").disabled, true);
+  }
+});
+
+test("legacy failed does not become definite rejection", () => {
+  const h = screen();
+  h.renderCompleteScreen([result("failed")], [], 0, null, null, null);
+  assert.equal(h.txStatusKind("failed"), "submission_unknown");
+  assert.match(h.$("complete-summary").textContent, /may already have moved/i);
+  assert.doesNotMatch(h.$("complete-txids").children[0].children[0].textContent, /Rejected/);
+});

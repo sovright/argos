@@ -2120,27 +2120,23 @@ async fn main() -> Result<()> {
                             }
                             println!();
                         }
-                        // Actual donated total (the truth, vs the proposal's
-                        // estimate). Print it only when a donation was actually
-                        // requested, so a "Donated: 0" line never appears on a
-                        // sweep the user never opted into (e.g. testnet, where
-                        // donation is disabled, or no --donation-rate). When a
-                        // donation WAS requested, a 0 is shown so a fallback to a
-                        // donation-free sweep is never silent. Mirrors the GUI.
-                        if donation_rate.is_some() {
-                            println!(
-                                "Donated to the Argos project: {}",
-                                format_zec(outcome.total_donation_zatoshis)
-                            );
-                            println!();
-                        }
                         let statuses: Vec<_> =
                             outcome.transactions.iter().map(|tx| tx.status).collect();
+                        if let Some(donation_line) = sweep_donation_line(
+                            donation_rate,
+                            outcome.total_donation_zatoshis,
+                            &statuses,
+                            outcome.donation_note.as_deref(),
+                        ) {
+                            println!("{donation_line}");
+                            println!();
+                        }
                         match outcome.error {
                             None => println!(
                                 "{}",
-                                sweep_completion_guidance(
+                                sweep_completion_guidance_with_skips(
                                     &statuses,
+                                    !outcome.skipped_accounts.is_empty(),
                                     outcome.follow_up_review_required
                                 )
                             ),
@@ -2782,6 +2778,44 @@ fn sweep_status_label(status: argos_core::TxLifecycleState) -> &'static str {
     }
 }
 
+fn sweep_donation_line(
+    donation_rate: Option<f64>,
+    total_zatoshis: u64,
+    states: &[argos_core::TxLifecycleState],
+    donation_note: Option<&str>,
+) -> Option<String> {
+    donation_rate?;
+    if states.contains(&argos_core::TxLifecycleState::SubmissionUnknown) {
+        return Some("Donation status and amount are uncertain. Reconcile the transaction txid before reporting a donation total.".to_owned());
+    }
+    if total_zatoshis == 0 {
+        if let Some(note) = donation_note {
+            return Some(note.to_owned());
+        }
+    }
+    Some(format!(
+        "Donated to the Argos project: {}",
+        format_zec(total_zatoshis)
+    ))
+}
+
+fn sweep_completion_guidance_with_skips(
+    states: &[argos_core::TxLifecycleState],
+    has_skipped_accounts: bool,
+    follow_up_review_required: bool,
+) -> &'static str {
+    if has_skipped_accounts
+        && !follow_up_review_required
+        && !states.is_empty()
+        && states
+            .iter()
+            .all(|state| *state == argos_core::TxLifecycleState::Mined)
+    {
+        return "Every listed transaction mined, but at least one account was not swept. Keep the source wallet and recovery workspace; review the skipped balance before a new proposal.";
+    }
+    sweep_completion_guidance(states, follow_up_review_required)
+}
+
 fn sweep_completion_guidance(
     states: &[argos_core::TxLifecycleState],
     follow_up_review_required: bool,
@@ -3023,6 +3057,26 @@ mod tests {
         assert!(
             sweep_completion_guidance(&[State::Mined, State::NotSubmitted], false)
                 .contains("mined, but")
+        );
+    }
+
+    #[test]
+    fn ordinary_sweep_donation_and_completion_wait_for_certain_receipts() {
+        use argos_core::TxLifecycleState as State;
+        let uncertain = sweep_donation_line(Some(0.1), 0, &[State::SubmissionUnknown], None)
+            .expect("requested donation must have a status line");
+        assert!(uncertain.contains("Donation status and amount are uncertain"));
+        assert!(!uncertain.contains("Donated") && !uncertain.contains("No donation"));
+        let sent = sweep_donation_line(Some(0.1), 0, &[State::Mined], None).unwrap();
+        assert!(sent.contains("0 ZEC"));
+        assert!(sweep_donation_line(None, 0, &[State::Mined], None).is_none());
+
+        let skipped = sweep_completion_guidance_with_skips(&[State::Mined], true, false);
+        assert!(!skipped.contains("Sweep complete"));
+        assert!(skipped.contains("not swept"));
+        assert!(
+            sweep_completion_guidance_with_skips(&[State::Mined], false, false)
+                .contains("Sweep complete")
         );
     }
 
