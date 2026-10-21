@@ -6835,7 +6835,8 @@ mod tests {
             transactions: vec![crate::models::TxBroadcastResult {
                 source_account: 0,
                 txid: Some(txid.into()),
-                status: "broadcast".into(),
+                status: crate::models::TxLifecycleState::Pending,
+                fee_zatoshis: 0,
                 detail: String::new(),
                 confirmed_height: None,
             }],
@@ -6843,6 +6844,7 @@ mod tests {
             total_donation_zatoshis: 0,
             error: None,
             donation_note: note.map(str::to_owned),
+            follow_up_review_required: false,
         };
         let merged = super::merge_combined_sweep_outcomes(
             leg("imported-tx", None),
