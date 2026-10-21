@@ -87,6 +87,31 @@ pub struct SpendableSproutNote {
     pub outpoint: JsOutPoint,
 }
 
+/// Wipes the spend-authorising fields: `a_sk`, and the note's `rho`, `r`,
+/// value and memo. The address, commitment, anchor, witness path and
+/// outpoint are public chain data and are kept.
+impl zeroize::Zeroize for SpendableSproutNote {
+    fn zeroize(&mut self) {
+        self.a_sk.zeroize();
+        self.note.rho.zeroize();
+        self.note.r.zeroize();
+        self.note.value.zeroize();
+        self.note.memo.zeroize();
+    }
+}
+
+/// A reviewed GUI proposal holds these notes for up to its TTL and a sweep
+/// for its whole run; dropping one wipes its key rather than leaving it in
+/// freed memory. Copies made before the drop (a `Vec` reallocation, a
+/// cloned `SproutNotePlaintext`) are not reached.
+impl Drop for SpendableSproutNote {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(self);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for SpendableSproutNote {}
+
 impl core::fmt::Debug for SpendableSproutNote {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // `a_sk` and the note's `r`/`rho` are spending material.
@@ -813,6 +838,43 @@ mod tests {
     use super::*;
     use argos_wallet_import::keys::{Provenance, SproutKey, SproutNoteData};
     use secrecy::Secret;
+
+    fn spendable(a_sk: [u8; 32]) -> SpendableSproutNote {
+        SpendableSproutNote {
+            note: SproutNotePlaintext {
+                value: 100_000,
+                rho: [0x11; 32],
+                r: [0x22; 32],
+                memo: [0x33; 512],
+            },
+            a_sk,
+            address: SproutPaymentAddress::from_spending_key(&a_sk),
+            commitment: [0x44; 32],
+            anchor: [0x55; 32],
+            witness_path: vec![0x66; 966],
+            outpoint: JsOutPoint {
+                txid: [0x77; 32],
+                js_index: 0,
+                output_index: 0,
+            },
+        }
+    }
+
+    /// A reviewed proposal or scan holds these for minutes to hours; the
+    /// spend-authorising fields are wiped when one is dropped (`Drop` calls
+    /// exactly this). Non-secret fields are left for diagnostics.
+    #[test]
+    fn a_spendable_note_wipes_its_spending_material() {
+        use zeroize::Zeroize;
+        let mut note = spendable([0x42; 32]);
+        note.zeroize();
+        assert_eq!(note.a_sk, [0; 32]);
+        assert_eq!(note.note.rho, [0; 32]);
+        assert_eq!(note.note.r, [0; 32]);
+        assert_eq!(note.note.memo, [0; 512]);
+        assert_eq!(note.note.value, 0);
+        assert_eq!(note.commitment, [0x44; 32], "not secret; kept");
+    }
 
     /// Build a wallet holding one real, self-consistent Sprout note: the
     /// ciphertext is produced by the encryption path, so decryption here is

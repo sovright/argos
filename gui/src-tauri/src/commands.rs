@@ -1796,12 +1796,18 @@ fn resolve_data_dir(app: &AppHandle, data_dir: Option<&str>) -> Option<PathBuf> 
 
 /// The wallet file's Sprout spending keys, as the checkpoint and the sweep
 /// journal are keyed.
-fn wallet_sprout_keys(keys: &argos_core::argos_wallet_import::ImportedKeys) -> Vec<[u8; 32]> {
+/// Wiped on drop: these are raw spending keys, copied out of their
+/// `Secret` wrappers for the journal and chain lookups.
+fn wallet_sprout_keys(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+) -> zeroize::Zeroizing<Vec<[u8; 32]>> {
     use secrecy::ExposeSecret;
-    keys.sprout
-        .iter()
-        .map(|k| *k.a_sk.expose_secret())
-        .collect()
+    zeroize::Zeroizing::new(
+        keys.sprout
+            .iter()
+            .map(|k| *k.a_sk.expose_secret())
+            .collect(),
+    )
 }
 
 #[tauri::command]
