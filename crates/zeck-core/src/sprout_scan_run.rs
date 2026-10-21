@@ -513,8 +513,8 @@ type Stamp = (u64, Option<std::time::SystemTime>, [u8; 32]);
 fn stamp_of(path: &Path) -> Option<Stamp> {
     use sha2::Digest;
     use std::io::Read;
-    let meta = std::fs::metadata(path).ok()?;
     let mut file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
     let mut hash = sha2::Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -739,23 +739,43 @@ async fn verified_checkpoint_lookup_with<V: CursorVerifier>(
             "the scan checkpoint at {} changed while it was being opened; Argos will not use its spent-note evidence.", path.display()
         )));
     }
-    let original_cursor = scanner.cursor();
-    let original_complete = scanner.is_complete();
-    reconcile_cursor(&mut scanner, verifier, network, &path).await?;
+    // For v3, bind the parsed state to the bytes stamped before the network
+    // await. Older formats re-encode as v3, so their initial and final file
+    // stamps remain the available identity check.
+    if scanner.checkpoint_version() == 3 {
+        let parsed = checkpoint_content_fingerprint(&scanner, network);
+        if (original_stamp.0, original_stamp.2) != parsed {
+            return Err(ZeckError::ScanNotReady(format!(
+                "the scan checkpoint at {} changed while it was being opened; Argos will not use its spent-note evidence.", path.display()
+            )));
+        }
+    }
+    // Wallet inspection does not own scanner progress. Reconcile only in
+    // memory so a scan writer advancing during this await is never replaced
+    // by a wallet lookup's older rewind or completion downgrade.
+    let changed = reconcile_cursor_in_memory(&mut scanner, verifier, &path).await?;
     after_reconcile(&path);
     let verified_stamp = read_stamp(&path).ok_or_else(unavailable_stamp)?;
-    let expected =
-        if scanner.cursor() == original_cursor && scanner.is_complete() == original_complete {
-            (original_stamp.0, original_stamp.2)
-        } else {
-            checkpoint_content_fingerprint(&scanner, network)
-        };
-    if (verified_stamp.0, verified_stamp.2) != expected {
+    if verified_stamp != original_stamp
+        || stamp_of(&path).ok_or_else(unavailable_stamp)? != original_stamp
+    {
         return Err(ZeckError::ScanNotReady(format!(
             "the scan checkpoint at {} does not match the state established by live verification; Argos will not use its spent-note evidence.", path.display()
         )));
     }
-    let lookup = cache.lookup(data_dir, network, keys)?;
+    let lookup = if changed {
+        let cursor = scanner.cursor().expect("checked before reconciliation");
+        CachedLookup::Found(
+            std::sync::Arc::new(crate::sprout_recovery::ChainSpends {
+                nullifiers: scanner.spent_nullifiers().clone(),
+                scanned_to: cursor.last_height,
+                complete: scanner.is_complete(),
+            }),
+            path.clone(),
+        )
+    } else {
+        cache.lookup(data_dir, network, keys)?
+    };
     if let CachedLookup::Found(spends, _) = &lookup {
         let cursor = scanner.cursor().expect("checked before reconciliation");
         if spends.scanned_to != cursor.last_height
@@ -767,7 +787,9 @@ async fn verified_checkpoint_lookup_with<V: CursorVerifier>(
             )));
         }
     }
-    if read_stamp(&path).ok_or_else(unavailable_stamp)? != verified_stamp {
+    if read_stamp(&path).ok_or_else(unavailable_stamp)? != original_stamp
+        || stamp_of(&path).ok_or_else(unavailable_stamp)? != original_stamp
+    {
         return Err(ZeckError::ScanNotReady(format!(
             "the scan checkpoint at {} changed after live verification; Argos will not use its spent-note evidence.", path.display()
         )));
@@ -1011,19 +1033,18 @@ fn beyond_retained_window(locators: &[ScanCursor], checkpoint_file: &Path) -> Ze
     ))
 }
 
-/// Persist the verified state before any page can be accepted. A failed
-/// reconciliation leaves the file untouched, including legacy checkpoints
-/// that have no rollback frames.
-async fn reconcile_cursor<V: CursorVerifier>(
+/// Reconcile the scanner in memory. Wallet inspection uses the result only
+/// while the original checkpoint bytes remain unchanged; a scan run persists
+/// it before consuming another page.
+async fn reconcile_cursor_in_memory<V: CursorVerifier>(
     scanner: &mut SproutScanner,
     verifier: &mut V,
-    network: P2pNetwork,
     checkpoint_file: &Path,
-) -> ZeckResult<()> {
+) -> ZeckResult<bool> {
     let locators = scanner.rollback_locators();
     if locators.is_empty() {
         return match scanner.cursor() {
-            None => Ok(()),
+            None => Ok(false),
             Some(cursor) => Err(ZeckError::ScanNotReady(format!(
                 "the saved Sprout scan at {} ended at height {} without a \
                  verifiable block-hash cursor. Argos will not use its \
@@ -1037,15 +1058,16 @@ async fn reconcile_cursor<V: CursorVerifier>(
     match verifier.continuation(&locators).await? {
         CanonicalContinuation::Current {
             chain_has_more: false,
-        } => Ok(()),
+        } => Ok(false),
         CanonicalContinuation::Current {
             chain_has_more: true,
         } => {
             if scanner.is_complete() {
                 scanner.mark_incomplete();
-                save_checkpoint(scanner, network, checkpoint_file)?;
+                Ok(true)
+            } else {
+                Ok(false)
             }
-            Ok(())
         }
         CanonicalContinuation::CommonAncestor(ancestor) => {
             if !locators.contains(&ancestor) {
@@ -1063,9 +1085,23 @@ async fn reconcile_cursor<V: CursorVerifier>(
                         checkpoint_file.display()
                     )),
                 })?;
-            save_checkpoint(scanner, network, checkpoint_file)
+            Ok(true)
         }
     }
+}
+
+/// Persist the verified state before a scan consumes another page. Failed
+/// reconciliation leaves the checkpoint untouched.
+async fn reconcile_cursor<V: CursorVerifier>(
+    scanner: &mut SproutScanner,
+    verifier: &mut V,
+    network: P2pNetwork,
+    checkpoint_file: &Path,
+) -> ZeckResult<()> {
+    if reconcile_cursor_in_memory(scanner, verifier, checkpoint_file).await? {
+        save_checkpoint(scanner, network, checkpoint_file)?;
+    }
+    Ok(())
 }
 
 /// Owns only the header validation phase; the same peer is handed to the
@@ -1087,17 +1123,47 @@ impl CursorVerifier for NetworkCursorVerifier<'_> {
         let mut failures = 0u32;
         let mut silent = Vec::new();
         loop {
-            let result = self.peer.get_headers(&hashes).await;
+            let mut tip_probe_parent = None;
+            let result = match self.peer.get_headers(&hashes).await {
+                Ok(headers)
+                    if headers.is_empty()
+                        && crate::p2p::wire::empty_reply_is_chain_tip(
+                            first_scan_height(Some(locators[0])),
+                            self.floor,
+                            self.peer.peer_height,
+                        ) =>
+                {
+                    let saved = locators[0];
+                    let pinned = crate::p2p::wire::checkpoint_at(self.network, saved.last_height)
+                        .is_none_or(|expected| expected == saved.last_block_hash)
+                        && self
+                            .tip_anchor
+                            .filter(|a| a.height == saved.last_height)
+                            .is_none_or(|anchor| anchor.hash == saved.last_block_hash);
+                    if !pinned {
+                        return Err(ZeckError::ScanNotReady(format!(
+                            "the saved Sprout cursor at {} disagrees with a pinned block at height {}; Argos will not use its spent-note evidence.",
+                            self.checkpoint_file.display(), saved.last_height
+                        )));
+                    }
+                    let Some(parent) = locators.get(1).copied() else {
+                        return Err(ZeckError::ScanNotReady(format!(
+                            "the peer returned no headers after the saved Sprout cursor at {}, and no retained predecessor can prove that cursor is on the current chain. Argos will not use its spent-note evidence; keep the original wallet or key and start a safe full rescan if needed.",
+                            self.checkpoint_file.display()
+                        )));
+                    };
+                    tip_probe_parent = Some(parent);
+                    self.peer.get_headers(&[parent.last_block_hash]).await
+                }
+                other => other,
+            };
             let failure = match result {
                 Ok(headers) if headers.is_empty() => {
-                    if crate::p2p::wire::empty_reply_is_chain_tip(
-                        first_scan_height(Some(locators[0])),
-                        self.floor,
-                        self.peer.peer_height,
-                    ) {
-                        return Ok(CanonicalContinuation::Current {
-                            chain_has_more: false,
-                        });
+                    if tip_probe_parent.is_some() {
+                        return Err(ZeckError::ScanNotReady(format!(
+                            "the peer supplied no validated header overlapping the saved Sprout cursor at {}; Argos will not use its spent-note evidence.",
+                            self.checkpoint_file.display()
+                        )));
                     }
                     format!(
                         "peer reported no headers after height {} despite a known tip of {}",
@@ -1126,22 +1192,46 @@ impl CursorVerifier for NetworkCursorVerifier<'_> {
                         else {
                             return Err(beyond_retained_window(locators, self.checkpoint_file));
                         };
-                        let valid_pins = headers.iter().enumerate().all(|(offset, header)| {
-                            let Some(height) = ancestor
-                                .last_height
-                                .checked_add(1)
-                                .and_then(|h| h.checked_add(offset as u32))
-                            else {
-                                return false;
-                            };
-                            crate::p2p::wire::checkpoint_at(self.network, height)
-                                .is_none_or(|expected| expected == header.hash)
+                        let valid_ancestor_pin =
+                            crate::p2p::wire::checkpoint_at(self.network, ancestor.last_height)
+                                .is_none_or(|expected| expected == ancestor.last_block_hash)
                                 && self
                                     .tip_anchor
-                                    .filter(|a| a.height == height)
-                                    .is_none_or(|anchor| anchor.hash == header.hash)
-                        });
+                                    .filter(|a| a.height == ancestor.last_height)
+                                    .is_none_or(|anchor| anchor.hash == ancestor.last_block_hash);
+                        let valid_pins = valid_ancestor_pin
+                            && headers.iter().enumerate().all(|(offset, header)| {
+                                let Some(height) = ancestor
+                                    .last_height
+                                    .checked_add(1)
+                                    .and_then(|h| h.checked_add(offset as u32))
+                                else {
+                                    return false;
+                                };
+                                crate::p2p::wire::checkpoint_at(self.network, height)
+                                    .is_none_or(|expected| expected == header.hash)
+                                    && self
+                                        .tip_anchor
+                                        .filter(|a| a.height == height)
+                                        .is_none_or(|anchor| anchor.hash == header.hash)
+                            });
                         if valid_pins {
+                            if let Some(parent) = tip_probe_parent {
+                                if ancestor == parent
+                                    && headers[0].hash == locators[0].last_block_hash
+                                {
+                                    if headers.len() == 1 {
+                                        return Ok(CanonicalContinuation::Current {
+                                            chain_has_more: false,
+                                        });
+                                    }
+                                    return Err(ZeckError::ScanNotReady(format!(
+                                        "the peer contradicted its empty tip reply for the saved Sprout cursor at {}; Argos will not use its spent-note evidence.",
+                                        self.checkpoint_file.display()
+                                    )));
+                                }
+                                return Ok(CanonicalContinuation::CommonAncestor(ancestor));
+                            }
                             return Ok(if ancestor == locators[0] {
                                 CanonicalContinuation::Current {
                                     chain_has_more: true,
@@ -1788,18 +1878,19 @@ pub fn save_checkpoint(
     // Written to a temporary file and renamed, so an interrupt during the
     // write cannot leave a half-written checkpoint where a good one was —
     // that would turn a recoverable pause into a restart from genesis.
-    let tmp = path.with_extension("checkpoint.tmp");
-    // Removed first: `mode(0600)` applies only to files this call *creates*,
-    // so writing into a leftover 0644 temporary from an earlier version
-    // would put spend-capable bytes in a world-readable inode and then
-    // rename that inode into place.
-    let _ = std::fs::remove_file(&tmp);
+    // A unique, create-new sibling keeps separate scan processes from
+    // removing or renaming each other's partially written checkpoints.
+    let tmp = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
     let mut bytes = vec![NETWORK_TAGGED, network_tag(network)];
     bytes.extend_from_slice(scanner.checkpoint().as_bytes());
     write_private(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path).map_err(|err| {
+    let result = std::fs::rename(&tmp, path).map_err(|err| {
         ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}"))
-    })?;
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
     Ok(())
 }
 
@@ -1846,7 +1937,7 @@ const fn legacy_scan_end(network: P2pNetwork) -> Option<u32> {
 fn write_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1855,19 +1946,48 @@ fn write_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     let mut file = options.open(path).map_err(|err| {
         ZeckError::TransactionBuild(format!("creating {}: {err}", path.display()))
     })?;
-    file.write_all(bytes).map_err(|err| {
-        ZeckError::TransactionBuild(format!("writing the scan checkpoint: {err}"))
-    })?;
+    if let Err(err) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(ZeckError::TransactionBuild(format!(
+            "writing the scan checkpoint: {err}"
+        )));
+    }
     Ok(())
 }
 
-/// Delete a checkpoint and its temporary sibling.
+/// Delete a checkpoint and any abandoned temporary siblings.
 ///
 /// Called once the funds it describes have been swept: it holds spending
 /// keys, and leaving it behind is a standing risk for no remaining benefit.
 pub fn discard_checkpoint(path: &Path) {
     let _ = std::fs::remove_file(path);
+    // Checkpoints written before unique temp names used this fixed sibling.
     let _ = std::fs::remove_file(path.with_extension("checkpoint.tmp"));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp_base = path.with_extension("checkpoint");
+    let Some(name) = temp_base.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(id) = file_name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|name| name.strip_suffix(".tmp"))
+            else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(id).is_ok() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// Take a peer, racing candidates.
@@ -2053,6 +2173,66 @@ mod tests {
         }
     }
 
+    struct ConcurrentWriteVerifier {
+        path: PathBuf,
+        replacement: SproutScanner,
+        response: CanonicalContinuation,
+    }
+
+    #[async_trait::async_trait]
+    impl CursorVerifier for ConcurrentWriteVerifier {
+        async fn continuation(
+            &mut self,
+            _locators: &[ScanCursor],
+        ) -> ZeckResult<CanonicalContinuation> {
+            save_checkpoint(&self.replacement, P2pNetwork::Regtest, &self.path)?;
+            Ok(match self.response {
+                CanonicalContinuation::Current { chain_has_more } => {
+                    CanonicalContinuation::Current { chain_has_more }
+                }
+                CanonicalContinuation::CommonAncestor(ancestor) => {
+                    CanonicalContinuation::CommonAncestor(ancestor)
+                }
+            })
+        }
+    }
+
+    async fn empty_headers_peer(advertised_height: u32) -> Peer {
+        use crate::p2p::wire::{encode_message, encode_version};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 24];
+            while stream.read_exact(&mut header).await.is_ok() {
+                let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+                let mut payload = vec![0u8; len];
+                if stream.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                if header[4..11] == *b"version" {
+                    let version = encode_version(170_160, "/tip-test/", advertised_height, 1, 0);
+                    stream
+                        .write_all(&encode_message(P2pNetwork::Regtest, "version", &version))
+                        .await
+                        .unwrap();
+                    stream
+                        .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
+                        .await
+                        .unwrap();
+                } else if header[4..14] == *b"getheaders" {
+                    stream
+                        .write_all(&encode_message(P2pNetwork::Regtest, "headers", &[0]))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        Peer::connect(&addr, P2pNetwork::Regtest).await.unwrap()
+    }
+
     fn reorg_scanner() -> SproutScanner {
         let mut scanner = SproutScanner::new(&[[0x11; 32]]);
         for height in 1..=3 {
@@ -2179,8 +2359,124 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .cursor(),
-            Some(parent)
+            Some(ScanCursor {
+                last_block_hash: [3; 32],
+                last_height: 3,
+            }),
+            "wallet inspection must not replace the scanner's checkpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_peer_cannot_publish_an_orphaned_wallet_nullifier() {
+        let dir = ScratchDir::new("empty-peer-orphan-nullifier");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut peer = empty_headers_peer(3).await;
+        let mut waits = Vec::new();
+        let mut verifier = NetworkCursorVerifier {
+            peer: &mut peer,
+            network: P2pNetwork::Regtest,
+            peers: &[],
+            floor: 0,
+            tip_anchor: None,
+            checkpoint_file: &path,
+            waits: &mut waits,
+        };
+        let (chain, notice) = wallet_lookup_result(
+            verified_checkpoint_lookup(
+                &dir.0,
+                P2pNetwork::Regtest,
+                &keys,
+                &mut verifier,
+                &ChainSpendsCache::default(),
+            )
+            .await,
+            None,
+        );
+        assert!(
+            chain.is_none(),
+            "an empty reply cannot certify the orphaned nullifier"
+        );
+        assert!(notice.unwrap().contains("not use its spent-note evidence"));
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn wallet_verification_cannot_replace_a_newer_scanner_checkpoint() {
+        let dir = ScratchDir::new("concurrent-scan-writer");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let mut replacement = reorg_scanner();
+        replacement
+            .scan_block_at(&[joinsplit_revealing([0xFA; 32])], [4; 32], 4)
+            .unwrap();
+        let expected = {
+            let mut bytes = vec![NETWORK_TAGGED, network_tag(P2pNetwork::Regtest)];
+            bytes.extend_from_slice(replacement.checkpoint().as_bytes());
+            bytes
+        };
+        let mut verifier = ConcurrentWriteVerifier {
+            path: path.clone(),
+            replacement,
+            response: CanonicalContinuation::CommonAncestor(ScanCursor {
+                last_block_hash: [2; 32],
+                last_height: 2,
+            }),
+        };
+        let result = verified_checkpoint_lookup(
+            &dir.0,
+            P2pNetwork::Regtest,
+            &keys,
+            &mut verifier,
+            &ChainSpendsCache::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the wallet must not adopt the concurrent writer's state"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn saving_a_checkpoint_does_not_touch_another_writers_temp_file() {
+        let dir = ScratchDir::new("independent-temp-files");
+        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
+        let other_writer_tmp = path.with_extension("checkpoint.tmp");
+        std::fs::write(&other_writer_tmp, b"writer in progress").unwrap();
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        assert_eq!(
+            std::fs::read(other_writer_tmp).unwrap(),
+            b"writer in progress"
+        );
+        assert_eq!(
+            load_checkpoint(&path, P2pNetwork::Regtest, &[[0x11; 32]])
+                .unwrap()
+                .unwrap()
+                .cursor()
+                .unwrap()
+                .last_height,
+            3
+        );
+    }
+
+    #[test]
+    fn discarding_a_checkpoint_removes_abandoned_unique_temp_files() {
+        let dir = ScratchDir::new("abandoned-unique-temp");
+        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let abandoned = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&abandoned, b"private partial checkpoint").unwrap();
+        let unrelated = dir.0.join("unrelated.tmp");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        discard_checkpoint(&path);
+        assert!(!path.exists());
+        assert!(!abandoned.exists(), "a crash can leave private temp bytes");
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"keep");
     }
 
     #[tokio::test]
@@ -2407,41 +2703,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_saved_tip_at_the_anchor_accepts_empty_headers() {
-        use crate::p2p::wire::{encode_message, encode_version};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut header = [0u8; 24];
-            while stream.read_exact(&mut header).await.is_ok() {
-                let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-                let mut payload = vec![0u8; len];
-                if stream.read_exact(&mut payload).await.is_err() {
-                    return;
-                }
-                if header[4..11] == *b"version" {
-                    let version = encode_version(170_160, "/tip-test/", 3, 1, 0);
-                    stream
-                        .write_all(&encode_message(P2pNetwork::Regtest, "version", &version))
-                        .await
-                        .unwrap();
-                    stream
-                        .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
-                        .await
-                        .unwrap();
-                } else if header[4..14] == *b"getheaders" {
-                    stream
-                        .write_all(&encode_message(P2pNetwork::Regtest, "headers", &[0]))
-                        .await
-                        .unwrap();
-                }
-            }
-        });
-
-        let mut peer = Peer::connect(&addr, P2pNetwork::Regtest).await.unwrap();
+    async fn an_empty_reply_without_overlap_cannot_certify_the_saved_tip() {
+        let mut peer = empty_headers_peer(3).await;
         assert_eq!(peer.peer_height, 3);
         let mut waits = Vec::new();
         let mut verifier = NetworkCursorVerifier {
@@ -2460,16 +2723,40 @@ mod tests {
             last_height: 3,
             last_block_hash: [3; 32],
         };
-        let continuation = verifier
+        let err = verifier
             .continuation(&[saved])
             .await
-            .expect("the empty reply is the tip after the saved anchor");
-        assert!(matches!(
-            continuation,
-            CanonicalContinuation::Current {
-                chain_has_more: false
-            }
-        ));
+            .err()
+            .expect("matching a pin still needs positive chain evidence");
+        assert!(err.to_string().contains("not use its spent-note evidence"));
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_tip_anchor_rejects_an_empty_low_height_peer() {
+        let mut peer = empty_headers_peer(3).await;
+        let mut waits = Vec::new();
+        let mut verifier = NetworkCursorVerifier {
+            peer: &mut peer,
+            network: P2pNetwork::Regtest,
+            peers: &[],
+            floor: 4,
+            tip_anchor: Some(TipAnchor {
+                height: 3,
+                hash: [0xEE; 32],
+            }),
+            checkpoint_file: Path::new("unused.checkpoint"),
+            waits: &mut waits,
+        };
+        let saved = ScanCursor {
+            last_height: 3,
+            last_block_hash: [3; 32],
+        };
+        let err = verifier
+            .continuation(&[saved])
+            .await
+            .err()
+            .expect("the anchor contradicts the saved block at its height");
+        assert!(err.to_string().contains("pinned block"));
     }
 
     #[tokio::test]

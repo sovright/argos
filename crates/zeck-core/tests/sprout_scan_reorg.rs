@@ -195,4 +195,24 @@ async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
 
     assert_eq!(display_hash(resumed.anchor), node_root);
     assert_eq!(after.anchor(), resumed.anchor, "saved replacement anchor");
+
+    // A second resume begins with an empty getheaders reply at the new tip.
+    // The verifier must fetch the saved block again through its retained
+    // predecessor and validate that overlap before preserving completion.
+    let stable_bytes = std::fs::read(&checkpoint).expect("saved replacement checkpoint");
+    let tip_only = run_sprout_scan(
+        &[KEY],
+        P2pNetwork::Regtest,
+        &peers,
+        Some(TipAnchor {
+            height: new_height,
+            hash: wire_hash(&new_tip),
+        }),
+        &checkpoint,
+        |_| {},
+    )
+    .await
+    .expect("validate and resume a checkpoint already at the tip");
+    assert_eq!(tip_only.anchor, resumed.anchor);
+    assert_eq!(std::fs::read(&checkpoint).unwrap(), stable_bytes);
 }
