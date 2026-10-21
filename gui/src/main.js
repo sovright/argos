@@ -1124,15 +1124,6 @@ function renderSproutSweepReport(report, { list, statusId, destination, statusPr
   }
   setStatus(statusId, `${statusPrefix}${text}`, kind);
 
-  if (report?.landed_in_unified_sapling) {
-    const li = document.createElement("li");
-    li.textContent = sproutSourceWarningMayClear(report)
-      ? "The mined funds are in the Sapling receiver of that unified address. " +
-        "To move them to Orchard, shield them from within your own wallet."
-      : "If mined, these funds land in the Sapling receiver of that unified address. " +
-        "Wait for canonical confirmation before moving them again.";
-    list.appendChild(li);
-  }
 }
 
 function noteUncoveredSproutKeys(summary) {
@@ -1516,6 +1507,7 @@ function publishSproutScanSnapshot(snapshot, generation = sproutScanGeneration) 
   const report = snapshot.report;
   if (!report) return;
   sproutScanResult = report;
+  const canReview = report.notes_found > 0 || report.has_lifecycle_status === true;
   // The bound actually used: after a resume, the saved scan's.
   $("sprout-scan-plan").textContent =
     report.decrypt_from_height != null
@@ -1527,11 +1519,13 @@ function publishSproutScanSnapshot(snapshot, generation = sproutScanGeneration) 
     (report.notes_found > 0
       ? `✓ Found ${report.notes_found} note(s), ${fmt(report.total_zatoshis)}. ` +
         `${report.spent_notes} already spent.`
-      : "Scan complete. No unspent Sprout notes were found for these keys.") + caveat,
+      : report.has_lifecycle_status
+        ? "Scan complete. No new unspent Sprout notes were found; saved transaction status still needs reconciliation."
+        : "Scan complete. No unspent Sprout notes were found for these keys.") + caveat,
     report.notes_found > 0 ? "success" : "",
   );
-  $("sprout-scan-sweep").hidden = report.notes_found === 0;
-  if (report.notes_found > 0 && $("sprout-scan-destination").value.trim()) {
+  $("sprout-scan-sweep").hidden = !canReview;
+  if (canReview && $("sprout-scan-destination").value.trim()) {
     refreshSproutScanReview();
   }
 }

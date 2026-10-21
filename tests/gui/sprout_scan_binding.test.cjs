@@ -18,7 +18,7 @@ const review = (id) => ({ proposal_id: id, notes: 1, gross_zatoshis: 100000,
   active: [], mined: [] });
 const lifecycle = (transactions, overrides = {}) => ({
   transactions, mined_zatoshis: 0, pending_zatoshis: 0, unknown_zatoshis: 0,
-  landed_in_unified_sapling: false, skipped: [], rejected: [], warnings: [],
+  skipped: [], rejected: [], warnings: [],
   error: null, fresh_all_mined: false, ...overrides,
 });
 
@@ -131,6 +131,49 @@ test("an immediate Sprout completion is recovered from the snapshot", async () =
   await h.scan();
   assert.equal(h.$("sprout-scan-sweep").hidden, false);
   assert.match(h.$("sprout-scan-status").textContent, /1 note/);
+});
+
+test("zero-note saved scan with lifecycle status opens and executes reconciliation", async () => {
+  const statusReview = {
+    ...review("status-proposal"),
+    notes: 0,
+    gross_zatoshis: 0,
+    fee_zatoshis: 0,
+    net_zatoshis: 0,
+    params_present: false,
+    active: [{ txid: "pending-tx", value_zatoshis: 7, state: "pending", mined_height: null }],
+  };
+  const h = harness((command, args, fallback) => {
+    if (command === "propose_sprout_scan_sweep") return statusReview;
+    if (command === "execute_sprout_scan_sweep") {
+      return lifecycle([{ txid: "pending-tx", value_zatoshis: 7, state: "pending", mined_height: null }]);
+    }
+    return fallback();
+  });
+  await h.scan();
+  await flush();
+  h.$("sprout-scan-destination").value = "zs-current-review-only";
+  h.emit("sprout-scan-complete", {
+    handle: "scan-1",
+    status: "completed",
+    report: { ...report(0), has_lifecycle_status: true },
+    error: null,
+  });
+  await flush();
+
+  assert.equal(h.$("sprout-scan-sweep").hidden, false);
+  assert.equal(h.peek("sproutScanReview?.proposal_id"), "status-proposal");
+  assert.equal(h.$("sprout-scan-sweep-run").textContent, "Check status and continue");
+  assert.match(h.$("sprout-scan-sweep-plan").textContent, /No note is ready|saved transaction/i);
+  assert.doesNotMatch(h.$("sprout-scan-sweep-plan").textContent, /to your address|new transaction will be proved/i);
+
+  h.$("sprout-scan-confirm").checked = true;
+  h.$("sprout-scan-confirm").dispatch("change");
+  await h.sweep();
+  assert.equal(
+    h.calls.filter((call) => call.command === "execute_sprout_scan_sweep").length,
+    1,
+  );
 });
 
 test("failed completion listener polls a running scan to its terminal snapshot", async () => {

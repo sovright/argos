@@ -563,6 +563,7 @@ mod tests {
                         notes_found: 1,
                         spent_notes: 0,
                         total_zatoshis: 100_000,
+                        has_lifecycle_status: false,
                         tip_warning: None,
                         decrypt_from_height: None,
                         decrypt_line: String::new(),

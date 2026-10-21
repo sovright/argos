@@ -160,7 +160,7 @@ test("runSproutScan sends the unfiltered lines so backend line numbers match the
 test("runSproutScanSweep sends only the reviewed proposal, never the box's lines", async () => {
   const { run, calls, context } = driveHandler("runSproutScanSweep", BOX, {
     transactions: [], mined_zatoshis: 0, pending_zatoshis: 0, unknown_zatoshis: 0,
-    landed_in_unified_sapling: false, skipped: [], rejected: [], warnings: [],
+    skipped: [], rejected: [], warnings: [],
     error: null, fresh_all_mined: false,
   });
   context.sproutScanHandle = "scan-1";

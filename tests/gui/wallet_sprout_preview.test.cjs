@@ -38,7 +38,6 @@ function sproutLifecycleReport(transactions, overrides = {}) {
     unknown_zatoshis: transactions
       .filter((transaction) => transaction.state === "submission_unknown")
       .reduce((sum, transaction) => sum + (transaction.value_zatoshis ?? 0), 0),
-    landed_in_unified_sapling: false,
     skipped: [],
     rejected: [],
     warnings: [],
@@ -709,6 +708,21 @@ test("current wallet sweep shows its mined transaction and clears its own warnin
   assert.equal(h.$("sprout-sweep-run").disabled, true);
   await h.open("/fixture/new.dat");
   assert.equal(h.$("sprout-sweep-results").children.length, 0);
+});
+
+test("historical lifecycle reports never claim the current unified destination", async () => {
+  const report = sproutLifecycleReport([
+    sproutTransaction("pending", { txid: "historical-tx" }),
+  ]);
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? report : fallback());
+  h.$("sprout-destination").value = "u1-new-destination";
+  await h.open("/fixture/historical.dat");
+  await h.sweepConfirmed();
+  const rendered = texts(h.$("sprout-sweep-results")).join("\n") +
+    h.$("sprout-sweep-status").textContent;
+  assert.match(rendered, /historical-tx/);
+  assert.doesNotMatch(rendered, /that unified address|these funds land|funds are in/i);
 });
 
 test("accepted_transaction_renders_broadcast_pending_without_a_green_check", async () => {

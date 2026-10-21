@@ -150,16 +150,27 @@ pub struct SproutSweepPlan {
 /// have different anchors. One note per transaction keeps every anchor
 /// exactly the one its own witness produced.
 pub fn plan_sweep(notes: &[SpendableSproutNote]) -> ZeckResult<SproutSweepPlan> {
-    let spendable: Vec<_> = notes
-        .iter()
-        .filter(|n| n.note.value > SPROUT_SWEEP_FEE)
-        .collect();
-
-    if spendable.is_empty() {
-        return Err(ZeckError::TransactionBuild(format!(
+    let candidates = notes.iter().collect::<Vec<_>>();
+    plan_sweep_candidates(&candidates)?.ok_or_else(|| {
+        ZeckError::TransactionBuild(format!(
             "no Sprout note is worth more than the {SPROUT_SWEEP_FEE} zatoshi fee needed \
              to move it"
-        )));
+        ))
+    })
+}
+
+/// Plan only the ready notes that execution can actually submit. Journal
+/// previews use this same function so dust never inflates their count or fee.
+pub fn plan_sweep_candidates(
+    notes: &[&SpendableSproutNote],
+) -> ZeckResult<Option<SproutSweepPlan>> {
+    let spendable = notes
+        .iter()
+        .copied()
+        .filter(|note| note.note.value > SPROUT_SWEEP_FEE)
+        .collect::<Vec<_>>();
+    if spendable.is_empty() {
+        return Ok(None);
     }
 
     // Saturating: every value came from the wallet file, checked only
@@ -170,12 +181,12 @@ pub fn plan_sweep(notes: &[SpendableSproutNote]) -> ZeckResult<SproutSweepPlan> 
         .fold(0u64, |sum, n| sum.saturating_add(n.note.value));
     let fee = SPROUT_SWEEP_FEE.saturating_mul(spendable.len() as u64);
 
-    Ok(SproutSweepPlan {
+    Ok(Some(SproutSweepPlan {
         notes: spendable.len(),
         gross_zatoshis: gross,
         fee_zatoshis: fee,
         net_zatoshis: gross.saturating_sub(fee),
-    })
+    }))
 }
 
 /// One built, signed sweep transaction.
@@ -474,10 +485,6 @@ pub struct SproutSweepOutcome {
     pub mined_zatoshis: u64,
     pub pending_zatoshis: u64,
     pub unknown_zatoshis: u64,
-    /// Which receiver the value landed in. Carried back so the surfaces can
-    /// tell the user the funds are in the Sapling pool, and that reaching
-    /// Orchard is a further hop from their own wallet.
-    pub destination_kind: Option<DestinationKind>,
     /// Notes that were skipped, and why. Reported rather than dropped: a
     /// user who sees a smaller total than expected needs to know which notes
     /// did not move.
@@ -1195,6 +1202,11 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
 
     if stop_reason.is_none() {
         for (outpoint, value_zatoshis, transaction) in retries {
+            // Observation can take long enough for an older Argos process
+            // that ignores the network operation guard to create a sibling
+            // journal. Narrow that compatibility race immediately before
+            // the exact saved bytes leave this process.
+            journal.load_scoped_snapshot(&[outpoint])?;
             let result = {
                 let mut store = journal.scoped_store(
                     JournalNoteContext {
@@ -1258,7 +1270,7 @@ pub async fn sweep_sprout_notes(
     options: SweepOptions<'_>,
     progress: impl FnMut(String),
 ) -> ZeckResult<SproutSweepOutcome> {
-    let (sapling_dest, destination_kind) = parse_sapling_destination_kind(destination, network)?;
+    let (sapling_dest, _) = parse_sapling_destination_kind(destination, network)?;
 
     let data_dir = options
         .journal
@@ -1273,7 +1285,6 @@ pub async fn sweep_sprout_notes(
             network,
             lightwalletd_url,
             sapling_dest,
-            destination_kind,
             params_path,
             options,
             progress,
@@ -1288,7 +1299,6 @@ async fn sweep_sprout_notes_guarded(
     network: crate::ZeckNetwork,
     lightwalletd_url: &str,
     sapling_dest: sapling_crypto::PaymentAddress,
-    destination_kind: DestinationKind,
     params_path: &Path,
     options: SweepOptions<'_>,
     progress: impl FnMut(String),
@@ -1296,7 +1306,8 @@ async fn sweep_sprout_notes_guarded(
     // Migration and identity validation must finish before any network I/O or
     // proving work. `run_sweep` reloads while the outer operation guard held
     // by `with_sprout_operation_guard` remains live.
-    options.journal.load_or_migrate()?;
+    let outpoints = notes.iter().map(|note| note.outpoint).collect::<Vec<_>>();
+    options.journal.load_scoped_snapshot(&outpoints)?;
 
     // Every other fund-moving path checks that lightwalletd serves the chain
     // the keys belong to. Without it, the mainnet default under
@@ -1317,7 +1328,7 @@ async fn sweep_sprout_notes_guarded(
         options.confirmation_sources,
     )?;
     let mut proving_key = None;
-    let mut outcome = run_sweep(
+    let outcome = run_sweep(
         notes,
         &mut node,
         &mut observer,
@@ -1342,7 +1353,6 @@ async fn sweep_sprout_notes_guarded(
         progress,
     )
     .await;
-    outcome.destination_kind = Some(destination_kind);
     Ok(outcome)
 }
 
@@ -1378,7 +1388,8 @@ pub(crate) async fn run_sweep(
 ) -> SproutSweepOutcome {
     let mut outcome = SproutSweepOutcome::default();
     let total = notes.len();
-    let snapshot = match journal.load_or_migrate() {
+    let outpoints = notes.iter().map(|note| note.outpoint).collect::<Vec<_>>();
+    let snapshot = match journal.load_scoped_snapshot(&outpoints) {
         Ok(snapshot) => snapshot,
         Err(err) => {
             outcome.error = Some(format!(
@@ -1395,7 +1406,7 @@ pub(crate) async fn run_sweep(
                 outcome.error = Some(format!(
                     "Sprout reconciliation failed before any new proof or broadcast: {err}"
                 ));
-                if let Ok(snapshot) = journal.load_or_migrate() {
+                if let Ok(snapshot) = journal.load_scoped_snapshot(&outpoints) {
                     refresh_outcome(&mut outcome, &snapshot, notes, &HashSet::new());
                 }
                 return outcome;
@@ -1507,6 +1518,15 @@ pub(crate) async fn run_sweep(
             fee_zatoshis: SPROUT_SWEEP_FEE,
             expiry_height: Some(u32::from(expiry)),
         };
+        // Proving may take minutes. Repeat the complete sibling inspection
+        // after it and immediately before durable prepare/send, protecting
+        // this note even though it is not yet present in the target journal.
+        if let Err(err) = journal.load_scoped_snapshot(&[note.outpoint]) {
+            outcome.error = Some(format!(
+                "Sprout journal scope changed before {label} could be broadcast: {err}. Nothing was sent for it."
+            ));
+            break;
+        }
         let result = {
             let mut store = journal.scoped_store(
                 JournalNoteContext {
@@ -1673,6 +1693,19 @@ mod tests {
         }
         assert!(nu7_broadcast_warning(crate::ZeckNetwork::Mainnet).contains("November 5, 2026"));
         assert!(nu7_broadcast_warning(crate::ZeckNetwork::Testnet).contains("4,465,026"));
+    }
+
+    #[test]
+    fn readme_does_not_treat_a_primary_rejection_as_terminal_evidence() {
+        let readme = include_str!("../../../README.md");
+        assert!(!readme.contains(
+            "deterministically rejected follows a separate terminal path back to a new plan"
+        ));
+        assert!(!readme
+            .contains("an eligible deterministic rejection can return separately to a new plan"));
+        assert!(readme.contains("SubmissionUnknown") || readme.contains("submission unknown"));
+        assert!(readme.contains("independent"));
+        assert!(readme.contains("older Argos") && readme.contains("concurrently"));
     }
 
     /// Kristi's F5 on #239: the plan printed before confirmation must not
@@ -1951,6 +1984,7 @@ mod tests {
 
     struct LifecycleNode {
         tip: u32,
+        tip_calls: usize,
         replies: std::collections::VecDeque<
             Result<zcash_client_backend::proto::service::SendResponse, tonic::Status>,
         >,
@@ -1962,6 +1996,7 @@ mod tests {
         fn accepted(tip: u32, count: usize) -> Self {
             Self {
                 tip,
+                tip_calls: 0,
                 replies: (0..count)
                     .map(|_| {
                         Ok(zcash_client_backend::proto::service::SendResponse {
@@ -1978,6 +2013,7 @@ mod tests {
         fn reply(tip: u32, code: i32, message: &str) -> Self {
             Self {
                 tip,
+                tip_calls: 0,
                 replies: [Ok(zcash_client_backend::proto::service::SendResponse {
                     error_code: code,
                     error_message: message.to_owned(),
@@ -1991,6 +2027,7 @@ mod tests {
 
     impl SweepNode for LifecycleNode {
         async fn tip(&mut self) -> Result<u32, String> {
+            self.tip_calls += 1;
             Ok(self.tip)
         }
     }
@@ -2311,6 +2348,201 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_sibling_key_sets_stop_before_network_proving_or_send() {
+        use crate::broadcast::TxLifecycleState;
+
+        for (current_keys, sibling_keys) in [
+            (vec![[0x42; 32]], vec![[0x42; 32], [0x24; 32]]),
+            (vec![[0x42; 32], [0x24; 32]], vec![[0x42; 32]]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let current = crate::sprout_sweep_journal::SweepJournal::for_keys(
+                dir.path(),
+                &current_keys,
+                crate::ZeckNetwork::Mainnet,
+            );
+            let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
+                dir.path(),
+                &sibling_keys,
+                crate::ZeckNetwork::Mainnet,
+            );
+            let note = lifecycle_note(1_000_000, 201);
+            seed_entry(
+                &sibling,
+                &note,
+                &fixture_transaction(901, 140),
+                TxLifecycleState::Pending,
+            );
+
+            let mut node = LifecycleNode::accepted(100, 1);
+            let mut observer = LifecycleObserver::default();
+            let (outcome, builds, _) =
+                run_lifecycle(&[note], &mut node, &mut observer, &current, 902);
+
+            let error = outcome.error.expect("overlapping journal must fail closed");
+            assert!(error.contains("overlap"), "{error}");
+            assert!(
+                error.contains(&current.path().display().to_string()),
+                "{error}"
+            );
+            assert!(
+                error.contains(&sibling.path().display().to_string()),
+                "{error}"
+            );
+            assert!(
+                error.contains("original") && error.contains("data dir"),
+                "{error}"
+            );
+            assert_eq!(node.tip_calls, 0, "network tip must not be queried");
+            assert!(observer.observed.is_empty(), "observer must not run");
+            assert_eq!(builds, 0, "prover/builder must not run");
+            assert!(node.sent.is_empty(), "no transaction may be sent");
+        }
+    }
+
+    #[test]
+    fn malformed_sibling_journal_stops_before_network_proving_or_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = lifecycle_journal(dir.path());
+        let malformed = dir.path().join("sprout-sweep-deadbeefdeadbeef.journal");
+        std::fs::write(&malformed, b"{not valid json}\n").unwrap();
+        let note = lifecycle_note(1_000_000, 202);
+        let mut node = LifecycleNode::accepted(100, 1);
+        let mut observer = LifecycleObserver::default();
+
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &current, 903);
+
+        let error = outcome.error.expect("malformed sibling must fail closed");
+        assert!(error.contains(&malformed.display().to_string()), "{error}");
+        assert_eq!(node.tip_calls, 0);
+        assert!(observer.observed.is_empty());
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+    }
+
+    #[test]
+    fn legacy_sibling_overlap_is_inspected_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = lifecycle_journal(dir.path());
+        let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
+            dir.path(),
+            &[[0x42; 32], [0x24; 32]],
+            crate::ZeckNetwork::Mainnet,
+        );
+        let legacy = format!("{}:0:0 {}\n", "cb".repeat(32), "33".repeat(32));
+        std::fs::write(sibling.path(), legacy.as_bytes()).unwrap();
+        let note = lifecycle_note(1_000_000, 0xcb);
+        let mut node = LifecycleNode::accepted(100, 1);
+        let mut observer = LifecycleObserver::default();
+
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &current, 904);
+
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("overlap")));
+        assert_eq!(std::fs::read(sibling.path()).unwrap(), legacy.as_bytes());
+        assert_eq!(node.tip_calls, 0);
+        assert!(observer.observed.is_empty());
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+    }
+
+    #[test]
+    fn sibling_created_during_proving_blocks_the_new_transaction_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = lifecycle_journal(dir.path());
+        let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
+            dir.path(),
+            &[[0x42; 32], [0x24; 32]],
+            crate::ZeckNetwork::Mainnet,
+        );
+        let note = lifecycle_note(1_000_000, 0xd1);
+        let mut node = LifecycleNode::accepted(100, 1);
+        let mut observer = LifecycleObserver::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut builds = 0;
+        let outcome = runtime.block_on(run_sweep(
+            &[note],
+            &mut node,
+            &mut observer,
+            crate::ZeckNetwork::Mainnet,
+            |note, expiry, _| {
+                builds += 1;
+                seed_entry(
+                    &sibling,
+                    note,
+                    &fixture_transaction(905, expiry.into()),
+                    crate::TxLifecycleState::Pending,
+                );
+                let tx = fixture_transaction(906, expiry.into());
+                Ok(BuiltSproutSweep {
+                    txid: tx.txid.to_string(),
+                    raw: tx.raw_tx,
+                    value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                })
+            },
+            NoteSource::WalletFile,
+            &current,
+            |_| {},
+        ));
+        assert_eq!(builds, 1);
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("overlap")));
+        assert!(
+            node.sent.is_empty(),
+            "the post-proof scope check must precede send"
+        );
+    }
+
+    #[test]
+    fn sibling_created_during_observation_blocks_exact_byte_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = lifecycle_journal(dir.path());
+        let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
+            dir.path(),
+            &[[0x42; 32], [0x24; 32]],
+            crate::ZeckNetwork::Mainnet,
+        );
+        let note = lifecycle_note(1_000_000, 0xd2);
+        let tx = fixture_transaction(907, 140);
+        seed_entry(
+            &current,
+            &note,
+            &tx,
+            crate::TxLifecycleState::SubmissionUnknown,
+        );
+        let sibling_note = lifecycle_note(1_000_000, 0xd2);
+        let mut observer = LifecycleObserver::new([(tx.txid, absent(tx.expiry_height, 100))]);
+        observer.before_observe = Some(Box::new(move || {
+            seed_entry(
+                &sibling,
+                &sibling_note,
+                &fixture_transaction(908, 140),
+                crate::TxLifecycleState::Pending,
+            );
+        }));
+        let mut node = LifecycleNode::accepted(100, 1);
+
+        let (outcome, builds, _) = run_lifecycle(&[note], &mut node, &mut observer, &current, 909);
+
+        assert_eq!(builds, 0);
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("overlap")));
+        assert!(
+            node.sent.is_empty(),
+            "the post-observation scope check must precede retry"
+        );
+    }
+
+    #[test]
     fn restart_after_prepared_sync_submits_the_same_raw_transaction_without_rebuilding() {
         let dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(dir.path());
@@ -2337,6 +2569,7 @@ mod tests {
         let notes = [lifecycle_note(1_000_000, 4), lifecycle_note(2_000_000, 5)];
         let mut node = LifecycleNode {
             tip: 100,
+            tip_calls: 0,
             replies: [Err(tonic::Status::unavailable("lost reply"))].into(),
             sent: Vec::new(),
             before_send: None,

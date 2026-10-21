@@ -966,8 +966,14 @@ async fn sweep_sprout(
     let spending_keys = wallet_sprout_keys(keys);
     let journal =
         argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
-    let snapshot = journal.load_or_migrate()?;
+    let outpoints = recovered
+        .notes
+        .iter()
+        .map(|note| note.outpoint)
+        .collect::<Vec<_>>();
+    let snapshot = journal.load_scoped_snapshot(&outpoints)?;
     let inventory = argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+    let preview_plan = sprout_preview_plan(&inventory)?;
     // stdout, beside the plan: `> plan.txt` must keep the reason the total
     // is smaller than the wallet's history.
     print_sprout_accounting(keys, &recovered, false, "argos inspect-wallet --show-spent");
@@ -995,7 +1001,7 @@ async fn sweep_sprout(
     }
 
     let no_ready_action = sprout_no_ready_action(
-        !inventory.ready.is_empty(),
+        preview_plan.is_some(),
         snapshot.entries().map(|entry| entry.state),
     );
     if no_ready_action == Some(SproutNoReadyAction::RecoverOrRescan) {
@@ -1011,23 +1017,13 @@ async fn sweep_sprout(
         return Ok(());
     }
 
-    if !inventory.ready.is_empty() {
-        let notes = inventory.ready.len();
-        let gross_zatoshis = inventory
-            .ready
-            .iter()
-            .map(|note| note.note.value)
-            .sum::<u64>();
-        let fee_zatoshis = argos_core::sprout_sweep::SPROUT_SWEEP_FEE * notes as u64;
+    if let Some(plan) = preview_plan {
         println!();
         println!("\u{2501}\u{2501}\u{2501} Sprout sweep \u{2501}\u{2501}\u{2501}");
-        println!("  Notes              {notes}");
-        println!("  Gross              {}", format_zec(gross_zatoshis));
-        println!("  Fee                {}", format_zec(fee_zatoshis));
-        println!(
-            "  Net to destination {}",
-            format_zec(gross_zatoshis - fee_zatoshis)
-        );
+        println!("  Notes              {}", plan.notes);
+        println!("  Gross              {}", format_zec(plan.gross_zatoshis));
+        println!("  Fee                {}", format_zec(plan.fee_zatoshis));
+        println!("  Net to destination {}", format_zec(plan.net_zatoshis));
         println!("  Destination        {destination}");
         println!();
     } else {
@@ -1100,20 +1096,13 @@ async fn sweep_sprout(
     report_sprout_skips_and_errors(&outcome);
     if outcome.fresh_all_mined {
         println!(
-            "Canonically mined {} to {destination}",
+            "Canonically mined {} from Sprout into Sapling.",
             format_zec(outcome.mined_zatoshis)
         );
     }
-    if let Some(receiver_line) = sprout_unified_receiver_line(&outcome) {
+    if let Some(pool_line) = sprout_post_execution_pool_line(&outcome) {
         println!();
-        println!("{receiver_line}");
-        if outcome.fresh_all_mined {
-            println!("To finish moving them to Orchard, shield them from your own wallet.");
-        } else {
-            println!(
-                "After they are mined, shield them from your own wallet to finish moving them to Orchard."
-            );
-        }
+        println!("{pool_line}");
     }
     // Non-zero, so a script cannot read a sweep that stopped partway as done.
     if outcome.error.is_some() {
@@ -1122,16 +1111,12 @@ async fn sweep_sprout(
     Ok(())
 }
 
-fn sprout_unified_receiver_line(
+fn sprout_post_execution_pool_line(
     outcome: &argos_core::sprout_sweep::SproutSweepOutcome,
 ) -> Option<&'static str> {
-    (outcome.destination_kind
-        == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified))
-    .then_some(if outcome.fresh_all_mined {
-        "These funds are in the Sapling receiver of that unified address."
-    } else {
-        "If mined, these funds will be in the Sapling receiver of that unified address."
-    })
+    (!outcome.transactions.is_empty()).then_some(
+        "Sprout recovery transactions move value into Sapling. Use the lifecycle rows above to verify each transaction before moving those funds again.",
+    )
 }
 
 /// Gather the spending keys a Sprout scan should look for.
@@ -1390,8 +1375,14 @@ async fn scan_sprout(
     println!();
 
     let journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys, network);
-    let snapshot = journal.load_or_migrate()?;
+    let outpoints = result
+        .notes
+        .iter()
+        .map(|note| note.outpoint)
+        .collect::<Vec<_>>();
+    let snapshot = journal.load_scoped_snapshot(&outpoints)?;
     let inventory = argos_core::sprout_sweep::classify_sprout_notes(&result.notes, &snapshot);
+    let preview_plan = sprout_preview_plan(&inventory)?;
     print_sprout_lifecycle_entries(&snapshot);
 
     if result.notes.is_empty() && snapshot.entries().next().is_none() {
@@ -1400,7 +1391,7 @@ async fn scan_sprout(
     }
 
     let no_ready_action = sprout_no_ready_action(
-        !inventory.ready.is_empty(),
+        preview_plan.is_some(),
         snapshot.entries().map(|entry| entry.state),
     );
     if no_ready_action == Some(SproutNoReadyAction::RecoverOrRescan) {
@@ -1463,7 +1454,7 @@ async fn scan_sprout(
     report_sprout_skips_and_errors(&outcome);
     if outcome.fresh_all_mined {
         println!(
-            "Canonically mined {} to {destination}",
+            "Canonically mined {} from Sprout into Sapling.",
             format_zec(outcome.mined_zatoshis)
         );
     }
@@ -1678,6 +1669,12 @@ fn sprout_nothing_left(
     journal_read
         && journal_states_allow_nothing_left(snapshot.entries().map(|entry| entry.state))
         && recovered.nothing_left_to_sweep(inventory)
+}
+
+fn sprout_preview_plan(
+    inventory: &argos_core::sprout_sweep::SproutSweepInventory<'_>,
+) -> argos_core::ZeckResult<Option<argos_core::sprout_sweep::SproutSweepPlan>> {
+    argos_core::sprout_sweep::plan_sweep_candidates(&inventory.ready)
 }
 
 fn print_sprout_lifecycle_entries(snapshot: &argos_core::sprout_sweep::SproutJournalSnapshot) {
@@ -1997,8 +1994,13 @@ fn print_sprout_inspection(
         let spending_keys = wallet_sprout_keys(keys);
         let journal =
             argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
+        let outpoints = recovered
+            .notes
+            .iter()
+            .map(|note| note.outpoint)
+            .collect::<Vec<_>>();
         let (snapshot, journal_read) = if data_dir.exists() {
-            match journal.load_or_migrate() {
+            match journal.load_scoped_snapshot(&outpoints) {
                 Ok(snapshot) => (snapshot, true),
                 Err(err) => {
                     println!("  Sweep lifecycle journal could not be read: {err}");
@@ -2017,6 +2019,14 @@ fn print_sprout_inspection(
         };
         let inventory =
             argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+        let preview_plan = match sprout_preview_plan(&inventory) {
+            Ok(plan) => plan,
+            Err(err) => {
+                println!("  Sprout sweep preview could not be computed: {err}");
+                println!("  {SPROUT_KEEP_SOURCE_WARNING}");
+                None
+            }
+        };
         print_sprout_accounting(
             keys,
             &recovered,
@@ -2040,7 +2050,10 @@ fn print_sprout_inspection(
         }
         let lifecycle_guidance =
             sprout_lifecycle_status_guidance(snapshot.entries().map(|entry| entry.state));
-        if inventory.ready.is_empty() && lifecycle_guidance.is_some() {
+        if !journal_read {
+            return;
+        }
+        if preview_plan.is_none() && lifecycle_guidance.is_some() {
             println!("  No Sprout note is ready for a new sweep.");
             for line in wrap_text(lifecycle_guidance.expect("checked above"), 74) {
                 println!("  {line}");
@@ -2061,11 +2074,11 @@ fn print_sprout_inspection(
             }
             println!();
             print_sprout_scan_cost_warning(network);
-        } else {
+        } else if let Some(plan) = preview_plan {
             println!(
                 "  {} spendable Sprout note(s), {} total.",
-                inventory.ready.len(),
-                format_zec(inventory.ready.iter().map(|note| note.note.value).sum())
+                plan.notes,
+                format_zec(plan.gross_zatoshis)
             );
             println!("  These were recovered from this file alone — no scan needed.");
             println!();
@@ -2081,6 +2094,8 @@ fn print_sprout_inspection(
                 "    argos sweep-sprout --wallet-file <this file> \\\n      --destination <your zs1… or unified address> --confirm-sweep"
             );
             println!();
+        } else {
+            println!("  No recovered Sprout note is worth more than the fee to move it.");
         }
     }
 }
@@ -3906,30 +3921,101 @@ fn powershell_quote(input: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pending_unified_receiver_wording_is_conditional_until_mined() {
-        use argos_core::sprout_sweep::{DestinationKind, SproutSweepOutcome};
+    fn preview_note(value: u64, id: u8) -> argos_core::sprout_recovery::SpendableSproutNote {
+        let a_sk = [0x42; 32];
+        let address = argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk);
+        let rho = [0x11; 32];
+        let r = [0x22; 32];
+        argos_core::sprout_recovery::SpendableSproutNote {
+            note: argos_core::sprout::SproutNotePlaintext {
+                value,
+                rho,
+                r,
+                memo: [0; 512],
+            },
+            a_sk,
+            address,
+            commitment: argos_core::sprout::note_commitment(address.a_pk(), value, &rho, &r),
+            anchor: [0; 32],
+            witness_path: vec![0; argos_core::sprout_witness::WITNESS_PATH_SIZE],
+            outpoint: argos_core::argos_wallet_import::keys::JsOutPoint {
+                txid: [id; 32],
+                js_index: 0,
+                output_index: 0,
+            },
+        }
+    }
 
-        let pending = SproutSweepOutcome {
-            destination_kind: Some(DestinationKind::SaplingReceiverOfUnified),
-            fresh_all_mined: false,
+    #[test]
+    fn cli_preview_counts_only_executable_ready_notes_and_cannot_wrap() {
+        let empty = argos_core::sprout_sweep::SproutJournalSnapshot::default();
+        let dust = preview_note(argos_core::sprout_sweep::SPROUT_SWEEP_FEE, 0x10);
+        let dust = [dust];
+        let dust_inventory = argos_core::sprout_sweep::classify_sprout_notes(&dust, &empty);
+        assert_eq!(sprout_preview_plan(&dust_inventory).unwrap(), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+            dir.path(),
+            &[[0x42; 32]],
+            argos_core::ZeckNetwork::Mainnet,
+        );
+        std::fs::write(
+            journal.path(),
+            format!("{}:0:0 {}\n", "11".repeat(32), "33".repeat(32)),
+        )
+        .unwrap();
+        let snapshot = journal.load_or_migrate().unwrap();
+        let notes = [preview_note(1_000_000, 0x11), preview_note(2_000_000, 0x12)];
+        let mixed = argos_core::sprout_sweep::classify_sprout_notes(&notes, &snapshot);
+        let plan = sprout_preview_plan(&mixed)
+            .unwrap()
+            .expect("one executable note");
+        assert_eq!(plan.notes, 1);
+        assert_eq!(plan.gross_zatoshis, 2_000_000);
+
+        let huge = [preview_note(u64::MAX, 0x13), preview_note(u64::MAX, 0x14)];
+        let huge_inventory = argos_core::sprout_sweep::classify_sprout_notes(&huge, &empty);
+        let plan = sprout_preview_plan(&huge_inventory)
+            .expect("overflow-safe preview")
+            .expect("executable notes");
+        assert_eq!(plan.gross_zatoshis, u64::MAX);
+    }
+
+    #[test]
+    fn post_execution_reporting_never_attributes_a_historical_destination() {
+        use argos_core::sprout_sweep::{SproutSweepOutcome, SproutSweepTransaction};
+
+        let historical = SproutSweepOutcome {
+            transactions: vec![SproutSweepTransaction {
+                txid: "historical".to_owned(),
+                value_zatoshis: Some(7),
+                state: argos_core::TxLifecycleState::Pending,
+                mined_height: None,
+            }],
             ..Default::default()
         };
-        let pending_line = sprout_unified_receiver_line(&pending).expect("unified receiver line");
-        assert!(pending_line.starts_with("If mined,"), "{pending_line}");
+        let line = sprout_post_execution_pool_line(&historical).expect("pool line");
+        assert!(line.contains("Sapling"), "{line}");
         assert!(
-            !pending_line.starts_with("These funds are"),
-            "{pending_line}"
+            !line.contains("unified") && !line.contains("address"),
+            "{line}"
         );
 
-        let mined = SproutSweepOutcome {
-            destination_kind: Some(DestinationKind::SaplingReceiverOfUnified),
-            fresh_all_mined: true,
-            ..Default::default()
-        };
-        assert!(sprout_unified_receiver_line(&mined)
-            .expect("unified receiver line")
-            .starts_with("These funds are"));
+        assert_eq!(sprout_post_execution_pool_line(&historical), Some(line));
+
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(!source.contains("Canonically mined {} to {destination}"));
+        assert_eq!(
+            source
+                .matches("Canonically mined {} from Sprout into Sapling.")
+                .count(),
+            2,
+            "wallet and saved-scan execution must use the same provenance-safe summary"
+        );
     }
 
     #[test]

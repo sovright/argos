@@ -496,7 +496,13 @@ fn compute_sprout_summary(
                 &wallet_sprout_keys(keys),
                 network,
             )
-            .load_or_migrate()
+            .load_scoped_snapshot(
+                &recovered
+                    .notes
+                    .iter()
+                    .map(|note| note.outpoint)
+                    .collect::<Vec<_>>(),
+            )
             .map_err(|err| err.to_string())
         })
     };
@@ -511,6 +517,8 @@ fn compute_sprout_summary(
     };
     let journal_read = journal_warning.is_none();
     let inventory = argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+    let (ready_notes, ready_zatoshis, _) =
+        sprout_ready_summary(&recovered.notes, &snapshot).unwrap_or((0, 0, true));
     let SproutScreen {
         nothing_left,
         needs_scan: _,
@@ -539,8 +547,8 @@ fn compute_sprout_summary(
                 )
             })
             .collect(),
-        sprout_spendable_notes: recovered.notes.len(),
-        sprout_spendable_zatoshis: recovered.total_value(),
+        sprout_spendable_notes: ready_notes,
+        sprout_spendable_zatoshis: ready_zatoshis,
         sprout_has_lifecycle_status: sprout_has_lifecycle_status(&snapshot),
         sprout_issues: forged
             .iter()
@@ -613,8 +621,8 @@ fn sprout_screen_with_journal(
     }
 }
 
-/// Read a legacy wallet file and report what is in it. No network, and
-/// nothing is written anywhere.
+/// Read a legacy wallet file and report what is in it. No network is used;
+/// legacy sweep-journal migration may replace it in the selected data dir.
 ///
 /// The passphrase crosses the IPC boundary as a `SecretString`, the same
 /// treatment the seed phrase gets (audit Issue A). That is a real exposure
@@ -1111,7 +1119,6 @@ pub struct SproutSweepReport {
     pub mined_zatoshis: u64,
     pub pending_zatoshis: u64,
     pub unknown_zatoshis: u64,
-    pub landed_in_unified_sapling: bool,
     pub skipped: Vec<String>,
     pub rejected: Vec<String>,
     pub warnings: Vec<String>,
@@ -1139,15 +1146,18 @@ fn sprout_sweep_preview(
     snapshot: &argos_core::sprout_sweep::SproutJournalSnapshot,
 ) -> Result<SproutSweepPreviewData, String> {
     let inventory = argos_core::sprout_sweep::classify_sprout_notes(notes, snapshot);
-    let notes = inventory.ready.len();
-    let gross_zatoshis = inventory
-        .ready
-        .iter()
-        .map(|note| note.note.value)
-        .sum::<u64>();
-    let fee_zatoshis = argos_core::sprout_sweep::SPROUT_SWEEP_FEE
-        .checked_mul(notes as u64)
-        .ok_or_else(|| "Sprout sweep fee total overflowed".to_owned())?;
+    let plan = argos_core::sprout_sweep::plan_sweep_candidates(&inventory.ready)
+        .map_err(|err| err.to_string())?;
+    let (notes, gross_zatoshis, fee_zatoshis, net_zatoshis) = plan
+        .map(|plan| {
+            (
+                plan.notes,
+                plan.gross_zatoshis,
+                plan.fee_zatoshis,
+                plan.net_zatoshis,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0));
     let active = snapshot
         .entries()
         .filter(|entry| match entry.state {
@@ -1175,10 +1185,24 @@ fn sprout_sweep_preview(
         notes,
         gross_zatoshis,
         fee_zatoshis,
-        net_zatoshis: gross_zatoshis.saturating_sub(fee_zatoshis),
+        net_zatoshis,
         active,
         mined,
     })
+}
+
+fn sprout_ready_summary(
+    notes: &[argos_core::sprout_recovery::SpendableSproutNote],
+    snapshot: &argos_core::sprout_sweep::SproutJournalSnapshot,
+) -> Result<(usize, u64, bool), String> {
+    let inventory = argos_core::sprout_sweep::classify_sprout_notes(notes, snapshot);
+    let plan = argos_core::sprout_sweep::plan_sweep_candidates(&inventory.ready)
+        .map_err(|err| err.to_string())?;
+    Ok((
+        plan.as_ref().map_or(0, |plan| plan.notes),
+        plan.as_ref().map_or(0, |plan| plan.gross_zatoshis),
+        snapshot.entries().next().is_some(),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1261,7 +1285,14 @@ pub async fn propose_wallet_sprout_sweep(
                 network,
             ))
         })?;
-    let snapshot = journal.load_or_migrate().map_err(|err| err.to_string())?;
+    let outpoints = recovered
+        .notes
+        .iter()
+        .map(|note| note.outpoint)
+        .collect::<Vec<_>>();
+    let snapshot = journal
+        .load_scoped_snapshot(&outpoints)
+        .map_err(|err| err.to_string())?;
     let inventory = argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
     let plan = sprout_sweep_preview(&recovered.notes, &snapshot)?;
     let plan_empty = plan.notes == 0 && plan.active.is_empty() && plan.mined.is_empty();
@@ -1359,6 +1390,9 @@ pub struct SproutScanReport {
     pub notes_found: usize,
     pub spent_notes: usize,
     pub total_zatoshis: u64,
+    /// A saved transaction exists even when the resumed scan found no new
+    /// unspent note. The frontend uses this typed fact to open status review.
+    pub has_lifecycle_status: bool,
     /// Set when the chain tip could not be confirmed with lightwalletd, so
     /// the results past the last pinned checkpoint rest on the peer alone.
     pub tip_warning: Option<String>,
@@ -1742,23 +1776,44 @@ pub async fn start_sprout_scan(
                 },
             )
             .await
-            .map(|result| SproutScanReport {
-                blocks_scanned: result.progress.blocks_scanned,
-                joinsplits_seen: result.progress.joinsplits_seen,
-                notes_found: result.notes.len(),
-                spent_notes: result.spent_notes,
-                total_zatoshis: result.total_value(),
-                tip_warning,
-                decrypt_from_height: result.decrypt_from_height,
-                // The plan line promised a skip the scan did not apply;
-                // replace it rather than leave the panel saying otherwise.
-                decrypt_line: argos_core::sprout_scan_run::dropped_bound_line(
-                    decrypt_from,
-                    tip_height,
-                )
-                .unwrap_or(decrypt_line),
-            })
             .map_err(|err| err.to_string())
+            .and_then(|result| {
+                let journal_dir = material
+                    .checkpoint
+                    .parent()
+                    .ok_or_else(|| "invalid Sprout checkpoint location".to_owned())?;
+                let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+                    journal_dir,
+                    &material.keys,
+                    material.network,
+                );
+                let outpoints = result
+                    .notes
+                    .iter()
+                    .map(|note| note.outpoint)
+                    .collect::<Vec<_>>();
+                let snapshot = journal
+                    .load_scoped_snapshot(&outpoints)
+                    .map_err(|err| err.to_string())?;
+                let has_lifecycle_status = snapshot.entries().next().is_some();
+                Ok(SproutScanReport {
+                    blocks_scanned: result.progress.blocks_scanned,
+                    joinsplits_seen: result.progress.joinsplits_seen,
+                    notes_found: result.notes.len(),
+                    spent_notes: result.spent_notes,
+                    total_zatoshis: result.total_value(),
+                    has_lifecycle_status,
+                    tip_warning,
+                    decrypt_from_height: result.decrypt_from_height,
+                    // The plan line promised a skip the scan did not apply;
+                    // replace it rather than leave the panel saying otherwise.
+                    decrypt_line: argos_core::sprout_scan_run::dropped_bound_line(
+                        decrypt_from,
+                        tip_height,
+                    )
+                    .unwrap_or(decrypt_line),
+                })
+            })
         });
         // Released scans abort this worker (and free its checkpoint) through
         // the store rather than run on detached for hours.
@@ -1879,8 +1934,6 @@ fn sprout_sweep_report(
         mined_zatoshis: outcome.mined_zatoshis,
         pending_zatoshis: outcome.pending_zatoshis,
         unknown_zatoshis: outcome.unknown_zatoshis,
-        landed_in_unified_sapling: outcome.destination_kind
-            == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
         skipped: outcome.skipped,
         rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
         warnings: outcome.warnings,
@@ -1968,7 +2021,14 @@ pub async fn propose_sprout_scan_sweep(
         .ok_or("invalid Sprout checkpoint location")?;
     let journal =
         argos_core::sprout_sweep::SweepJournal::for_keys(dir, &material.keys, material.network);
-    let snapshot = journal.load_or_migrate().map_err(|err| err.to_string())?;
+    let outpoints = result
+        .notes
+        .iter()
+        .map(|note| note.outpoint)
+        .collect::<Vec<_>>();
+    let snapshot = journal
+        .load_scoped_snapshot(&outpoints)
+        .map_err(|err| err.to_string())?;
     let plan = sprout_sweep_preview(&result.notes, &snapshot)?;
     let plan_empty = plan.notes == 0 && plan.active.is_empty() && plan.mined.is_empty();
     if let Some(message) = empty_sprout_proposal_error(
@@ -2842,6 +2902,31 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 mod tests {
     use super::{sprout_nu7_warning, summary_nu7_warning};
 
+    fn preview_note(value: u64, id: u8) -> argos_core::sprout_recovery::SpendableSproutNote {
+        let a_sk = [0x42; 32];
+        let address = argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk);
+        let rho = [0x11; 32];
+        let r = [0x22; 32];
+        argos_core::sprout_recovery::SpendableSproutNote {
+            note: argos_core::sprout::SproutNotePlaintext {
+                value,
+                rho,
+                r,
+                memo: [0; 512],
+            },
+            a_sk,
+            address,
+            commitment: argos_core::sprout::note_commitment(address.a_pk(), value, &rho, &r),
+            anchor: [0; 32],
+            witness_path: vec![0; argos_core::sprout_witness::WITNESS_PATH_SIZE],
+            outpoint: argos_core::argos_wallet_import::keys::JsOutPoint {
+                txid: [id; 32],
+                js_index: 0,
+                output_index: 0,
+            },
+        }
+    }
+
     fn test_sprout_journal(marker: u8) -> argos_core::sprout_sweep::SweepJournal {
         argos_core::sprout_sweep::SweepJournal::for_keys(
             &std::env::temp_dir().join(format!("argos-command-journal-{}", uuid::Uuid::new_v4())),
@@ -3611,6 +3696,7 @@ mod tests {
                 notes_found: 1,
                 spent_notes: 0,
                 total_zatoshis: 100_000,
+                has_lifecycle_status: false,
                 tip_warning: None,
                 decrypt_from_height: None,
                 decrypt_line: String::new(),
@@ -3643,6 +3729,7 @@ mod tests {
                 notes_found: 1,
                 spent_notes: 0,
                 total_zatoshis: 100_000,
+                has_lifecycle_status: false,
                 tip_warning: None,
                 decrypt_from_height: None,
                 decrypt_line: String::new(),
@@ -3961,9 +4048,116 @@ mod tests {
         };
         let wallet = super::sprout_sweep_report(outcome.clone());
         let scan = super::sprout_sweep_report(outcome);
-        assert_eq!(
-            serde_json::to_value(wallet).unwrap(),
-            serde_json::to_value(scan).unwrap()
+        let wallet = serde_json::to_value(wallet).unwrap();
+        let scan = serde_json::to_value(scan).unwrap();
+        assert_eq!(wallet, scan);
+        assert!(
+            wallet.get("landed_in_unified_sapling").is_none(),
+            "post-execution reports cannot attribute a historical transaction to the current destination"
+        );
+    }
+
+    #[test]
+    fn sprout_summary_and_preview_count_only_executable_ready_notes() {
+        use argos_core::broadcast::{EndpointTxEvidence, TxObservation, TxObservationState};
+
+        let dir =
+            std::env::temp_dir().join(format!("argos-ready-summary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+            &dir,
+            &[[0x42; 32]],
+            argos_core::ZeckNetwork::Mainnet,
+        );
+        std::fs::write(
+            journal.path(),
+            format!(
+                "{}:0:0 {}\n{}:0:0 {}\n",
+                "11".repeat(32),
+                "21".repeat(32),
+                "12".repeat(32),
+                "22".repeat(32)
+            ),
+        )
+        .unwrap();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let mined_txid = snapshot
+            .entries()
+            .find(|entry| entry.outpoint.txid == [0x12; 32])
+            .expect("second legacy entry")
+            .txid();
+        let observation = TxObservation {
+            state: TxObservationState::Mined,
+            mined_height: Some(100),
+            expiry_height: None,
+            primary_tip: Some(110),
+            secondary_tip: Some(110),
+            evidence: ["alpha", "bravo"]
+                .into_iter()
+                .map(|operator| EndpointTxEvidence {
+                    operator_id: operator.to_owned(),
+                    endpoint: format!("https://{operator}.example"),
+                    tip_height: Some(110),
+                    reported_height: Some(100),
+                    block_hash: Some(vec![0x55; 32]),
+                    tx_in_block: true,
+                })
+                .collect(),
+        };
+        journal
+            .append_transition(
+                &mut snapshot,
+                mined_txid,
+                argos_core::TxLifecycleState::Mined,
+                None,
+                Some(&observation),
+            )
+            .unwrap();
+
+        let recovered = [preview_note(1_000_000, 0x11), preview_note(2_000_000, 0x12)];
+        let (notes, value, lifecycle) = sprout_ready_summary(&recovered, &snapshot).unwrap();
+        assert_eq!((notes, value, lifecycle), (0, 0, true));
+
+        let preview = sprout_sweep_preview(&recovered, &snapshot).unwrap();
+        assert_eq!((preview.notes, preview.gross_zatoshis), (0, 0));
+        assert_eq!((preview.active.len(), preview.mined.len()), (1, 1));
+
+        let dust = [preview_note(
+            argos_core::sprout_sweep::SPROUT_SWEEP_FEE,
+            0x31,
+        )];
+        let preview = sprout_sweep_preview(
+            &dust,
+            &argos_core::sprout_sweep::SproutJournalSnapshot::default(),
+        )
+        .unwrap();
+        assert_eq!((preview.notes, preview.gross_zatoshis), (0, 0));
+
+        let huge = [preview_note(u64::MAX, 0x41), preview_note(u64::MAX, 0x42)];
+        let preview = sprout_sweep_preview(
+            &huge,
+            &argos_core::sprout_sweep::SproutJournalSnapshot::default(),
+        )
+        .expect("preview aggregation must not panic or wrap");
+        assert_eq!(preview.gross_zatoshis, u64::MAX);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspect_comment_acknowledges_legacy_journal_migration() {
+        let source = include_str!("commands.rs");
+        let inspect = source
+            .split("pub async fn inspect_wallet_file")
+            .next()
+            .expect("inspect declaration");
+        let comment = &inspect[inspect.len().saturating_sub(600)..];
+        assert!(
+            !comment.contains("nothing is written anywhere"),
+            "{comment}"
+        );
+        assert!(
+            comment.contains("journal") && comment.contains("migration"),
+            "{comment}"
         );
     }
 

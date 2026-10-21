@@ -161,10 +161,14 @@ unknown outcome, Argos stops before processing later notes: on the next run it
 reconciles that transaction and, while it remains valid, retries the same bytes
 rather than building a different spend. For an absent or unresolved saved
 transaction, Argos builds a replacement only after independent sources
-corroborate absence beyond its expiry height. An eligible transaction that was
-deterministically rejected follows a separate terminal path back to a new plan.
+corroborate absence beyond its expiry height. A deterministic, retryable, or
+already-known reply from the primary submission endpoint remains
+**SubmissionUnknown** until independent observation resolves its lifecycle.
 Keep the wallet or key, checkpoint, and journal available through every retry
-and restart.
+and restart. Do not run an older Argos version concurrently against the same
+Sprout data directory: older binaries do not honor the directory-wide network
+operation guard. Current Argos also repeats sibling-journal validation just
+before every send, but an older process can still race after that final check.
 
 Configure confirmation sources with the global option
 `--confirmation-source operator-id=https://host:port`, repeated for distinct,
@@ -233,7 +237,7 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Transparent funds are imported into the wallet workspace using Argos's audited legacy derivation, not modern per-account transparent derivation.
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
-- Sprout transactions are journaled before submission. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. An absent or unresolved transaction requires independently corroborated absence beyond expiry before rebuilding; an eligible deterministic rejection can return separately to a new plan.
+- Sprout transactions are journaled before submission. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. An absent or unresolved transaction requires independently corroborated absence beyond expiry before rebuilding. A deterministic, retryable, or already-known reply from the primary submission endpoint remains SubmissionUnknown until independent observation resolves it.
 - Keep the original wallet or Sprout key and the scan checkpoint until Argos reports fresh canonical mined evidence for every saved Sprout transaction.
 - A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
 - A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.

@@ -1,7 +1,7 @@
 //! Durable, versioned Sprout sweep transactions, keyed by note and source.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{Cursor, Write},
     path::{Path, PathBuf},
@@ -494,6 +494,95 @@ impl SweepJournal {
         with_sweep_journal_lock(&self.path, || self.load_or_migrate_unlocked())
     }
 
+    /// Load this key set's journal and reject any sibling journal that also
+    /// claims a note protected by this invocation. The process-wide network
+    /// operation guard serializes current Argos writers; each sibling's own
+    /// journal lock serializes its read with older per-journal writers.
+    /// Binaries predating the network guard cannot be made to honor it, so a
+    /// later execution repeats this check immediately before reconciliation.
+    pub fn load_scoped_snapshot(
+        &self,
+        invocation_outpoints: &[JsOutPoint],
+    ) -> ZeckResult<SproutJournalSnapshot> {
+        let snapshot = self.load_or_migrate()?;
+        let mut protected = invocation_outpoints
+            .iter()
+            .map(note_id)
+            .collect::<HashSet<_>>();
+        protected.extend(snapshot.entries().map(|entry| note_id(&entry.outpoint)));
+        self.reject_overlapping_siblings(&protected)?;
+        Ok(snapshot)
+    }
+
+    fn reject_overlapping_siblings(&self, protected: &HashSet<SproutNoteId>) -> ZeckResult<()> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| journal_error("Sprout journal has no data directory"))?;
+        let mut siblings = fs::read_dir(parent)
+            .map_err(|err| journal_error(format!("reading {}: {err}", parent.display())))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|err| journal_error(format!("reading {}: {err}", parent.display())))
+            })
+            .collect::<ZeckResult<Vec<_>>>()?;
+        siblings.sort();
+
+        for path in siblings {
+            if path == self.path {
+                continue;
+            }
+            let Some(short) = sibling_journal_short_name(&path)? else {
+                continue;
+            };
+            let metadata = fs::symlink_metadata(&path).map_err(|err| {
+                journal_error(format!(
+                    "inspecting sibling journal {}: {err}",
+                    path.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(journal_error(format!(
+                    "sibling Sprout journal {} is a symlink or irregular file; preserve the original key set and data dir and inspect it before sweeping",
+                    path.display()
+                )));
+            }
+            let (network, sibling) =
+                with_sweep_journal_lock(&path, || inspect_sibling_journal(&path, &short)).map_err(
+                    |err| {
+                        journal_error(format!(
+                            "cannot safely inspect sibling Sprout journal {}: {err}",
+                            path.display()
+                        ))
+                    },
+                )?;
+            if network.is_some_and(|network| network != self.network) {
+                continue;
+            }
+            let overlapping_outpoint = sibling
+                .entries()
+                .find(|entry| protected.contains(&note_id(&entry.outpoint)))
+                .map(|entry| entry.outpoint);
+            if let Some(overlapping_outpoint) = overlapping_outpoint {
+                let id = note_id(&overlapping_outpoint);
+                let txid =
+                    id.0.iter()
+                        .rev()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                return Err(journal_error(format!(
+                    "Sprout journal overlap for {txid}:{}:{} between {} and {}. Preserve the original key set and data dir; recover or reconcile that journal identity before sweeping.",
+                    id.1,
+                    id.2,
+                    self.path.display(),
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn load_or_migrate_unlocked(&self) -> ZeckResult<SproutJournalSnapshot> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -769,6 +858,143 @@ impl SweepJournal {
     }
 }
 
+fn sibling_journal_short_name(path: &Path) -> ZeckResult<Option<String>> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(journal_error(format!(
+            "sibling journal path is not UTF-8: {}",
+            path.display()
+        )));
+    };
+    let Some(short) = name
+        .strip_prefix("sprout-sweep-")
+        .and_then(|name| name.strip_suffix(".journal"))
+    else {
+        return Ok(None);
+    };
+    if short.len() != 16
+        || !short
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(journal_error(format!(
+            "invalid sibling Sprout journal filename {}",
+            path.display()
+        )));
+    }
+    Ok(Some(short.to_owned()))
+}
+
+fn inspect_sibling_journal(
+    path: &Path,
+    filename_short: &str,
+) -> ZeckResult<(Option<ZeckNetwork>, SproutJournalSnapshot)> {
+    let bytes = fs::read(path)
+        .map_err(|err| journal_error(format!("reading {}: {err}", path.display())))?;
+    if bytes.is_empty() {
+        return Err(journal_error("empty sibling journal"));
+    }
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| journal_error("sibling journal is not UTF-8"))?;
+    if text.lines().next().unwrap_or_default().starts_with('{') {
+        inspect_v2_sibling(&bytes, filename_short)
+    } else {
+        inspect_v1_sibling(text, filename_short).map(|snapshot| (None, snapshot))
+    }
+}
+
+fn inspect_v2_sibling(
+    bytes: &[u8],
+    filename_short: &str,
+) -> ZeckResult<(Option<ZeckNetwork>, SproutJournalSnapshot)> {
+    if !bytes.contains(&b'\n') {
+        return Err(journal_error("unterminated sibling journal header"));
+    }
+    let mut lines = bytes.split(|byte| *byte == b'\n');
+    let header = lines
+        .next()
+        .ok_or_else(|| journal_error("missing sibling journal header"))?;
+    let (network, fingerprint) = match serde_json::from_slice::<SproutJournalRecord>(header)
+        .map_err(|err| journal_error(format!("invalid sibling journal header: {err}")))?
+    {
+        SproutJournalRecord::Header {
+            version,
+            network,
+            source_fingerprint,
+        } if version == SPROUT_SWEEP_JOURNAL_VERSION => (network, source_fingerprint),
+        _ => return Err(journal_error("unsupported sibling journal header")),
+    };
+    if fingerprint.len() != 64
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !fingerprint.starts_with(filename_short)
+    {
+        return Err(journal_error(
+            "sibling journal fingerprint does not match its filename",
+        ));
+    }
+
+    let mut snapshot = SproutJournalSnapshot::default();
+    let mut remaining = lines.peekable();
+    while let Some(line) = remaining.next() {
+        if remaining.peek().is_none() && !bytes.ends_with(b"\n") {
+            break;
+        }
+        if line.is_empty() {
+            if remaining.peek().is_none() {
+                break;
+            }
+            return Err(journal_error("empty complete sibling journal record"));
+        }
+        let record = serde_json::from_slice(line).map_err(|err| {
+            journal_error(format!("malformed complete sibling journal record: {err}"))
+        })?;
+        snapshot.apply(record, &fingerprint)?;
+    }
+    Ok((Some(network), snapshot))
+}
+
+fn inspect_v1_sibling(text: &str, filename_short: &str) -> ZeckResult<SproutJournalSnapshot> {
+    if !text.ends_with('\n') {
+        return Err(journal_error("unterminated legacy sibling journal record"));
+    }
+    let fingerprint = format!("legacy:{filename_short}");
+    let mut snapshot = SproutJournalSnapshot::default();
+    for line in text.lines() {
+        let (note_text, txid) = line
+            .split_once(' ')
+            .ok_or_else(|| journal_error("malformed legacy sibling journal line"))?;
+        if txid.contains(' ') {
+            return Err(journal_error("malformed legacy sibling journal line"));
+        }
+        let mut parts = note_text.split(':');
+        let tx = parts
+            .next()
+            .ok_or_else(|| journal_error("missing legacy sibling note ID"))?;
+        let js = parts
+            .next()
+            .ok_or_else(|| journal_error("missing legacy sibling JoinSplit index"))?
+            .parse::<u64>()
+            .map_err(|_| journal_error("invalid legacy sibling JoinSplit index"))?;
+        let output = parts
+            .next()
+            .ok_or_else(|| journal_error("missing legacy sibling output index"))?
+            .parse::<u8>()
+            .map_err(|_| journal_error("invalid legacy sibling output index"))?;
+        if parts.next().is_some() || output > 1 {
+            return Err(journal_error("malformed legacy sibling outpoint"));
+        }
+        snapshot.apply(
+            SproutJournalRecord::LegacyAccepted {
+                note_id: (decode_txid(tx)?.into(), js, output),
+                txid: decode_txid(txid)?.to_string(),
+            },
+            &fingerprint,
+        )?;
+    }
+    Ok(snapshot)
+}
+
 pub struct SproutBroadcastStore<'a> {
     journal: &'a SweepJournal,
     note: JournalNoteContext,
@@ -939,6 +1165,82 @@ mod tests {
         let other = SweepJournal::for_keys(dir.path(), &[[0x43; 32]], ZeckNetwork::Mainnet);
         std::fs::copy(journal.path(), other.path()).unwrap();
         assert!(other.load_or_migrate().is_err());
+    }
+
+    #[test]
+    fn scoped_load_strictly_validates_sibling_header_and_raw_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = SweepJournal::for_keys(dir.path(), &[[0x43; 32]], ZeckNetwork::Mainnet);
+        let sibling = journal(dir.path());
+        let mut snapshot = sibling.load_or_migrate().unwrap();
+        sibling
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+
+        let mismatched = dir.path().join("sprout-sweep-deadbeefdeadbeef.journal");
+        std::fs::rename(sibling.path(), &mismatched).unwrap();
+        let err = current
+            .load_scoped_snapshot(&[outpoint()])
+            .expect_err("filename must authenticate the full fingerprint")
+            .to_string();
+        assert!(
+            err.contains("fingerprint") && err.contains("filename"),
+            "{err}"
+        );
+
+        std::fs::rename(&mismatched, sibling.path()).unwrap();
+        let mut records = std::fs::read_to_string(sibling.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        records[1]["transaction"]["raw_tx_base64"] = serde_json::Value::String("AA==".into());
+        let corrupted = records
+            .into_iter()
+            .map(|record| serde_json::to_string(&record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(sibling.path(), corrupted).unwrap();
+        let err = current
+            .load_scoped_snapshot(&[outpoint()])
+            .expect_err("every sibling raw transaction must be reduced and verified")
+            .to_string();
+        assert!(err.contains("transaction") || err.contains("raw"), "{err}");
+    }
+
+    #[test]
+    fn scoped_load_ignores_only_a_fully_valid_other_network_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = journal(dir.path());
+        let sibling = SweepJournal::for_keys(dir.path(), &[[0x43; 32]], ZeckNetwork::Testnet);
+        let mut snapshot = sibling.load_or_migrate().unwrap();
+        sibling
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+        current
+            .load_scoped_snapshot(&[outpoint()])
+            .expect("a valid other-network sibling cannot claim this network's note");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_load_rejects_a_symlinked_sibling() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = journal(dir.path());
+        let target = dir.path().join("outside");
+        std::fs::write(&target, b"not a journal\n").unwrap();
+        let sibling = dir.path().join("sprout-sweep-deadbeefdeadbeef.journal");
+        symlink(&target, &sibling).unwrap();
+        let err = current
+            .load_scoped_snapshot(&[])
+            .expect_err("sibling symlinks fail closed")
+            .to_string();
+        assert!(err.contains("symlink") && err.contains(&sibling.display().to_string()));
     }
 
     #[test]
