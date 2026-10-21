@@ -38,6 +38,173 @@ fn argos(args: &[&str]) -> std::process::Output {
         .expect("argos binary should run")
 }
 
+// Missing dispatch, wrong-network wording, or warning after validation would
+// leave a recovery operator unaware of the deadline before starting work.
+fn nu7_warning(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn nu7_warning_reaches_wallet_inspection_only_when_sprout_keys_exist() {
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&["--wallet-file", wallet.to_str().unwrap(), "inspect-wallet"]);
+    assert!(out.status.success());
+    let warning = nu7_warning(&out.stderr);
+    assert!(warning.contains("NU7"), "{warning}");
+    assert!(warning.contains("all version 4"), "{warning}");
+    assert!(warning.contains("unspendable"), "{warning}");
+    assert!(warning.contains("mined before activation"), "{warning}");
+    assert!(
+        warning.contains("broadcast alone is not enough"),
+        "{warning}"
+    );
+    assert!(warning.contains("Start recovery promptly"), "{warning}");
+    assert!(
+        warning.contains("targeted for about November 5, 2026"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("final height is not yet assigned (proposed in zcash/zips#1405)"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("https://zips.z.cash/zip-0259"),
+        "{warning}"
+    );
+
+    let keys = key_file("nu7-sapling-only.txt", TEST_SAPLING_KEY_MAINNET);
+    let out = argos(&[
+        "--sapling-key-file",
+        keys.to_str().unwrap(),
+        "inspect-wallet",
+    ]);
+    assert!(out.status.success());
+    assert!(!nu7_warning(&out.stderr).contains("NU7"));
+}
+
+#[test]
+fn nu7_warning_precedes_scan_preparation_for_wallet_and_standalone_keys() {
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let spending_key = argos_core::sprout_key::encode_sprout_spending_key(
+        &[7; 32],
+        argos_core::ZeckNetwork::Mainnet,
+    );
+    let keys = key_file("nu7-sprout.txt", &spending_key);
+    for (source, path) in [("--wallet-file", wallet), ("--sprout-key-file", keys)] {
+        let out = argos(&[
+            source,
+            path.to_str().unwrap(),
+            "--accept-tos",
+            "--data-dir",
+            &scratch_dir("nu7-scan"),
+            "scan-sprout",
+            "--destination",
+            "invalid-destination",
+        ]);
+        assert!(!out.status.success());
+        let stderr = nu7_warning(&out.stderr);
+        let warning = stderr.find("NU7").expect("warn before scan preparation");
+        let failure = stderr
+            .find("Error:")
+            .expect("invalid destination must fail");
+        assert!(warning < failure, "{stderr}");
+    }
+}
+
+/// PR #263 review item 4: `scan` and `sweep` warn about NU7 only when the
+/// wallet file holds Sprout keys. A zcashd wallet with transparent and Sapling
+/// keys but no Sprout must stay silent, or the warning becomes noise.
+///
+/// Each run is checked to have got past the point where the warning is
+/// printed (the import line for `scan`, the destination refusal for
+/// `sweep`), and the Sprout fixture is run the same way as a control, so the
+/// silence cannot come from failing too early.
+#[test]
+fn nu7_warning_stays_silent_for_scan_and_sweep_of_a_wallet_without_sprout() {
+    const NO_SPROUT: &str = "modern-plaintext.dat";
+    let run = |wallet: &str, sweep: bool| {
+        let path = fixture(wallet);
+        let dir = scratch_dir(&format!("nu7-silent-{wallet}-{sweep}"));
+        let mut args = vec![
+            "--wallet-file",
+            path.to_str().unwrap(),
+            "--accept-tos",
+            "--lightwalletd-url",
+            "https://127.0.0.1:1",
+            "--data-dir",
+            &dir,
+        ];
+        if sweep {
+            // Refused before any network access, after the warning point.
+            args.extend(["sweep", "--destination", "invalid-destination"]);
+        } else {
+            args.push("scan");
+        }
+        let out = argos(&args);
+        assert!(!out.status.success());
+        nu7_warning(&out.stderr)
+    };
+
+    for sweep in [false, true] {
+        let silent = run(NO_SPROUT, sweep);
+        assert!(silent.contains("Imported"), "{silent}");
+        assert!(silent.contains("Error:"), "{silent}");
+        assert!(!silent.contains("NU7"), "sweep={sweep}: {silent}");
+        assert!(!silent.contains("version 4"), "sweep={sweep}: {silent}");
+
+        let control = run(SPROUT_PLAINTEXT, sweep);
+        assert!(control.contains("NU7"), "sweep={sweep}: {control}");
+    }
+}
+
+#[test]
+fn nu7_testnet_warning_explains_the_activation_boundary_without_urging_a_spend() {
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        wallet.to_str().unwrap(),
+        "--network",
+        "testnet",
+        "inspect-wallet",
+    ]);
+    assert!(out.status.success());
+    let warning = nu7_warning(&out.stderr);
+    assert!(warning.contains("4,465,026"), "{warning}");
+    assert!(warning.contains("At or after"), "{warning}");
+    assert!(warning.contains("cannot spend"), "{warning}");
+    assert!(!warning.contains("Start recovery promptly"), "{warning}");
+}
+
+#[test]
+fn nu7_warning_precedes_wallet_sweep_recovery_including_dry_runs() {
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    for gate in ["--dry-run", "--confirm-sweep"] {
+        let out = argos(&[
+            "--wallet-file",
+            wallet.to_str().unwrap(),
+            "--accept-tos",
+            "--data-dir",
+            &scratch_dir("nu7-sweep"),
+            "sweep-sprout",
+            "--destination",
+            "invalid-destination",
+            gate,
+        ]);
+        assert!(!out.status.success());
+        let stderr = nu7_warning(&out.stderr);
+        let warning = stderr
+            .find("NU7")
+            .expect("warn even when preview cannot recover notes");
+        let recovery = stderr
+            .find("No spendable Sprout notes")
+            .expect("fixture has no notes");
+        assert!(warning < recovery, "{stderr}");
+    }
+}
+
 #[test]
 fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     let path = fixture(SPROUT_PLAINTEXT);
@@ -215,6 +382,10 @@ fn a_wallet_with_sprout_keys_says_sprout_is_not_covered() {
     ]);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("NU7"),
+        "ordinary recovery must warn: {stderr}"
+    );
     assert!(
         stderr.contains("SPROUT FUNDS ARE NOT COVERED"),
         "the Sprout caveat must be unmissable, got:\n{stderr}"
@@ -712,6 +883,11 @@ fn inspect_wallet_consults_a_scan_of_the_same_keys() {
         "inspect-wallet",
     ]);
     let _ = std::fs::remove_file(&checkpoint);
+
+    assert!(
+        nu7_warning(&with_scan.stderr).contains("mined before activation"),
+        "resuming with a checkpoint must retain the deadline warning"
+    );
 
     let with = String::from_utf8_lossy(&with_scan.stdout);
     assert!(

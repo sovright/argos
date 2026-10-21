@@ -89,6 +89,20 @@
         <article class="guide-content">
           <section id="before">
             <h2>Before You Start</h2>
+            <div class="callout">
+              <strong>Urgent: recover Sprout funds before NU7 activates.</strong>
+              <span>
+                NU7 disables version 4 transactions, including all Sprout spends. Your recovery
+                transaction must be <strong>mined before activation</strong>; broadcasting is not
+                enough. Start promptly: a full Sprout scan can take days. Mainnet activation
+                is targeted for about November 5, 2026; the final height is not yet assigned
+                (proposed in <a href="https://github.com/zcash/zips/pull/1405">zcash/zips#1405</a>;
+                see the <a href="https://forum.zcashcommunity.com/t/nu7-timeline/57655">NU7
+                timeline</a>). Check <a href="https://zips.z.cash/zip-0259">ZIP 259</a> for the
+                assigned height. Funds remaining in Sprout after activation will be
+                unspendable under the current NU7 rules.
+              </span>
+            </div>
             <p>
               Argos accepts a 24-word ZecWallet Lite seed, a ZecWallet Lite or zcashd wallet file,
               or a standalone Sapling spending key. It also recovers Sprout from zcashd wallet
@@ -190,6 +204,21 @@
 
           <section id="sprout">
             <h2>Sprout Recovery</h2>
+            <div class="callout">
+              <strong>Sprout recovery deadline: the sweep must be mined before NU7 activation.</strong>
+              <span>
+                NU7 disables version 4 transactions and therefore Sprout spends. A broadcast or
+                completed scan alone does not meet this deadline. Mainnet activation is
+                targeted for about November 5, 2026; the final height is not yet assigned
+                (proposed in <a href="https://github.com/zcash/zips/pull/1405">zcash/zips#1405</a>;
+                see the <a href="https://forum.zcashcommunity.com/t/nu7-timeline/57655">NU7
+                timeline</a>). Start promptly and check
+                <a href="https://zips.z.cash/zip-0259">ZIP 259</a> for the assigned height. After a
+                sweep broadcasts, confirm the transaction is mined before activation.
+                Remaining Sprout funds will be unspendable under the current NU7 rules.
+                Historical scanning and reporting can still identify funds after activation.
+              </span>
+            </div>
             <p>
               Sprout support is included in normal Argos builds. A ZecWallet Lite seed alone cannot
               reconstruct Sprout keys, because the legacy wallet generated those independently.
@@ -205,9 +234,11 @@
             <div class="callout">
               <strong>A Sprout scan is not an ordinary scan.</strong>
               <span>
-                Compact blocks omit Sprout ciphertexts. Mainnet recovery reads 1,046,400 full
-                blocks from the Zcash P2P network, transfers roughly 26 GB, takes hours, and keeps
-                under 500 MB on disk. Progress is checkpointed so you can stop and resume.
+                Compact blocks omit Sprout ciphertexts. Mainnet recovery reads full blocks
+                from genesis through the chain tip to find notes and later spends. Plan for
+                roughly 280 GB of transfer, likely days of work, and under 500 MB retained on
+                disk; the transfer estimate grows with the chain. Progress is checkpointed so
+                you can stop and resume.
               </span>
             </div>
             <p>
