@@ -175,29 +175,13 @@ async fn local_proxy_lost_reply_keeps_unknown_and_restarts_with_exact_bytes() {
         DurableBroadcastLog, LightwalletdSubmitter, PreparedTransaction, SubmissionDisposition,
     };
     use argos_core::models::TxLifecycleState;
-    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTxEvidence};
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
     use zcash_client_backend::proto::service::{
         compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, TxFilter,
     };
-    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
-    use zcash_protocol::consensus::{BlockHeight, BranchId};
-
-    let tx = TransactionData::<Authorized>::from_parts(
-        TxVersion::V5,
-        BranchId::Nu5,
-        0,
-        BlockHeight::from_u32(100),
-        None,
-        None,
-        None,
-        None,
-    )
-    .freeze()
-    .unwrap();
-    let mut raw = Vec::new();
-    tx.write(&mut raw).unwrap();
+    let (txid, raw) = test_v5_transaction();
     let prepared = PreparedTransaction {
-        txid: tx.txid(),
+        txid,
         raw_tx: raw.clone(),
         fee_zatoshis: 12_345,
         expiry_height: Some(100),
@@ -238,12 +222,15 @@ async fn local_proxy_lost_reply_keeps_unknown_and_restarts_with_exact_bytes() {
         vec![raw.clone()]
     );
     proxy.set_scripted_transaction_evidence(ScriptedTxEvidence {
-        txid: Vec::new(),
-        raw_tx: Vec::new(),
+        transaction: ScriptedTransaction::Fixed {
+            txid: prepared.txid.as_ref().to_vec(),
+            raw_tx: raw.clone(),
+        },
         reported_height: 123,
         tip_height: 124,
         block_hash: vec![8; 32],
         block_txids: Vec::new(),
+        include_transaction_in_block: false,
     });
     let tip = client.get_lightd_info(Empty {}).await.unwrap().into_inner();
     assert_eq!(tip.block_height, 124);
@@ -292,21 +279,86 @@ async fn local_proxy_lost_reply_keeps_unknown_and_restarts_with_exact_bytes() {
 }
 
 #[tokio::test]
-async fn fake_lightwalletd_scripts_consistent_transaction_tip_and_block_evidence() {
-    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTxEvidence};
+async fn fake_lightwalletd_binds_next_accepted_transaction_to_including_block() {
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
     use zcash_client_backend::proto::service::{
-        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, TxFilter,
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, RawTransaction, TxFilter,
     };
 
-    let txid = vec![7; 32];
+    let (txid, raw_tx) = test_v5_transaction();
     let fake = FakeLightwalletd::builder()
+        .accept_submissions_for_test()
         .scripted_transaction_evidence(ScriptedTxEvidence {
-            txid: txid.clone(),
-            raw_tx: vec![0xaa, 0xbb],
+            transaction: ScriptedTransaction::NextAcceptedSubmission,
             reported_height: 123,
             tip_height: 124,
             block_hash: vec![8; 32],
             block_txids: Vec::new(),
+            include_transaction_in_block: true,
+        })
+        .build()
+        .await
+        .unwrap();
+    let mut client = CompactTxStreamerClient::connect(fake.url).await.unwrap();
+    let early = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(early.code(), tonic::Code::NotFound);
+    let response = client
+        .send_transaction(RawTransaction {
+            data: raw_tx.clone(),
+            height: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.error_code, 0);
+    let reported = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reported.data, raw_tx);
+    assert_eq!(submitted_txid(&reported.data), txid);
+    let block = client
+        .get_block(BlockId {
+            height: 123,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(block.vtx.iter().any(|tx| tx.txid == txid.as_ref()));
+}
+
+#[tokio::test]
+async fn fake_lightwalletd_scripts_consistent_transaction_tip_and_block_evidence() {
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, TxFilter,
+    };
+
+    let (txid, raw_tx) = test_v5_transaction();
+    let fake = FakeLightwalletd::builder()
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            transaction: ScriptedTransaction::Fixed {
+                txid: txid.as_ref().to_vec(),
+                raw_tx: raw_tx.clone(),
+            },
+            reported_height: 123,
+            tip_height: 124,
+            block_hash: vec![8; 32],
+            block_txids: Vec::new(),
+            include_transaction_in_block: false,
         })
         .build()
         .await
@@ -318,12 +370,13 @@ async fn fake_lightwalletd_scripts_consistent_transaction_tip_and_block_evidence
         .get_transaction(TxFilter {
             block: None,
             index: 0,
-            hash: txid,
+            hash: txid.as_ref().to_vec(),
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(raw.data, vec![0xaa, 0xbb]);
+    assert_eq!(raw.data, raw_tx);
+    assert_eq!(submitted_txid(&raw.data), txid);
     assert_eq!(raw.height, 123);
     let block = client
         .get_block(BlockId {
@@ -344,6 +397,115 @@ async fn fake_lightwalletd_scripts_consistent_transaction_tip_and_block_evidence
         .await
         .unwrap_err();
     assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+#[test]
+#[should_panic(expected = "scripted transaction ID does not match raw bytes")]
+fn fake_lightwalletd_rejects_incoherent_fixed_script() {
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+    let (_, raw_tx) = test_v5_transaction();
+    let _ = FakeLightwalletd::builder().scripted_transaction_evidence(ScriptedTxEvidence {
+        transaction: ScriptedTransaction::Fixed {
+            txid: vec![7; 32],
+            raw_tx,
+        },
+        reported_height: 123,
+        tip_height: 124,
+        block_hash: vec![8; 32],
+        block_txids: Vec::new(),
+        include_transaction_in_block: false,
+    });
+}
+
+#[tokio::test]
+async fn local_observer_contests_included_primary_when_secondary_disagrees() {
+    use argos_core::{
+        broadcast::{TxObservationState, TxObserver},
+        lightwalletd::LightwalletdTxObserver,
+        models::ConfirmationEndpoint,
+    };
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+
+    let (txid, raw_tx) = test_v5_transaction();
+    let primary = FakeLightwalletd::builder()
+        .chain_name("testnet")
+        .sapling_activation_height(280_000)
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            transaction: ScriptedTransaction::Fixed {
+                txid: txid.as_ref().to_vec(),
+                raw_tx: raw_tx.clone(),
+            },
+            reported_height: 123,
+            tip_height: 124,
+            block_hash: vec![8; 32],
+            block_txids: Vec::new(),
+            include_transaction_in_block: true,
+        })
+        .build()
+        .await
+        .unwrap();
+    let secondary = FakeLightwalletd::builder()
+        .chain_name("testnet")
+        .sapling_activation_height(280_000)
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            transaction: ScriptedTransaction::Fixed {
+                txid: txid.as_ref().to_vec(),
+                raw_tx,
+            },
+            reported_height: 122,
+            tip_height: 124,
+            block_hash: vec![9; 32],
+            block_txids: Vec::new(),
+            include_transaction_in_block: true,
+        })
+        .build()
+        .await
+        .unwrap();
+    let mut observer = LightwalletdTxObserver::new(
+        &primary.url,
+        &[
+            ConfirmationEndpoint {
+                operator_id: "primary-operator".to_owned(),
+                endpoint: primary.url.clone(),
+            },
+            ConfirmationEndpoint {
+                operator_id: "secondary-operator".to_owned(),
+                endpoint: secondary.url.clone(),
+            },
+        ],
+    )
+    .unwrap();
+    let result = observer
+        .observe(ZeckNetwork::Testnet, txid, None)
+        .await
+        .unwrap();
+    assert_eq!(result.state, TxObservationState::Contested, "{result:?}");
+    assert_eq!(result.mined_height, None);
+    assert_eq!(result.evidence.len(), 2);
+    assert!(result.evidence[0].tx_in_block);
+    assert!(result.evidence[1].tx_in_block);
+    assert_eq!(result.evidence[0].reported_height, Some(123));
+    assert_eq!(result.evidence[1].reported_height, Some(122));
+}
+
+fn test_v5_transaction() -> (zcash_primitives::transaction::TxId, Vec<u8>) {
+    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+    let tx = TransactionData::<Authorized>::from_parts(
+        TxVersion::V5,
+        BranchId::Nu5,
+        0,
+        BlockHeight::from_u32(100),
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+    let mut raw = Vec::new();
+    tx.write(&mut raw).unwrap();
+    (tx.txid(), raw)
 }
 
 fn submitted_txid(raw: &[u8]) -> zcash_primitives::transaction::TxId {
@@ -554,7 +716,7 @@ async fn hostile_primary_height_with_secondary_disagreement_is_not_mined() {
         broadcast::{BroadcastStore, DurableBroadcastLog, TxObservationState},
         models::{ConfirmationEndpoint, TxLifecycleState},
     };
-    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTxEvidence};
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
 
     let harness = RegtestHarness::require();
     common::regtest_harness::fund_test_account(0, 1_000_000).await;
@@ -587,14 +749,12 @@ async fn hostile_primary_height_with_secondary_disagreement_is_not_mined() {
         .as_u64()
         .expect("regtest tip height");
     fake.set_scripted_transaction_evidence(ScriptedTxEvidence {
-        // Bind this script to the next accepted submission, including its
-        // exact raw bytes and computed txid.
-        txid: Vec::new(),
-        raw_tx: Vec::new(),
+        transaction: ScriptedTransaction::NextAcceptedSubmission,
         reported_height: tip,
         tip_height: tip,
         block_hash: vec![9; 32],
         block_txids: Vec::new(),
+        include_transaction_in_block: true,
     });
     let reviewed = fixture
         .service
@@ -636,7 +796,7 @@ async fn hostile_primary_height_with_secondary_disagreement_is_not_mined() {
     assert_eq!(observation.evidence.len(), 2);
     assert_eq!(observation.evidence[0].reported_height, Some(tip as u32));
     assert!(observation.evidence[0].block_hash.is_some());
-    assert!(!observation.evidence[0].tx_in_block);
+    assert!(observation.evidence[0].tx_in_block);
     assert!(observation.evidence[1].tip_height.is_some());
     assert_ne!(observation.evidence[1].reported_height, Some(tip as u32));
     assert!(

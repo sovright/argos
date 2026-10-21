@@ -123,25 +123,39 @@ impl FakeLightwalletd {
 }
 
 /// Coherent answers for the three RPCs used by transaction confirmation.
-/// `reported_height` selects the only scripted block, whose `block_txids`
-/// explicitly decide whether the claimed transaction is actually included.
+/// `reported_height` selects the only scripted block. Its explicit txids and
+/// `include_transaction_in_block` decide whether the claimed tx is included.
 #[derive(Clone, Debug)]
 pub struct ScriptedTxEvidence {
-    pub txid: Vec<u8>,
-    pub raw_tx: Vec<u8>,
+    pub transaction: ScriptedTransaction,
     pub reported_height: u64,
     pub tip_height: u64,
     pub block_hash: Vec<u8>,
     pub block_txids: Vec<Vec<u8>>,
+    pub include_transaction_in_block: bool,
+}
+
+/// A checked, fixed transaction or the next submission accepted by the node.
+#[derive(Clone, Debug)]
+pub enum ScriptedTransaction {
+    Fixed { txid: Vec<u8>, raw_tx: Vec<u8> },
+    NextAcceptedSubmission,
 }
 
 impl ScriptedTxEvidence {
     fn validate(&self) {
-        assert!(
-            (self.txid.len() == 32 && !self.raw_tx.is_empty())
-                || (self.txid.is_empty() && self.raw_tx.is_empty()),
-            "scripted txid/raw bytes must be explicit or bind to the submitted transaction"
-        );
+        if let ScriptedTransaction::Fixed { txid, raw_tx } = &self.transaction {
+            assert_eq!(txid.len(), 32, "scripted txid must be 32 bytes");
+            let mut cursor = Cursor::new(raw_tx.as_slice());
+            let parsed = Transaction::read(&mut cursor, BranchId::Nu5)
+                .expect("scripted raw bytes must be a valid V5/Nu5 transaction");
+            assert_eq!(cursor.position(), raw_tx.len() as u64);
+            assert_eq!(
+                parsed.txid().as_ref().as_slice(),
+                txid.as_slice(),
+                "scripted transaction ID does not match raw bytes"
+            );
+        }
         assert!(self.tip_height >= self.reported_height);
         assert_eq!(
             self.block_hash.len(),
@@ -412,6 +426,32 @@ struct FakeService {
 }
 
 impl FakeService {
+    fn bind_accepted_submission(&self, raw_tx: &[u8]) -> Result<(), Status> {
+        let mut script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex");
+        if let Some(script) = script.as_mut() {
+            if matches!(
+                script.transaction,
+                ScriptedTransaction::NextAcceptedSubmission
+            ) {
+                let mut cursor = Cursor::new(raw_tx);
+                let tx = Transaction::read(&mut cursor, BranchId::Nu5).map_err(|err| {
+                    Status::internal(format!("cannot parse accepted transaction: {err}"))
+                })?;
+                if cursor.position() != raw_tx.len() as u64 {
+                    return Err(Status::internal("accepted transaction has trailing bytes"));
+                }
+                script.transaction = ScriptedTransaction::Fixed {
+                    txid: tx.txid().as_ref().to_vec(),
+                    raw_tx: raw_tx.to_vec(),
+                };
+            }
+        }
+        Ok(())
+    }
+
     async fn new(builder: FakeLightwalletdBuilder) -> Self {
         let upstream = match builder.upstream_url.as_deref() {
             Some(url) => {
@@ -623,11 +663,18 @@ impl CompactTxStreamer for FakeService {
                     "scripted block does not match requested ID",
                 ));
             }
+            let mut block_txids = script.block_txids.clone();
+            if script.include_transaction_in_block {
+                if let ScriptedTransaction::Fixed { txid, .. } = &script.transaction {
+                    if !block_txids.contains(txid) {
+                        block_txids.push(txid.clone());
+                    }
+                }
+            }
             return Ok(Response::new(CompactBlock {
                 height: script.reported_height,
                 hash: script.block_hash.clone(),
-                vtx: script
-                    .block_txids
+                vtx: block_txids
                     .iter()
                     .map(|txid| pb::CompactTx {
                         txid: txid.clone(),
@@ -746,29 +793,19 @@ impl CompactTxStreamer for FakeService {
             .expect("scripted evidence mutex")
             .clone();
         if let Some(script) = &script {
-            let (txid, raw_tx) = if script.txid.is_empty() {
-                let raw = self
-                    .captured_submissions
-                    .lock()
-                    .expect("submission capture mutex")
-                    .last()
-                    .cloned()
-                    .ok_or_else(|| Status::not_found("no submitted transaction to script"))?;
-                let tx = Transaction::read(&mut Cursor::new(raw.as_slice()), BranchId::Nu5)
-                    .map_err(|err| {
-                        Status::internal(format!("cannot parse captured transaction: {err}"))
-                    })?;
-                (tx.txid().as_ref().to_vec(), raw)
-            } else {
-                (script.txid.clone(), script.raw_tx.clone())
+            let (txid, raw_tx) = match &script.transaction {
+                ScriptedTransaction::Fixed { txid, raw_tx } => (txid, raw_tx),
+                ScriptedTransaction::NextAcceptedSubmission => {
+                    return Err(Status::not_found("no accepted transaction to script"));
+                }
             };
-            if request.get_ref().hash != txid {
+            if request.get_ref().hash != *txid {
                 return Err(Status::not_found(
                     "scripted transaction does not match requested hash",
                 ));
             }
             return Ok(Response::new(RawTransaction {
-                data: raw_tx,
+                data: raw_tx.clone(),
                 height: script.reported_height,
             }));
         }
@@ -787,6 +824,7 @@ impl CompactTxStreamer for FakeService {
             .expect("submission capture mutex")
             .push(request.get_ref().data.clone());
         if self.accept_submissions_for_test && self.upstream.is_none() {
+            self.bind_accepted_submission(&request.get_ref().data)?;
             return Ok(Response::new(SendResponse::default()));
         }
         if let Some(code) = self
@@ -802,6 +840,9 @@ impl CompactTxStreamer for FakeService {
         let req =
             reencode::<_, zcash_client_backend::proto::service::RawTransaction>(request.get_ref());
         let resp = upstream.send_transaction(req).await?.into_inner();
+        if resp.error_code == 0 {
+            self.bind_accepted_submission(&request.get_ref().data)?;
+        }
         if self.drop_send_response_after_forward_once
             && resp.error_code == 0
             && self

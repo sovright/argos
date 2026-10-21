@@ -1421,6 +1421,35 @@ mod tests {
         assert!(DurableBroadcastLog::open(&path).is_ok());
     }
 
+    struct ChildReaper(Option<std::process::Child>);
+
+    impl ChildReaper {
+        fn new(child: std::process::Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.0.as_mut().expect("child still owned").try_wait()
+        }
+
+        fn kill_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            let child = self.0.as_mut().expect("child still owned");
+            child.kill()?;
+            let status = child.wait()?;
+            self.0 = None;
+            Ok(status)
+        }
+    }
+
+    impl Drop for ChildReaper {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     #[test]
     fn process_lock_releases_after_forced_child_exit() {
         const CHILD_ENV: &str = "ARGOS_TEST_BROADCAST_LOCK_CHILD_PATH";
@@ -1436,21 +1465,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
         let ready = dir.path().join("child-ready");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "broadcast::tests::process_lock_releases_after_forced_child_exit",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, &path)
-            .env(READY_ENV, &ready)
-            .spawn()
-            .unwrap();
+        let mut child = ChildReaper::new(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "broadcast::tests::process_lock_releases_after_forced_child_exit",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, &path)
+                .env(READY_ENV, &ready)
+                .spawn()
+                .unwrap(),
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !ready.exists() {
             if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
-                let _ = child.kill();
-                let _ = child.wait();
                 panic!("child never acquired lock");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -1459,8 +1488,7 @@ mod tests {
             DurableBroadcastLog::open(&path).is_err(),
             "child must hold the lock"
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.kill_and_wait().unwrap();
         assert!(
             DurableBroadcastLog::open(&path).is_ok(),
             "OS must release lock on child death"
