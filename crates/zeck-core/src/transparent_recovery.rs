@@ -19,6 +19,7 @@
 //! wallet ever hold". Callers must not present it as the latter.
 
 use sapling_crypto as sapling;
+use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 use tracing::warn;
 use zcash_client_backend::proto::service::{
@@ -31,10 +32,80 @@ use zcash_transparent::{
 };
 
 use crate::{
+    broadcast::{
+        submit_prepared_transaction, BroadcastStore, DurableBroadcastLog, LightwalletdSubmitter,
+        PreparedTransaction, TxSubmitter, BROADCAST_LOG_FILE_NAME,
+    },
     error::{ZeckError, ZeckResult},
     imported::{encode_transparent_address, ImportedTransparentKey},
-    models::ZeckNetwork,
+    models::{TxBroadcastResult, ZeckNetwork},
 };
+
+/// Stable standalone wallet identity; only public addresses enter the hash.
+pub fn standalone_broadcast_log_path(
+    data_dir: &std::path::Path,
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+) -> std::path::PathBuf {
+    let mut addresses = keys
+        .iter()
+        .map(|key| encode_transparent_address(&key.address, network))
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    let mut hasher = Sha256::new();
+    for address in addresses {
+        hasher.update((address.len() as u32).to_le_bytes());
+        hasher.update(address.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let fingerprint = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    data_dir
+        .join(network.label())
+        .join(format!("transparent-{fingerprint}"))
+        .join(BROADCAST_LOG_FILE_NAME)
+}
+
+pub fn open_standalone_broadcast_log(
+    data_dir: &std::path::Path,
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+) -> ZeckResult<DurableBroadcastLog> {
+    let path = standalone_broadcast_log_path(data_dir, keys, network);
+    let parent = path
+        .parent()
+        .ok_or_else(|| ZeckError::Storage("broadcast log has no parent".to_owned()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", parent.display())))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                ZeckError::Storage(format!(
+                    "setting permissions on {}: {err}",
+                    parent.display()
+                ))
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(parent)
+        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", parent.display())))?;
+    let log = DurableBroadcastLog::open(path)?;
+    if let Some(txid) = log.blocking_submission() {
+        return Err(ZeckError::Broadcast(format!(
+            "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep"
+        )));
+    }
+    Ok(log)
+}
 
 /// lightwalletd is queried in batches so a wallet with many addresses does
 /// not build one enormous request. zcashd wallets routinely hold hundreds
@@ -567,10 +638,11 @@ where
     Ok(result.transaction().clone())
 }
 
-/// Outcome of a completed transparent-only sweep.
+/// Outcome of a transparent sweep submission, including uncertain replies.
 #[derive(Debug, Clone)]
 pub struct TransparentSweepOutcome {
-    pub txid: String,
+    pub transaction: TxBroadcastResult,
+    pub disposition: crate::broadcast::SubmissionDisposition,
     pub plan: TransparentSweepPlan,
     pub destination: String,
 }
@@ -627,9 +699,10 @@ pub(crate) fn check_transparent_fee(
 /// same sweep already paid (the Sapling leg of an imported wallet), and 0
 /// when this is the only transaction.
 ///
-/// Broadcasts. Returns once lightwalletd has accepted the transaction into
-/// the mempool — acceptance is not confirmation, and the caller must say so.
+/// Persists the signed transaction before submission and returns its lifecycle
+/// state even when the reply is uncertain or the node rejects it.
 pub async fn sweep_transparent_only(
+    store: &mut impl BroadcastStore,
     keys: &[ImportedTransparentKey],
     network: ZeckNetwork,
     lightwalletd_url: &str,
@@ -637,7 +710,6 @@ pub async fn sweep_transparent_only(
     max_fee_zatoshis: Option<u64>,
     prior_fee_zatoshis: u64,
 ) -> ZeckResult<Option<TransparentSweepOutcome>> {
-    use zcash_client_backend::proto::service::RawTransaction;
     use zcash_proofs::prover::LocalTxProver;
     use zcash_protocol::consensus::BlockHeight;
 
@@ -683,30 +755,53 @@ pub async fn sweep_transparent_only(
     tx.write(&mut raw)
         .map_err(|err| ZeckError::TransactionBuild(format!("serializing the sweep: {err}")))?;
 
-    let response = client
-        .send_transaction(RawTransaction {
-            data: raw,
-            height: 0,
-        })
-        .await
-        .map_err(|err| ZeckError::Broadcast(err.to_string()))?
-        .into_inner();
-    if response.error_code != 0 {
-        let reason = if response.error_message.is_empty() {
-            format!("error code {}", response.error_code)
-        } else {
-            response.error_message.clone()
-        };
-        return Err(ZeckError::Broadcast(format!(
-            "the node rejected the sweep transaction: {reason}"
-        )));
-    }
+    let prepared = PreparedTransaction {
+        txid: tx.txid(),
+        raw_tx: raw,
+        fee_zatoshis: plan.fee_zatoshis,
+        expiry_height: Some(u32::from(tx.expiry_height())),
+    };
+    Ok(Some(
+        submit_transparent_prepared(
+            store,
+            &mut LightwalletdSubmitter {
+                client: &mut client,
+            },
+            prepared,
+            plan,
+            destination,
+        )
+        .await?,
+    ))
+}
 
-    Ok(Some(TransparentSweepOutcome {
-        txid: tx.txid().to_string(),
+async fn submit_transparent_prepared<S: BroadcastStore, N: TxSubmitter>(
+    store: &mut S,
+    submitter: &mut N,
+    prepared: PreparedTransaction,
+    plan: TransparentSweepPlan,
+    destination: &str,
+) -> ZeckResult<TransparentSweepOutcome> {
+    let submitted = submit_prepared_transaction(
+        store,
+        submitter,
+        prepared,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    Ok(TransparentSweepOutcome {
+        transaction: TxBroadcastResult {
+            source_account: 0,
+            txid: Some(submitted.txid.to_string()),
+            status: submitted.state,
+            fee_zatoshis: submitted.fee_zatoshis,
+            detail: format!("transparent sweep submission: {:?}", submitted.disposition),
+            confirmed_height: None,
+        },
+        disposition: submitted.disposition,
         plan,
         destination: destination.to_owned(),
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -828,8 +923,99 @@ mod sweep_tests {
     use super::*;
     use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK};
 
+    #[tokio::test]
+    async fn transparent_transport_failure_returns_known_txid_and_unknown_state() {
+        use crate::broadcast::{DurableBroadcastLog, PreparedTransaction, TxSubmitter};
+        use crate::models::TxLifecycleState;
+        use zcash_client_backend::proto::service::SendResponse;
+        use zcash_primitives::transaction::Authorized;
+        use zcash_primitives::transaction::{TransactionData, TxVersion};
+        use zcash_protocol::consensus::BranchId;
+
+        struct LostReply;
+        #[async_trait::async_trait]
+        impl TxSubmitter for LostReply {
+            async fn send_raw(&mut self, _raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
+                Err(tonic::Status::unavailable("reply lost after send"))
+            }
+        }
+
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::V5,
+            BranchId::Nu5,
+            0,
+            BlockHeight::from_u32(100),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let mut raw = Vec::new();
+        tx.write(&mut raw).unwrap();
+        let prepared = PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx: raw,
+            fee_zatoshis: 10_000,
+            expiry_height: Some(100),
+        };
+        let plan = TransparentSweepPlan {
+            input_count: 1,
+            total_input_zatoshis: 30_000,
+            fee_zatoshis: 10_000,
+            output_zatoshis: 20_000,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        let outcome =
+            submit_transparent_prepared(&mut log, &mut LostReply, prepared, plan, "destination")
+                .await
+                .unwrap();
+        assert_eq!(
+            outcome.transaction.txid.as_deref(),
+            Some(tx.txid().to_string().as_str())
+        );
+        assert_eq!(
+            outcome.transaction.status,
+            TxLifecycleState::SubmissionUnknown
+        );
+        assert_eq!(outcome.transaction.fee_zatoshis, 10_000);
+        assert!(
+            path.exists(),
+            "raw bytes must be durably stored before network I/O"
+        );
+    }
+
     fn height() -> BlockHeight {
         BlockHeight::from_u32(3_000_000)
+    }
+
+    #[test]
+    fn standalone_log_identity_uses_sorted_public_addresses_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |secret: u8, address: u8| ImportedTransparentKey {
+            secret: secp256k1::SecretKey::from_slice(&[secret; 32]).unwrap(),
+            address: tests_support::addr(address),
+        };
+        let first = standalone_broadcast_log_path(
+            dir.path(),
+            &[make(1, 0x11), make(2, 0x22)],
+            ZeckNetwork::Mainnet,
+        );
+        let same_public_addresses = standalone_broadcast_log_path(
+            dir.path(),
+            &[make(4, 0x22), make(3, 0x11)],
+            ZeckNetwork::Mainnet,
+        );
+        let other_network = standalone_broadcast_log_path(
+            dir.path(),
+            &[make(1, 0x11), make(2, 0x22)],
+            ZeckNetwork::Testnet,
+        );
+        assert_eq!(first, same_public_addresses);
+        assert_ne!(first, other_network);
     }
 
     #[test]

@@ -23,9 +23,7 @@ use zcash_client_backend::{
         CoinbaseFilter, InputSource, MaxSpendMode, TransactionStatus, WalletRead, WalletWrite,
     },
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
-    proto::service::{
-        compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction, TxFilter,
-    },
+    proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, TxFilter},
     wallet::OvkPolicy,
 };
 // The crate re-export is deprecated in favor of the standalone `zip321` crate,
@@ -47,6 +45,10 @@ use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, S
 
 use crate::{
     address::validate_destination_address,
+    broadcast::{
+        submit_prepared_transaction, DurableBroadcastLog, LightwalletdSubmitter,
+        PreparedTransaction,
+    },
     derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
     error::{ZeckError, ZeckResult},
     key_source::{KeySource, KeySourceFingerprint, SeedKeySource},
@@ -812,10 +814,7 @@ impl RecoveryService {
                     request.max_fee_zatoshis,
                 )
                 .await;
-            let imported_fee = checked_fee_total(
-                imported.sapling_fee_zatoshis,
-                imported.transparent_fee_zatoshis,
-            )?;
+            let imported_fee = at_risk_fee_total(&imported.transactions)?;
             let imported_outcome = assemble_imported_sweep_outcome_for_legs(
                 imported,
                 imported_result,
@@ -1501,6 +1500,13 @@ async fn execute_sweep_for_session(
             guard.progress.clone(),
         )
     };
+    if let Some(txid) =
+        DurableBroadcastLog::open(workspace.broadcast_log_path())?.blocking_submission()
+    {
+        return Err(ZeckError::Broadcast(format!(
+            "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep leg"
+        )));
+    }
 
     // A scan cannot have reached this point without a seed — `run_recovery_scan_inner`
     // rejects a seedless key source before it derives anything — so this is a
@@ -1520,7 +1526,6 @@ async fn execute_sweep_for_session(
             ))
         })?;
     let prover = LocalTxProver::bundled();
-    let mut total_fee_zatoshis = initial_fee_zatoshis;
     // Sum of the donation outputs actually broadcast (0 when a per-account
     // donation was below the floor or its split fell back). Reported on the
     // outcome so the completion screen shows the true donated total rather than
@@ -1653,13 +1658,14 @@ async fn execute_sweep_for_session(
                 let shielded_before =
                     shielded_spendable_zatoshis(&workspace, runtime.network, &tracked_account)?;
                 let shielded_fee = {
+                    let prior_fee_zatoshis = checked_fee_total(initial_fee_zatoshis, at_risk_fee_total(&results)?)?;
                     let mut ctx = SweepStepCtx {
                         workspace: &workspace,
                         network: runtime.network,
                         client: &mut client,
                         prover: &prover,
                         results: &mut results,
-                        prior_fee_zatoshis: total_fee_zatoshis,
+                        prior_fee_zatoshis,
                         max_fee_zatoshis: request.max_fee_zatoshis,
                         donation_address: effective_donation_address.as_str(),
                         donation_rate: request.donation_rate,
@@ -1674,12 +1680,10 @@ async fn execute_sweep_for_session(
                 // (only dust UTXOs, or funds outside the two receivers); leave it
                 // unshielded and fall through to sweep any existing shielded
                 // balance instead of aborting the whole sweep.
-                if let Some(fee) = shielded_fee {
+                if let Some(_fee) = shielded_fee {
                     account_shielded = true;
-                    // Step already enforced the cap against (prior + step fee)
-                    // before broadcast; recompute here purely to advance the
-                    // running total for the next step.
-                    total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
+                    // Later steps sum the recorded at-risk fees, including
+                    // this shielding transaction if it remains pending.
 
                     // The shield was just broadcast (pending in the mempool). It
                     // MUST mine before the send-max can spend the resulting
@@ -1780,13 +1784,14 @@ async fn execute_sweep_for_session(
             }
 
             let send_max_fee = {
+                let prior_fee_zatoshis = checked_fee_total(initial_fee_zatoshis, at_risk_fee_total(&results)?)?;
                 let mut ctx = SweepStepCtx {
                     workspace: &workspace,
                     network: runtime.network,
                     client: &mut client,
                     prover: &prover,
                     results: &mut results,
-                    prior_fee_zatoshis: total_fee_zatoshis,
+                    prior_fee_zatoshis,
                     max_fee_zatoshis: request.max_fee_zatoshis,
                     donation_address: effective_donation_address.as_str(),
                     donation_rate: request.donation_rate,
@@ -1805,7 +1810,7 @@ async fn execute_sweep_for_session(
             };
             // `None` => no selectable shielded value for this account; skip it
             // rather than aborting the whole sweep.
-            let Some((fee, account_donation)) = send_max_fee else {
+            let Some((_fee, account_donation)) = send_max_fee else {
                 if !account_shielded {
                     skipped_accounts.push(SkippedSweepAccount {
                         account_index: tracked_account.derived.index,
@@ -1817,9 +1822,7 @@ async fn execute_sweep_for_session(
                 }
                 continue;
             };
-            // Step already enforced the cap against (prior + step fee) before broadcast;
-            // recompute here purely to advance the running total for the next account.
-            total_fee_zatoshis = checked_fee_total(total_fee_zatoshis, fee)?;
+            // The next account reads its prior cost from recorded submissions.
             total_donation_zatoshis =
                 total_donation_zatoshis.checked_add(account_donation).ok_or_else(|| {
                     ZeckError::Internal("donation total overflowed the supported range".to_owned())
@@ -1848,11 +1851,9 @@ async fn execute_sweep_for_session(
 /// [`SweepOutcome`].
 ///
 /// - Full success (`Ok(())`) → `Ok` with no error.
-/// - Aborted *after* broadcasting at least one transaction → `Ok` carrying the
-///   partial records plus the error message, so the caller never loses the
-///   record of funds already on-chain (audit Issue E).
-/// - Aborted *before* any broadcast (empty `results`) → propagate the `Err`, so
-///   "no transaction was sent" remains a faithful report.
+/// - Aborted after recording at least one submission → `Ok` carrying the
+///   records plus the error message, including an uncertain first submission.
+/// - Aborted before any submission (empty `results`) → propagate the `Err`.
 ///
 /// `skipped_accounts` records accounts that held a balance but moved nothing
 /// (every spendable note below the ZIP-317 fee floor); it rides along on the
@@ -1875,11 +1876,19 @@ fn assemble_sweep_outcome(
             if results.is_empty() {
                 Err(err)
             } else {
+                let uncertain = results
+                    .iter()
+                    .any(|tx| tx.status == TxLifecycleState::SubmissionUnknown);
+                let error = if uncertain {
+                    format!("{err}. A transaction may already have reached the network; reconcile its txid before retrying or discarding the source wallet.")
+                } else {
+                    err.to_string()
+                };
                 Ok(SweepOutcome {
                     transactions: results,
                     skipped_accounts,
                     total_donation_zatoshis,
-                    error: Some(err.to_string()),
+                    error: Some(error),
                     donation_note: None,
                 })
             }
@@ -1998,6 +2007,7 @@ async fn execute_shielding_step(
 
     broadcast_transactions(
         &mut wallet_db,
+        ctx.workspace,
         ctx.client,
         tracked_account.derived.index,
         txids.into_iter().collect(),
@@ -2006,6 +2016,8 @@ async fn execute_shielding_step(
         ctx.lightwalletd_url,
         ctx.primary_endpoint,
         ctx.network,
+        ctx.prior_fee_zatoshis,
+        ctx.max_fee_zatoshis,
     )
     .await?;
 
@@ -2342,6 +2354,7 @@ async fn execute_send_max_step(
 
     broadcast_transactions(
         &mut wallet_db,
+        ctx.workspace,
         ctx.client,
         tracked_account.derived.index,
         txids.into_iter().collect(),
@@ -2350,6 +2363,8 @@ async fn execute_send_max_step(
         ctx.lightwalletd_url,
         ctx.primary_endpoint,
         ctx.network,
+        ctx.prior_fee_zatoshis,
+        ctx.max_fee_zatoshis,
     )
     .await?;
 
@@ -2364,6 +2379,7 @@ async fn broadcast_transactions(
         SystemClock,
         rand_core::OsRng,
     >,
+    workspace: &RecoveryWorkspace,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     account_index: u32,
     txids: Vec<TxId>,
@@ -2372,7 +2388,23 @@ async fn broadcast_transactions(
     lightwalletd_url: &str,
     primary_endpoint: &str,
     network: crate::models::ZeckNetwork,
+    prior_fee_zatoshis: u64,
+    max_fee_zatoshis: Option<u64>,
 ) -> ZeckResult<()> {
+    use rusqlite::OptionalExtension;
+
+    let mut log = DurableBroadcastLog::open(workspace.broadcast_log_path())?;
+    if let Some(txid) = log.blocking_submission() {
+        return Err(ZeckError::Broadcast(format!(
+            "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before another submission"
+        )));
+    }
+    let fee_db = rusqlite::Connection::open_with_flags(
+        workspace.wallet_db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|err| ZeckError::Wallet(format!("opening wallet fee records: {err}")))?;
+    let mut batch_fee_zatoshis = 0u64;
     for txid in txids {
         let tx = wallet_db
             .get_transaction(txid)
@@ -2387,39 +2419,68 @@ async fn broadcast_transactions(
         tx.write(&mut tx_bytes).map_err(|err| {
             ZeckError::TransactionBuild(format!("serializing transaction {txid}: {err}"))
         })?;
+        let fee_zatoshis: Option<i64> = fee_db
+            .query_row(
+                "SELECT fee FROM transactions WHERE txid = ?1",
+                [txid.as_ref()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| ZeckError::Wallet(format!("reading transaction fee for {txid}: {err}")))?
+            .flatten();
+        let fee_zatoshis = fee_zatoshis
+            .and_then(|fee| u64::try_from(fee).ok())
+            .ok_or_else(|| {
+                ZeckError::Wallet(format!(
+                    "wallet did not persist a valid fee for {label} transaction {txid}"
+                ))
+            })?;
+        enforce_max_fee(
+            checked_fee_total(
+                checked_fee_total(prior_fee_zatoshis, batch_fee_zatoshis)?,
+                fee_zatoshis,
+            )?,
+            max_fee_zatoshis,
+        )?;
+        let submission = submit_prepared_transaction(
+            &mut log,
+            &mut LightwalletdSubmitter { client },
+            PreparedTransaction {
+                txid,
+                raw_tx: tx_bytes,
+                fee_zatoshis,
+                expiry_height: Some(u32::from(tx.expiry_height())),
+            },
+            Duration::from_secs(30),
+        )
+        .await?;
 
-        let response = client
-            .send_transaction(RawTransaction {
-                data: tx_bytes,
-                height: 0,
-            })
-            .await
-            .map_err(|err| ZeckError::Broadcast(err.to_string()))?
-            .into_inner();
-        if response.error_code != 0 {
-            let reason = if response.error_message.is_empty() {
-                format!("error code {}", response.error_code)
-            } else {
-                response.error_message.clone()
-            };
-            return Err(ZeckError::Broadcast(format!(
-                "{label} transaction {txid} was rejected: {reason}"
-            )));
-        }
-
-        // The transaction is on the network now. Record it immediately as
-        // pending so the record survives even if confirmation polling fails
-        // below (audit Issue E); `execute_sweep` surfaces it either way. The
-        // entry is then updated in place once polling resolves.
+        // Record the submission before examining its disposition. A lost reply
+        // still leaves a known txid, fee, and possibly an on-chain transaction.
+        // Accepted submissions are updated if confirmation polling resolves.
         let result_index = results.len();
         results.push(TxBroadcastResult {
             source_account: account_index,
             txid: Some(txid.to_string()),
-            status: TxLifecycleState::Pending,
-            fee_zatoshis: 0,
-            detail: format!("{label} transaction broadcast; awaiting confirmation"),
+            status: submission.state,
+            fee_zatoshis,
+            detail: format!("{label} submission: {:?}", submission.disposition),
             confirmed_height: None,
         });
+        if submission.state.fee_is_at_risk() {
+            batch_fee_zatoshis = checked_fee_total(batch_fee_zatoshis, fee_zatoshis)?;
+        }
+        if submission.blocks_followup_submission() {
+            return Err(ZeckError::Broadcast(format!(
+                "{label} transaction {txid} may already have reached the network or was retryably refused; reconcile its stored bytes before retrying or submitting another sweep leg",
+            )));
+        }
+        if submission.state == TxLifecycleState::Rejected {
+            return Err(ZeckError::Broadcast(format!(
+                "{label} transaction {txid} was rejected: {:?}",
+                submission.disposition,
+            )));
+        }
 
         let (status, detail, confirmed_height) =
             wait_for_confirmation(wallet_db, client, txid, label).await?;
@@ -2427,7 +2488,7 @@ async fn broadcast_transactions(
         // before presenting it as final, so a single hostile server cannot fake
         // a confirmation (audit Issue B follow-up). Best-effort: never fails the
         // sweep, only annotates the detail with the independent result.
-        let detail = if status == "confirmed" {
+        let detail = if status == TxLifecycleState::Mined {
             match cross_verify_mined(lightwalletd_url, primary_endpoint, network, txid).await {
                 Some(true) => format!(
                     "{detail} A second configured endpoint also reported this transaction as mined."
@@ -2444,11 +2505,7 @@ async fn broadcast_transactions(
             detail
         };
         let entry = &mut results[result_index];
-        entry.status = if status == "confirmed" {
-            TxLifecycleState::Mined
-        } else {
-            TxLifecycleState::Pending
-        };
+        entry.status = status;
         entry.detail = detail;
         entry.confirmed_height = confirmed_height;
     }
@@ -2540,7 +2597,7 @@ async fn wait_for_confirmation(
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     txid: TxId,
     label: &str,
-) -> ZeckResult<(String, String, Option<u32>)> {
+) -> ZeckResult<(TxLifecycleState, String, Option<u32>)> {
     for _ in 0..CONFIRMATION_POLL_ATTEMPTS {
         match client
             .get_transaction(TxFilter {
@@ -2593,7 +2650,7 @@ async fn wait_for_confirmation(
                     // must not let the user treat a single server's word as
                     // final. Make the attestation explicit (audit Issue B).
                     return Ok((
-                        "confirmed".to_owned(),
+                        TxLifecycleState::Mined,
                         format!(
                             "{label} transaction reported mined at height {mined_height} by the \
                              connected lightwalletd server. This confirmation is attested by a \
@@ -2619,7 +2676,7 @@ async fn wait_for_confirmation(
     }
 
     Ok((
-        "pending".to_owned(),
+        TxLifecycleState::Pending,
         format!(
             "{label} transaction broadcast successfully, but confirmation was not observed during the wait window."
         ),
@@ -2710,6 +2767,13 @@ pub(crate) fn checked_fee_total(
     prior_fee_zatoshis
         .checked_add(next_fee_zatoshis)
         .ok_or_else(|| ZeckError::Internal("fee total overflowed the supported range".to_owned()))
+}
+
+pub(crate) fn at_risk_fee_total(results: &[TxBroadcastResult]) -> ZeckResult<u64> {
+    results
+        .iter()
+        .filter(|result| result.status.fee_is_at_risk())
+        .try_fold(0, |sum, result| checked_fee_total(sum, result.fee_zatoshis))
 }
 
 pub(crate) fn enforce_max_fee(
@@ -2890,30 +2954,13 @@ fn assemble_imported_sweep_outcome_for_legs(
     sapling_expected: bool,
     transparent_expected: bool,
 ) -> ZeckResult<SweepOutcome> {
-    let mut transactions = Vec::new();
+    let transactions = outcome.transactions;
     let mut skipped_accounts = Vec::new();
-
-    // One entry per Sapling account that moved, so a wallet holding several
-    // Sapling keys reports every transaction rather than only the first.
-    for (index, txid) in outcome.sapling_txids.iter().enumerate() {
-        transactions.push(TxBroadcastResult {
-            source_account: outcome
-                .sapling_display_indices
-                .get(index)
-                .copied()
-                .unwrap_or(index as u32),
-            txid: Some(txid.clone()),
-            status: TxLifecycleState::Pending,
-            fee_zatoshis: 0,
-            detail: "Sapling notes from the imported wallet".to_owned(),
-            confirmed_height: None,
-        });
-    }
     // Only claimed when the leg actually ran to the end. A leg that aborted
     // has not established that the pool is empty, and reporting "holds no
     // spendable Sapling notes" for a pool whose sweep failed would tell the
     // user the opposite of what happened.
-    if sapling_expected && outcome.sapling_txids.is_empty() && outcome.sapling_leg_completed {
+    if sapling_expected && outcome.sapling_transaction_count == 0 && outcome.sapling_leg_completed {
         skipped_accounts.push(SkippedSweepAccount {
             account_index: outcome.sapling_empty_display_index.unwrap_or(0),
             reason: "the imported wallet holds no spendable Sapling notes".to_owned(),
@@ -2921,27 +2968,15 @@ fn assemble_imported_sweep_outcome_for_legs(
         });
     }
 
-    match outcome.transparent_txid {
-        Some(txid) => transactions.push(TxBroadcastResult {
-            source_account: outcome.transparent_display_index.unwrap_or(0),
-            txid: Some(txid),
-            status: TxLifecycleState::Pending,
-            fee_zatoshis: outcome.transparent_fee_zatoshis,
-            detail: format!(
-                "standalone transparent UTXOs sent directly to the destination Sapling receiver ({} zatoshis, {} fee)",
-                outcome.transparent_zatoshis, outcome.transparent_fee_zatoshis
-            ),
-            confirmed_height: None,
-        }),
-        None => {
-            if transparent_expected && outcome.transparent_leg_completed {
-                skipped_accounts.push(SkippedSweepAccount {
-                    account_index: outcome.transparent_display_index.unwrap_or(0),
-                    reason: "the imported wallet holds no spendable transparent funds".to_owned(),
-                    gross_zatoshis: 0,
-                });
-            }
-        }
+    if transparent_expected
+        && !outcome.transparent_transaction_recorded
+        && outcome.transparent_leg_completed
+    {
+        skipped_accounts.push(SkippedSweepAccount {
+            account_index: outcome.transparent_display_index.unwrap_or(0),
+            reason: "the imported wallet holds no spendable transparent funds".to_owned(),
+            gross_zatoshis: 0,
+        });
     }
 
     assemble_sweep_outcome(
@@ -3651,7 +3686,8 @@ mod tests {
     fn an_imported_sweep_outcome_says_why_no_donation_was_sent() {
         let outcome = crate::service::assemble_imported_sweep_outcome(
             crate::imported_sweep::ImportedSweepOutcome {
-                sapling_txids: vec!["txid".to_owned()],
+                transactions: vec![sample_imported_result(0, "txid", "Sapling")],
+                sapling_transaction_count: 1,
                 sapling_leg_completed: true,
                 transparent_leg_completed: true,
                 ..Default::default()
@@ -3808,6 +3844,21 @@ mod tests {
         }
     }
 
+    fn sample_imported_result(
+        account: u32,
+        txid: &str,
+        detail: &str,
+    ) -> crate::models::TxBroadcastResult {
+        crate::models::TxBroadcastResult {
+            source_account: account,
+            txid: Some(txid.to_owned()),
+            status: crate::models::TxLifecycleState::Pending,
+            fee_zatoshis: 10_000,
+            detail: detail.to_owned(),
+            confirmed_height: None,
+        }
+    }
+
     #[test]
     fn sweep_outcome_full_success_carries_no_error() {
         use super::assemble_sweep_outcome;
@@ -3844,6 +3895,61 @@ mod tests {
         assert!(message.contains("account 2 rejected"));
     }
 
+    #[test]
+    fn unknown_first_transaction_is_returned_even_without_prior_success() {
+        use super::assemble_sweep_outcome;
+        use crate::models::TxLifecycleState;
+
+        let mut unknown = sample_broadcast_result(0);
+        unknown.txid = Some("known-before-submit".to_owned());
+        unknown.status = TxLifecycleState::SubmissionUnknown;
+        unknown.fee_zatoshis = 10_000;
+        unknown.confirmed_height = None;
+        let outcome = assemble_sweep_outcome(
+            vec![unknown],
+            Vec::new(),
+            0,
+            Err(ZeckError::Broadcast("transport closed".to_owned())),
+        )
+        .expect("an ambiguous first submission must return its durable identity");
+        assert_eq!(outcome.transactions.len(), 1);
+        assert_eq!(
+            outcome.transactions[0].txid.as_deref(),
+            Some("known-before-submit")
+        );
+        assert_eq!(outcome.transactions[0].fee_zatoshis, 10_000);
+        let error = outcome.error.expect("uncertainty must remain visible");
+        assert!(
+            error.contains("may already have reached the network"),
+            "{error}"
+        );
+        assert!(error.contains("reconcil"), "{error}");
+    }
+
+    #[test]
+    fn unknown_submission_fee_counts_against_total_cap() {
+        let mut unknown = sample_broadcast_result(0);
+        unknown.status = crate::models::TxLifecycleState::SubmissionUnknown;
+        unknown.fee_zatoshis = 10_000;
+        let prior = super::at_risk_fee_total(&[unknown]).unwrap();
+        assert_eq!(prior, 10_000);
+        assert!(matches!(
+            super::enforce_max_fee(
+                super::checked_fee_total(prior, 20_000).unwrap(),
+                Some(20_000)
+            ),
+            Err(ZeckError::MaxFeeExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn rejected_submission_does_not_consume_fee_cap() {
+        let mut rejected = sample_broadcast_result(0);
+        rejected.status = crate::models::TxLifecycleState::Rejected;
+        rejected.fee_zatoshis = 10_000;
+        assert_eq!(super::at_risk_fee_total(&[rejected]).unwrap(), 0);
+    }
+
     /// An imported sweep that broadcast some accounts and then failed must
     /// report the transactions it already sent, with the failure attached.
     ///
@@ -3866,18 +3972,16 @@ mod tests {
 
         let outcome = assemble_imported_sweep_outcome(
             ImportedSweepOutcome {
-                sapling_txids: vec!["txid-account-0".to_owned(), "txid-account-1".to_owned()],
-                sapling_display_indices: vec![0, 1],
-                sapling_empty_display_index: None,
+                transactions: vec![
+                    sample_imported_result(0, "txid-account-0", "Sapling"),
+                    sample_imported_result(1, "txid-account-1", "Sapling"),
+                ],
+                sapling_transaction_count: 2,
                 // The leg aborted on account 2, so it never established that
                 // the pool was empty.
                 sapling_leg_completed: false,
-                transparent_txid: None,
-                transparent_display_index: None,
-                transparent_zatoshis: 0,
-                transparent_fee_zatoshis: 0,
                 transparent_leg_completed: true,
-                sapling_fee_zatoshis: 0,
+                ..Default::default()
             },
             Err(ZeckError::Broadcast(
                 "the node rejected the Sapling sweep: account 2".to_owned(),
@@ -3918,8 +4022,8 @@ mod tests {
     fn imported_sweep_uses_registered_display_indices_after_filtering() {
         let outcome = super::assemble_imported_sweep_outcome(
             crate::imported_sweep::ImportedSweepOutcome {
-                sapling_txids: vec!["imported-tx".to_owned()],
-                sapling_display_indices: vec![7],
+                transactions: vec![sample_imported_result(7, "imported-tx", "Sapling")],
+                sapling_transaction_count: 1,
                 sapling_leg_completed: true,
                 transparent_leg_completed: true,
                 ..Default::default()
@@ -3936,7 +4040,8 @@ mod tests {
             crate::imported_sweep::ImportedSweepOutcome {
                 sapling_leg_completed: true,
                 transparent_leg_completed: true,
-                transparent_txid: Some("transparent-tx".to_owned()),
+                transactions: vec![sample_imported_result(5, "transparent-tx", "direct")],
+                transparent_transaction_recorded: true,
                 transparent_display_index: Some(5),
                 ..Default::default()
             },

@@ -14,7 +14,10 @@ use argos_core::{
     argos_wallet_import::{self, ImportedKeys},
     derive_accounts, detect_birthday, estimate_birthday_from_date,
     imported::{encode_transparent_address, imported_transparent_keys},
-    transparent_recovery::{scan_transparent_only, sweep_transparent_only, TransparentScanReport},
+    transparent_recovery::{
+        open_standalone_broadcast_log, scan_transparent_only, sweep_transparent_only,
+        TransparentScanReport,
+    },
     validate_destination_address, ImportedKeySource, KeySource, RecoveryService, ScanConfig,
     ScanDiscovery, ScanHandle, ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
 };
@@ -476,8 +479,10 @@ fn report_forged_sprout_keys(keys: &mut ImportedKeys) {
 /// Sweep a transparent-only wallet, with the same guard rails the HD sweep
 /// has: a dry run that signs nothing, an explicit confirmation for an
 /// irreversible action, and a fee ceiling checked before signing.
+#[allow(clippy::too_many_arguments)]
 async fn run_transparent_sweep(
     keys: &[argos_core::imported::ImportedTransparentKey],
+    data_dir: &Path,
     network: ZeckNetwork,
     lightwalletd_url: &str,
     destination: &str,
@@ -517,21 +522,51 @@ async fn run_transparent_sweep(
         );
     }
 
-    let outcome = sweep_transparent_only(keys, network, lightwalletd_url, destination, max_fee, 0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("there was nothing to sweep"))?;
+    let mut log = open_standalone_broadcast_log(data_dir, keys, network)?;
+    let outcome = sweep_transparent_only(
+        &mut log,
+        keys,
+        network,
+        lightwalletd_url,
+        destination,
+        max_fee,
+        0,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("there was nothing to sweep"))?;
 
     println!();
-    println!("━━━ Sweep broadcast ━━━");
-    println!("  Transaction  {}", outcome.txid);
+    println!("━━━ Sweep submission ━━━");
+    println!(
+        "  Transaction  {}",
+        outcome.transaction.txid.as_deref().unwrap_or("unknown")
+    );
     println!("  Inputs       {}", outcome.plan.input_count);
     println!("  Fee          {}", format_zec(outcome.plan.fee_zatoshis));
     println!(
-        "  Sent         {}",
+        "  Planned output  {}",
         format_zec(outcome.plan.output_zatoshis)
     );
     println!("  Destination  {}", outcome.destination);
     println!();
+    if outcome.transaction.status == argos_core::TxLifecycleState::SubmissionUnknown {
+        bail!("Transaction {} (fee {}) may already have reached the network; do not retry or discard the source wallet. Reconcile this txid before any further sweep.",
+            outcome.transaction.txid.as_deref().unwrap_or("unknown"),
+            format_zec(outcome.transaction.fee_zatoshis));
+    }
+    if outcome.transaction.status == argos_core::TxLifecycleState::Rejected {
+        bail!(
+            "Transaction {} was rejected: {}",
+            outcome.transaction.txid.as_deref().unwrap_or("unknown"),
+            outcome.transaction.detail
+        );
+    }
+    if matches!(
+        outcome.disposition,
+        argos_core::broadcast::SubmissionDisposition::RetryableRejection { .. }
+    ) {
+        bail!("Transaction {} was retryably refused; reconcile the stored transaction before retrying. Do not submit another sweep leg.", outcome.transaction.txid.as_deref().unwrap_or("unknown"));
+    }
     // Mempool acceptance is not confirmation, and a recovery user reading
     // "broadcast" as "done" may delete the wallet file that still holds the
     // only copy of these keys.
@@ -1761,6 +1796,7 @@ async fn main() -> Result<()> {
                     let resolved = imported_transparent_keys(keys)?;
                     return run_transparent_sweep(
                         &resolved,
+                        &cli.data_dir,
                         network,
                         &cli.lightwalletd_url,
                         destination,
@@ -1994,8 +2030,12 @@ async fn main() -> Result<()> {
                         println!();
                         for result in &outcome.transactions {
                             println!(
-                                "  account {}  {}  {}",
-                                result.source_account, result.status, result.detail
+                                "  account {}  {}  txid {}  fee {}  {}",
+                                result.source_account,
+                                result.status,
+                                result.txid.as_deref().unwrap_or("unknown"),
+                                format_zec(result.fee_zatoshis),
+                                result.detail
                             );
                         }
                         println!();
@@ -2039,13 +2079,13 @@ async fn main() -> Result<()> {
                             // Make this loud so the operator does not assume
                             // nothing was sent and retry into a double-broadcast.
                             Some(message) => {
-                                eprintln!(
-                                    "Sweep aborted after broadcasting the transactions listed \
-                                     above. Those funds are already on-chain; the remaining \
-                                     accounts were NOT swept. Rescan or check a block explorer \
-                                     for the destination before retrying, to avoid broadcasting \
-                                     duplicates."
-                                );
+                                if outcome.transactions.iter().any(|tx| {
+                                    tx.status == argos_core::TxLifecycleState::SubmissionUnknown
+                                }) {
+                                    eprintln!("A listed transaction may already have reached the network; do not retry or discard the source wallet. Reconcile its txid before any further sweep.");
+                                } else {
+                                    eprintln!("Sweep aborted with the transaction results listed above. Verify their txids before retrying; remaining accounts were not swept.");
+                                }
                                 eprintln!("Error: {message}");
                                 std::process::exit(1);
                             }

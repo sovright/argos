@@ -153,6 +153,18 @@ pub struct TxSubmissionResult {
     pub disposition: SubmissionDisposition,
 }
 
+impl TxSubmissionResult {
+    /// A later sweep leg cannot advance until this exact transaction is reconciled.
+    pub fn blocks_followup_submission(&self) -> bool {
+        self.state == TxLifecycleState::SubmissionUnknown
+            || (self.state == TxLifecycleState::Pending
+                && matches!(
+                    self.disposition,
+                    SubmissionDisposition::RetryableRejection { .. }
+                ))
+    }
+}
+
 /// Recognize only stable, specific node reasons. Any unfamiliar response stays
 /// ambiguous; response codes alone are not proof of consensus invalidity.
 pub fn classify_send_response(response: &SendResponse) -> SubmissionDisposition {
@@ -348,6 +360,20 @@ pub struct DurableBroadcastLog {
 }
 
 impl DurableBroadcastLog {
+    /// A prior ambiguous or retryable submission must be reconciled before a
+    /// fresh sweep can construct or submit another transaction.
+    pub fn blocking_submission(&self) -> Option<TxId> {
+        self.latest.iter().find_map(|(txid, persisted)| {
+            (persisted.state == TxLifecycleState::SubmissionUnknown
+                || (persisted.state == TxLifecycleState::Pending
+                    && matches!(
+                        persisted.last_submission,
+                        Some(SubmissionDisposition::RetryableRejection { .. })
+                    )))
+            .then_some(*txid)
+        })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> ZeckResult<Self> {
         let path = path.as_ref().to_path_buf();
         let bytes = match fs::read(&path) {
@@ -681,6 +707,48 @@ mod tests {
     use zcash_primitives::transaction::TxId;
     use zcash_primitives::transaction::{TransactionData, TxVersion};
     use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    #[test]
+    fn retryable_disposition_blocks_followup_only_while_pending() {
+        let txid = fixture().txid;
+        let retryable = SubmissionDisposition::RetryableRejection {
+            code: 1,
+            reason: "mempool full".to_owned(),
+        };
+        let pending = TxSubmissionResult {
+            txid,
+            state: TxLifecycleState::Pending,
+            fee_zatoshis: 10_000,
+            disposition: retryable.clone(),
+        };
+        assert!(pending.blocks_followup_submission());
+        let rejected = TxSubmissionResult {
+            state: TxLifecycleState::Rejected,
+            disposition: retryable,
+            ..pending
+        };
+        assert!(!rejected.blocks_followup_submission());
+    }
+
+    #[test]
+    fn durable_log_identifies_submissions_that_block_new_sweep_legs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(log.blocking_submission(), None);
+        log.persist_prepared(&tx).unwrap();
+        log.transition(
+            tx.txid,
+            TxLifecycleState::SubmissionUnknown,
+            Some(&SubmissionDisposition::AmbiguousTransport),
+            None,
+        )
+        .unwrap();
+        assert_eq!(log.blocking_submission(), Some(tx.txid));
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(reopened.blocking_submission(), Some(tx.txid));
+    }
 
     #[derive(Default, Clone)]
     struct RecordingStore(Arc<Mutex<Option<PersistedTransaction>>>);

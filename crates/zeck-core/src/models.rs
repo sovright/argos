@@ -486,6 +486,13 @@ pub enum TxLifecycleState {
     Rejected,
 }
 
+impl TxLifecycleState {
+    /// A submitted transaction can still be mined even if its reply was lost.
+    pub fn fee_is_at_risk(self) -> bool {
+        matches!(self, Self::SubmissionUnknown | Self::Pending | Self::Mined)
+    }
+}
+
 impl std::fmt::Display for TxLifecycleState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -511,18 +518,14 @@ pub struct TxBroadcastResult {
 
 /// Outcome of an `execute_sweep`, reported even when the sweep aborts partway.
 ///
-/// A multi-account sweep broadcasts transactions one account at a time. If a
-/// later account fails after an earlier one has already been broadcast, the
-/// earlier transactions are on-chain and irreversible. `transactions` always
-/// lists every transaction that was broadcast — on full success and on a
-/// partial abort alike — so the caller never loses the record of funds that
-/// have already moved (audit Issue E).
+/// A multi-account sweep submits transactions one account at a time.
+/// `transactions` records every attempted submission, including one whose
+/// reply was lost or whose rejection was definite. Each record retains the
+/// known txid, fee, and lifecycle state.
 ///
 /// `error` is `None` on full success and `Some(message)` when the sweep
-/// aborted after broadcasting the transactions in `transactions`. A failure
-/// *before any* transaction is broadcast is reported as an `Err` from
-/// `execute_sweep` instead, so an empty `transactions` with `error: Some` is
-/// never produced.
+/// aborted after preparing a listed transaction. A failure before any
+/// transaction is prepared is reported as an `Err` from `execute_sweep`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepOutcome {
     pub transactions: Vec<TxBroadcastResult>,
