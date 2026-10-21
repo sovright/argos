@@ -28,6 +28,7 @@
 
 pub mod bdb;
 pub mod error;
+mod identity;
 pub mod keys;
 pub mod sniff;
 pub mod zcashd;

@@ -84,6 +84,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::{ImportDiagnostic, ImportError},
+    identity,
     keys::{ImportedKeys, Provenance, SaplingKey, TransparentKey},
 };
 
@@ -289,13 +290,12 @@ impl<'a> Cursor<'a> {
 
     /// ZWL address strings (`WalletTKey::read`'s `address` field): a
     /// plain little-endian `u64` byte length, NOT CompactSize like
-    /// `Vector`. The bytes are discarded — this crate does not retain
-    /// addresses, only key material.
-    fn skip_zwl_string(&mut self) -> ZwlReadResult<()> {
+    /// `Vector`. Return a borrowed slice for comparison with the key.
+    fn zwl_string(&mut self) -> ZwlReadResult<&'a [u8]> {
         let len = self.u64_le("address")?;
         let len = usize::try_from(len)
             .map_err(|_| self.error("address", "value length limit exceeded"))?;
-        self.skip(len, "address")
+        self.take(len, "address")
     }
 }
 
@@ -339,6 +339,7 @@ enum ZKeyEntry {
     /// unrecognized key type). No spending key was ever present here —
     /// this is not a failure.
     NoSpendingKey,
+    Mismatch,
 }
 
 /// Read one `WalletZKey`. Field order confirmed against `WalletZKey::read`
@@ -348,7 +349,7 @@ fn read_zkey(cur: &mut Cursor) -> ZwlReadResult<ZKeyEntry> {
     let keytype = cur.u32_le("zkey")?;
     cur.u8("zkey")?;
     let extsk = cur.optional("zkey", |c| c.array::<EXTSK_LEN>("zkey"))?;
-    cur.skip(EXTFVK_LEN, "zkey")?;
+    let extfvk = cur.take(EXTFVK_LEN, "zkey")?;
     cur.optional("zkey", |c| c.u32_le("zkey"))?;
     cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
     cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
@@ -364,10 +365,13 @@ fn read_zkey(cur: &mut Cursor) -> ZwlReadResult<ZKeyEntry> {
     };
 
     Ok(match extsk {
-        Some(bytes) => ZKeyEntry::Recovered(SaplingKey {
-            extsk: Secret::new(bytes.to_vec()),
-            provenance,
-        }),
+        Some(bytes) if identity::sapling_matches_extfvk(&bytes, extfvk) => {
+            ZKeyEntry::Recovered(SaplingKey {
+                extsk: Secret::new(bytes.to_vec()),
+                provenance,
+            })
+        }
+        Some(_) => ZKeyEntry::Mismatch,
         None => ZKeyEntry::Locked(provenance),
     })
 }
@@ -375,6 +379,7 @@ fn read_zkey(cur: &mut Cursor) -> ZwlReadResult<ZKeyEntry> {
 enum TKeyEntry {
     Recovered(TransparentKey),
     Locked(Provenance),
+    Mismatch,
 }
 
 /// Read one `WalletTKey` in the post-version-20 shape. Field order
@@ -384,7 +389,7 @@ fn read_tkey(cur: &mut Cursor) -> ZwlReadResult<TKeyEntry> {
     let keytype = cur.u32_le("tkey")?;
     cur.u8("tkey")?;
     let key = cur.optional("tkey", |c| c.array::<TRANSPARENT_SECRET_LEN>("tkey"))?;
-    cur.skip_zwl_string()?; // t-address, not retained
+    let address = cur.zwl_string()?;
     cur.optional("tkey", |c| c.u32_le("tkey"))?;
     cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
     cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
@@ -396,10 +401,16 @@ fn read_tkey(cur: &mut Cursor) -> ZwlReadResult<TKeyEntry> {
     };
 
     Ok(match key {
-        Some(secret) => TKeyEntry::Recovered(TransparentKey {
-            secret: Secret::new(secret),
-            provenance,
-        }),
+        Some(secret)
+            if std::str::from_utf8(address)
+                .is_ok_and(|s| identity::transparent_matches_address(&secret, s).is_ok()) =>
+        {
+            TKeyEntry::Recovered(TransparentKey {
+                secret: Secret::new(secret),
+                provenance,
+            })
+        }
+        Some(_) => TKeyEntry::Mismatch,
         None => TKeyEntry::Locked(provenance),
     })
 }
@@ -462,6 +473,13 @@ fn read_key_vectors(
                 out.diagnostics.push(locked_key("zwl-zkey", provenance))
             }
             ZKeyEntry::NoSpendingKey => {}
+            ZKeyEntry::Mismatch => {
+                out.diagnostics
+                    .push(ImportDiagnostic::PublicIdentifierMismatch {
+                        record_type: "zwl-zkey".to_owned(),
+                        identifier: "extended full viewing key",
+                    })
+            }
         }
     }
 
@@ -470,21 +488,39 @@ fn read_key_vectors(
         // secp256k1 secrets, then a parallel vector of address strings —
         // no per-key locked/Optional wrapper at all. Confirmed against
         // the `version <= 20` arm of `Keys::read` in `src/keys.rs`. This
-        // shape predates ZWL's wallet-encryption feature, so trusting
-        // these bytes directly (as the reference implementation itself
-        // does, unconditionally) is safe in the cases that shape actually
-        // occurs in.
+        // shape predates ZWL's wallet-encryption feature. Pair each
+        // secret with its parallel address before accepting it.
         let secret_count = cur.compact_size("tkeys")?;
+        let mut secrets = Vec::new();
         for _ in 0..secret_count {
-            let secret = cur.array::<TRANSPARENT_SECRET_LEN>("key")?;
-            out.transparent.push(TransparentKey {
-                secret: Secret::new(secret),
-                provenance: Provenance::HdDerived,
-            });
+            secrets.push(Secret::new(cur.array::<TRANSPARENT_SECRET_LEN>("key")?));
         }
         let address_count = cur.compact_size("address")?;
+        let mut pending = secrets.into_iter();
         for _ in 0..address_count {
-            cur.skip_zwl_string()?;
+            let address = cur.zwl_string()?;
+            if let Some(secret) = pending.next() {
+                if std::str::from_utf8(address).is_ok_and(|s| {
+                    identity::transparent_matches_address(secret.expose_secret(), s).is_ok()
+                }) {
+                    out.transparent.push(TransparentKey {
+                        secret,
+                        provenance: Provenance::HdDerived,
+                    });
+                } else {
+                    out.diagnostics
+                        .push(ImportDiagnostic::PublicIdentifierMismatch {
+                            record_type: "zwl-tkey".to_owned(),
+                            identifier: "transparent address",
+                        });
+                }
+            }
+        }
+        if secret_count != address_count {
+            out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                record_type: "zwl-tkey".to_owned(),
+                reason: "secret and address counts differ".to_owned(),
+            });
         }
     } else {
         let tkey_count = cur.compact_size("tkeys")?;
@@ -492,6 +528,13 @@ fn read_key_vectors(
             let entry = read_tkey(cur)?;
             match entry {
                 TKeyEntry::Recovered(k) => out.transparent.push(k),
+                TKeyEntry::Mismatch => {
+                    out.diagnostics
+                        .push(ImportDiagnostic::PublicIdentifierMismatch {
+                            record_type: "zwl-tkey".to_owned(),
+                            identifier: "transparent address",
+                        })
+                }
                 TKeyEntry::Locked(provenance) => {
                     out.diagnostics.push(locked_key("zwl-tkey", provenance))
                 }
@@ -733,14 +776,23 @@ mod tests {
     }
 
     fn zkey_hd(extsk_byte: u8) -> Vec<u8> {
-        let mut v = vec![1u8]; // record version
-        v.extend_from_slice(&u32le(0)); // keytype = HdKey
-        v.push(0); // locked = false
-        v.extend_from_slice(&opt_some(vec![extsk_byte; EXTSK_LEN])); // extsk
-        v.extend_from_slice(&[0u8; EXTFVK_LEN]); // extfvk
-        v.extend_from_slice(&opt_some(u32le(0))); // hdkey_num
-        v.extend_from_slice(&opt_none()); // enc_key
-        v.extend_from_slice(&opt_none()); // nonce
+        use sapling_crypto::zip32::ExtendedSpendingKey;
+        let extsk = ExtendedSpendingKey::master(&[extsk_byte; 32]);
+        let mut extfvk = Vec::new();
+        #[allow(deprecated)]
+        extsk
+            .to_extended_full_viewing_key()
+            .write(&mut extfvk)
+            .unwrap();
+        assert_eq!(extfvk.len(), EXTFVK_LEN);
+        let mut v = vec![1u8];
+        v.extend_from_slice(&u32le(0));
+        v.push(0);
+        v.extend_from_slice(&opt_some(extsk.to_bytes().to_vec()));
+        v.extend_from_slice(&extfvk);
+        v.extend_from_slice(&opt_some(u32le(0)));
+        v.extend_from_slice(&opt_none());
+        v.extend_from_slice(&opt_none());
         v
     }
 
@@ -769,14 +821,23 @@ mod tests {
     }
 
     fn tkey_hd(secret_byte: u8) -> Vec<u8> {
+        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use zcash_protocol::consensus::NetworkType;
+        use zcash_transparent::address::TransparentAddress;
+        let secret = [secret_byte; TRANSPARENT_SECRET_LEN];
+        let sk = SecretKey::from_slice(&secret).unwrap();
+        let pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
+        let address = TransparentAddress::from_pubkey(&pubkey)
+            .to_zcash_address(NetworkType::Main)
+            .encode();
         let mut v = vec![1u8];
-        v.extend_from_slice(&u32le(0)); // keytype = HdKey
-        v.push(0); // locked = false
-        v.extend_from_slice(&opt_some(vec![secret_byte; TRANSPARENT_SECRET_LEN])); // key
-        v.extend_from_slice(&zwl_string("t1TestAddress"));
-        v.extend_from_slice(&opt_some(u32le(0))); // hdkey_num
-        v.extend_from_slice(&opt_none()); // enc_key
-        v.extend_from_slice(&opt_none()); // nonce
+        v.extend_from_slice(&u32le(0));
+        v.push(0);
+        v.extend_from_slice(&opt_some(secret.to_vec()));
+        v.extend_from_slice(&zwl_string(&address));
+        v.extend_from_slice(&opt_some(u32le(0)));
+        v.extend_from_slice(&opt_none());
+        v.extend_from_slice(&opt_none());
         v
     }
 
@@ -802,6 +863,56 @@ mod tests {
         v.extend_from_slice(&opt_none()); // enc_key
         v.extend_from_slice(&opt_none()); // nonce
         v
+    }
+
+    #[test]
+    fn mutated_zwl_extfvk_rejects_extsk() {
+        let good = zkey_hd(0x11);
+        let mut bad = zkey_hd(0x22);
+        // Extended FVK begins after version, key type, lock flag, optional flag, extsk.
+        bad[1 + 4 + 1 + 1 + EXTSK_LEN] ^= 1;
+        let mut vectors = cs(0); // no Orchard entries
+        vectors.extend_from_slice(&cs(2));
+        vectors.extend_from_slice(&bad);
+        vectors.extend_from_slice(&good);
+        vectors.extend_from_slice(&cs(0));
+        let keys = import_zwl(&wallet(25, &keys_body(22, false, &vectors)), None).unwrap();
+        assert_eq!(keys.sapling.len(), 1);
+        assert_eq!(
+            keys.sapling[0].extsk.expose_secret(),
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x11; 32]).to_bytes()
+        );
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+        assert!(keys.diagnostics.iter().any(|d| matches!(d,
+            ImportDiagnostic::PublicIdentifierMismatch { record_type, identifier: "extended full viewing key" }
+            if record_type == "zwl-zkey")));
+        assert!(!format!("{:?}", keys.diagnostics).contains("[34, 34, 34"));
+    }
+
+    #[test]
+    fn mutated_zwl_taddress_rejects_secret() {
+        let good = tkey_hd(0x11);
+        let mut bad = tkey_hd(0x22);
+        let start = 1 + 4 + 1 + 1 + TRANSPARENT_SECRET_LEN + 8;
+        let len = u64::from_le_bytes(bad[start - 8..start].try_into().unwrap()) as usize;
+        assert_eq!(
+            len,
+            u64::from_le_bytes(good[start - 8..start].try_into().unwrap()) as usize
+        );
+        bad[start..start + len].copy_from_slice(&good[start..start + len]);
+        let mut vectors = cs(0);
+        vectors.extend_from_slice(&cs(0));
+        vectors.extend_from_slice(&cs(2));
+        vectors.extend_from_slice(&bad);
+        vectors.extend_from_slice(&good);
+        let keys = import_zwl(&wallet(25, &keys_body(22, false, &vectors)), None).unwrap();
+        assert_eq!(keys.transparent.len(), 1);
+        assert_eq!(keys.transparent[0].secret.expose_secret(), &[0x11; 32]);
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+        assert!(keys.diagnostics.iter().any(|d| matches!(d,
+            ImportDiagnostic::PublicIdentifierMismatch { record_type, identifier: "transparent address" }
+            if record_type == "zwl-tkey")));
+        assert!(!format!("{:?}", keys.diagnostics).contains("[34, 34, 34"));
     }
 
     #[test]
@@ -842,7 +953,10 @@ mod tests {
             }
             if cut >= first_zkey_end {
                 assert_eq!(keys.sapling.len(), 1, "first zkey lost at cut {cut}");
-                assert_eq!(keys.sapling[0].extsk.expose_secret(), &[0x12; EXTSK_LEN]);
+                assert_eq!(
+                    keys.sapling[0].extsk.expose_secret(),
+                    &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x12; 32]).to_bytes()
+                );
             }
             if cut >= first_tkey_end {
                 assert_eq!(keys.transparent.len(), 1, "first tkey lost at cut {cut}");
@@ -1005,7 +1119,10 @@ mod tests {
         let keys = import_zwl(&bytes, None).unwrap();
 
         assert_eq!(keys.sapling.len(), 1);
-        assert_eq!(keys.sapling[0].extsk.expose_secret(), &[0xEF; EXTSK_LEN]);
+        assert_eq!(
+            keys.sapling[0].extsk.expose_secret(),
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0xEF; 32]).to_bytes()
+        );
         assert_eq!(keys.sapling[0].provenance, Provenance::HdDerived);
 
         assert_eq!(keys.transparent.len(), 1);
@@ -1037,7 +1154,10 @@ mod tests {
         let keys = import_zwl(&bytes, None).unwrap();
 
         assert_eq!(keys.sapling.len(), 1);
-        assert_eq!(keys.sapling[0].extsk.expose_secret(), &[0x11; EXTSK_LEN]);
+        assert_eq!(
+            keys.sapling[0].extsk.expose_secret(),
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x11; 32]).to_bytes()
+        );
         assert_eq!(keys.transparent.len(), 1);
         assert_eq!(
             keys.transparent[0].secret.expose_secret(),
@@ -1077,7 +1197,10 @@ mod tests {
         vectors.extend_from_slice(&cs(1)); // one legacy secret
         vectors.extend_from_slice(&[0x33; TRANSPARENT_SECRET_LEN]);
         vectors.extend_from_slice(&cs(1)); // one legacy address
-        vectors.extend_from_slice(&zwl_string("t1Legacy"));
+        let address = tkey_hd(0x33);
+        let start = 1 + 4 + 1 + 1 + TRANSPARENT_SECRET_LEN;
+        let len = u64::from_le_bytes(address[start..start + 8].try_into().unwrap()) as usize;
+        vectors.extend_from_slice(&address[start..start + 8 + len]);
 
         let body = keys_body(20, false, &vectors);
         let bytes = wallet(25, &body);

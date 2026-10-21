@@ -4,6 +4,7 @@ use secrecy::Secret;
 
 use crate::{
     error::ImportDiagnostic,
+    identity,
     keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
     zcashd::records::{compact_size, parse_record_key},
 };
@@ -103,12 +104,23 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                 let a_sk: Option<[u8; 32]> = value.get(..32).and_then(|s| s.try_into().ok());
 
                 match (addr, a_sk) {
-                    (Some(address), Some(a_sk)) => out.sprout.push(SproutKey {
-                        a_sk: Secret::new(a_sk),
-                        address,
-                        // zcashd Sprout keys were never HD-derived.
-                        provenance: Provenance::Standalone,
-                    }),
+                    (Some(address), Some(a_sk))
+                        if identity::sprout_address_from_spending_key(&a_sk) == address =>
+                    {
+                        out.sprout.push(SproutKey {
+                            a_sk: Secret::new(a_sk),
+                            address,
+                            // zcashd Sprout keys were never HD-derived.
+                            provenance: Provenance::Standalone,
+                        })
+                    }
+                    (Some(_), Some(_)) => {
+                        out.diagnostics
+                            .push(ImportDiagnostic::PublicIdentifierMismatch {
+                                record_type: "zkey".to_owned(),
+                                identifier: "payment address",
+                            })
+                    }
                     _ => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                         record_type: "zkey".to_owned(),
                         reason: "address or spending key has the wrong length".to_owned(),
@@ -120,10 +132,18 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
             // parent_fvk_tag(4) + child_index(4) + chain_code(32) +
             // expsk(96) + dk(32). The key remainder is the 32-byte IVK.
             "sapzkey" => match value.get(..169) {
-                Some(extsk) => out.sapling.push(SaplingKey {
-                    extsk: Secret::new(extsk.to_vec()),
-                    provenance: Provenance::Standalone,
-                }),
+                Some(extsk) if identity::sapling_matches_ivk(extsk, &rec.rest) => {
+                    out.sapling.push(SaplingKey {
+                        extsk: Secret::new(extsk.to_vec()),
+                        provenance: Provenance::Standalone,
+                    })
+                }
+                Some(_) => out
+                    .diagnostics
+                    .push(ImportDiagnostic::PublicIdentifierMismatch {
+                        record_type: "sapzkey".to_owned(),
+                        identifier: "incoming viewing key",
+                    }),
                 None => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                     record_type: "sapzkey".to_owned(),
                     reason: "extended spending key is truncated".to_owned(),
@@ -143,10 +163,22 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                 // of the long form zcashd always emits.
                 match read_length_prefixed(value).and_then(secret_from_key_der) {
                     Some(s) => match <[u8; 32]>::try_from(s) {
-                        Ok(secret) => out.transparent.push(TransparentKey {
-                            secret: Secret::new(secret),
-                            provenance: Provenance::HdDerived,
-                        }),
+                        Ok(secret)
+                            if read_length_prefixed(&rec.rest).is_some_and(|pubkey| {
+                                identity::transparent_matches_pubkey(&secret, pubkey)
+                            }) =>
+                        {
+                            out.transparent.push(TransparentKey {
+                                secret: Secret::new(secret),
+                                provenance: Provenance::HdDerived,
+                            })
+                        }
+                        Ok(_) => out
+                            .diagnostics
+                            .push(ImportDiagnostic::PublicIdentifierMismatch {
+                                record_type: "key".to_owned(),
+                                identifier: "public key",
+                            }),
                         Err(_) => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                             record_type: "key".to_owned(),
                             reason: "secret is not 32 bytes".to_owned(),
@@ -196,12 +228,29 @@ mod tests {
         (k, value.to_vec())
     }
 
+    fn genuine_sprout_pair() -> ([u8; 64], [u8; 32]) {
+        let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
+        pairs
+            .into_iter()
+            .find_map(|(raw_key, value)| {
+                let rec = parse_record_key(&raw_key)?;
+                if rec.record_type != "zkey" {
+                    return None;
+                }
+                Some((
+                    rec.rest.get(..64)?.try_into().ok()?,
+                    value.get(..32)?.try_into().ok()?,
+                ))
+            })
+            .unwrap()
+    }
+
     #[test]
     fn extracts_a_sprout_spending_key() {
-        let addr = [0xAB; 64];
+        let (addr, value) = genuine_sprout_pair();
         // The value is the bare 32-byte a_sk with no CompactSize prefix —
         // confirmed against the golden fixtures.
-        let value = [0xCD; 32];
         let pairs = vec![record("zkey", &addr, &value)];
 
         let mut out = ImportedKeys::default();
@@ -210,14 +259,13 @@ mod tests {
         assert_eq!(out.sprout.len(), 1);
         let k = &out.sprout[0];
         assert_eq!(k.address, addr);
-        assert_eq!(k.a_sk.expose_secret(), &[0xCD; 32]);
+        assert_eq!(k.a_sk.expose_secret(), &value);
     }
 
     #[test]
     fn a_malformed_record_does_not_silence_a_good_one() {
         // This is the governing principle: partial recovery.
-        let addr = [0x11; 64];
-        let good = [0x22; 32];
+        let (addr, good) = genuine_sprout_pair();
 
         let pairs = vec![
             record("zkey", &[0x99; 3], &[0x00]), // too-short address

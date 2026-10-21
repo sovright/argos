@@ -29,7 +29,11 @@
 //! If that holds for a key recovered by decrypting `czkey`, the decryption is
 //! correct. If it does not, we recovered something plausible and wrong.
 
-use argos_wallet_import::{bdb, keys::ImportedKeys, zcashd};
+use argos_wallet_import::{
+    bdb,
+    keys::{ImportCoverage, ImportedKeys},
+    zcashd, ImportDiagnostic,
+};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::compress256;
 use sha2::digest::generic_array::GenericArray;
@@ -147,4 +151,60 @@ fn the_derivation_rejects_a_wrong_key() {
         a_pk_from(key.a_sk.expose_secret()),
         "flipping one bit of a_sk must change the derived a_pk"
     );
+}
+
+fn assert_one_sprout_rejected(before: &ImportedKeys, after: &ImportedKeys, kind: &str) {
+    assert_eq!(after.sprout.len() + 1, before.sprout.len());
+    for (actual, expected) in after.sprout.iter().zip(before.sprout.iter().skip(1)) {
+        assert_eq!(actual.a_sk.expose_secret(), expected.a_sk.expose_secret());
+    }
+    assert_ne!(after.coverage(), ImportCoverage::Complete);
+    let mismatches: Vec<_> = after
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d,
+        ImportDiagnostic::PublicIdentifierMismatch { record_type, identifier: "payment address" }
+        if record_type == kind)
+        })
+        .collect();
+    assert_eq!(mismatches.len(), 1);
+    let message = mismatches[0].to_string();
+    assert!(message.contains("stored public identifier"));
+    assert!(!message.contains(&format!("{:02x?}", before.sprout[0].a_sk.expose_secret())));
+}
+
+fn mutate_first_sprout_address(pairs: &mut [(Vec<u8>, Vec<u8>)], kind: &str) {
+    let (raw_key, _) = pairs
+        .iter_mut()
+        .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == kind))
+        .unwrap();
+    // Corrupt pk_enc, the other half of the address beyond a_pk.
+    raw_key[1 + kind.len() + 63] ^= 1;
+}
+
+#[test]
+fn mutated_zkey_address_rejects_secret() {
+    let mut pairs = load("sprout-plaintext");
+    let mut before = ImportedKeys::default();
+    zcashd::collect_plaintext(&pairs, &mut before);
+    mutate_first_sprout_address(&mut pairs, "zkey");
+    let mut after = ImportedKeys::default();
+    zcashd::collect_plaintext(&pairs, &mut after);
+    assert_one_sprout_rejected(&before, &after, "zkey");
+}
+
+#[test]
+fn mutated_czkey_address_rejects_secret() {
+    let mut pairs = load("sprout-encrypted");
+    let mkey = zcashd::find_mkey(&pairs).unwrap();
+    let master =
+        zcashd::derive_master_key(&SecretString::new(FIXTURE_PASSPHRASE.to_owned()), &mkey)
+            .unwrap();
+    let mut before = ImportedKeys::default();
+    zcashd::collect_encrypted(&pairs, &master, &mut before);
+    mutate_first_sprout_address(&mut pairs, "czkey");
+    let mut after = ImportedKeys::default();
+    zcashd::collect_encrypted(&pairs, &master, &mut after);
+    assert_one_sprout_rejected(&before, &after, "czkey");
 }
