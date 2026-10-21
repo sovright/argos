@@ -622,6 +622,17 @@ pub struct DurableBroadcastLog {
     // SQLite owns an OS file lock, released by Drop or process death. The
     // sidecar never stores transaction data and cannot leave a stale lock.
     _process_lock: rusqlite::Connection,
+    // A network registry keeps every legacy source locked until the caller's
+    // entire scan, review, submission, reconciliation, or deletion ends.
+    // Otherwise an older binary can append to a local journal just after its
+    // one-time import (or after an absent-JSONL sidecar was overlooked).
+    held_legacy_sources: Vec<DurableBroadcastLog>,
+}
+
+/// Keeps old workspace/standalone journal locks alive while a route reopens
+/// the network registry for its individual submissions.
+pub(crate) struct LegacyBroadcastGuards {
+    _held: Vec<DurableBroadcastLog>,
 }
 
 impl DurableBroadcastLog {
@@ -729,49 +740,98 @@ impl DurableBroadcastLog {
             latest: HashMap::new(),
             write_failed: false,
             _process_lock: process_lock,
+            held_legacy_sources: Vec::new(),
         };
         log.replay_from_disk()?;
         Ok(log)
     }
 
-    /// Copy a legacy workspace journal into this locked network registry.
-    /// Source bytes are preserved, and an imported source may never change
-    /// underneath the registry. A missing manifest after a crash is safe to
-    /// recover because each source transaction must be an exact event prefix.
-    pub(crate) fn import_legacy_log(&mut self, source_path: &Path) -> ZeckResult<()> {
+    /// Lock a legacy source even when its JSONL does not exist yet. If bytes
+    /// exist, import them while still holding that exact source lock. A
+    /// missing manifest after a crash is safe to recover because each source
+    /// transaction must be an exact event prefix of the network registry.
+    pub(crate) fn hold_legacy_source(&mut self, source_path: &Path) -> ZeckResult<()> {
+        self.hold_legacy_source_before_lock(source_path, || {})
+    }
+
+    fn hold_legacy_source_before_lock<F: FnOnce()>(
+        &mut self,
+        source_path: &Path,
+        before_lock: F,
+    ) -> ZeckResult<()> {
         if self.write_failed {
             return Err(ZeckError::Storage(format!(
                 "broadcast log {} needs reopening after a failed write",
                 self.path.display()
             )));
         }
-        let metadata = fs::symlink_metadata(source_path).map_err(|err| {
-            ZeckError::Storage(format!(
-                "inspecting legacy log {}: {err}",
-                source_path.display()
-            ))
-        })?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(ZeckError::Storage(format!(
-                "legacy broadcast log {} must be a regular file",
-                source_path.display()
-            )));
-        }
-        let source_path = source_path.canonicalize().map_err(|err| {
-            ZeckError::Storage(format!(
-                "resolving legacy log {}: {err}",
-                source_path.display()
-            ))
-        })?;
+        let source_path = source_path.to_path_buf();
         if source_path == self.path {
             return Err(ZeckError::Storage(
                 "cannot import broadcast log into itself".to_owned(),
             ));
         }
-        // A concurrent legacy writer must not change the source between the
-        // byte snapshot and its manifest entry.
-        let source = Self::open(&source_path)?;
-        let source_bytes = fs::read(&source_path).map_err(|err| {
+        let source = if let Some(index) = self
+            .held_legacy_sources
+            .iter()
+            .position(|source| source.path == source_path)
+        {
+            self.held_legacy_sources.swap_remove(index)
+        } else {
+            before_lock();
+            Self::open(&source_path)?
+        };
+        // Inspect only after acquiring the exact source sidecar. An older
+        // writer could create its first JSONL between a pre-lock absent stat
+        // and this acquisition; that newly persisted Unknown must be imported.
+        let present = match fs::symlink_metadata(&source_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+            Ok(_) => {
+                return Err(ZeckError::Storage(format!(
+                    "legacy broadcast log {} must be a regular file",
+                    source_path.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(ZeckError::Storage(format!(
+                    "inspecting legacy log {}: {err}",
+                    source_path.display()
+                )));
+            }
+        };
+        let result = if present {
+            self.import_locked_legacy_log(&source_path, &source)
+        } else {
+            Ok(())
+        };
+        self.held_legacy_sources.push(source);
+        result
+    }
+
+    /// Copy an existing legacy journal into this locked network registry.
+    /// Kept for in-crate callers and fixture tests; the source remains locked.
+    pub(crate) fn import_legacy_log(&mut self, source_path: &Path) -> ZeckResult<()> {
+        if !source_path.is_file() {
+            return Err(ZeckError::Storage(format!(
+                "legacy broadcast log {} is missing",
+                source_path.display()
+            )));
+        }
+        self.hold_legacy_source(source_path)
+    }
+
+    pub(crate) fn into_legacy_source_guards(mut self) -> LegacyBroadcastGuards {
+        let held = std::mem::take(&mut self.held_legacy_sources);
+        LegacyBroadcastGuards { _held: held }
+    }
+
+    fn import_locked_legacy_log(
+        &mut self,
+        source_path: &Path,
+        source: &DurableBroadcastLog,
+    ) -> ZeckResult<()> {
+        let source_bytes = fs::read(source_path).map_err(|err| {
             ZeckError::Storage(format!(
                 "reading legacy log {}: {err}",
                 source_path.display()
@@ -863,7 +923,6 @@ impl DurableBroadcastLog {
             })?;
             atomic_replace_private(&manifest_path, &bytes)?;
         }
-        drop(source);
         Ok(())
     }
 
@@ -1679,6 +1738,7 @@ mod tests {
         assert_eq!(fs::read(&registry_path).unwrap(), advanced);
         assert!(manifest.exists());
 
+        drop(registry);
         let mut old = DurableBroadcastLog::open(&old_path).unwrap();
         old.transition(
             tx.txid,
@@ -1688,8 +1748,67 @@ mod tests {
         )
         .unwrap();
         drop(old);
+        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
         assert!(registry.import_legacy_log(&old_path).is_err());
         assert_eq!(fs::read(&registry_path).unwrap(), advanced);
+    }
+
+    #[test]
+    fn imported_legacy_journal_lock_survives_until_registry_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("workspace-old");
+        let registry_root = dir.path().join(".broadcast-registry");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&registry_root).unwrap();
+        let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
+        let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
+        let tx = fixture();
+        let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+        old.persist_prepared(&tx).unwrap();
+        drop(old);
+
+        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+        registry.import_legacy_log(&old_path).unwrap();
+        assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
+        let attempt = DurableBroadcastLog::open(&old_path)
+            .err()
+            .expect("older signer must not reopen its source while registry operates");
+        assert!(attempt.to_string().contains("in use"), "{attempt}");
+        let guards = registry.into_legacy_source_guards();
+        let attempt = DurableBroadcastLog::open(&old_path)
+            .err()
+            .expect("per-leg registry reopening must not release the old source lock");
+        assert!(attempt.to_string().contains("in use"), "{attempt}");
+        drop(guards);
+        DurableBroadcastLog::open(&old_path).unwrap();
+    }
+
+    #[test]
+    fn jsonl_created_after_absent_hint_is_imported_under_source_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("workspace-old");
+        let registry_root = dir.path().join(".broadcast-registry");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&registry_root).unwrap();
+        let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
+        let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
+        let tx = fixture();
+        assert!(!old_path.exists());
+
+        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+        registry
+            .hold_legacy_source_before_lock(&old_path, || {
+                // Deterministically occupy the gap where a pre-lock absence
+                // check would have been stale in the older implementation.
+                let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+                old.persist_prepared(&tx).unwrap();
+                old.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(registry.blocking_submission(), Some(tx.txid));
+        assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
+        assert!(DurableBroadcastLog::open(&old_path).is_err());
     }
 
     #[test]

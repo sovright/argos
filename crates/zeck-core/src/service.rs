@@ -998,16 +998,8 @@ fn recover_interrupted_cleanup(
         return Err(manual("surviving workspace journal is missing or unsafe"));
     }
     let registry = operation_lock
-        .open_broadcast_log()
+        .open_broadcast_log_for(&local_path)
         .map_err(|_| manual("surviving journal cannot be imported into the registry"))?;
-    let local = if local_journal_exists {
-        Some(
-            DurableBroadcastLog::open(&local_path)
-                .map_err(|_| manual("surviving workspace journal cannot be replayed"))?,
-        )
-    } else {
-        None
-    };
     let registry_records = registry.records();
     for (txid, digest) in expected {
         let Some(receipt) = registry_records
@@ -1020,11 +1012,9 @@ fn recover_interrupted_cleanup(
             return Err(manual("registry raw transaction changed"));
         }
     }
-    // A legacy journal may contain only the older imported prefix. The
-    // registry import already verified that prefix and this locked replay
-    // verified its survival; newer outcome receipts live only in the global
-    // registry and need not also appear in the legacy source.
-    drop(local);
+    // The registry owns and replays the exact surviving local source lock.
+    // Newer outcome receipts live only in the global registry and need not
+    // also appear in an older imported prefix.
     drop(registry);
     clear_cleanup_marker(root)?;
     refuse_interrupted_cleanup(root)
@@ -1127,12 +1117,53 @@ impl NetworkOperationGuard {
     }
 
     /// Migrate every pre-registry journal while holding the network-wide
-    /// operation lock. A failed import leaves its source intact and stops the
-    /// caller before it can sign, scan into a new alias, or delete a wallet.
+    /// operation lock. Existing source locks remain held for the returned
+    /// log's lifetime, including sidecars whose JSONL has not appeared yet.
+    /// A failed lock or import stops the caller before signing or deletion.
     pub fn open_broadcast_log(&self) -> ZeckResult<DurableBroadcastLog> {
+        self.open_broadcast_log_with_current(None)
+    }
+
+    /// Also lock this operation's exact pre-registry workspace/key-set path,
+    /// even if no old process has created a sidecar or JSONL there yet.
+    pub fn open_broadcast_log_for(
+        &self,
+        current_legacy_path: &std::path::Path,
+    ) -> ZeckResult<DurableBroadcastLog> {
+        self.open_broadcast_log_with_current(Some(current_legacy_path))
+    }
+
+    fn open_broadcast_log_with_current(
+        &self,
+        current_legacy_path: Option<&std::path::Path>,
+    ) -> ZeckResult<DurableBroadcastLog> {
         let mut registry = DurableBroadcastLog::open(self.broadcast_log_path()?)?;
-        for path in discover_legacy_broadcast_logs(&self.data_dir, self.network)? {
-            registry.import_legacy_log(&path)?;
+        let mut sources = discover_legacy_broadcast_logs(&self.data_dir, self.network)?;
+        if let Some(current_legacy_path) = current_legacy_path {
+            let parent = current_legacy_path.parent().ok_or_else(|| {
+                ZeckError::Storage(format!(
+                    "legacy log {} has no parent",
+                    current_legacy_path.display()
+                ))
+            })?;
+            let name = current_legacy_path.file_name().ok_or_else(|| {
+                ZeckError::Storage(format!(
+                    "legacy log {} has no file name",
+                    current_legacy_path.display()
+                ))
+            })?;
+            // Canonicalize the parent, not the file: the held-source check
+            // must still see and reject a symlink at the JSONL path itself.
+            sources.push(canonical_workspace_identity(parent)?.join(name));
+        }
+        sources.sort();
+        sources.dedup();
+        for path in sources {
+            if path.is_file() {
+                registry.import_legacy_log(&path)?;
+            } else {
+                registry.hold_legacy_source(&path)?;
+            }
         }
         Ok(registry)
     }
@@ -1158,6 +1189,7 @@ fn discover_legacy_broadcast_logs(
     data_dir: &std::path::Path,
     network: crate::models::ZeckNetwork,
 ) -> ZeckResult<Vec<std::path::PathBuf>> {
+    let lock_suffix = format!(".{}.lock.sqlite", crate::broadcast::BROADCAST_LOG_FILE_NAME);
     let network_root = canonical_workspace_identity(data_dir)?.join(network.label());
     let entries = match std::fs::read_dir(&network_root) {
         Ok(entries) => entries,
@@ -1177,15 +1209,9 @@ fn discover_legacy_broadcast_logs(
                 network_root.display()
             ))
         })?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("workspace-")
-            || entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("transparent-")
-        {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("workspace-") || name.starts_with("transparent-") {
             stack.push(entry.path());
         }
     }
@@ -1221,12 +1247,23 @@ fn discover_legacy_broadcast_logs(
                         .path(),
                 );
             }
-        } else if metadata.is_file()
-            && path
+        } else if metadata.is_file() {
+            let name = path
                 .file_name()
-                .is_some_and(|name| name == crate::broadcast::BROADCAST_LOG_FILE_NAME)
-        {
-            journals.push(path);
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    ZeckError::Storage(format!("invalid legacy source name {}", path.display()))
+                })?;
+            if name == crate::broadcast::BROADCAST_LOG_FILE_NAME {
+                journals.push(path);
+            } else if let Some(source_name) = name.strip_suffix(&lock_suffix) {
+                journals.push(
+                    path.parent()
+                        .expect("sidecar file has a parent")
+                        .join(source_name)
+                        .join(crate::broadcast::BROADCAST_LOG_FILE_NAME),
+                );
+            }
         }
     }
     journals.sort();
@@ -1359,8 +1396,8 @@ impl RecoveryService {
             label: config.label,
         };
 
-        let workspace_root =
-            canonical_workspace_identity(RecoveryWorkspace::from_runtime(&runtime)?.root())?;
+        let workspace = RecoveryWorkspace::from_runtime(&runtime)?;
+        let workspace_root = canonical_workspace_identity(workspace.root())?;
         let source_fingerprint = runtime.key_source.fingerprint()?;
         if self
             .cleanup_retry
@@ -1380,7 +1417,9 @@ impl RecoveryService {
             })?;
         let operation_lock = NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network)?;
         recover_interrupted_cleanup(&workspace_root, &operation_lock)?;
-        drop(operation_lock.open_broadcast_log()?);
+        workspace.ensure_broadcast_log_directory()?;
+        let legacy_log_guards =
+            operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
 
         // Cancel any existing session targeting the same workspace to prevent
         // concurrent SQLite writers from locking each other out.
@@ -1423,6 +1462,7 @@ impl RecoveryService {
         let task = tokio::spawn(async move {
             let _workspace_guard = scan_guard;
             let _operation_lock = operation_lock;
+            let _legacy_log_guards = legacy_log_guards;
             // Acquire a power-management guard so the OS doesn't put the
             // machine to sleep mid-scan. Held for the entire scan task; the
             // Drop impl releases on completion, error, panic, or task abort.
@@ -1525,13 +1565,13 @@ impl RecoveryService {
         let _operation_lock =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let global_log = _operation_lock.open_broadcast_log()?;
+        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
+        let global_log = _operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
         if global_log.has_unresolved_history() {
             return Err(ZeckError::Broadcast(
                 "cannot review a new sweep while the network registry has unresolved prepared transaction history".to_owned(),
             ));
         }
-        drop(global_log);
         if self
             .reconciliation_rescan_required
             .lock()
@@ -1698,7 +1738,8 @@ impl RecoveryService {
         let operation_guard =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let mut log = operation_guard.open_broadcast_log()?;
+        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
+        let mut log = operation_guard.open_broadcast_log_for(&workspace.broadcast_log_path())?;
         let previous_states = log
             .records()
             .into_iter()
@@ -1786,7 +1827,8 @@ impl RecoveryService {
         let operation_guard =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let mut log = operation_guard.open_broadcast_log()?;
+        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
+        let mut log = operation_guard.open_broadcast_log_for(&workspace.broadcast_log_path())?;
         let previous_states = log
             .records()
             .into_iter()
@@ -1845,13 +1887,16 @@ impl RecoveryService {
         let _operation_lock =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let global_log = _operation_lock.open_broadcast_log()?;
+        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
+        let global_log = _operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
         if global_log.has_unresolved_history() {
             return Err(ZeckError::Broadcast(
                 "cannot start a new sweep while the network registry has unresolved prepared transaction history".to_owned(),
             ));
         }
-        drop(global_log);
+        // Per-leg signers reopen the registry. Release only that registry
+        // lock, retaining every legacy source lock through the entire route.
+        let _legacy_source_guards = global_log.into_legacy_source_guards();
         if self
             .reconciliation_rescan_required
             .lock()
@@ -2249,13 +2294,11 @@ impl RecoveryService {
         // restored its actual path. The network registry is authoritative for
         // all aliases; the local journal is also checked so a changed source
         // cannot be silently ignored.
-        let mut broadcast_log = _operation_lock.open_broadcast_log()?;
         let local_path = workspace.broadcast_log_path();
         let local_journal_exists = local_path.exists();
-        // Acquire the legacy lock even when its journal has not been written
-        // yet. Another process may hold that lock and be about to append its
-        // first Unknown; a missing JSONL file is not proof of quiescence.
-        let _local_log = DurableBroadcastLog::open(&local_path)?;
+        let mut broadcast_log = _operation_lock.open_broadcast_log_for(&local_path)?;
+        // The returned registry retains the exact legacy lock even if its
+        // JSONL has not been written yet, as well as all discovered aliases.
         // A legacy local journal is an immutable migration source. Its
         // historical Pending prefix may have been reconciled to Mined in the
         // global registry. `open_broadcast_log` checks the exact source
@@ -7869,6 +7912,97 @@ mod propose_workspace_guard_tests {
         assert!(session.workspace_root.exists());
         assert!(service.session(&handle).await.is_ok());
         drop(lock);
+    }
+
+    #[tokio::test]
+    async fn absent_legacy_journal_lock_blocks_scan_review_and_execution() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            Arc::new(SeedKeySource::new(SecretString::new(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
+            ))),
+            transparent_account(0),
+        )
+        .await;
+        let session = service.session(&handle).await.unwrap();
+        let legacy_path = RecoveryWorkspace::from_runtime(&session.runtime)
+            .unwrap()
+            .broadcast_log_path();
+        assert!(!legacy_path.exists());
+        let legacy_writer = DurableBroadcastLog::open(&legacy_path).unwrap();
+        assert!(!legacy_path.exists(), "only the legacy sidecar exists");
+
+        let fresh_service = RecoveryService::new();
+        let runtime = &session.runtime;
+        let scan_error = fresh_service
+            .start_scan_from_key_source(
+                ScanConfig {
+                    birthday: runtime.birthday,
+                    num_accounts: runtime.num_accounts,
+                    gap_limit: runtime.gap_limit,
+                    transparent_scan: runtime.transparent_scan,
+                    lightwalletd_url: runtime.lightwalletd_url.clone(),
+                    confirmation_sources: runtime.confirmation_sources.clone(),
+                    data_dir: runtime.data_dir.clone(),
+                    network: runtime.network,
+                    label: runtime.label.clone(),
+                },
+                runtime.key_source.clone(),
+            )
+            .await
+            .expect_err("a scan cannot race an older writer before JSONL appears");
+        assert!(scan_error.to_string().contains("in use"), "{scan_error}");
+
+        let review_error = service
+            .propose_sweep(&handle, request())
+            .await
+            .expect_err("a quote cannot race the older writer");
+        assert!(
+            review_error.to_string().contains("in use"),
+            "{review_error}"
+        );
+        let execution_error = service
+            .execute_sweep(&handle, &SweepProposalId("unused".to_owned()))
+            .await
+            .expect_err("execution cannot enter before the older writer releases its lock");
+        assert!(
+            execution_error.to_string().contains("in use"),
+            "{execution_error}"
+        );
+        drop(legacy_writer);
+    }
+
+    #[test]
+    fn network_registry_holds_an_alias_legacy_sidecar_without_jsonl() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let alias_root = tempdir
+            .path()
+            .join("mainnet/workspace-old/birthday-1/scope-old");
+        std::fs::create_dir_all(&alias_root).unwrap();
+        let legacy_path = alias_root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let legacy_writer = DurableBroadcastLog::open(&legacy_path).unwrap();
+        assert!(
+            !legacy_path.exists(),
+            "older process has not written JSONL yet"
+        );
+
+        let operation =
+            NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+        let error = operation
+            .open_broadcast_log()
+            .err()
+            .expect("existing legacy sidecar must block a global signer");
+        assert!(error.to_string().contains("in use"), "{error}");
+        drop(legacy_writer);
+
+        let registry = operation.open_broadcast_log().unwrap();
+        let attempted_old_open = DurableBroadcastLog::open(&legacy_path)
+            .err()
+            .expect("the global registry must retain the legacy lock until it closes");
+        assert!(attempted_old_open.to_string().contains("in use"));
+        drop(registry);
+        DurableBroadcastLog::open(&legacy_path).unwrap();
     }
 
     fn mined_outcome(txid: String) -> SweepOutcome {
