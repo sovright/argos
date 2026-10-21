@@ -142,49 +142,31 @@ fn checkpoint_identity(path: &Path) -> Result<PathBuf, String> {
     let filename = absolute
         .file_name()
         .ok_or("invalid Sprout checkpoint path")?;
-    if let Ok(canonical_parent) = parent.canonicalize() {
-        return Ok(canonical_parent.join(filename));
-    }
-    let mut lexical = PathBuf::new();
-    for component in absolute.components() {
+    let mut resolved = PathBuf::new();
+    // Resolve each existing prefix before applying a later `..`. Lexically
+    // removing `link/..` first is wrong when `link` points into another tree.
+    // Once a component does not exist, keep it in the path so reservations
+    // also work before the scanner creates its data directory or checkpoint.
+    for component in parent.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                lexical.pop();
+                resolved.pop();
             }
-            other => lexical.push(other.as_os_str()),
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match candidate.canonicalize() {
+                    Ok(canonical) => resolved = canonical,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => resolved = candidate,
+                    Err(err) => {
+                        return Err(format!("resolving Sprout checkpoint directory: {err}"))
+                    }
+                }
+            }
+            root_or_prefix => resolved.push(root_or_prefix.as_os_str()),
         }
     }
-    let filename = lexical
-        .file_name()
-        .ok_or("invalid Sprout checkpoint path")?
-        .to_os_string();
-    let mut ancestor = lexical
-        .parent()
-        .ok_or("invalid Sprout checkpoint directory")?
-        .to_path_buf();
-    let mut suffix = Vec::new();
-    let mut canonical = loop {
-        match ancestor.canonicalize() {
-            Ok(path) => break path,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let name = ancestor
-                    .file_name()
-                    .ok_or("invalid Sprout checkpoint directory")?;
-                suffix.push(name.to_os_string());
-                ancestor = ancestor
-                    .parent()
-                    .ok_or("invalid Sprout checkpoint directory")?
-                    .to_path_buf();
-            }
-            Err(err) => return Err(format!("resolving Sprout checkpoint directory: {err}")),
-        }
-    };
-    for name in suffix.into_iter().rev() {
-        canonical.push(name);
-    }
-    canonical.push(filename);
-    Ok(canonical)
+    Ok(resolved.join(filename))
 }
 
 #[derive(Default)]
@@ -743,6 +725,29 @@ mod tests {
             .reserve_checkpoint(&alias.join("scan.checkpoint"))
             .is_err());
         std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_reservation_resolves_symlink_before_parent_of_missing_directory() {
+        let root =
+            std::env::temp_dir().join(format!("argos-reservation-dotdot-{}", Uuid::new_v4()));
+        let real = root.join("real");
+        let nested = real.join("sub");
+        let link = root.join("link");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        let store = ReviewedIntentStore::default();
+        let expected = real.join("new/scan.checkpoint");
+        let alias = link.join("../new/scan.checkpoint");
+        assert!(!expected.exists());
+        let _reservation = store.reserve_checkpoint(&expected).unwrap();
+        assert!(
+            store.reserve_checkpoint(&alias).is_err(),
+            "link/../new and real/new resolve to the same future checkpoint"
+        );
+        std::fs::remove_file(&link).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
