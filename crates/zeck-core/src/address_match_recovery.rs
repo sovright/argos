@@ -428,6 +428,7 @@ mod tests {
             gap_limit: 1,
             transparent_scan: None,
             lightwalletd_url: "https://example.invalid".to_owned(),
+            confirmation_sources: Vec::new(),
             data_dir: temp.path().to_owned(),
             network: ZeckNetwork::Testnet,
             label: "match".to_owned(),

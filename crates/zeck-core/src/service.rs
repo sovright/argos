@@ -23,7 +23,7 @@ use zcash_client_backend::{
         CoinbaseFilter, InputSource, MaxSpendMode, TransactionStatus, WalletRead, WalletWrite,
     },
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
-    proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, TxFilter},
+    proto::service::compact_tx_streamer_client::CompactTxStreamerClient,
     wallet::OvkPolicy,
 };
 // The crate re-export is deprecated in favor of the standalone `zip321` crate,
@@ -45,20 +45,20 @@ use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis, S
 use crate::{
     address::validate_destination_address,
     broadcast::{
-        submit_prepared_transaction, DurableBroadcastLog, LightwalletdSubmitter,
-        PreparedTransaction,
+        submit_prepared_transaction, BroadcastStore, DurableBroadcastLog, LightwalletdSubmitter,
+        PreparedTransaction, TxObservation, TxObservationState, TxObserver,
     },
     derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
     error::{ZeckError, ZeckResult},
     key_source::{KeySource, KeySourceFingerprint, SeedKeySource},
     lightwalletd::{
         connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
-        validated_lightwalletd_endpoints,
+        validated_lightwalletd_endpoints, LightwalletdTxObserver,
     },
     models::{
-        ProposedTx, ProposedTxKind, ReviewedSweepProposal, RuntimeScanConfig, ScanConfig,
-        ScanHandle, ScanPhase, ScanProgress, SkippedSweepAccount, SweepOutcome, SweepProposal,
-        SweepProposalId, SweepRequest, TxBroadcastResult, TxLifecycleState,
+        ConfirmationEndpoint, ProposedTx, ProposedTxKind, ReviewedSweepProposal, RuntimeScanConfig,
+        ScanConfig, ScanHandle, ScanPhase, ScanProgress, SkippedSweepAccount, SweepOutcome,
+        SweepProposal, SweepProposalId, SweepRequest, TxBroadcastResult, TxLifecycleState,
     },
     scan::{
         refresh_scan_progress, run_recovery_scan, run_wallet_sync_with_retry,
@@ -139,7 +139,6 @@ type SweepWalletDb =
     WalletDb<rusqlite::Connection, crate::workspace::ArgosParams, SystemClock, rand_core::OsRng>;
 const CONFIRMATION_POLL_INTERVAL_SECS: u64 = 5;
 const CONFIRMATION_POLL_ATTEMPTS: u32 = 24;
-const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
 const MAX_REVIEWED_SWEEPS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +438,7 @@ impl RecoveryService {
             gap_limit: config.gap_limit,
             transparent_scan,
             lightwalletd_url: config.lightwalletd_url,
+            confirmation_sources: config.confirmation_sources,
             data_dir: config.data_dir,
             network: config.network,
             label: config.label,
@@ -982,6 +982,10 @@ fn validate_scan_config(config: &ScanConfig) -> ZeckResult<()> {
         }
     }
     validated_lightwalletd_endpoints(&config.lightwalletd_url)?;
+    crate::lightwalletd::confirmation_endpoints(
+        &config.lightwalletd_url,
+        &config.confirmation_sources,
+    )?;
 
     Ok(())
 }
@@ -1888,7 +1892,7 @@ async fn execute_sweep_for_session(
         .server
         .as_ref()
         .map(|server| server.endpoint.as_str());
-    let (mut client, primary_endpoint) =
+    let (mut client, _primary_endpoint) =
         connect_lightwalletd_endpoints_with_retry(&runtime.lightwalletd_url, preferred_endpoint)
             .await?;
     let lightwalletd_info = client
@@ -1978,7 +1982,7 @@ async fn execute_sweep_for_session(
                     donation_rate: request.donation_rate,
                     donation_memo: donation_memo.clone(),
                     lightwalletd_url: runtime.lightwalletd_url.as_str(),
-                    primary_endpoint: primary_endpoint.as_str(),
+                    confirmation_sources: &runtime.confirmation_sources,
                 };
                 if execute_shielding_step(&mut ctx, &tracked_account, &transparent_account, &usk)
                     .await?
@@ -2028,7 +2032,7 @@ async fn execute_sweep_for_session(
                     donation_rate: request.donation_rate,
                     donation_memo: donation_memo.clone(),
                     lightwalletd_url: runtime.lightwalletd_url.as_str(),
-                    primary_endpoint: primary_endpoint.as_str(),
+                    confirmation_sources: &runtime.confirmation_sources,
                 };
                 execute_send_max_step(
                     &mut ctx,
@@ -2168,11 +2172,8 @@ struct SweepStepCtx<'a> {
     donation_address: &'a str,
     donation_rate: Option<f64>,
     donation_memo: Option<MemoBytes>,
-    // For the best-effort confirmation cross-check (audit Issue B follow-up):
-    // the full configured endpoint list and the endpoint this sweep is using,
-    // so a second distinct endpoint can be picked to verify confirmations.
     lightwalletd_url: &'a str,
-    primary_endpoint: &'a str,
+    confirmation_sources: &'a [ConfirmationEndpoint],
 }
 
 /// The change strategy used for every Argos proposal: ZIP-317 fees, no change
@@ -2269,7 +2270,7 @@ async fn execute_shielding_step(
         ctx.results,
         ctx.broadcast_log,
         ctx.lightwalletd_url,
-        ctx.primary_endpoint,
+        ctx.confirmation_sources,
         ctx.network,
         ctx.prior_fee_zatoshis,
         ctx.max_fee_zatoshis,
@@ -2634,7 +2635,7 @@ async fn execute_send_max_step(
         ctx.results,
         ctx.broadcast_log,
         ctx.lightwalletd_url,
-        ctx.primary_endpoint,
+        ctx.confirmation_sources,
         ctx.network,
         ctx.prior_fee_zatoshis,
         ctx.max_fee_zatoshis,
@@ -2661,7 +2662,7 @@ async fn broadcast_transactions(
     results: &mut Vec<TxBroadcastResult>,
     log: &mut DurableBroadcastLog,
     lightwalletd_url: &str,
-    primary_endpoint: &str,
+    confirmation_sources: &[ConfirmationEndpoint],
     network: crate::models::ZeckNetwork,
     prior_fee_zatoshis: u64,
     max_fee_zatoshis: Option<u64>,
@@ -2729,6 +2730,7 @@ async fn broadcast_transactions(
     for tx in prepared {
         let txid = tx.txid;
         let fee_zatoshis = tx.fee_zatoshis;
+        let expiry_height = tx.expiry_height;
         let submission = submit_prepared_transaction(
             log,
             &mut LightwalletdSubmitter { client },
@@ -2772,28 +2774,17 @@ async fn broadcast_transactions(
             )));
         }
 
-        let (status, detail, confirmed_height) =
-            wait_for_confirmation(wallet_db, client, txid, label).await?;
-        // Cross-check a "confirmed" status against a second configured endpoint
-        // before presenting it as final, so a single hostile server cannot fake
-        // a confirmation (audit Issue B follow-up). Best-effort: never fails the
-        // sweep, only annotates the detail with the independent result.
-        let detail = if status == TxLifecycleState::Mined {
-            match cross_verify_mined(lightwalletd_url, primary_endpoint, network, txid).await {
-                Some(true) => format!(
-                    "{detail} A second configured endpoint also reported this transaction as mined."
-                ),
-                Some(false) => format!(
-                    "{detail} NOTE: a second configured endpoint did not report this transaction as \
-                     mined yet. This is most often benign propagation lag right after broadcast, but \
-                     if it persists, verify the transaction on a block explorer before treating the \
-                     recovery as final."
-                ),
-                None => detail,
-            }
-        } else {
-            detail
-        };
+        let mut observer = LightwalletdTxObserver::new(lightwalletd_url, confirmation_sources)?;
+        let (status, detail, confirmed_height) = wait_for_confirmation(
+            wallet_db,
+            log,
+            &mut observer,
+            network,
+            txid,
+            expiry_height,
+            label,
+        )
+        .await?;
         let entry = &mut results[result_index];
         entry.status = status;
         entry.detail = detail;
@@ -2803,173 +2794,81 @@ async fn broadcast_transactions(
     Ok(())
 }
 
-/// Best-effort cross-check of a confirmation against a second configured
-/// lightwalletd endpoint (audit Issue B follow-up).
-///
-/// Returns `Some(true)` if a distinct second endpoint also reports `txid`
-/// mined, `Some(false)` if it reports the transaction as not in the main chain,
-/// and `None` if there is no distinct second endpoint or it could not be
-/// reached/queried. This never errors: a confirmation that cannot be
-/// independently checked falls back to the single-server attestation already
-/// disclosed to the user, rather than failing the sweep.
-async fn cross_verify_mined(
-    lightwalletd_url: &str,
-    primary_endpoint: &str,
-    network: crate::models::ZeckNetwork,
-    txid: TxId,
-) -> Option<bool> {
-    let secondary = validated_lightwalletd_endpoints(lightwalletd_url)
-        .ok()?
-        .into_iter()
-        .find(|endpoint| is_distinct_lightwalletd_endpoint(endpoint, primary_endpoint))?;
-    let mut client = tokio::time::timeout(
-        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
-        CompactTxStreamerClient::connect(secondary),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    // Validate the secondary's network (chain name + Sapling activation height)
-    // before trusting its answer, so a wrong-chain endpoint cannot produce a
-    // misleading confirmation result (audit Issue B follow-up review).
-    let info = tokio::time::timeout(
-        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
-        client.get_lightd_info(zcash_client_backend::proto::service::Empty {}),
-    )
-    .await
-    .ok()?
-    .ok()?
-    .into_inner();
-    validate_lightwalletd_network(network, &info).ok()?;
-    let response = tokio::time::timeout(
-        Duration::from_secs(SECONDARY_CONFIRMATION_TIMEOUT_SECS),
-        client.get_transaction(TxFilter {
-            block: None,
-            index: 0,
-            hash: txid.as_ref().to_vec(),
-        }),
-    )
-    .await
-    .ok()?
-    .ok()?
-    .into_inner();
-    // Mined iff the height is a real block height: 0 means mempool/not found and
-    // u64::MAX means reorged out. A `Some(false)` can also reflect benign
-    // propagation lag on a healthy second endpoint, which is why the caller only
-    // warns (never blocks) on it.
-    Some(response.height != 0 && response.height != u64::MAX)
-}
-
+#[cfg(test)]
 fn is_distinct_lightwalletd_endpoint(candidate: &str, primary: &str) -> bool {
-    normalized_endpoint_authority(candidate) != normalized_endpoint_authority(primary)
+    crate::lightwalletd::normalized_endpoint_authority(candidate).ok()
+        != crate::lightwalletd::normalized_endpoint_authority(primary).ok()
 }
 
-fn normalized_endpoint_authority(endpoint: &str) -> String {
-    let Ok(url) = url::Url::parse(endpoint) else {
-        return endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
+fn record_confirmation_observation(
+    log: &mut impl BroadcastStore,
+    txid: TxId,
+    observation: &TxObservation,
+) -> ZeckResult<TxLifecycleState> {
+    let state = if observation.state == TxObservationState::Mined {
+        TxLifecycleState::Mined
+    } else if observation.is_expired() {
+        TxLifecycleState::Expired
+    } else {
+        TxLifecycleState::Pending
     };
-    let scheme = url.scheme().to_ascii_lowercase();
-    let host = url
-        .host_str()
-        .map(|host| host.to_ascii_lowercase())
-        .unwrap_or_default();
-    let port = url.port_or_known_default().unwrap_or(0);
-    format!("{scheme}://{host}:{port}")
+    log.transition(txid, state, None, Some(observation))?;
+    Ok(state)
 }
 
-async fn wait_for_confirmation(
+async fn wait_for_confirmation<O: TxObserver>(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
         crate::workspace::ArgosParams,
         SystemClock,
         rand_core::OsRng,
     >,
-    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    log: &mut impl BroadcastStore,
+    observer: &mut O,
+    network: crate::models::ZeckNetwork,
     txid: TxId,
+    expiry_height: Option<u32>,
     label: &str,
 ) -> ZeckResult<(TxLifecycleState, String, Option<u32>)> {
-    for _ in 0..CONFIRMATION_POLL_ATTEMPTS {
-        match client
-            .get_transaction(TxFilter {
-                block: None,
-                index: 0,
-                hash: txid.as_ref().to_vec(),
-            })
-            .await
-        {
-            Ok(response) => {
-                let tx = response.into_inner();
-                if tx.height == 0 {
-                    wallet_db
-                        .set_transaction_status(txid, TransactionStatus::NotInMainChain)
-                        .map_err(|err| {
-                            ZeckError::Wallet(format!(
-                                "marking pending transaction {txid} in wallet db: {err}"
-                            ))
-                        })?;
-                } else if tx.height == u64::MAX {
-                    wallet_db
-                        .set_transaction_status(txid, TransactionStatus::NotInMainChain)
-                        .map_err(|err| {
-                            ZeckError::Wallet(format!(
-                                "marking reorged transaction {txid} in wallet db: {err}"
-                            ))
-                        })?;
-                } else {
-                    let mined_height = u32::try_from(tx.height).map_err(|_| {
-                        ZeckError::Broadcast(format!(
-                            "{label} transaction {txid} returned an invalid mined height"
-                        ))
-                    })?;
-                    wallet_db
-                        .set_transaction_status(
-                            txid,
-                            TransactionStatus::Mined(BlockHeight::from_u32(mined_height)),
-                        )
-                        .map_err(|err| {
-                            ZeckError::Wallet(format!(
-                                "marking mined transaction {txid} in wallet db: {err}"
-                            ))
-                        })?;
-                    // The mined height is reported by the single connected
-                    // lightwalletd server and trusted verbatim. A hostile
-                    // server can return a success code without relaying the
-                    // transaction and then answer the confirmation poll with a
-                    // fabricated height. Theft is not possible (signatures
-                    // commit to the user's own outputs), but a recovery tool
-                    // must not let the user treat a single server's word as
-                    // final. Make the attestation explicit (audit Issue B).
-                    return Ok((
-                        TxLifecycleState::Mined,
-                        format!(
-                            "{label} transaction reported mined at height {mined_height} by the \
-                             connected lightwalletd server. This confirmation is attested by a \
-                             single server — verify it against a block explorer or a second node \
-                             before treating the recovery as final."
-                        ),
-                        Some(mined_height),
-                    ));
-                }
-            }
-            Err(_) => {
-                wallet_db
-                    .set_transaction_status(txid, TransactionStatus::NotInMainChain)
-                    .map_err(|err| {
-                        ZeckError::Wallet(format!(
-                            "marking pending transaction {txid} in wallet db: {err}"
-                        ))
-                    })?;
-            }
+    let mut last_state = TxObservationState::Unavailable;
+    for attempt in 0..CONFIRMATION_POLL_ATTEMPTS {
+        let observation = observer.observe(network, txid, expiry_height).await?;
+        last_state = observation.state.clone();
+        let state = record_confirmation_observation(log, txid, &observation)?;
+        if state == TxLifecycleState::Mined {
+            let height = observation.mined_height.ok_or_else(|| {
+                ZeckError::Broadcast(format!("canonical evidence for {txid} has no height"))
+            })?;
+            wallet_db
+                .set_transaction_status(
+                    txid,
+                    TransactionStatus::Mined(BlockHeight::from_u32(height)),
+                )
+                .map_err(|err| {
+                    ZeckError::Wallet(format!(
+                        "marking mined transaction {txid} in wallet db: {err}"
+                    ))
+                })?;
+            return Ok((
+                state,
+                format!("{label} transaction canonically mined at height {height} with matching independent block evidence."),
+                Some(height),
+            ));
         }
-
-        tokio::time::sleep(Duration::from_secs(CONFIRMATION_POLL_INTERVAL_SECS)).await;
+        if state == TxLifecycleState::Expired {
+            return Ok((
+                state,
+                format!("{label} transaction expired with independent absence beyond its expiry height."),
+                None,
+            ));
+        }
+        if attempt + 1 < CONFIRMATION_POLL_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(CONFIRMATION_POLL_INTERVAL_SECS)).await;
+        }
     }
-
     Ok((
         TxLifecycleState::Pending,
-        format!(
-            "{label} transaction broadcast successfully, but confirmation was not observed during the wait window."
-        ),
+        format!("{label} transaction is pending ({last_state:?}); independent confirmation is unavailable."),
         None,
     ))
 }
@@ -3286,10 +3185,14 @@ mod tests {
 
     use super::{
         build_seedless_sweep_proposal, build_sweep_proposal, is_distinct_lightwalletd_endpoint,
-        standalone_transparent_signing_keys, ReviewedSweepIntent, ReviewedSweepStore, ScanSession,
-        SweepBalanceSnapshot, MAX_REVIEWED_SWEEPS,
+        record_confirmation_observation, standalone_transparent_signing_keys, ReviewedSweepIntent,
+        ReviewedSweepStore, ScanSession, SweepBalanceSnapshot, MAX_REVIEWED_SWEEPS,
     };
     use crate::{
+        broadcast::{
+            observe_transaction, BroadcastStore, DurableBroadcastLog, EndpointTxEvidence,
+            PreparedTransaction, TxObservationState,
+        },
         derivation::{
             legacy_transparent_account_key, mnemonic_seed, transparent_address_from_seed,
         },
@@ -3304,6 +3207,76 @@ mod tests {
     };
     use std::{path::PathBuf, sync::Arc, time::Instant};
     use tokio::sync::Mutex;
+
+    #[test]
+    fn confirmation_one_source_remains_pending_in_durable_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = zcash_primitives::transaction::TxId::from_bytes([42; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![42],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(130),
+        })
+        .unwrap();
+        let observation = observe_transaction(
+            vec![EndpointTxEvidence {
+                operator_id: "one".to_owned(),
+                endpoint: "https://one.example".to_owned(),
+                tip_height: Some(120),
+                reported_height: Some(100),
+                block_hash: Some(vec![1; 32]),
+                tx_in_block: true,
+            }],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Unavailable);
+        let state = record_confirmation_observation(&mut log, txid, &observation).unwrap();
+        assert_eq!(state, crate::models::TxLifecycleState::Pending);
+        drop(log);
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(
+            reopened.latest(txid).unwrap().observation,
+            Some(observation)
+        );
+    }
+
+    #[test]
+    fn confirmation_independent_absence_only_expires_after_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = zcash_primitives::transaction::TxId::from_bytes([43; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![43],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(130),
+        })
+        .unwrap();
+        let evidence = |operator: &str, tip| EndpointTxEvidence {
+            operator_id: operator.to_owned(),
+            endpoint: format!("https://{operator}.example"),
+            tip_height: Some(tip),
+            reported_height: None,
+            block_hash: None,
+            tx_in_block: false,
+        };
+        let pending =
+            observe_transaction(vec![evidence("one", 130), evidence("two", 131)], Some(130));
+        assert_eq!(
+            record_confirmation_observation(&mut log, txid, &pending).unwrap(),
+            crate::models::TxLifecycleState::Pending
+        );
+        let expired =
+            observe_transaction(vec![evidence("one", 131), evidence("two", 131)], Some(130));
+        assert_eq!(
+            record_confirmation_observation(&mut log, txid, &expired).unwrap(),
+            crate::models::TxLifecycleState::Expired
+        );
+    }
 
     fn reviewed_session(handle: ScanHandle, phrase: &str) -> ScanSession {
         let handle_id = handle.id.clone();
@@ -3322,6 +3295,7 @@ mod tests {
                 gap_limit: 1,
                 transparent_scan: None,
                 lightwalletd_url: "https://example.invalid".to_owned(),
+                confirmation_sources: Vec::new(),
                 data_dir: PathBuf::from("/tmp/argos-reviewed-intent-test"),
                 network: ZeckNetwork::Mainnet,
                 label: String::new(),
@@ -5450,6 +5424,7 @@ mod propose_workspace_guard_tests {
             gap_limit: 20,
             transparent_scan: None,
             lightwalletd_url: "https://127.0.0.1:1".to_owned(),
+            confirmation_sources: Vec::new(),
             data_dir: data_dir.to_owned(),
             network: ZeckNetwork::Mainnet,
             label: String::new(),

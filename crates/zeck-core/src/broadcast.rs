@@ -59,6 +59,13 @@ pub struct TxObservation {
 }
 
 impl TxObservation {
+    pub fn has_canonical_mined_evidence(&self) -> bool {
+        self.state == TxObservationState::Mined
+            && self.mined_height.is_some()
+            && observe_transaction(self.evidence.clone(), self.expiry_height).mined_height
+                == self.mined_height
+    }
+
     /// Expiry needs independent absence after the transaction's expiry height.
     pub fn is_expired(&self) -> bool {
         if self.state != TxObservationState::Absent || self.mined_height.is_some() {
@@ -83,6 +90,99 @@ impl TxObservation {
             .len()
             >= 2
     }
+}
+
+/// Reduce independently labelled lightwalletd observations. A missing height
+/// with a known tip means the transaction was absent; a missing tip means the
+/// source could not give usable evidence. `u32::MAX` is reserved for the
+/// lightwalletd `u64::MAX` orphaned-transaction sentinel.
+pub fn observe_transaction(
+    evidence: Vec<EndpointTxEvidence>,
+    expiry_height: Option<u32>,
+) -> TxObservation {
+    let primary_tip = evidence.first().and_then(|item| item.tip_height);
+    let secondary_tip = evidence.get(1).and_then(|item| item.tip_height);
+    let mut claims: Vec<(u32, &[u8], &str)> = Vec::new();
+    let mut absent_operators = HashSet::new();
+    let mut any_absent = false;
+    let mut present_unmined = false;
+    let mut reorged = false;
+    let mut contested = false;
+    let mut claimed_height = false;
+    for item in &evidence {
+        match item.reported_height {
+            Some(u32::MAX) => reorged = true,
+            Some(0) => present_unmined = true,
+            Some(height) => {
+                claimed_height = true;
+                if let Some(hash) = item.block_hash.as_deref().filter(|hash| !hash.is_empty()) {
+                    if item.tx_in_block {
+                        claims.push((height, hash, item.operator_id.as_str()));
+                    } else {
+                        contested = true;
+                    }
+                }
+            }
+            None if item.tip_height.is_some() => {
+                any_absent = true;
+                if !item.operator_id.trim().is_empty() {
+                    absent_operators.insert(item.operator_id.as_str());
+                }
+            }
+            None => {}
+        }
+    }
+    if let Some((height, hash, _)) = claims.first() {
+        if claims
+            .iter()
+            .any(|(other_height, other_hash, _)| other_height != height || other_hash != hash)
+            || present_unmined
+            || any_absent
+        {
+            contested = true;
+        }
+    }
+    let distinct_mined_operators = claims
+        .iter()
+        .filter_map(|(_, _, operator)| (!operator.trim().is_empty()).then_some(*operator))
+        .collect::<HashSet<_>>()
+        .len();
+    let (state, mined_height) = if contested {
+        (TxObservationState::Contested, None)
+    } else if reorged {
+        (TxObservationState::Reorged, None)
+    } else if distinct_mined_operators >= 2 {
+        (
+            TxObservationState::Mined,
+            claims.first().map(|(height, _, _)| *height),
+        )
+    } else if claimed_height {
+        (TxObservationState::Unavailable, None)
+    } else if present_unmined {
+        (TxObservationState::PresentUnmined, None)
+    } else if absent_operators.len() >= 2 {
+        (TxObservationState::Absent, None)
+    } else {
+        (TxObservationState::Unavailable, None)
+    };
+    TxObservation {
+        state,
+        mined_height,
+        expiry_height,
+        primary_tip,
+        secondary_tip,
+        evidence,
+    }
+}
+
+#[async_trait]
+pub trait TxObserver {
+    async fn observe(
+        &mut self,
+        network: crate::models::ZeckNetwork,
+        txid: TxId,
+        expiry_height: Option<u32>,
+    ) -> ZeckResult<TxObservation>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,18 +755,17 @@ fn validate_transition(
                 )
         }
         TxLifecycleState::Mined => {
-            matches!(
-                observation
-                    .or(existing.observation.as_ref())
-                    .map(|item| &item.state),
-                Some(TxObservationState::Mined)
-            ) && !matches!(
-                existing.state,
-                TxLifecycleState::Rejected | TxLifecycleState::Expired
-            ) && !matches!(
-                submission,
-                Some(SubmissionDisposition::DeterministicRejection { .. })
-            )
+            observation
+                .or(existing.observation.as_ref())
+                .is_some_and(TxObservation::has_canonical_mined_evidence)
+                && !matches!(
+                    existing.state,
+                    TxLifecycleState::Rejected | TxLifecycleState::Expired
+                )
+                && !matches!(
+                    submission,
+                    Some(SubmissionDisposition::DeterministicRejection { .. })
+                )
         }
         TxLifecycleState::Rejected => {
             matches!(
@@ -1482,7 +1581,10 @@ mod tests {
             expiry_height: Some(100),
             primary_tip: Some(90),
             secondary_tip: Some(90),
-            evidence: vec![],
+            evidence: vec![
+                confirmation_evidence("one", Some(90), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(90), Some(&[1; 32]), true),
+            ],
         };
         log.transition(txid, TxLifecycleState::Mined, None, Some(&mined))
             .unwrap();
@@ -1538,6 +1640,186 @@ mod tests {
         assert!(observation.is_expired());
         observation.evidence[1].tx_in_block = true;
         assert!(!observation.is_expired());
+    }
+
+    fn confirmation_evidence(
+        operator_id: &str,
+        reported_height: Option<u32>,
+        block_hash: Option<&[u8]>,
+        tx_in_block: bool,
+    ) -> EndpointTxEvidence {
+        EndpointTxEvidence {
+            operator_id: operator_id.to_owned(),
+            endpoint: format!("https://{operator_id}.example"),
+            tip_height: Some(120),
+            reported_height,
+            block_hash: block_hash.map(<[u8]>::to_vec),
+            tx_in_block,
+        }
+    }
+
+    #[test]
+    fn one_reported_height_is_not_canonical_mined() {
+        let observation = observe_transaction(
+            vec![confirmation_evidence(
+                "one",
+                Some(100),
+                Some(&[1; 32]),
+                true,
+            )],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Unavailable);
+        assert_eq!(observation.mined_height, None);
+    }
+
+    #[test]
+    fn durable_log_rejects_a_mined_label_without_canonical_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([44; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![44],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(130),
+        })
+        .unwrap();
+        let forged = TxObservation {
+            state: TxObservationState::Mined,
+            mined_height: Some(100),
+            expiry_height: Some(130),
+            primary_tip: Some(120),
+            secondary_tip: None,
+            evidence: vec![confirmation_evidence(
+                "one",
+                Some(100),
+                Some(&[1; 32]),
+                true,
+            )],
+        };
+        assert!(log
+            .transition(txid, TxLifecycleState::Mined, None, Some(&forged))
+            .is_err());
+    }
+
+    #[test]
+    fn same_operator_sources_are_not_independent() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("zec.rocks", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("zec.rocks", Some(100), Some(&[1; 32]), true),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Unavailable);
+    }
+
+    #[test]
+    fn matching_height_without_txid_in_block_is_contested() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(100), Some(&[1; 32]), false),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Contested);
+    }
+
+    #[test]
+    fn different_block_hashes_are_contested() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(100), Some(&[2; 32]), true),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Contested);
+    }
+
+    #[test]
+    fn secondary_absence_keeps_transaction_pending() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", None, None, false),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Contested);
+        assert_eq!(observation.mined_height, None);
+    }
+
+    #[test]
+    fn unlabeled_absence_prevents_mined_status() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("", None, None, false),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Contested);
+    }
+
+    #[test]
+    fn matching_independent_evidence_returns_mined() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(100), Some(&[1; 32]), true),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Mined);
+        assert_eq!(observation.mined_height, Some(100));
+    }
+
+    #[test]
+    fn u64_max_is_reorged() {
+        let observation = observe_transaction(
+            vec![confirmation_evidence("one", Some(u32::MAX), None, false)],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Reorged);
+    }
+
+    #[tokio::test]
+    async fn unexpired_absence_remains_pending_and_resubmittable() {
+        let mut observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", None, None, false),
+                confirmation_evidence("two", None, None, false),
+            ],
+            Some(100),
+        );
+        for item in &mut observation.evidence {
+            item.tip_height = Some(99);
+        }
+        assert_eq!(observation.state, TxObservationState::Absent);
+        assert!(!observation.is_expired());
+        let tx = fixture();
+        let mut store = RecordingStore::default();
+        store.persist_prepared(&tx).unwrap();
+        store
+            .transition(tx.txid, TxLifecycleState::Pending, None, Some(&observation))
+            .unwrap();
+        let mut submitter = ScriptedSubmitter {
+            store: store.clone(),
+            script: Script::Response(0, ""),
+            calls: 0,
+            sent: Vec::new(),
+        };
+        let result =
+            resubmit_prepared_transaction(&mut store, &mut submitter, &tx, Duration::from_secs(1))
+                .await
+                .unwrap();
+        assert_eq!(result.state, TxLifecycleState::Pending);
+        assert_eq!(submitter.sent, vec![tx.raw_tx]);
     }
 
     #[test]

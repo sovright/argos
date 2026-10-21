@@ -643,6 +643,7 @@ async fn probe_shielded_window(
         gap_limit: 1,
         transparent_scan: None,
         lightwalletd_url: lightwalletd_url.to_owned(),
+        confirmation_sources: Vec::new(),
         data_dir: probe_dir.clone(),
         network,
         label: String::new(),

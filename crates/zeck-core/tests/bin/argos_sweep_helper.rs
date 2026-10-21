@@ -236,6 +236,7 @@ async fn main() {
         gap_limit: args.gap_limit,
         transparent_scan: None,
         lightwalletd_url: args.lightwalletd_url,
+        confirmation_sources: Vec::new(),
         data_dir: args.data_dir,
         network: ZeckNetwork::Testnet,
         label: args.label,

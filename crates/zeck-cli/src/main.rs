@@ -2,6 +2,7 @@
 use std::process::Command;
 use std::{
     collections::VecDeque,
+    ffi::OsString,
     fs,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
@@ -97,6 +98,11 @@ struct Cli {
     )]
     lightwalletd_url: String,
 
+    /// Independent transaction confirmation source, as operator-id=https://url.
+    /// Repeat for each distinct operator. Localhost HTTP is allowed for tests.
+    #[arg(long, global = true, action = clap::ArgAction::Append, value_name = "OPERATOR=URL")]
+    confirmation_source: Vec<String>,
+
     /// Blocks downloaded and scanned at a time by `scan` and `sweep`. Trades
     /// speed for memory: a smaller batch holds fewer blocks and less
     /// decryption work at once, at the cost of more requests to lightwalletd.
@@ -166,6 +172,42 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Clap's global Vec handling keeps only the values from the deepest command
+/// when the same option is used on both sides of a subcommand. Recover the
+/// source arguments in their original order after Clap validates the syntax.
+fn parse_cli_from<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let mut cli = Cli::try_parse_from(args.iter().cloned())?;
+    let mut sources = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let Some(arg) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--confirmation-source" {
+            if let Some(value) = args.get(index + 1).and_then(|value| value.to_str()) {
+                sources.push(value.to_owned());
+            }
+            index += 2;
+        } else {
+            if let Some(value) = arg.strip_prefix("--confirmation-source=") {
+                sources.push(value.to_owned());
+            }
+            index += 1;
+        }
+    }
+    cli.confirmation_source = sources;
+    Ok(cli)
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1599,7 +1641,7 @@ fn install_regtest_params_if_requested() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|err| err.exit());
     if let Some(requested) = cli.scan_batch_size {
         let used = argos_core::scan::set_sync_batch_size(requested);
         if used != requested {
@@ -1918,6 +1960,12 @@ async fn main() -> Result<()> {
                         num_accounts: cli.num_accounts,
                         gap_limit: cli.gap_limit,
                         lightwalletd_url: cli.lightwalletd_url.clone(),
+                        confirmation_sources: argos_core::lightwalletd::parse_confirmation_sources(
+                            &cli.confirmation_source
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                        )?,
                         data_dir: cli.data_dir.clone(),
                         network,
                         label: String::new(),
@@ -1983,6 +2031,12 @@ async fn main() -> Result<()> {
                         num_accounts: cli.num_accounts,
                         gap_limit: cli.gap_limit,
                         lightwalletd_url: cli.lightwalletd_url.clone(),
+                        confirmation_sources: argos_core::lightwalletd::parse_confirmation_sources(
+                            &cli.confirmation_source
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                        )?,
                         data_dir: cli.data_dir.clone(),
                         network,
                         label: String::new(),
@@ -2923,6 +2977,48 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["argos", "scan"]).unwrap();
         assert_eq!(cli.scan_batch_size, None, "unset keeps the default");
+    }
+
+    #[test]
+    fn confirmation_source_is_repeatable_and_global() {
+        let cli = Cli::try_parse_from([
+            "argos",
+            "scan",
+            "--confirmation-source",
+            "one=https://one.example",
+            "--confirmation-source",
+            "two=https://two.example",
+        ])
+        .unwrap();
+        let raw = cli
+            .confirmation_source
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let sources = argos_core::lightwalletd::parse_confirmation_sources(&raw).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].operator_id, "one");
+        assert_eq!(sources[1].operator_id, "two");
+        let before = Cli::try_parse_from([
+            "argos",
+            "--confirmation-source",
+            "one=https://one.example",
+            "scan",
+        ])
+        .unwrap();
+        assert_eq!(before.confirmation_source, vec!["one=https://one.example"]);
+        let mixed = parse_cli_from([
+            "argos",
+            "--confirmation-source=one=https://one.example",
+            "scan",
+            "--confirmation-source",
+            "two=https://two.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            mixed.confirmation_source,
+            vec!["one=https://one.example", "two=https://two.example",]
+        );
     }
 
     /// A scan whose stdout went to a file or a pipe must still say on the

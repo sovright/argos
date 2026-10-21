@@ -112,6 +112,12 @@ pub fn default_transparent_scan() -> Option<TransparentScanConfig> {
     Some(TransparentScanConfig::default())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationEndpoint {
+    pub operator_id: String,
+    pub endpoint: String,
+}
+
 #[derive(Clone)]
 pub struct RuntimeScanConfig {
     /// Where the scan keys come from. A BIP-39 seed phrase
@@ -125,6 +131,7 @@ pub struct RuntimeScanConfig {
     /// exact-match/imported-key recovery. New seed scans select an explicit range.
     pub transparent_scan: Option<TransparentScanConfig>,
     pub lightwalletd_url: String,
+    pub confirmation_sources: Vec<ConfirmationEndpoint>,
     pub data_dir: PathBuf,
     pub network: ZeckNetwork,
     /// User-facing label written to `session.json` so the launch-time
@@ -145,6 +152,7 @@ impl std::fmt::Debug for RuntimeScanConfig {
             .field("gap_limit", &self.gap_limit)
             .field("transparent_scan", &self.transparent_scan)
             .field("lightwalletd_url", &self.lightwalletd_url)
+            .field("confirmation_sources", &self.confirmation_sources)
             .field("data_dir", &self.data_dir)
             .field("network", &self.network)
             .field("label", &self.label)
@@ -160,6 +168,8 @@ pub struct ScanConfig {
     #[serde(default = "default_transparent_scan")]
     pub transparent_scan: Option<TransparentScanConfig>,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<ConfirmationEndpoint>,
     pub data_dir: PathBuf,
     pub network: ZeckNetwork,
     #[serde(default)]
@@ -601,6 +611,7 @@ mod transparent_range_tests {
             "network": "mainnet"
         }))
         .unwrap();
+        assert!(config.confirmation_sources.is_empty());
         assert_eq!(
             config.transparent_scan,
             Some(TransparentScanConfig::default())
