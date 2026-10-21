@@ -152,6 +152,32 @@ fn ensure_tos_accepted_for_base(base: &Path) -> Result<(), String> {
     }
 }
 
+/// Require two independently labelled operators before the GUI starts a
+/// recovery that can submit funds. Backup hosts run by the same operator do
+/// not provide independent confirmation evidence.
+fn parse_gui_confirmation_sources(
+    scan_urls: &str,
+    raw: &[String],
+) -> Result<Vec<argos_core::ConfirmationEndpoint>, String> {
+    let raw = raw.iter().map(String::as_str).collect::<Vec<_>>();
+    let explicit = argos_core::lightwalletd::parse_confirmation_sources(&raw)
+        .map_err(|err| err.to_string())?;
+    let all = argos_core::lightwalletd::confirmation_endpoints(scan_urls, &explicit)
+        .map_err(|err| err.to_string())?;
+    let operators = all
+        .iter()
+        .map(|source| source.operator_id.as_str())
+        .filter(|operator| !operator.trim().is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if operators.len() < 2 {
+        return Err(
+            "Add a confirmation lightwalletd endpoint run by an independent operator (operator-id=https://url); two hosts of one operator cannot confirm a sweep."
+                .to_owned(),
+        );
+    }
+    Ok(explicit)
+}
+
 // No `Debug`/`Serialize`/`Clone`: this struct carries the cleartext seed, so it
 // must never be debug-printed, serialized, or duplicated. It only deserializes
 // the Tauri command payload, and its `SecretString` seed field redacts and
@@ -163,6 +189,8 @@ pub struct ScanConfigInput {
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     pub data_dir: String,
     pub network: ZeckNetwork,
     #[serde(default = "argos_core::default_transparent_scan")]
@@ -181,6 +209,8 @@ pub struct ScanConfigInput {
 pub struct MatchedScanConfigInput {
     pub birthday: u32,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     pub data_dir: String,
     pub network: ZeckNetwork,
     #[serde(default)]
@@ -202,6 +232,8 @@ pub async fn start_matched_recovery(
     config: MatchedScanConfigInput,
 ) -> Result<ScanHandle, String> {
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&config.lightwalletd_url, &config.confirmation_sources)?;
     if config.transparent_scan.is_some() {
         return Err(
             "matched-address recovery cannot widen its transparent address range".to_owned(),
@@ -240,7 +272,7 @@ pub async fn start_matched_recovery(
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: config.lightwalletd_url,
-                confirmation_sources: Vec::new(),
+                confirmation_sources,
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
@@ -616,6 +648,8 @@ pub struct WalletFileScanInput {
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     pub data_dir: String,
     pub network: ZeckNetwork,
     #[serde(default = "argos_core::default_transparent_scan")]
@@ -669,6 +703,8 @@ pub async fn start_scan_from_wallet_file(
     use std::sync::Arc;
 
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&config.lightwalletd_url, &config.confirmation_sources)?;
 
     // Either source alone is enough, and both together are meaningful: a
     // user may hold a wallet whose keys were never rescanned *and* a paper
@@ -728,7 +764,7 @@ pub async fn start_scan_from_wallet_file(
                 num_accounts: config.num_accounts,
                 gap_limit: config.gap_limit,
                 lightwalletd_url: config.lightwalletd_url,
-                confirmation_sources: Vec::new(),
+                confirmation_sources,
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
@@ -751,6 +787,8 @@ pub async fn start_scan(
     config: ScanConfigInput,
 ) -> Result<ScanHandle, String> {
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&config.lightwalletd_url, &config.confirmation_sources)?;
     let handle = state
         .service
         .start_scan(
@@ -759,7 +797,7 @@ pub async fn start_scan(
                 num_accounts: config.num_accounts,
                 gap_limit: config.gap_limit,
                 lightwalletd_url: config.lightwalletd_url,
-                confirmation_sources: Vec::new(),
+                confirmation_sources,
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
@@ -847,6 +885,35 @@ pub async fn cancel_scan(state: State<'_, AppState>, handle: ScanHandle) -> Resu
 }
 
 #[tauri::command]
+pub async fn reconcile_sweep(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    handle: ScanHandle,
+) -> Result<Vec<argos_core::reconciliation::ReconciledTransaction>, String> {
+    ensure_tos_accepted(&app)?;
+    state
+        .service
+        .reconcile_sweep(&handle)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn retry_unknown_sweep(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    handle: ScanHandle,
+    txid: String,
+) -> Result<argos_core::reconciliation::ReconciledTransaction, String> {
+    ensure_tos_accepted(&app)?;
+    state
+        .service
+        .retry_unknown_sweep(&handle, &txid)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn propose_sweep(
     app: AppHandle,
@@ -865,6 +932,15 @@ pub async fn propose_sweep(
         .filter(|value| !value.is_empty())
         .map(parse_zec_to_zatoshis)
         .transpose()?;
+
+    // Observe every durable transaction first. A previously accepted sweep
+    // may now have canonical mining evidence, but only a fresh proposal can
+    // quote the remaining funds after that transition.
+    state
+        .service
+        .reconcile_sweep(&handle)
+        .await
+        .map_err(|err| err.to_string())?;
 
     state
         .service
@@ -2001,6 +2077,8 @@ pub struct ResumeSessionInput {
     #[serde(default)]
     pub passphrase: Option<SecretString>,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     /// If supplied (non-empty after trimming), overwrites the existing
     /// label in the sidecar at resume time. Mostly useful when resuming a
     /// legacy "(unlabeled scan)" workspace.
@@ -2013,6 +2091,7 @@ pub struct ResumeSessionResult {
     pub network: ZeckNetwork,
     pub data_dir: String,
     pub lightwalletd_url: String,
+    pub confirmation_sources: Vec<String>,
 }
 
 /// Resume an incomplete scan: verify the seed matches the workspace, then
@@ -2028,6 +2107,8 @@ pub async fn resume_session(
     input: ResumeSessionInput,
 ) -> Result<ResumeSessionResult, String> {
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&input.lightwalletd_url, &input.confirmation_sources)?;
     let workspace_path = PathBuf::from(input.workspace_path.trim());
     if workspace_path.as_os_str().is_empty() {
         return Err("workspace path cannot be empty".to_owned());
@@ -2048,7 +2129,7 @@ pub async fn resume_session(
         num_accounts: keying.num_accounts,
         gap_limit: keying.gap_limit,
         lightwalletd_url: input.lightwalletd_url.clone(),
-        confirmation_sources: Vec::new(),
+        confirmation_sources,
         data_dir: data_dir.clone(),
         network: keying.network,
         label,
@@ -2093,6 +2174,7 @@ pub async fn resume_session(
         network: keying.network,
         data_dir: data_dir.to_string_lossy().into_owned(),
         lightwalletd_url: input.lightwalletd_url,
+        confirmation_sources: input.confirmation_sources,
     })
 }
 
@@ -2299,6 +2381,48 @@ mod tests {
             ScanHandle,
             argos_core::SweepProposalId,
         ) -> _ = super::execute_sweep;
+    }
+
+    #[test]
+    fn reconciliation_commands_accept_only_existing_handle_and_txid() {
+        let _status: fn(AppHandle, State<'static, AppState>, ScanHandle) -> _ =
+            super::reconcile_sweep;
+        let _retry: fn(AppHandle, State<'static, AppState>, ScanHandle, String) -> _ =
+            super::retry_unknown_sweep;
+    }
+
+    #[test]
+    fn gui_requires_two_independent_labelled_confirmation_operators() {
+        let sources = super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443,https://na.zec.rocks:443",
+            &["independent=https://other.example:443".to_owned()],
+        )
+        .expect("explicit independent operator complements the known primary");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].operator_id, "independent");
+        assert!(super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443,https://na.zec.rocks:443",
+            &[],
+        )
+        .is_err());
+        assert!(super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443",
+            &["other=https://na.zec.rocks:443".to_owned()],
+        )
+        .is_err());
+        assert!(super::parse_gui_confirmation_sources(
+            "https://custom.example:443",
+            &["one=https://one.example:443".to_owned()],
+        )
+        .is_err());
+        assert!(super::parse_gui_confirmation_sources(
+            "https://custom.example:443",
+            &[
+                "one=https://one.example:443".to_owned(),
+                "two=https://two.example:443".to_owned(),
+            ],
+        )
+        .is_ok());
     }
 
     #[test]

@@ -18,6 +18,12 @@
 //! enough here.
 //!
 //! [`UnifiedSpendingKey`]: zcash_keys::keys::UnifiedSpendingKey
+//!
+//! Unreviewed sweep entrypoints are not part of the public API:
+//!
+//! ```compile_fail
+//! use argos_core::imported_sweep::{sweep_imported_wallet, sweep_imported_filtered_wallet};
+//! ```
 
 // `low_level_signer::Signer` and `signer::Signer` are different roles with
 // the same name; alias so which one is in use is never ambiguous.
@@ -664,13 +670,33 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
 fn open_imported_broadcast_log(
     runtime: &crate::models::RuntimeScanConfig,
 ) -> ZeckResult<DurableBroadcastLog> {
-    let workspace = crate::workspace::RecoveryWorkspace::from_runtime(runtime)?;
-    workspace.ensure_broadcast_log_directory()?;
-    let log = DurableBroadcastLog::open(workspace.broadcast_log_path())?;
+    let path = crate::service::network_broadcast_log_path(&runtime.data_dir, runtime.network)?;
+    std::fs::create_dir_all(path.parent().expect("registry log has a parent")).map_err(|err| {
+        ZeckError::Storage(format!(
+            "creating network broadcast registry {}: {err}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            path.parent().expect("registry log has a parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .map_err(|err| ZeckError::Storage(format!("securing network broadcast registry: {err}")))?;
+    }
+    let log = DurableBroadcastLog::open(path)?;
     if let Some(txid) = log.blocking_submission() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep leg"
         )));
+    }
+    if log.has_unresolved_history() {
+        return Err(ZeckError::Broadcast(
+            "cannot start another sweep leg with unresolved prepared transaction history"
+                .to_owned(),
+        ));
     }
     Ok(log)
 }
@@ -696,7 +722,8 @@ fn open_imported_broadcast_log(
 /// that may have moved real funds. This is the same split the HD sweep path
 /// makes for the same reason (audit Issue E); the caller folds the two back
 /// together with `assemble_sweep_outcome`.
-pub async fn sweep_imported_wallet(
+#[cfg(test)]
+async fn sweep_imported_wallet(
     runtime: &crate::models::RuntimeScanConfig,
     keys: &argos_wallet_import::ImportedKeys,
     destination: &str,
@@ -740,7 +767,8 @@ pub(crate) async fn sweep_imported_wallet_reviewed(
 /// Spend only the standalone identities registered by a mixed scan. The
 /// account IDs come from that scan; re-registering the original imported set
 /// would reintroduce HD-overlapping keys and duplicate spend authority.
-pub async fn sweep_imported_filtered_wallet(
+#[cfg(test)]
+async fn sweep_imported_filtered_wallet(
     runtime: &crate::models::RuntimeScanConfig,
     keys: &argos_wallet_import::ImportedKeys,
     sapling_accounts: &[(u32, AccountUuid, usize)],

@@ -161,7 +161,7 @@ pub(crate) fn canonical_confirmation_operator_id(operator_id: &str, endpoint: &s
     } else {
         known_confirmation_operator(endpoint)
             .unwrap_or(operator_id)
-            .to_owned()
+            .to_ascii_lowercase()
     }
 }
 

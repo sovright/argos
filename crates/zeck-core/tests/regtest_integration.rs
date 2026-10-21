@@ -188,6 +188,77 @@ async fn local_public_transparent_review_binds_live_outpoint_before_submission()
     assert!(fake.captured_submissions().lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn standalone_transparent_quote_refuses_same_fee_outpoint_swap_before_signing() {
+    use argos_core::transparent_recovery::{
+        quote_transparent_only, sweep_transparent_only_from_quote,
+    };
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use zcash_client_backend::proto::service::GetAddressUtxosReply;
+
+    let key = common::standalone_transparent::standalone_transparent_key();
+    let mut utxo = GetAddressUtxosReply {
+        address: argos_core::imported::encode_transparent_address(
+            &key.address,
+            ZeckNetwork::Testnet,
+        ),
+        txid: vec![0x61; 32],
+        index: 0,
+        script: Vec::new(),
+        value_zat: 250_000,
+        height: 3_500_000,
+    };
+    let fake = FakeLightwalletd::builder()
+        .chain_name("test")
+        .sapling_activation_height(280_000)
+        .block_height(3_500_000)
+        .scripted_address_utxos(vec![utxo.clone()])
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let keys = [key];
+    let quote = quote_transparent_only(&keys, ZeckNetwork::Testnet, &fake.url)
+        .await
+        .unwrap();
+    let plan = quote.plan().unwrap();
+    assert_eq!(plan.total_input_zatoshis, 250_000);
+    assert_eq!(plan.fee_zatoshis, 15_000);
+    assert_eq!(plan.output_zatoshis, 235_000);
+
+    utxo.txid = vec![0x62; 32];
+    fake.set_scripted_address_utxos(vec![utxo]);
+    let data_dir = tempfile::tempdir().unwrap();
+    let registry =
+        argos_core::service::NetworkOperationGuard::acquire(data_dir.path(), ZeckNetwork::Testnet)
+            .unwrap();
+    let mut log = registry.open_broadcast_log().unwrap();
+    let destination = argos_core::derive_accounts(
+        &SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned()),
+        ZeckNetwork::Testnet,
+        1,
+    )
+    .unwrap()[0]
+        .unified_address
+        .clone();
+    let error = sweep_transparent_only_from_quote(
+        &mut log,
+        &keys,
+        ZeckNetwork::Testnet,
+        &fake.url,
+        &destination,
+        Some(15_000),
+        &quote,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("selected sweep inputs changed"),
+        "{error}"
+    );
+    assert!(fake.captured_submissions().lock().unwrap().is_empty());
+}
+
 // This local RPC test runs without the external regtest node. A missing
 // capture or a response dropped before upstream acceptance breaks it.
 #[tokio::test]

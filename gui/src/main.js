@@ -50,6 +50,8 @@ const state = {
   retainedAddressSearchId: null,
   addressMatchRecoveryLocked: false,
   addressMatchRecoveryStartGeneration: null,
+  completionContext: null,
+  reconciliationPending: false,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1523,6 +1525,12 @@ const SERVER_PRESETS = {
   testnet: "https://testnet.zec.rocks:443",
 };
 
+const CONFIRMATION_SOURCES_STORAGE_KEY = "argos-confirmation-sources-v1";
+
+function confirmationSourcesFromForm(id = "confirmation-sources") {
+  return $(id).value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
 function clearMatchedRecoveryUi() {
   state.matchedRecovery = null;
   $("matched-recovery-banner").hidden = true;
@@ -1980,6 +1988,7 @@ go back and provide one.",
     num_accounts: state.matchedRecovery ? 1 : (autoGap ? null : parseInt($("accounts-range").value, 10)),
     gap_limit: state.matchedRecovery ? 1 : (autoGap ? parseInt($("gap-limit").value, 10) : 20),
     lightwalletd_url: $("lightwalletd-url").value.trim(),
+    confirmation_sources: confirmationSourcesFromForm(),
     data_dir: dataDirVal,
     network: $("network-select").value,
     label: labelRaw || defaultScanLabel(),
@@ -2118,6 +2127,7 @@ async function startProgressListeners(expectedHandle) {
   $("scan-rows").innerHTML = "";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
+  $("scan-saved-transactions").disabled = true;
   $("back-to-config").style.display = "none";
   $("scan-return-address-matches").hidden = true;
   $("cancel-scan").disabled = false;
@@ -2374,6 +2384,7 @@ function updateScanUI(progress) {
     !canReturnToAddressMatches(progress, state.retainedAddressSearchId);
   if (progress.phase === "complete") {
     $("review-sweep").disabled = false;
+    $("scan-saved-transactions").disabled = false;
   }
 }
 
@@ -2392,6 +2403,7 @@ function returnToAddressMatches() {
   state.scanHandle = null;
   state.lastProgress = null;
   invalidateSweepReview();
+  $("scan-saved-transactions").disabled = true;
   state.addressMatchRecoveryLocked = false;
   $("start-scan").disabled = false;
   setStatus("config-status", "", "");
@@ -2484,6 +2496,7 @@ function invalidateScanAuthority() {
   $("copy-report-path").style.display = "none";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
+  $("scan-saved-transactions").disabled = true;
   $("back-to-config").style.display = "none";
   $("cancel-scan").disabled = true;
   $("start-scan").disabled = state.sweepExecutionPending;
@@ -2494,7 +2507,7 @@ for (const id of [
   "seed-input", "wallet-path", "wallet-passphrase", "sapling-scan-keys",
   "network-select", "birthday-height", "accounts-range", "auto-gap-limit",
   "gap-limit", "transparent-index-start", "transparent-index-count",
-  "transparent-include-change", "lightwalletd-url", "server-preset", "data-dir",
+  "transparent-include-change", "lightwalletd-url", "confirmation-sources", "server-preset", "data-dir",
   "sprout-scan-peers",
 ]) {
   $(id)?.addEventListener("input", invalidateScanAuthority);
@@ -2605,10 +2618,52 @@ $("review-sweep").addEventListener("click", async () => {
   try {
     if (await refreshSweepProposal()) goTo("sweep");
   } catch (err) {
-    setStatus("scan-message", `✗ ${err}`, "error");
+    const message = String(err);
+    const guidance = message.includes("unresolved prepared transaction history")
+      ? " Use Saved transaction status to inspect or explicitly retry stored bytes." : "";
+    setStatus("scan-message", `✗ ${message}${guidance}`, "error");
     $("review-sweep").disabled = false;
   }
 });
+
+async function showSavedTransactions() {
+  const handle = state.scanHandle;
+  if (!handle || state.lastProgress?.phase !== "complete") return;
+  const button = $("scan-saved-transactions");
+  button.disabled = true;
+  setStatus("scan-message", "Checking saved transaction history…", "");
+  try {
+    const rows = await invoke("reconcile_sweep", { handle });
+    if (state.scanHandle?.id !== handle.id) return;
+    if (!rows.length) {
+      setStatus("scan-message", "No saved transaction receipts were found for this network.", "");
+      return;
+    }
+    const outcome = {
+      transactions: rows.map((row) => ({ source_account: null, ...row })),
+      skipped_accounts: [], total_donation_zatoshis: 0, donation_note: null,
+      error: null, follow_up_review_required: false,
+    };
+    const completionContext = {
+      handle, outcome, statusOnly: true, scanConfig: state.scanConfig,
+      lastProgress: state.lastProgress, donationRate: null,
+    };
+    state.completedScanHandle = handle;
+    invalidateSweepReview();
+    state.lastProgress = null;
+    $("review-sweep").disabled = true;
+    renderCompleteScreen(outcome.transactions, [], 0, null, null, null, completionContext);
+    goTo("complete");
+  } catch (error) {
+    if (state.scanHandle?.id === handle.id) {
+      setStatus("scan-message", `Could not check saved transactions: ${error}`, "error");
+    }
+  } finally {
+    button.disabled = state.scanHandle?.id !== handle.id || state.lastProgress?.phase !== "complete";
+  }
+}
+
+$("scan-saved-transactions").addEventListener("click", showSavedTransactions);
 
 $("sweep-back").addEventListener("click", () => {
   // Re-enable Review & Sweep so the user can navigate back to sweep via the
@@ -2861,7 +2916,7 @@ function txStatusKind(status) {
 function txStatusLabel(status) {
   return {
     not_submitted: "Not submitted.",
-    submission_unknown: "Submission uncertain — may already be on the network. Do not retry.",
+    submission_unknown: "Submission uncertain — may already be on the network. Do not retry without a fresh status check.",
     pending: "Broadcast — awaiting independent confirmation.",
     mined: "Mined — independently confirmed.",
     expired: "Expired — rescan before rebuilding.",
@@ -2887,22 +2942,22 @@ function sweepCompleteSummary(results, error, followUpReviewRequired = false, sk
     const atRisk = unknown + pending + mined;
     const sent = atRisk > 0 ? `${atRisk} transaction${atRisk === 1 ? " may" : "s may"} already have moved. ` : "";
     const warning = atRisk ? walletWarning : "Keep the source wallet and recovery workspace until remaining balances are accounted for.";
-    return `The sweep stopped before completing. ${sent}${unknown ? "A submission may already have moved; do not retry it. " : ""}${warning} Rescan and reconcile each txid before any new proposal. Error: ${error}`;
+    return `The sweep stopped before completing. ${sent}${unknown ? "A submission may already have moved; do not retry it without a fresh status check. " : ""}${warning} Rescan and reconcile each txid before any new proposal. Error: ${error}`;
   }
   if (results.length === 0) {
     return "No funds were swept — every account with a balance was skipped (reasons below).";
   }
   if (followUpReviewRequired) {
-    const uncertainty = unknown ? "A shielding transaction may already have moved; do not retry it; reconcile its txid. " : "";
+    const uncertainty = unknown ? "A shielding transaction may already have moved; do not retry it without a fresh status check; reconcile its txid. " : "";
     return `Shielding stage requires follow-up. ${uncertainty}${mined ? `${mined} transaction${mined === 1 ? "" : "s"} mined. ` : ""}${walletWarning}${pending ? " Reconcile pending txids and wait for independent confirmation." : ""}${expired ? " An expired transaction requires a rescan before rebuilding." : ""} Rescan and review a new proposal before sending shielded funds.`;
   }
   if (expired && (unknown || pending)) {
-    const uncertain = unknown ? `${unknown} submission${unknown === 1 ? " is" : "s are"} uncertain and may already have moved; do not retry; reconcile the txid. ` : "";
+    const uncertain = unknown ? `${unknown} submission${unknown === 1 ? " is" : "s are"} uncertain and may already have moved; do not retry without a fresh status check; reconcile the txid. ` : "";
     const awaiting = pending ? `${pending} transaction${pending === 1 ? " is" : "s are"} awaiting independent confirmation; reconcile the txid. ` : "";
     return `${uncertain}${awaiting}${expired} transaction${expired === 1 ? " has" : "s have"} expired; rescan before rebuilding. ${walletWarning}`;
   }
   if (unknown) {
-    return `${unknown} submission${unknown === 1 ? "" : "s"} uncertain — transaction${unknown === 1 ? " may" : "s may"} already have moved. Do not retry. ${walletWarning}`;
+    return `${unknown} submission${unknown === 1 ? "" : "s"} uncertain — transaction${unknown === 1 ? " may" : "s may"} already have moved. Do not retry without a fresh status check. ${walletWarning}`;
   }
   if (pending) {
     return `${pending} transaction${pending === 1 ? "" : "s"} broadcast, awaiting independent confirmation. ${walletWarning}`;
@@ -2915,7 +2970,118 @@ function sweepCompleteSummary(results, error, followUpReviewRequired = false, sk
   return "No transaction was submitted. Review the details before trying again.";
 }
 
+function applyReconciledTransactions(rows) {
+  const context = state.completionContext;
+  if (!context) return;
+  const outcome = context.outcome || { transactions: [] };
+  const transactions = [...(outcome.transactions || [])];
+  for (const row of rows) {
+    const index = transactions.findIndex((item) => item.txid === row.txid);
+    if (index >= 0) transactions[index] = { ...transactions[index], ...row };
+    else transactions.push({ source_account: null, ...row });
+  }
+  const updatedOutcome = { ...outcome, transactions };
+  const updatedContext = { ...context, outcome: updatedOutcome };
+  renderCompleteScreen(
+    transactions, updatedOutcome.skipped_accounts || [],
+    updatedOutcome.total_donation_zatoshis || 0,
+    updatedContext.donationRate ?? null,
+    updatedOutcome.error || null, updatedOutcome.donation_note || null,
+    updatedContext,
+  );
+}
+
+async function refreshSweepStatus() {
+  const context = state.completionContext;
+  const handle = context?.handle;
+  if (!handle || state.reconciliationPending) return;
+  state.reconciliationPending = true;
+  $("complete-check-status").disabled = true;
+  setStatus("complete-reconciliation-status", "Checking saved transactions with independent operators…", "");
+  try {
+    const rows = await invoke("reconcile_sweep", { handle });
+    if (state.completionContext !== context) return;
+    const reported = new Set(rows.map((row) => row.txid));
+    if (context.outcome?.transactions?.some((row) => row.txid && !reported.has(row.txid))) {
+      throw new Error("The journal did not return every displayed transaction; keep the recovery workspace.");
+    }
+    const newlyFinal = rows.some((row) => {
+      const previous = context.outcome?.transactions?.find((item) => item.txid === row.txid);
+      return (!previous || txStatusKind(previous.status) !== txStatusKind(row.status)) &&
+        ["mined", "expired"].includes(txStatusKind(row.status));
+    });
+    applyReconciledTransactions(rows);
+    if (newlyFinal) {
+      invalidateSweepReview();
+      state.lastProgress = null;
+    }
+    setStatus("complete-reconciliation-status", newlyFinal
+      ? "Transaction status refreshed. Run a fresh scan and review a new quote before another sweep stage."
+      : "Transaction status refreshed from independent operators.", "success");
+  } catch (error) {
+    if (state.completionContext !== context) return;
+    // A failed fresh observation cannot support deleting this workspace.
+    $("delete-workspace").disabled = true;
+    $("delete-workspace-zone").hidden = true;
+    setStatus("complete-reconciliation-status", `Could not verify current status: ${error}`, "error");
+  } finally {
+    state.reconciliationPending = false;
+    $("complete-check-status").disabled = false;
+  }
+}
+
+async function retryStoredSweepTransaction(txid) {
+  const context = state.completionContext;
+  const handle = context?.handle;
+  const current = context?.outcome?.transactions?.find((row) => row.txid === txid);
+  if (!handle || !current ||
+      !["submission_unknown", "not_submitted"].includes(txStatusKind(current.status)) ||
+      state.reconciliationPending) return;
+  if (!window.confirm(
+    `Retry only the exact saved transaction ${txid}? The app will first check its current status. ` +
+    "No new transaction will be built or signed."
+  )) return;
+  const network = context.scanConfig?.network ?? state.scanConfig?.network ?? "the configured network";
+  const dataDir = context.scanConfig?.data_dir ?? state.scanConfig?.data_dir ?? "the configured data directory";
+  if (typeof window.prompt !== "function") {
+    setStatus("complete-reconciliation-status", "Full txid confirmation is unavailable; transaction was not retried.", "error");
+    return;
+  }
+  const typedTxid = window.prompt(
+    `Saved transactions cover ${network} in ${dataDir} and may belong to another wallet. ` +
+    `To retry only the exact stored bytes for ${txid}, type the full txid:`,
+    "",
+  );
+  if (typedTxid === null) return;
+  if (typedTxid !== txid) {
+    setStatus("complete-reconciliation-status", "The full txid did not match; transaction was not retried.", "error");
+    return;
+  }
+  state.reconciliationPending = true;
+  $("complete-check-status").disabled = true;
+  setStatus("complete-reconciliation-status", "Checking status before retrying saved transaction…", "");
+  try {
+    const row = await invoke("retry_unknown_sweep", { handle, txid });
+    if (state.completionContext !== context) return;
+    applyReconciledTransactions([row]);
+    setStatus("complete-reconciliation-status", "Saved transaction retry completed; check status for independent confirmation.", "success");
+  } catch (error) {
+    if (state.completionContext !== context) return;
+    $("delete-workspace").disabled = true;
+    $("delete-workspace-zone").hidden = true;
+    setStatus("complete-reconciliation-status", `Saved transaction was not retried: ${error}`, "error");
+  } finally {
+    state.reconciliationPending = false;
+    $("complete-check-status").disabled = false;
+  }
+}
+
 function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote, completionContext = null) {
+  state.completionContext = completionContext;
+  const statusOnly = !!completionContext?.statusOnly;
+  const statusButton = $("complete-check-status");
+  statusButton.hidden = !completionContext?.handle;
+  statusButton.onclick = () => refreshSweepStatus();
   $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
   if (state.retainedAddressSearchId) {
     state.addressMatchRecoveryLocked = false;
@@ -2923,13 +3089,17 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
   }
   const { unknown, pending, expired, rejected, not_submitted: notSubmitted } = sweepStatusCounts(results);
   const followUpReviewRequired = !!(completionContext?.outcome?.follow_up_review_required ?? completionContext?.followUpReviewRequired);
-  const allMined = !error && !followUpReviewRequired && !(skipped?.length) && results.length > 0 &&
+  const allMined = !statusOnly && !error && !followUpReviewRequired && !(skipped?.length) && results.length > 0 &&
     results.every((r) => txStatusKind(r.status) === "mined");
-  $("complete-heading").textContent = allMined ? "Recovery complete" : "Sweep status";
-  $("complete-summary").textContent = sweepCompleteSummary(results, error, followUpReviewRequired, skipped);
-  const confirmationNote = allMined
+  $("complete-heading").textContent = statusOnly ? "Saved transaction status" : allMined ? "Recovery complete" : "Sweep status";
+  $("complete-summary").textContent = statusOnly
+    ? "These are saved transactions in this network data directory, which may include another wallet. Keep the source wallets and recovery workspaces; run a fresh scan and review a new quote before another sweep stage."
+    : sweepCompleteSummary(results, error, followUpReviewRequired, skipped);
+  const confirmationNote = statusOnly
+    ? "The status below reflects current independent observations. Verify the txid and source wallet before retrying stored Unknown or Not Submitted bytes."
+    : allMined
     ? "Every submitted transaction has independent mining evidence. Verify the destination balance before deleting your recovery workspace."
-    : unknown ? "Keep the source wallet and recovery workspace. A submission may already have moved; do not retry it. Reconcile its txid before a new proposal."
+    : unknown ? "Keep the source wallet and recovery workspace. A submission may already have moved; do not retry it without a fresh status check. Reconcile its txid before a new proposal."
     : pending ? "Keep the source wallet and recovery workspace. A pending transaction may still mine; check its txid before a new proposal."
     : expired ? "The transaction expired. Keep the source wallet and recovery workspace; rescan before rebuilding."
     : rejected ? "The node rejected the transaction. Keep the source wallet and recovery workspace; review the evidence before a new proposal."
@@ -2940,7 +3110,7 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     (expired && (unknown || pending) ? " An expired transaction also requires a rescan before rebuilding." : "");
   $("delete-workspace").disabled = !allMined;
   $("delete-workspace-zone").hidden = !allMined;
-  $("restart-flow").textContent = followUpReviewRequired ? "Rescan and review" : "Start over";
+  $("restart-flow").textContent = statusOnly || followUpReviewRequired ? "Rescan and review" : "Start over";
 
   const container = $("complete-txids");
   container.innerHTML = "";
@@ -2950,7 +3120,7 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
 
     const label = document.createElement("div");
     label.className = "txid-label";
-    label.textContent = `Account ${r.source_account} · ${txStatusLabel(r.status)}`;
+    label.textContent = `${r.source_account == null ? "Journal transaction" : `Account ${r.source_account}`} · ${txStatusLabel(r.status)}`;
     card.appendChild(label);
 
     if (r.txid) {
@@ -2991,6 +3161,14 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
       note.className = "txid-note";
       note.textContent = r.detail;
       card.appendChild(note);
+    }
+
+    if (r.txid && ["submission_unknown", "not_submitted"].includes(txStatusKind(r.status)) && completionContext?.handle) {
+      const retry = document.createElement("button");
+      retry.className = "secondary";
+      retry.textContent = "Retry saved transaction";
+      retry.addEventListener("click", () => retryStoredSweepTransaction(r.txid));
+      card.appendChild(retry);
     }
 
     container.appendChild(card);
@@ -3060,13 +3238,14 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
 
 function buildReport(results, completionContext = null) {
   const outcome = completionContext?.outcome;
+  const statusOnly = !!completionContext?.statusOnly;
   const transactions = outcome?.transactions ?? results;
   const skipped = outcome?.skipped_accounts ?? [];
   const error = outcome?.error ?? null;
   const followUpReviewRequired = !!outcome?.follow_up_review_required;
-  const allMined = !error && !followUpReviewRequired && skipped.length === 0 && transactions.length > 0 &&
+  const allMined = !statusOnly && !error && !followUpReviewRequired && skipped.length === 0 && transactions.length > 0 &&
     transactions.every((r) => r.status === "mined");
-  const status = allMined ? "Recovery complete" : followUpReviewRequired
+  const status = statusOnly ? "Saved transaction status" : allMined ? "Recovery complete" : followUpReviewRequired
     ? "Shielding stage — follow-up review required" : "Incomplete";
   const cfg = completionContext?.scanConfig ?? state.scanConfig;
   const prog = completionContext?.lastProgress ?? state.lastProgress;
@@ -3095,12 +3274,12 @@ function buildReport(results, completionContext = null) {
     `Status: ${status}`,
     `Follow-up review required: ${followUpReviewRequired ? "yes" : "no"}`,
     ...(error ? [`Error: ${error}`] : []),
-    `Guidance: ${sweepCompleteSummary(transactions, error, followUpReviewRequired, skipped)}`,
+    `Guidance: ${statusOnly ? "Run a fresh scan and review a new quote before another sweep stage." : sweepCompleteSummary(transactions, error, followUpReviewRequired, skipped)}`,
     "",
     "Transaction Results",
     "──────────────────",
     ...transactions.map((r) => {
-      let line = `Account ${r.source_account}: ${txStatusKind(r.status)}`;
+      let line = `${r.source_account == null ? "Journal transaction" : `Account ${r.source_account}`}: ${txStatusKind(r.status)}`;
       if (r.txid) line += `\n  txid: ${r.txid}`;
       if (r.fee_zatoshis != null) line += `\n  fee: ${fmt(r.fee_zatoshis)}`;
       if (txStatusKind(r.status) === "mined" && r.confirmed_height) line += `\n  mined at block ${r.confirmed_height}`;
@@ -3212,6 +3391,8 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
     retainedAddressSearchId: null,
     addressMatchRecoveryLocked: false,
     addressMatchRecoveryStartGeneration: null,
+    completionContext: null,
+    reconciliationPending: false,
   });
   $("copy-report-path").style.display = "none";
   $("delete-workspace").disabled = false;
@@ -3302,6 +3483,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("scan-workspace").textContent = "Workspace: not initialized";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
+  $("scan-saved-transactions").disabled = true;
   $("back-to-config").style.display = "none";
   $("cancel-scan").style.display = "";
 
@@ -3624,6 +3806,7 @@ function openResumeModal(row) {
   $("resume-destination-input").value = "";
   $("resume-memo-input").value = "";
   $("resume-max-fee-zec").value = "";
+  $("resume-confirmation-sources").value = $("confirmation-sources").value;
   $("resume-bip39-passphrase-field").hidden = !row.match_coordinates;
   setStatus("resume-modal-status", "", "");
   $("resume-modal").hidden = false;
@@ -3709,6 +3892,7 @@ $("resume-confirm").addEventListener("click", async () => {
         seed,
         passphrase,
         lightwalletd_url: lightwalletdUrl,
+        confirmation_sources: confirmationSourcesFromForm("resume-confirmation-sources"),
         label: labelOverride || null,
       },
     });
@@ -3721,10 +3905,15 @@ $("resume-confirm").addEventListener("click", async () => {
       network: resumed.network,
       data_dir: resumed.data_dir,
       lightwalletd_url: resumed.lightwalletd_url,
+      confirmation_sources: resumed.confirmation_sources,
     };
     $("network-select").value = resumed.network;
     $("data-dir").value = resumed.data_dir;
     $("lightwalletd-url").value = resumed.lightwalletd_url;
+    $("confirmation-sources").value = (resumed.confirmation_sources || []).join("\n");
+    try {
+      localStorage.setItem(CONFIRMATION_SOURCES_STORAGE_KEY, $("confirmation-sources").value);
+    } catch (_) {}
     $("server-preset").value = resumed.lightwalletd_url === SERVER_PRESETS[resumed.network]
       ? "recommended" : "custom";
     state.scanHandle = resumed.handle;
@@ -3743,6 +3932,16 @@ $("resume-confirm").addEventListener("click", async () => {
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 $("lightwalletd-url").value = SERVER_PRESETS.mainnet;
+try {
+  $("confirmation-sources").value = localStorage.getItem(CONFIRMATION_SOURCES_STORAGE_KEY) || "";
+} catch (_) {
+  // Scans can still use the source input when webview storage is unavailable.
+}
+$("confirmation-sources").addEventListener("input", () => {
+  try {
+    localStorage.setItem(CONFIRMATION_SOURCES_STORAGE_KEY, $("confirmation-sources").value);
+  } catch (_) {}
+});
 $("gap-limit-row").style.display = $("auto-gap-limit").checked ? "none" : "block";
 $("accounts-range").disabled = !$("auto-gap-limit").checked;
 $("scan-label").value = defaultScanLabel();

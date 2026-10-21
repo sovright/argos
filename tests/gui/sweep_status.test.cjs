@@ -52,7 +52,7 @@ test("submission_unknown is not rendered as failed or zero broadcasts", () => {
   assert.doesNotMatch(h.$("complete-summary").textContent, /no funds were moved|failed to broadcast/i);
   assert.equal(h.$("complete-txids").children[0].className.includes("failed"), false);
   assert.match(h.$("complete-txids").children[0].children[0].textContent,
-    /Submission uncertain — may already be on the network\. Do not retry\./);
+    /Submission uncertain — may already be on the network\. Do not retry without a fresh status check\./);
   assert.equal(h.sweepStatusCounts([unknown]).unknown, 1);
 });
 

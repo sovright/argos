@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     fs::OpenOptions,
-    io::Cursor,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -10,6 +10,7 @@ use std::{
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction, SendResponse,
@@ -27,6 +28,50 @@ pub use crate::models::TxLifecycleState;
 
 pub const BROADCAST_LOG_SCHEMA_VERSION: u32 = 1;
 pub const BROADCAST_LOG_FILE_NAME: &str = "broadcasts-v1.jsonl";
+const LEGACY_IMPORT_MANIFEST_FILE_NAME: &str = "legacy-imports-v1.json";
+
+#[derive(Default, Serialize, Deserialize)]
+struct LegacyImportManifest {
+    /// Canonical source path to the exact bytes imported from that source.
+    sources: BTreeMap<String, String>,
+}
+
+fn atomic_replace_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ZeckError::Storage(format!("{} has no parent directory", path.display())))?;
+    let temp = parent.join(format!(
+        ".{}.import-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("log"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp)
+            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", temp.display())))?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", temp.display())))?;
+        fs::rename(&temp, path)
+            .map_err(|err| ZeckError::Storage(format!("replacing {}: {err}", path.display())))?;
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", parent.display())))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
+}
 
 /// The lock lives beside the workspace, so renaming or deleting that
 /// workspace cannot unlink the lock inode while a submitter holds it.
@@ -460,10 +505,7 @@ where
             | TxLifecycleState::Pending
     ) || persisted.observation.as_ref().is_some_and(|observation| {
         observation.expiry_height == persisted.prepared.expiry_height && observation.is_expired()
-    }) || matches!(
-        persisted.last_submission,
-        Some(SubmissionDisposition::DeterministicRejection { .. })
-    ) {
+    }) {
         return Err(ZeckError::Broadcast(format!(
             "transaction {} is not eligible for resubmission",
             tx.txid
@@ -488,10 +530,14 @@ where
     };
     let state = match disposition {
         SubmissionDisposition::Accepted => TxLifecycleState::Pending,
-        SubmissionDisposition::DeterministicRejection { .. } => TxLifecycleState::Rejected,
         SubmissionDisposition::AmbiguousTransport
         | SubmissionDisposition::AlreadyKnown
-        | SubmissionDisposition::RetryableRejection { .. } => TxLifecycleState::SubmissionUnknown,
+        | SubmissionDisposition::RetryableRejection { .. }
+        | SubmissionDisposition::DeterministicRejection { .. } => {
+            // A primary may forward the bytes and then fabricate a rejection.
+            // Only an independent observation can discharge the fee risk.
+            TxLifecycleState::SubmissionUnknown
+        }
     };
     let persistence_warning = store
         .transition(tx.txid, state, Some(&disposition), None)
@@ -529,6 +575,46 @@ enum BroadcastLogEvent {
     },
 }
 
+impl BroadcastLogEvent {
+    fn txid(&self) -> TxId {
+        match self {
+            Self::Prepared { txid, .. } | Self::StateChanged { txid, .. } => {
+                TxId::from_bytes(*txid)
+            }
+        }
+    }
+}
+
+fn ordered_event_lines(bytes: &[u8]) -> ZeckResult<Vec<(TxId, Vec<u8>)>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(ZeckError::Storage(
+            "incomplete broadcast log during legacy import".to_owned(),
+        ));
+    }
+    bytes[..bytes.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .map(|line| {
+            let event: BroadcastLogEvent = serde_json::from_slice(line).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "invalid broadcast event during legacy import: {err}"
+                ))
+            })?;
+            Ok((event.txid(), line.to_vec()))
+        })
+        .collect()
+}
+
+fn event_lines_by_txid(bytes: &[u8]) -> ZeckResult<HashMap<TxId, Vec<Vec<u8>>>> {
+    let mut grouped: HashMap<TxId, Vec<Vec<u8>>> = HashMap::new();
+    for (txid, line) in ordered_event_lines(bytes)? {
+        grouped.entry(txid).or_default().push(line);
+    }
+    Ok(grouped)
+}
+
 pub struct DurableBroadcastLog {
     path: PathBuf,
     latest: HashMap<TxId, PersistedTransaction>,
@@ -558,14 +644,41 @@ impl DurableBroadcastLog {
     }
 
     pub fn contains_mined_txid(&self, txid: &str) -> bool {
-        self.latest.values().any(|record| {
-            record.state == TxLifecycleState::Mined
-                && record.prepared.txid.to_string() == txid
-                && record
-                    .observation
-                    .as_ref()
-                    .is_some_and(TxObservation::has_canonical_mined_evidence)
-        })
+        self.mined_record_by_txid(txid).is_some()
+    }
+
+    pub fn mined_record_by_txid(&self, txid: &str) -> Option<PersistedTransaction> {
+        self.latest
+            .values()
+            .find(|record| {
+                record.state == TxLifecycleState::Mined
+                    && record.prepared.txid.to_string() == txid
+                    && record
+                        .observation
+                        .as_ref()
+                        .is_some_and(TxObservation::has_canonical_mined_evidence)
+            })
+            .cloned()
+    }
+
+    pub fn mined_records(&self) -> Vec<PersistedTransaction> {
+        self.records()
+            .into_iter()
+            .filter(|record| {
+                record.state == TxLifecycleState::Mined
+                    && record
+                        .observation
+                        .as_ref()
+                        .is_some_and(TxObservation::has_canonical_mined_evidence)
+            })
+            .collect()
+    }
+
+    /// A deterministic snapshot for observing every historical transaction.
+    pub fn records(&self) -> Vec<PersistedTransaction> {
+        let mut records = self.latest.values().cloned().collect::<Vec<_>>();
+        records.sort_by_key(|record| record.prepared.txid.to_string());
+        records
     }
 
     pub fn open(path: impl AsRef<Path>) -> ZeckResult<Self> {
@@ -619,6 +732,139 @@ impl DurableBroadcastLog {
         };
         log.replay_from_disk()?;
         Ok(log)
+    }
+
+    /// Copy a legacy workspace journal into this locked network registry.
+    /// Source bytes are preserved, and an imported source may never change
+    /// underneath the registry. A missing manifest after a crash is safe to
+    /// recover because each source transaction must be an exact event prefix.
+    pub(crate) fn import_legacy_log(&mut self, source_path: &Path) -> ZeckResult<()> {
+        if self.write_failed {
+            return Err(ZeckError::Storage(format!(
+                "broadcast log {} needs reopening after a failed write",
+                self.path.display()
+            )));
+        }
+        let metadata = fs::symlink_metadata(source_path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "inspecting legacy log {}: {err}",
+                source_path.display()
+            ))
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ZeckError::Storage(format!(
+                "legacy broadcast log {} must be a regular file",
+                source_path.display()
+            )));
+        }
+        let source_path = source_path.canonicalize().map_err(|err| {
+            ZeckError::Storage(format!(
+                "resolving legacy log {}: {err}",
+                source_path.display()
+            ))
+        })?;
+        if source_path == self.path {
+            return Err(ZeckError::Storage(
+                "cannot import broadcast log into itself".to_owned(),
+            ));
+        }
+        // A concurrent legacy writer must not change the source between the
+        // byte snapshot and its manifest entry.
+        let source = Self::open(&source_path)?;
+        let source_bytes = fs::read(&source_path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "reading legacy log {}: {err}",
+                source_path.display()
+            ))
+        })?;
+        let source_digest = format!("{:x}", Sha256::digest(&source_bytes));
+        let manifest_path = self
+            .path
+            .parent()
+            .ok_or_else(|| ZeckError::Storage("broadcast registry has no directory".to_owned()))?
+            .join(LEGACY_IMPORT_MANIFEST_FILE_NAME);
+        let mut manifest: LegacyImportManifest = match fs::read(&manifest_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "invalid legacy import manifest {}: {err}",
+                    manifest_path.display()
+                ))
+            })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                LegacyImportManifest::default()
+            }
+            Err(err) => {
+                return Err(ZeckError::Storage(format!(
+                    "reading legacy import manifest {}: {err}",
+                    manifest_path.display()
+                )))
+            }
+        };
+        let source_key = source_path.to_string_lossy().into_owned();
+        if let Some(previous_digest) = manifest.sources.get(&source_key) {
+            if previous_digest != &source_digest {
+                return Err(ZeckError::Storage(format!(
+                    "legacy broadcast log {} changed after import",
+                    source_path.display()
+                )));
+            }
+        }
+
+        let registry_bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => {
+                return Err(ZeckError::Storage(format!(
+                    "reading registry {}: {err}",
+                    self.path.display()
+                )))
+            }
+        };
+        let source_events = event_lines_by_txid(&source_bytes)?;
+        let registry_events = event_lines_by_txid(&registry_bytes)?;
+        for (txid, source_lines) in &source_events {
+            if let Some(registry_lines) = registry_events.get(txid) {
+                if !registry_lines.starts_with(source_lines) {
+                    return Err(ZeckError::Storage(format!(
+                        "conflicting legacy broadcast history for {txid} in {}",
+                        source_path.display()
+                    )));
+                }
+                if source.latest(*txid).is_none() || self.latest(*txid).is_none() {
+                    return Err(ZeckError::Storage(format!(
+                        "missing broadcast history for {txid} during legacy import"
+                    )));
+                }
+            }
+        }
+        let mut merged = registry_bytes.clone();
+        for (txid, line) in ordered_event_lines(&source_bytes)? {
+            if !registry_events.contains_key(&txid) {
+                merged.extend_from_slice(&line);
+                merged.push(b'\n');
+            }
+        }
+        if merged != registry_bytes {
+            if let Err(err) = atomic_replace_private(&self.path, &merged) {
+                self.write_failed = true;
+                return Err(err);
+            }
+            if let Err(err) = self.replay_from_disk() {
+                self.write_failed = true;
+                return Err(err);
+            }
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            manifest.sources.entry(source_key)
+        {
+            entry.insert(source_digest);
+            let bytes = serde_json::to_vec(&manifest).map_err(|err| {
+                ZeckError::Serialization(format!("serializing legacy import manifest: {err}"))
+            })?;
+            atomic_replace_private(&manifest_path, &bytes)?;
+        }
+        drop(source);
+        Ok(())
     }
 
     fn replay_from_disk(&mut self) -> ZeckResult<()> {
@@ -809,7 +1055,16 @@ impl DurableBroadcastLog {
                     legacy_replay,
                 )?;
                 let existing = self.latest.get_mut(&txid).expect("checked above");
-                existing.state = state;
+                existing.state = if legacy_replay
+                    && state == TxLifecycleState::Rejected
+                    && matches!(
+                        submission.as_ref(),
+                        Some(SubmissionDisposition::DeterministicRejection { .. })
+                    ) {
+                    TxLifecycleState::SubmissionUnknown
+                } else {
+                    state
+                };
                 if let Some(submission) = submission {
                     existing.last_submission = Some(submission);
                 }
@@ -847,6 +1102,7 @@ fn validate_transition(
                     None | Some(SubmissionDisposition::AmbiguousTransport)
                         | Some(SubmissionDisposition::AlreadyKnown)
                         | Some(SubmissionDisposition::RetryableRejection { .. })
+                        | Some(SubmissionDisposition::DeterministicRejection { .. })
                 )
         }
         TxLifecycleState::Pending => {
@@ -872,14 +1128,19 @@ fn validate_transition(
                     )
                 );
             let mined_reorg = existing.state == TxLifecycleState::Mined
-                && matches!(
+                && (matches!(
                     observation.map(|item| &item.state),
                     Some(
                         TxObservationState::Reorged
                             | TxObservationState::Contested
                             | TxObservationState::Absent
+                            | TxObservationState::Unavailable
                     )
-                );
+                ) || (positive_presence
+                    && matches!(
+                        observation.map(|item| &item.state),
+                        Some(TxObservationState::PresentUnmined)
+                    )));
             // An earlier acceptance cannot resolve a later Unknown recorded
             // before an exact-byte resend whose outcome has not arrived.
             let accepted = matches!(submission, Some(SubmissionDisposition::Accepted));
@@ -894,11 +1155,20 @@ fn validate_transition(
                             | TxObservationState::Unavailable
                     )
                 );
+            // Schema-v1 submitters wrote a retryable response as Pending even
+            // without transaction-presence evidence. Preserve replay of that
+            // historical identity, but never authorize a new Pending append.
+            let legacy_retryable = legacy_replay
+                && matches!(
+                    submission.or(existing.last_submission.as_ref()),
+                    Some(SubmissionDisposition::RetryableRejection { .. })
+                );
             (positive_presence
                 || accepted
                 || already_pending_nonfinal
                 || mined_reorg
-                || legacy_nonfinal)
+                || legacy_nonfinal
+                || legacy_retryable)
                 && !effective_observation.is_some_and(|item| {
                     item.expiry_height == existing.prepared.expiry_height && item.is_expired()
                 })
@@ -910,15 +1180,7 @@ fn validate_transition(
                     effective_observation.map(|item| &item.state),
                     Some(TxObservationState::Mined)
                 )
-                && (existing.state != TxLifecycleState::Mined
-                    || matches!(
-                        observation.map(|item| &item.state),
-                        Some(
-                            TxObservationState::Reorged
-                                | TxObservationState::Contested
-                                | TxObservationState::Absent
-                        )
-                    ))
+                && (existing.state != TxLifecycleState::Mined || mined_reorg)
                 && !matches!(
                     existing.state,
                     TxLifecycleState::Rejected | TxLifecycleState::Expired
@@ -938,18 +1200,21 @@ fn validate_transition(
                 )
         }
         TxLifecycleState::Rejected => {
-            matches!(
-                submission.or(existing.last_submission.as_ref()),
-                Some(SubmissionDisposition::DeterministicRejection { .. })
-            ) && !matches!(
-                existing.state,
-                TxLifecycleState::Mined | TxLifecycleState::Expired
-            ) && !matches!(
-                observation
-                    .or(existing.observation.as_ref())
-                    .map(|item| &item.state),
-                Some(TxObservationState::Mined)
-            )
+            legacy_replay
+                && matches!(
+                    submission.or(existing.last_submission.as_ref()),
+                    Some(SubmissionDisposition::DeterministicRejection { .. })
+                )
+                && !matches!(
+                    existing.state,
+                    TxLifecycleState::Mined | TxLifecycleState::Expired
+                )
+                && !matches!(
+                    observation
+                        .or(existing.observation.as_ref())
+                        .map(|item| &item.state),
+                    Some(TxObservationState::Mined)
+                )
         }
         TxLifecycleState::Expired => {
             let effective_observation = observation.or(existing.observation.as_ref());
@@ -1224,6 +1489,210 @@ mod tests {
     }
 
     #[test]
+    fn legacy_retryable_pending_reopens_but_new_retryable_pending_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let txid_bytes: [u8; 32] = tx.txid.into();
+        // Schema-v1 production wrote this exact three-event chain after a
+        // retryable send response. Write the JSONL directly: the new writer
+        // must never create the final event, but reopen must preserve it.
+        let legacy_events = [
+            serde_json::json!({
+                "kind": "prepared",
+                "schema_version": 1,
+                "txid": txid_bytes,
+                "raw_tx": STANDARD.encode(&tx.raw_tx),
+                "fee_zatoshis": tx.fee_zatoshis,
+                "expiry_height": tx.expiry_height,
+            }),
+            serde_json::json!({
+                "kind": "state_changed",
+                "schema_version": 1,
+                "txid": txid_bytes,
+                "state": "submission_unknown",
+                "submission": null,
+                "observation": null,
+            }),
+            serde_json::json!({
+                "kind": "state_changed",
+                "schema_version": 1,
+                "txid": txid_bytes,
+                "state": "pending",
+                "submission": {"kind": "retryable_rejection", "code": -26, "reason": "mempool full"},
+                "observation": null,
+            }),
+        ];
+        let bytes = legacy_events
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, bytes.as_bytes()).unwrap();
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        let saved = reopened.latest(tx.txid).unwrap();
+        assert_eq!(saved.state, TxLifecycleState::Pending);
+        assert_eq!(saved.prepared.raw_tx, tx.raw_tx);
+        assert!(matches!(
+            saved.last_submission,
+            Some(SubmissionDisposition::RetryableRejection { .. })
+        ));
+        assert_eq!(reopened.blocking_submission(), Some(tx.txid));
+        assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+
+        let fresh_path = dir.path().join("fresh.jsonl");
+        let mut fresh = DurableBroadcastLog::open(&fresh_path).unwrap();
+        fresh.persist_prepared(&tx).unwrap();
+        fresh
+            .transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        let before = fs::read(&fresh_path).unwrap();
+        assert!(fresh
+            .transition(
+                tx.txid,
+                TxLifecycleState::Pending,
+                Some(&SubmissionDisposition::RetryableRejection {
+                    code: -26,
+                    reason: "mempool full".to_owned(),
+                }),
+                None,
+            )
+            .is_err());
+        assert_eq!(fs::read(&fresh_path).unwrap(), before);
+        drop(fresh);
+        let fresh_reopened = DurableBroadcastLog::open(&fresh_path).unwrap();
+        assert_eq!(
+            fresh_reopened.latest(tx.txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+        assert_eq!(fresh_reopened.blocking_submission(), Some(tx.txid));
+    }
+
+    #[test]
+    fn legacy_post_io_rejected_replays_as_unknown_and_new_rejected_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let txid_bytes: [u8; 32] = tx.txid.into();
+        let legacy_events = [
+            serde_json::json!({
+                "kind": "prepared", "schema_version": 1, "txid": txid_bytes,
+                "raw_tx": STANDARD.encode(&tx.raw_tx),
+                "fee_zatoshis": tx.fee_zatoshis,
+                "expiry_height": tx.expiry_height,
+            }),
+            serde_json::json!({
+                "kind": "state_changed", "schema_version": 1, "txid": txid_bytes,
+                "state": "submission_unknown", "submission": null, "observation": null,
+            }),
+            serde_json::json!({
+                "kind": "state_changed", "schema_version": 1, "txid": txid_bytes,
+                "state": "rejected",
+                "submission": {"kind": "deterministic_rejection", "code": -26, "reason": "invalid proof"},
+                "observation": null,
+            }),
+        ];
+        let bytes = legacy_events
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, bytes.as_bytes()).unwrap();
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        let record = reopened.latest(tx.txid).unwrap();
+        assert_eq!(record.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(record.prepared.raw_tx, tx.raw_tx);
+        assert!(matches!(
+            record.last_submission,
+            Some(SubmissionDisposition::DeterministicRejection { .. })
+        ));
+        assert_eq!(reopened.blocking_submission(), Some(tx.txid));
+        assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+
+        let fresh_path = dir.path().join("fresh-rejection.jsonl");
+        let mut fresh = DurableBroadcastLog::open(&fresh_path).unwrap();
+        fresh.persist_prepared(&tx).unwrap();
+        fresh
+            .transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        let before = fs::read(&fresh_path).unwrap();
+        assert!(fresh
+            .transition(
+                tx.txid,
+                TxLifecycleState::Rejected,
+                Some(&SubmissionDisposition::DeterministicRejection {
+                    code: -26,
+                    reason: "invalid proof".to_owned(),
+                }),
+                None,
+            )
+            .is_err());
+        assert_eq!(fs::read(&fresh_path).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_import_preserves_bytes_and_ignores_unchanged_source_after_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("workspace-old");
+        let registry_root = dir.path().join(".broadcast-registry");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&registry_root).unwrap();
+        let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
+        let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
+        let tx = fixture();
+        let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+        old.persist_prepared(&tx).unwrap();
+        old.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        drop(old);
+        let old_bytes = fs::read(&old_path).unwrap();
+
+        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+        registry.import_legacy_log(&old_path).unwrap();
+        assert_eq!(fs::read(&registry_path).unwrap(), old_bytes);
+        assert_eq!(registry.blocking_submission(), Some(tx.txid));
+        assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
+
+        registry
+            .transition(
+                tx.txid,
+                TxLifecycleState::Pending,
+                Some(&SubmissionDisposition::Accepted),
+                None,
+            )
+            .unwrap();
+        let advanced = fs::read(&registry_path).unwrap();
+        registry.import_legacy_log(&old_path).unwrap();
+        assert_eq!(fs::read(&registry_path).unwrap(), advanced);
+        assert_eq!(
+            registry.latest(tx.txid).unwrap().state,
+            TxLifecycleState::Pending
+        );
+
+        // A crash can land after the atomic registry replacement but before
+        // its manifest entry. The exact source prefix still proves import.
+        let manifest = registry_root.join(LEGACY_IMPORT_MANIFEST_FILE_NAME);
+        fs::remove_file(&manifest).unwrap();
+        registry.import_legacy_log(&old_path).unwrap();
+        assert_eq!(fs::read(&registry_path).unwrap(), advanced);
+        assert!(manifest.exists());
+
+        let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+        old.transition(
+            tx.txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+        drop(old);
+        assert!(registry.import_legacy_log(&old_path).is_err());
+        assert_eq!(fs::read(&registry_path).unwrap(), advanced);
+    }
+
+    #[test]
     fn invalid_new_state_event_does_not_poison_durable_log() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
@@ -1494,15 +1963,44 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn deterministic_node_refusal_is_rejected() {
-        let mut store = RecordingStore::default();
+    async fn hostile_deterministic_reply_keeps_prepared_bytes_unknown_and_blocks_followup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let mut store = DurableBroadcastLog::open(&path).unwrap();
         let tx = fixture();
-        let mut node = network(&store, Script::Response(-26, "invalid proof"));
+        struct HostileSubmitter {
+            sent: Vec<Vec<u8>>,
+        }
+        #[async_trait::async_trait]
+        impl TxSubmitter for HostileSubmitter {
+            async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
+                self.sent.push(raw);
+                Ok(SendResponse {
+                    error_code: -26,
+                    error_message: "invalid proof".to_owned(),
+                })
+            }
+        }
+        let mut node = HostileSubmitter { sent: vec![] };
         let result =
-            submit_prepared_transaction(&mut store, &mut node, tx, Duration::from_secs(30))
+            submit_prepared_transaction(&mut store, &mut node, tx.clone(), Duration::from_secs(30))
                 .await
                 .unwrap();
-        assert_eq!(result.state, TxLifecycleState::Rejected);
+        assert_eq!(node.sent, vec![tx.raw_tx.clone()]);
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert!(matches!(
+            result.disposition,
+            SubmissionDisposition::DeterministicRejection { .. }
+        ));
+        assert!(result.blocks_followup_submission());
+        assert!(result.state.fee_is_at_risk());
+        assert_eq!(result.fee_zatoshis, tx.fee_zatoshis);
+        assert_eq!(store.blocking_submission(), Some(tx.txid));
+        drop(store);
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        let saved = reopened.latest(tx.txid).unwrap();
+        assert_eq!(saved.prepared.raw_tx, tx.raw_tx);
+        assert_eq!(saved.state, TxLifecycleState::SubmissionUnknown);
     }
     #[tokio::test]
     async fn duplicate_response_remains_unknown_until_observed() {
@@ -2098,6 +2596,14 @@ mod tests {
             .unwrap();
         log.transition(txid, TxLifecycleState::Mined, None, None)
             .unwrap();
+        assert_eq!(
+            log.mined_record_by_txid(&txid.to_string())
+                .unwrap()
+                .prepared
+                .txid,
+            txid
+        );
+        assert_eq!(log.mined_records().len(), 1);
         let before = fs::read(&path).unwrap();
         assert!(matches!(
             log.transition(txid, TxLifecycleState::Pending, None, None),
@@ -2111,6 +2617,8 @@ mod tests {
         };
         log.transition(txid, TxLifecycleState::Pending, None, Some(&reorged))
             .unwrap();
+        assert!(log.mined_record_by_txid(&txid.to_string()).is_none());
+        assert!(log.mined_records().is_empty());
         drop(log);
         assert_eq!(
             DurableBroadcastLog::open(&path)
@@ -2223,6 +2731,38 @@ mod tests {
             Some(130),
         );
         assert_eq!(observation.state, TxObservationState::Unavailable);
+    }
+
+    #[test]
+    fn operator_label_capitalization_cannot_finalize_mined_or_expired() {
+        let evidence =
+            |operator_id: &str, endpoint: &str, reported_height: Option<u32>, tx_in_block: bool| {
+                EndpointTxEvidence {
+                    operator_id: operator_id.to_owned(),
+                    endpoint: endpoint.to_owned(),
+                    tip_height: Some(140),
+                    reported_height,
+                    block_hash: tx_in_block.then(|| vec![3; 32]),
+                    tx_in_block,
+                }
+            };
+        let mined = observe_transaction(
+            vec![
+                evidence("OperatorA", "https://one.example", Some(120), true),
+                evidence("operatora", "https://two.example", Some(120), true),
+            ],
+            Some(130),
+        );
+        assert_ne!(mined.state, TxObservationState::Mined);
+        assert!(!mined.has_canonical_mined_evidence());
+        let absent = observe_transaction(
+            vec![
+                evidence("OperatorA", "https://one.example", None, false),
+                evidence("operatora", "https://two.example", None, false),
+            ],
+            Some(130),
+        );
+        assert!(!absent.is_expired());
     }
 
     #[test]

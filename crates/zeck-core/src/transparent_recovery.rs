@@ -17,6 +17,20 @@
 //! that was funded and later emptied reports zero here, which is the right
 //! answer to "what can I recover" and the wrong answer to "what did this
 //! wallet ever hold". Callers must not present it as the latter.
+//!
+//! Standalone callers must present a quote before submitting. The old direct
+//! signer is deliberately absent from the public API:
+//!
+//! ```compile_fail
+//! use argos_core::transparent_recovery::sweep_transparent_only;
+//! ```
+//!
+//! The old standalone per-key journal opener is also unavailable to new
+//! callers; the network registry guard owns journal opening and migration:
+//!
+//! ```compile_fail
+//! use argos_core::transparent_recovery::open_standalone_broadcast_log;
+//! ```
 
 use sapling_crypto as sapling;
 use sha2::{Digest, Sha256};
@@ -33,15 +47,17 @@ use zcash_transparent::{
 
 use crate::{
     broadcast::{
-        submit_prepared_transaction, BroadcastStore, DurableBroadcastLog, LightwalletdSubmitter,
-        PreparedTransaction, TxSubmitter, BROADCAST_LOG_FILE_NAME,
+        submit_prepared_transaction, BroadcastStore, LightwalletdSubmitter, PreparedTransaction,
+        TxSubmitter, BROADCAST_LOG_FILE_NAME,
     },
     error::{ZeckError, ZeckResult},
     imported::{encode_transparent_address, ImportedTransparentKey},
     models::{TxBroadcastResult, ZeckNetwork},
 };
 
-/// Stable standalone wallet identity; only public addresses enter the hash.
+/// Legacy standalone journal path, retained for discovery and migration.
+/// New submissions use the guarded network registry instead. Only public
+/// addresses enter this historical path's hash.
 pub fn standalone_broadcast_log_path(
     data_dir: &std::path::Path,
     keys: &[ImportedTransparentKey],
@@ -67,44 +83,6 @@ pub fn standalone_broadcast_log_path(
         .join(network.label())
         .join(format!("transparent-{fingerprint}"))
         .join(BROADCAST_LOG_FILE_NAME)
-}
-
-pub fn open_standalone_broadcast_log(
-    data_dir: &std::path::Path,
-    keys: &[ImportedTransparentKey],
-    network: ZeckNetwork,
-) -> ZeckResult<DurableBroadcastLog> {
-    let path = standalone_broadcast_log_path(data_dir, keys, network);
-    let parent = path
-        .parent()
-        .ok_or_else(|| ZeckError::Storage("broadcast log has no parent".to_owned()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", parent.display())))?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
-            |err| {
-                ZeckError::Storage(format!(
-                    "setting permissions on {}: {err}",
-                    parent.display()
-                ))
-            },
-        )?;
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(parent)
-        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", parent.display())))?;
-    let log = DurableBroadcastLog::open(path)?;
-    if let Some(txid) = log.blocking_submission() {
-        return Err(ZeckError::Broadcast(format!(
-            "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep"
-        )));
-    }
-    Ok(log)
 }
 
 /// lightwalletd is queried in batches so a wallet with many addresses does
@@ -327,13 +305,102 @@ pub fn summarize(
 ///
 /// Produced separately from execution so a dry run and a real sweep agree
 /// by construction rather than by two code paths happening to match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentSweepPlan {
     pub input_count: usize,
     pub total_input_zatoshis: u64,
     pub fee_zatoshis: u64,
     /// What actually lands at the destination: inputs minus fee.
     pub output_zatoshis: u64,
+}
+
+/// A transparent-only sweep review bound to its complete spendable input set.
+///
+/// The inputs and target height stay private so a caller cannot replace the
+/// coins after displaying the fee. Execution refreshes the live set before
+/// signing and consumes that validated set without fetching it again.
+#[derive(Debug)]
+pub struct TransparentSweepQuote {
+    report: TransparentScanReport,
+    plan: Option<TransparentSweepPlan>,
+    utxos: Vec<TransparentUtxo>,
+    target_height: u32,
+    key_addresses: Vec<String>,
+    network: ZeckNetwork,
+}
+
+impl TransparentSweepQuote {
+    pub fn report(&self) -> &TransparentScanReport {
+        &self.report
+    }
+
+    pub fn plan(&self) -> Option<&TransparentSweepPlan> {
+        self.plan.as_ref()
+    }
+}
+
+fn transparent_key_addresses(keys: &[ImportedTransparentKey], network: ZeckNetwork) -> Vec<String> {
+    let mut addresses = keys
+        .iter()
+        .map(|key| encode_transparent_address(&key.address, network))
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+fn transparent_input_identity(utxo: &TransparentUtxo) -> Vec<u8> {
+    let mut bytes = utxo.outpoint.hash().to_vec();
+    bytes.extend_from_slice(&utxo.outpoint.n().to_le_bytes());
+    utxo.txout
+        .write(&mut bytes)
+        .expect("serializing a TxOut into Vec cannot fail");
+    let address = format!("{:?}", utxo.address);
+    bytes.extend_from_slice(&(address.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(address.as_bytes());
+    bytes.extend_from_slice(&utxo.height.to_le_bytes());
+    bytes
+}
+
+fn transparent_input_set_identity(utxos: &[TransparentUtxo]) -> Vec<Vec<u8>> {
+    let mut inputs = utxos
+        .iter()
+        .map(transparent_input_identity)
+        .collect::<Vec<_>>();
+    inputs.sort();
+    inputs
+}
+
+/// Fetch and cost the exact transparent inputs a standalone CLI sweep will
+/// show before confirmation. No signing or submission takes place.
+pub async fn quote_transparent_only(
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+) -> ZeckResult<TransparentSweepQuote> {
+    use zcash_protocol::consensus::BlockHeight;
+
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    let chain_tip = u32::try_from(info.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    let target_height = chain_tip.saturating_add(1);
+    let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+    let report = summarize(&utxos, keys.len(), chain_tip, network);
+    let plan = plan_sweep(
+        &crate::workspace::consensus_network(network),
+        BlockHeight::from_u32(target_height),
+        &utxos,
+    )?;
+    Ok(TransparentSweepQuote {
+        report,
+        plan,
+        utxos,
+        target_height,
+        key_addresses: transparent_key_addresses(keys, network),
+        network,
+    })
 }
 
 /// The ZIP-317 fee for sweeping `input_count` P2PKH inputs into a single
@@ -690,37 +757,65 @@ pub(crate) fn check_transparent_fee(
     }
 }
 
-/// Sweep every spendable transparent UTXO into one shielded output at
-/// `destination`.
-///
-/// `max_fee_zatoshis` is checked before anything is signed, so a fee the
-/// caller considers unacceptable costs nothing. It caps the whole sweep:
-/// `prior_fee_zatoshis` is what the caller's earlier transactions in the
-/// same sweep already paid (the Sapling leg of an imported wallet), and 0
-/// when this is the only transaction.
-///
-/// Persists the signed transaction before submission and returns its lifecycle
-/// state even when the reply is uncertain or the node rejects it.
+/// Execute a standalone transparent quote only while its exact reviewed
+/// coins, fee, output, and target height remain current. When no ceiling was
+/// supplied, the quoted fee is the maximum authorized by this review.
 #[allow(clippy::too_many_arguments)]
-pub async fn sweep_transparent_only(
+pub async fn sweep_transparent_only_from_quote(
     store: &mut impl BroadcastStore,
     keys: &[ImportedTransparentKey],
     network: ZeckNetwork,
     lightwalletd_url: &str,
     destination: &str,
     max_fee_zatoshis: Option<u64>,
-    prior_fee_zatoshis: u64,
+    quote: &TransparentSweepQuote,
 ) -> ZeckResult<Option<TransparentSweepOutcome>> {
+    use zcash_protocol::consensus::BlockHeight;
+
+    sapling_receiver(destination, network)?;
+    if network != quote.network || transparent_key_addresses(keys, network) != quote.key_addresses {
+        return Err(ZeckError::StaleSweepProposal(
+            "transparent sweep source keys or network changed after review".to_owned(),
+        ));
+    }
+
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    let chain_tip = u32::try_from(info.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    if chain_tip.saturating_add(1) != quote.target_height {
+        return Err(ZeckError::StaleSweepProposal(
+            "transparent sweep target height changed after review; quote again".to_owned(),
+        ));
+    }
+    let current_utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+    let current_plan = plan_sweep(
+        &crate::workspace::consensus_network(network),
+        BlockHeight::from_u32(quote.target_height),
+        &current_utxos,
+    )?;
+    if transparent_input_set_identity(&current_utxos)
+        != transparent_input_set_identity(&quote.utxos)
+        || current_plan != quote.plan
+    {
+        return Err(ZeckError::StaleSweepProposal(
+            "selected sweep inputs changed after review; quote again before signing".to_owned(),
+        ));
+    }
+    let Some(plan) = quote.plan.as_ref() else {
+        return Ok(None);
+    };
     sweep_transparent_only_reviewed(
         store,
         keys,
         network,
         lightwalletd_url,
         destination,
-        max_fee_zatoshis,
-        prior_fee_zatoshis,
-        None,
-        None,
+        Some(max_fee_zatoshis.unwrap_or(plan.fee_zatoshis)),
+        0,
+        Some(plan.fee_zatoshis),
+        Some((&current_utxos, plan, quote.target_height)),
     )
     .await
 }

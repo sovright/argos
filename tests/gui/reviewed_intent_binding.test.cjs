@@ -295,6 +295,7 @@ function flowHarness() {
     SERVER_PRESETS: { mainnet: "main.example", testnet: "test.example" },
     eta: { reset() {} }, fmt: String, TextEncoder,
     defaultScanLabel: () => "today's scan",
+    confirmationSourcesFromForm: () => [],
     document: {
       createElement: () => element(),
       querySelectorAll: () => chips,
@@ -308,6 +309,7 @@ function flowHarness() {
       if (command === "resume_session") return {
         handle: { id: "scan-new" }, network: "testnet", data_dir: "/resumed",
         lightwalletd_url: "resumed.example",
+        confirmation_sources: ["independent=https://other.example:443"],
       };
       if (command === "get_scan_progress") return null;
       if (command === "cancel_scan") return null;
@@ -625,6 +627,8 @@ test("destination edit preserves completed scan authority", async () => {
 
 test("resume initializes every reviewed field", async () => {
   const h = flowHarness();
+  h.$("confirmation-sources").value = "independent=https://other.example:443";
+  h.context.confirmationSourcesFromForm = (id) => [h.$(id).value.trim()];
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
   loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
   loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
@@ -637,6 +641,9 @@ test("resume initializes every reviewed field", async () => {
   h.$("resume-max-fee-zec").value = "0.02";
   await h.$("resume-confirm").fire("click");
   assert.equal(h.calls.filter((call) => call.command === "resume_session").length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.find((call) => call.command === "resume_session").args.input.confirmation_sources)),
+    ["independent=https://other.example:443"]);
+  assert.equal(h.state.scanConfig.confirmation_sources[0], "independent=https://other.example:443");
   assert.equal(h.state.scanHandle.id, "scan-new");
   assert.equal(h.state.scanConfig.network, "testnet");
   assert.equal(h.state.scanConfig.data_dir, "/resumed");
