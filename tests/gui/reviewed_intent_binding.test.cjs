@@ -47,7 +47,7 @@ function harness(
   $("donate-enabled").checked = true;
   $("donate-rate").value = "10";
   const state = {
-    scanHandle: { id: "scan-current" }, destination: "zs-reviewed",
+    scanHandle: { id: "scan-current" }, scanAuthorityGeneration: 0, destination: "zs-reviewed",
     memo: "reviewed memo", maxFeeZec: "0.01", donationEnabled: true,
     scanConfig: { network: "mainnet" }, lastProgress: { phase: "complete" },
     sweepReview: null, proposalGeneration: 0, proposalPending: false,
@@ -262,7 +262,8 @@ function flowHarness() {
     return elements.get(id);
   };
   const state = {
-    scanHandle: { id: "scan-old" }, lastProgress: { phase: "complete" },
+    scanHandle: { id: "scan-old" }, scanAuthorityGeneration: 0,
+    lastProgress: { phase: "complete" },
     sweepReview: review("old"), proposalGeneration: 4, proposalPending: false,
     sweepExecutionPending: false, destination: "zs-old", memo: "old memo",
     maxFeeZec: "0.5", donationEnabled: true,
@@ -279,6 +280,7 @@ function flowHarness() {
   $("scan-discoveries").innerHTML = "old discovery";
   $("scan-totals").textContent = "old balance";
   $("sweep-rows").innerHTML = "old proposal";
+  $("sweep-skipped").innerHTML = "old skipped account";
   $("irreversible-check").checked = true;
   $("execute-sweep").disabled = false;
   $("review-sweep").disabled = false;
@@ -368,6 +370,7 @@ test("source setting edits invalidate completed scan authority", () => {
     assert.equal(h.$("review-sweep").disabled, true, `${id} left review available`);
     assert.equal(h.$("scan-rows").innerHTML, "");
     assert.equal(h.$("scan-discoveries").innerHTML, "");
+    assert.equal(h.$("sweep-skipped").innerHTML, "", `${id} retained skipped account`);
     assert.doesNotMatch(h.$("scan-totals").textContent, /old balance/);
   }
 });
@@ -379,6 +382,101 @@ test("editing wallet path drops the prior loaded wallet", () => {
   h.$("wallet-path").fire("input");
   assert.equal(h.context.walletFile, null);
   assert.equal(h.$("wallet-path").value, "/new/wallet.dat");
+});
+
+test("wallet drop invalidates the previous scan before opening the new file", async () => {
+  const h = flowHarness();
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  const nativeEvents = new Map();
+  let opened = 0;
+  h.context.window.__TAURI__ = { event: {
+    listen: async (name, callback) => { nativeEvents.set(name, callback); },
+  } };
+  h.context.document.querySelector = () => ({ classList: { contains: () => true } });
+  h.context.openWalletFile = () => { opened++; };
+  loadFlow(h, "// Drag-and-drop, using Tauri", '$("sprout-sweep-run").addEventListener');
+  await new Promise((resolve) => setImmediate(resolve));
+  nativeEvents.get("tauri://drag-drop")({ payload: { paths: ["/new/wallet.dat"] } });
+  assert.equal(h.state.scanHandle, null);
+  assert.equal(h.state.sweepReview, null);
+  assert.equal(h.$("wallet-path").value, "/new/wallet.dat");
+  assert.equal(opened, 1);
+});
+
+test("a start response after a source edit cannot install its old handle", async () => {
+  const h = flowHarness();
+  const oldStart = deferred();
+  const commands = [];
+  let scanViews = 0;
+  let listeners = 0;
+  h.context.walletFile = null;
+  h.context.seedInput.value = "seed A";
+  h.$("destination-input").value = "zs-destination";
+  h.$("data-dir").value = "/new-data";
+  h.$("network-select").value = "mainnet";
+  h.$("auto-gap-limit").checked = true;
+  h.$("gap-limit").value = "20";
+  h.$("birthday-height").value = "419200";
+  h.context.hasSaplingScanKeys = () => false;
+  h.context.shouldShowTransparentRange = () => false;
+  h.context.scanKeySourceConflict = () => null;
+  h.context.defaultScanLabel = () => "scan";
+  h.context.startProgressListeners = async () => { listeners++; };
+  h.context.goTo = () => { scanViews++; };
+  h.context.invoke = async (command, args) => {
+    commands.push({ command, args });
+    if (command === "validate_address") return { destination_ok: true };
+    if (command === "start_scan") return oldStart.promise;
+    if (command === "cancel_scan") return null;
+    throw new Error(`unexpected ${command}`);
+  };
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, '$("start-scan").addEventListener("click"', "// ─── Step 4: Scan Progress");
+  const first = h.$("start-scan").fire("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(commands.filter((call) => call.command === "start_scan").length, 1);
+  h.$("network-select").fire("input");
+  h.context.seedInput.value = "seed B";
+  oldStart.resolve({ id: "scan-A" });
+  await first;
+  assert.equal(h.state.scanHandle, null);
+  assert.equal(h.state.scanConfig, null);
+  assert.equal(h.context.seedInput.value, "seed B");
+  assert.equal(scanViews, 0);
+  assert.equal(listeners, 0);
+  assert.equal(commands.filter((call) => call.command === "cancel_scan").length, 1);
+});
+
+test("a stale matched-start failure releases its address-search lock", async () => {
+  const h = flowHarness();
+  const oldStart = deferred();
+  h.state.matchedRecovery = { searchId: "search-A", matchId: "match-A" };
+  h.context.walletFile = null;
+  h.$("destination-input").value = "zs-destination";
+  h.$("data-dir").value = "/data";
+  h.$("network-select").value = "mainnet";
+  h.$("auto-gap-limit").checked = true;
+  h.$("gap-limit").value = "20";
+  h.$("birthday-height").value = "419200";
+  h.context.hasSaplingScanKeys = () => false;
+  h.context.shouldShowTransparentRange = () => false;
+  h.context.scanKeySourceConflict = () => null;
+  h.context.defaultScanLabel = () => "scan";
+  h.context.configForMatchedRecovery = (config) => config;
+  h.context.invoke = async (command) => {
+    if (command === "validate_address") return { destination_ok: true };
+    if (command === "start_matched_recovery") return oldStart.promise;
+    throw new Error(`unexpected ${command}`);
+  };
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, '$("start-scan").addEventListener("click"', "// ─── Step 4: Scan Progress");
+  const first = h.$("start-scan").fire("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.state.addressMatchRecoveryLocked, true);
+  h.$("network-select").fire("input");
+  oldStart.reject(new Error("old start failed"));
+  await first;
+  assert.equal(h.state.addressMatchRecoveryLocked, false);
 });
 
 test("destination edit preserves completed scan authority", async () => {
@@ -423,6 +521,7 @@ test("resume initializes every reviewed field", async () => {
   assert.equal(h.state.lastProgress, null);
   assert.equal(h.$("scan-rows").innerHTML, "");
   assert.equal(h.$("scan-discoveries").innerHTML, "");
+  assert.equal(h.$("sweep-skipped").innerHTML, "");
   assert.equal(h.$("review-sweep").disabled, true);
 });
 
@@ -436,4 +535,5 @@ test("start over still drops the loaded wallet", () => {
   assert.equal(h.state.scanHandle, null);
   assert.equal(h.$("donate-rate").value, "10");
   assert.equal(h.$("scan-rows").innerHTML, "");
+  assert.equal(h.$("sweep-skipped").innerHTML, "");
 });

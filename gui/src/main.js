@@ -28,6 +28,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 const state = {
   scanHandle: null,
+  scanAuthorityGeneration: 0,
   completedScanHandle: null,
   lastProgress: null,
   sweepReview: null,
@@ -936,6 +937,7 @@ $("wallet-passphrase")?.addEventListener("keydown", (e) => {
       // elsewhere in the app cannot silently swap the selected file.
       const screen = document.querySelector('.screen[data-step="wallet-file"]');
       if (!screen?.classList.contains("active")) return;
+      invalidateScanAuthority();
       $("wallet-path").value = paths[0];
       // As with the picker: a new file is not the one the old passphrase
       // belongs to.
@@ -1685,6 +1687,7 @@ phrase, or clear the seed phrase to scan the pasted key.";
 
 $("start-scan").addEventListener("click", async () => {
   if (state.sweepExecutionPending) return;
+  const generation = state.scanAuthorityGeneration;
   // Three routes to the same scan: a seed phrase, a wallet file, or a
   // pasted Sapling spending key.
   const hasTypedSaplingKeys = hasSaplingScanKeys();
@@ -1731,11 +1734,13 @@ go back and provide one.",
 
   try {
     const info = await invoke("validate_address", { address, network: $("network-select").value });
+    if (generation !== state.scanAuthorityGeneration) return;
     if (!info.destination_ok) {
       setStatus("config-status", "✗ Address must have an Orchard or Sapling receiver.", "error");
       return;
     }
   } catch (err) {
+    if (generation !== state.scanAuthorityGeneration) return;
     setStatus("config-status", `✗ ${err}`, "error");
     return;
   }
@@ -1754,8 +1759,10 @@ go back and provide one.",
   if (!dataDirVal) {
     try {
       dataDirVal = await invoke("default_data_dir");
+      if (generation !== state.scanAuthorityGeneration) return;
       $("data-dir").value = dataDirVal;
     } catch (_) {
+      if (generation !== state.scanAuthorityGeneration) return;
       setStatus("config-status", "✗ Could not determine a data directory. Please enter one manually.", "error");
       $("start-scan").disabled = false;
       return;
@@ -1784,6 +1791,7 @@ go back and provide one.",
   setStatus("config-status", "Starting scan…", "");
   $("start-scan").disabled = true;
 
+  let matched = null;
   try {
     let handle;
     // Raw lines, so the backend applies its own skip rule and its errors
@@ -1791,7 +1799,7 @@ go back and provide one.",
     // comments, so a wallet-file-only scan is not handed a key set to reject.
     const typedSaplingKeys = hasTypedSaplingKeys ? saplingScanKeyLines() : [];
     if (state.matchedRecovery) {
-      const matched = state.matchedRecovery;
+      matched = state.matchedRecovery;
       const matchedConfig = configForMatchedRecovery(config);
       state.addressMatchRecoveryLocked = true;
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: true } }));
@@ -1802,8 +1810,6 @@ go back and provide one.",
         // the sweep screen has no memo field to remove it from afterwards.
         config: { ...matchedConfig, sweep_memo: state.memo },
       });
-      state.matchedRecovery = null;
-      clearMatchedRecoveryUi();
     } else if (walletFile || typedSaplingKeys.length) {
       // Routing between the HD path and the imported-account path lives in
       // the core service, not here: it depends on whether the file yielded a
@@ -1825,6 +1831,20 @@ go back and provide one.",
       });
     } else {
       handle = await invoke("start_scan", { config });
+    }
+    if (generation !== state.scanAuthorityGeneration) {
+      // The backend may have started scan A after its form was edited into B.
+      // It is no longer UI authority; ask it to stop without disturbing B.
+      invoke("cancel_scan", { handle }).catch(() => {});
+      if (matched && state.matchedRecovery === matched) {
+        state.addressMatchRecoveryLocked = false;
+        document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
+      }
+      return;
+    }
+    if (matched) {
+      state.matchedRecovery = null;
+      clearMatchedRecoveryUi();
     }
     state.scanHandle = handle;
     if (state.retainedAddressSearchId) {
@@ -1852,6 +1872,13 @@ go back and provide one.",
     goTo("scan");
     await startProgressListeners(handle);
   } catch (err) {
+    if (generation !== state.scanAuthorityGeneration) {
+      if (matched && state.matchedRecovery === matched) {
+        state.addressMatchRecoveryLocked = false;
+        document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
+      }
+      return;
+    }
     if (state.matchedRecovery) {
       state.addressMatchRecoveryLocked = false;
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
@@ -1862,7 +1889,7 @@ go back and provide one.",
     // Clear the seed phrase from the DOM regardless of whether start_scan
     // succeeded; on failure the user can retype, and a successful scan no
     // longer needs the cleartext phrase visible.
-    seedInput.value = "";
+    if (generation === state.scanAuthorityGeneration) seedInput.value = "";
   }
 });
 
@@ -2196,6 +2223,7 @@ $("cancel-scan").addEventListener("click", async () => {
 });
 
 function invalidateScanAuthority() {
+  state.scanAuthorityGeneration += 1;
   cleanupListeners();
   invalidateSweepReview();
   state.scanHandle = null;
@@ -2218,12 +2246,14 @@ function invalidateScanAuthority() {
   $("scan-sleep-detail").textContent = "";
   $("scan-gap-extension-detail").textContent = "";
   $("sweep-rows").innerHTML = "";
+  $("sweep-skipped").innerHTML = "";
   $("sweep-summary").textContent = "";
   $("copy-report-path").style.display = "none";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
   $("back-to-config").style.display = "none";
   $("cancel-scan").disabled = true;
+  $("start-scan").disabled = state.sweepExecutionPending;
   eta.reset();
 }
 
@@ -2898,6 +2928,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("irreversible-check").disabled = true;
   $("execute-sweep").disabled = true;
   $("sweep-rows").innerHTML = "";
+  $("sweep-skipped").innerHTML = "";
   $("sweep-summary").textContent = "";
   $("complete-txids").innerHTML = "";
   $("complete-summary").textContent = "";
