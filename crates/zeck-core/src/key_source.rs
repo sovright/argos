@@ -412,6 +412,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plaintext_zwl_seed_derives_orchard_account_zero() {
+        use bip0039::{English, Mnemonic};
+        use zcash_address::unified::{Address, Container, Encoding, Receiver};
+
+        let entropy = [0x11u8; 32];
+        let phrase = Mnemonic::<English>::from_entropy(entropy.to_vec())
+            .unwrap()
+            .into_phrase();
+        let mut bytes = 25u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&22u64.to_le_bytes());
+        bytes.push(0); // plaintext
+        bytes.extend_from_slice(&[0u8; 48]);
+        bytes.push(0); // empty nonce
+        bytes.extend_from_slice(&entropy);
+        bytes.extend_from_slice(&[0, 0, 0]); // empty okey, zkey, tkey vectors
+        let imported = argos_wallet_import::zwl::import_zwl(&bytes, None).unwrap();
+        let source = ImportedKeySource::new(imported);
+        let seed = source.wallet_seed().unwrap().expect("plaintext ZWL seed");
+        let actual = crate::derivation::derive_accounts_from_seed(
+            &seed,
+            crate::models::ZeckNetwork::Mainnet,
+            1,
+        )
+        .unwrap();
+        let expected = crate::derivation::derive_accounts(
+            &SecretString::new(phrase),
+            crate::models::ZeckNetwork::Mainnet,
+            1,
+        )
+        .unwrap();
+        let orchard = |ua: &str| {
+            let (_, address) = Address::decode(ua).unwrap();
+            address
+                .items()
+                .into_iter()
+                .find_map(|item| match item {
+                    Receiver::Orchard(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            orchard(&actual[0].unified_address),
+            orchard(&expected[0].unified_address)
+        );
+    }
+
     /// The whole reason a decrypted ZecWallet Lite wallet is scannable is
     /// that its recovered mnemonic re-enters the ordinary HD pipeline. If
     /// the seed it yields ever diverged from what the same phrase typed by

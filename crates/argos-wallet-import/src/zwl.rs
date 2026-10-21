@@ -32,12 +32,10 @@
 //! reimplements them directly rather than taking the dependency, the same
 //! way `compact_size` in `zcashd::records` does for zcashd.
 //!
-//! Everything past the `encrypted` flag is parsed best-effort: a
-//! truncated or unrecognized shape stops parsing and returns whatever key
-//! material was already collected, rather than failing the whole import.
-//! Only two conditions are hard errors: an unreadable/too-new
-//! `external_version`, and an encrypted wallet with no passphrase or the
-//! wrong one.
+//! A truncated or unrecognized shape stops parsing and returns any completed
+//! key material with a damage diagnostic, so coverage cannot be Complete.
+//! Only an unreadable external version and a missing or wrong passphrase are
+//! fatal errors. Unsupported versions return a non-complete result.
 //!
 //! ZWL never held Sprout keys, so nothing here contributes to sub-spec 3.
 //!
@@ -140,13 +138,10 @@ fn unreadable(msg: impl Into<String>) -> ImportError {
 /// (`enc_key` + its own `nonce`) is a distinct, still-unimplemented
 /// scheme from the whole-wallet `enc_seed` this module now decrypts — see
 /// the module docs. These entries keep surfacing as diagnostics.
-fn decryption_not_supported(record_type: &str) -> ImportDiagnostic {
-    ImportDiagnostic::DecryptionFailed {
+fn locked_key(record_type: &str, provenance: Provenance) -> ImportDiagnostic {
+    ImportDiagnostic::LockedKey {
         record_type: record_type.to_owned(),
-        reason: "ZecWallet Lite's per-key libsodium ciphertext is not supported by this build; \
-                 this key is only recoverable from the wallet's decrypted seed, via HD \
-                 re-derivation"
-            .to_owned(),
+        provenance,
     }
 }
 
@@ -181,10 +176,14 @@ fn decrypt_seed(
 
 /// Minimal, bounds-checked cursor over attacker-controlled bytes.
 ///
-/// Every read returns `None` on truncation or an unrecognized shape,
-/// rather than panicking or guessing. Callers above the fixed `Keys`
-/// header treat a `None` as "stop here, keep whatever was already
-/// collected" — see the module-level partial-recovery note.
+/// Every read returns a canonical byte coordinate and field on failure.
+struct ZwlReadError {
+    offset: usize,
+    field: &'static str,
+    reason: &'static str,
+}
+type ZwlReadResult<T> = Result<T, ZwlReadError>;
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -195,69 +194,85 @@ impl<'a> Cursor<'a> {
         Self { bytes, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let s = self.bytes.get(self.pos..end)?;
+    fn error(&self, field: &'static str, reason: &'static str) -> ZwlReadError {
+        ZwlReadError {
+            offset: self.pos,
+            field,
+            reason,
+        }
+    }
+
+    fn take(&mut self, n: usize, field: &'static str) -> ZwlReadResult<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| self.error(field, "value length limit exceeded"))?;
+        let s = self.bytes.get(self.pos..end).ok_or_else(|| ZwlReadError {
+            offset: self.bytes.len(),
+            field,
+            reason: "truncated field",
+        })?;
         self.pos = end;
-        Some(s)
+        Ok(s)
     }
 
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1)?.first().copied()
+    fn u8(&mut self, field: &'static str) -> ZwlReadResult<u8> {
+        Ok(self.take(1, field)?[0])
     }
 
-    fn u32_le(&mut self) -> Option<u32> {
-        let arr: [u8; 4] = self.take(4)?.try_into().ok()?;
-        Some(u32::from_le_bytes(arr))
+    fn u32_le(&mut self, field: &'static str) -> ZwlReadResult<u32> {
+        let arr: [u8; 4] = self.take(4, field)?.try_into().expect("fixed-size read");
+        Ok(u32::from_le_bytes(arr))
     }
 
-    fn u64_le(&mut self) -> Option<u64> {
-        let arr: [u8; 8] = self.take(8)?.try_into().ok()?;
-        Some(u64::from_le_bytes(arr))
+    fn u64_le(&mut self, field: &'static str) -> ZwlReadResult<u64> {
+        let arr: [u8; 8] = self.take(8, field)?.try_into().expect("fixed-size read");
+        Ok(u64::from_le_bytes(arr))
     }
 
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.take(N)?.try_into().ok()
+    fn array<const N: usize>(&mut self, field: &'static str) -> ZwlReadResult<[u8; N]> {
+        Ok(self.take(N, field)?.try_into().expect("fixed-size read"))
     }
 
-    fn skip(&mut self, n: usize) -> Option<()> {
-        self.take(n).map(|_| ())
+    fn skip(&mut self, n: usize, field: &'static str) -> ZwlReadResult<()> {
+        self.take(n, field).map(|_| ())
     }
 
     /// Bitcoin-style CompactSize, the same encoding already implemented
     /// for zcashd record keys.
-    fn compact_size(&mut self) -> Option<u64> {
-        let (value, consumed) = crate::zcashd::records::compact_size(self.bytes.get(self.pos..)?)?;
-        self.pos = self.pos.checked_add(consumed)?;
-        Some(value)
-    }
-
-    /// `zcash_encoding::Vector::read`: a CompactSize count, then that many
-    /// elements decoded by `read`.
-    fn vector<T>(&mut self, mut read: impl FnMut(&mut Self) -> Option<T>) -> Option<Vec<T>> {
-        let count = self.compact_size()?;
-        let mut out = Vec::new();
-        for _ in 0..count {
-            out.push(read(self)?);
-        }
-        Some(out)
+    fn compact_size(&mut self, field: &'static str) -> ZwlReadResult<u64> {
+        let (value, consumed) =
+            crate::zcashd::records::compact_size(self.bytes.get(self.pos..).unwrap_or_default())
+                .ok_or_else(|| ZwlReadError {
+                    offset: self.bytes.len(),
+                    field,
+                    reason: "truncated field",
+                })?;
+        self.pos += consumed;
+        Ok(value)
     }
 
     /// A `Vec<u8>` written as `Vector::write(w, bytes, |w, b| ...)`, i.e.
     /// CompactSize-prefixed.
-    fn vector_bytes(&mut self) -> Option<Vec<u8>> {
-        let count = self.compact_size()?;
-        Some(self.take(usize::try_from(count).ok()?)?.to_vec())
+    fn vector_bytes(&mut self, field: &'static str) -> ZwlReadResult<Vec<u8>> {
+        let count = self.compact_size(field)?;
+        let count =
+            usize::try_from(count).map_err(|_| self.error(field, "value length limit exceeded"))?;
+        Ok(self.take(count, field)?.to_vec())
     }
 
     /// `zcash_encoding::Optional::read`: a single flag byte (0 = absent,
     /// 1 = present), then the value if present. Any other flag byte value
     /// is non-canonical and treated as a parse failure.
-    fn optional<T>(&mut self, read: impl FnOnce(&mut Self) -> Option<T>) -> Option<Option<T>> {
-        match self.u8()? {
-            0 => Some(None),
+    fn optional<T>(
+        &mut self,
+        field: &'static str,
+        read: impl FnOnce(&mut Self) -> ZwlReadResult<T>,
+    ) -> ZwlReadResult<Option<T>> {
+        match self.u8(field)? {
+            0 => Ok(None),
             1 => read(self).map(Some),
-            _ => None,
+            _ => Err(self.error(field, "wallet structure could not be read")),
         }
     }
 
@@ -265,9 +280,11 @@ impl<'a> Cursor<'a> {
     /// plain little-endian `u64` byte length, NOT CompactSize like
     /// `Vector`. The bytes are discarded — this crate does not retain
     /// addresses, only key material.
-    fn skip_zwl_string(&mut self) -> Option<()> {
-        let len = self.u64_le()?;
-        self.skip(usize::try_from(len).ok()?)
+    fn skip_zwl_string(&mut self) -> ZwlReadResult<()> {
+        let len = self.u64_le("address")?;
+        let len = usize::try_from(len)
+            .map_err(|_| self.error("address", "value length limit exceeded"))?;
+        self.skip(len, "address")
     }
 }
 
@@ -278,27 +295,25 @@ struct KeysHeader {
     encrypted: bool,
     enc_seed: [u8; ENC_SEED_LEN],
     nonce: Vec<u8>,
+    seed: [u8; SEED_LEN],
 }
 
-fn read_keys_header(cur: &mut Cursor) -> Option<KeysHeader> {
-    let keys_version = cur.u64_le()?;
-    if keys_version > MAX_SUPPORTED_KEYS_VERSION {
-        // An internal version this build has never seen: same risk as an
-        // unrecognized external_version (wrong parse over silent
-        // misread), but treated as a stop-here rather than a hard error,
-        // since we cannot tell truncation apart from a genuinely newer
-        // shape at this point without more information than we have.
-        return None;
-    }
-    let encrypted = cur.u8()? > 0;
-    let enc_seed = cur.array::<ENC_SEED_LEN>()?;
-    let nonce = cur.vector_bytes()?;
-    cur.skip(SEED_LEN)?;
-    Some(KeysHeader {
+fn read_keys_header(cur: &mut Cursor) -> ZwlReadResult<KeysHeader> {
+    let keys_version = cur.u64_le("keys_version")?;
+    let encrypted = match cur.u8("header")? {
+        0 => false,
+        1 => true,
+        _ => return Err(cur.error("header", "wallet structure could not be read")),
+    };
+    let enc_seed = cur.array::<ENC_SEED_LEN>("enc_seed")?;
+    let nonce = cur.vector_bytes("nonce")?;
+    let seed = cur.array::<SEED_LEN>("seed")?;
+    Ok(KeysHeader {
         keys_version,
         encrypted,
         enc_seed,
         nonce,
+        seed,
     })
 }
 
@@ -308,7 +323,7 @@ enum ZKeyEntry {
     /// The spending key exists but was omitted from the file because the
     /// wallet was locked at write time. Recoverable only with a working
     /// decryption path, which this build does not yet have.
-    Locked,
+    Locked(Provenance),
     /// A view-key-only entry (`WalletZKeyType::ImportedViewKey`, or an
     /// unrecognized key type). No spending key was ever present here —
     /// this is not a failure.
@@ -317,64 +332,64 @@ enum ZKeyEntry {
 
 /// Read one `WalletZKey`. Field order confirmed against `WalletZKey::read`
 /// in `zingolabs/zewif-zwl`'s `src/walletzkey.rs`.
-fn read_zkey(cur: &mut Cursor) -> Option<ZKeyEntry> {
-    cur.u8()?; // per-record serialization version, not gated here
-    let keytype = cur.u32_le()?;
-    cur.u8()?; // locked flag: redundant with extsk's Optional presence below
-    let extsk = cur.optional(|c| c.array::<EXTSK_LEN>())?;
-    cur.skip(EXTFVK_LEN)?; // extfvk: always present, not retained
-    cur.optional(|c| c.u32_le())?; // hdkey_num
-    cur.optional(Cursor::vector_bytes)?; // enc_key
-    cur.optional(Cursor::vector_bytes)?; // nonce
+fn read_zkey(cur: &mut Cursor) -> ZwlReadResult<ZKeyEntry> {
+    cur.u8("zkey")?;
+    let keytype = cur.u32_le("zkey")?;
+    cur.u8("zkey")?;
+    let extsk = cur.optional("zkey", |c| c.array::<EXTSK_LEN>("zkey"))?;
+    cur.skip(EXTFVK_LEN, "zkey")?;
+    cur.optional("zkey", |c| c.u32_le("zkey"))?;
+    cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
+    cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
 
     let provenance = match keytype {
-        0 => Provenance::HdDerived,                 // WalletZKeyType::HdKey
-        1 => Provenance::Standalone,                // WalletZKeyType::ImportedSpendingKey
-        2 => return Some(ZKeyEntry::NoSpendingKey), // ImportedViewKey
+        0 => Provenance::HdDerived,               // WalletZKeyType::HdKey
+        1 => Provenance::Standalone,              // WalletZKeyType::ImportedSpendingKey
+        2 => return Ok(ZKeyEntry::NoSpendingKey), // ImportedViewKey
         // Unrecognized discriminant: continuing would mean guessing at a
         // shape we do not know, exactly the risk this crate refuses to
         // take elsewhere (see zcashd::plaintext's DER header check).
-        _ => return None,
+        _ => return Err(cur.error("zkey", "wallet structure could not be read")),
     };
 
-    Some(match extsk {
+    Ok(match extsk {
         Some(bytes) => ZKeyEntry::Recovered(SaplingKey {
             extsk: Secret::new(bytes.to_vec()),
             provenance,
         }),
-        None => ZKeyEntry::Locked,
+        None => ZKeyEntry::Locked(provenance),
     })
 }
 
 enum TKeyEntry {
     Recovered(TransparentKey),
-    Locked,
+    Locked(Provenance),
 }
 
 /// Read one `WalletTKey` in the post-version-20 shape. Field order
 /// confirmed against `WalletTKey::read` in `src/wallettkey.rs`.
-fn read_tkey(cur: &mut Cursor) -> Option<TKeyEntry> {
-    cur.u8()?; // per-record serialization version
-    let keytype = cur.u32_le()?;
-    cur.u8()?; // locked flag: redundant with key's Optional presence below
-    let key = cur.optional(|c| c.array::<TRANSPARENT_SECRET_LEN>())?;
+fn read_tkey(cur: &mut Cursor) -> ZwlReadResult<TKeyEntry> {
+    cur.u8("tkey")?;
+    let keytype = cur.u32_le("tkey")?;
+    cur.u8("tkey")?;
+    let key = cur.optional("tkey", |c| c.array::<TRANSPARENT_SECRET_LEN>("tkey"))?;
     cur.skip_zwl_string()?; // t-address, not retained
-    cur.optional(|c| c.u32_le())?; // hdkey_num
-    cur.optional(Cursor::vector_bytes)?; // enc_key
-    cur.optional(Cursor::vector_bytes)?; // nonce
+    cur.optional("tkey", |c| c.u32_le("tkey"))?;
+    cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
+    cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
 
     let provenance = match keytype {
         0 => Provenance::HdDerived,  // WalletTKeyType::HdKey
         1 => Provenance::Standalone, // WalletTKeyType::ImportedKey
-        _ => return None,
+        _ => return Err(cur.error("tkey", "wallet structure could not be read")),
     };
 
-    Some(match key {
+    Ok(match key {
         Some(secret) => TKeyEntry::Recovered(TransparentKey {
             secret: Secret::new(secret),
             provenance,
         }),
-        None => TKeyEntry::Locked,
+        None => TKeyEntry::Locked(provenance),
     })
 }
 
@@ -383,26 +398,28 @@ fn read_tkey(cur: &mut Cursor) -> Option<TKeyEntry> {
 /// `zkeys`/`tkeys` vectors that follow aligned — nothing is extracted.
 /// Field order confirmed against `WalletOKey::read` in
 /// `src/walletokey.rs`.
-fn skip_okey(cur: &mut Cursor) -> Option<()> {
-    cur.u8()?; // per-record serialization version
-    cur.u32_le()?; // keytype
-    cur.u8()?; // locked flag
-    cur.optional(|c| c.u32_le())?; // hdkey_num
-    cur.skip(ORCHARD_FVK_LEN)?; // fvk: always present
-    cur.optional(|c| c.array::<32>())?; // sk
-    cur.optional(Cursor::vector_bytes)?; // enc_key
-    cur.optional(Cursor::vector_bytes)?; // nonce
-    Some(())
+fn skip_okey(cur: &mut Cursor) -> ZwlReadResult<()> {
+    cur.u8("okey")?;
+    cur.u32_le("okey")?;
+    cur.u8("okey")?;
+    cur.optional("okey", |c| c.u32_le("okey"))?;
+    cur.skip(ORCHARD_FVK_LEN, "okey")?;
+    cur.optional("okey", |c| c.array::<32>("okey"))?;
+    cur.optional("okey", |c| c.vector_bytes("okey"))?;
+    cur.optional("okey", |c| c.vector_bytes("okey"))?;
+    Ok(())
 }
 
 /// Read `okeys` (if the `Keys` version supports them), `zkeys`, and
-/// `tkeys`, pushing recovered key material into `out`. Returns `None` on
-/// the first truncated or unrecognized field; the caller treats that as
-/// "stop here", not an error — whatever was pushed into `out` before that
-/// point is kept.
-fn read_key_vectors(cur: &mut Cursor, keys_version: u64, out: &mut ImportedKeys) -> Option<()> {
+/// `tkeys`, pushing each completed key into `out`. On failure the caller
+/// adds a damage diagnostic while retaining those completed keys.
+fn read_key_vectors(
+    cur: &mut Cursor,
+    keys_version: u64,
+    out: &mut ImportedKeys,
+) -> ZwlReadResult<()> {
     if keys_version > 21 {
-        let count = cur.compact_size()?;
+        let count = cur.compact_size("okeys")?;
         for _ in 0..count {
             skip_okey(cur)?;
         }
@@ -425,11 +442,14 @@ fn read_key_vectors(cur: &mut Cursor, keys_version: u64, out: &mut ImportedKeys)
         }
     }
 
-    let zkeys = cur.vector(|c| read_zkey(c))?;
-    for entry in zkeys {
+    let zkey_count = cur.compact_size("zkeys")?;
+    for _ in 0..zkey_count {
+        let entry = read_zkey(cur)?;
         match entry {
             ZKeyEntry::Recovered(k) => out.sapling.push(k),
-            ZKeyEntry::Locked => out.diagnostics.push(decryption_not_supported("zwl-zkey")),
+            ZKeyEntry::Locked(provenance) => {
+                out.diagnostics.push(locked_key("zwl-zkey", provenance))
+            }
             ZKeyEntry::NoSpendingKey => {}
         }
     }
@@ -443,28 +463,32 @@ fn read_key_vectors(cur: &mut Cursor, keys_version: u64, out: &mut ImportedKeys)
         // these bytes directly (as the reference implementation itself
         // does, unconditionally) is safe in the cases that shape actually
         // occurs in.
-        let secrets = cur.vector(|c| c.array::<TRANSPARENT_SECRET_LEN>())?;
-        let address_count = cur.compact_size()?;
-        for _ in 0..address_count {
-            cur.skip_zwl_string()?;
-        }
-        for secret in secrets {
+        let secret_count = cur.compact_size("tkeys")?;
+        for _ in 0..secret_count {
+            let secret = cur.array::<TRANSPARENT_SECRET_LEN>("key")?;
             out.transparent.push(TransparentKey {
                 secret: Secret::new(secret),
                 provenance: Provenance::HdDerived,
             });
         }
+        let address_count = cur.compact_size("address")?;
+        for _ in 0..address_count {
+            cur.skip_zwl_string()?;
+        }
     } else {
-        let tkeys = cur.vector(|c| read_tkey(c))?;
-        for entry in tkeys {
+        let tkey_count = cur.compact_size("tkeys")?;
+        for _ in 0..tkey_count {
+            let entry = read_tkey(cur)?;
             match entry {
                 TKeyEntry::Recovered(k) => out.transparent.push(k),
-                TKeyEntry::Locked => out.diagnostics.push(decryption_not_supported("zwl-tkey")),
+                TKeyEntry::Locked(provenance) => {
+                    out.diagnostics.push(locked_key("zwl-tkey", provenance))
+                }
             }
         }
     }
 
-    Some(())
+    Ok(())
 }
 
 /// Parse a ZecWallet Lite wallet file.
@@ -488,26 +512,48 @@ pub fn import_zwl(
     let mut cur = Cursor::new(bytes);
 
     let external_version = cur
-        .u64_le()
-        .ok_or_else(|| unreadable("file is too short to contain a ZWL version"))?;
-
-    if external_version > MAX_SUPPORTED_VERSION {
-        return Err(unreadable(format!(
-            "ZecWallet Lite wallet version {external_version} is newer than this build \
-             understands (max {MAX_SUPPORTED_VERSION})"
-        )));
-    }
+        .u64_le("external_version")
+        .map_err(|_| unreadable("file is too short to contain a ZWL version"))?;
 
     let mut out = ImportedKeys::default();
 
-    if external_version < MIN_KEYS_READ_EXTERNAL_VERSION {
+    if !(MIN_KEYS_READ_EXTERNAL_VERSION..=MAX_SUPPORTED_VERSION).contains(&external_version) {
+        out.diagnostics
+            .push(ImportDiagnostic::UnsupportedWalletVersion {
+                component: "ZecWallet Lite external",
+                found: external_version,
+                minimum: MIN_KEYS_READ_EXTERNAL_VERSION,
+                maximum: MAX_SUPPORTED_VERSION,
+            });
         return Ok(out);
     }
 
-    let Some(header) = read_keys_header(&mut cur) else {
-        // Truncated or an unrecognized internal Keys version: partial
-        // recovery applies, same as everywhere else past this point.
+    // The internal version word precedes the rest of the fixed header.
+    // Detect unsupported layouts before decoding fields whose shape may differ.
+    let keys_version = match cur.u64_le("keys_version") {
+        Ok(version) => version,
+        Err(err) => {
+            out.diagnostics.push(damage(err));
+            return Ok(out);
+        }
+    };
+    if keys_version > MAX_SUPPORTED_KEYS_VERSION {
+        out.diagnostics
+            .push(ImportDiagnostic::UnsupportedWalletVersion {
+                component: "ZecWallet Lite keys",
+                found: keys_version,
+                minimum: 0,
+                maximum: MAX_SUPPORTED_KEYS_VERSION,
+            });
         return Ok(out);
+    }
+    cur.pos -= 8;
+    let header = match read_keys_header(&mut cur) {
+        Ok(header) => header,
+        Err(err) => {
+            out.diagnostics.push(damage(err));
+            return Ok(out);
+        }
     };
 
     if header.encrypted {
@@ -528,12 +574,41 @@ pub fn import_zwl(
             // `derive_master_key` uses for its master key.
             Err(()) => return Err(ImportError::WrongPassphrase),
         }
+    } else {
+        let mnemonic = Mnemonic::<English>::from_entropy(header.seed.to_vec())
+            .expect("32 bytes are valid BIP-39 entropy");
+        out.mnemonic = Some(SecretString::new(mnemonic.into_phrase()));
     }
 
-    // Best-effort from here: `None` means "stop parsing", not an error.
-    let _ = read_key_vectors(&mut cur, header.keys_version, &mut out);
+    if let Err(err) = read_key_vectors(&mut cur, header.keys_version, &mut out) {
+        out.diagnostics.push(damage(err));
+    }
+
+    if out.mnemonic.is_none()
+        && out.sapling.is_empty()
+        && out.transparent.is_empty()
+        && !out.diagnostics.iter().any(|d| {
+            matches!(
+                d,
+                ImportDiagnostic::LockedKey { .. } | ImportDiagnostic::ContainerDamage { .. }
+            )
+        })
+    {
+        out.diagnostics
+            .push(ImportDiagnostic::MissingSpendAuthority {
+                format: "ZecWallet Lite",
+            });
+    }
 
     Ok(out)
+}
+
+fn damage(err: ZwlReadError) -> ImportDiagnostic {
+    ImportDiagnostic::ContainerDamage {
+        format: "ZecWallet Lite",
+        location: format!("byte {} {}", err.offset, err.field),
+        reason: err.reason.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -711,12 +786,171 @@ mod tests {
         v
     }
 
+    #[test]
+    fn plaintext_seed_round_trips_to_mnemonic() {
+        let entropy = [0x11; SEED_LEN];
+        let mut body = keys_body(22, false, &[0, 0, 0]);
+        let seed_start = 8 + 1 + ENC_SEED_LEN + 1;
+        body[seed_start..seed_start + SEED_LEN].copy_from_slice(&entropy);
+        let keys = import_zwl(&wallet(25, &body), None).unwrap();
+        let expected = Mnemonic::<English>::from_entropy(entropy.to_vec())
+            .unwrap()
+            .into_phrase();
+        assert_eq!(keys.mnemonic.as_ref().unwrap().expose_secret(), &expected);
+    }
+
+    #[test]
+    fn all_zwl_truncation_boundaries_are_non_complete() {
+        let mut vectors = cs(1);
+        vectors.extend_from_slice(&okey_stub());
+        vectors.extend_from_slice(&cs(1));
+        vectors.extend_from_slice(&zkey_hd(0x12));
+        vectors.extend_from_slice(&cs(2));
+        let first_tkey_end =
+            8 + 8 + 1 + ENC_SEED_LEN + 1 + SEED_LEN + vectors.len() + tkey_hd(0x34).len();
+        vectors.extend_from_slice(&tkey_hd(0x34));
+        vectors.extend_from_slice(&tkey_hd(0x56));
+        let bytes = wallet(25, &keys_body(22, false, &vectors));
+        let vectors_start = 8 + 8 + 1 + ENC_SEED_LEN + 1 + SEED_LEN;
+        for cut in 8..bytes.len() {
+            let keys = import_zwl(&bytes[..cut], None).unwrap();
+            assert_ne!(
+                keys.coverage(),
+                crate::keys::ImportCoverage::Complete,
+                "cut {cut}"
+            );
+            if cut >= vectors_start {
+                assert!(keys.diagnostics.iter().any(|d| matches!(d, ImportDiagnostic::ContainerDamage { location, .. } if location.starts_with(&format!("byte {cut} ")))), "missing coordinate at cut {cut}: {:?}", keys.diagnostics);
+            }
+            if cut >= first_tkey_end {
+                assert_eq!(keys.transparent.len(), 1, "first tkey lost at cut {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_external_version_is_non_complete() {
+        let keys = import_zwl(&wallet(32, &[]), None).unwrap();
+        assert!(matches!(
+            keys.diagnostics.as_slice(),
+            [ImportDiagnostic::UnsupportedWalletVersion { .. }]
+        ));
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn unsupported_keys_version_is_non_complete() {
+        let keys = import_zwl(&wallet(25, &keys_body(23, false, &[])), None).unwrap();
+        assert!(matches!(
+            keys.diagnostics.as_slice(),
+            [ImportDiagnostic::UnsupportedWalletVersion { .. }]
+        ));
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn pre_v15_layout_is_non_complete() {
+        let keys = import_zwl(&wallet(14, &[0xff; 32]), None).unwrap();
+        assert!(matches!(
+            keys.diagnostics.as_slice(),
+            [ImportDiagnostic::UnsupportedWalletVersion { .. }]
+        ));
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn recognized_truncated_zwl_is_keys_unread_and_zero_seed_is_present() {
+        let keys = import_zwl(&wallet(25, &[]), None).unwrap();
+        assert!(matches!(
+            keys.diagnostics.as_slice(),
+            [ImportDiagnostic::ContainerDamage { .. }]
+        ));
+        assert_eq!(keys.coverage(), crate::keys::ImportCoverage::KeysUnread);
+        let keys = import_zwl(&wallet(25, &keys_body(22, false, &[0, 0, 0])), None).unwrap();
+        assert!(keys.mnemonic.is_some()); // zero entropy is still a valid ZWL seed
+    }
+
+    #[test]
+    fn locked_hd_and_standalone_zkeys_have_distinct_guidance() {
+        let mut hd = zkey_locked();
+        let mut standalone = zkey_locked();
+        standalone[1..5].copy_from_slice(&1u32.to_le_bytes());
+        let mut vectors = cs(2);
+        vectors.append(&mut hd);
+        vectors.append(&mut standalone);
+        vectors.extend_from_slice(&cs(0));
+        let bytes = wallet(25, &keys_body(21, false, &vectors));
+        let keys = import_zwl(&bytes, None).unwrap();
+        assert!(matches!(
+            &keys.diagnostics[0],
+            ImportDiagnostic::LockedKey {
+                provenance: Provenance::HdDerived,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &keys.diagnostics[1],
+            ImportDiagnostic::LockedKey {
+                provenance: Provenance::Standalone,
+                ..
+            }
+        ));
+        assert!(keys.diagnostics[1]
+            .to_string()
+            .contains("cannot be recreated from the seed"));
+    }
+
+    #[test]
+    fn locked_hd_and_standalone_tkeys_have_distinct_guidance() {
+        let mut standalone = tkey_locked();
+        standalone[1..5].copy_from_slice(&1u32.to_le_bytes());
+        let mut vectors = vec![0, 2];
+        vectors.extend_from_slice(&tkey_locked());
+        vectors.extend_from_slice(&standalone);
+        let bytes = wallet(25, &keys_body(21, false, &vectors));
+        let keys = import_zwl(&bytes, None).unwrap();
+        assert!(matches!(
+            &keys.diagnostics[0],
+            ImportDiagnostic::LockedKey {
+                provenance: Provenance::HdDerived,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &keys.diagnostics[1],
+            ImportDiagnostic::LockedKey {
+                provenance: Provenance::Standalone,
+                ..
+            }
+        ));
+        assert!(keys.diagnostics[1]
+            .to_string()
+            .contains("cannot be recreated from the seed"));
+    }
+
+    #[test]
+    fn truncated_second_tkey_keeps_first_tkey() {
+        let mut vectors = vec![0, 0, 2];
+        vectors.extend_from_slice(&tkey_hd(0x11));
+        vectors.extend_from_slice(&tkey_hd(0x22));
+        let bytes = wallet(25, &keys_body(22, false, &vectors));
+        let keys = import_zwl(&bytes[..bytes.len() - 1], None).unwrap();
+        assert_eq!(keys.transparent.len(), 1);
+        assert!(matches!(
+            keys.diagnostics.last(),
+            Some(ImportDiagnostic::ContainerDamage { .. })
+        ));
+    }
+
     // --- the tests specified by the task brief ---
 
     #[test]
     fn rejects_a_version_newer_than_we_understand() {
-        let err = import_zwl(&wallet(999, &[]), None).unwrap_err();
-        assert!(matches!(err, ImportError::UnwalkableBtree(_)));
+        let keys = import_zwl(&wallet(999, &[]), None).unwrap();
+        assert!(matches!(
+            keys.diagnostics.as_slice(),
+            [ImportDiagnostic::UnsupportedWalletVersion { .. }]
+        ));
     }
 
     #[test]
@@ -964,9 +1198,10 @@ mod tests {
 
         let keys = import_zwl(&bytes, None).unwrap();
         assert_eq!(keys.sapling.len(), 1, "the fully-read zkey must survive");
-        assert!(
-            keys.transparent.is_empty(),
-            "a truncated tkey vector must not fabricate a partial key"
+        assert_eq!(
+            keys.transparent.len(),
+            1,
+            "the complete first tkey must survive"
         );
     }
 }
