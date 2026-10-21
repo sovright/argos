@@ -58,10 +58,10 @@ as `license = "MIT or Apache 2.0"`, which is not a parseable SPDX
 expression (`MIT OR Apache-2.0` would be), so GitHub reports NOASSERTION
 and `cargo-deny check licenses` cannot classify them. That is a metadata
 problem, not a permission problem. `zingolabs/zewif-zwl` is the genuinely
-unlicensed one — no licence file, no crate `license` field — and it is the
-repo that matters, since `crates/argos-wallet-import/src/zwl.rs` cites it
-for the ZecWallet Lite byte layout. Hence that layout is re-derived and
-every ZWL fixture is hand-built rather than copied.
+unlicensed one — no licence file, no crate `license` field — so nothing is
+taken from it. `crates/argos-wallet-import/src/zwl.rs` cites the upstream
+writer instead, `zingolabs/zwl-lib` (MIT), for the ZecWallet Lite byte
+layout, and no hand-built ZWL test stream is copied from zewif-zwl.
 
 `czkey` (encrypted Sprout spending keys) is decrypted here and nowhere
 else in the ecosystem: Zallet drops Sprout keys during migration and
@@ -78,8 +78,15 @@ zcashd refuses all inbound Sprout transfers regardless of Canopy height —
 so the note/witness preservation path is validated structurally, not
 against a real note. See `tests/regtest/fixtures/README.md`.
 
-Every ZecWallet Lite test fixture is a hand-built byte stream; there is no
-real-world ZWL wallet file fixture. Treat ZWL parsing claims accordingly.
+Three ZecWallet Lite fixtures (`crates/argos-wallet-import/tests/fixtures/zwl-*.dat`)
+are written by the upstream writer, `zwl-lib`'s `LightWallet::write`, from
+the public test seed (reproduction in that directory's `README.md`). They
+pin the container, chain name and versioned tail (birthday included), but
+hold no funds, no shielded notes or blocks, no imported keys and no
+encryption. Encrypted imported keys, Orchard key records, HD indices and
+the older key layouts are tested only with hand-built byte streams, and
+there is still no real user's ZWL wallet file fixture. Treat claims about
+those shapes accordingly.
 
 `argos-wallet-import` has no dependency on `argos-core` (the reverse is
 true: `argos-core` depends on it), no network access, and no filesystem
