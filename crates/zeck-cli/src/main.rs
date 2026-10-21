@@ -1702,9 +1702,9 @@ async fn main() -> Result<()> {
     {
         if seed_phrase.is_none() {
             argos_core::refuse_memo_without_seed(memo.as_deref())?;
-            // Before the scan: the transparent leg is swept last and needs a
-            // Sapling receiver, so an Orchard-only address would otherwise
-            // be found out after the Sapling legs had already broadcast.
+            // With a mnemonic, transparent keys may overlap discovered HD
+            // receivers. The core sweep checks any remaining direct leg
+            // after scanning; only a seedless source is certain here.
             if let Some(source) = imported.as_ref() {
                 argos_core::transparent_recovery::refuse_destination_the_transparent_leg_cannot_reach(
                     source.keys(),

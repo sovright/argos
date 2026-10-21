@@ -634,9 +634,9 @@ pub struct WalletFileScanInput {
 
 /// Refuse, before the scan, a destination a seedless sweep cannot pay.
 ///
-/// A key set that carries a mnemonic takes the ordinary HD sweep, which has
-/// no transparent-leg constraint, so only a seedless source is checked. This
-/// mirrors the CLI's pre-scan check and the core sweep's own.
+/// With a mnemonic, transparent keys may overlap HD receivers discovered
+/// during the scan. The core sweep checks the resulting direct leg after
+/// that discovery; preflight only decides seedless sources exactly.
 fn refuse_unreachable_sweep_destination(
     keys: &argos_core::argos_wallet_import::ImportedKeys,
     destination: &str,
@@ -2207,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn destinations_are_unconstrained_without_a_transparent_leg_or_without_a_seedless_source() {
+    fn destinations_are_unconstrained_without_a_transparent_leg() {
         // No transparent keys: only Sapling legs, which Orchard-only can take.
         refuse_unreachable_sweep_destination(
             &ImportedKeys::default(),
@@ -2216,11 +2216,16 @@ mod tests {
         )
         .expect("no transparent leg, nothing to refuse");
 
-        // A mnemonic takes the HD sweep, which has no such constraint.
+        // A standalone key can overlap an HD receiver discovered during the
+        // scan. Preflight cannot establish whether a direct leg remains.
         let mut seeded = transparent_keys();
         seeded.mnemonic = Some(secrecy::SecretString::new("abandon".to_owned()));
         refuse_unreachable_sweep_destination(&seeded, ORCHARD_ONLY_UA, ZeckNetwork::Mainnet)
-            .expect("seeded wallets sweep through the HD path");
+            .expect("mixed-source overlap must reach the scan to resolve its legs");
+
+        seeded.transparent[0].provenance = Provenance::HdDerived;
+        refuse_unreachable_sweep_destination(&seeded, ORCHARD_ONLY_UA, ZeckNetwork::Mainnet)
+            .expect("HD-derived transparent keys use the mnemonic's sweep path");
     }
 
     #[test]

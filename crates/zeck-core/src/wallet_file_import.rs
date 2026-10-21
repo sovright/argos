@@ -84,21 +84,71 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_absent_metadata_never_claims_a_match() {
+    fn nonempty_block_and_sapling_note_history_still_reject_wrong_network() {
+        let mut bytes =
+            include_bytes!("../../argos-wallet-import/tests/fixtures/zwl-testnet-txn.dat").to_vec();
+        assert_eq!(bytes[285], 0);
+        let mut note = Vec::new();
+        note.extend_from_slice(&20u64.to_le_bytes());
+        note.extend_from_slice(&vec![0u8; 169 + 11 + 8 + 33]);
+        note.push(0);
+        note.extend_from_slice(&0u64.to_le_bytes());
+        note.extend_from_slice(&[0u8; 32]);
+        note.extend_from_slice(&[0, 0, 0, 0, 0]);
+        bytes[285] = 1;
+        bytes.splice(286..286, note);
+
+        assert_eq!(bytes[190], 0);
+        let mut block = Vec::new();
+        block.extend_from_slice(&419_200u32.to_le_bytes());
+        block.extend_from_slice(&[0u8; 32]);
+        block.extend_from_slice(&[0, 0, 0]);
+        block.extend_from_slice(&20u64.to_le_bytes());
+        block.push(0);
+        bytes[190] = 1;
+        bytes.splice(191..191, block);
+
+        let err = import_wallet_file_for_network(&bytes, None, ZeckNetwork::Mainnet).unwrap_err();
+        assert!(
+            matches!(err, ZeckError::Import(message) if message.contains("mainnet") && message.contains("testnet"))
+        );
+    }
+
+    #[test]
+    fn damaged_tail_after_chain_name_still_rejects_wrong_network() {
+        let bytes =
+            include_bytes!("../../argos-wallet-import/tests/fixtures/zwl-testnet-empty.dat");
+        let err =
+            import_wallet_file_for_network(&bytes[..bytes.len() - 1], None, ZeckNetwork::Mainnet)
+                .unwrap_err();
+        assert!(
+            matches!(err, ZeckError::Import(message) if message.contains("mainnet") && message.contains("testnet"))
+        );
+    }
+
+    #[test]
+    fn readable_tkey_metadata_precedes_truncated_chain_name() {
         let truncated =
             include_bytes!("../../argos-wallet-import/tests/fixtures/zwl-mainnet-empty.dat");
         // Byte 200 is just before the writer's u64 chain-name length in
         // this 256-byte fixture, after its complete Keys and Txns sections.
+        let result = import_wallet_file_for_network(&truncated[..200], None, ZeckNetwork::Testnet);
+        assert!(
+            matches!(result, Err(ZeckError::Import(message)) if message.contains("mainnet") && message.contains("testnet"))
+        );
+
         let imported =
-            import_wallet_file_for_network(&truncated[..200], None, ZeckNetwork::Testnet).unwrap();
-        assert_eq!(imported.embedded_network, None);
+            import_wallet_file_for_network(&truncated[..200], None, ZeckNetwork::Mainnet).unwrap();
+        assert_eq!(imported.embedded_network, Some(EmbeddedNetwork::Mainnet));
         assert_ne!(
             imported.coverage(),
             argos_wallet_import::ImportCoverage::Complete
         );
 
+        // Before any complete key or chain_name, the selected network remains
+        // unknown and partial key recovery is still allowed.
         let imported =
-            import_wallet_file_for_network(&truncated[..200], None, ZeckNetwork::Mainnet).unwrap();
+            import_wallet_file_for_network(&truncated[..80], None, ZeckNetwork::Testnet).unwrap();
         assert_eq!(imported.embedded_network, None);
     }
 

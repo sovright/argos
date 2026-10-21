@@ -620,19 +620,13 @@ fn skip_unverified_history_vector(
     cur: &mut Cursor,
     field: &'static str,
     mut item: impl FnMut(&mut Cursor) -> ZwlReadResult<()>,
-) -> ZwlReadResult<()> {
+) -> ZwlReadResult<bool> {
     let mut saw_item = false;
     skip_vector(cur, field, |cur| {
         saw_item = true;
         item(cur)
     })?;
-    if saw_item {
-        return Err(cur.error(
-            field,
-            "nonempty history layout is not verified against an upstream writer fixture",
-        ));
-    }
-    Ok(())
+    Ok(saw_item)
 }
 
 fn skip_bytes_vector(cur: &mut Cursor, field: &'static str) -> ZwlReadResult<()> {
@@ -726,7 +720,7 @@ fn skip_orchard_note(cur: &mut Cursor) -> ZwlReadResult<()> {
     Ok(())
 }
 
-fn skip_wallet_tx(cur: &mut Cursor) -> ZwlReadResult<()> {
+fn skip_wallet_tx(cur: &mut Cursor, history_damage: &mut Vec<ZwlReadError>) -> ZwlReadResult<()> {
     let version = cur.u64_le("txns")?;
     if version > 23 {
         return Err(cur.error("txns", "wallet structure could not be read"));
@@ -739,7 +733,12 @@ fn skip_wallet_tx(cur: &mut Cursor) -> ZwlReadResult<()> {
         cur.skip(8, "txns")?;
     }
     cur.skip(32, "txns")?; // txid
-    skip_unverified_history_vector(cur, "txns", skip_sapling_note)?;
+    if skip_unverified_history_vector(cur, "txns", skip_sapling_note)? {
+        history_damage.push(cur.error(
+            "txns",
+            "nonempty Sapling note history layout is not verified against an upstream writer fixture",
+        ));
+    }
     skip_vector(cur, "txns", skip_utxo)?;
     if version > 22 {
         cur.skip(8, "txns")?;
@@ -760,7 +759,12 @@ fn skip_wallet_tx(cur: &mut Cursor) -> ZwlReadResult<()> {
         skip_vector(cur, "txns", |cur| cur.skip(32, "txns"))?;
     }
     if version > 21 {
-        skip_unverified_history_vector(cur, "txns", skip_orchard_note)?;
+        if skip_unverified_history_vector(cur, "txns", skip_orchard_note)? {
+            history_damage.push(cur.error(
+                "txns",
+                "nonempty Orchard note history layout is not verified against an upstream writer fixture",
+            ));
+        }
         skip_vector(cur, "txns", |cur| cur.skip(32, "txns"))?;
     }
     Ok(())
@@ -769,25 +773,32 @@ fn skip_wallet_tx(cur: &mut Cursor) -> ZwlReadResult<()> {
 fn read_chain_network(
     cur: &mut Cursor,
     external_version: u64,
-) -> ZwlReadResult<Option<EmbeddedNetwork>> {
+    out: &mut ImportedKeys,
+) -> ZwlReadResult<()> {
     // zewif-zwl's ZwlParser uses Keys::read and WalletTxns::read for
     // external versions 15..=31; the older read_old layout is outside scope.
     if !(15..=31).contains(&external_version) {
         return Err(cur.error("txns", "wallet structure could not be read"));
     }
-    skip_unverified_history_vector(cur, "blocks", skip_compact_block)?;
+    let mut history_damage = Vec::new();
+    if skip_unverified_history_vector(cur, "blocks", skip_compact_block)? {
+        history_damage.push(cur.error(
+            "blocks",
+            "nonempty block history layout is not verified against an upstream writer fixture",
+        ));
+    }
     let txns_version = cur.u64_le("txns")?;
     if txns_version > 21 {
         return Err(cur.error("txns", "wallet structure could not be read"));
     }
     skip_vector(cur, "txns", |cur| {
         cur.skip(32, "txns")?;
-        skip_wallet_tx(cur)
+        skip_wallet_tx(cur, &mut history_damage)
     })?;
     if txns_version <= 20 {
         skip_vector(cur, "txns", |cur| {
             cur.skip(32, "txns")?;
-            skip_wallet_tx(cur)
+            skip_wallet_tx(cur, &mut history_damage)
         })?;
     }
     let len = cur.u64_le("chain_name")?;
@@ -795,13 +806,15 @@ fn read_chain_network(
         usize::try_from(len).map_err(|_| cur.error("chain_name", "value length limit exceeded"))?;
     let name = std::str::from_utf8(cur.take(len, "chain_name")?)
         .map_err(|_| cur.error("chain_name", "wallet structure could not be read"))?;
-    read_wallet_tail(cur, external_version)?;
-    Ok(match name {
-        "main" | "mainnet" => Some(EmbeddedNetwork::Mainnet),
-        "test" | "testnet" => Some(EmbeddedNetwork::Testnet),
-        "regtest" => Some(EmbeddedNetwork::Regtest),
-        _ => None,
-    })
+    match name {
+        "main" | "mainnet" => merge_embedded_network(out, EmbeddedNetwork::Mainnet),
+        "test" | "testnet" => merge_embedded_network(out, EmbeddedNetwork::Testnet),
+        "regtest" => merge_embedded_network(out, EmbeddedNetwork::Regtest),
+        _ => unrecognized_network(out, "ZecWallet Lite", "unknown chain name"),
+    }
+    out.diagnostics
+        .extend(history_damage.into_iter().map(damage));
+    read_wallet_tail(cur, external_version)
 }
 
 /// The fields following the chain name in the upstream LightWallet writer.
@@ -947,14 +960,11 @@ pub fn import_zwl(
 
     match read_key_vectors(&mut cur, header.keys_version, &mut out) {
         Err(err) => {
-            out.embedded_network = None;
             out.diagnostics.push(damage(err));
         }
-        Ok(()) => match read_chain_network(&mut cur, external_version) {
-            Ok(Some(network)) => merge_embedded_network(&mut out, network),
-            Ok(None) => unrecognized_network(&mut out, "ZecWallet Lite", "unknown chain name"),
+        Ok(()) => match read_chain_network(&mut cur, external_version, &mut out) {
+            Ok(()) => (),
             Err(err) => {
-                out.embedded_network = None;
                 out.diagnostics.push(damage(err));
             }
         },
@@ -1079,6 +1089,45 @@ mod tests {
     }
 
     #[test]
+    fn truncated_tail_retains_preceding_testnet_identity() {
+        let bytes = include_bytes!("../tests/fixtures/zwl-testnet-empty.dat");
+        let imported = import_zwl(&bytes[..bytes.len() - 1], None).unwrap();
+        assert_eq!(imported.embedded_network, Some(EmbeddedNetwork::Testnet));
+        assert_ne!(imported.coverage(), crate::keys::ImportCoverage::Complete);
+        assert!(imported
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, ImportDiagnostic::ContainerDamage { .. })));
+    }
+
+    #[test]
+    fn truncated_later_tkey_retains_earlier_testnet_identity() {
+        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use zcash_protocol::consensus::NetworkType;
+        use zcash_transparent::address::TransparentAddress;
+
+        let secret = [0x55; TRANSPARENT_SECRET_LEN];
+        let public =
+            PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&secret).unwrap());
+        let address = TransparentAddress::from_pubkey(&public)
+            .to_zcash_address(NetworkType::Test)
+            .encode();
+        let mut first = tkey_hd(0x55);
+        let address_start = 1 + 4 + 1 + 1 + TRANSPARENT_SECRET_LEN + 8;
+        let address_end = address_start + address.len();
+        first[address_start..address_end].copy_from_slice(address.as_bytes());
+
+        let mut vectors = cs(0);
+        vectors.extend_from_slice(&cs(2));
+        vectors.extend_from_slice(&first);
+        vectors.extend_from_slice(&tkey_hd(0x66)[..12]);
+        let imported = import_zwl(&wallet(25, &keys_body(21, false, &vectors)), None).unwrap();
+        assert_eq!(imported.embedded_network, Some(EmbeddedNetwork::Testnet));
+        assert_eq!(imported.transparent.len(), 1);
+        assert_ne!(imported.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
     fn nonempty_block_history_cannot_be_complete_without_writer_fixture() {
         let mut bytes = include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat").to_vec();
         assert_eq!(bytes[190], 0); // writer's empty CompactBlockData vector
@@ -1117,13 +1166,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_nested_transaction_version_leaves_network_unknown() {
+    fn unsupported_nested_transaction_version_retains_tkey_network() {
         let mut bytes = include_bytes!("../tests/fixtures/zwl-testnet-txn.dat").to_vec();
         // In the writer fixture, the first WalletTx version begins at 232,
         // after the keys, empty blocks, WalletTxns header, and txid.
         bytes[232] = 24; // upstream WalletTx::serialized_version() is 23
         let imported = import_zwl(&bytes, None).unwrap();
-        assert_eq!(imported.embedded_network, None);
+        assert_eq!(imported.embedded_network, Some(EmbeddedNetwork::Testnet));
         assert_ne!(imported.coverage(), crate::keys::ImportCoverage::Complete);
         assert!(imported
             .diagnostics
