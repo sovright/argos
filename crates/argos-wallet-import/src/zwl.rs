@@ -2143,8 +2143,7 @@ mod tests {
             &bytes,
             Some(&SecretString::new("battery staple".to_owned())),
         )
-        .err()
-        .expect("a wrong passphrase must not import");
+        .expect_err("a wrong passphrase must not import");
         assert_eq!(err, ImportError::WrongPassphrase);
     }
 
