@@ -1698,15 +1698,19 @@ pub async fn run_sprout_scan_with_decrypt_from(
             break;
         };
 
-        let consumed = match consume_page(&mut scanner, &page, network, tip_anchor, &mut height) {
-            Ok(count) => count,
-            Err(err) => {
-                scanner.mark_incomplete();
-                save_before_stopping(&scanner, network, checkpoint_file);
-                return Err(err);
-            }
-        };
-        since_checkpoint += consumed;
+        // Already in header order, and already complete: `next_page`
+        // assembles the page in the order the headers came in and treats a
+        // missing block as a hard error, because a short page still looks
+        // well-formed and would land every later commitment at the wrong
+        // position.
+        since_checkpoint += consume_page_or_save(
+            &mut scanner,
+            &page,
+            network,
+            tip_anchor,
+            &mut height,
+            checkpoint_file,
+        )?;
 
         if since_checkpoint >= CHECKPOINT_EVERY {
             save_checkpoint(&scanner, network, checkpoint_file)?;
@@ -1757,9 +1761,41 @@ impl Page {
     }
 }
 
-/// Reject a branch switch before parsing a single body. On this error the
-/// caller saves only the scanner state from the last consistent page; the
-/// next invocation verifies that cursor against live headers again.
+/// [`consume_page`], saving on the way out of a failure: the scanner is
+/// marked incomplete and checkpointed, so the saved-progress claim in the
+/// error holds and a re-run resumes rather than starting over.
+fn consume_page_or_save(
+    scanner: &mut SproutScanner,
+    page: &Page,
+    network: P2pNetwork,
+    tip_anchor: Option<TipAnchor>,
+    height: &mut u32,
+    checkpoint_file: &Path,
+) -> ZeckResult<u64> {
+    consume_page(scanner, page, network, tip_anchor, height).inspect_err(|_| {
+        scanner.mark_incomplete();
+        save_before_stopping(scanner, network, checkpoint_file);
+    })
+}
+
+/// Check one page, then scan it, advancing `height` past it.
+///
+/// A branch switch is rejected before a single body is used. On that error
+/// the caller saves only the scanner state from the last consistent page;
+/// the next invocation verifies that cursor against live headers again.
+///
+/// Every hash in the page is then checked against the pinned checkpoints and
+/// the [`TipAnchor`] before any block of it is scanned. A pinned block must
+/// be the block we were handed: cheap forged headers link to each other
+/// fine, but they cannot reproduce a real mainnet hash at a real height
+/// without doing the work. The checkpoints are keyed by true heights
+/// (genesis = 0), so each block is checked at its own height.
+///
+/// On a mismatch the scan stops — fail closed — and the state the caller
+/// saves ends at the last block of the previous page. Checking the whole
+/// page up front is what makes that possible: no block of the mismatching
+/// page, including those before the mismatch (they came from the same peer,
+/// and the forgery may begin anywhere in the page), has reached the scanner.
 fn consume_page(
     scanner: &mut SproutScanner,
     page: &Page,
@@ -1784,16 +1820,23 @@ fn consume_page(
         floor: 0,
         tip_anchor,
     };
-    let mut consumed = 0;
-    for (hash, joinsplits) in &page.blocks {
-        if !pins.agrees(*height, *hash) {
+    for (offset, (hash, _)) in page.blocks.iter().enumerate() {
+        let at = *height + offset as u32;
+        if !pins.agrees(at, *hash) {
+            let saved = match scanner.cursor() {
+                Some(cursor) => format!("Progress up to height {} is saved.", cursor.last_height),
+                None => "Nothing had been scanned yet.".to_owned(),
+            };
             return Err(ZeckError::Broadcast(format!(
-                "the chain this peer served does not match Zcash at height {height}. \
-                 It is serving a different or fabricated chain, so the scan stops \
-                 rather than search it. Re-run to pick another peer, or pass \
-                 --peer with a node you trust."
+                "the chain this peer served does not match Zcash at height {at}. It is \
+                 serving a different or fabricated chain, so the scan stops rather than \
+                 search it. {saved} Re-run to pick another peer, or pass --peer with a \
+                 node you trust."
             )));
         }
+    }
+    let mut consumed = 0;
+    for (hash, joinsplits) in &page.blocks {
         scanner
             .scan_block_at(joinsplits, *hash, *height)
             .map_err(|err| {
@@ -4838,5 +4881,118 @@ mod tests {
         // The file is kept: it is still a valid scan under its own bound.
         assert!(path.exists());
         discard_checkpoint(&path);
+    }
+
+    /// Review of #265, round 2: a hash mismatch against a pinned checkpoint
+    /// or the [`TipAnchor`] used to return without saving, losing up to a
+    /// page of work. It must still stop — fail closed — but first save what
+    /// was consumed before the mismatching page, and none of that page.
+    #[test]
+    fn a_hash_mismatch_saves_progress_before_the_page_and_none_of_it() {
+        let dir = ScratchDir::new("mismatch-save");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut scanner = SproutScanner::new(&keys);
+        let mut height = 1u32;
+
+        // An anchor further up, so the first page is checked against nothing
+        // and consumed. Nothing is saved yet: the page is under
+        // CHECKPOINT_EVERY.
+        let anchor = TipAnchor {
+            height: 5,
+            hash: [0xAA; 32],
+        };
+        let good = Page {
+            parent: [0; 32],
+            blocks: vec![
+                ([1; 32], Vec::new()),
+                ([2; 32], Vec::new()),
+                ([3; 32], Vec::new()),
+            ],
+        };
+        consume_page_or_save(
+            &mut scanner,
+            &good,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &mut height,
+            &path,
+        )
+        .expect("an unanchored page is consumed");
+        assert_eq!(height, 4);
+        assert!(!path.exists(), "no checkpoint is due yet");
+
+        // The next page disagrees with the anchor at height 5. Height 4,
+        // before it in the same page, is from the same peer and is not kept.
+        let forged = Page {
+            parent: [3; 32],
+            blocks: vec![
+                ([4; 32], Vec::new()),
+                ([5; 32], Vec::new()),
+                ([6; 32], Vec::new()),
+            ],
+        };
+        let err = consume_page_or_save(
+            &mut scanner,
+            &forged,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &mut height,
+            &path,
+        )
+        .expect_err("a mismatch stops the scan");
+        let text = err.to_string();
+        assert!(text.contains("height 5"), "{text}");
+        assert!(text.contains("Re-run"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert!(text.contains("saved"), "{text}");
+        assert_eq!(height, 4, "the scan does not advance into the forged page");
+
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+            .expect("the checkpoint loads")
+            .expect("progress before the forged page was saved");
+        let cursor = saved.cursor().expect("a cursor");
+        assert_eq!(
+            cursor.last_height, 3,
+            "up to the last block before the page"
+        );
+        assert_eq!(cursor.last_block_hash, [3; 32]);
+        assert!(
+            !saved.is_complete(),
+            "a stopped scan never reads as complete"
+        );
+    }
+
+    /// A mismatch on the first page of a fresh scan has nothing before it to
+    /// save, and must not claim "progress up to height 0".
+    #[test]
+    fn a_mismatch_on_the_first_page_does_not_claim_progress() {
+        let dir = ScratchDir::new("mismatch-first-page");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut scanner = SproutScanner::new(&keys);
+        let mut height = 1u32;
+        let anchor = TipAnchor {
+            height: 1,
+            hash: [0xAA; 32],
+        };
+        let forged = Page {
+            parent: [0; 32],
+            blocks: vec![([1; 32], Vec::new())],
+        };
+        let text = consume_page_or_save(
+            &mut scanner,
+            &forged,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &mut height,
+            &path,
+        )
+        .expect_err("a mismatch stops the scan")
+        .to_string();
+        assert!(!text.contains("height 0"), "{text}");
+        assert!(text.contains("Nothing had been scanned yet"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert_eq!(height, 1);
     }
 }
