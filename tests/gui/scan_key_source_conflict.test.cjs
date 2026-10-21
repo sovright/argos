@@ -111,7 +111,9 @@ test("Start over drops the loaded wallet file and its caveats", () => {
   assert.notEqual(start, -1);
   const end = source.indexOf("\n});\n", start);
   const handler = source.slice(start, end);
-  assert.match(handler, /forgetLoadedWalletFile\(\)/);
+  assert.match(handler, /resetRecoveryFlowState\(\)/);
+  const resetFlow = loadFunction("resetRecoveryFlowState");
+  assert.match(resetFlow.toString(), /forgetLoadedWalletFile\(\)/);
 
   const reset = loadFunction("forgetLoadedWalletFile");
   assert.match(reset.toString(), /walletFile = null;/);

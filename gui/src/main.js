@@ -28,6 +28,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 const state = {
   scanHandle: null,
+  completedScanHandle: null,
   lastProgress: null,
   sweepReview: null,
   proposalGeneration: 0,
@@ -891,6 +892,7 @@ $("wallet-browse")?.addEventListener("click", async () => {
     const path = await invoke("pick_wallet_file");
     // Cancelling is not an error, and must not clear a file already chosen.
     if (!path) return;
+    invalidateScanAuthority();
     $("wallet-path").value = path;
     // A freshly chosen file is not the one the old passphrase belongs to.
     $("wallet-passphrase").value = "";
@@ -901,13 +903,16 @@ $("wallet-browse")?.addEventListener("click", async () => {
   }
 });
 
-$("wallet-open")?.addEventListener("click", openWalletFile);
+$("wallet-open")?.addEventListener("click", () => {
+  invalidateScanAuthority();
+  openWalletFile();
+});
 $("wallet-forget")?.addEventListener("click", forgetLoadedWalletFile);
 $("wallet-path")?.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
+  if (e.key === "Enter") { e.preventDefault(); invalidateScanAuthority(); openWalletFile(); }
 });
 $("wallet-passphrase")?.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
+  if (e.key === "Enter") { e.preventDefault(); invalidateScanAuthority(); openWalletFile(); }
 });
 
 // Drag-and-drop, using Tauri's core webview event rather than an HTML5 drop
@@ -1585,6 +1590,7 @@ $("birthday-autodetect").addEventListener("click", async () => {
       network: $("network-select").value,
     });
     $("birthday-height").value = result.birthday;
+    invalidateScanAuthority();
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
     setBirthdayHint(
@@ -1615,6 +1621,7 @@ $("birthday-estimate").addEventListener("click", async () => {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
     });
     $("birthday-height").value = height;
+    invalidateScanAuthority();
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(height));
     setBirthdayHint(
@@ -1677,6 +1684,7 @@ phrase, or clear the seed phrase to scan the pasted key.";
 }
 
 $("start-scan").addEventListener("click", async () => {
+  if (state.sweepExecutionPending) return;
   // Three routes to the same scan: a seed phrase, a wallet file, or a
   // pasted Sapling spending key.
   const hasTypedSaplingKeys = hasSaplingScanKeys();
@@ -1842,7 +1850,7 @@ go back and provide one.",
     if (saplingBox) saplingBox.value = "";
     $("sapling-key-addresses").innerHTML = "";
     goTo("scan");
-    await startProgressListeners();
+    await startProgressListeners(handle);
   } catch (err) {
     if (state.matchedRecovery) {
       state.addressMatchRecoveryLocked = false;
@@ -1860,7 +1868,8 @@ go back and provide one.",
 
 // ─── Step 4: Scan Progress ────────────────────────────────────────────────────
 
-async function startProgressListeners() {
+async function startProgressListeners(expectedHandle) {
+  const expectedId = expectedHandle.id;
   $("scan-phase").textContent = "Starting…";
   $("scan-server").textContent = "Connecting…";
   $("scan-progress-text").textContent = "0 / 0";
@@ -1890,17 +1899,18 @@ async function startProgressListeners() {
 
   const [unlistenProgress, unlistenComplete, unlistenDiscovered] = await Promise.all([
     listen("scan-progress", (event) => {
-      if (event.payload.handle?.id !== state.scanHandle?.id) return;
+      if (event.payload.handle?.id !== expectedId || state.scanHandle?.id !== expectedId) return;
       updateScanUI(event.payload);
     }),
     listen("scan-complete", (event) => {
-      if (event.payload.handle?.id !== state.scanHandle?.id) return;
+      if (event.payload.handle?.id !== expectedId || state.scanHandle?.id !== expectedId) return;
       updateScanUI(event.payload);
       notifyScanComplete(event.payload);
       cleanupListeners();
     }),
     listen("scan-discovery", (event) => {
-      const d = event.payload;
+      if (event.payload.handle?.id !== expectedId || state.scanHandle?.id !== expectedId) return;
+      const d = event.payload.discovery;
       const div = document.createElement("div");
       div.className = "discovery-toast";
       // at_block_height is the scan frontier when first observed, not the
@@ -1921,6 +1931,12 @@ async function startProgressListeners() {
       container.style.display = "";
     }),
   ]);
+  if (state.scanHandle?.id !== expectedId) {
+    unlistenProgress();
+    unlistenComplete();
+    unlistenDiscovered();
+    return;
+  }
   state.unlistenProgress = unlistenProgress;
   state.unlistenComplete = unlistenComplete;
   state.unlistenDiscovered = unlistenDiscovered;
@@ -2177,6 +2193,55 @@ $("cancel-scan").addEventListener("click", async () => {
   } catch (err) {
     setStatus("scan-message", `Cancel failed: ${err}`, "error");
   }
+});
+
+function invalidateScanAuthority() {
+  cleanupListeners();
+  invalidateSweepReview();
+  state.scanHandle = null;
+  state.lastProgress = null;
+  state.scanConfig = null;
+  state.savedReportPath = null;
+  $("scan-phase").textContent = "Idle";
+  $("scan-server").textContent = "Not connected";
+  $("scan-progress-text").textContent = "0 / 0";
+  $("scan-eta").textContent = "Calculating…";
+  $("scan-progress-bar").style.width = "0%";
+  $("scan-rows").innerHTML = "";
+  $("scan-discoveries").innerHTML = "";
+  $("scan-discoveries").style.display = "none";
+  $("scan-totals").textContent = "Grand total: 0.00000000 ZEC across 0 accounts.";
+  $("scan-workspace").textContent = "Workspace: not initialized";
+  $("scan-sleep-banner").style.display = "none";
+  $("scan-sandblasting-banner").style.display = "none";
+  $("scan-gap-extension-banner").style.display = "none";
+  $("scan-sleep-detail").textContent = "";
+  $("scan-gap-extension-detail").textContent = "";
+  $("sweep-rows").innerHTML = "";
+  $("sweep-summary").textContent = "";
+  $("copy-report-path").style.display = "none";
+  setStatus("scan-message", "", "");
+  $("review-sweep").disabled = true;
+  $("back-to-config").style.display = "none";
+  $("cancel-scan").disabled = true;
+  eta.reset();
+}
+
+for (const id of [
+  "seed-input", "wallet-path", "wallet-passphrase", "sapling-scan-keys",
+  "network-select", "birthday-height", "accounts-range", "auto-gap-limit",
+  "gap-limit", "transparent-index-start", "transparent-index-count",
+  "transparent-include-change", "lightwalletd-url", "server-preset", "data-dir",
+  "sprout-scan-peers",
+]) {
+  $(id)?.addEventListener("input", invalidateScanAuthority);
+  $(id)?.addEventListener("change", invalidateScanAuthority);
+}
+
+$("wallet-path")?.addEventListener("input", () => {
+  const path = $("wallet-path").value;
+  forgetLoadedWalletFile();
+  $("wallet-path").value = path;
 });
 
 function donationParamsFromForm() {
@@ -2454,6 +2519,11 @@ $("execute-sweep").addEventListener("click", async () => {
       review.handleId !== state.scanHandle?.id ||
       !$("irreversible-check").checked) return;
   const handle = state.scanHandle;
+  const completionContext = {
+    handle,
+    scanConfig: state.scanConfig,
+    lastProgress: state.lastProgress,
+  };
   state.sweepExecutionPending = true;
   state.sweepReview = null;
   $("execute-sweep").disabled = true;
@@ -2465,7 +2535,7 @@ $("execute-sweep").addEventListener("click", async () => {
     // abort after one or more broadcasts resolves with `{ transactions, error }`
     // so the already-broadcast transaction IDs are still shown (audit Issue E).
     const outcome = await invoke("execute_sweep", { handle, proposalId: review.proposal_id });
-    if (handle.id !== state.scanHandle?.id) return;
+    state.completedScanHandle = handle;
     setStatus("sweep-execute-status", "", "");
     renderCompleteScreen(
       outcome.transactions,
@@ -2474,10 +2544,15 @@ $("execute-sweep").addEventListener("click", async () => {
       review.donationRateForDisplay,
       outcome.error,
       outcome.donation_note,
+      completionContext,
     );
+    if (state.scanHandle?.id !== handle.id) {
+      $("complete-summary").textContent =
+        "This result belongs to the sweep started before the scan source changed. " +
+        $("complete-summary").textContent;
+    }
     goTo("complete");
   } catch (err) {
-    if (handle.id !== state.scanHandle?.id) return;
     invalidateSweepReview();
     setStatus("sweep-execute-status", `✗ Sweep failed: ${err}`, "error");
   } finally {
@@ -2542,7 +2617,7 @@ function sweepCompleteSummary(results, error) {
   return `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
 }
 
-function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote) {
+function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote, completionContext = null) {
   $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
   if (state.retainedAddressSearchId) {
     state.addressMatchRecoveryLocked = false;
@@ -2646,14 +2721,14 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     donationEl.textContent = "";
   }
 
-  const report = buildReport(results);
+  const report = buildReport(results, completionContext);
   $("save-report").dataset.report = report;
   $("report-path").value = buildDefaultReportPath();
 }
 
-function buildReport(results) {
-  const cfg = state.scanConfig;
-  const prog = state.lastProgress;
+function buildReport(results, completionContext = null) {
+  const cfg = completionContext?.scanConfig ?? state.scanConfig;
+  const prog = completionContext?.lastProgress ?? state.lastProgress;
   const accountsScanned = prog?.accounts?.length ?? "—";
   const network = cfg?.network ?? "—";
   const birthday = cfg?.birthday != null ? Number(cfg.birthday).toLocaleString() : "—";
@@ -2703,7 +2778,7 @@ $("save-report").addEventListener("click", async () => {
   }
   try {
     const saved = await invoke("save_recovery_report", {
-      handle: state.scanHandle,
+      handle: state.completedScanHandle || state.scanHandle,
       path,
       report,
     });
@@ -2725,7 +2800,8 @@ $("copy-report-path").addEventListener("click", () => {
 });
 
 $("delete-workspace").addEventListener("click", async () => {
-  if (!state.scanHandle) {
+  const handle = state.completedScanHandle || state.scanHandle;
+  if (!handle) {
     setStatus("delete-workspace-status", "No workspace to delete.", "error");
     return;
   }
@@ -2742,10 +2818,11 @@ $("delete-workspace").addEventListener("click", async () => {
   btn.disabled = true;
   setStatus("delete-workspace-status", "Deleting…", "");
   try {
-    const deletedPath = await invoke("delete_workspace", { handle: state.scanHandle });
+    const deletedPath = await invoke("delete_workspace", { handle });
     setStatus("delete-workspace-status", `✓ Deleted ${deletedPath}`, "success");
     // The session is gone server-side; further per-handle commands would fail.
     state.scanHandle = null;
+    state.completedScanHandle = null;
     state.savedReportPath = null;
     // The recovery report is inside the workspace we just deleted; the
     // "Copy path" affordance now points at nothing.
@@ -2757,9 +2834,8 @@ $("delete-workspace").addEventListener("click", async () => {
   }
 });
 
-$("restart-flow").addEventListener("click", () => {
-  cleanupListeners();
-  invalidateSweepReview();
+function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } = {}) {
+  invalidateScanAuthority();
   if (state.retainedAddressSearchId || state.matchedRecovery) {
     const searchId = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
     state.retainedAddressSearchId = null;
@@ -2769,12 +2845,13 @@ $("restart-flow").addEventListener("click", () => {
   furthestStep = 0;
   Object.assign(state, {
     scanHandle: null,
+    completedScanHandle: null,
     lastProgress: null,
     sweepReview: null,
     proposalPending: false,
-    destination: null,
-    memo: null,
-    maxFeeZec: null,
+    destination: destination || null,
+    memo: memo || null,
+    maxFeeZec: maxFeeZec || null,
     scanConfig: null,
     savedReportPath: null,
     matchedRecovery: null,
@@ -2795,9 +2872,9 @@ $("restart-flow").addEventListener("click", () => {
   seedNextBtn.disabled = true;
   setStatus("seed-status", "", "");
   setStatus("config-status", "", "");
-  $("destination-input").value = "";
-  $("max-fee-zec").value = "";
-  $("sweep-memo").value = "";
+  $("destination-input").value = destination;
+  $("max-fee-zec").value = maxFeeZec;
+  $("sweep-memo").value = memo;
   $("transparent-index-start").value = "0";
   $("transparent-index-count").value = "1000";
   $("transparent-include-change").checked = false;
@@ -2817,6 +2894,19 @@ $("restart-flow").addEventListener("click", () => {
   });
   setStatus("donate-amount-preview", "", "");
   $("start-scan").disabled = false;
+  $("irreversible-check").checked = false;
+  $("irreversible-check").disabled = true;
+  $("execute-sweep").disabled = true;
+  $("sweep-rows").innerHTML = "";
+  $("sweep-summary").textContent = "";
+  $("complete-txids").innerHTML = "";
+  $("complete-summary").textContent = "";
+  $("complete-skipped").textContent = "";
+  $("complete-donation").textContent = "";
+  $("complete-report").textContent = "";
+  $("complete-report").style.display = "none";
+  $("save-report").dataset.report = "";
+  setStatus("save-report-status", "", "");
 
   // Reset scan screen to blank state so stale results aren't visible if the
   // user navigates forward via the sidebar before starting a new scan.
@@ -2835,6 +2925,10 @@ $("restart-flow").addEventListener("click", () => {
   $("back-to-config").style.display = "none";
   $("cancel-scan").style.display = "";
 
+}
+
+$("restart-flow").addEventListener("click", () => {
+  resetRecoveryFlowState();
   goTo("welcome");
 });
 
@@ -3144,6 +3238,9 @@ function openResumeModal(row) {
   $("resume-seed-visibility").checked = false;
   $("resume-label-input").value = "";
   $("resume-bip39-passphrase").value = "";
+  $("resume-destination-input").value = "";
+  $("resume-memo-input").value = "";
+  $("resume-max-fee-zec").value = "";
   $("resume-bip39-passphrase-field").hidden = !row.match_coordinates;
   setStatus("resume-modal-status", "", "");
   $("resume-modal").hidden = false;
@@ -3155,6 +3252,9 @@ function closeResumeModal() {
   $("resume-modal").hidden = true;
   $("resume-seed-input").value = "";
   $("resume-bip39-passphrase").value = "";
+  $("resume-destination-input").value = "";
+  $("resume-memo-input").value = "";
+  $("resume-max-fee-zec").value = "";
 }
 
 function passphraseForResumedSession(row, value) {
@@ -3170,10 +3270,35 @@ $("resume-seed-clear-clipboard").addEventListener("click", () =>
 );
 
 $("resume-confirm").addEventListener("click", async () => {
+  if (state.sweepExecutionPending) {
+    setStatus("resume-modal-status", "Wait for the current sweep to finish before resuming a scan.", "error");
+    return;
+  }
   if (!pendingResumeRow) return;
   const seed = $("resume-seed-input").value.trim().toLowerCase();
   if (!seed) {
     setStatus("resume-modal-status", "Enter the seed phrase to continue.", "error");
+    return;
+  }
+  const destination = $("resume-destination-input").value.trim();
+  const memo = $("resume-memo-input").value.trim();
+  const maxFeeZec = $("resume-max-fee-zec").value.trim();
+  if (!destination) {
+    setStatus("resume-modal-status", "Enter a destination Unified Address.", "error");
+    return;
+  }
+  if (!/^\d+(?:\.\d{1,8})?$/.test(maxFeeZec) || Number(maxFeeZec) <= 0 || !Number.isFinite(Number(maxFeeZec))) {
+    setStatus("resume-modal-status", "Enter a positive maximum fee in ZEC with at most 8 decimal places.", "error");
+    return;
+  }
+  try {
+    const info = await invoke("validate_address", { address: destination, network: pendingResumeRow.network });
+    if (!info.destination_ok) {
+      setStatus("resume-modal-status", "Destination must have an Orchard or Sapling receiver.", "error");
+      return;
+    }
+  } catch (err) {
+    setStatus("resume-modal-status", `Could not validate destination: ${err}`, "error");
     return;
   }
   const labelOverride = $("resume-label-input").value.trim();
@@ -3181,16 +3306,12 @@ $("resume-confirm").addEventListener("click", async () => {
     pendingResumeRow,
     $("resume-bip39-passphrase").value,
   );
-  const lightwalletdUrl =
-    $("lightwalletd-url").value.trim() ||
-    (pendingResumeRow.network === "testnet"
-      ? SERVER_PRESETS.testnet
-      : SERVER_PRESETS.mainnet);
+  const lightwalletdUrl = SERVER_PRESETS[pendingResumeRow.network] ?? SERVER_PRESETS.mainnet;
 
   $("resume-confirm").disabled = true;
   setStatus("resume-modal-status", "Verifying seed and resuming…", "");
   try {
-    const handle = await invoke("resume_session", {
+    const resumed = await invoke("resume_session", {
       input: {
         workspace_path: pendingResumeRow.workspace_path,
         seed,
@@ -3199,12 +3320,21 @@ $("resume-confirm").addEventListener("click", async () => {
         label: labelOverride || null,
       },
     });
-    state.scanHandle = handle;
+    resetRecoveryFlowState({ destination, memo, maxFeeZec });
+    state.scanConfig = {
+      network: resumed.network,
+      data_dir: resumed.data_dir,
+      lightwalletd_url: resumed.lightwalletd_url,
+    };
+    $("network-select").value = resumed.network;
+    $("data-dir").value = resumed.data_dir;
+    $("lightwalletd-url").value = resumed.lightwalletd_url;
+    state.scanHandle = resumed.handle;
     closeResumeModal();
     // Skip the seed/config screens — they don't apply to a resumed scan.
     furthestStep = steps.indexOf("scan");
     goTo("scan");
-    await startProgressListeners();
+    await startProgressListeners(resumed.handle);
   } catch (err) {
     setStatus("resume-modal-status", `✗ ${err}`, "error");
   } finally {

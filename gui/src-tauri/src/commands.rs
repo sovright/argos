@@ -755,6 +755,12 @@ pub async fn start_scan(
     Ok(handle)
 }
 
+#[derive(Clone, Serialize)]
+struct ScanDiscoveryEvent {
+    handle: ScanHandle,
+    discovery: argos_core::ScanDiscovery,
+}
+
 /// Forward `scan-progress` / `scan-discovery` / `scan-complete` events to
 /// the frontend while a scan is running. Identical for fresh scans and
 /// resumed scans, so it's factored out.
@@ -772,7 +778,13 @@ fn spawn_scan_progress_pump(app: AppHandle, service: RecoveryService, handle: Sc
             }
             if progress.discoveries.len() > emitted_discoveries {
                 for discovery in &progress.discoveries[emitted_discoveries..] {
-                    let _ = app.emit("scan-discovery", discovery);
+                    let _ = app.emit(
+                        "scan-discovery",
+                        ScanDiscoveryEvent {
+                            handle: handle.clone(),
+                            discovery: discovery.clone(),
+                        },
+                    );
                 }
                 emitted_discoveries = progress.discoveries.len();
             }
@@ -1944,6 +1956,14 @@ pub struct ResumeSessionInput {
     pub label: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct ResumeSessionResult {
+    pub handle: ScanHandle,
+    pub network: ZeckNetwork,
+    pub data_dir: String,
+    pub lightwalletd_url: String,
+}
+
 /// Resume an incomplete scan: verify the seed matches the workspace, then
 /// hand off to the existing scan entry point with parameters reconstructed
 /// from the workspace path. The data dir for `ScanConfig` is inferred from
@@ -1955,7 +1975,7 @@ pub async fn resume_session(
     app: AppHandle,
     state: State<'_, AppState>,
     input: ResumeSessionInput,
-) -> Result<ScanHandle, String> {
+) -> Result<ResumeSessionResult, String> {
     ensure_tos_accepted(&app)?;
     let workspace_path = PathBuf::from(input.workspace_path.trim());
     if workspace_path.as_os_str().is_empty() {
@@ -1976,8 +1996,8 @@ pub async fn resume_session(
         birthday: keying.birthday,
         num_accounts: keying.num_accounts,
         gap_limit: keying.gap_limit,
-        lightwalletd_url: input.lightwalletd_url,
-        data_dir,
+        lightwalletd_url: input.lightwalletd_url.clone(),
+        data_dir: data_dir.clone(),
         network: keying.network,
         label,
         transparent_scan: keying.transparent_scan,
@@ -2016,7 +2036,12 @@ pub async fn resume_session(
     .map_err(|err| err.to_string())?;
 
     spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
-    Ok(handle)
+    Ok(ResumeSessionResult {
+        handle,
+        network: keying.network,
+        data_dir: data_dir.to_string_lossy().into_owned(),
+        lightwalletd_url: input.lightwalletd_url,
+    })
 }
 
 /// Strip the four keying segments (`<network>/<fp>/birthday-N/<scope>`)
@@ -2161,6 +2186,26 @@ mod tests {
         seeded.mnemonic = Some(secrecy::SecretString::new("abandon".to_owned()));
         refuse_unreachable_sweep_destination(&seeded, ORCHARD_ONLY_UA, ZeckNetwork::Mainnet)
             .expect("seeded wallets sweep through the HD path");
+    }
+
+    #[test]
+    fn scan_discovery_event_serializes_its_handle() {
+        let event = super::ScanDiscoveryEvent {
+            handle: argos_core::ScanHandle {
+                id: "scan-a".into(),
+            },
+            discovery: argos_core::ScanDiscovery {
+                account_index: 3,
+                pool: argos_core::DiscoveryPool::Orchard,
+                zatoshis: 42,
+                at_block_height: 123,
+                address: "u-test".into(),
+            },
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["handle"]["id"], "scan-a");
+        assert_eq!(value["discovery"]["zatoshis"], 42);
+        assert_eq!(value["discovery"]["account_index"], 3);
     }
 
     #[test]

@@ -20,6 +20,7 @@ function harness(
 ) {
   const elements = new Map();
   const calls = [];
+  const completed = [];
   const chips = ["10", "99", "custom"].map((pct) => element({ pct }));
   function element(dataset = {}) {
     const listeners = new Map();
@@ -67,11 +68,12 @@ function harness(
     },
     setStatus: (id, message) => { $(id).textContent = message; },
     goTo: () => {},
-    renderCompleteScreen: () => {},
+    renderCompleteScreen: (...args) => completed.push(args),
+    cleanupListeners: () => {}, eta: { reset() {} },
   });
   vm.runInContext(source.slice(start, end), context);
   return {
-    $, state, chips, calls,
+    $, state, chips, calls, completed, context,
     refresh: () => vm.runInContext("refreshSweepProposal()", context),
     fire: (id, type) => $(id).fire(type),
     executeArgs: () => calls.filter((call) => call.command === "execute_sweep").map((call) => call.args),
@@ -208,4 +210,230 @@ test("donation edits cannot enable another sweep during execution", async () => 
   assert.equal(h.state.sweepReview, null);
   await h.refresh();
   assert.equal(h.state.sweepReview.proposal_id, "proposal-next");
+});
+
+test("source edit during execution clears authority but retains the old broadcast receipt", async () => {
+  const inFlight = deferred();
+  const h = harness(async () => review("proposal-old"), () => inFlight.promise);
+  await accepted(h);
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  const first = h.fire("execute-sweep", "click");
+  h.$("network-select").fire("input");
+  assert.equal(h.state.scanHandle, null);
+  assert.equal(h.state.lastProgress, null);
+  assert.equal(h.$("review-sweep").disabled, true);
+  inFlight.resolve({ transactions: [{ txid: "old-tx", status: "pending" }],
+    skipped_accounts: [], total_donation_zatoshis: 0 });
+  await first;
+  assert.equal(h.completed.length, 1);
+  assert.equal(h.completed[0][0][0].txid, "old-tx");
+  assert.equal(h.completed[0].at(-1).handle.id, "scan-current");
+  assert.equal(h.state.scanHandle, null);
+  assert.equal(h.$("execute-sweep").disabled, true);
+});
+
+function flowHarness() {
+  const elements = new Map();
+  const events = new Map();
+  const calls = [];
+  const chips = ["10", "99"].map((pct) => ({
+    dataset: { pct }, setAttribute(name, value) { this[name] = value; },
+  }));
+  function element() {
+    const handlers = new Map();
+    return {
+      value: "", checked: false, disabled: false, hidden: false, innerHTML: "old",
+      textContent: "old", style: {}, classList: { add() {}, remove() {}, toggle() {} },
+      children: [], dataset: {},
+      addEventListener(type, handler) {
+        if (!handlers.has(type)) handlers.set(type, []);
+        handlers.get(type).push(handler);
+      },
+      fire(type) {
+        const results = (handlers.get(type) || []).map((handler) => handler({ target: this }));
+        return results.at(-1);
+      },
+      appendChild(child) { this.children.push(child); },
+      setAttribute() {}, focus() {},
+    };
+  }
+  const $ = (id) => {
+    if (!elements.has(id)) elements.set(id, element());
+    return elements.get(id);
+  };
+  const state = {
+    scanHandle: { id: "scan-old" }, lastProgress: { phase: "complete" },
+    sweepReview: review("old"), proposalGeneration: 4, proposalPending: false,
+    sweepExecutionPending: false, destination: "zs-old", memo: "old memo",
+    maxFeeZec: "0.5", donationEnabled: true,
+    scanConfig: { network: "mainnet", data_dir: "/old", lightwalletd_url: "old" },
+    savedReportPath: "/old/report", retainedAddressSearchId: null, matchedRecovery: null,
+  };
+  $("destination-input").value = "zs-old";
+  $("sweep-memo").value = "old memo";
+  $("max-fee-zec").value = "0.5";
+  $("donate-enabled").checked = false;
+  $("donate-rate").value = "99";
+  $("donate-email").value = "old@example.test";
+  $("scan-rows").innerHTML = "old rows";
+  $("scan-discoveries").innerHTML = "old discovery";
+  $("scan-totals").textContent = "old balance";
+  $("sweep-rows").innerHTML = "old proposal";
+  $("irreversible-check").checked = true;
+  $("execute-sweep").disabled = false;
+  $("review-sweep").disabled = false;
+  const context = vm.createContext({
+    state, $, window: {}, seedInput: element(), seedVisibility: element(), seedNextBtn: element(),
+    steps: ["welcome", "seed", "config", "scan"], furthestStep: 3,
+    SERVER_PRESETS: { mainnet: "main.example", testnet: "test.example" },
+    eta: { reset() {} }, fmt: String,
+    document: {
+      createElement: () => element(),
+      querySelectorAll: () => chips,
+      dispatchEvent() {},
+    },
+    CustomEvent: class { constructor(name, opts) { this.type = name; this.detail = opts?.detail; } },
+    invoke: async (command, args) => {
+      calls.push({ command, args });
+      if (command === "validate_address") return { destination_ok: true };
+      if (command === "resume_session") return {
+        handle: { id: "scan-new" }, network: "testnet", data_dir: "/resumed",
+        lightwalletd_url: "resumed.example",
+      };
+      throw new Error(`unexpected ${command}`);
+    },
+    listen: async (name, callback) => { events.set(name, callback); return () => events.delete(name); },
+    setStatus: (id, message) => { $(id).textContent = message; },
+    cleanupListeners() {}, invalidateSweepReview() {
+      state.proposalGeneration++;
+      state.sweepReview = null;
+      $("irreversible-check").checked = false;
+      $("irreversible-check").disabled = true;
+      $("execute-sweep").disabled = true;
+    },
+    forgetWalletCaveats() {},
+    updateTransparentScanSummary() {}, clearMatchedRecoveryUi() {},
+    goTo() {}, updateScanUI(progress) { state.lastProgress = progress; },
+    notifyScanComplete() {},
+  });
+  context.walletOpenGeneration = 0;
+  context.sproutPreviewWallet = { path: "/old/wallet.dat" };
+  context.walletFile = { path: "/old/wallet.dat" };
+  const forgetStart = source.indexOf("function forgetLoadedWalletFile(");
+  const forgetEnd = source.indexOf("function renderSproutUncoveredBanners(", forgetStart);
+  vm.runInContext(source.slice(forgetStart, forgetEnd), context);
+  return { $, state, context, events, calls, chips };
+}
+
+function loadFlow(h, start, end) {
+  const from = source.indexOf(start);
+  const to = source.indexOf(end, from);
+  assert.ok(from >= 0 && to > from, `missing production flow ${start}`);
+  vm.runInContext(source.slice(from, to), h.context);
+}
+
+test("scan discovery from another handle is ignored", async () => {
+  const h = flowHarness();
+  loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
+  await vm.runInContext('startProgressListeners({ id: "scan-old" })', h.context);
+  const staleListener = h.events.get("scan-discovery");
+  h.state.scanHandle = { id: "scan-new" };
+  await vm.runInContext('startProgressListeners({ id: "scan-new" })', h.context);
+  const old = { handle: { id: "scan-old" }, discovery: {
+    account_index: 1, pool: "orchard", zatoshis: 5, at_block_height: 10,
+  } };
+  h.events.get("scan-discovery")({ payload: old });
+  assert.equal(h.$("scan-discoveries").children.length, 0);
+  staleListener({ payload: { ...old, handle: { id: "scan-new" } } });
+  assert.equal(h.$("scan-discoveries").children.length, 0);
+  h.events.get("scan-discovery")({ payload: { ...old, handle: { id: "scan-new" } } });
+  assert.equal(h.$("scan-discoveries").children.length, 1);
+  assert.match(h.$("scan-discoveries").children[0].textContent, /account 1/);
+  h.events.get("scan-progress")({ payload: { handle: { id: "scan-old" }, phase: "complete" } });
+  assert.equal(h.state.lastProgress.phase, "complete");
+});
+
+test("source setting edits invalidate completed scan authority", () => {
+  for (const id of [
+    "seed-input", "wallet-path", "sapling-scan-keys", "network-select",
+    "birthday-height", "accounts-range", "gap-limit", "transparent-index-start",
+    "lightwalletd-url", "data-dir", "sprout-scan-peers",
+  ]) {
+    const h = flowHarness();
+    loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+    h.$(id).fire("input");
+    assert.equal(h.state.scanHandle, null, `${id} retained the scan handle`);
+    assert.equal(h.state.lastProgress, null, `${id} retained progress`);
+    assert.equal(h.state.sweepReview, null, `${id} retained sweep review`);
+    assert.equal(h.$("review-sweep").disabled, true, `${id} left review available`);
+    assert.equal(h.$("scan-rows").innerHTML, "");
+    assert.equal(h.$("scan-discoveries").innerHTML, "");
+    assert.doesNotMatch(h.$("scan-totals").textContent, /old balance/);
+  }
+});
+
+test("editing wallet path drops the prior loaded wallet", () => {
+  const h = flowHarness();
+  h.$("wallet-path").value = "/new/wallet.dat";
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  h.$("wallet-path").fire("input");
+  assert.equal(h.context.walletFile, null);
+  assert.equal(h.$("wallet-path").value, "/new/wallet.dat");
+});
+
+test("destination edit preserves completed scan authority", async () => {
+  const h = harness();
+  await accepted(h);
+  h.$("destination-input").value = "zs-new";
+  h.fire("destination-input", "input");
+  assert.equal(h.state.scanHandle.id, "scan-current");
+  assert.equal(h.state.lastProgress.phase, "complete");
+  assert.equal(h.state.sweepReview, null);
+});
+
+test("resume initializes every reviewed field", async () => {
+  const h = flowHarness();
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
+  loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
+  vm.runInContext("let pendingResumeRow = null;", h.context);
+  loadFlow(h, "function openResumeModal(", "// ─── Init");
+  vm.runInContext('openResumeModal({ workspace_path: "/resumed/ws", network: "testnet", match_coordinates: null })', h.context);
+  h.$("resume-seed-input").value = "seed words";
+  h.$("resume-destination-input").value = "zs-new";
+  h.$("resume-memo-input").value = "new memo";
+  h.$("resume-max-fee-zec").value = "0.02";
+  await h.$("resume-confirm").fire("click");
+  assert.equal(h.calls.filter((call) => call.command === "resume_session").length, 1);
+  assert.equal(h.state.scanHandle.id, "scan-new");
+  assert.equal(h.state.scanConfig.network, "testnet");
+  assert.equal(h.state.scanConfig.data_dir, "/resumed");
+  assert.equal(h.state.scanConfig.lightwalletd_url, "resumed.example");
+  assert.equal(h.state.destination, "zs-new");
+  assert.equal(h.state.memo, "new memo");
+  assert.equal(h.state.maxFeeZec, "0.02");
+  assert.equal(h.$("destination-input").value, "zs-new");
+  assert.equal(h.$("sweep-memo").value, "new memo");
+  assert.equal(h.$("max-fee-zec").value, "0.02");
+  assert.equal(h.$("donate-enabled").checked, true);
+  assert.equal(h.$("donate-rate").value, "10");
+  assert.equal(h.$("donate-email").value, "");
+  assert.equal(h.context.walletFile, null);
+  assert.equal(h.state.sweepReview, null);
+  assert.equal(h.state.lastProgress, null);
+  assert.equal(h.$("scan-rows").innerHTML, "");
+  assert.equal(h.$("scan-discoveries").innerHTML, "");
+  assert.equal(h.$("review-sweep").disabled, true);
+});
+
+test("start over still drops the loaded wallet", () => {
+  const h = flowHarness();
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, "function resetRecoveryFlowState(", "// ─── Donate");
+  h.$("restart-flow").fire("click");
+  assert.equal(h.context.walletFile, null);
+  assert.equal(h.$("wallet-path").value, "");
+  assert.equal(h.state.scanHandle, null);
+  assert.equal(h.$("donate-rate").value, "10");
+  assert.equal(h.$("scan-rows").innerHTML, "");
 });
