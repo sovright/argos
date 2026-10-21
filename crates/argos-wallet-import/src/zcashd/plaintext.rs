@@ -5,7 +5,10 @@ use secrecy::Secret;
 use crate::{
     error::ImportDiagnostic,
     identity,
-    keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
+    keys::{
+        merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
+        SaplingKey, SproutKey, TransparentKey,
+    },
     zcashd::records::{compact_size, parse_record_key},
 };
 
@@ -25,7 +28,6 @@ const IGNORED: &[&str] = &[
     "minversion",
     "mnemonichdchain",
     "name",
-    "networkinfo",
     "orchard_note_commitment_tree",
     "orderposnext",
     "pool",
@@ -48,6 +50,28 @@ fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
     let (len, consumed) = compact_size(value)?;
     let end = consumed.checked_add(usize::try_from(len).ok()?)?;
     value.get(consumed..end)
+}
+
+fn networkinfo(value: &[u8]) -> Option<EmbeddedNetwork> {
+    let (package_len, package_prefix) = compact_size(value)?;
+    let package_end = package_prefix.checked_add(usize::try_from(package_len).ok()?)?;
+    let package = std::str::from_utf8(value.get(package_prefix..package_end)?).ok()?;
+    if package.is_empty() {
+        return None;
+    }
+    let rest = value.get(package_end..)?;
+    let (network_len, network_prefix) = compact_size(rest)?;
+    let network_end = network_prefix.checked_add(usize::try_from(network_len).ok()?)?;
+    if network_end != rest.len() {
+        return None;
+    }
+    let name = std::str::from_utf8(rest.get(network_prefix..network_end)?).ok()?;
+    match name {
+        "main" | "mainnet" => Some(EmbeddedNetwork::Mainnet),
+        "test" | "testnet" => Some(EmbeddedNetwork::Testnet),
+        "regtest" => Some(EmbeddedNetwork::Regtest),
+        _ => None,
+    }
 }
 
 /// Validate that a `key` record's DER blob has the exact header zcashd's
@@ -95,6 +119,10 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
         };
 
         match rec.record_type.as_str() {
+            "networkinfo" => match networkinfo(value) {
+                Some(network) => merge_embedded_network(out, network),
+                None => unrecognized_network(out, "zcashd", "invalid networkinfo value"),
+            },
             "zkey" => {
                 let addr: Option<[u8; 64]> = rec.rest.get(..64).and_then(|s| s.try_into().ok());
                 // Verified against the golden fixtures: the value is the bare
@@ -226,6 +254,60 @@ mod tests {
         k.extend_from_slice(kind.as_bytes());
         k.extend_from_slice(key_rest);
         (k, value.to_vec())
+    }
+
+    fn network_value(package: &str, network: &str) -> Vec<u8> {
+        let mut value = vec![package.len() as u8];
+        value.extend_from_slice(package.as_bytes());
+        value.push(network.len() as u8);
+        value.extend_from_slice(network.as_bytes());
+        value
+    }
+
+    #[test]
+    fn networkinfo_recognizes_exact_network_aliases() {
+        for (name, expected) in [
+            ("main", crate::keys::EmbeddedNetwork::Mainnet),
+            ("mainnet", crate::keys::EmbeddedNetwork::Mainnet),
+            ("test", crate::keys::EmbeddedNetwork::Testnet),
+            ("testnet", crate::keys::EmbeddedNetwork::Testnet),
+            ("regtest", crate::keys::EmbeddedNetwork::Regtest),
+        ] {
+            let mut out = ImportedKeys::default();
+            collect_plaintext(
+                &[record("networkinfo", &[], &network_value("zcashd", name))],
+                &mut out,
+            );
+            assert_eq!(out.embedded_network, Some(expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn networkinfo_malformed_and_conflicting_records_never_claim_a_match() {
+        for bad in [vec![3, b'a'], network_value("zcashd", "mainish")] {
+            let mut out = ImportedKeys::default();
+            collect_plaintext(&[record("networkinfo", &[], &bad)], &mut out);
+            assert_eq!(out.embedded_network, None);
+            assert!(out
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ImportDiagnostic::UnrecognizedNetworkMetadata { .. })));
+        }
+        let main = record("networkinfo", &[], &network_value("zcashd", "main"));
+        let test = record("networkinfo", &[], &network_value("zcashd", "test"));
+        let mut matching = ImportedKeys::default();
+        collect_plaintext(&[main.clone(), main.clone()], &mut matching);
+        assert_eq!(
+            matching.embedded_network,
+            Some(crate::keys::EmbeddedNetwork::Mainnet)
+        );
+        let mut conflict = ImportedKeys::default();
+        collect_plaintext(&[main, test], &mut conflict);
+        assert_eq!(conflict.embedded_network, None);
+        assert!(conflict
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, ImportDiagnostic::ConflictingNetworkMetadata { .. })));
     }
 
     fn genuine_sprout_pair() -> ([u8; 64], [u8; 32]) {

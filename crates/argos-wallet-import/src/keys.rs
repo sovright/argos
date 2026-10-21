@@ -35,6 +35,40 @@ impl std::fmt::Display for EmbeddedNetwork {
     }
 }
 
+pub(crate) fn merge_embedded_network(out: &mut ImportedKeys, network: EmbeddedNetwork) {
+    if out.diagnostics.iter().any(|d| {
+        matches!(
+            d,
+            ImportDiagnostic::ConflictingNetworkMetadata { .. }
+                | ImportDiagnostic::UnrecognizedNetworkMetadata { .. }
+        )
+    }) {
+        return;
+    }
+    match out.embedded_network {
+        Some(first) if first != network => {
+            out.embedded_network = None;
+            out.diagnostics
+                .push(ImportDiagnostic::ConflictingNetworkMetadata {
+                    first,
+                    second: network,
+                });
+        }
+        None => out.embedded_network = Some(network),
+        _ => {}
+    }
+}
+
+pub(crate) fn unrecognized_network(
+    out: &mut ImportedKeys,
+    format: &'static str,
+    reason: &'static str,
+) {
+    out.embedded_network = None;
+    out.diagnostics
+        .push(ImportDiagnostic::UnrecognizedNetworkMetadata { format, reason });
+}
+
 /// Deliberately no `#[derive(Debug, Clone)]` on any struct below that holds
 /// a `Secret`. A derived `Debug` on a key-bearing struct is a standing risk
 /// that a spending key ends up in a log line or a panic message, and this

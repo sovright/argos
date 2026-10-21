@@ -22,8 +22,8 @@
 //!   Vector<WalletTKey>  tkeys          (only when keys version > 20; older
 //!                                      versions use a flat secret-key +
 //!                                      address-string pair of vectors)
-//! ... blocks, transactions, chain name, options, birthday, tree state,
-//!     price info — ignored, this task only extracts key material.
+//! ... blocks and transactions — structurally skipped to reach the chain
+//!     name; later options, birthday, tree state, and price info are ignored.
 //! ```
 //!
 //! `Vector`, `Optional`, and `CompactSize` above match
@@ -70,12 +70,11 @@
 //! entries keep surfacing as diagnostics exactly as before, since the
 //! seed does not unlock them at this layer.
 //!
-//! **This is the least-validated code in the crate.** There is no real
-//! ZWL wallet fixture to test against (unlike the zcashd path, which has
-//! eight). The tests below are round-trips against hand-built byte
-//! streams that follow the confirmed reference layout — they prove the
-//! parser reads back what it was given, not that the layout matches every
-//! real-world ZWL wallet on disk.
+//! The network parser is checked against three deterministic, no-funds
+//! wallets written by the upstream ZWL writer, including one with nonempty
+//! transaction metadata. The older key/decryption tests below still use
+//! hand-built streams, so they do not establish compatibility with every
+//! historical wallet layout.
 
 use bip0039::{English, Mnemonic};
 use crypto_secretbox::{aead::Aead, KeyInit, Nonce as SecretboxNonce, XSalsa20Poly1305};
@@ -85,7 +84,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     error::{ImportDiagnostic, ImportError},
     identity,
-    keys::{ImportedKeys, Provenance, SaplingKey, TransparentKey},
+    keys::{
+        merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
+        SaplingKey, TransparentKey,
+    },
 };
 
 /// Highest `external_version` this parser understands, matching
@@ -377,7 +379,7 @@ fn read_zkey(cur: &mut Cursor) -> ZwlReadResult<ZKeyEntry> {
 }
 
 enum TKeyEntry {
-    Recovered(TransparentKey),
+    Recovered(TransparentKey, EmbeddedNetwork),
     Locked(Provenance),
     Mismatch,
 }
@@ -401,16 +403,19 @@ fn read_tkey(cur: &mut Cursor) -> ZwlReadResult<TKeyEntry> {
     };
 
     Ok(match key {
-        Some(secret)
-            if std::str::from_utf8(address)
-                .is_ok_and(|s| identity::transparent_matches_address(&secret, s).is_ok()) =>
+        Some(secret) => match std::str::from_utf8(address)
+            .ok()
+            .and_then(|s| identity::transparent_matches_address(&secret, s).ok())
         {
-            TKeyEntry::Recovered(TransparentKey {
-                secret: Secret::new(secret),
-                provenance,
-            })
-        }
-        Some(_) => TKeyEntry::Mismatch,
+            Some(network) => TKeyEntry::Recovered(
+                TransparentKey {
+                    secret: Secret::new(secret),
+                    provenance,
+                },
+                network,
+            ),
+            None => TKeyEntry::Mismatch,
+        },
         None => TKeyEntry::Locked(provenance),
     })
 }
@@ -500,9 +505,10 @@ fn read_key_vectors(
         for _ in 0..address_count {
             let address = cur.zwl_string()?;
             if let Some(secret) = pending.next() {
-                if std::str::from_utf8(address).is_ok_and(|s| {
-                    identity::transparent_matches_address(secret.expose_secret(), s).is_ok()
+                if let Some(network) = std::str::from_utf8(address).ok().and_then(|s| {
+                    identity::transparent_matches_address(secret.expose_secret(), s).ok()
                 }) {
+                    merge_embedded_network(out, network);
                     out.transparent.push(TransparentKey {
                         secret,
                         provenance: Provenance::HdDerived,
@@ -527,7 +533,10 @@ fn read_key_vectors(
         for _ in 0..tkey_count {
             let entry = read_tkey(cur)?;
             match entry {
-                TKeyEntry::Recovered(k) => out.transparent.push(k),
+                TKeyEntry::Recovered(k, network) => {
+                    merge_embedded_network(out, network);
+                    out.transparent.push(k);
+                }
                 TKeyEntry::Mismatch => {
                     out.diagnostics
                         .push(ImportDiagnostic::PublicIdentifierMismatch {
@@ -559,6 +568,218 @@ fn read_key_vectors(
 /// Individual locked `zkey`/`tkey` entries — a different, per-record
 /// ciphertext this module still does not decrypt — keep surfacing as
 /// diagnostics rather than being silently dropped.
+fn skip_compact_block(cur: &mut Cursor) -> ZwlReadResult<()> {
+    cur.skip(4 + 32, "blocks")?; // height and hash
+                                 // Legacy Sapling CommitmentTree: optional left/right nodes, then
+                                 // CompactSize-prefixed optional parent nodes (all nodes are 32 bytes).
+    for _ in 0..2 {
+        cur.optional("blocks", |cur| cur.skip(32, "blocks"))?;
+    }
+    let parents = cur.compact_size("blocks")?;
+    if parents > 32 {
+        return Err(cur.error("blocks", "wallet structure could not be read"));
+    }
+    for _ in 0..parents {
+        cur.optional("blocks", |cur| cur.skip(32, "blocks"))?;
+    }
+    let version = cur.u64_le("blocks")?;
+    if version > 20 {
+        return Err(cur.error("blocks", "wallet structure could not be read"));
+    }
+    if version > 11 {
+        let len = cur.compact_size("blocks")?;
+        let len =
+            usize::try_from(len).map_err(|_| cur.error("blocks", "value length limit exceeded"))?;
+        cur.skip(len, "blocks")?;
+    }
+    Ok(())
+}
+
+fn skip_vector(
+    cur: &mut Cursor,
+    field: &'static str,
+    mut item: impl FnMut(&mut Cursor) -> ZwlReadResult<()>,
+) -> ZwlReadResult<()> {
+    let count = cur.compact_size(field)?;
+    // Every supported item consumes at least one byte. This also prevents
+    // attacker-sized loop counts on a short damaged file.
+    if count > cur.bytes.len().saturating_sub(cur.pos) as u64 {
+        return Err(cur.error(field, "value length limit exceeded"));
+    }
+    for _ in 0..count {
+        item(cur)?;
+    }
+    Ok(())
+}
+
+fn skip_bytes_vector(cur: &mut Cursor, field: &'static str) -> ZwlReadResult<()> {
+    let len = cur.compact_size(field)?;
+    let len = usize::try_from(len).map_err(|_| cur.error(field, "value length limit exceeded"))?;
+    cur.skip(len, field)
+}
+
+fn skip_tree(cur: &mut Cursor, field: &'static str) -> ZwlReadResult<()> {
+    for _ in 0..2 {
+        cur.optional(field, |cur| cur.skip(32, field))?;
+    }
+    skip_vector(cur, field, |cur| {
+        cur.optional(field, |cur| cur.skip(32, field))?;
+        Ok(())
+    })
+}
+
+fn skip_sapling_witness(cur: &mut Cursor) -> ZwlReadResult<()> {
+    skip_tree(cur, "txns")?;
+    skip_vector(cur, "txns", |cur| cur.skip(32, "txns"))?;
+    cur.optional("txns", |cur| skip_tree(cur, "txns"))?;
+    Ok(())
+}
+
+fn skip_sapling_note(cur: &mut Cursor) -> ZwlReadResult<()> {
+    let version = cur.u64_le("txns")?;
+    if version > 20 {
+        return Err(cur.error("txns", "wallet structure could not be read"));
+    }
+    if version <= 5 {
+        cur.skip(8, "txns")?;
+    }
+    cur.skip(EXTFVK_LEN + 11 + 8, "txns")?;
+    cur.skip(if version <= 3 { 32 } else { 33 }, "txns")?;
+    skip_vector(cur, "txns", skip_sapling_witness)?;
+    if version >= 20 {
+        cur.skip(8, "txns")?;
+    }
+    cur.skip(32, "txns")?;
+    if version <= 5 {
+        cur.optional("txns", |cur| cur.skip(32, "txns"))?;
+        if version >= 2 {
+            cur.optional("txns", |cur| cur.skip(4, "txns"))?;
+        }
+    } else {
+        cur.optional("txns", |cur| cur.skip(36, "txns"))?;
+    }
+    if version > 4 {
+        cur.optional("txns", |cur| cur.skip(36, "txns"))?;
+    }
+    cur.optional("txns", |cur| cur.skip(512, "txns"))?;
+    cur.skip(1, "txns")?;
+    if version > 2 {
+        cur.skip(1, "txns")?;
+    }
+    Ok(())
+}
+
+fn skip_utxo(cur: &mut Cursor) -> ZwlReadResult<()> {
+    let version = cur.u64_le("txns")?;
+    if version > 3 {
+        return Err(cur.error("txns", "wallet structure could not be read"));
+    }
+    let address_len = cur.u32_le("txns")? as usize;
+    cur.skip(address_len, "txns")?;
+    cur.skip(32 + 8 + 8 + 4, "txns")?;
+    skip_bytes_vector(cur, "txns")?;
+    cur.optional("txns", |cur| cur.skip(32, "txns"))?;
+    if version > 1 {
+        cur.optional("txns", |cur| cur.skip(4, "txns"))?;
+    }
+    if version > 2 {
+        cur.optional("txns", |cur| cur.skip(36, "txns"))?;
+    }
+    Ok(())
+}
+
+fn skip_orchard_note(cur: &mut Cursor) -> ZwlReadResult<()> {
+    let version = cur.u64_le("txns")?;
+    if version > 22 {
+        return Err(cur.error("txns", "wallet structure could not be read"));
+    }
+    cur.skip(ORCHARD_FVK_LEN + 43 + 8 + 32 + 32, "txns")?;
+    cur.optional("txns", |cur| cur.skip(8, "txns"))?;
+    for _ in 0..2 {
+        cur.optional("txns", |cur| cur.skip(36, "txns"))?;
+    }
+    cur.optional("txns", |cur| cur.skip(512, "txns"))?;
+    cur.skip(2, "txns")?;
+    Ok(())
+}
+
+fn skip_wallet_tx(cur: &mut Cursor) -> ZwlReadResult<()> {
+    let version = cur.u64_le("txns")?;
+    if version > 23 {
+        return Err(cur.error("txns", "wallet structure could not be read"));
+    }
+    cur.skip(4, "txns")?; // block height
+    if version > 20 {
+        cur.skip(1, "txns")?;
+    }
+    if version >= 4 {
+        cur.skip(8, "txns")?;
+    }
+    cur.skip(32, "txns")?; // txid
+    skip_vector(cur, "txns", skip_sapling_note)?;
+    skip_vector(cur, "txns", skip_utxo)?;
+    if version > 22 {
+        cur.skip(8, "txns")?;
+    }
+    cur.skip(8 + 8, "txns")?;
+    skip_vector(cur, "txns", |cur| {
+        let len = cur.u64_le("txns")?;
+        let len =
+            usize::try_from(len).map_err(|_| cur.error("txns", "value length limit exceeded"))?;
+        cur.skip(len, "txns")?;
+        cur.skip(8 + 512, "txns")
+    })?;
+    cur.skip(1, "txns")?;
+    if version > 4 {
+        cur.optional("txns", |cur| cur.skip(8, "txns"))?;
+    }
+    if version > 5 {
+        skip_vector(cur, "txns", |cur| cur.skip(32, "txns"))?;
+    }
+    if version > 21 {
+        skip_vector(cur, "txns", skip_orchard_note)?;
+        skip_vector(cur, "txns", |cur| cur.skip(32, "txns"))?;
+    }
+    Ok(())
+}
+
+fn read_chain_network(
+    cur: &mut Cursor,
+    external_version: u64,
+) -> ZwlReadResult<Option<EmbeddedNetwork>> {
+    // zewif-zwl's ZwlParser uses Keys::read and WalletTxns::read for
+    // external versions 15..=31; the older read_old layout is outside scope.
+    if !(15..=31).contains(&external_version) {
+        return Err(cur.error("txns", "wallet structure could not be read"));
+    }
+    skip_vector(cur, "blocks", skip_compact_block)?;
+    let txns_version = cur.u64_le("txns")?;
+    if txns_version > 21 {
+        return Err(cur.error("txns", "wallet structure could not be read"));
+    }
+    skip_vector(cur, "txns", |cur| {
+        cur.skip(32, "txns")?;
+        skip_wallet_tx(cur)
+    })?;
+    if txns_version <= 20 {
+        skip_vector(cur, "txns", |cur| {
+            cur.skip(32, "txns")?;
+            skip_wallet_tx(cur)
+        })?;
+    }
+    let len = cur.u64_le("chain_name")?;
+    let len =
+        usize::try_from(len).map_err(|_| cur.error("chain_name", "value length limit exceeded"))?;
+    let name = std::str::from_utf8(cur.take(len, "chain_name")?)
+        .map_err(|_| cur.error("chain_name", "wallet structure could not be read"))?;
+    Ok(match name {
+        "main" | "mainnet" => Some(EmbeddedNetwork::Mainnet),
+        "test" | "testnet" => Some(EmbeddedNetwork::Testnet),
+        "regtest" => Some(EmbeddedNetwork::Regtest),
+        _ => None,
+    })
+}
+
 pub fn import_zwl(
     bytes: &[u8],
     passphrase: Option<&SecretString>,
@@ -641,8 +862,19 @@ pub fn import_zwl(
         }
     }
 
-    if let Err(err) = read_key_vectors(&mut cur, header.keys_version, &mut out) {
-        out.diagnostics.push(damage(err));
+    match read_key_vectors(&mut cur, header.keys_version, &mut out) {
+        Err(err) => {
+            out.embedded_network = None;
+            out.diagnostics.push(damage(err));
+        }
+        Ok(()) => match read_chain_network(&mut cur, external_version) {
+            Ok(Some(network)) => merge_embedded_network(&mut out, network),
+            Ok(None) => unrecognized_network(&mut out, "ZecWallet Lite", "unknown chain name"),
+            Err(err) => {
+                out.embedded_network = None;
+                out.diagnostics.push(damage(err));
+            }
+        },
     }
 
     if out.mnemonic.is_none()
@@ -676,9 +908,60 @@ fn damage(err: ZwlReadError) -> ImportDiagnostic {
 mod tests {
     use super::*;
 
+    #[test]
+    fn network_from_upstream_writer_fixtures() {
+        for (bytes, expected) in [
+            (
+                include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat").as_slice(),
+                crate::keys::EmbeddedNetwork::Mainnet,
+            ),
+            (
+                include_bytes!("../tests/fixtures/zwl-testnet-empty.dat").as_slice(),
+                crate::keys::EmbeddedNetwork::Testnet,
+            ),
+        ] {
+            let imported = import_zwl(bytes, None).unwrap();
+            assert_eq!(imported.embedded_network, Some(expected));
+        }
+    }
+
+    #[test]
+    fn network_from_upstream_writer_nonempty_transaction_fixture() {
+        let bytes = include_bytes!("../tests/fixtures/zwl-testnet-txn.dat");
+        let imported = import_zwl(bytes, None).unwrap();
+        assert_eq!(
+            imported.embedded_network,
+            Some(crate::keys::EmbeddedNetwork::Testnet)
+        );
+    }
+
+    #[test]
+    fn unsupported_nested_transaction_version_leaves_network_unknown() {
+        let mut bytes = include_bytes!("../tests/fixtures/zwl-testnet-txn.dat").to_vec();
+        // In the writer fixture, the first WalletTx version begins at 232,
+        // after the keys, empty blocks, WalletTxns header, and txid.
+        bytes[232] = 24; // upstream WalletTx::serialized_version() is 23
+        let imported = import_zwl(&bytes, None).unwrap();
+        assert_eq!(imported.embedded_network, None);
+        assert_ne!(imported.coverage(), crate::keys::ImportCoverage::Complete);
+        assert!(imported
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, ImportDiagnostic::ContainerDamage { .. })));
+    }
+
     fn wallet(version: u64, body: &[u8]) -> Vec<u8> {
         let mut v = version.to_le_bytes().to_vec();
         v.extend_from_slice(body);
+        v
+    }
+
+    fn wallet_with_empty_history(version: u64, body: &[u8]) -> Vec<u8> {
+        let mut v = wallet(version, body);
+        v.push(0); // Vector<CompactBlockData>
+        v.extend_from_slice(&21u64.to_le_bytes()); // WalletTxns version
+        v.push(0); // no transactions
+        v.extend_from_slice(&zwl_string("main"));
         v
     }
 
@@ -1114,7 +1397,7 @@ mod tests {
         vectors.extend_from_slice(&tkey_hd(0xAB));
 
         let body = keys_body(21, false, &vectors);
-        let bytes = wallet(25, &body);
+        let bytes = wallet_with_empty_history(25, &body);
 
         let keys = import_zwl(&bytes, None).unwrap();
 
@@ -1223,7 +1506,7 @@ mod tests {
         vectors.extend_from_slice(&cs(0)); // tkeys
 
         let body = keys_body(21, false, &vectors);
-        let bytes = wallet(25, &body);
+        let bytes = wallet_with_empty_history(25, &body);
 
         let keys = import_zwl(&bytes, None).unwrap();
         assert!(keys.sapling.is_empty());
@@ -1257,7 +1540,7 @@ mod tests {
         let entropy = [0x7A; SEED_LEN];
         let (enc_seed, nonce) = encrypt_test_seed("whatever", &entropy, [0x24; NONCE_LEN]);
         let body = keys_body_with_seed(21, true, &enc_seed, &nonce, &vectors);
-        let bytes = wallet(25, &body);
+        let bytes = wallet_with_empty_history(25, &body);
 
         let pass = SecretString::new("whatever".to_owned());
         let keys = import_zwl(&bytes, Some(&pass)).unwrap();

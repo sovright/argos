@@ -12,6 +12,7 @@ pub mod key_source;
 pub mod lightwalletd;
 pub mod models;
 pub mod wallet_file;
+pub mod wallet_file_import;
 // Transfer-based funding for the regtest harness. Test-only: a released
 // binary must contain no code that spends from a hardcoded seed.
 #[cfg(feature = "argos-network")]
@@ -64,6 +65,7 @@ pub use donation::{
 };
 pub use error::{ZeckError, ZeckResult};
 pub use key_source::{ImportedKeySource, KeySource, KeySourceFingerprint, SeedKeySource};
+pub use wallet_file_import::import_wallet_file_for_network;
 
 /// Re-exported so front-ends can read a wallet file without taking a
 /// direct dependency on the parser crate.

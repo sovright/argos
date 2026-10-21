@@ -410,11 +410,11 @@ fn refuse_unconsumed_key_sources(cli: &Cli) -> Result<()> {
 /// land in shell history and in `ps` output for every user on the box
 /// (T-S6 in the threat model). We attempt an unencrypted read first so an
 /// unencrypted wallet is never asked for a passphrase it does not have.
-fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
+fn load_wallet_file(path: &Path, network: ZeckNetwork) -> Result<ImportedKeys> {
     let bytes = argos_core::wallet_file::read_wallet_file(path)
         .with_context(|| format!("failed to read wallet file {}", path.display()))?;
 
-    match argos_wallet_import::import_wallet_file(&bytes, None) {
+    match argos_core::import_wallet_file_for_network(&bytes, None, network) {
         Ok(mut keys) => {
             report_forged_sprout_keys(&mut keys);
             Ok(keys)
@@ -422,7 +422,9 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
         // The parser reports a locked wallet and a wrong passphrase with
         // the same variant. Here it can only mean "locked", because we
         // supplied no passphrase to be wrong.
-        Err(argos_wallet_import::ImportError::WrongPassphrase) => {
+        Err(argos_core::ZeckError::Import(ref message))
+            if message == &argos_wallet_import::ImportError::WrongPassphrase.to_string() =>
+        {
             eprintln!("This wallet is encrypted.");
             let passphrase = Password::new()
                 .with_prompt("Enter the wallet passphrase")
@@ -430,8 +432,9 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
                 .interact()
                 .context("failed to read wallet passphrase from terminal")?;
             let passphrase = SecretString::new(passphrase);
-            let mut keys = argos_wallet_import::import_wallet_file(&bytes, Some(&passphrase))
-                .with_context(|| format!("failed to import wallet file {}", path.display()))?;
+            let mut keys =
+                argos_core::import_wallet_file_for_network(&bytes, Some(&passphrase), network)
+                    .with_context(|| format!("failed to import wallet file {}", path.display()))?;
             report_forged_sprout_keys(&mut keys);
             Ok(keys)
         }
@@ -1585,7 +1588,7 @@ async fn main() -> Result<()> {
     {
         ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
         let wallet_keys = match &cli.wallet_file {
-            Some(path) => Some(load_wallet_file(path)?),
+            Some(path) => Some(load_wallet_file(path, network)?),
             None => None,
         };
         let keys = collect_sprout_scan_keys(
@@ -1616,7 +1619,7 @@ async fn main() -> Result<()> {
         Option<Arc<ImportedKeySource>>,
     ) = match (&cli.wallet_file, &cli.sapling_key_file) {
         (Some(path), key_file) => {
-            let mut keys = load_wallet_file(path)?;
+            let mut keys = load_wallet_file(path, network)?;
             if let Some(key_path) = key_file {
                 // Refuses before any scan work starts when the wallet has a
                 // mnemonic: that wallet takes the HD route, which cannot

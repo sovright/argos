@@ -20,9 +20,60 @@ use std::process::{Command, Stdio};
 const SPROUT_PLAINTEXT: &str = "sprout-plaintext.dat";
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let original = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../argos-wallet-import/tests/fixtures")
-        .join(name)
+        .join(name);
+    if name != SPROUT_PLAINTEXT {
+        return original;
+    }
+    // The source golden file was written on regtest. Operational imports
+    // now refuse that network in a production build, so use a disposable
+    // copy whose sole `networkinfo` value is mainnet for legacy CLI behavior
+    // tests. Keep the checked-in writer fixture byte-for-byte unchanged.
+    static MAINNET_COPY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    MAINNET_COPY
+        .get_or_init(|| {
+            let mut bytes = std::fs::read(&original).unwrap();
+            let matches: Vec<_> = bytes
+                .windows(7)
+                .enumerate()
+                .filter_map(|(offset, window)| (window == b"regtest").then_some(offset))
+                .collect();
+            assert_eq!(matches.len(), 1, "golden wallet network marker changed");
+            bytes[matches[0]..matches[0] + 7].copy_from_slice(b"mainnet");
+            let path = std::env::temp_dir().join(format!(
+                "argos-cli-mainnet-golden-{}.dat",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .clone()
+}
+
+#[test]
+fn wallet_network_mismatch_stops_before_lightwalletd() {
+    let path = fixture("zwl-testnet-empty.dat");
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().unwrap(),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("network-mismatch"),
+        "scan",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mainnet") && stderr.contains("testnet"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("127.0.0.1") && !stderr.contains("lightwalletd probe"),
+        "{stderr}"
+    );
 }
 
 /// Run `argos` with stdin closed.
