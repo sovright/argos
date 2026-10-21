@@ -55,7 +55,11 @@ pub mod transparent_recovery;
 pub mod workspace;
 
 pub use address::validate_destination_address;
-pub use birthday::{detect_birthday, estimate_birthday_from_date};
+pub use birthday::{
+    detect_birthday, detect_wallet_file_birthday, estimate_birthday_from_date,
+    height_at_or_before_time, sprout_skip_height, wallet_file_birthday_from_metadata,
+    WalletBirthdaySource, WalletFileBirthday,
+};
 pub use derivation::{derive_accounts, validate_mnemonic_words};
 pub use donation::{
     donation_for_send_amount, donation_memo_body, feature_enabled as donation_enabled,
