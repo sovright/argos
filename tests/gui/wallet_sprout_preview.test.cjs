@@ -172,7 +172,7 @@ test("changing wallet invalidates its Sprout proposal", async () => {
 });
 
 test("wallet source and endpoint edits revoke the reviewed proposal", async () => {
-  for (const id of ["wallet-passphrase", "network-select", "data-dir", "lightwalletd-url"]) {
+  for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url"]) {
     const h = harness();
     await h.open("/fixture/wallet.dat");
     h.$("sprout-sweep-confirm").checked = true;

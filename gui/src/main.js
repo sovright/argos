@@ -1308,14 +1308,24 @@ async function runSproutScan() {
     sproutScanHandle = handle;
     // A scan may finish before its listeners are installed. The snapshot
     // closes that race after both event subscriptions become active.
-    await sproutScanListenersReady;
+    const listenersReady = await sproutScanListenersReady;
     if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
-    const snapshot = await invoke("get_sprout_scan", { handle });
+    let snapshot = await invoke("get_sprout_scan", { handle });
     publishSproutScanSnapshot(snapshot, generation);
+    // If event registration failed, keep reading the retained backend state.
+    // The first snapshot alone can still be running for hours.
+    while (!listenersReady && snapshot.status === "running" &&
+           generation === sproutScanGeneration && handle === sproutScanHandle) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
+      snapshot = await invoke("get_sprout_scan", { handle });
+      publishSproutScanSnapshot(snapshot, generation);
+    }
   } catch (err) {
     if (generation !== sproutScanGeneration) return;
-    $("sprout-scan-bar").hidden = true;
-    // Interrupting is safe and expected: the scan checkpoints as it goes.
+    // A failed snapshot request leaves no reliable completion channel. Release
+    // local authority and let the user retry; the backend worker checkpoints.
+    invalidateSproutScanSource();
     setStatus("sprout-scan-status", `✗ ${err}`, "error");
   }
   if (generation === sproutScanGeneration && !sproutScanHandle) button.disabled = false;
@@ -1449,7 +1459,7 @@ for (const id of ["sprout-scan-keys", "sprout-scan-peers", "network-select",
   $(id)?.addEventListener("input", invalidateSproutScanSource);
   $(id)?.addEventListener("change", invalidateSproutScanSource);
 }
-for (const id of ["wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "server-preset"]) {
+for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "server-preset"]) {
   $(id)?.addEventListener("input", invalidateWalletSproutReview);
   $(id)?.addEventListener("change", invalidateWalletSproutReview);
 }
@@ -1480,8 +1490,9 @@ const sproutScanListenersReady = (async () => {
         publishSproutScanSnapshot(event.payload);
       }),
     ]);
+    return true;
   } catch (_) {
-    // A snapshot still reports scans that completed before subscriptions.
+    return false;
   }
 })();
 

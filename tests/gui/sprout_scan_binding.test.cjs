@@ -18,7 +18,7 @@ const review = (id) => ({ proposal_id: id, notes: 1, gross_zatoshis: 100000,
 
 // The scan code and its real event handlers run in a VM. Only Tauri IPC and
 // the DOM boundary are simulated; the returned handles are opaque strings.
-function harness(intercept = (_, __, fallback) => fallback()) {
+function harness(intercept = (_, __, fallback) => fallback(), { failCompletionListener = false } = {}) {
   const ids = new Set([...fs.readFileSync("gui/src/index.html", "utf8").matchAll(/\bid="([^"]+)"/g)]
     .map((match) => match[1]));
   const elements = new Map();
@@ -46,8 +46,13 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   $("sprout-scan-sweep-run").disabled = true;
   const context = vm.createContext({
     $, document: { createElement: element }, fmt: (n) => String(n),
+    setTimeout: (callback) => setImmediate(callback),
     setStatus: (id, message) => { $(id).textContent = message; },
-    listen: async (name, callback) => { listeners.set(name, callback); return () => {}; },
+    listen: async (name, callback) => {
+      if (failCompletionListener && name === "sprout-scan-complete") throw new Error("event channel unavailable");
+      listeners.set(name, callback);
+      return () => {};
+    },
     invoke: (command, args) => {
       calls.push({ command, args });
       return intercept(command, args, async () => {
@@ -100,6 +105,23 @@ test("an immediate Sprout completion is recovered from the snapshot", async () =
   assert.match(h.$("sprout-scan-status").textContent, /1 note/);
 });
 
+test("failed completion listener polls a running scan to its terminal snapshot", async () => {
+  let reads = 0;
+  const h = harness((command, args, fallback) => {
+    if (command === "get_sprout_scan") {
+      reads++;
+      return reads === 1
+        ? { handle: args.handle, status: "running", report: null, error: null }
+        : { handle: args.handle, status: "completed", report: report(1), error: null };
+    }
+    return fallback();
+  }, { failCompletionListener: true });
+  await h.scan();
+  assert.equal(reads, 2);
+  assert.equal(h.$("sprout-scan-sweep").hidden, false);
+  assert.match(h.$("sprout-scan-status").textContent, /1 note/);
+});
+
 test("scan A result cannot be displayed under scan B", async () => {
   const old = deferred();
   const h = harness((command, args, fallback) =>
@@ -113,6 +135,21 @@ test("scan A result cannot be displayed under scan B", async () => {
   assert.equal(h.$("sprout-scan-sweep").hidden, true);
   h.emit("sprout-scan-complete", { handle: "scan-2", status: "completed", report: report(1), error: null });
   assert.match(h.$("sprout-scan-status").textContent, /1 note/);
+});
+
+test("a start response after a source edit releases its stale scan handle", async () => {
+  const pending = deferred();
+  const h = harness((command, args, fallback) => command === "start_sprout_scan"
+    ? pending.promise : fallback());
+  const starting = h.scan();
+  await flush();
+  h.edit("sprout-scan-keys", "SK-other");
+  pending.resolve("scan-stale");
+  await starting;
+  assert.equal(h.peek("sproutScanHandle"), null);
+  assert.equal(h.$("sprout-scan-sweep").hidden, true);
+  assert.ok(h.calls.some((call) => call.command === "release_sprout_scan" &&
+    call.args.handle === "scan-stale"));
 });
 
 test("scan source edit releases its handle and hides sweep controls", async () => {
