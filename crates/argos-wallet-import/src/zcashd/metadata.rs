@@ -68,16 +68,24 @@ impl MetadataKind {
 /// the key.
 #[derive(Debug, Default)]
 pub struct KeyMetadataIndex {
-    times: HashMap<(MetadataKind, Vec<u8>), i64>,
+    /// `None` is a tombstone: the key had a record, but its time is not
+    /// trusted (unknown, unparseable, or contradicted by a second record).
+    /// It must stay in the map so a later record cannot revive a time.
+    times: HashMap<(MetadataKind, Vec<u8>), Option<i64>>,
 }
 
 impl KeyMetadataIndex {
     /// Index every metadata record in `pairs`.
     ///
     /// A record that does not parse is reported through `diagnostics` and
-    /// left out, so its key ends up with no creation time. Records whose time
-    /// zcashd itself marks as unknown are left out silently: that is the
-    /// normal state of an imported key, not damage to the file.
+    /// its key ends up with no creation time. Records whose time zcashd
+    /// itself marks as unknown do the same silently: that is the normal state
+    /// of an imported key, not damage to the file.
+    ///
+    /// zcashd writes one metadata record per key, so a second record for the
+    /// same key means the file is not what zcashd wrote. Either record could
+    /// be the true one, and picking the later time could hide notes, so the
+    /// key is left undated whatever the two records say.
     pub fn build(
         pairs: &[(Vec<u8>, Vec<u8>)],
         mut diagnostics: Option<&mut Vec<ImportDiagnostic>>,
@@ -90,11 +98,8 @@ impl KeyMetadataIndex {
             let Some(kind) = MetadataKind::of_record(&rec.record_type) else {
                 continue;
             };
-            match parse_create_time(value) {
-                Ok(Some(time)) => {
-                    index.times.insert((kind, rec.rest), time);
-                }
-                Ok(None) => {}
+            let time = match parse_create_time(value) {
+                Ok(time) => time,
                 Err(reason) => {
                     if let Some(diagnostics) = diagnostics.as_deref_mut() {
                         diagnostics.push(ImportDiagnostic::UnreadableKeyMetadata {
@@ -102,8 +107,14 @@ impl KeyMetadataIndex {
                             reason: reason.to_owned(),
                         });
                     }
+                    None
                 }
-            }
+            };
+            index
+                .times
+                .entry((kind, rec.rest))
+                .and_modify(|seen| *seen = None)
+                .or_insert(time);
         }
         index
     }
@@ -111,7 +122,10 @@ impl KeyMetadataIndex {
     /// The creation time recorded for the key whose record-key remainder is
     /// `identifier`, if one is known.
     pub fn created_at(&self, kind: MetadataKind, identifier: &[u8]) -> Option<i64> {
-        self.times.get(&(kind, identifier.to_vec())).copied()
+        self.times
+            .get(&(kind, identifier.to_vec()))
+            .copied()
+            .flatten()
     }
 }
 
@@ -274,6 +288,45 @@ mod tests {
         let mut v = metadata_v10(1_785_406_081, "m/0");
         v.extend_from_slice(&[0xEE; 7]);
         assert_eq!(parse_create_time(&v), Ok(Some(1_785_406_081)));
+    }
+
+    /// Two records for one key are a contradiction the file cannot resolve:
+    /// either could be the real one, and trusting the later time could hide
+    /// notes received before it. So any duplicate, and any record zcashd
+    /// marks unknown or that does not parse, leaves the key undated, in
+    /// whichever order the records arrive.
+    #[test]
+    fn a_duplicated_or_contradicted_key_is_undated() {
+        let dated = || metadata_v10(1_700_000_000, "");
+        let later = || metadata_v10(1_750_000_000, "");
+        let unknown = || metadata_v10(1, "");
+        let broken = || dated()[..20].to_vec();
+        let cases: [(&str, Vec<Vec<u8>>); 6] = [
+            ("dated then unknown", vec![dated(), unknown()]),
+            ("unknown then dated", vec![unknown(), dated()]),
+            ("dated then unparseable", vec![dated(), broken()]),
+            ("unparseable then dated", vec![broken(), dated()]),
+            ("dated then dated", vec![dated(), later()]),
+            ("dated twice, same time", vec![dated(), dated()]),
+        ];
+        for (name, values) in cases {
+            for kind in ["keymeta", "zkeymeta", "sapzkeymeta"] {
+                let pairs: Vec<_> = values
+                    .iter()
+                    .map(|v| record(kind, &[0x33; 32], v.clone()))
+                    .chain(std::iter::once(record(kind, &[0x44; 32], dated())))
+                    .collect();
+                let index = KeyMetadataIndex::build(&pairs, None);
+                let pool = MetadataKind::of_record(kind).unwrap();
+                assert_eq!(index.created_at(pool, &[0x33; 32]), None, "{name} ({kind})");
+                // A neighbouring key with a single clean record keeps its time.
+                assert_eq!(
+                    index.created_at(pool, &[0x44; 32]),
+                    Some(1_700_000_000),
+                    "{name} ({kind})"
+                );
+            }
+        }
     }
 
     /// A Sapling ivk and the first bytes of something else must not collide:
