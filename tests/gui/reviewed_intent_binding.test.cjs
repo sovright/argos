@@ -254,6 +254,7 @@ function flowHarness() {
         return results.at(-1);
       },
       appendChild(child) { this.children.push(child); },
+      replaceChildren(...children) { this.children = children; },
       setAttribute() {}, focus() {},
     };
   }
@@ -277,6 +278,8 @@ function flowHarness() {
   $("donate-rate").value = "99";
   $("donate-email").value = "old@example.test";
   $("scan-rows").innerHTML = "old rows";
+  $("sapling-scan-keys").value = "old key";
+  $("sapling-key-addresses").appendChild(element());
   $("scan-discoveries").innerHTML = "old discovery";
   $("scan-totals").textContent = "old balance";
   $("sweep-rows").innerHTML = "old proposal";
@@ -386,6 +389,18 @@ test("editing wallet path drops the prior loaded wallet", () => {
   h.$("wallet-path").fire("input");
   assert.equal(h.context.walletFile, null);
   assert.equal(h.$("wallet-path").value, "/new/wallet.dat");
+});
+
+test("forgetting a loaded wallet revokes its completed scan", () => {
+  const h = flowHarness();
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, '$("wallet-open")?.addEventListener', '$("wallet-path")?.addEventListener');
+  h.$("wallet-forget").fire("click");
+  assert.equal(h.context.walletFile, null);
+  assert.equal(h.state.scanHandle, null);
+  assert.equal(h.state.lastProgress, null);
+  assert.equal(h.state.sweepReview, null);
+  assert.equal(h.$("review-sweep").disabled, true);
 });
 
 test("wallet drop invalidates the previous scan before opening the new file", async () => {
@@ -586,6 +601,8 @@ test("start over still drops the loaded wallet", () => {
   h.$("restart-flow").fire("click");
   assert.equal(h.context.walletFile, null);
   assert.equal(h.$("wallet-path").value, "");
+  assert.equal(h.$("sapling-scan-keys").value, "");
+  assert.equal(h.$("sapling-key-addresses").children.length, 0);
   assert.equal(h.state.scanHandle, null);
   assert.equal(h.$("donate-rate").value, "10");
   assert.equal(h.$("scan-rows").innerHTML, "");

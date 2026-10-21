@@ -86,7 +86,7 @@ test("the wallet screen has a Forget this file control wired to the reset", () =
   assert.match(html, /id="wallet-forget"[^>]*>\s*Forget this file/);
   assert.match(
     source,
-    /\$\("wallet-forget"\)\?\.addEventListener\("click", forgetLoadedWalletFile\)/,
+    /\$\("wallet-forget"\)\?\.addEventListener\("click", \(\) => \{\s*invalidateScanAuthority\(\);\s*forgetLoadedWalletFile\(\);/,
   );
 });
 
@@ -94,8 +94,10 @@ test("Start over also clears the pasted Sapling keys", () => {
   const start = source.indexOf('$("restart-flow").addEventListener("click"');
   const end = source.indexOf("\n});\n", start);
   const handler = source.slice(start, end);
-  assert.match(handler, /\$\("sapling-scan-keys"\)\.value = ""/);
-  assert.match(handler, /\$\("sapling-key-addresses"\)\.replaceChildren\(\)/);
+  assert.match(handler, /resetRecoveryFlowState\(\)/);
+  const resetFlow = loadFunction("resetRecoveryFlowState");
+  assert.match(resetFlow.toString(), /\$\("sapling-scan-keys"\)\.value = ""/);
+  assert.match(resetFlow.toString(), /\$\("sapling-key-addresses"\)\.replaceChildren\(\)/);
 });
 
 test("matched-address recovery resets the wallet file through the shared helper", () => {

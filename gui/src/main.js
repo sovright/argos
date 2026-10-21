@@ -964,7 +964,10 @@ $("wallet-open")?.addEventListener("click", () => {
   invalidateScanAuthority();
   openWalletFile();
 });
-$("wallet-forget")?.addEventListener("click", forgetLoadedWalletFile);
+$("wallet-forget")?.addEventListener("click", () => {
+  invalidateScanAuthority();
+  forgetLoadedWalletFile();
+});
 $("wallet-path")?.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); invalidateScanAuthority(); openWalletFile(); }
 });

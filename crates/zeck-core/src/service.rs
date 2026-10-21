@@ -3891,14 +3891,21 @@ mod propose_workspace_guard_tests {
         task_state.workspace = Some(workspace.clone());
 
         let service = RecoveryService::new();
+        let source_fingerprint = runtime
+            .key_source
+            .fingerprint()
+            .expect("source fingerprint");
         service.sessions.write().await.insert(
             handle.id.clone(),
             Arc::new(ScanSession {
+                handle_id: handle.id.clone(),
+                source_fingerprint,
                 state: Arc::new(Mutex::new(task_state)),
                 runtime,
                 started_at: Instant::now(),
                 task: Mutex::new(None),
                 workspace_root: workspace.root().to_owned(),
+                reviewed_sweeps: Mutex::new(ReviewedSweepStore::default()),
             }),
         );
         (service, handle)
@@ -3958,12 +3965,15 @@ mod propose_workspace_guard_tests {
             .await
             .expect("a transparent-only scan must be sweepable");
         assert_eq!(
-            proposal.transactions.len(),
+            proposal.proposal.transactions.len(),
             1,
             "{:?}",
-            proposal.transactions
+            proposal.proposal.transactions
         );
-        assert_eq!(proposal.transactions[0].gross_zatoshis, 2_099_979_000);
+        assert_eq!(
+            proposal.proposal.transactions[0].gross_zatoshis,
+            2_099_979_000
+        );
     }
 
     /// The other half: the guard still refuses a route whose balances do come
