@@ -1284,3 +1284,32 @@ test("Start over clears the raw Sprout key box and closes the panel", async () =
     assert.match(source.slice(at, at + 300), /forgetSproutScanInputs\(\)/);
   }
 });
+
+test("a malformed scan peer does not fail the preview; the backend warns and the sweep still refuses", async () => {
+  const seen = {};
+  const h = harness(async (command, args, fallback) => {
+    seen[command] = { ...args };
+    if (command === "preview_sprout_sweep") {
+      const response = await fallback();
+      return {
+        ...response,
+        scan_warning: "The scan panel's peers were not used: custom peer \"no-port-here\" is not valid.",
+      };
+    }
+    return fallback();
+  });
+  h.loadScanPanel();
+  h.$("sprout-scan-peers").value = "192.0.2.7:8233, no-port-here";
+  await h.open("/fixture/bad-peer.dat");
+  await flush();
+  // The raw entries reach the backend, which decides how to degrade.
+  assert.deepEqual([...seen.preview_sprout_sweep.peers], ["192.0.2.7:8233", "no-port-here"]);
+  assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
+  assert.match(h.$("sprout-sweep-status").textContent, /peers were not used/);
+  // Sweeping with the same field refuses before anything is sent.
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  await flush();
+  assert.equal("execute_sprout_sweep" in seen, false);
+  assert.match(h.$("sprout-sweep-status").textContent, /no-port-here.*host:port/);
+});

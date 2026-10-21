@@ -674,6 +674,16 @@ async function showSproutSweep() {
 
   try {
     const previewNetwork = $("network-select").value;
+    // A malformed entry in the scan panel's peer field must not cost the
+    // preview: the raw entries go to the backend, which skips live
+    // verification, keeps the wallet file's own spent record and says why
+    // in the scan warning. The sweep itself still refuses the field.
+    let previewPeers;
+    try {
+      previewPeers = sproutScanPeers();
+    } catch {
+      previewPeers = sproutScanPeerEntries();
+    }
     const preview = await invoke("preview_sprout_sweep", {
       path: source.path,
       passphrase: source.passphrase,
@@ -683,7 +693,7 @@ async function showSproutSweep() {
       dataDir: $("data-dir").value.trim() || null,
       // The scan panel's peers, dialled first when that checkpoint is
       // verified against live headers. Opening the wallet never dials.
-      peers: sproutScanPeers(),
+      peers: previewPeers,
     });
 
     if (walletFile !== source) return;
@@ -1304,12 +1314,17 @@ function sproutScanKeys() {
 // those come back as the backend's own, more specific error.
 const MAX_CUSTOM_PEERS = 8;
 
-function sproutScanPeers() {
+// The scan panel's peer entries, trimmed and deduplicated but not checked.
+function sproutScanPeerEntries() {
   const entries = $("sprout-scan-peers").value
     .split(/[\n,]/)
     .map((p) => p.trim().toLowerCase())
     .filter(Boolean);
-  const peers = [...new Set(entries)];
+  return [...new Set(entries)];
+}
+
+function sproutScanPeers() {
+  const peers = sproutScanPeerEntries();
   for (const peer of peers) {
     const match = /^(\[[0-9a-f:.]+\]|[a-z0-9._-]+):(\d+)$/.exec(peer);
     const port = match ? Number(match[2]) : 0;

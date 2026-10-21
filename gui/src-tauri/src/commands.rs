@@ -975,7 +975,6 @@ pub async fn preview_sprout_sweep(
     peers: Option<Vec<String>>,
 ) -> Result<SproutSweepPreview, String> {
     ensure_tos_accepted(&app)?;
-    let peers = parse_custom_peers(&peers.unwrap_or_default())?;
 
     let bytes = argos_core::wallet_file::read_wallet_file(&path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
@@ -984,8 +983,13 @@ pub async fn preview_sprout_sweep(
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
     let network = network_from(network.as_deref().unwrap_or("mainnet"));
-    let recovered =
-        recover_with_scan(&app, &keys, network, data_dir.as_deref(), Some(&peers)).await;
+    let recovered = recover_for_sweep_preview(
+        &keys,
+        network,
+        resolve_data_dir(&app, data_dir.as_deref()),
+        &peers.unwrap_or_default(),
+    )
+    .await;
     let plan = plan_wallet_sprout_preview(&recovered)?;
 
     let params_path = argos_core::sprout_sweep::default_params_path();
@@ -1737,6 +1741,35 @@ async fn recover_for_wallet_open(
     dir: Option<PathBuf>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
     recover_with_scan_in_dir(keys, network, dir, None).await
+}
+
+/// Recovery for a sweep preview. A malformed entry in the scan panel's peer
+/// field does not fail the preview: live verification is skipped, so no
+/// network attempt is made and an unverified scan supplies no spent verdict
+/// (fail closed), the wallet file's own record stands, and the reason leads
+/// the preview's scan warning. The sweep itself still refuses the field.
+async fn recover_for_sweep_preview(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    dir: Option<PathBuf>,
+    raw_peers: &[String],
+) -> argos_core::sprout_recovery::SproutRecovery {
+    match parse_custom_peers(raw_peers) {
+        Ok(peers) => recover_with_scan_in_dir(keys, network, dir, Some(&peers)).await,
+        Err(err) => {
+            let mut recovered = recover_with_scan_in_dir(keys, network, dir, None).await;
+            let line = format!(
+                "The scan panel's peers were not used: {err} No saved scan was verified \
+                 for this preview, so spent status is the wallet file's own record. Fix \
+                 the peer field before sweeping."
+            );
+            recovered.chain_notice = Some(match recovered.chain_notice.take() {
+                Some(notice) => format!("{line} {notice}"),
+                None => line,
+            });
+            recovered
+        }
+    }
 }
 
 async fn recover_with_scan_in_dir(
@@ -3193,6 +3226,63 @@ mod tests {
         assert!(accounting.contains("not verified offline"), "{accounting}");
         assert!(accounting.contains(&checkpoint.display().to_string()));
         assert!(recovered.spent.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review of #272, round 2: a malformed entry in the scan panel's peer
+    /// field used to fail the wallet's sweep preview outright. It now skips
+    /// live verification and makes no network attempt, keeps the wallet
+    /// file's own spent record (fail closed: the unverified scan is not
+    /// used), and says why in the preview's scan warning.
+    #[tokio::test]
+    async fn a_malformed_scan_peer_degrades_the_preview_to_a_warning() {
+        let dir =
+            std::env::temp_dir().join(format!("argos-gui-preview-bad-peer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_sk = [0x53; 32];
+        let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk)
+                    .to_bytes(),
+                provenance: argos_core::argos_wallet_import::keys::Provenance::Standalone,
+                created_at: None,
+            });
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let mut scanner = argos_core::sprout_scan::SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[], [0xCD; 32], 2_000_000).unwrap();
+        argos_core::sprout_scan_run::save_checkpoint(
+            &scanner,
+            argos_core::p2p::wire::P2pNetwork::Mainnet,
+            &checkpoint,
+        )
+        .unwrap();
+
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recover_for_sweep_preview(
+                &keys,
+                argos_core::ZeckNetwork::Mainnet,
+                Some(dir.clone()),
+                &["no-port-here".to_owned()],
+            ),
+        )
+        .await
+        .expect("a malformed peer list makes no network attempt");
+        let notice = recovered
+            .chain_notice
+            .clone()
+            .expect("the preview says why");
+        assert!(notice.contains("no-port-here"), "{notice}");
+        assert!(notice.contains("is not valid"), "{notice}");
+        assert!(notice.contains("wallet file's own"), "{notice}");
+        assert!(notice.contains("before sweeping"), "{notice}");
+        assert!(recovered.spent.is_empty());
+
+        // The sweep itself still refuses the same field, with the format.
+        let err = parse_custom_peers(&["no-port-here".to_owned()]).unwrap_err();
+        assert!(err.contains("host:port"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
