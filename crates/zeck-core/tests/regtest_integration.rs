@@ -2259,9 +2259,14 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         donation_rate: Some(0.10),
         donor_email: None,
     };
+    let reviewed = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await
+        .expect("review the 10% donation sweep");
     let outcome = fixture
         .service
-        .execute_sweep(&fixture.handle, request)
+        .execute_sweep(&fixture.handle, &reviewed.proposal_id)
         .await;
 
     // Always clear the override, even on assertion failure below.
@@ -2284,6 +2289,57 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         "[regtest] donation sweep placed {} zats across {} tx(s)",
         outcome.total_donation_zatoshis,
         outcome.transactions.len()
+    );
+}
+
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported) and --features argos-network"]
+#[tokio::test]
+async fn reviewed_proposal_cannot_be_replayed_after_execution() {
+    let harness = RegtestHarness::require();
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
+
+    let temp_data_dir = tempfile::tempdir().expect("tempdir for one-shot sweep");
+    let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-one-shot").await;
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua.clone(),
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("review funded sweep");
+
+    let outcome = fixture
+        .service
+        .execute_sweep(&fixture.handle, &reviewed.proposal_id)
+        .await
+        .expect("first execution succeeds");
+    assert!(
+        !outcome.transactions.is_empty(),
+        "first execution must broadcast a transaction"
+    );
+
+    let mempool_before_replay =
+        common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+    let replay = fixture
+        .service
+        .execute_sweep(&fixture.handle, &reviewed.proposal_id)
+        .await;
+    assert!(
+        matches!(&replay, Err(argos_core::ZeckError::UnknownSweepProposal)),
+        "a consumed proposal ID must fail before another broadcast: {replay:?}"
+    );
+    let mempool_after_replay =
+        common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+    assert_eq!(
+        mempool_after_replay, mempool_before_replay,
+        "replaying a reviewed ID must not broadcast another transaction"
     );
 }
 
@@ -2632,8 +2688,8 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
         }
     });
 
-    let outcome = service
-        .execute_sweep(
+    let reviewed = service
+        .propose_sweep(
             &handle,
             SweepRequest {
                 destination,
@@ -2643,6 +2699,10 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
                 donor_email: None,
             },
         )
+        .await
+        .expect("review sweep before execution");
+    let outcome = service
+        .execute_sweep(&handle, &reviewed.proposal_id)
         .await
         .expect("sweep must not error");
     mining.abort();
@@ -3056,8 +3116,8 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
     // path, which is the part a front-end depends on and which calling the
     // builder directly would leave untested.
     let destination = regtest_encoded_unified_address(harness.test_seed());
-    let outcome = service
-        .execute_sweep(
+    let reviewed = service
+        .propose_sweep(
             &handle,
             SweepRequest {
                 destination: destination.clone(),
@@ -3067,6 +3127,10 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
                 max_fee_zatoshis: None,
             },
         )
+        .await
+        .expect("review the imported sweep");
+    let outcome = service
+        .execute_sweep(&handle, &reviewed.proposal_id)
         .await
         .expect("the imported sweep must succeed");
 
@@ -3236,8 +3300,8 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
         donation_rate: None,
         donor_email: None,
     };
-    service
-        .propose_sweep(&handle, request.clone())
+    let reviewed = service
+        .propose_sweep(&handle, request)
         .await
         .expect("matched sweep proposal");
     let mining = tokio::spawn(async {
@@ -3250,7 +3314,7 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
     });
     let outcome = tokio::time::timeout(
         Duration::from_secs(600),
-        service.execute_sweep(&handle, request),
+        service.execute_sweep(&handle, &reviewed.proposal_id),
     )
     .await;
     mining.abort();
@@ -3427,10 +3491,7 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
         donation_rate: None,
         donor_email: None,
     };
-    service
-        .propose_sweep(&handle, request.clone())
-        .await
-        .unwrap();
+    let reviewed = service.propose_sweep(&handle, request).await.unwrap();
     let mining = tokio::spawn(async {
         let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
@@ -3441,7 +3502,7 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
     });
     let outcome = tokio::time::timeout(
         Duration::from_secs(600),
-        service.execute_sweep(&handle, request),
+        service.execute_sweep(&handle, &reviewed.proposal_id),
     )
     .await
     .expect("internal Sapling sweep timed out")
@@ -3613,8 +3674,8 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
         donation_rate: None,
         donor_email: None,
     };
-    resumed
-        .propose_sweep(&resumed_handle, request.clone())
+    let reviewed = resumed
+        .propose_sweep(&resumed_handle, request)
         .await
         .unwrap();
     let mining = tokio::spawn(async {
@@ -3627,7 +3688,7 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     });
     let outcome = tokio::time::timeout(
         Duration::from_secs(600),
-        resumed.execute_sweep(&resumed_handle, request),
+        resumed.execute_sweep(&resumed_handle, &reviewed.proposal_id),
     )
     .await;
     mining.abort();

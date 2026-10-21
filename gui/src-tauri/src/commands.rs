@@ -11,8 +11,8 @@ use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
     validate_destination_address, validate_mnemonic_words, verify_seed_for_workspace,
-    BirthdayDetectResult, IncompleteSession, RecoveryService, ScanConfig, ScanHandle, SweepOutcome,
-    SweepProposal, SweepRequest, ZeckNetwork,
+    BirthdayDetectResult, IncompleteSession, RecoveryService, ReviewedSweepProposal, ScanConfig,
+    ScanHandle, SweepOutcome, SweepProposalId, SweepRequest, ZeckNetwork,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -825,7 +825,7 @@ pub async fn propose_sweep(
     max_fee_zec: Option<String>,
     donation_rate: Option<f64>,
     donor_email: Option<String>,
-) -> Result<SweepProposal, String> {
+) -> Result<ReviewedSweepProposal, String> {
     ensure_tos_accepted(&app)?;
     let max_fee_zatoshis = max_fee_zec
         .as_deref()
@@ -851,24 +851,13 @@ pub async fn propose_sweep(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 pub async fn execute_sweep(
     app: AppHandle,
     state: State<'_, AppState>,
     handle: ScanHandle,
-    destination: String,
-    memo: Option<String>,
-    max_fee_zec: Option<String>,
-    donation_rate: Option<f64>,
-    donor_email: Option<String>,
+    proposal_id: SweepProposalId,
 ) -> Result<SweepOutcome, String> {
     ensure_tos_accepted(&app)?;
-    let max_fee_zatoshis = max_fee_zec
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(parse_zec_to_zatoshis)
-        .transpose()?;
 
     // `execute_sweep` returns an `Err` only when nothing was broadcast. A
     // mid-sequence abort *after* one or more broadcasts comes back as an `Ok`
@@ -876,16 +865,7 @@ pub async fn execute_sweep(
     // funds already on-chain are never lost to the frontend (audit Issue E).
     let outcome = state
         .service
-        .execute_sweep(
-            &handle,
-            SweepRequest {
-                destination,
-                memo,
-                max_fee_zatoshis,
-                donation_rate,
-                donor_email,
-            },
-        )
+        .execute_sweep(&handle, &proposal_id)
         .await
         .map_err(|err| err.to_string())?;
 
@@ -2181,6 +2161,18 @@ mod tests {
         seeded.mnemonic = Some(secrecy::SecretString::new("abandon".to_owned()));
         refuse_unreachable_sweep_destination(&seeded, ORCHARD_ONLY_UA, ZeckNetwork::Mainnet)
             .expect("seeded wallets sweep through the HD path");
+    }
+
+    #[test]
+    fn execute_sweep_authority_contains_only_handle_and_proposal_id() {
+        // Binding the actual command to this function pointer makes additional
+        // destination, memo, donation, or fee arguments a compile-time error.
+        let _command: fn(
+            AppHandle,
+            State<'static, AppState>,
+            ScanHandle,
+            argos_core::SweepProposalId,
+        ) -> _ = super::execute_sweep;
     }
 
     fn spent_note() -> SpentSproutNote {
