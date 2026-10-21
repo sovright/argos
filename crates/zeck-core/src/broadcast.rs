@@ -1,12 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Cursor,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use zcash_primitives::transaction::TxId;
+use tonic::transport::Channel;
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction, SendResponse,
+};
+use zcash_primitives::transaction::{Transaction, TxId};
+use zcash_protocol::consensus::BranchId;
 
 use crate::{
     error::{ZeckError, ZeckResult},
@@ -112,6 +120,206 @@ pub trait BroadcastStore {
         observation: Option<&TxObservation>,
     ) -> ZeckResult<()>;
     fn latest(&self, txid: TxId) -> Option<PersistedTransaction>;
+}
+
+/// A single raw transaction submission. The caller owns the durable record.
+#[async_trait]
+pub trait TxSubmitter {
+    async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status>;
+}
+
+pub struct LightwalletdSubmitter<'a> {
+    pub client: &'a mut CompactTxStreamerClient<Channel>,
+}
+
+#[async_trait]
+impl TxSubmitter for LightwalletdSubmitter<'_> {
+    async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
+        self.client
+            .send_transaction(RawTransaction {
+                data: raw,
+                height: 0,
+            })
+            .await
+            .map(tonic::Response::into_inner)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxSubmissionResult {
+    pub txid: TxId,
+    pub state: TxLifecycleState,
+    pub fee_zatoshis: u64,
+    pub disposition: SubmissionDisposition,
+}
+
+/// Recognize only stable, specific node reasons. Any unfamiliar response stays
+/// ambiguous; response codes alone are not proof of consensus invalidity.
+pub fn classify_send_response(response: &SendResponse) -> SubmissionDisposition {
+    if response.error_code == 0 {
+        return SubmissionDisposition::Accepted;
+    }
+    let reason = response.error_message.trim().to_owned();
+    let normalized = reason.to_ascii_lowercase();
+    if [
+        "already in mempool",
+        "already known",
+        "already have transaction",
+        "already in block chain",
+        "already in blockchain",
+        "txn-already-known",
+        "txn-already-in-mempool",
+        "txn-already-in-chain",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return SubmissionDisposition::AlreadyKnown;
+    }
+    if [
+        "mempool full",
+        "mempool is full",
+        "mempool min fee",
+        "mempool minimum fee",
+        "mempool minimum",
+        "mempool fee",
+        "min relay fee",
+        "minrelaytxfee",
+        "insufficient fee",
+        "too many unconfirmed",
+        "mempool eviction",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || (["non-final", "nonfinal"]
+            .iter()
+            .any(|needle| normalized.contains(needle))
+            && !normalized.contains("expired"))
+    {
+        return SubmissionDisposition::RetryableRejection {
+            code: response.error_code,
+            reason,
+        };
+    }
+    if [
+        "invalid proof",
+        "invalid signature",
+        "bad signature",
+        "wrong consensus branch",
+        "wrong branch id",
+        "confirmed conflicting spend",
+        "malformed transaction",
+        "deserialize transaction",
+        "transaction decode failed",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return SubmissionDisposition::DeterministicRejection {
+            code: response.error_code,
+            reason,
+        };
+    }
+    SubmissionDisposition::AmbiguousTransport
+}
+
+fn txid_from_raw(raw_tx: &[u8]) -> ZeckResult<TxId> {
+    let mut cursor = Cursor::new(raw_tx);
+    // V5/V6 carry their branch in the header. For older transactions the
+    // branch supplied here does not affect the serialized transaction ID.
+    let parsed = Transaction::read(&mut cursor, BranchId::Nu5).map_err(|err| {
+        ZeckError::TransactionBuild(format!("cannot parse persisted transaction: {err}"))
+    })?;
+    if cursor.position() != raw_tx.len() as u64 {
+        return Err(ZeckError::TransactionBuild(
+            "persisted transaction has trailing bytes".into(),
+        ));
+    }
+    Ok(parsed.txid())
+}
+
+pub async fn submit_prepared_transaction<S, N>(
+    store: &mut S,
+    network: &mut N,
+    tx: PreparedTransaction,
+    deadline: Duration,
+) -> ZeckResult<TxSubmissionResult>
+where
+    S: BroadcastStore,
+    N: TxSubmitter,
+{
+    store.persist_prepared(&tx)?;
+    resubmit_prepared_transaction(store, network, &tx, deadline).await
+}
+
+pub async fn resubmit_prepared_transaction<S, N>(
+    store: &mut S,
+    network: &mut N,
+    tx: &PreparedTransaction,
+    deadline: Duration,
+) -> ZeckResult<TxSubmissionResult>
+where
+    S: BroadcastStore,
+    N: TxSubmitter,
+{
+    let persisted = store.latest(tx.txid).ok_or_else(|| {
+        ZeckError::Storage(format!("transaction {} is not durably prepared", tx.txid))
+    })?;
+    if persisted.prepared != *tx {
+        return Err(ZeckError::Storage(format!(
+            "prepared transaction {} differs from durable record",
+            tx.txid
+        )));
+    }
+    if !matches!(
+        persisted.state,
+        TxLifecycleState::NotSubmitted
+            | TxLifecycleState::SubmissionUnknown
+            | TxLifecycleState::Pending
+    ) || persisted.observation.as_ref().is_some_and(|observation| {
+        observation.expiry_height == persisted.prepared.expiry_height && observation.is_expired()
+    }) || matches!(
+        persisted.last_submission,
+        Some(SubmissionDisposition::DeterministicRejection { .. })
+    ) {
+        return Err(ZeckError::Broadcast(format!(
+            "transaction {} is not eligible for resubmission",
+            tx.txid
+        )));
+    }
+    if txid_from_raw(&persisted.prepared.raw_tx)? != persisted.prepared.txid {
+        return Err(ZeckError::Storage(format!(
+            "persisted raw transaction does not match txid {}",
+            tx.txid
+        )));
+    }
+    // The transition is synced by BroadcastStore before any network I/O.
+    store.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)?;
+    let disposition = match tokio::time::timeout(
+        deadline.min(Duration::from_secs(30)),
+        network.send_raw(persisted.prepared.raw_tx),
+    )
+    .await
+    {
+        Ok(Ok(response)) => classify_send_response(&response),
+        Ok(Err(_)) | Err(_) => SubmissionDisposition::AmbiguousTransport,
+    };
+    let state = match disposition {
+        SubmissionDisposition::Accepted | SubmissionDisposition::RetryableRejection { .. } => {
+            TxLifecycleState::Pending
+        }
+        SubmissionDisposition::DeterministicRejection { .. } => TxLifecycleState::Rejected,
+        SubmissionDisposition::AmbiguousTransport | SubmissionDisposition::AlreadyKnown => {
+            TxLifecycleState::SubmissionUnknown
+        }
+    };
+    store.transition(tx.txid, state, Some(&disposition), None)?;
+    Ok(TxSubmissionResult {
+        txid: tx.txid,
+        state,
+        fee_zatoshis: tx.fee_zatoshis,
+        disposition,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -462,8 +670,331 @@ impl BroadcastStore for DurableBroadcastLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, io::Write};
+    use std::{
+        fs,
+        io::Write,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use zcash_client_backend::proto::service::SendResponse;
+    use zcash_primitives::transaction::Authorized;
     use zcash_primitives::transaction::TxId;
+    use zcash_primitives::transaction::{TransactionData, TxVersion};
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    #[derive(Default, Clone)]
+    struct RecordingStore(Arc<Mutex<Option<PersistedTransaction>>>);
+
+    impl BroadcastStore for RecordingStore {
+        fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
+            let mut latest = self.0.lock().unwrap();
+            if latest.is_some() {
+                return Err(ZeckError::Storage("already prepared".into()));
+            }
+            *latest = Some(PersistedTransaction {
+                prepared: tx.clone(),
+                state: TxLifecycleState::NotSubmitted,
+                last_submission: None,
+                observation: None,
+            });
+            Ok(())
+        }
+        fn transition(
+            &mut self,
+            txid: TxId,
+            state: TxLifecycleState,
+            submission: Option<&SubmissionDisposition>,
+            observation: Option<&TxObservation>,
+        ) -> ZeckResult<()> {
+            let mut latest = self.0.lock().unwrap();
+            let existing = latest
+                .as_mut()
+                .ok_or_else(|| ZeckError::Storage("not prepared".into()))?;
+            if existing.prepared.txid != txid {
+                return Err(ZeckError::Storage("wrong txid".into()));
+            }
+            existing.state = state;
+            if let Some(submission) = submission {
+                existing.last_submission = Some(submission.clone());
+            }
+            if let Some(observation) = observation {
+                existing.observation = Some(observation.clone());
+            }
+            Ok(())
+        }
+        fn latest(&self, txid: TxId) -> Option<PersistedTransaction> {
+            self.0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|record| record.prepared.txid == txid)
+                .cloned()
+        }
+    }
+
+    enum Script {
+        Response(i32, &'static str),
+        Transport,
+        Stall,
+    }
+    struct ScriptedSubmitter {
+        store: RecordingStore,
+        script: Script,
+        calls: usize,
+        sent: Vec<Vec<u8>>,
+    }
+    #[async_trait::async_trait]
+    impl TxSubmitter for ScriptedSubmitter {
+        async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
+            assert_eq!(
+                self.store.0.lock().unwrap().as_ref().unwrap().state,
+                TxLifecycleState::SubmissionUnknown
+            );
+            self.calls += 1;
+            self.sent.push(raw);
+            match self.script {
+                Script::Response(code, reason) => Ok(SendResponse {
+                    error_code: code,
+                    error_message: reason.into(),
+                }),
+                Script::Transport => Err(tonic::Status::unavailable("connection lost")),
+                Script::Stall => std::future::pending().await,
+            }
+        }
+    }
+    fn fixture() -> PreparedTransaction {
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::V5,
+            BranchId::Nu5,
+            0,
+            BlockHeight::from_u32(100),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let mut raw_tx = Vec::new();
+        tx.write(&mut raw_tx).unwrap();
+        PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx,
+            fee_zatoshis: 12_345,
+            expiry_height: Some(100),
+        }
+    }
+    fn network(store: &RecordingStore, script: Script) -> ScriptedSubmitter {
+        ScriptedSubmitter {
+            store: store.clone(),
+            script,
+            calls: 0,
+            sent: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_state_is_unknown_before_network_io() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        let mut node = network(&store, Script::Response(0, ""));
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx.clone(), Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(result.state, TxLifecycleState::Pending);
+        assert_eq!(node.sent, vec![tx.raw_tx]);
+    }
+    #[tokio::test]
+    async fn transport_failure_preserves_txid_raw_bytes_and_unknown_state() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        let mut node = network(&store, Script::Transport);
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx.clone(), Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(
+            result.disposition,
+            SubmissionDisposition::AmbiguousTransport
+        );
+        assert_eq!(store.latest(tx.txid).unwrap().prepared, tx);
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn submission_timeout_is_unknown_not_rejected() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        let mut node = network(&store, Script::Stall);
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx, Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(
+            result.disposition,
+            SubmissionDisposition::AmbiguousTransport
+        );
+    }
+    #[tokio::test]
+    async fn deterministic_node_refusal_is_rejected() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        let mut node = network(&store, Script::Response(-26, "invalid proof"));
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx, Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(result.state, TxLifecycleState::Rejected);
+    }
+    #[tokio::test]
+    async fn duplicate_response_remains_unknown_until_observed() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        let mut node = network(
+            &store,
+            Script::Response(-27, "transaction already in mempool"),
+        );
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx, Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(result.disposition, SubmissionDisposition::AlreadyKnown);
+    }
+    #[tokio::test]
+    async fn retryable_policy_rejection_remains_pending() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        let mut node = network(&store, Script::Response(-26, "mempool full"));
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx, Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(result.state, TxLifecycleState::Pending);
+        assert!(matches!(
+            result.disposition,
+            SubmissionDisposition::RetryableRejection { .. }
+        ));
+    }
+    #[tokio::test]
+    async fn deterministic_rejection_cannot_be_resubmitted() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        store.persist_prepared(&tx).unwrap();
+        store
+            .transition(
+                tx.txid,
+                TxLifecycleState::Rejected,
+                Some(&SubmissionDisposition::DeterministicRejection {
+                    code: -26,
+                    reason: "invalid proof".into(),
+                }),
+                None,
+            )
+            .unwrap();
+        let mut node = network(&store, Script::Response(0, ""));
+        assert!(
+            resubmit_prepared_transaction(&mut store, &mut node, &tx, Duration::from_secs(30))
+                .await
+                .is_err()
+        );
+        assert_eq!(node.calls, 0);
+    }
+    #[tokio::test]
+    async fn resubmit_uses_exact_persisted_bytes() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        store.persist_prepared(&tx).unwrap();
+        let mut node = network(&store, Script::Response(0, ""));
+        let result =
+            resubmit_prepared_transaction(&mut store, &mut node, &tx, Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(result.state, TxLifecycleState::Pending);
+        assert_eq!(node.sent, vec![tx.raw_tx]);
+    }
+    #[tokio::test]
+    async fn resubmit_refuses_raw_txid_mismatch() {
+        let mut store = RecordingStore::default();
+        let mut tx = fixture();
+        tx.txid = TxId::from_bytes([42; 32]);
+        store.persist_prepared(&tx).unwrap();
+        let mut node = network(&store, Script::Response(0, ""));
+        assert!(
+            resubmit_prepared_transaction(&mut store, &mut node, &tx, Duration::from_secs(30))
+                .await
+                .is_err()
+        );
+        assert_eq!(node.calls, 0);
+    }
+
+    #[test]
+    fn unknown_node_refusal_is_ambiguous() {
+        let response = SendResponse {
+            error_code: -26,
+            error_message: "unfamiliar policy response".into(),
+        };
+        assert_eq!(
+            classify_send_response(&response),
+            SubmissionDisposition::AmbiguousTransport
+        );
+        let expired = SendResponse {
+            error_code: -26,
+            error_message: "non-final expired transaction".into(),
+        };
+        assert_eq!(
+            classify_send_response(&expired),
+            SubmissionDisposition::AmbiguousTransport
+        );
+        let spent = SendResponse {
+            error_code: -26,
+            error_message: "bad-txns-inputs-spent".into(),
+        };
+        assert_eq!(
+            classify_send_response(&spent),
+            SubmissionDisposition::AmbiguousTransport
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_unknown_transition_prevents_network_io() {
+        struct FailingStore(RecordingStore);
+        impl BroadcastStore for FailingStore {
+            fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
+                self.0.persist_prepared(tx)
+            }
+            fn transition(
+                &mut self,
+                _: TxId,
+                _: TxLifecycleState,
+                _: Option<&SubmissionDisposition>,
+                _: Option<&TxObservation>,
+            ) -> ZeckResult<()> {
+                Err(ZeckError::Storage("sync failed".into()))
+            }
+            fn latest(&self, txid: TxId) -> Option<PersistedTransaction> {
+                self.0.latest(txid)
+            }
+        }
+        let tx = fixture();
+        let recording = RecordingStore::default();
+        let mut store = FailingStore(recording.clone());
+        let mut node = network(&recording, Script::Response(0, ""));
+        assert!(submit_prepared_transaction(
+            &mut store,
+            &mut node,
+            tx.clone(),
+            Duration::from_secs(30)
+        )
+        .await
+        .is_err());
+        assert_eq!(node.calls, 0);
+        assert_eq!(
+            recording.latest(tx.txid).unwrap().state,
+            TxLifecycleState::NotSubmitted
+        );
+    }
 
     #[test]
     fn lifecycle_states_serialize_to_the_public_contract() {
