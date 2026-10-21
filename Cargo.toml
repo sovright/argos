@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "1.4.0"
+version = "1.5.3"
 license = "MIT OR Apache-2.0"
 authors = ["The Bootstrap Org Inc"]
 rust-version = "1.88"
@@ -54,12 +54,12 @@ pczt = { version = "0.9.1", default-features = false, features = ["prover", "sig
 prost = "0.14.3"
 rand_core = "0.6.4"
 rusqlite = "0.37.0"
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 secp256k1 = "0.29.1"
 secrecy = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-tauri = { version = "2.10.3" }
+tauri = { version = "~2.11.6" }
 tauri-build = "2.5.6"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2.7.2"

@@ -19,8 +19,7 @@ use argos_core::{
     ScanDiscovery, ScanHandle, ScanPhase, SeedKeySource, SweepProposal, SweepRequest, ZeckNetwork,
 };
 use argos_core::{
-    p2p::wire::P2pNetwork, sprout_recovery::recover_spendable_sprout_notes,
-    sprout_scan_cost::SproutScanCost,
+    p2p::wire::P2pNetwork, sprout_recovery::SpentEvidence, sprout_scan_cost::SproutScanCost,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
@@ -94,6 +93,14 @@ struct Cli {
         default_value = argos_core::lightwalletd::DEFAULT_MAINNET_LIGHTWALLETD
     )]
     lightwalletd_url: String,
+
+    /// Blocks downloaded and scanned at a time by `scan` and `sweep`. Trades
+    /// speed for memory: a smaller batch holds fewer blocks and less
+    /// decryption work at once, at the cost of more requests to lightwalletd.
+    /// The default of 1000 suits most machines; on one with little RAM, or
+    /// through the 2022 spam-era blocks, try 200 or 100. Clamped to 10–10000.
+    #[arg(long, global = true, value_name = "BLOCKS")]
+    scan_batch_size: Option<u32>,
 
     /// Scan exactly this many accounts (overrides --gap-limit). Also how many
     /// accounts show-keys prints (default 20). Seed sources only: an
@@ -196,7 +203,12 @@ enum Commands {
     /// Report what Argos can read out of --wallet-file and/or
     /// --sapling-key-file. Purely local: no network, and nothing is written
     /// anywhere.
-    InspectWallet,
+    InspectWallet {
+        /// List each Sprout note the wallet already spent: its outpoint, its
+        /// value, and the transaction that spent it.
+        #[arg(long)]
+        show_spent: bool,
+    },
 
     /// Scan the blockchain and report balances for derived or imported keys.
     Scan,
@@ -357,7 +369,7 @@ fn command_requires_tos(command: &Commands) -> bool {
 fn refuse_unconsumed_key_sources(cli: &Cli) -> Result<()> {
     let (name, reads_seed, reads_wallet, reads_sapling, reads_sprout) = match &cli.command {
         Commands::ShowKeys => ("show-keys", true, true, true, false),
-        Commands::InspectWallet => ("inspect-wallet", false, true, true, false),
+        Commands::InspectWallet { .. } => ("inspect-wallet", false, true, true, false),
         Commands::Scan => ("scan", true, true, true, false),
         Commands::Sweep { .. } => ("sweep", true, true, true, false),
         Commands::ScanSprout { .. } => ("scan-sprout", false, true, false, true),
@@ -593,8 +605,7 @@ fn warn_about_uncovered_pools(keys: &ImportedKeys, covers_shielded: bool) {
 /// incomplete. `inspect-wallet` says it once; a user who goes straight to
 /// `scan` would otherwise read a total with nothing attached to it.
 fn warn_about_partial_import(keys: &ImportedKeys) {
-    let coverage = keys.coverage();
-    if !coverage.may_hide_funds() {
+    if !keys.coverage().may_hide_funds() {
         return;
     }
     if let Some(notice) = keys.coverage_notice() {
@@ -606,6 +617,12 @@ fn warn_about_partial_import(keys: &ImportedKeys) {
     }
 }
 
+/// Whether a sweep may broadcast: `--dry-run` and `--confirm-sweep`.
+struct SweepGate {
+    dry_run: bool,
+    confirm_sweep: bool,
+}
+
 /// Recover Sprout notes from a wallet file and move them to Sapling.
 ///
 /// Thin by design: address parsing, branch-id selection, proving and
@@ -614,13 +631,29 @@ fn warn_about_partial_import(keys: &ImportedKeys) {
 async fn sweep_sprout(
     keys: &ImportedKeys,
     network: ZeckNetwork,
+    data_dir: &Path,
     lightwalletd_url: &str,
     destination: &str,
     sprout_params: Option<PathBuf>,
-    dry_run: bool,
-    confirm_sweep: bool,
+    gate: SweepGate,
 ) -> Result<()> {
-    let recovered = recover_spendable_sprout_notes(keys);
+    print_sprout_nu7_warning(network);
+    let SweepGate {
+        dry_run,
+        confirm_sweep,
+    } = gate;
+    let recovered = recover_with_scan(keys, network, data_dir);
+    // stdout, beside the plan: `> plan.txt` must keep the reason the total
+    // is smaller than the wallet's history.
+    print_sprout_accounting(keys, &recovered, false, "argos inspect-wallet --show-spent");
+    if recovered.nothing_left_to_sweep() {
+        println!("Nothing is left to sweep: every Sprout note this file records was spent by");
+        println!("the wallet itself or is worth less than the fee to move it.");
+        println!("To check that against the chain: argos scan-sprout --wallet-file <this file>");
+        println!();
+        print_sprout_scan_cost_warning(network);
+        return Ok(());
+    }
 
     if recovered.notes.is_empty() {
         eprintln!("No spendable Sprout notes could be recovered from this wallet file.");
@@ -651,6 +684,12 @@ async fn sweep_sprout(
         println!("  {line}");
     }
     println!();
+    // Before the confirmation, where it changes the decision: this is the
+    // one limit that costs proving time rather than showing up in a count.
+    for line in wrap_text(&recovered.spent_status(), 76) {
+        println!("  {line}");
+    }
+    println!();
 
     if dry_run {
         println!("Dry run: nothing was built or broadcast.");
@@ -669,13 +708,23 @@ async fn sweep_sprout(
         params_path.display()
     );
 
+    let journal =
+        argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &wallet_sprout_keys(keys));
+    eprintln!(
+        "Each broadcast is recorded in {}, so an interrupted sweep resumes without \
+         proving any note twice.",
+        journal.path().display()
+    );
     let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &recovered.notes,
         network,
         lightwalletd_url,
         destination,
         &params_path,
-        [0u8; 512],
+        argos_core::sprout_sweep::SweepOptions {
+            source: argos_core::sprout_sweep::NoteSource::WalletFile,
+            journal: Some(&journal),
+        },
         |msg| eprintln!("  {msg}"),
     )
     .await?;
@@ -688,6 +737,7 @@ async fn sweep_sprout(
             sent.txid
         );
     }
+    print_sprout_nu7_broadcast_warning(network, &outcome);
     report_sprout_skips_and_errors(&outcome);
     println!("Swept {} to {destination}", format_zec(outcome.total_swept));
     if outcome.destination_kind
@@ -696,6 +746,10 @@ async fn sweep_sprout(
         println!();
         println!("These funds are in the Sapling receiver of that unified address.");
         println!("To finish moving them to Orchard, shield them from your own wallet.");
+    }
+    // Non-zero, so a script cannot read a sweep that stopped partway as done.
+    if outcome.error.is_some() {
+        bail!("the Sprout sweep did not finish; see above");
     }
     Ok(())
 }
@@ -793,6 +847,7 @@ async fn scan_sprout(
     sprout_params: Option<PathBuf>,
     confirm_sweep: bool,
 ) -> Result<()> {
+    print_sprout_nu7_warning(network);
     let p2p_network: P2pNetwork = network.into();
 
     // The destination is validated before the scan, not after. Discovering
@@ -900,13 +955,17 @@ async fn scan_sprout(
     }
 
     let params_path = sprout_params.unwrap_or_else(argos_core::sprout_sweep::default_params_path);
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys);
     let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &result.notes,
         network,
         lightwalletd_url,
         destination,
         &params_path,
-        [0u8; 512],
+        argos_core::sprout_sweep::SweepOptions {
+            source: argos_core::sprout_sweep::NoteSource::Scan,
+            journal: Some(&journal),
+        },
         |msg| eprintln!("  {msg}"),
     )
     .await?;
@@ -914,9 +973,124 @@ async fn scan_sprout(
     for sent in &outcome.sent {
         println!("  swept {} — {}", format_zec(sent.value_swept), sent.txid);
     }
+    print_sprout_nu7_broadcast_warning(network, &outcome);
     report_sprout_skips_and_errors(&outcome);
     println!("Swept {} to {destination}", format_zec(outcome.total_swept));
+    if outcome.error.is_some() {
+        bail!("the Sprout sweep did not finish; see above");
+    }
     Ok(())
+}
+
+/// Why the Sprout total is what it is: notes the wallet spent, dust,
+/// unconfirmed spends, and unreadable transactions. Shared by inspect-wallet
+/// and sweep-sprout so the two cannot describe one file differently.
+fn print_sprout_accounting(
+    keys: &ImportedKeys,
+    recovered: &argos_core::sprout_recovery::SproutRecovery,
+    show_spent: bool,
+    list_with: &str,
+) {
+    for line in recovered.accounting_lines() {
+        for wrapped in wrap_text(&line, 76) {
+            println!("  {wrapped}");
+        }
+    }
+    if !recovered.spent.is_empty() {
+        if show_spent {
+            for n in &recovered.spent {
+                let by = match &n.spent_in {
+                    SpentEvidence::Wallet { txid } => format!("spent in {}", display_txid(txid)),
+                    SpentEvidence::Chain {
+                        txid: Some(txid), ..
+                    } => format!("spent on chain in {}", display_txid(txid)),
+                    SpentEvidence::Chain {
+                        scanned_to,
+                        txid: None,
+                    } => format!("spent on chain (scan to height {scanned_to})"),
+                };
+                println!(
+                    "    {}:{}:{}  {}  {by}",
+                    display_txid(&n.outpoint.txid),
+                    n.outpoint.js_index,
+                    n.outpoint.output_index,
+                    format_zec(n.value),
+                );
+            }
+        } else {
+            println!("  List them with `{list_with}`.");
+        }
+    }
+    // Every note the total leaves out can be found again by outpoint, not
+    // only the spent ones.
+    if show_spent {
+        for (what, outpoints) in [
+            ("worth less than the fee", &recovered.dust),
+            ("with an unconfirmed spend", &recovered.unconfirmed_spends),
+        ] {
+            for o in outpoints {
+                println!(
+                    "    {}:{}:{}  {what}",
+                    display_txid(&o.txid),
+                    o.js_index,
+                    o.output_index
+                );
+            }
+        }
+    }
+    if let Some(warning) = argos_core::sprout_recovery::unreadable_transactions_warning(keys) {
+        for line in wrap_text(&warning, 76) {
+            println!("  {line}");
+        }
+    }
+    println!();
+}
+
+/// Recover the wallet file's Sprout notes, letting a full-block scan of the
+/// same keys — if one has run in this data directory — settle every spend it
+/// saw on chain. The scan is optional; a checkpoint that cannot be used is
+/// reported and the file's own record stands.
+fn recover_with_scan(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    data_dir: &Path,
+) -> argos_core::sprout_recovery::SproutRecovery {
+    let spending_keys = wallet_sprout_keys(keys);
+    let (chain, mut notice) = argos_core::sprout_scan_run::chain_spends_for_wallet(
+        data_dir,
+        network.into(),
+        &spending_keys,
+    );
+    let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
+        keys,
+        chain.as_deref(),
+    );
+    if !spending_keys.is_empty() {
+        match argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys).load() {
+            Ok(swept) => recovered.drop_already_swept(&swept),
+            Err(err) => {
+                let line = format!("Not using the sweep journal: {err}");
+                notice = Some(notice.map_or(line.clone(), |n| format!("{n} {line}")));
+            }
+        }
+    }
+    recovered.chain_notice = notice;
+    recovered
+}
+
+/// The wallet file's Sprout spending keys, in the form the scan checkpoint
+/// and the sweep journal are keyed by.
+fn wallet_sprout_keys(keys: &ImportedKeys) -> Vec<[u8; 32]> {
+    use secrecy::ExposeSecret;
+    keys.sprout
+        .iter()
+        .map(|k| *k.a_sk.expose_secret())
+        .collect()
+}
+
+/// A txid as explorers show it: byte-reversed hex.
+fn display_txid(txid: &[u8; 32]) -> String {
+    txid.iter().rev().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Print notes that did not move, and any partial failure.
@@ -928,6 +1102,49 @@ async fn scan_sprout(
 fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSweepOutcome) {
     for reason in &outcome.skipped {
         println!("  not swept — {reason}");
+    }
+    for warning in &outcome.warnings {
+        eprintln!("  warning: {warning}");
+    }
+    if !outcome.already_held.is_empty() {
+        println!();
+        println!(
+            "  The node already holds {} of these transaction(s). They are not counted as swept",
+            outcome.already_held.len()
+        );
+        println!("  until they are mined; if one never is, running the sweep again retries it:");
+        for held in &outcome.already_held {
+            println!("    {} — {}", format_zec(held.value_swept), held.txid);
+        }
+    }
+    if !outcome.rejected.is_empty() {
+        println!();
+        println!(
+            "  The network refused {} note(s). Nothing moved for these, and no fee was paid:",
+            outcome.rejected.len()
+        );
+        // One line per note, then each kind's cause and remedy once: a
+        // spent note, a stale witness and an evicted transaction call for
+        // different next steps, but a heavily refused run must not print a
+        // paragraph per note.
+        for r in &outcome.rejected {
+            println!("    {}", r.summary());
+        }
+        let mut kinds: Vec<(
+            argos_core::sprout_sweep::Refusal,
+            argos_core::sprout_sweep::NoteSource,
+        )> = Vec::new();
+        for r in &outcome.rejected {
+            if !kinds.contains(&(r.kind, r.source)) {
+                kinds.push((r.kind, r.source));
+            }
+        }
+        for (kind, source) in kinds {
+            println!();
+            for line in wrap_text(kind.explanation(source), 74) {
+                println!("  {line}");
+            }
+        }
     }
     if let Some(error) = &outcome.error {
         println!();
@@ -946,6 +1163,33 @@ fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSwee
 fn fmt_elapsed(d: std::time::Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn print_sprout_nu7_warning(network: ZeckNetwork) {
+    eprintln!();
+    for line in wrap_text(&argos_core::sprout_sweep::nu7_recovery_warning(network), 76) {
+        eprintln!("  {line}");
+    }
+    eprintln!();
+}
+
+/// Once a Sprout sweep has broadcast, the deadline that matters is mining:
+/// "start recovery promptly" would be the wrong advice here.
+fn print_sprout_nu7_broadcast_warning(
+    network: ZeckNetwork,
+    outcome: &argos_core::sprout_sweep::SproutSweepOutcome,
+) {
+    if outcome.sent.is_empty() {
+        return;
+    }
+    eprintln!();
+    for line in wrap_text(
+        &argos_core::sprout_sweep::nu7_broadcast_warning(network),
+        76,
+    ) {
+        eprintln!("  {line}");
+    }
+    eprintln!();
 }
 
 /// Tell the user what a Sprout scan actually costs, before they start one.
@@ -1050,8 +1294,14 @@ fn print_sprout_next_steps() {
     );
 }
 
-fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
+fn print_sprout_inspection(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    show_spent: bool,
+    data_dir: &Path,
+) {
     if !keys.sprout.is_empty() {
+        print_sprout_nu7_warning(network);
         println!("Sprout addresses:");
         for key in &keys.sprout {
             // Encoded, not hex: a user has to be able to match this against a
@@ -1072,7 +1322,27 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
         // witness. A wallet with both needs no network at all; a wallet
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
-        let recovered = recover_spendable_sprout_notes(keys);
+        let recovered = recover_with_scan(keys, network, data_dir);
+        print_sprout_accounting(
+            keys,
+            &recovered,
+            show_spent,
+            "argos inspect-wallet --show-spent",
+        );
+        if recovered.nothing_left_to_sweep() {
+            println!("  Nothing is left to sweep: every Sprout note this file records was spent");
+            println!("  by the wallet itself or is worth less than the fee to move it.");
+            // Still offered: the verdict is the file's, and a spend recorded
+            // against a block later reorged out would read exactly like this.
+            println!(
+                "  To check that against the chain: argos scan-sprout --wallet-file <this file>"
+            );
+            println!();
+            // Quoted wherever the scan is offered: it is a multi-day,
+            // hundreds-of-gigabytes run, and that must be known up front.
+            print_sprout_scan_cost_warning(network);
+            return;
+        }
         if recovered.notes.is_empty() {
             println!("  No spendable Sprout notes were recovered from this file.");
             if !recovered.issues.is_empty() {
@@ -1094,6 +1364,10 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
             );
             println!("  These were recovered from this file alone — no scan needed.");
             println!();
+            for line in wrap_text(&recovered.spent_status(), 74) {
+                println!("  {line}");
+            }
+            println!();
             // The literal next command. A user following a guide will not
             // read --help, and a terminal state that names no next step is
             // where people give up with their funds still stranded.
@@ -1111,7 +1385,12 @@ fn print_sprout_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
 /// This is the only useful thing it can do with a zcashd `wallet.dat`
 /// today, so it must be honest about the difference between "found a
 /// key" and "can move the funds".
-fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
+fn print_wallet_inspection(
+    keys: &ImportedKeys,
+    network: ZeckNetwork,
+    show_spent: bool,
+    data_dir: &Path,
+) {
     println!("━━━ Recovered key material ━━━");
     println!("  Transparent keys  {}", keys.transparent.len());
     println!("  Sapling keys      {}", keys.sapling.len());
@@ -1174,7 +1453,7 @@ fn print_wallet_inspection(keys: &ImportedKeys, network: ZeckNetwork) {
     // The Sprout address list and spendability verdict live in a helper to
     // keep this function to one screen; the key/note counts above come from
     // the parser, and this adds what the recovery path can say about them.
-    print_sprout_inspection(keys, network);
+    print_sprout_inspection(keys, network, show_spent, data_dir);
 
     // Never summarized away: an unread record means key material that
     // still exists only in the original file, and the user is the only
@@ -1328,6 +1607,12 @@ fn install_regtest_params_if_requested() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(requested) = cli.scan_batch_size {
+        let used = argos_core::scan::set_sync_batch_size(requested);
+        if used != requested {
+            eprintln!("--scan-batch-size {requested} is out of range; using {used}.");
+        }
+    }
     init_tracing(cli.verbose)?;
     refuse_unconsumed_key_sources(&cli)?;
 
@@ -1398,7 +1683,7 @@ async fn main() -> Result<()> {
             let phrase = keys.mnemonic.clone();
             // `inspect-wallet` prints a fuller version of this below, so
             // don't say it twice.
-            if !matches!(cli.command, Commands::InspectWallet) {
+            if !matches!(cli.command, Commands::InspectWallet { .. }) {
                 eprintln!(
                     "Imported {} key(s) from {}.",
                     keys.total_keys(),
@@ -1422,7 +1707,7 @@ async fn main() -> Result<()> {
             // `show-keys` are unavailable, exactly as for a wallet file with
             // no recoverable mnemonic.
             let keys = load_sapling_key_file(key_path, network)?;
-            if !matches!(cli.command, Commands::InspectWallet) {
+            if !matches!(cli.command, Commands::InspectWallet { .. }) {
                 eprintln!(
                     "Loaded {} Sapling key(s) from {}.",
                     keys.sapling.len(),
@@ -1435,7 +1720,7 @@ async fn main() -> Result<()> {
         (None, None) => {
             // Bail before prompting: an interactive seed prompt for a
             // command that only reads a wallet file is pure confusion.
-            if matches!(cli.command, Commands::InspectWallet) {
+            if matches!(cli.command, Commands::InspectWallet { .. }) {
                 bail!("inspect-wallet needs --wallet-file or --sapling-key-file");
             }
             let phrase = load_seed_phrase(cli.seed_file.clone())?;
@@ -1446,6 +1731,16 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    // Even an ordinary HD or imported-key recovery can leave Sprout behind.
+    // Warn as soon as those keys are known, before either scan route starts.
+    if matches!(cli.command, Commands::Scan | Commands::Sweep { .. })
+        && imported
+            .as_ref()
+            .is_some_and(|source| !source.keys().sprout.is_empty())
+    {
+        print_sprout_nu7_warning(network);
+    }
 
     // Only the seed-phrase sweep attaches a memo or a donation; the
     // imported-key and transparent-only sweeps send neither. Say so before
@@ -1497,6 +1792,16 @@ async fn main() -> Result<()> {
                     let report =
                         scan_transparent_only(&resolved, network, &cli.lightwalletd_url).await?;
                     print_transparent_report(&report);
+                    if echo_scan_summary(std::io::stdout().is_terminal()) {
+                        eprintln!();
+                        eprintln!(
+                            "Scan finished: {} funded of {} transparent address(es) checked, {} \
+                             in total. Full results were written to stdout.",
+                            report.funded.len(),
+                            report.addresses_checked,
+                            format_zec(report.total_zatoshis)
+                        );
+                    }
                     return Ok(());
                 }
                 Commands::Sweep {
@@ -1556,9 +1861,9 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::InspectWallet => {
+        Commands::InspectWallet { show_spent } => {
             let source = imported.expect("--wallet-file is required and was checked above");
-            print_wallet_inspection(source.keys(), network);
+            print_wallet_inspection(source.keys(), network, show_spent, &cli.data_dir);
         }
 
         // Dispatched above, before key-source resolution, so that it never
@@ -1580,11 +1885,14 @@ async fn main() -> Result<()> {
             sweep_sprout(
                 source.keys(),
                 network,
+                &cli.data_dir,
                 &cli.lightwalletd_url,
                 &destination,
                 sprout_params,
-                dry_run,
-                confirm_sweep,
+                SweepGate {
+                    dry_run,
+                    confirm_sweep,
+                },
             )
             .await?;
         }
@@ -1641,6 +1949,14 @@ async fn main() -> Result<()> {
 
             let progress = wait_for_scan(&service, &handle).await?;
             print_scan_result(&progress);
+            if echo_scan_summary(std::io::stdout().is_terminal()) {
+                let totals: Vec<u64> = progress.accounts.iter().map(|a| a.total_zatoshis).collect();
+                eprintln!();
+                eprintln!(
+                    "{}",
+                    scan_summary_line(progress.phase, &totals, progress.error.as_deref())
+                );
+            }
             notify_scan_complete(&progress);
             if progress.phase == ScanPhase::Cancelled {
                 std::process::exit(130);
@@ -1900,7 +2216,7 @@ fn load_seed_phrase(seed_file: Option<PathBuf>) -> Result<SecretString> {
     }
 
     let phrase = Password::new()
-        .with_prompt("Enter your 24-word seed phrase")
+        .with_prompt("Enter your seed phrase (12, 15, 18, 21 or 24 words)")
         .allow_empty_password(false)
         .interact()
         .context("failed to read seed phrase from terminal")?;
@@ -2293,6 +2609,41 @@ fn format_discovery(discovery: &ScanDiscovery) -> String {
     )
 }
 
+/// One line for stderr when a scan ends: whether it finished, what it
+/// found, and that the full result is on stdout. Needed because the result
+/// goes to stdout alone — redirect that, and a finished scan looks, on the
+/// terminal, exactly like one that found nothing.
+fn scan_summary_line(phase: ScanPhase, account_totals: &[u64], error: Option<&str>) -> String {
+    match phase {
+        ScanPhase::Complete => {
+            let total = account_totals
+                .iter()
+                .fold(0u64, |sum, v| sum.saturating_add(*v));
+            format!(
+                "Scan finished: {} account(s), {} in total (Sapling, Orchard and transparent; \
+                 Sprout is not scanned here). Full results were written to stdout.",
+                account_totals.len(),
+                format_zec(total)
+            )
+        }
+        ScanPhase::Cancelled => {
+            "Scan cancelled. Progress is saved; re-run the same command to resume. Partial \
+             results were written to stdout."
+                .to_owned()
+        }
+        _ => format!(
+            "Scan did not finish: {}. Details were written to stdout.",
+            error.unwrap_or("no reason was given")
+        ),
+    }
+}
+
+/// Only when stdout is not a terminal: on one, the result is already on
+/// screen and the line would repeat it.
+fn echo_scan_summary(stdout_is_terminal: bool) -> bool {
+    !stdout_is_terminal
+}
+
 fn print_scan_result(progress: &argos_core::ScanProgress) {
     println!("Phase: {:?}", progress.phase);
 
@@ -2528,6 +2879,57 @@ fn powershell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The speed-for-memory knob reaches the scanner.
+    #[test]
+    fn scan_batch_size_is_a_global_flag() {
+        let cli = Cli::try_parse_from(["argos", "--scan-batch-size", "200", "scan"]).unwrap();
+        assert_eq!(cli.scan_batch_size, Some(200));
+        let cli = Cli::try_parse_from(["argos", "scan", "--scan-batch-size", "100"]).unwrap();
+        assert_eq!(
+            cli.scan_batch_size,
+            Some(100),
+            "global: accepted after the subcommand too"
+        );
+        let cli = Cli::try_parse_from(["argos", "scan"]).unwrap();
+        assert_eq!(cli.scan_batch_size, None, "unset keeps the default");
+    }
+
+    /// A scan whose stdout went to a file or a pipe must still say on the
+    /// terminal that it finished, what it found, and where the rest went. A
+    /// user ran a 149-minute scan with stdout redirected, saw nothing, and
+    /// asked whether that meant no funds.
+    #[test]
+    fn a_finished_scan_says_so_on_stderr_when_stdout_is_elsewhere() {
+        let line = scan_summary_line(ScanPhase::Complete, &[150_000_000, 0, 25_000_000], None);
+        assert!(line.contains("finished"), "{line}");
+        assert!(line.contains("3 account(s)"), "{line}");
+        assert!(line.contains("1.75000000 ZEC"), "{line}");
+        assert!(line.contains("stdout"), "{line}");
+
+        let nothing = scan_summary_line(ScanPhase::Complete, &[0, 0], None);
+        assert!(
+            nothing.contains("0 ZEC"),
+            "a zero total is said, not left to silence: {nothing}"
+        );
+
+        let failed = scan_summary_line(ScanPhase::Error, &[], Some("lightwalletd unreachable"));
+        assert!(
+            failed.contains("did not finish") && failed.contains("lightwalletd unreachable"),
+            "{failed}"
+        );
+
+        let cancelled = scan_summary_line(ScanPhase::Cancelled, &[], None);
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+    }
+
+    /// On a terminal the full result is already on screen; the summary
+    /// would only repeat it.
+    #[test]
+    fn the_summary_is_only_echoed_when_stdout_is_not_a_terminal() {
+        assert!(echo_scan_summary(false));
+        assert!(!echo_scan_summary(true));
+    }
 
     #[test]
     fn one_zatoshi() {

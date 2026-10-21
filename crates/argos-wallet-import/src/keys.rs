@@ -142,6 +142,11 @@ pub struct ImportedKeys {
     /// `SproutNoteData::outpoint`. Kept flat rather than nested under the
     /// notes because one JoinSplit's `hSig` covers both of its outputs.
     pub sprout_joinsplits: Vec<SproutJoinSplit>,
+    /// Transactions in `sprout_joinsplits` that the wallet never recorded as
+    /// mined: a null `hashBlock`, or `nIndex == -1`. zcashd writes a
+    /// transaction before relaying it and keeps it after it expires, so
+    /// these nullifiers are not evidence of a spend.
+    pub sprout_unconfirmed_txids: Vec<[u8; 32]>,
     /// A recovered BIP-39 mnemonic, when the source wallet held a seed
     /// rather than (or in addition to) flat key material — currently only
     /// ZWL, whose HD keys are re-derived from this seed rather than stored
@@ -209,23 +214,31 @@ impl ImportedKeys {
     /// How much of the file's key material this import is known to cover,
     /// graded by the worst diagnostic.
     pub fn coverage(&self) -> ImportCoverage {
-        self.diagnostics
-            .iter()
-            .map(ImportCoverage::of)
-            .max()
-            .unwrap_or(ImportCoverage::Complete)
+        self.grades().max().unwrap_or(ImportCoverage::Complete)
     }
 
-    /// Every distinct way this import is incomplete, most severe first, in
-    /// the words both surfaces show. `None` when complete.
-    ///
-    /// Not just the worst grade: two failure modes neither of which is worse
-    /// than the other — unscanned unified accounts and an unreadable key
-    /// record — call for different things, and saying only one hid the
-    /// other.
+    /// Each diagnostic's cost to coverage, for this wallet. An unreadable
+    /// transaction costs only Sprout note data — every other pool is scanned
+    /// from the chain — so it costs nothing to a wallet with no Sprout keys.
+    fn grades(&self) -> impl Iterator<Item = ImportCoverage> + '_ {
+        self.diagnostics
+            .iter()
+            .map(|d| match ImportCoverage::of(d) {
+                ImportCoverage::SproutNoteDataUnread if self.sprout.is_empty() => {
+                    ImportCoverage::Complete
+                }
+                grade => grade,
+            })
+    }
+
+    /// Every distinct coverage caveat, most severe first, with the call to
+    /// action once at the end — not only the worst one. A file with both
+    /// unknown records and an unreadable transaction must say both, and two
+    /// failure modes neither of which is worse than the other — unscanned
+    /// unified accounts and an unreadable key record — call for different
+    /// things.
     pub fn coverage_notice(&self) -> Option<String> {
-        let mut grades: Vec<ImportCoverage> =
-            self.diagnostics.iter().map(ImportCoverage::of).collect();
+        let mut grades: Vec<ImportCoverage> = self.grades().collect();
         grades.sort_unstable_by(|a, b| b.cmp(a));
         grades.dedup();
         let may_hide_funds = grades.iter().any(|g| g.may_hide_funds());
@@ -234,7 +247,7 @@ impl ImportedKeys {
             .filter_map(ImportCoverage::notice)
             .collect();
         // Once, after every notice, rather than at the end of each: joining
-        // two notices used to print the same call to action twice.
+        // two notices would otherwise print the same call to action twice.
         if may_hide_funds {
             notices.push(KEEP_THE_FILE);
         }
@@ -259,6 +272,10 @@ pub enum ImportCoverage {
     /// Only records of unrecognised types were skipped. They may hold
     /// nothing of value, but we cannot say so.
     UnknownRecordsSkipped,
+    /// A transaction record could not be read. Every key was, but Sprout
+    /// notes the transaction received or spent are missing from what the
+    /// file alone reports.
+    SproutNoteDataUnread,
     /// A record known to hold key material could not be read or decrypted.
     KeysUnread,
     /// The file's own seed chain says keys were derived that it does not
@@ -273,14 +290,20 @@ pub enum ImportCoverage {
 }
 
 impl ImportCoverage {
-    fn of(diagnostic: &ImportDiagnostic) -> Self {
+    /// How much one diagnostic costs coverage.
+    pub fn of(diagnostic: &ImportDiagnostic) -> Self {
         match diagnostic {
             ImportDiagnostic::UnrecoveredSeed { .. } => Self::SeedNotRecovered,
-            ImportDiagnostic::UnscannedSeedAccounts { .. } => Self::SeedAccountsNotScanned,
-            ImportDiagnostic::MissingDerivedKeys { .. } => Self::DerivedKeysMissing,
+            // A transaction holds note data, never keys: every key was
+            // still read, and the full-block scan recovers the notes.
+            ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx" => {
+                Self::SproutNoteDataUnread
+            }
             ImportDiagnostic::UnparseableRecord { .. }
             | ImportDiagnostic::DecryptionFailed { .. } => Self::KeysUnread,
             ImportDiagnostic::UnknownRecord { .. } => Self::UnknownRecordsSkipped,
+            ImportDiagnostic::UnscannedSeedAccounts { .. } => Self::SeedAccountsNotScanned,
+            ImportDiagnostic::MissingDerivedKeys { .. } => Self::DerivedKeysMissing,
             ImportDiagnostic::UncheckedLegacySeed { .. } => Self::LegacySeedUnchecked,
         }
     }
@@ -301,6 +324,11 @@ impl ImportCoverage {
                 "Some records of a type Argos does not recognise were skipped. They \
                  are listed with the other diagnostics; if any held keys, those keys \
                  exist only in the original wallet file.",
+            ),
+            Self::SproutNoteDataUnread => Some(
+                "Some transaction records could not be read. Every key was read, but \
+                 Sprout notes those transactions received or spent are missing from what \
+                 this file reports; the full-block Sprout scan recovers them from the chain.",
             ),
             Self::KeysUnread => Some(
                 "Incomplete — some key records could not be read, so recovered keys \
@@ -326,7 +354,7 @@ impl ImportCoverage {
     /// Whether the notice must follow the user to the totals and the
     /// delete-workspace screen, not just the import summary.
     pub fn may_hide_funds(self) -> bool {
-        self >= Self::KeysUnread
+        self >= Self::SproutNoteDataUnread
     }
 }
 
@@ -366,6 +394,99 @@ mod coverage_tests {
             diagnostics,
             ..ImportedKeys::default()
         }
+    }
+
+    /// [`with`], for a wallet that holds a Sprout key.
+    fn with_sprout(diagnostics: Vec<ImportDiagnostic>) -> ImportedKeys {
+        let mut keys = with(diagnostics);
+        keys.sprout.push(SproutKey {
+            a_sk: secrecy::Secret::new([1; 32]),
+            address: [2; 64],
+            provenance: Provenance::Standalone,
+        });
+        keys
+    }
+
+    /// Kristi's F9 on #239: a `tx` record holds note data, not keys. One old
+    /// unwalkable transaction must not raise a key-loss banner that follows
+    /// the user to every screen.
+    #[test]
+    fn an_unreadable_transaction_is_not_graded_as_lost_keys() {
+        let tx = ImportDiagnostic::UnparseableRecord {
+            record_type: "tx".to_owned(),
+            reason: "could not be read".to_owned(),
+        };
+        let coverage = with_sprout(vec![tx.clone()]).coverage();
+        assert_eq!(coverage, ImportCoverage::SproutNoteDataUnread);
+        // Round-5 finding 9: a note received in an unreadable transaction is
+        // uncounted money, so the caveat follows the user to the totals and
+        // the delete-workspace screen — worded as note data, not keys.
+        assert!(coverage.may_hide_funds());
+        let notice = coverage.notice().unwrap();
+        assert!(notice.contains("transaction"), "{notice}");
+        assert!(!notice.contains("key records"), "{notice}");
+
+        let zkey = ImportDiagnostic::UnparseableRecord {
+            record_type: "zkey".to_owned(),
+            reason: "truncated".to_owned(),
+        };
+        assert_eq!(
+            with_sprout(vec![tx, zkey]).coverage(),
+            ImportCoverage::KeysUnread,
+            "a real key record still is"
+        );
+    }
+
+    /// Kristi's round-5 finding 9, second half: a file with both unknown
+    /// records and an unreadable transaction showed only the higher grade's
+    /// notice, dropping the other caveat. Every distinct one is shown, most
+    /// severe first, and the call to action once.
+    #[test]
+    fn every_distinct_caveat_is_shown_and_the_call_to_action_once() {
+        let keys = with_sprout(vec![
+            unknown(),
+            ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".to_owned(),
+                reason: "x".to_owned(),
+            },
+            ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".to_owned(),
+                reason: "y".to_owned(),
+            },
+        ]);
+        let notice = keys.coverage_notice().unwrap();
+        let sprout = ImportCoverage::SproutNoteDataUnread.notice().unwrap();
+        let unknown_notice = ImportCoverage::UnknownRecordsSkipped.notice().unwrap();
+        assert!(
+            notice.contains(sprout) && notice.contains(unknown_notice),
+            "{notice}"
+        );
+        assert!(
+            notice.find(sprout) < notice.find(unknown_notice),
+            "most severe first: {notice}"
+        );
+        assert_eq!(notice.matches(sprout).count(), 1, "one notice per grade");
+        assert_eq!(
+            notice.matches("Keep the original wallet file").count(),
+            1,
+            "{notice}"
+        );
+        assert!(with(vec![]).coverage_notice().is_none());
+    }
+
+    /// Kristi's round-6 finding 7: an unreadable transaction costs only
+    /// Sprout note data, and every other pool is scanned from the chain. A
+    /// wallet with no Sprout keys must not be told it was partly recovered —
+    /// a caveat that would sit beside Delete workspace for no reason.
+    #[test]
+    fn an_unreadable_transaction_is_no_caveat_without_sprout_keys() {
+        let keys = with(vec![ImportDiagnostic::UnparseableRecord {
+            record_type: "tx".to_owned(),
+            reason: "x".to_owned(),
+        }]);
+        assert!(keys.sprout.is_empty());
+        assert_eq!(keys.coverage(), ImportCoverage::Complete);
+        assert!(keys.coverage_notice().is_none());
     }
 
     fn unknown() -> ImportDiagnostic {

@@ -364,32 +364,40 @@ impl RecoveryService {
         // loss this guards against. So require a readable wallet summary too; a
         // missing or freshly-recreated database yields `None` here and fails
         // loudly, matching what the execute path already demands.
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let wallet_db = open_wallet_db(
-            workspace.wallet_db_path(),
-            consensus_network(session.runtime.network),
-        )
-        .map_err(|err| {
-            ZeckError::Wallet(format!(
-                "the recovery workspace backing this scan is no longer readable, so its \
-                 balances cannot be trusted: {err}"
-            ))
-        })?;
-        wallet_db
-            .get_wallet_summary(ConfirmationsPolicy::MIN)
+        //
+        // Not on the transparent-only route. It never creates an account, so
+        // its database is empty by design, and the guard refused every such
+        // sweep (1.2.0 through 1.5.2) while the scan above it showed the
+        // funds. Its balance never came from that database, and the sweep
+        // re-reads every UTXO from the chain before signing.
+        if !is_transparent_only_route(session.runtime.key_source.as_ref())? {
+            let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
+            let wallet_db = open_wallet_db(
+                workspace.wallet_db_path(),
+                consensus_network(session.runtime.network),
+            )
             .map_err(|err| {
                 ZeckError::Wallet(format!(
                     "the recovery workspace backing this scan is no longer readable, so its \
                      balances cannot be trusted: {err}"
                 ))
-            })?
-            .ok_or_else(|| {
-                ZeckError::Wallet(
-                    "the recovery workspace backing this scan no longer contains a wallet, \
-                     so its balances cannot be trusted"
-                        .to_owned(),
-                )
             })?;
+            wallet_db
+                .get_wallet_summary(ConfirmationsPolicy::MIN)
+                .map_err(|err| {
+                    ZeckError::Wallet(format!(
+                        "the recovery workspace backing this scan is no longer readable, so \
+                         its balances cannot be trusted: {err}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ZeckError::Wallet(
+                        "the recovery workspace backing this scan no longer contains a \
+                         wallet, so its balances cannot be trusted"
+                            .to_owned(),
+                    )
+                })?;
+        }
 
         refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
         if session.runtime.key_source.wallet_seed()?.is_none() {
@@ -797,6 +805,21 @@ pub fn refuse_memo_without_seed(memo: Option<&str>) -> ZeckResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether this key source scans through `run_transparent_only_scan`, which
+/// creates no account and so leaves nothing in the wallet database.
+///
+/// Asked through `classify_recovery_route`, the predicate the scan routes on,
+/// so the scan and `propose_sweep` cannot disagree about which wallets take it.
+fn is_transparent_only_route(source: &dyn KeySource) -> ZeckResult<bool> {
+    if source.wallet_seed()?.is_some() {
+        return Ok(false);
+    }
+    Ok(source.imported_keys().is_some_and(|keys| {
+        crate::key_source::classify_recovery_route(keys)
+            == crate::key_source::RecoveryRoute::TransparentOnly
+    }))
 }
 
 /// [`refuse_memo_without_seed`], asked of the key source that will be swept.
@@ -3425,5 +3448,176 @@ mod memo_refusal_tests {
         // is seedless here although its user has just typed a seed phrase.
         assert!(!text.contains("has no seed phrase"), "{text}");
         assert!(text.contains("sends no memo"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod propose_workspace_guard_tests {
+    use super::*;
+    use crate::key_source::{ImportedKeySource, SeedKeySource};
+    use crate::models::{AccountBalancePreview, ZeckNetwork};
+    use crate::scan::ScanTaskState;
+    use argos_wallet_import::keys::{Provenance, TransparentKey};
+    use secrecy::Secret;
+
+    fn destination() -> String {
+        crate::derive_accounts(
+            &SecretString::new(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon about"
+                    .to_owned(),
+            ),
+            ZeckNetwork::Mainnet,
+            1,
+        )
+        .expect("derived account")[0]
+            .unified_address
+            .clone()
+    }
+
+    fn request() -> SweepRequest {
+        SweepRequest {
+            destination: destination(),
+            memo: None,
+            max_fee_zatoshis: None,
+            donation_rate: None,
+            donor_email: None,
+        }
+    }
+
+    /// A completed session, built the way `begin_scan_session` leaves the
+    /// workspace: initialized, with no account registered in it.
+    async fn completed_session(
+        data_dir: &std::path::Path,
+        key_source: Arc<dyn KeySource>,
+        account: AccountBalancePreview,
+    ) -> (RecoveryService, ScanHandle) {
+        let runtime = RuntimeScanConfig {
+            key_source,
+            birthday: 1_528_061,
+            num_accounts: None,
+            gap_limit: 20,
+            transparent_scan: None,
+            lightwalletd_url: "https://127.0.0.1:1".to_owned(),
+            data_dir: data_dir.to_owned(),
+            network: ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        let workspace = RecoveryWorkspace::from_runtime(&runtime).expect("workspace paths");
+        workspace
+            .initialize_from_source(runtime.network, runtime.key_source.as_ref())
+            .expect("workspace initializes");
+
+        let handle = ScanHandle::new();
+        let mut task_state = ScanTaskState::new(handle.clone());
+        task_state.progress.phase = ScanPhase::Complete;
+        task_state.progress.accounts = vec![account];
+        task_state.workspace = Some(workspace.clone());
+
+        let service = RecoveryService::new();
+        service.sessions.write().await.insert(
+            handle.id.clone(),
+            Arc::new(ScanSession {
+                state: Arc::new(Mutex::new(task_state)),
+                runtime,
+                started_at: Instant::now(),
+                task: Mutex::new(None),
+                workspace_root: workspace.root().to_owned(),
+            }),
+        );
+        (service, handle)
+    }
+
+    fn transparent_account(zatoshis: u64) -> AccountBalancePreview {
+        AccountBalancePreview {
+            account_index: 0,
+            sapling_address: String::new(),
+            unified_address: String::new(),
+            transparent_receive_address: String::new(),
+            transparent_change_address: String::new(),
+            transparent_utxo_count: 1,
+            sapling_zatoshis: 0,
+            orchard_zatoshis: 0,
+            transparent_zatoshis: zatoshis,
+            total_zatoshis: zatoshis,
+            has_activity: true,
+            status: "204 transparent address(es) checked, 1 funded".to_owned(),
+        }
+    }
+
+    /// A transparent-only `wallet.dat` scanned in the GUI must reach a sweep
+    /// proposal.
+    ///
+    /// That route never builds an account — ZIP-316 gives a transparent-only
+    /// key set no UFVK to anchor one to — so its `wallet.sqlite` is empty by
+    /// design, not because it was lost. The workspace guard read that as a
+    /// deleted workspace and refused every such sweep with "no longer
+    /// contains a wallet", from 1.2.0 through 1.5.2, while the scan above it
+    /// showed the funds. The balance is not taken from that database, and the
+    /// sweep re-reads every UTXO from the chain before signing, so there is
+    /// nothing for the guard to protect here.
+    #[tokio::test]
+    async fn a_transparent_only_scan_can_propose_a_sweep() {
+        let mut keys = argos_wallet_import::ImportedKeys::default();
+        keys.transparent.push(TransparentKey {
+            secret: Secret::new([0x42; 32]),
+            provenance: Provenance::Standalone,
+        });
+        assert_eq!(
+            crate::key_source::classify_recovery_route(&keys),
+            crate::key_source::RecoveryRoute::TransparentOnly,
+            "fixture must classify as transparent-only or this test proves nothing"
+        );
+
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            Arc::new(ImportedKeySource::new(keys)),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+
+        let proposal = service
+            .propose_sweep(&handle, request())
+            .await
+            .expect("a transparent-only scan must be sweepable");
+        assert_eq!(
+            proposal.transactions.len(),
+            1,
+            "{:?}",
+            proposal.transactions
+        );
+        assert_eq!(proposal.transactions[0].gross_zatoshis, 2_099_979_000);
+    }
+
+    /// The other half: the guard still refuses a route whose balances do come
+    /// from the wallet database, when that database holds no wallet. The
+    /// transparent-only exemption must not widen into skipping the check.
+    #[tokio::test]
+    async fn an_hd_scan_with_an_empty_workspace_is_still_refused() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let mut account = transparent_account(0);
+        account.sapling_zatoshis = 5_000_000;
+        account.total_zatoshis = 5_000_000;
+        account.transparent_utxo_count = 0;
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            Arc::new(SeedKeySource::new(SecretString::new(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon about"
+                    .to_owned(),
+            ))),
+            account,
+        )
+        .await;
+
+        let err = service
+            .propose_sweep(&handle, request())
+            .await
+            .expect_err("an HD scan with no wallet in its workspace must not be quoted");
+        assert!(
+            err.to_string().contains("no longer contains a wallet"),
+            "got: {err}"
+        );
     }
 }

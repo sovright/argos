@@ -70,7 +70,32 @@ fn now_epoch_seconds() -> i64 {
 }
 
 const MAX_ACCOUNT_SCAN_COUNT: u32 = 500;
+/// Blocks downloaded and scanned per batch unless the caller chose otherwise.
+/// The in-memory block cache holds one batch, so this bounds its size.
 const SYNC_BATCH_SIZE: u32 = 1_000;
+
+/// The range [`set_sync_batch_size`] clamps to: below this a scan is all
+/// round-trips; above it one batch in the spam era is gigabytes.
+const SYNC_BATCH_RANGE: std::ops::RangeInclusive<u32> = 10..=10_000;
+
+static SYNC_BATCH_BLOCKS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(SYNC_BATCH_SIZE);
+
+/// Trade scan speed for memory: fewer blocks per batch means a smaller
+/// block cache and less decryption work in flight, at the cost of more
+/// round-trips to lightwalletd. Process-wide, set once by the CLI before a
+/// scan starts (`--scan-batch-size`); the GUI keeps the default. Returns the
+/// value actually used, after clamping to [`SYNC_BATCH_RANGE`].
+pub fn set_sync_batch_size(blocks: u32) -> u32 {
+    let blocks = blocks.clamp(*SYNC_BATCH_RANGE.start(), *SYNC_BATCH_RANGE.end());
+    SYNC_BATCH_BLOCKS.store(blocks, std::sync::atomic::Ordering::Relaxed);
+    blocks
+}
+
+/// The batch size scans use.
+pub fn sync_batch_size() -> u32 {
+    SYNC_BATCH_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 enum CacheError {
@@ -108,6 +133,21 @@ impl MemoryBlockCache {
         self.0
             .lock()
             .map_err(|_| CacheError::Corrupted("block cache mutex was poisoned".to_owned()))
+    }
+}
+
+impl MemoryBlockCache {
+    /// Remove `[start, end)` of `range` from the cache.
+    fn evict(&self, range: &ScanRange) -> Result<(), CacheError> {
+        let start = u32::from(range.block_range().start);
+        let end = u32::from(range.block_range().end);
+        let mut guard = self.lock()?;
+        // `BTreeMap` has no remove-range; `split_off` twice removes
+        // `[start, end)` without visiting unrelated entries.
+        let mut tail = guard.split_off(&start);
+        let keep = tail.split_off(&end);
+        guard.extend(keep);
+        Ok(())
     }
 }
 
@@ -202,16 +242,28 @@ impl BlockCache for MemoryBlockCache {
         Ok(())
     }
 
-    async fn delete(&self, range: ScanRange) -> Result<(), Self::Error> {
-        let start = u32::from(range.block_range().start);
-        let end = u32::from(range.block_range().end);
-        let mut guard = self.lock()?;
-        // `BTreeMap` has no remove-range; `split_off` twice removes
-        // `[start, end)` without visiting unrelated entries.
-        let mut tail = guard.split_off(&start);
-        let keep = tail.split_off(&end);
-        guard.extend(keep);
-        Ok(())
+    /// Evicts `range` when called, not when awaited.
+    ///
+    /// `sync::run` pushes each batch's delete future into a Vec and awaits
+    /// them all only when the whole pass ends — its comment assumes a cache
+    /// whose delete spawns the work. As an `async fn` this did nothing until
+    /// then, so every compact block from the birthday to the tip stayed in
+    /// memory for the entire scan: a user's scan was OOM-killed at 11 GiB
+    /// resident on a 16 GB machine. Written out rather than as `async fn` so
+    /// the eviction runs in the synchronous part; the returned future only
+    /// reports the result.
+    fn delete<'life0, 'async_trait>(
+        &'life0 self,
+        range: ScanRange,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let result = self.evict(&range);
+        Box::pin(std::future::ready(result))
     }
 }
 
@@ -1863,7 +1915,7 @@ where
     let cache = MemoryBlockCache::new();
     let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), *network)?;
 
-    sync::run(client, network, &cache, &mut wallet_db, SYNC_BATCH_SIZE)
+    sync::run(client, network, &cache, &mut wallet_db, sync_batch_size())
         .await
         .map_err(|err| ZeckError::Wallet(format!("synchronizing wallet workspace: {err}")))?;
 
@@ -3936,6 +3988,48 @@ mod tests {
                 Ok(())
             })?;
             Ok(heights)
+        }
+
+        /// The batch size trades speed for memory: the cache holds one batch.
+        /// Out-of-range requests are clamped rather than refused, so a typo
+        /// cannot make a scan take a thousand times longer or hold the chain.
+        #[test]
+        fn the_batch_size_is_settable_and_clamped() {
+            use super::super::{set_sync_batch_size, sync_batch_size};
+            assert_eq!(set_sync_batch_size(200), 200);
+            assert_eq!(sync_batch_size(), 200);
+            assert_eq!(set_sync_batch_size(1), 10, "floor");
+            assert_eq!(set_sync_batch_size(1_000_000), 10_000, "ceiling");
+            set_sync_batch_size(1_000);
+            assert_eq!(sync_batch_size(), 1_000);
+        }
+
+        /// The OOM a user hit on a 16 GB machine (11 GiB resident). `sync::run`
+        /// collects each batch's `delete` future in a Vec and awaits them only
+        /// when the whole pass ends; its comment assumes a cache whose delete
+        /// spawns work. A lazy delete therefore kept every block from the
+        /// birthday to the tip in memory. Reproduce that exact pattern: insert
+        /// a batch, create its delete without awaiting it, repeat.
+        #[tokio::test]
+        async fn a_delete_takes_effect_before_it_is_awaited() {
+            let cache = MemoryBlockCache::new();
+            let mut pending = Vec::new();
+            for batch in 0..50u32 {
+                let (start, end) = (1_000 + batch * 100, 1_000 + (batch + 1) * 100);
+                cache
+                    .insert((start..end).map(test_block).collect())
+                    .await
+                    .expect("insert");
+                pending.push(cache.delete(scan_range(start, end)));
+                let held = cache.lock().expect("lock").len();
+                assert_eq!(
+                    held, 0,
+                    "batch {batch}: {held} blocks still held before the delete is awaited"
+                );
+            }
+            for deletion in pending {
+                deletion.await.expect("a late await still succeeds");
+            }
         }
 
         #[tokio::test]

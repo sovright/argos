@@ -209,6 +209,60 @@ rejects the sweep, so no funds move, but the number is not trustworthy
 until then. The full-block scan derives everything from the chain and is
 immune.
 
+**Spent status on the wallet-file path is the wallet's own record.**
+zcashd keeps a `CSproutNoteData` for every note it ever received
+(`spentHeight` is memory-only), so `recover_spendable_sprout_notes`
+recomputes it: a note is spent when `PRF^nf(a_sk, rho)` appears in a
+JoinSplit of a transaction the wallet recorded as mined (`hashBlock`
+non-null, `nIndex != -1`). Never count an unmined transaction's
+nullifiers — zcashd keeps expired `z_sendmany`s forever, and treating them
+as spends hides a live note with no way back, which is worse than a
+phantom balance. What the file cannot see (spends from another copy of the
+wallet) is handled at the sweep: every note is tried, and a refusal about
+the note itself — a spent nullifier, an unknown anchor, or a ZIP-401
+eviction, classified from the node's reject reason by `classify_refusal`,
+never from `error_code` alone — is recorded and carried past. Spent-note
+refusals never stop it, however many come in a row; unknown-anchor ones do
+after `UNKNOWN_ANCHOR_BREAKER` in a row while nothing has been accepted,
+since that pattern is the server, not the notes. A node saying it already
+has this exact transaction (`txn-already-known` and kin) counts as sent.
+Everything else stops the sweep, because it would repeat for every
+remaining note at the cost of a proving run each: `-10`/`-28` (node not
+ready, by code), expiry, any unrecognised reason, a build failure (the
+post-proof failures are about the destination and bundle, not the note),
+and a transport error (which cannot say whether the transaction landed).
+The tip, expiry height and branch id are read before every note. The loop
+is `run_sweep`, generic over `SweepNode`, and is tested with a scripted
+node — keep new sweep behaviour behind it and tested that way.
+
+A full-block scan of the same keys outranks the file for every spend it
+saw. `sprout_scan_run::chain_spends` reads the checkpoint `scan-sprout`
+leaves in the data directory (same key-set fingerprint, same network and
+key checks as resume, via the shared `load_checkpoint`), and
+`recover_spendable_sprout_notes_with_chain` marks any note whose nullifier
+it saw as spent (`SpentEvidence::Chain`). The rule is one-way: absence from
+the scan proves nothing, since the wallet may have spent after the height
+the scan reached, so a spend the wallet recorded still stands.
+
+Surfaces look the scan up only through `chain_spends_for_wallet`. With no
+checkpoint for exactly the wallet's keys it uses one whose key set is a
+strict superset (a scan run with keys typed in beside the wallet's) — never
+a mere overlap: holding every one of the wallet's `a_sk` is what makes a
+planted checkpoint self-defeating. Parsed evidence is cached in
+`ChainSpendsCache`, keyed by path and network and validated by size and
+mtime, because the GUI asks twice per wallet open.
+
+Sprout sweeps are journaled. `sprout_sweep::SweepJournal`
+(`sprout-sweep-<fingerprint>.journal`, beside the checkpoint, same
+key-set fingerprint, `0600`) gets one line per broadcast — note outpoint
+and sweep txid — appended and synced the moment the node accepts it. Every
+surface drops journaled notes before planning (`drop_already_swept`), and
+the sweep loop skips them as a safety net, so an interrupted sweep of
+hundreds of notes never re-proves one it already sent. Only accepted
+broadcasts are journaled; a refusal may be transient. Unlike the
+checkpoint, it is not deleted after a successful sweep: it holds no keys,
+and it is what stops a repeat run from proving everything again.
+
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
 `transparent_recovery`, because ZIP-316 gives it no UFVK to anchor an

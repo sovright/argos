@@ -33,6 +33,7 @@
 //! skipped, per the partial-recovery principle, rather than guessed at.
 
 use crate::{
+    error::ImportDiagnostic,
     keys::{ImportedKeys, JsOutPoint, SproutJoinSplit, SproutNoteData},
     zcashd::records::{compact_size, parse_record_key},
 };
@@ -244,12 +245,22 @@ fn skip_transaction_body(
 }
 
 /// Walk past `CMerkleTx`'s own fields (`hashBlock`, `vMerkleBranch`,
-/// `nIndex`), which follow the `CTransaction` body.
-fn skip_merkle_tx_tail(c: &mut Cursor) -> Option<()> {
-    c.skip(32)?; // hashBlock
+/// `nIndex`), which follow the `CTransaction` body, and say whether the
+/// wallet recorded the transaction as mined.
+///
+/// The test is zcashd's own (`GetDepthInMainChainINTERNAL`): a null
+/// `hashBlock` or `nIndex == -1` is depth zero. It is the wallet's record,
+/// not the chain's — a transaction mined while the node was down still
+/// reads as unmined — so it only decides what to trust, never what exists.
+fn read_merkle_tx_tail(c: &mut Cursor) -> Option<bool> {
+    let hash_block = c.take(32)?;
     let n_branch = usize::try_from(c.compact_size()?).ok()?;
     c.skip(n_branch.checked_mul(32)?)?; // vMerkleBranch: Vec<uint256>
-    c.skip(4) // nIndex
+    let &[a, b, c3, d] = c.take(4)? else {
+        return None;
+    };
+    let n_index = i32::from_le_bytes([a, b, c3, d]);
+    Some(hash_block.iter().any(|&x| x != 0) && n_index != -1)
 }
 
 fn read_var_string(c: &mut Cursor) -> Option<()> {
@@ -326,7 +337,7 @@ fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) ->
     let mut joinsplits = Vec::new();
     let mut notes = Vec::new();
     skip_transaction_body(&mut c, txid, &mut joinsplits)?;
-    skip_merkle_tx_tail(&mut c)?;
+    let mined = read_merkle_tx_tail(&mut c)?;
 
     // vUnused (formerly vtxPrev): always empty in every wallet this crate
     // has seen. A nonzero count means either an ancient wallet format
@@ -386,6 +397,9 @@ fn extract_sprout_notes(value: &[u8], txid: [u8; 32], out: &mut ImportedKeys) ->
         }
     }
 
+    if !mined && !joinsplits.is_empty() {
+        out.sprout_unconfirmed_txids.push(txid);
+    }
     out.sprout_notes.append(&mut notes);
     out.sprout_joinsplits.append(&mut joinsplits);
     Some(())
@@ -428,8 +442,34 @@ pub fn collect_sprout_notes(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys
         let Ok(txid) = <[u8; 32]>::try_from(rec.rest.as_slice()) else {
             continue;
         };
-        let _ = extract_sprout_notes(value, txid, out);
+        // v5 cannot carry a JoinSplit (`read_v5` has no Sprout bundle), so
+        // it holds nothing this walk wants. Refusing it is not a failure.
+        if is_v5_or_later(value) {
+            continue;
+        }
+        // Reported, never dropped. A transaction that cannot be walked takes
+        // its nullifiers with it, and every note it spent then reads as
+        // unspent — the Sprout total grows with no sign anything is wrong.
+        if extract_sprout_notes(value, txid, out).is_none() {
+            let shown: String = txid.iter().rev().map(|b| format!("{b:02x}")).collect();
+            out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
+                record_type: "tx".to_owned(),
+                reason: format!(
+                    "transaction {shown} could not be read, so any Sprout note it \
+                     received or spent is unaccounted for"
+                ),
+            });
+        }
     }
+}
+
+/// Whether a `tx` record is a v5 (NU5) or later transaction.
+fn is_v5_or_later(value: &[u8]) -> bool {
+    let Some(&[a, b, c, d]) = value.get(..4) else {
+        return false;
+    };
+    let header = u32::from_le_bytes([a, b, c, d]);
+    header & 0x8000_0000 != 0 && header & 0x7fff_ffff >= 5
 }
 
 #[cfg(test)]
@@ -849,5 +889,101 @@ mod tests {
             "a record that fails to walk must not leave JoinSplits behind"
         );
         assert!(out.sprout_notes.is_empty());
+        // ...and it must say so: the nullifiers it held are gone, so any
+        // note it spent would otherwise read as unspent with no warning.
+        match out.diagnostics.as_slice() {
+            [ImportDiagnostic::UnparseableRecord {
+                record_type,
+                reason,
+            }] => {
+                assert_eq!(record_type, "tx");
+                assert!(reason.contains(&"44".repeat(32)), "{reason}");
+            }
+            other => panic!("expected one tx diagnostic, got {other:?}"),
+        }
+    }
+
+    /// A v4 `tx` record holding one JoinSplit, followed by a `CMerkleTx`
+    /// tail with the given `hashBlock` and `nIndex`, and an empty wallet
+    /// tail (no vUnused, no mapValue, no notes).
+    fn tx_record_with_tail(
+        txid: [u8; 32],
+        hash_block: [u8; 32],
+        n_index: i32,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut value = Vec::new();
+        value.extend_from_slice(&0x8000_0004u32.to_le_bytes());
+        value.extend_from_slice(&[0x89, 0xBB, 0x09, 0x00]);
+        value.push(0x00); // n_vin
+        value.push(0x00); // n_vout
+        value.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        value.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
+        value.extend_from_slice(&0i64.to_le_bytes()); // valueBalanceSapling
+        value.push(0x00);
+        value.push(0x00);
+        value.push(0x01); // n_js = 1
+        value.extend_from_slice(&js_description_bytes(true));
+        value.extend_from_slice(&[0x7E; 32]); // joinSplitPubKey
+        value.extend_from_slice(&[0x7F; 64]); // joinSplitSig
+        value.extend_from_slice(&hash_block);
+        value.push(0x00); // vMerkleBranch
+        value.extend_from_slice(&n_index.to_le_bytes());
+        value.push(0x00); // vUnused
+        value.push(0x00); // mapValue
+        value.push(0x00); // mapSproutNoteData
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+        key.extend_from_slice(&txid);
+        (key, value)
+    }
+
+    /// zcashd writes a transaction before relaying it and fills in
+    /// `hashBlock`/`nIndex` only once it is mined. One that expired or was
+    /// never relayed keeps a null `hashBlock` forever; its nullifiers are
+    /// not spends, and must not be treated as proof its inputs are gone.
+    #[test]
+    fn a_transaction_the_wallet_never_saw_mined_is_marked_unconfirmed() {
+        let mined = tx_record_with_tail([0x51; 32], [0x0B; 32], 3);
+        let never_mined = tx_record_with_tail([0x52; 32], [0u8; 32], 0);
+        let unindexed = tx_record_with_tail([0x53; 32], [0x0B; 32], -1);
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[mined, never_mined, unindexed], &mut out);
+
+        assert_eq!(out.sprout_joinsplits.len(), 3, "{:?}", out.diagnostics);
+        let mut unconfirmed = out.sprout_unconfirmed_txids.clone();
+        unconfirmed.sort_unstable();
+        assert_eq!(unconfirmed, vec![[0x52; 32], [0x53; 32]]);
+    }
+
+    #[test]
+    fn a_v5_transaction_is_skipped_not_reported() {
+        let mut value = 0x8000_0005u32.to_le_bytes().to_vec();
+        value.extend_from_slice(&[0xAA; 40]);
+        let mut key = vec![2u8];
+        key.extend_from_slice(b"tx");
+        key.extend_from_slice(&[0x45; 32]);
+
+        let mut out = ImportedKeys::default();
+        collect_sprout_notes(&[(key, value)], &mut out);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// Every real `tx` record in the golden wallets walks: none may be
+    /// reported, or the diagnostic above would be noise on every import.
+    #[test]
+    fn the_golden_wallets_report_no_unreadable_transactions() {
+        for name in [
+            "sprout-plaintext.dat",
+            "sprout-encrypted.dat",
+            "modern-plaintext.dat",
+            "modern-encrypted.dat",
+        ] {
+            let bytes = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
+            let pairs = crate::bdb::walk(&bytes).unwrap();
+            let mut out = ImportedKeys::default();
+            collect_sprout_notes(&pairs, &mut out);
+            assert!(out.diagnostics.is_empty(), "{name}: {:?}", out.diagnostics);
+        }
     }
 }
