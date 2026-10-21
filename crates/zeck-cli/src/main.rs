@@ -641,7 +641,7 @@ async fn sweep_sprout(
         dry_run,
         confirm_sweep,
     } = gate;
-    let recovered = recover_with_scan(keys, network, data_dir);
+    let recovered = recover_with_scan(keys, network, data_dir).await;
     // stdout, beside the plan: `> plan.txt` must keep the reason the total
     // is smaller than the wallet's history.
     print_sprout_accounting(keys, &recovered, false, "argos inspect-wallet --show-spent");
@@ -1046,7 +1046,7 @@ fn print_sprout_accounting(
 /// same keys — if one has run in this data directory — settle every spend it
 /// saw on chain. The scan is optional; a checkpoint that cannot be used is
 /// reported and the file's own record stands.
-fn recover_with_scan(
+async fn recover_with_scan(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     data_dir: &Path,
@@ -1056,7 +1056,9 @@ fn recover_with_scan(
         data_dir,
         network.into(),
         &spending_keys,
-    );
+        &[],
+    )
+    .await;
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
         chain.as_deref(),
@@ -1263,7 +1265,7 @@ fn print_sprout_next_steps() {
     );
 }
 
-fn print_sprout_inspection(
+async fn print_sprout_inspection(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     show_spent: bool,
@@ -1290,7 +1292,7 @@ fn print_sprout_inspection(
         // witness. A wallet with both needs no network at all; a wallet
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
-        let recovered = recover_with_scan(keys, network, data_dir);
+        let recovered = recover_with_scan(keys, network, data_dir).await;
         print_sprout_accounting(
             keys,
             &recovered,
@@ -1353,7 +1355,7 @@ fn print_sprout_inspection(
 /// This is the only useful thing it can do with a zcashd `wallet.dat`
 /// today, so it must be honest about the difference between "found a
 /// key" and "can move the funds".
-fn print_wallet_inspection(
+async fn print_wallet_inspection(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     show_spent: bool,
@@ -1418,7 +1420,7 @@ fn print_wallet_inspection(
     // The Sprout address list and spendability verdict live in a helper to
     // keep this function to one screen; the key/note counts above come from
     // the parser, and this adds what the recovery path can say about them.
-    print_sprout_inspection(keys, network, show_spent, data_dir);
+    print_sprout_inspection(keys, network, show_spent, data_dir).await;
 
     // Never summarized away: an unread record means key material that
     // still exists only in the original file, and the user is the only
@@ -1799,7 +1801,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::InspectWallet { show_spent } => {
             let source = imported.expect("--wallet-file is required and was checked above");
-            print_wallet_inspection(source.keys(), network, show_spent, &cli.data_dir);
+            print_wallet_inspection(source.keys(), network, show_spent, &cli.data_dir).await;
         }
 
         // Dispatched above, before key-source resolution, so that it never
@@ -2814,6 +2816,34 @@ fn powershell_quote(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-cli-unverified-sprout-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_sk = [0x51; 32];
+        let mut keys = ImportedKeys::default();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk)
+                    .to_bytes(),
+                provenance: argos_core::argos_wallet_import::keys::Provenance::Standalone,
+            });
+        let recovered = recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir).await;
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let notice = recovered.chain_notice.unwrap();
+        assert!(
+            notice.contains(&checkpoint.display().to_string()),
+            "{notice}"
+        );
+        assert!(notice.contains("wallet file's own record"), "{notice}");
+        assert!(recovered.spent.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     /// The speed-for-memory knob reaches the scanner.

@@ -664,12 +664,11 @@ fn a_key_source_the_command_would_ignore_is_refused() {
     }
 }
 
-/// A full-block scan of a wallet's keys, run earlier in the same data
-/// directory, is what settles spends the wallet file cannot see — notes
-/// spent from another copy of the wallet. inspect-wallet must find it by
-/// itself, from the checkpoint `scan-sprout` leaves behind, and say it did.
+/// A saved checkpoint alone cannot settle spends. Inspection must find it,
+/// attempt live verification, and keep the wallet file's own accounting when
+/// verification is unavailable.
 #[test]
-fn inspect_wallet_consults_a_scan_of_the_same_keys() {
+fn inspection_refuses_an_unverified_scan_of_the_same_keys() {
     use secrecy::ExposeSecret;
 
     let path = fixture(SPROUT_PLAINTEXT);
@@ -719,13 +718,13 @@ fn inspect_wallet_consults_a_scan_of_the_same_keys() {
         "{}",
         String::from_utf8_lossy(&with_scan.stderr)
     );
-    // This checkpoint never reached the tip, so it must be named as a scan
-    // that stopped — never as an all-clear (#240 review, finding 3).
+    // This synthetic checkpoint has no reachable canonical peer. It must
+    // never be promoted into spent-note evidence merely because it exists.
     let with = with.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        with.contains("stopped at height 2000000")
-            && with.contains("before reaching the chain tip"),
-        "the scan must be found, and said to have stopped early:\n{with}"
+        with.contains("will not use its spent-note evidence")
+            && with.contains("Spent status is the wallet file's own record"),
+        "the scan must be found and refused without live verification:\n{with}"
     );
     let without = String::from_utf8_lossy(&without_scan.stdout);
     let without = without.split_whitespace().collect::<Vec<_>>().join(" ");

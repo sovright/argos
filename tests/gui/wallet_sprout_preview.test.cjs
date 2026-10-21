@@ -363,6 +363,40 @@ function inspected(overrides) {
 }
 const texts = (el) => el.children.map((c) => c.textContent);
 
+test("unverified checkpoint notice stays visible while wallet-file preview remains available", async () => {
+  const checkpoint = "/fixture/workspace/sprout-scan-123.checkpoint";
+  const notice = `Not using the full-block scan checkpoint at ${checkpoint}. Spent status is the wallet file's own record.`;
+  const h = harness(inspected({
+    sprout_spendable_notes: 1,
+    sprout_spendable_zatoshis: 100000,
+    sprout_accounting: [notice],
+    sprout_spent_status: "Spent status comes from this wallet file's own history.",
+  }));
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), [notice]);
+  assert.match(h.$("sprout-sweep-spent-status").textContent, /wallet file's own history/);
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+  assert.deepEqual(h.previews.at(-1), {
+    path: "/fixture/wallet.dat", passphrase: null, network: "mainnet", dataDir: null,
+  });
+});
+
+test("deep reorg notice names the preserved checkpoint and source wallet", async () => {
+  const checkpoint = "/fixture/workspace/sprout-scan-456.checkpoint";
+  const notice = `The scan checkpoint at ${checkpoint} could not be reconciled. Keep the original wallet or key for a safe full rescan.`;
+  const h = harness(inspected({
+    sprout_spendable_notes: 0,
+    sprout_spendable_zatoshis: 0,
+    sprout_nothing_left: false,
+    sprout_accounting: [notice],
+  }));
+  await h.open("/fixture/wallet.dat");
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), [notice]);
+  assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /keep the original wallet or key/i);
+  assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /sprout-scan-456\.checkpoint/);
+});
+
 test("a wallet that spent every Sprout note says so instead of asking for note data", async () => {
   const h = harness(inspected({
     sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,

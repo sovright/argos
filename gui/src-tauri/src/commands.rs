@@ -403,7 +403,7 @@ struct SproutSummary {
 /// Compute the Sprout summary for a wallet. Body is verbatim the logic that
 /// previously lived inline in `inspect_wallet_file`: reject forged keys, then
 /// try to recover notes, then quote the scan cost when a scan would be needed.
-fn compute_sprout_summary(
+async fn compute_sprout_summary(
     app: &AppHandle,
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
     network_name: &str,
@@ -417,7 +417,7 @@ fn compute_sprout_summary(
     // stored address must not be counted, shown, or spent with.
     let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(keys);
 
-    let recovered = recover_with_scan(app, keys, network_from(network_name), data_dir);
+    let recovered = recover_with_scan(app, keys, network_from(network_name), data_dir).await;
     let SproutScreen {
         nothing_left,
         needs_scan: _,
@@ -560,7 +560,7 @@ pub async fn inspect_wallet_file(
     // readable. It takes `&mut keys` because rejecting forged Sprout keys
     // must drop them before anything else reads the wallet.
     let mut keys = keys;
-    let sprout = compute_sprout_summary(&app, &mut keys, &network_name, data_dir.as_deref());
+    let sprout = compute_sprout_summary(&app, &mut keys, &network_name, data_dir.as_deref()).await;
 
     Ok(WalletFileSummary {
         path,
@@ -912,7 +912,7 @@ pub async fn preview_sprout_sweep(
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
     let network = network_from(network.as_deref().unwrap_or("mainnet"));
-    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
+    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref()).await;
     let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
 
     let params_path = argos_core::sprout_sweep::default_params_path();
@@ -987,7 +987,7 @@ pub async fn execute_sprout_sweep(
         .map_err(|err| err.to_string())?;
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
-    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
+    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref()).await;
     if recovered.notes.is_empty() {
         // Said by cause: a file Argos could not read, and a wallet whose
         // notes the file or the scan show as spent, need different next steps.
@@ -1477,22 +1477,33 @@ fn network_from(name: &str) -> argos_core::ZeckNetwork {
 /// from this app is found without asking. The scan is optional: without one,
 /// or with one that cannot be used, the file's own record stands, and the
 /// reason is logged rather than failing the wallet screen.
-fn recover_with_scan(
+async fn recover_with_scan(
     app: &AppHandle,
     keys: &argos_core::argos_wallet_import::ImportedKeys,
     network: argos_core::ZeckNetwork,
     data_dir: Option<&str>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
+    recover_with_scan_in_dir(keys, network, resolve_data_dir(app, data_dir)).await
+}
+
+async fn recover_with_scan_in_dir(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    dir: Option<PathBuf>,
+) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
-    let dir = resolve_data_dir(app, data_dir);
     // The lookup's notice is shown on the wallet screen, not logged: a scan
     // that exists but cannot be used must not look like no scan at all.
     let (chain, mut notice) = match &dir {
-        Some(dir) => argos_core::sprout_scan_run::chain_spends_for_wallet(
-            dir,
-            network.into(),
-            &spending_keys,
-        ),
+        Some(dir) => {
+            argos_core::sprout_scan_run::chain_spends_for_wallet(
+                dir,
+                network.into(),
+                &spending_keys,
+                &[],
+            )
+            .await
+        }
         None => (None, None),
     };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
@@ -2093,6 +2104,33 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use argos_core::sprout_recovery::{SpentSproutNote, SproutRecovery};
+
+    #[tokio::test]
+    async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-gui-unverified-sprout-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_sk = [0x52; 32];
+        let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk)
+                    .to_bytes(),
+                provenance: argos_core::argos_wallet_import::keys::Provenance::Standalone,
+            });
+        let recovered =
+            recover_with_scan_in_dir(&keys, argos_core::ZeckNetwork::Mainnet, Some(dir.clone()))
+                .await;
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let accounting = recovered.accounting_lines().join(" ");
+        assert!(accounting.contains(&checkpoint.display().to_string()));
+        assert!(accounting.contains("wallet file's own record"));
+        assert!(recovered.spent.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn spent_note() -> SpentSproutNote {
         SpentSproutNote {
