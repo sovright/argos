@@ -67,10 +67,15 @@ function driveHandler(name, boxText, report) {
   $("sprout-scan-keys").value = boxText;
   $("sprout-scan-destination").value = "zs1destination";
   $("network-select").value = "mainnet";
+  // The decrypt-bound inputs (#260): an empty panel birthday, the untouched
+  // main field and the skip left on, so the wallet's own skip applies.
+  $("sprout-scan-every-block").checked = false;
+  $("birthday-height").value = "419200";
   const calls = [];
   const context = {
     $,
     walletFile: null,
+    birthdayTouched: false,
     document: { createElement: el },
     fmt: String,
     setStatus() {},
@@ -86,7 +91,16 @@ function driveHandler(name, boxText, report) {
   const end = source.indexOf("\n}\n", start) + 3;
   Object.assign(
     context,
-    loadFunctions(["sproutScanKeyLines", "sproutScanKeyEntries", "sproutScanKeys"], context),
+    loadFunctions(
+      [
+        "sproutScanKeyLines",
+        "sproutScanKeyEntries",
+        "sproutScanKeys",
+        "sproutDecryptRequest",
+        "currentSproutDecryptRequest",
+      ],
+      context,
+    ),
   );
   vm.createContext(context);
   const run = vm.runInContext(`${source.slice(start, end)}; ${name}`, context);
@@ -104,6 +118,9 @@ test("runSproutScan sends the unfiltered lines so backend line numbers match the
   assert.equal(calls.length, 1, "comments and blanks must not block a real key");
   assert.equal(calls[0].command, "start_sprout_scan");
   assert.deepEqual([...calls[0].args.keys], RAW_LINES);
+  // Nothing chosen: no floor, skip left to the wallet's own key times.
+  assert.equal(calls[0].args.birthdayFloor, null);
+  assert.equal(calls[0].args.decryptEveryBlock, false);
 });
 
 test("runSproutScanSweep sends the unfiltered lines so backend line numbers match the box", async () => {

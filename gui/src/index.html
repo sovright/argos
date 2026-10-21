@@ -372,8 +372,32 @@
                   </p>
                 </details>
 
+                <!-- Mirrors `scan-sprout --no-birthday-skip` / `--birthday`.
+                     A wallet.dat whose Sprout keys are all dated skips
+                     trial decryption before them; the file's times are its
+                     own claim, so the user can always undo the skip. -->
+                <details id="sprout-scan-skip">
+                  <summary>Where decryption starts</summary>
+                  <p class="muted">
+                    If every Sprout key in your wallet file records when it was created, the
+                    scan still reads every block but does not try to decrypt notes in blocks
+                    made before then, which saves hours. Keys pasted above have no creation time,
+                    so with any of them every block is decrypted.
+                  </p>
+                  <label class="checkbox-row">
+                    <input type="checkbox" id="sprout-scan-every-block" />
+                    Decrypt every block (ignore the wallet file's key creation times)
+                  </label>
+                  <label for="sprout-scan-birthday">
+                    Birthday for this scan (optional; can only move the start earlier)
+                  </label>
+                  <input id="sprout-scan-birthday" type="number" min="0" inputmode="numeric"
+                    placeholder="Block height" />
+                </details>
+
                 <button id="sprout-scan-run" type="button">Start scan</button>
                 <p id="sprout-scan-status" class="status-line"></p>
+                <p id="sprout-scan-plan" class="muted"></p>
                 <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
 
                 <!-- Revealed only once a scan has actually found notes. A

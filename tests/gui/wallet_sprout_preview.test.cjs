@@ -84,7 +84,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     sweep: () => vm.runInContext("runSproutSweep()", context),
     peek: (expr) => vm.runInContext(expr, context),
     // The scan-sweep handler lives outside the slices above; load it on its
-    // own, with its two input helpers stubbed only if not already present.
+    // own, with its input helpers stubbed only if not already present.
     scanSweep() {
       const start = source.indexOf("async function runSproutScanSweep()");
       const end = source.indexOf("\n}\n", start) + 3;
@@ -769,6 +769,35 @@ test("the scan sweep keeps the caveat when a note was refused", async () => {
     await h.scanSweep();
     assert.equal(h.peek("uncoveredSproutKeys") > 0, kept, `rejected=${rejected.length}`);
     if (kept) assert.match(h.$("sprout-scan-status").textContent, /1 note\(s\) refused/);
+  }
+});
+
+// The sweep resumes the saved scan, and the backend reads the bound that
+// scan used from its checkpoint. The form may have changed since — an
+// auto-detected or retyped main birthday below the scan's skip — and
+// re-deriving the bound from it would make the resume conflict after hours
+// of scanning. So the sweep must send no decrypt request at all, and must
+// not be stopped by a form value it no longer reads.
+test("the scan sweep sends no decrypt bound, whatever the form says now", async () => {
+  for (const formNow of [
+    "{ birthdayFloor: 1000, decryptEveryBlock: true }",
+    "{ error: 'The Sprout scan birthday must be a block number.' }",
+  ]) {
+    const sent = [];
+    const h = harness((command, args, fallback) => {
+      if (command === "sweep_sprout_from_scan") {
+        sent.push({ ...args });
+        return { sent: [], total_swept: 0, skipped: [], rejected: [], error: null };
+      }
+      return fallback();
+    });
+    h.peek(`function currentSproutDecryptRequest() { return ${formNow}; }`);
+    h.$("sprout-scan-destination").value = "fixture-destination";
+    h.$("sprout-scan-confirm").checked = true;
+    await h.scanSweep();
+    assert.equal(sent.length, 1, formNow);
+    assert.equal("birthdayFloor" in sent[0], false, JSON.stringify(sent[0]));
+    assert.equal("decryptEveryBlock" in sent[0], false, JSON.stringify(sent[0]));
   }
 });
 
