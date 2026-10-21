@@ -164,6 +164,12 @@ impl RecoveryWorkspace {
     pub fn broadcast_log_path(&self) -> PathBuf {
         self.root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME)
     }
+
+    /// Establish the private workspace before the broadcast lock sidecar is opened.
+    pub fn ensure_broadcast_log_directory(&self) -> ZeckResult<()> {
+        create_private_dir_all(&self.root)?;
+        tighten_private_perms(&self.private_root, &self.root)
+    }
 }
 
 /// The consensus parameter set Argos evaluates heights against.

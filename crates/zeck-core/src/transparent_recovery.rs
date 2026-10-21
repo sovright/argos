@@ -795,7 +795,15 @@ async fn submit_transparent_prepared<S: BroadcastStore, N: TxSubmitter>(
             txid: Some(submitted.txid.to_string()),
             status: submitted.state,
             fee_zatoshis: submitted.fee_zatoshis,
-            detail: format!("transparent sweep submission: {:?}", submitted.disposition),
+            detail: format!(
+                "transparent sweep submission: {:?}{}",
+                submitted.disposition,
+                submitted
+                    .persistence_warning
+                    .as_ref()
+                    .map(|warning| format!(" Persistence warning: {warning}"))
+                    .unwrap_or_default()
+            ),
             confirmed_height: None,
         },
         disposition: submitted.disposition,
@@ -921,7 +929,96 @@ mod tests {
 mod sweep_tests {
     use super::tests_support::*;
     use super::*;
+    use crate::TxLifecycleState;
     use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK};
+
+    #[tokio::test]
+    async fn transparent_record_keeps_txid_fee_and_warning_when_final_sync_fails() {
+        use crate::broadcast::{BroadcastStore, DurableBroadcastLog, TxSubmitter};
+        use zcash_client_backend::proto::service::SendResponse;
+        use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+        use zcash_protocol::consensus::BranchId;
+
+        struct FinalSyncFails(DurableBroadcastLog);
+        impl BroadcastStore for FinalSyncFails {
+            fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
+                self.0.persist_prepared(tx)
+            }
+            fn transition(
+                &mut self,
+                txid: zcash_primitives::transaction::TxId,
+                state: TxLifecycleState,
+                submission: Option<&crate::broadcast::SubmissionDisposition>,
+                observation: Option<&crate::broadcast::TxObservation>,
+            ) -> ZeckResult<()> {
+                if submission.is_some() {
+                    return Err(ZeckError::Storage("final sync failed".to_owned()));
+                }
+                self.0.transition(txid, state, submission, observation)
+            }
+            fn latest(
+                &self,
+                txid: zcash_primitives::transaction::TxId,
+            ) -> Option<crate::broadcast::PersistedTransaction> {
+                self.0.latest(txid)
+            }
+        }
+        struct Accepted;
+        #[async_trait::async_trait]
+        impl TxSubmitter for Accepted {
+            async fn send_raw(&mut self, _: Vec<u8>) -> Result<SendResponse, tonic::Status> {
+                Ok(SendResponse {
+                    error_code: 0,
+                    error_message: String::new(),
+                })
+            }
+        }
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::V5,
+            BranchId::Nu5,
+            0,
+            BlockHeight::from_u32(100),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let mut raw_tx = Vec::new();
+        tx.write(&mut raw_tx).unwrap();
+        let prepared = PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx,
+            fee_zatoshis: 10_000,
+            expiry_height: Some(100),
+        };
+        let plan = TransparentSweepPlan {
+            input_count: 1,
+            total_input_zatoshis: 30_000,
+            fee_zatoshis: 10_000,
+            output_zatoshis: 20_000,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FinalSyncFails(
+            DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap(),
+        );
+        let result =
+            submit_transparent_prepared(&mut store, &mut Accepted, prepared, plan, "destination")
+                .await
+                .unwrap();
+        assert_eq!(result.transaction.txid, Some(tx.txid().to_string()));
+        assert_eq!(result.transaction.fee_zatoshis, 10_000);
+        assert_eq!(
+            result.transaction.status,
+            TxLifecycleState::SubmissionUnknown
+        );
+        assert!(result.transaction.detail.contains("final sync failed"));
+        assert_eq!(
+            store.latest(tx.txid()).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
 
     #[tokio::test]
     async fn transparent_transport_failure_returns_known_txid_and_unknown_state() {

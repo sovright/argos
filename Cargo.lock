@@ -134,9 +134,11 @@ dependencies = [
  "dialoguer",
  "indicatif",
  "secrecy",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zcash_primitives",
 ]
 
 [[package]]

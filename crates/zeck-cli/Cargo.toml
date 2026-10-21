@@ -18,6 +18,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 argos-core = { path = "../zeck-core" }
 
+[dev-dependencies]
+tempfile.workspace = true
+zcash_primitives.workspace = true
+
 [features]
 # `argos-network` — test-only passthrough to the core feature of the same
 # name, so the regtest integration tests can drive the real `argos` binary

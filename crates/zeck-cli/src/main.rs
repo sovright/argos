@@ -490,6 +490,9 @@ async fn run_transparent_sweep(
     dry_run: bool,
     confirm_sweep: bool,
 ) -> Result<()> {
+    // Hold the durable lock through scanning and submission. A prior unknown
+    // transaction takes precedence even if the new UTXO scan is empty.
+    let mut log = open_standalone_broadcast_log(data_dir, keys, network)?;
     // Report before deciding, so a dry run and a real sweep show the user
     // the same numbers.
     let report = scan_transparent_only(keys, network, lightwalletd_url).await?;
@@ -522,7 +525,6 @@ async fn run_transparent_sweep(
         );
     }
 
-    let mut log = open_standalone_broadcast_log(data_dir, keys, network)?;
     let outcome = sweep_transparent_only(
         &mut log,
         keys,
@@ -550,9 +552,9 @@ async fn run_transparent_sweep(
     println!("  Destination  {}", outcome.destination);
     println!();
     if outcome.transaction.status == argos_core::TxLifecycleState::SubmissionUnknown {
-        bail!("Transaction {} (fee {}) may already have reached the network; do not retry or discard the source wallet. Reconcile this txid before any further sweep.",
+        bail!("Transaction {} (fee {}) may already have reached the network; do not retry or discard the source wallet. Reconcile this txid before any further sweep. {}",
             outcome.transaction.txid.as_deref().unwrap_or("unknown"),
-            format_zec(outcome.transaction.fee_zatoshis));
+            format_zec(outcome.transaction.fee_zatoshis), outcome.transaction.detail);
     }
     if outcome.transaction.status == argos_core::TxLifecycleState::Rejected {
         bail!(
@@ -2865,6 +2867,44 @@ fn powershell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_transparent_scan_reports_prior_blocking_txid() {
+        use argos_core::broadcast::{BroadcastStore, PreparedTransaction, SubmissionDisposition};
+        use zcash_primitives::transaction::TxId;
+        let dir = tempfile::tempdir().unwrap();
+        let txid = TxId::from_bytes([9; 32]);
+        let mut log = open_standalone_broadcast_log(dir.path(), &[], ZeckNetwork::Mainnet).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![1],
+            fee_zatoshis: 10_000,
+            expiry_height: None,
+        })
+        .unwrap();
+        log.transition(
+            txid,
+            argos_core::TxLifecycleState::SubmissionUnknown,
+            Some(&SubmissionDisposition::AmbiguousTransport),
+            None,
+        )
+        .unwrap();
+        drop(log);
+        let error = run_transparent_sweep(
+            &[],
+            dir.path(),
+            ZeckNetwork::Mainnet,
+            "http://127.0.0.1:1",
+            "irrelevant",
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect_err("a zero scan cannot hide a prior uncertain submission");
+        assert!(error.to_string().contains(&txid.to_string()), "{error}");
+        assert!(error.to_string().contains("reconcile"), "{error}");
+    }
 
     /// The speed-for-memory knob reaches the scanner.
     #[test]

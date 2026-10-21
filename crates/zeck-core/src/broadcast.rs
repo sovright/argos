@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    fs::OpenOptions,
     io::Cursor,
     path::{Path, PathBuf},
     time::Duration,
@@ -151,6 +152,8 @@ pub struct TxSubmissionResult {
     pub state: TxLifecycleState,
     pub fee_zatoshis: u64,
     pub disposition: SubmissionDisposition,
+    /// The pre-I/O Unknown was synced, but the post-I/O status could not be.
+    pub persistence_warning: Option<String>,
 }
 
 impl TxSubmissionResult {
@@ -325,12 +328,20 @@ where
             TxLifecycleState::SubmissionUnknown
         }
     };
-    store.transition(tx.txid, state, Some(&disposition), None)?;
+    let persistence_warning = store
+        .transition(tx.txid, state, Some(&disposition), None)
+        .err()
+        .map(|err| format!("post-submission status could not be persisted ({err}); reconcile the durable pre-submission Unknown for {}", tx.txid));
     Ok(TxSubmissionResult {
         txid: tx.txid,
-        state,
+        state: if persistence_warning.is_some() {
+            TxLifecycleState::SubmissionUnknown
+        } else {
+            state
+        },
         fee_zatoshis: tx.fee_zatoshis,
         disposition,
+        persistence_warning,
     })
 }
 
@@ -357,6 +368,9 @@ pub struct DurableBroadcastLog {
     path: PathBuf,
     latest: HashMap<TxId, PersistedTransaction>,
     write_failed: bool,
+    // SQLite owns an OS file lock, released by Drop or process death. The
+    // sidecar never stores transaction data and cannot leave a stale lock.
+    _process_lock: rusqlite::Connection,
 }
 
 impl DurableBroadcastLog {
@@ -376,6 +390,65 @@ impl DurableBroadcastLog {
 
     pub fn open(path: impl AsRef<Path>) -> ZeckResult<Self> {
         let path = path.as_ref().to_path_buf();
+        let lock_path = path.with_file_name(format!(
+            "{}.lock.sqlite",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("broadcast")
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(0o600);
+            options.open(&lock_path).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "opening broadcast lock {}: {err}",
+                    lock_path.display()
+                ))
+            })?;
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "securing broadcast lock {}: {err}",
+                    lock_path.display()
+                ))
+            })?;
+        }
+        #[cfg(not(unix))]
+        options.open(&lock_path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "opening broadcast lock {}: {err}",
+                lock_path.display()
+            ))
+        })?;
+        let process_lock = rusqlite::Connection::open(&lock_path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "opening broadcast lock {}: {err}",
+                lock_path.display()
+            ))
+        })?;
+        process_lock
+            .busy_timeout(Duration::ZERO)
+            .map_err(|err| ZeckError::Storage(format!("setting broadcast lock timeout: {err}")))?;
+        process_lock
+            .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
+            .map_err(|err| {
+                ZeckError::Storage(format!("broadcast log {} is in use: {err}", path.display()))
+            })?;
+        let mut log = Self {
+            path,
+            latest: HashMap::new(),
+            write_failed: false,
+            _process_lock: process_lock,
+        };
+        log.replay_from_disk()?;
+        Ok(log)
+    }
+
+    fn replay_from_disk(&mut self) -> ZeckResult<()> {
+        self.latest.clear();
+        let path = self.path.clone();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -386,19 +459,14 @@ impl DurableBroadcastLog {
                 )))
             }
         };
-        let mut log = Self {
-            path,
-            latest: HashMap::new(),
-            write_failed: false,
-        };
         if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             return Err(ZeckError::Storage(format!(
                 "incomplete broadcast log at {}: final event has no newline",
-                log.path.display()
+                path.display()
             )));
         }
         if bytes.is_empty() {
-            return Ok(log);
+            return Ok(());
         }
         let complete_bytes = &bytes[..bytes.len() - 1];
         for (index, line) in complete_bytes.split(|byte| *byte == b'\n').enumerate() {
@@ -406,7 +474,7 @@ impl DurableBroadcastLog {
                 ZeckError::Storage(format!(
                     "invalid broadcast log event {} in {}: {err}",
                     index + 1,
-                    log.path.display()
+                    path.display()
                 ))
             })?;
             let version = value
@@ -417,19 +485,19 @@ impl DurableBroadcastLog {
                     "unsupported broadcast log schema {:?} at event {} in {}",
                     version,
                     index + 1,
-                    log.path.display()
+                    path.display()
                 )));
             }
             let event: BroadcastLogEvent = serde_json::from_value(value).map_err(|err| {
                 ZeckError::Storage(format!(
                     "invalid broadcast log event {} in {}: {err}",
                     index + 1,
-                    log.path.display()
+                    path.display()
                 ))
             })?;
-            log.apply_event(event)?;
+            self.apply_event(event)?;
         }
-        Ok(log)
+        Ok(())
     }
 
     fn append_event(&mut self, event: BroadcastLogEvent) -> ZeckResult<()> {
@@ -641,10 +709,15 @@ impl BroadcastStore for DurableBroadcastLog {
         }
         if let Some(existing) = self.latest.get(&tx.txid) {
             if existing.prepared == *tx {
-                let replayed = Self::open(&self.path)?;
-                return if replayed.latest(tx.txid).as_ref() == Some(existing) {
+                let expected = existing.clone();
+                if let Err(err) = self.replay_from_disk() {
+                    self.write_failed = true;
+                    return Err(err);
+                }
+                return if self.latest(tx.txid).as_ref() == Some(&expected) {
                     Ok(())
                 } else {
+                    self.write_failed = true;
                     Err(ZeckError::Storage(format!(
                         "prepared transaction {} is missing or changed in {}",
                         tx.txid,
@@ -720,6 +793,7 @@ mod tests {
             state: TxLifecycleState::Pending,
             fee_zatoshis: 10_000,
             disposition: retryable.clone(),
+            persistence_warning: None,
         };
         assert!(pending.blocks_followup_submission());
         let rejected = TxSubmissionResult {
@@ -746,6 +820,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(log.blocking_submission(), Some(tx.txid));
+        drop(log);
         let reopened = DurableBroadcastLog::open(&path).unwrap();
         assert_eq!(reopened.blocking_submission(), Some(tx.txid));
     }
@@ -1062,6 +1137,114 @@ mod tests {
             recording.latest(tx.txid).unwrap().state,
             TxLifecycleState::NotSubmitted
         );
+    }
+
+    #[tokio::test]
+    async fn failed_final_transition_returns_known_unknown_after_accepted_response() {
+        struct FinalTransitionFails(RecordingStore);
+        impl BroadcastStore for FinalTransitionFails {
+            fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
+                self.0.persist_prepared(tx)
+            }
+            fn transition(
+                &mut self,
+                txid: TxId,
+                state: TxLifecycleState,
+                submission: Option<&SubmissionDisposition>,
+                observation: Option<&TxObservation>,
+            ) -> ZeckResult<()> {
+                if submission.is_some() {
+                    return Err(ZeckError::Storage("final sync failed".into()));
+                }
+                self.0.transition(txid, state, submission, observation)
+            }
+            fn latest(&self, txid: TxId) -> Option<PersistedTransaction> {
+                self.0.latest(txid)
+            }
+        }
+        let tx = fixture();
+        let recording = RecordingStore::default();
+        let mut store = FinalTransitionFails(recording.clone());
+        let mut node = network(&recording, Script::Response(0, ""));
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx.clone(), Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(node.calls, 1);
+        assert_eq!(result.txid, tx.txid);
+        assert_eq!(result.fee_zatoshis, tx.fee_zatoshis);
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert!(result.blocks_followup_submission());
+        assert!(result
+            .persistence_warning
+            .as_deref()
+            .unwrap()
+            .contains("final sync failed"));
+        assert_eq!(
+            recording.latest(tx.txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_final_transition_returns_known_unknown_after_transport_failure() {
+        struct FinalTransitionFails(RecordingStore);
+        impl BroadcastStore for FinalTransitionFails {
+            fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
+                self.0.persist_prepared(tx)
+            }
+            fn transition(
+                &mut self,
+                txid: TxId,
+                state: TxLifecycleState,
+                submission: Option<&SubmissionDisposition>,
+                observation: Option<&TxObservation>,
+            ) -> ZeckResult<()> {
+                if submission.is_some() {
+                    return Err(ZeckError::Storage("final sync failed".into()));
+                }
+                self.0.transition(txid, state, submission, observation)
+            }
+            fn latest(&self, txid: TxId) -> Option<PersistedTransaction> {
+                self.0.latest(txid)
+            }
+        }
+        let tx = fixture();
+        let recording = RecordingStore::default();
+        let mut store = FinalTransitionFails(recording.clone());
+        let mut node = network(&recording, Script::Transport);
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx.clone(), Duration::from_secs(30))
+                .await
+                .unwrap();
+        assert_eq!(node.calls, 1);
+        assert_eq!(result.txid, tx.txid);
+        assert_eq!(result.fee_zatoshis, tx.fee_zatoshis);
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert!(result.persistence_warning.is_some());
+        assert_eq!(
+            recording.latest(tx.txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[test]
+    fn durable_log_excludes_second_opener_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let first = DurableBroadcastLog::open(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock_path = dir.path().join("broadcasts-v1.jsonl.lock.sqlite");
+            assert_eq!(
+                fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(DurableBroadcastLog::open(&path).is_err());
+        drop(first);
+        assert!(DurableBroadcastLog::open(&path).is_ok());
     }
 
     #[test]
@@ -1400,6 +1583,7 @@ mod tests {
         ));
         log.transition(txid, TxLifecycleState::Expired, None, Some(&observation))
             .unwrap();
+        drop(log);
         assert_eq!(
             DurableBroadcastLog::open(&path)
                 .unwrap()
@@ -1457,5 +1641,12 @@ mod tests {
             log.persist_prepared(&prepared),
             Err(crate::ZeckError::Storage(_))
         ));
+        assert!(
+            matches!(
+                log.persist_prepared(&prepared),
+                Err(crate::ZeckError::Storage(_))
+            ),
+            "a missing durable record poisons this open log"
+        );
     }
 }

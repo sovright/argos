@@ -1500,9 +1500,8 @@ async fn execute_sweep_for_session(
             guard.progress.clone(),
         )
     };
-    if let Some(txid) =
-        DurableBroadcastLog::open(workspace.broadcast_log_path())?.blocking_submission()
-    {
+    let mut broadcast_log = DurableBroadcastLog::open(workspace.broadcast_log_path())?;
+    if let Some(txid) = broadcast_log.blocking_submission() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep leg"
         )));
@@ -1665,6 +1664,7 @@ async fn execute_sweep_for_session(
                         client: &mut client,
                         prover: &prover,
                         results: &mut results,
+                        broadcast_log: &mut broadcast_log,
                         prior_fee_zatoshis,
                         max_fee_zatoshis: request.max_fee_zatoshis,
                         donation_address: effective_donation_address.as_str(),
@@ -1791,6 +1791,7 @@ async fn execute_sweep_for_session(
                     client: &mut client,
                     prover: &prover,
                     results: &mut results,
+                    broadcast_log: &mut broadcast_log,
                     prior_fee_zatoshis,
                     max_fee_zatoshis: request.max_fee_zatoshis,
                     donation_address: effective_donation_address.as_str(),
@@ -1902,6 +1903,7 @@ struct SweepStepCtx<'a> {
     client: &'a mut CompactTxStreamerClient<tonic::transport::Channel>,
     prover: &'a LocalTxProver,
     results: &'a mut Vec<TxBroadcastResult>,
+    broadcast_log: &'a mut DurableBroadcastLog,
     prior_fee_zatoshis: u64,
     max_fee_zatoshis: Option<u64>,
     donation_address: &'a str,
@@ -2013,6 +2015,7 @@ async fn execute_shielding_step(
         txids.into_iter().collect(),
         "shielding",
         ctx.results,
+        ctx.broadcast_log,
         ctx.lightwalletd_url,
         ctx.primary_endpoint,
         ctx.network,
@@ -2360,6 +2363,7 @@ async fn execute_send_max_step(
         txids.into_iter().collect(),
         "sweep",
         ctx.results,
+        ctx.broadcast_log,
         ctx.lightwalletd_url,
         ctx.primary_endpoint,
         ctx.network,
@@ -2385,6 +2389,7 @@ async fn broadcast_transactions(
     txids: Vec<TxId>,
     label: &str,
     results: &mut Vec<TxBroadcastResult>,
+    log: &mut DurableBroadcastLog,
     lightwalletd_url: &str,
     primary_endpoint: &str,
     network: crate::models::ZeckNetwork,
@@ -2393,7 +2398,6 @@ async fn broadcast_transactions(
 ) -> ZeckResult<()> {
     use rusqlite::OptionalExtension;
 
-    let mut log = DurableBroadcastLog::open(workspace.broadcast_log_path())?;
     if let Some(txid) = log.blocking_submission() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before another submission"
@@ -2443,7 +2447,7 @@ async fn broadcast_transactions(
             max_fee_zatoshis,
         )?;
         let submission = submit_prepared_transaction(
-            &mut log,
+            log,
             &mut LightwalletdSubmitter { client },
             PreparedTransaction {
                 txid,
@@ -2464,7 +2468,15 @@ async fn broadcast_transactions(
             txid: Some(txid.to_string()),
             status: submission.state,
             fee_zatoshis,
-            detail: format!("{label} submission: {:?}", submission.disposition),
+            detail: format!(
+                "{label} submission: {:?}{}",
+                submission.disposition,
+                submission
+                    .persistence_warning
+                    .as_ref()
+                    .map(|warning| format!(" Persistence warning: {warning}"))
+                    .unwrap_or_default()
+            ),
             confirmed_height: None,
         });
         if submission.state.fee_is_at_risk() {

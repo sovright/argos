@@ -437,12 +437,15 @@ fn record_sapling_submission(
     display_index: u32,
     submission: &TxSubmissionResult,
 ) -> ZeckResult<bool> {
-    let detail = match &submission.disposition {
+    let mut detail = match &submission.disposition {
         crate::broadcast::SubmissionDisposition::Accepted => {
             "Sapling transaction accepted; awaiting confirmation".to_owned()
         }
         other => format!("Sapling submission: {other:?}"),
     };
+    if let Some(warning) = &submission.persistence_warning {
+        detail.push_str(&format!(" Persistence warning: {warning}"));
+    }
     outcome.transactions.push(TxBroadcastResult {
         source_account: display_index,
         txid: Some(submission.txid.to_string()),
@@ -461,10 +464,129 @@ fn may_start_transparent_leg(outcome: &ImportedSweepOutcome) -> bool {
     !outcome.followup_blocked
 }
 
+async fn run_transparent_followup<F, Fut>(allowed: bool, submit: F) -> ZeckResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ZeckResult<()>>,
+{
+    if !allowed {
+        return Err(ZeckError::Broadcast("a Sapling transaction may already have reached the network; reconcile its txid before retrying any sweep leg".to_owned()));
+    }
+    submit().await
+}
+
+#[async_trait::async_trait(?Send)]
+trait SaplingAccountRunner {
+    async fn build_and_submit(
+        &mut self,
+        account: &crate::imported::ImportedWalletAccount,
+        prior_fee_zatoshis: u64,
+    ) -> ZeckResult<Option<TxSubmissionResult>>;
+}
+
+/// This loop is the production coordinator: once an uncertain submission is
+/// recorded, no later account runner is invoked.
+async fn run_sapling_accounts<R: SaplingAccountRunner>(
+    accounts: &[(u32, crate::imported::ImportedWalletAccount)],
+    outcome: &mut ImportedSweepOutcome,
+    runner: &mut R,
+) -> ZeckResult<()> {
+    for (display_index, account) in accounts {
+        let prior_fee = crate::service::at_risk_fee_total(&outcome.transactions)?;
+        let Some(submission) = runner.build_and_submit(account, prior_fee).await? else {
+            continue;
+        };
+        if record_sapling_submission(outcome, *display_index, &submission)? {
+            return Err(ZeckError::Broadcast(format!(
+                "Sapling transaction {} may already have reached the network or was retryably refused; reconcile it before any further sweep",
+                submission.txid,
+            )));
+        }
+        if submission.state == TxLifecycleState::Rejected {
+            return Err(ZeckError::Broadcast(format!(
+                "the node rejected Sapling transaction {}: {:?}",
+                submission.txid, submission.disposition,
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct RealSaplingAccountRunner<'a> {
+    runtime: &'a crate::models::RuntimeScanConfig,
+    workspace: &'a crate::workspace::RecoveryWorkspace,
+    params: crate::workspace::ArgosParams,
+    recipient: &'a ZcashAddress,
+    prover: &'a LocalTxProver,
+    max_fee_zatoshis: Option<u64>,
+    broadcast_log: &'a mut DurableBroadcastLog,
+}
+
+#[async_trait::async_trait(?Send)]
+impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
+    async fn build_and_submit(
+        &mut self,
+        account: &crate::imported::ImportedWalletAccount,
+        prior_fee_zatoshis: u64,
+    ) -> ZeckResult<Option<TxSubmissionResult>> {
+        let Some(extsk) = account.sapling_extsk.as_ref() else {
+            return Ok(None);
+        };
+        let built = {
+            let mut wallet_db =
+                crate::workspace::open_wallet_db(self.workspace.wallet_db_path(), self.params)?;
+            build_imported_sapling_sweep(
+                &mut wallet_db,
+                &self.params,
+                account.wallet_account_id,
+                extsk,
+                self.recipient,
+                self.prover,
+                self.max_fee_zatoshis,
+                prior_fee_zatoshis,
+            )
+        };
+        let tx = match built {
+            Ok(tx) => tx,
+            Err(err) if crate::service::is_insufficient_funds_error(&err.to_string()) => {
+                return Ok(None)
+            }
+            Err(err) => return Err(err),
+        };
+        let mut raw = Vec::new();
+        tx.write(&mut raw).map_err(|err| {
+            ZeckError::TransactionBuild(format!("serializing the Sapling sweep: {err}"))
+        })?;
+        let prepared = PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx: raw,
+            fee_zatoshis: transaction_fee_zatoshis(&tx)?,
+            expiry_height: Some(u32::from(tx.expiry_height())),
+        };
+        let (mut client, _endpoint) =
+            crate::lightwalletd::connect_lightwalletd_endpoints_with_retry(
+                &self.runtime.lightwalletd_url,
+                None,
+            )
+            .await?;
+        submit_prepared_transaction(
+            self.broadcast_log,
+            &mut LightwalletdSubmitter {
+                client: &mut client,
+            },
+            prepared,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map(Some)
+    }
+}
+
 fn open_imported_broadcast_log(
     runtime: &crate::models::RuntimeScanConfig,
 ) -> ZeckResult<DurableBroadcastLog> {
     let workspace = crate::workspace::RecoveryWorkspace::from_runtime(runtime)?;
+    workspace.ensure_broadcast_log_directory()?;
     let log = DurableBroadcastLog::open(workspace.broadcast_log_path())?;
     if let Some(txid) = log.blocking_submission() {
         return Err(ZeckError::Broadcast(format!(
@@ -525,6 +647,7 @@ pub async fn sweep_imported_filtered_wallet(
         ..Default::default()
     };
     let result = async {
+        let mut log = open_imported_broadcast_log(runtime)?;
         sweep_imported_sapling_leg(
             runtime,
             keys,
@@ -532,6 +655,7 @@ pub async fn sweep_imported_filtered_wallet(
             max_fee_zatoshis,
             &mut outcome,
             Some(sapling_accounts),
+            &mut log,
         )
         .await?;
         outcome.sapling_leg_completed = true;
@@ -552,7 +676,6 @@ pub async fn sweep_imported_filtered_wallet(
                     address: key.address,
                 })
                 .collect::<Vec<_>>();
-            let mut log = open_imported_broadcast_log(runtime)?;
             if let Some(swept) = crate::transparent_recovery::sweep_transparent_only(
                 &mut log,
                 &selected,
@@ -604,22 +727,26 @@ async fn sweep_imported_wallet_into(
     outcome: &mut ImportedSweepOutcome,
 ) -> ZeckResult<()> {
     use crate::imported::imported_transparent_keys;
+    let mut log = open_imported_broadcast_log(runtime)?;
 
     // Sapling first. A definite failure may leave the independent transparent
     // pool spendable, but an uncertain or retryable submission blocks it.
-    let sapling_result =
-        sweep_imported_sapling_leg(runtime, keys, destination, max_fee_zatoshis, outcome, None)
-            .await;
+    let sapling_result = sweep_imported_sapling_leg(
+        runtime,
+        keys,
+        destination,
+        max_fee_zatoshis,
+        outcome,
+        None,
+        &mut log,
+    )
+    .await;
     outcome.sapling_leg_completed = sapling_result.is_ok();
 
     // Transparent, through the path that needs no account at all.
-    let transparent_result = async {
-        if !may_start_transparent_leg(outcome) {
-            return Err(ZeckError::Broadcast("a Sapling transaction may already have reached the network; reconcile its txid before retrying any sweep leg".to_owned()));
-        }
+    let transparent_result = run_transparent_followup(may_start_transparent_leg(outcome), || async {
         let transparent = imported_transparent_keys(keys)?;
         if !transparent.is_empty() {
-            let mut log = open_imported_broadcast_log(runtime)?;
             if let Some(swept) = crate::transparent_recovery::sweep_transparent_only(
                 &mut log,
                 &transparent,
@@ -646,7 +773,7 @@ async fn sweep_imported_wallet_into(
             }
         }
         Ok(())
-    }
+    })
     .await;
     outcome.transparent_leg_completed = transparent_result.is_ok();
 
@@ -679,6 +806,7 @@ async fn sweep_imported_sapling_leg(
     max_fee_zatoshis: Option<u64>,
     outcome: &mut ImportedSweepOutcome,
     registered_accounts: Option<&[(u32, AccountUuid, usize)]>,
+    broadcast_log: &mut DurableBroadcastLog,
 ) -> ZeckResult<()> {
     use crate::imported::register_imported_accounts;
     use crate::workspace::{consensus_network, open_wallet_db, RecoveryWorkspace};
@@ -723,7 +851,6 @@ async fn sweep_imported_sapling_leg(
     enforce_sapling_fee_floor(max_fee_zatoshis)?;
 
     let workspace = RecoveryWorkspace::from_runtime(runtime)?;
-    let mut broadcast_log = open_imported_broadcast_log(runtime)?;
     let accounts = if let Some(registered) = registered_accounts {
         registered
             .iter()
@@ -775,89 +902,16 @@ async fn sweep_imported_sapling_leg(
     // ~725 MB, and loading them per key would dominate the sweep.
     let prover = LocalTxProver::bundled();
 
-    for (display_index, account) in &accounts {
-        // Every account created from a Sapling key carries its key; the
-        // `None` case is the transparent-anchor account, which has no
-        // Sapling notes of its own to move.
-        let Some(extsk) = account.sapling_extsk.as_ref() else {
-            continue;
-        };
-
-        let built = {
-            let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
-            build_imported_sapling_sweep(
-                &mut wallet_db,
-                &params,
-                account.wallet_account_id,
-                extsk,
-                &recipient,
-                &prover,
-                max_fee_zatoshis,
-                crate::service::at_risk_fee_total(&outcome.transactions)?,
-            )
-        };
-
-        match built {
-            Ok(tx) => {
-                // Every failure between here and the push below aborts the
-                // remaining accounts, but `outcome` is the caller's, so the
-                // earlier submission records are kept. An uncertain or
-                // retryable response stops every later leg until reconciled.
-                let mut raw = Vec::new();
-                tx.write(&mut raw).map_err(|err| {
-                    ZeckError::TransactionBuild(format!("serializing the Sapling sweep: {err}"))
-                })?;
-                let fee_zatoshis = transaction_fee_zatoshis(&tx)?;
-                let prepared = PreparedTransaction {
-                    txid: tx.txid(),
-                    raw_tx: raw,
-                    fee_zatoshis,
-                    expiry_height: Some(u32::from(tx.expiry_height())),
-                };
-                let (mut client, _endpoint) =
-                    crate::lightwalletd::connect_lightwalletd_endpoints_with_retry(
-                        &runtime.lightwalletd_url,
-                        None,
-                    )
-                    .await?;
-                let submission = submit_prepared_transaction(
-                    &mut broadcast_log,
-                    &mut LightwalletdSubmitter {
-                        client: &mut client,
-                    },
-                    prepared,
-                    std::time::Duration::from_secs(30),
-                )
-                .await?;
-                if record_sapling_submission(outcome, *display_index, &submission)? {
-                    return Err(ZeckError::Broadcast(format!(
-                        "Sapling transaction {} may already have reached the network or was retryably refused; reconcile it before any further sweep",
-                        submission.txid,
-                    )));
-                }
-                if submission.state == TxLifecycleState::Rejected {
-                    return Err(ZeckError::Broadcast(format!(
-                        "the node rejected Sapling transaction {}: {:?}",
-                        submission.txid, submission.disposition,
-                    )));
-                }
-            }
-            Err(err) => {
-                // "Nothing selectable" is the ordinary shape of an account
-                // whose Sapling pool is empty or all dust; it must not
-                // abort the remaining accounts or the transparent sweep.
-                //
-                // One shared classifier, in `service`, which is the only
-                // one with tests. The local copy here was a second, looser
-                // definition of the same predicate.
-                if !crate::service::is_insufficient_funds_error(&err.to_string()) {
-                    return Err(err);
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let mut runner = RealSaplingAccountRunner {
+        runtime,
+        workspace: &workspace,
+        params,
+        recipient: &recipient,
+        prover: &prover,
+        max_fee_zatoshis,
+        broadcast_log,
+    };
+    run_sapling_accounts(&accounts, outcome, &mut runner).await
 }
 
 /// A wallet file may contain repeated records for one Sapling key. Registration
@@ -1101,12 +1155,65 @@ mod tests {
     use crate::models::TxLifecycleState;
     use zcash_primitives::transaction::TxId;
 
+    struct CountingRunner {
+        first: TxSubmissionResult,
+        builds: usize,
+        submissions: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl SaplingAccountRunner for CountingRunner {
+        async fn build_and_submit(
+            &mut self,
+            _: &crate::imported::ImportedWalletAccount,
+            _: u64,
+        ) -> ZeckResult<Option<TxSubmissionResult>> {
+            self.builds += 1;
+            self.submissions += 1;
+            Ok(Some(self.first.clone()))
+        }
+    }
+
+    async fn assert_first_submission_stops_coordinator(first: TxSubmissionResult) {
+        let account = || crate::imported::ImportedWalletAccount {
+            wallet_account_id: AccountUuid::default(),
+            sapling_extsk: None,
+            transparent_addresses: Vec::new(),
+        };
+        let accounts = vec![(0, account()), (1, account())];
+        let mut runner = CountingRunner {
+            first,
+            builds: 0,
+            submissions: 0,
+        };
+        let mut outcome = ImportedSweepOutcome::default();
+        assert!(run_sapling_accounts(&accounts, &mut outcome, &mut runner)
+            .await
+            .is_err());
+        assert_eq!(runner.builds, 1, "second Sapling builder was called");
+        assert_eq!(runner.submissions, 1, "second Sapling submitter was called");
+        assert_eq!(outcome.transactions.len(), 1);
+        let transparent_calls = std::cell::Cell::new(0);
+        let result = run_transparent_followup(may_start_transparent_leg(&outcome), || async {
+            transparent_calls.set(transparent_calls.get() + 1);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            transparent_calls.get(),
+            0,
+            "transparent submitter was called"
+        );
+    }
+
     fn unknown() -> TxSubmissionResult {
         TxSubmissionResult {
             txid: TxId::from_bytes([7; 32]),
             state: TxLifecycleState::SubmissionUnknown,
             fee_zatoshis: 10_000,
             disposition: SubmissionDisposition::AmbiguousTransport,
+            persistence_warning: None,
         }
     }
 
@@ -1125,6 +1232,32 @@ mod tests {
             TxLifecycleState::SubmissionUnknown
         );
         assert_eq!(outcome.transactions[0].fee_zatoshis, 10_000);
+    }
+
+    #[tokio::test]
+    async fn unknown_first_submission_leaves_second_builder_and_transparent_submitter_untouched() {
+        assert_first_submission_stops_coordinator(unknown()).await;
+    }
+
+    #[tokio::test]
+    async fn retryable_first_submission_leaves_second_builder_and_transparent_submitter_untouched()
+    {
+        let mut retryable = unknown();
+        retryable.state = TxLifecycleState::Pending;
+        retryable.disposition = SubmissionDisposition::RetryableRejection {
+            code: -26,
+            reason: "mempool full".to_owned(),
+        };
+        assert_first_submission_stops_coordinator(retryable).await;
+    }
+
+    #[test]
+    fn sapling_record_includes_post_io_persistence_warning() {
+        let mut submission = unknown();
+        submission.persistence_warning = Some("final sync failed".to_owned());
+        let mut outcome = ImportedSweepOutcome::default();
+        record_sapling_submission(&mut outcome, 0, &submission).unwrap();
+        assert!(outcome.transactions[0].detail.contains("final sync failed"));
     }
 
     #[tokio::test]
