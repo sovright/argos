@@ -12,6 +12,7 @@ use crate::{
     broadcast::{observe_transaction, EndpointTxEvidence, TxObservation, TxObserver},
     error::{ZeckError, ZeckResult},
     models::{
+        canonical_confirmation_operator_id, known_confirmation_operator,
         normalized_confirmation_authority, ConfirmationEndpoint, LightwalletdProbe, ZeckNetwork,
     },
 };
@@ -76,19 +77,6 @@ pub fn normalized_endpoint_authority(endpoint: &str) -> ZeckResult<String> {
     })
 }
 
-fn builtin_operator(endpoint: &str) -> Option<&'static str> {
-    let url = Url::parse(endpoint).ok()?;
-    match url
-        .host_str()?
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "zec.rocks" | "na.zec.rocks" | "testnet.zec.rocks" => Some("zec.rocks"),
-        _ => None,
-    }
-}
-
 pub fn parse_confirmation_sources(raw: &[&str]) -> ZeckResult<Vec<ConfirmationEndpoint>> {
     let mut sources = Vec::with_capacity(raw.len());
     let mut authorities = HashSet::new();
@@ -112,9 +100,7 @@ pub fn parse_confirmation_sources(raw: &[&str]) -> ZeckResult<Vec<ConfirmationEn
             )));
         }
         sources.push(ConfirmationEndpoint {
-            operator_id: builtin_operator(&endpoint)
-                .unwrap_or(operator_id)
-                .to_owned(),
+            operator_id: canonical_confirmation_operator_id(operator_id, &endpoint),
             endpoint,
         });
     }
@@ -141,16 +127,16 @@ pub fn confirmation_endpoints(
             )));
         }
         result.push(ConfirmationEndpoint {
-            operator_id: builtin_operator(&endpoint)
-                .unwrap_or(source.operator_id.trim())
-                .to_owned(),
+            operator_id: canonical_confirmation_operator_id(&source.operator_id, &endpoint),
             endpoint,
         });
     }
     for endpoint in validated_lightwalletd_endpoints(scan_urls)? {
         if authorities.insert(normalized_endpoint_authority(&endpoint)?) {
             result.push(ConfirmationEndpoint {
-                operator_id: builtin_operator(&endpoint).unwrap_or("").to_owned(),
+                operator_id: known_confirmation_operator(&endpoint)
+                    .unwrap_or("")
+                    .to_owned(),
                 endpoint,
             });
         }

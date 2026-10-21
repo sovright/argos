@@ -19,7 +19,7 @@ use zcash_protocol::consensus::BranchId;
 
 use crate::{
     error::{ZeckError, ZeckResult},
-    models::normalized_confirmation_authority,
+    models::{canonical_confirmation_operator_id, normalized_confirmation_authority},
     workspace::append_private_file,
 };
 
@@ -60,8 +60,8 @@ pub struct TxObservation {
 }
 
 fn independent_evidence_sources(a: &EndpointTxEvidence, b: &EndpointTxEvidence) -> bool {
-    let a_operator = a.operator_id.trim();
-    let b_operator = b.operator_id.trim();
+    let a_operator = canonical_confirmation_operator_id(&a.operator_id, &a.endpoint);
+    let b_operator = canonical_confirmation_operator_id(&b.operator_id, &b.endpoint);
     if a_operator.is_empty() || b_operator.is_empty() || a_operator == b_operator {
         return false;
     }
@@ -127,7 +127,8 @@ pub fn observe_transaction(
     let evidence = evidence
         .into_iter()
         .map(|mut item| {
-            item.operator_id = item.operator_id.trim().to_owned();
+            item.operator_id =
+                canonical_confirmation_operator_id(&item.operator_id, &item.endpoint);
             item
         })
         .collect::<Vec<_>>();
@@ -1978,6 +1979,77 @@ mod tests {
             secondary_tip: Some(120),
             evidence: vec![confirmation_evidence("one", None, None, false), second],
         };
+        assert!(log
+            .transition(txid, TxLifecycleState::Expired, None, Some(&observation))
+            .is_err());
+    }
+
+    #[test]
+    fn review_durable_log_rejects_mined_builtin_operator_relabel() {
+        let dir = tempfile::tempdir().unwrap();
+        let txid = TxId::from_bytes([47; 32]);
+        let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![47],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(130),
+        })
+        .unwrap();
+        let mut first = confirmation_evidence("one", Some(100), Some(&[1; 32]), true);
+        first.endpoint = "https://zec.rocks:443".to_owned();
+        let mut second = confirmation_evidence("two", Some(100), Some(&[1; 32]), true);
+        second.endpoint = "https://na.zec.rocks:443".to_owned();
+        let observation = TxObservation {
+            state: TxObservationState::Mined,
+            mined_height: Some(100),
+            expiry_height: Some(130),
+            primary_tip: Some(120),
+            secondary_tip: Some(120),
+            evidence: vec![first, second],
+        };
+        let reduced = observe_transaction(observation.evidence.clone(), observation.expiry_height);
+        assert_ne!(reduced.state, TxObservationState::Mined);
+        assert!(reduced
+            .evidence
+            .iter()
+            .all(|item| item.operator_id == "zec.rocks"));
+        assert!(log
+            .transition(txid, TxLifecycleState::Mined, None, Some(&observation))
+            .is_err());
+    }
+
+    #[test]
+    fn review_durable_log_rejects_expired_builtin_operator_relabel_with_trailing_dots() {
+        let dir = tempfile::tempdir().unwrap();
+        let txid = TxId::from_bytes([48; 32]);
+        let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![48],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(100),
+        })
+        .unwrap();
+        let mut first = confirmation_evidence("one", None, None, false);
+        first.endpoint = "https://zec.rocks.:443".to_owned();
+        let mut second = confirmation_evidence("two", None, None, false);
+        second.endpoint = "https://na.zec.rocks.:443".to_owned();
+        let observation = TxObservation {
+            state: TxObservationState::Absent,
+            mined_height: None,
+            expiry_height: Some(100),
+            primary_tip: Some(120),
+            secondary_tip: Some(120),
+            evidence: vec![first, second],
+        };
+        assert!(!observation.is_expired());
+        let reduced = observe_transaction(observation.evidence.clone(), observation.expiry_height);
+        assert_ne!(reduced.state, TxObservationState::Absent);
+        assert!(reduced
+            .evidence
+            .iter()
+            .all(|item| item.operator_id == "zec.rocks"));
         assert!(log
             .transition(txid, TxLifecycleState::Expired, None, Some(&observation))
             .is_err());

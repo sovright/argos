@@ -143,6 +143,28 @@ pub(crate) fn normalized_confirmation_authority(endpoint: &str) -> Option<String
     Some(format!("{}://{}:{}", url.scheme(), host, port))
 }
 
+/// Known public endpoints share an operator even when callers supply different
+/// labels. Resolve this from the same validated host used for authority checks.
+pub(crate) fn known_confirmation_operator(endpoint: &str) -> Option<&'static str> {
+    let authority = normalized_confirmation_authority(endpoint)?;
+    let url = Url::parse(&authority).ok()?;
+    match url.host_str()? {
+        "zec.rocks" | "na.zec.rocks" | "testnet.zec.rocks" => Some("zec.rocks"),
+        _ => None,
+    }
+}
+
+pub(crate) fn canonical_confirmation_operator_id(operator_id: &str, endpoint: &str) -> String {
+    let operator_id = operator_id.trim();
+    if operator_id.is_empty() {
+        String::new()
+    } else {
+        known_confirmation_operator(endpoint)
+            .unwrap_or(operator_id)
+            .to_owned()
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeScanConfig {
     /// Where the scan keys come from. A BIP-39 seed phrase
