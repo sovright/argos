@@ -394,11 +394,14 @@ pub fn in_sandblasting_zone(height: u32, network: ZeckNetwork) -> bool {
 pub struct SweepRequest {
     pub destination: String,
     pub memo: Option<String>,
-    /// Maximum total fee in zatoshis across all sweep transactions. If actual
-    /// fees exceed this the sweep is aborted with `MaxFeeExceeded`. `None`
-    /// means no limit — use only when the caller has already reviewed the
-    /// proposal fee and explicitly accepted it.
+    /// Maximum total fee in zatoshis across all sweep transactions. The
+    /// service binds `None` to the exact reviewed proposal total before
+    /// issuing the one-shot proposal ID.
     pub max_fee_zatoshis: Option<u64>,
+    /// Informational input only. The service replaces this with its own
+    /// proposal fee before storing a one-shot reviewed intent.
+    #[serde(default)]
+    pub reviewed_fee_zatoshis: Option<u64>,
     /// Fraction of each account's send amount to donate (e.g. 0.10). `None`
     /// skips the donation entirely. Validated to 0.0..1.0.
     #[serde(default)]
@@ -454,6 +457,9 @@ pub struct SweepProposal {
     pub total_donation_zatoshis: u64,
     pub dry_run_default: bool,
     pub warning: Option<String>,
+    /// The quoted stage shields funds; a mined/rescanned send needs new review.
+    #[serde(default)]
+    pub follow_up_review_required: bool,
 }
 
 /// Ephemeral authority for one reviewed ordinary sweep in one scan session.
@@ -546,6 +552,8 @@ pub struct SweepOutcome {
     #[serde(default)]
     pub total_donation_zatoshis: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub follow_up_review_required: bool,
 }
 
 #[cfg(test)]

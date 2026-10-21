@@ -2082,6 +2082,7 @@ async fn workspace_deleted_between_scan_and_sweep_surfaces_clean_error() {
         max_fee_zatoshis: None,
         donation_rate: None,
         donor_email: None,
+        reviewed_fee_zatoshis: None,
     };
 
     let result = fixture
@@ -2140,6 +2141,7 @@ async fn deleting_only_the_wallet_db_surfaces_a_clean_error() {
         max_fee_zatoshis: None,
         donation_rate: None,
         donor_email: None,
+        reviewed_fee_zatoshis: None,
     };
 
     let result = fixture
@@ -2200,6 +2202,7 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
         max_fee_zatoshis: None,
         donation_rate: None,
         donor_email: None,
+        reviewed_fee_zatoshis: None,
     };
 
     let result = fixture
@@ -2258,6 +2261,7 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         max_fee_zatoshis: None,
         donation_rate: Some(0.10),
         donor_email: None,
+        reviewed_fee_zatoshis: None,
     };
     let reviewed = fixture
         .service
@@ -2310,6 +2314,7 @@ async fn reviewed_proposal_cannot_be_replayed_after_execution() {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
+                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -2697,6 +2702,7 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
+                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -3129,6 +3135,7 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
                 donation_rate: None,
                 donor_email: None,
                 max_fee_zatoshis: None,
+                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -3303,6 +3310,7 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
         max_fee_zatoshis: Some(100_000),
         donation_rate: None,
         donor_email: None,
+        reviewed_fee_zatoshis: None,
     };
     let reviewed = service
         .propose_sweep(&handle, request)
@@ -3498,6 +3506,7 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
         max_fee_zatoshis: Some(100_000),
         donation_rate: None,
         donor_email: None,
+        reviewed_fee_zatoshis: None,
     };
     let reviewed = service.propose_sweep(&handle, request).await.unwrap();
     let mining = tokio::spawn(async {
@@ -3531,6 +3540,203 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
             .and_then(|height| height.as_u64())
             .is_some(),
         "internal Sapling sweep must be mined, got: {mined}"
+    );
+}
+
+/// Four mined notes force a ZIP-317 fee above the two-action floor. This
+/// exercises the wallet-backed imported Sapling proposal used for review and
+/// compares it with the fee of the transaction actually built and submitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn imported_multi_action_quote_matches_built_transaction_fee() {
+    use argos_core::address_search::candidate_seed;
+    use argos_core::{prepare_match_recovery, AddressScope, DiscoveryPool, MatchCoordinates};
+    use secrecy::ExposeSecret;
+    use zcash_keys::encoding::AddressCodec;
+
+    let harness = RegtestHarness::require();
+    let phrase = SecretString::new(harness.test_seed().to_owned());
+    let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
+    let account_index = 4u32;
+    let account = zip32::AccountId::try_from(account_index).unwrap();
+    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account);
+    let internal_dfvk = extsk.derive_internal().to_diversifiable_full_viewing_key();
+    let (address_index, internal_address) = (1u32..100)
+        .find_map(|index| {
+            internal_dfvk
+                .address(index.into())
+                .map(|address| (index, address))
+        })
+        .expect("valid internal diversifier");
+    let encoded = internal_address.encode(&zcash_protocol::consensus::TEST_NETWORK);
+    for _ in 0..4 {
+        common::regtest_harness::fund_address(&encoded, 100_000_000).await;
+    }
+    let source = prepare_match_recovery(
+        seed.expose_secret(),
+        ZeckNetwork::Testnet,
+        MatchCoordinates {
+            pool: DiscoveryPool::Sapling,
+            account: account_index,
+            scope: AddressScope::Internal,
+            index: address_index,
+            network: ZeckNetwork::Testnet,
+            address: encoded,
+            path: String::new(),
+        },
+    )
+    .unwrap();
+    drop(seed);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "four imported Sapling notes".into(),
+                transparent_scan: None,
+            },
+            source,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => break,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("multi-note scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("multi-note scan timed out");
+
+    let reviewed = service
+        .propose_sweep(
+            &handle,
+            SweepRequest {
+                destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
+                memo: None,
+                max_fee_zatoshis: None,
+                reviewed_fee_zatoshis: Some(1), // service must ignore caller-supplied fee
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reviewed.proposal.transactions.len(), 1);
+    let quoted_fee = reviewed.proposal.total_fee_zatoshis;
+    assert!(
+        quoted_fee > 10_000,
+        "four spends need more than the fee floor: {quoted_fee}"
+    );
+    assert_eq!(reviewed.proposal.transactions[0].fee_zatoshis, quoted_fee);
+
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        service.execute_sweep(&handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("multi-note sweep timed out")
+    .expect("multi-note sweep failed");
+    mining.abort();
+    assert_eq!(outcome.transactions.len(), 1);
+    assert_eq!(outcome.transactions[0].fee_zatoshis, quoted_fee);
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+}
+
+/// Wallet-backed HD quote: several separately mined notes make the actual
+/// send-max proposal cost more than the ZIP-317 floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn multi_note_shielded_quote_uses_real_zip317_fee() {
+    let harness = RegtestHarness::require();
+    let receive = regtest_encoded_unified_address(harness.test_seed());
+    for _ in 0..4 {
+        common::regtest_harness::fund_address(&receive, 100_000_000).await;
+    }
+    let temp_data_dir = tempfile::tempdir().unwrap();
+    let fixture =
+        complete_scan_against_test_seed(&harness, &temp_data_dir, "multi-note exact fee").await;
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua,
+                memo: None,
+                max_fee_zatoshis: None,
+                reviewed_fee_zatoshis: Some(1), // ignored; the wallet proposal supplies the fee
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("real send-max quote");
+    let steps = reviewed
+        .proposal
+        .transactions
+        .iter()
+        .filter(|tx| tx.kind == argos_core::models::ProposedTxKind::SweepShielded)
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), 1, "fixture must quote one HD send-max step");
+    assert!(
+        steps[0].fee_zatoshis > 10_000,
+        "multi-note fee must exceed the two-action floor: {:?}",
+        steps[0]
+    );
+    assert_eq!(
+        reviewed.proposal.total_fee_zatoshis,
+        steps.iter().map(|step| step.fee_zatoshis).sum::<u64>()
+    );
+    assert!(!reviewed.proposal.follow_up_review_required);
+
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        fixture
+            .service
+            .execute_sweep(&fixture.handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("multi-note HD sweep timed out")
+    .expect("multi-note HD sweep failed");
+    mining.abort();
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(outcome.transactions.len(), steps.len());
+    assert_eq!(
+        outcome
+            .transactions
+            .iter()
+            .map(|tx| tx.fee_zatoshis)
+            .collect::<Vec<_>>(),
+        steps.iter().map(|tx| tx.fee_zatoshis).collect::<Vec<_>>()
     );
 }
 
@@ -3658,7 +3864,10 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     };
     let resumed = RecoveryService::new();
     let resumed_handle = resumed
-        .start_scan(config, SecretString::new(harness.test_seed().to_owned()))
+        .start_scan(
+            config.clone(),
+            SecretString::new(harness.test_seed().to_owned()),
+        )
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(180), async {
@@ -3681,11 +3890,18 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
         max_fee_zatoshis: Some(100_000),
         donation_rate: None,
         donor_email: None,
+        reviewed_fee_zatoshis: None,
     };
     let reviewed = resumed
         .propose_sweep(&resumed_handle, request)
         .await
         .unwrap();
+    assert!(reviewed.proposal.follow_up_review_required);
+    assert_eq!(reviewed.proposal.transactions.len(), 1);
+    assert_eq!(
+        reviewed.proposal.transactions[0].kind,
+        argos_core::models::ProposedTxKind::ShieldTransparent
+    );
     let mining = tokio::spawn(async {
         let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
@@ -3703,23 +3919,21 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     let outcome = outcome.expect("range sweep timed out").unwrap();
     assert!(
         outcome.error.is_none(),
-        "sweep must fully finish: {:?}",
+        "shielding stage must finish: {:?}",
         outcome.error
     );
+    assert!(outcome.follow_up_review_required);
     assert!(
         outcome.skipped_accounts.is_empty(),
         "funded range must not be skipped"
     );
-    assert!(
-        outcome
-            .transactions
-            .iter()
-            .any(|tx| tx.detail.starts_with("sweep transaction") && tx.txid.is_some()),
-        "consuming transparent inputs through shielding alone is not a completed recovery"
-    );
-    assert!(
-        !outcome.transactions.is_empty(),
-        "range sweep must broadcast"
+    assert_eq!(outcome.transactions.len(), 1);
+    assert!(outcome.transactions[0]
+        .detail
+        .starts_with("shielding submission"));
+    assert_eq!(
+        outcome.transactions[0].fee_zatoshis,
+        reviewed.proposal.total_fee_zatoshis
     );
     let txids: Vec<_> = outcome
         .transactions
@@ -3743,5 +3957,46 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     assert!(
         after.is_empty(),
         "the sweep must spend both index 7 and index 997 UTXOs"
+    );
+
+    // Mining and scanning create a new, independently reviewed send stage.
+    let next_handle = resumed
+        .start_scan(config, SecretString::new(harness.test_seed().to_owned()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let progress = resumed.get_scan_progress(&next_handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => break,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("post-shield scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("post-shield scan timed out");
+    let next = resumed
+        .propose_sweep(
+            &next_handle,
+            SweepRequest {
+                destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                donation_rate: None,
+                donor_email: None,
+                reviewed_fee_zatoshis: None,
+            },
+        )
+        .await
+        .expect("review mined shielded send stage");
+    assert_ne!(next.proposal_id, reviewed.proposal_id);
+    assert!(!next.proposal.follow_up_review_required);
+    assert_eq!(next.proposal.transactions.len(), 1);
+    assert_eq!(
+        next.proposal.transactions[0].kind,
+        argos_core::models::ProposedTxKind::SweepShielded
     );
 }

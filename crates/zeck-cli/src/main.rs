@@ -2011,6 +2011,7 @@ async fn main() -> Result<()> {
                 destination: destination.clone(),
                 memo: memo.clone(),
                 max_fee_zatoshis: max_fee,
+                reviewed_fee_zatoshis: None,
                 donation_rate,
                 donor_email,
             };
@@ -2074,6 +2075,9 @@ async fn main() -> Result<()> {
                             println!();
                         }
                         match outcome.error {
+                            None if outcome.follow_up_review_required => println!(
+                                "Shielding stage submitted. After it mines, rescan and review a new proposal before sending the shielded funds."
+                            ),
                             None => println!("Sweep complete."),
                             // A mid-sequence abort: the transactions above were
                             // already broadcast and are irreversible, but the

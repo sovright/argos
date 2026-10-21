@@ -701,6 +701,7 @@ pub(crate) fn check_transparent_fee(
 ///
 /// Persists the signed transaction before submission and returns its lifecycle
 /// state even when the reply is uncertain or the node rejects it.
+#[allow(clippy::too_many_arguments)]
 pub async fn sweep_transparent_only(
     store: &mut impl BroadcastStore,
     keys: &[ImportedTransparentKey],
@@ -709,6 +710,30 @@ pub async fn sweep_transparent_only(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
     prior_fee_zatoshis: u64,
+) -> ZeckResult<Option<TransparentSweepOutcome>> {
+    sweep_transparent_only_reviewed(
+        store,
+        keys,
+        network,
+        lightwalletd_url,
+        destination,
+        max_fee_zatoshis,
+        prior_fee_zatoshis,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sweep_transparent_only_reviewed(
+    store: &mut impl BroadcastStore,
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+    destination: &str,
+    max_fee_zatoshis: Option<u64>,
+    prior_fee_zatoshis: u64,
+    reviewed_fee_zatoshis: Option<u64>,
 ) -> ZeckResult<Option<TransparentSweepOutcome>> {
     use zcash_proofs::prover::LocalTxProver;
     use zcash_protocol::consensus::BlockHeight;
@@ -731,6 +756,15 @@ pub async fn sweep_transparent_only(
     let Some(plan) = plan_sweep(&params, target_height, &utxos)? else {
         return Ok(None);
     };
+
+    if let Some(reviewed) = reviewed_fee_zatoshis {
+        if reviewed != plan.fee_zatoshis {
+            return Err(ZeckError::FeeQuoteChanged {
+                reviewed,
+                current: plan.fee_zatoshis,
+            });
+        }
+    }
 
     check_transparent_fee(
         plan.fee_zatoshis,

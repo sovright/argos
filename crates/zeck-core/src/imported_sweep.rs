@@ -37,7 +37,7 @@ use zcash_client_backend::{
     fees::StandardFeeRule,
     wallet::OvkPolicy,
 };
-use zcash_client_sqlite::AccountUuid;
+use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
 use zcash_keys::keys::sapling::ExtendedSpendingKey;
 use zcash_primitives::transaction::{builder::BundlePadding, Transaction};
 use zcash_proofs::prover::LocalTxProver;
@@ -119,6 +119,31 @@ impl From<pczt::sapling::ParseError> for ProofKeyError {
 /// transaction. The second is the one that matters — the first is the
 /// planner's own arithmetic restated, whereas the second reads what was
 /// built.
+pub(crate) fn propose_imported_sapling_sweep<P>(
+    wallet_db: &mut crate::imported::ArgosWalletDb,
+    params: &P,
+    account_id: AccountUuid,
+    destination: &ZcashAddress,
+) -> ZeckResult<zcash_client_backend::proposal::Proposal<StandardFeeRule, ReceivedNoteId>>
+where
+    P: zcash_protocol::consensus::Parameters + Clone,
+{
+    propose_send_max_transfer::<_, _, _, std::convert::Infallible>(
+        wallet_db,
+        params,
+        account_id,
+        &[ShieldedPool::Sapling],
+        &StandardFeeRule::Zip317,
+        destination.clone(),
+        None,
+        MaxSpendMode::MaxSpendable,
+        ConfirmationsPolicy::MIN,
+        &LockedInputPolicy::Exclude,
+        None,
+    )
+    .map_err(|err| ZeckError::TransactionBuild(format!("proposing the Sapling sweep: {err}")))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_imported_sapling_sweep<P>(
     wallet_db: &mut crate::imported::ArgosWalletDb,
@@ -133,6 +158,34 @@ pub fn build_imported_sapling_sweep<P>(
 where
     P: zcash_protocol::consensus::Parameters + Clone,
 {
+    build_imported_sapling_sweep_reviewed(
+        wallet_db,
+        params,
+        account_id,
+        extsk,
+        destination,
+        prover,
+        max_fee_zatoshis,
+        prior_fee_zatoshis,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_imported_sapling_sweep_reviewed<P>(
+    wallet_db: &mut crate::imported::ArgosWalletDb,
+    params: &P,
+    account_id: AccountUuid,
+    extsk: &ExtendedSpendingKey,
+    destination: &ZcashAddress,
+    prover: &LocalTxProver,
+    max_fee_zatoshis: Option<u64>,
+    prior_fee_zatoshis: u64,
+    reviewed_fee_zatoshis: Option<u64>,
+) -> ZeckResult<Transaction>
+where
+    P: zcash_protocol::consensus::Parameters + Clone,
+{
     // Cheapest possible refusal: a cap this low can never be met by any
     // Sapling sweep, whatever this account holds.
     enforce_sapling_fee_floor(max_fee_zatoshis)?;
@@ -141,27 +194,18 @@ where
     // keys come from the same parameters that produced them rather than
     // being passed in alongside and risking a mismatch.
     let (spend_vk, output_vk) = prover.verifying_keys();
-    let proposal = propose_send_max_transfer::<_, _, _, std::convert::Infallible>(
-        wallet_db,
-        params,
-        account_id,
-        &[ShieldedPool::Sapling],
-        &StandardFeeRule::Zip317,
-        destination.clone(),
-        None,
-        MaxSpendMode::MaxSpendable,
-        ConfirmationsPolicy::MIN,
-        // Argos takes no advisory input locks; never draw on another
-        // holder's.
-        &LockedInputPolicy::Exclude,
-        None,
-    )
-    .map_err(|err| ZeckError::TransactionBuild(format!("proposing the Sapling sweep: {err}")))?;
+    let proposal = propose_imported_sapling_sweep(wallet_db, params, account_id, destination)?;
 
-    // First gate, before ~725 MB of proving parameters are put to work and
-    // long before anything could be broadcast. Same helper the HD sweep
-    // path uses, so the two cannot drift on what "over the cap" means.
+    // First gate, before proving parameters are put to work.
     let planned_fee_zatoshis = crate::service::proposal_fee_zatoshis(&proposal)?;
+    if let Some(reviewed) = reviewed_fee_zatoshis {
+        if reviewed != planned_fee_zatoshis {
+            return Err(ZeckError::FeeQuoteChanged {
+                reviewed,
+                current: planned_fee_zatoshis,
+            });
+        }
+    }
     enforce_cumulative_fee(prior_fee_zatoshis, planned_fee_zatoshis, max_fee_zatoshis)?;
 
     let pczt = zcash_client_backend::data_api::wallet::create_pczt_from_proposal::<
@@ -175,8 +219,6 @@ where
         wallet_db,
         params,
         account_id,
-        // The imported wallet must not be able to decrypt its own outgoing
-        // output afterwards, and there is no meaningful account OVK here.
         OvkPolicy::Discard,
         &proposal,
         None,
@@ -519,6 +561,7 @@ struct RealSaplingAccountRunner<'a> {
     recipient: &'a ZcashAddress,
     prover: &'a LocalTxProver,
     max_fee_zatoshis: Option<u64>,
+    reviewed_sapling_fees: Option<&'a std::collections::HashMap<AccountUuid, u64>>,
     broadcast_log: &'a mut DurableBroadcastLog,
 }
 
@@ -535,7 +578,7 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
         let built = {
             let mut wallet_db =
                 crate::workspace::open_wallet_db(self.workspace.wallet_db_path(), self.params)?;
-            build_imported_sapling_sweep(
+            build_imported_sapling_sweep_reviewed(
                 &mut wallet_db,
                 &self.params,
                 account.wallet_account_id,
@@ -544,6 +587,8 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
                 self.prover,
                 self.max_fee_zatoshis,
                 prior_fee_zatoshis,
+                self.reviewed_sapling_fees
+                    .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0)),
             )
         };
         let tx = match built {
@@ -623,10 +668,28 @@ pub async fn sweep_imported_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
+    sweep_imported_wallet_reviewed(runtime, keys, destination, max_fee_zatoshis, None, None).await
+}
+
+pub(crate) async fn sweep_imported_wallet_reviewed(
+    runtime: &crate::models::RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+    destination: &str,
+    max_fee_zatoshis: Option<u64>,
+    reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
+    reviewed_transparent_fee: Option<u64>,
+) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome::default();
-    let result =
-        sweep_imported_wallet_into(runtime, keys, destination, max_fee_zatoshis, &mut outcome)
-            .await;
+    let result = sweep_imported_wallet_into(
+        runtime,
+        keys,
+        destination,
+        max_fee_zatoshis,
+        &mut outcome,
+        reviewed_sapling_fees,
+        reviewed_transparent_fee,
+    )
+    .await;
     (outcome, result)
 }
 
@@ -642,6 +705,32 @@ pub async fn sweep_imported_filtered_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
+    sweep_imported_filtered_wallet_reviewed(
+        runtime,
+        keys,
+        sapling_accounts,
+        transparent_indices,
+        transparent_display_index,
+        destination,
+        max_fee_zatoshis,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
+    runtime: &crate::models::RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+    sapling_accounts: &[(u32, AccountUuid, usize)],
+    transparent_indices: &[usize],
+    transparent_display_index: Option<u32>,
+    destination: &str,
+    max_fee_zatoshis: Option<u64>,
+    reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
+    reviewed_transparent_fee: Option<u64>,
+) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome {
         sapling_empty_display_index: sapling_accounts.first().map(|account| account.0),
         ..Default::default()
@@ -656,6 +745,7 @@ pub async fn sweep_imported_filtered_wallet(
             &mut outcome,
             Some(sapling_accounts),
             &mut log,
+            reviewed_sapling_fees,
         )
         .await?;
         outcome.sapling_leg_completed = true;
@@ -676,7 +766,7 @@ pub async fn sweep_imported_filtered_wallet(
                     address: key.address,
                 })
                 .collect::<Vec<_>>();
-            if let Some(swept) = crate::transparent_recovery::sweep_transparent_only(
+            if let Some(swept) = crate::transparent_recovery::sweep_transparent_only_reviewed(
                 &mut log,
                 &selected,
                 runtime.network,
@@ -684,6 +774,7 @@ pub async fn sweep_imported_filtered_wallet(
                 destination,
                 max_fee_zatoshis,
                 crate::service::at_risk_fee_total(&outcome.transactions)?,
+                reviewed_transparent_fee,
             )
             .await?
             {
@@ -725,6 +816,8 @@ async fn sweep_imported_wallet_into(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
     outcome: &mut ImportedSweepOutcome,
+    reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
+    reviewed_transparent_fee: Option<u64>,
 ) -> ZeckResult<()> {
     use crate::imported::imported_transparent_keys;
     let mut log = open_imported_broadcast_log(runtime)?;
@@ -739,6 +832,7 @@ async fn sweep_imported_wallet_into(
         outcome,
         None,
         &mut log,
+        reviewed_sapling_fees,
     )
     .await;
     outcome.sapling_leg_completed = sapling_result.is_ok();
@@ -747,7 +841,7 @@ async fn sweep_imported_wallet_into(
     let transparent_result = run_transparent_followup(may_start_transparent_leg(outcome), || async {
         let transparent = imported_transparent_keys(keys)?;
         if !transparent.is_empty() {
-            if let Some(swept) = crate::transparent_recovery::sweep_transparent_only(
+            if let Some(swept) = crate::transparent_recovery::sweep_transparent_only_reviewed(
                 &mut log,
                 &transparent,
                 runtime.network,
@@ -755,6 +849,7 @@ async fn sweep_imported_wallet_into(
                 destination,
                 max_fee_zatoshis,
                 crate::service::at_risk_fee_total(&outcome.transactions)?,
+                reviewed_transparent_fee,
             )
             .await?
             {
@@ -799,6 +894,7 @@ async fn sweep_imported_wallet_into(
 ///
 /// Writes each submission into `outcome` as it happens, so an abort part-way
 /// through still leaves the caller holding the known txid, fee, and state.
+#[allow(clippy::too_many_arguments)]
 async fn sweep_imported_sapling_leg(
     runtime: &crate::models::RuntimeScanConfig,
     keys: &argos_wallet_import::ImportedKeys,
@@ -807,6 +903,7 @@ async fn sweep_imported_sapling_leg(
     outcome: &mut ImportedSweepOutcome,
     registered_accounts: Option<&[(u32, AccountUuid, usize)]>,
     broadcast_log: &mut DurableBroadcastLog,
+    reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
 ) -> ZeckResult<()> {
     use crate::imported::register_imported_accounts;
     use crate::workspace::{consensus_network, open_wallet_db, RecoveryWorkspace};
@@ -909,6 +1006,7 @@ async fn sweep_imported_sapling_leg(
         recipient: &recipient,
         prover: &prover,
         max_fee_zatoshis,
+        reviewed_sapling_fees,
         broadcast_log,
     };
     run_sapling_accounts(&accounts, outcome, &mut runner).await
