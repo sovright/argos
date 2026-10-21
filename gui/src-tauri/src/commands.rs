@@ -2151,8 +2151,10 @@ mod tests {
 
     #[test]
     fn preview_error_carries_fresh_verification_notice_when_no_note_is_available() {
-        let mut recovered = SproutRecovery::default();
-        recovered.chain_notice = Some("preview verification found a deep reorg".to_owned());
+        let recovered = SproutRecovery {
+            chain_notice: Some("preview verification found a deep reorg".to_owned()),
+            ..Default::default()
+        };
         let error = plan_wallet_sprout_preview(&recovered).unwrap_err();
         assert!(
             error.contains("preview verification found a deep reorg"),
