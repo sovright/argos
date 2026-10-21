@@ -1074,14 +1074,14 @@ pub async fn run_sprout_scan_with_decrypt_from(
     };
 
     let cursor = scanner.cursor();
-    // An all-zero locator asks the peer to start from genesis.
+    // An all-zero locator asks the peer for the headers after genesis.
     let locator = cursor.map_or([0u8; 32], |c| c.last_block_hash);
     // `height` is the height of the *next* block to scan, and the block being
     // scanned is checkpointed and recorded at this value before it is
-    // incremented. A fresh scan begins at genesis (height 0): the all-zero
-    // locator makes the peer include genesis as `headers[0]`, so the first
-    // block scanned is height 0, not 1. A resumed scan continues one past the
-    // last block it recorded.
+    // incremented. A fresh scan begins at height 1: the peer never serves
+    // genesis itself, so the first header of a fresh walk is the child of
+    // genesis (see `first_scan_height`). A resumed scan continues one past
+    // the last block it recorded.
     let mut height = first_scan_height(cursor);
     let mut since_checkpoint = 0u64;
 
