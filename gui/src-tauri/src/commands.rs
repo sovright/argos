@@ -1061,6 +1061,11 @@ pub struct SproutScanReport {
     /// Set when the chain tip could not be confirmed with lightwalletd, so
     /// the results past the last pinned checkpoint rest on the peer alone.
     pub tip_warning: Option<String>,
+    /// The block trial decryption started from, as actually used: after a
+    /// resume this is the checkpoint's bound. `None` is every block.
+    pub decrypt_from_height: Option<u32>,
+    /// Why, in the words the CLI prints.
+    pub decrypt_line: String,
 }
 
 /// Check a raw Sprout spending key and report the address it controls.
@@ -1101,12 +1106,22 @@ pub async fn check_sapling_key(key: String, network: String) -> Result<String, S
 /// address it never knew about. Mirrors `collect_sprout_scan_keys` in the
 /// CLI, including the dedup: a repeated key trial-decrypts every ciphertext
 /// twice for nothing.
+/// The Sprout keys a scan covers, with the pasted ones and the wallet kept
+/// apart: pasted keys carry no creation time, and the skip decision needs
+/// the wallet's own records.
+struct ScanKeys {
+    /// Every key, deduplicated: what the scan decrypts for.
+    all: Vec<[u8; 32]>,
+    typed: Vec<[u8; 32]>,
+    wallet: Option<argos_core::argos_wallet_import::ImportedKeys>,
+}
+
 fn collect_scan_keys(
     path: Option<&str>,
     passphrase: Option<&SecretString>,
     typed: &[String],
     network: argos_core::ZeckNetwork,
-) -> Result<Vec<[u8; 32]>, String> {
+) -> Result<ScanKeys, String> {
     use secrecy::ExposeSecret;
 
     let mut keys: Vec<[u8; 32]> = Vec::new();
@@ -1122,6 +1137,8 @@ fn collect_scan_keys(
         );
     }
 
+    let typed_keys = keys.clone();
+    let mut wallet_keys = None;
     if let Some(path) = path {
         let bytes = argos_core::wallet_file::read_wallet_file(path)
             .map_err(|err| format!("could not read {path}: {err}"))?;
@@ -1135,6 +1152,7 @@ fn collect_scan_keys(
         for key in &wallet.sprout {
             keys.push(*key.a_sk.expose_secret());
         }
+        wallet_keys = Some(wallet);
     }
 
     keys.sort_unstable();
@@ -1146,7 +1164,46 @@ fn collect_scan_keys(
                 .to_owned(),
         );
     }
-    Ok(keys)
+    Ok(ScanKeys {
+        all: keys,
+        typed: typed_keys,
+        wallet: wallet_keys,
+    })
+}
+
+/// Where the Sprout scan starts trial-decrypting, and the line saying why.
+/// The same decision as `argos scan-sprout`: the skip comes only from the
+/// wallet's dated Sprout keys, every pasted key is an extra that rules it
+/// out, and a birthday the user entered can only lower it.
+fn sprout_scan_plan(
+    wallet: Option<&argos_core::argos_wallet_import::ImportedKeys>,
+    typed: &[[u8; 32]],
+    network: ZeckNetwork,
+    birthday_floor: Option<u32>,
+    decrypt_every_block: bool,
+) -> argos_core::SproutDecryptPlan {
+    let empty = argos_core::argos_wallet_import::ImportedKeys::default();
+    let dated =
+        argos_core::wallet_file_birthday_from_metadata(wallet.unwrap_or(&empty), typed, network);
+    argos_core::plan_sprout_decrypt(
+        dated.sprout_skip_height,
+        &dated.sprout_skip_reason,
+        birthday_floor,
+        decrypt_every_block,
+    )
+}
+
+/// The plan's line plus how to undo a skip in this app.
+fn sprout_plan_line(plan: &argos_core::SproutDecryptPlan) -> String {
+    if plan.decrypt_from.is_some() {
+        format!(
+            "{} To decrypt every block, tick \"Decrypt every block\" or enter an earlier \
+             birthday for this scan.",
+            plan.line
+        )
+    } else {
+        plan.line.clone()
+    }
 }
 
 /// How many user-supplied peers a scan accepts.
@@ -1258,6 +1315,8 @@ pub async fn start_sprout_scan(
     data_dir: String,
     lightwalletd_url: String,
     peers: Vec<String>,
+    birthday_floor: Option<u32>,
+    decrypt_every_block: Option<bool>,
 ) -> Result<SproutScanReport, String> {
     ensure_tos_accepted(&app)?;
     let network = network_from(&network);
@@ -1269,7 +1328,19 @@ pub async fn start_sprout_scan(
     // can. Previously this took typed keys only, so the one user it exists
     // for — a wallet holding Sprout keys but no note data — was told to
     // leave the box blank and then refused, with no way to see the keys.
-    let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
+    let scan_keys = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
+    let plan = sprout_scan_plan(
+        scan_keys.wallet.as_ref(),
+        &scan_keys.typed,
+        network,
+        birthday_floor,
+        decrypt_every_block.unwrap_or(false),
+    );
+    let decrypt_line = sprout_plan_line(&plan);
+    // Before any network step, so the panel says what will be left
+    // undecrypted while the hours run, not only at the end.
+    let _ = app.emit("sprout-scan-plan", decrypt_line.clone());
+    let decoded = scan_keys.all;
 
     let p2p: argos_core::p2p::wire::P2pNetwork = network.into();
     // Blank resolves to the app default, as it does for inspection, preview
@@ -1281,12 +1352,13 @@ pub async fn start_sprout_scan(
     let (tip_anchor, tip_warning) = sprout_tip_anchor(network, &lightwalletd_url).await;
 
     let emitter = app.clone();
-    let result = argos_core::sprout_scan_run::run_sprout_scan(
+    let result = argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
         &decoded,
         p2p,
         &peers,
         tip_anchor,
         &checkpoint,
+        plan.decrypt_from,
         move |tick| {
             let _ = emitter.emit(
                 "sprout-scan-progress",
@@ -1312,6 +1384,8 @@ pub async fn start_sprout_scan(
         spent_notes: result.spent_notes,
         total_zatoshis: result.total_value(),
         tip_warning,
+        decrypt_from_height: result.decrypt_from_height,
+        decrypt_line,
     })
 }
 
@@ -1359,11 +1433,23 @@ pub async fn sweep_sprout_from_scan(
     data_dir: String,
     lightwalletd_url: String,
     peers: Vec<String>,
+    birthday_floor: Option<u32>,
+    decrypt_every_block: Option<bool>,
 ) -> Result<SproutSweepReport, String> {
     ensure_tos_accepted(&app)?;
     let net = network_from(&network);
     let peers = parse_custom_peers(&peers)?;
-    let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, net)?;
+    let scan_keys = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, net)?;
+    // The resume below must ask for the bound the scan ran under, or it is
+    // refused; the same inputs through the same decision give the same one.
+    let plan = sprout_scan_plan(
+        scan_keys.wallet.as_ref(),
+        &scan_keys.typed,
+        net,
+        birthday_floor,
+        decrypt_every_block.unwrap_or(false),
+    );
+    let decoded = scan_keys.all;
 
     // Validated before anything else: an address with no Sapling receiver
     // should fail here, not after the notes are re-derived.
@@ -1386,12 +1472,13 @@ pub async fn sweep_sprout_from_scan(
 
     let (tip_anchor, _) = sprout_tip_anchor(net, &lightwalletd_url).await;
     let emitter = app.clone();
-    let result = argos_core::sprout_scan_run::run_sprout_scan(
+    let result = argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
         &decoded,
         p2p,
         &peers,
         tip_anchor,
         &checkpoint,
+        plan.decrypt_from,
         move |tick| {
             let _ = emitter.emit(
                 "sprout-scan-progress",
@@ -1686,55 +1773,136 @@ pub async fn detect_birthday(
     .map_err(|err| err.to_string())
 }
 
-/// The mnemonic a wallet file yielded, or the reason there is none.
-///
-/// Birthday auto-detection probes HD-derived addresses, so a wallet without a
-/// recoverable phrase has nothing to probe. The wording mirrors the CLI's.
-fn mnemonic_of(
+/// How a loaded wallet file is dated.
+enum BirthdayRoute {
+    /// The file yielded a mnemonic: probe its HD addresses on chain.
+    Seed(SecretString),
+    /// A seedless zcashd wallet.dat: date it from its key creation times.
+    WalletDat(argos_core::argos_wallet_import::ImportedKeys),
+}
+
+/// Pick the route. A ZecWallet Lite file without its seed has nothing
+/// dated, and reporting it as a wallet.dat whose keys zcashd left undated
+/// would be wrong, so it keeps the refusal. The wording mirrors the CLI's.
+fn birthday_route(
     keys: argos_core::argos_wallet_import::ImportedKeys,
-) -> Result<SecretString, String> {
-    keys.mnemonic.ok_or_else(|| {
-        "Auto-detect probes on-chain history for HD-derived addresses, which a wallet file \
-         without a recoverable seed phrase does not have. Enter a block height or a date instead."
-            .to_owned()
+    format: argos_core::argos_wallet_import::WalletFormat,
+) -> Result<BirthdayRoute, String> {
+    if let Some(phrase) = keys.mnemonic {
+        return Ok(BirthdayRoute::Seed(phrase));
+    }
+    match format {
+        argos_core::argos_wallet_import::WalletFormat::Zcashd => Ok(BirthdayRoute::WalletDat(keys)),
+        argos_core::argos_wallet_import::WalletFormat::ZecwalletLite => Err(
+            "Auto-detect needs a seed phrase to probe on chain, or a zcashd wallet.dat whose key \
+             creation times date it, and this wallet file offers neither. Enter a block height \
+             or a date instead."
+                .to_owned(),
+        ),
+    }
+}
+
+/// Re-open a wallet file and choose how to date it, so a mnemonic stays in
+/// the backend and never crosses IPC. Pasted Sapling keys are merged in as
+/// the scan merges them: they carry no creation time, and leaving them out
+/// would let the file's dated keys set a birthday later than theirs.
+fn birthday_route_for_file(
+    path: &str,
+    passphrase: Option<&SecretString>,
+    sapling_keys: &[String],
+    network: ZeckNetwork,
+) -> Result<BirthdayRoute, String> {
+    let bytes = argos_core::wallet_file::read_wallet_file(path)
+        .map_err(|err| format!("could not read {path}: {err}"))?;
+    let format = argos_core::argos_wallet_import::sniff(&bytes).map_err(|err| err.to_string())?;
+    let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
+        .map_err(|err| err.to_string())?;
+    if keys.mnemonic.is_none() && sapling_keys.iter().any(|k| !k.trim().is_empty()) {
+        let typed = argos_core::sapling_key::keys_from_sapling_strings(sapling_keys, network)
+            .map_err(|err| err.to_string())?;
+        argos_core::sapling_key::merge_standalone_sapling_keys(&mut keys, typed)
+            .map_err(|err| err.to_string())?;
+    }
+    birthday_route(keys, format)
+}
+
+/// Turn a wallet.dat birthday into what the birthday field shows. No height
+/// is an error carrying the core's reason, so the field keeps its value
+/// (which scans from the start of Sapling) rather than taking a guess.
+fn wallet_dat_birthday_result(
+    found: argos_core::WalletFileBirthday,
+    network: ZeckNetwork,
+) -> Result<BirthdayDetectResult, String> {
+    let Some(height) = found.height else {
+        return Err(found.message);
+    };
+    let (method, source) = match found.source {
+        argos_core::WalletBirthdaySource::TransparentUtxos => (
+            "transparent_utxos",
+            "on-chain unspent outputs, so it may be later than the wallet's real age",
+        ),
+        argos_core::WalletBirthdaySource::WalletMetadata
+        | argos_core::WalletBirthdaySource::None => {
+            ("wallet_metadata", "the wallet file's key creation times")
+        }
+    };
+    let date = match network {
+        ZeckNetwork::Mainnet => format!(
+            " (about {})",
+            argos_core::estimate_date_from_height_offline(height)
+        ),
+        ZeckNetwork::Testnet => String::new(),
+    };
+    Ok(BirthdayDetectResult {
+        birthday: height,
+        method: method.to_owned(),
+        message: format!("Block {height}{date}, from {source}. {}", found.message),
     })
 }
 
-/// Re-open a wallet file and take its mnemonic, so the phrase stays in the
-/// backend and never crosses IPC to the frontend.
-fn wallet_file_mnemonic(
-    path: &str,
-    passphrase: Option<&SecretString>,
-) -> Result<SecretString, String> {
-    let bytes = argos_core::wallet_file::read_wallet_file(path)
-        .map_err(|err| format!("could not read {path}: {err}"))?;
-    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
-        .map_err(|err| err.to_string())?;
-    mnemonic_of(keys)
-}
-
-/// `detect_birthday` for a loaded wallet file, which holds its own mnemonic.
+/// Auto-detect the birthday of a loaded wallet file: by its mnemonic when
+/// it has one, else by a wallet.dat's key creation times, falling back to
+/// the earliest unspent output of its transparent keys.
 #[tauri::command]
 pub async fn detect_birthday_from_wallet_file(
     app: AppHandle,
     path: String,
     passphrase: Option<SecretString>,
+    sapling_keys: Option<Vec<String>>,
     lightwalletd_url: String,
     network: ZeckNetwork,
 ) -> Result<BirthdayDetectResult, String> {
     ensure_tos_accepted(&app)?;
-    let seed_phrase = wallet_file_mnemonic(&path, passphrase.as_ref())?;
-    let app_clone = app.clone();
-    zeck_detect_birthday(
-        &seed_phrase,
+    let route = birthday_route_for_file(
+        &path,
+        passphrase.as_ref(),
+        sapling_keys.as_deref().unwrap_or_default(),
         network,
-        &lightwalletd_url,
-        move |msg: &str| {
-            let _ = app_clone.emit("birthday-probe-progress", msg.to_owned());
-        },
-    )
-    .await
-    .map_err(|err| err.to_string())
+    )?;
+    let app_clone = app.clone();
+    let progress = move |msg: &str| {
+        let _ = app_clone.emit("birthday-probe-progress", msg.to_owned());
+    };
+    match route {
+        BirthdayRoute::Seed(seed_phrase) => {
+            zeck_detect_birthday(&seed_phrase, network, &lightwalletd_url, progress)
+                .await
+                .map_err(|err| err.to_string())
+        }
+        // Not the Sprout paste box: the birthday field drives the Sapling
+        // scan, which reads no Sprout keys from it.
+        BirthdayRoute::WalletDat(keys) => {
+            let found = argos_core::detect_wallet_file_birthday(
+                &keys,
+                &[],
+                network,
+                Some(&lightwalletd_url),
+                progress,
+            )
+            .await;
+            wallet_dat_birthday_result(found, network)
+        }
+    }
 }
 
 #[tauri::command]
@@ -2153,26 +2321,192 @@ mod tests {
         )
     }
 
-    /// A zcashd wallet holds flat keys and no BIP-39 phrase, so there is
-    /// nothing for HD birthday detection to probe. Refused locally, before
-    /// any network call, in words that point at the other two routes.
+    use argos_core::argos_wallet_import::{ImportedKeys, WalletFormat};
+    use argos_core::ZeckNetwork;
+
+    /// A Sapling extended spending key from the fixed seed `[7u8; 32]`,
+    /// controlling no funds; the same constant the CLI tests pin.
+    const TEST_SAPLING_KEY_MAINNET: &str =
+        "secret-extended-key-main1qqqqqqqqqqqqqqyx7gddcfgw5zrw2n3nqd8f507vcpv82synampp4p8ljdz2t3ulhcn5yrvjwfsua98evx3p4v6596l8ttyctcphvxvyjf450h2dtevsakxzfjncm4v2gngdakt5384xumspjaw5uelkz2prq6cnmpd4kdczrjxr4zw2svjfq4j9amnkld3h6xetz4zq7p2lp5kzugwr7p2ln77xlj8ley3v2m8k44zduvjuynw7tpzpfv2mreh0qacxzeqrrcymmjgqvp59t";
+
+    fn wallet_dat_keys(route: BirthdayRoute) -> ImportedKeys {
+        match route {
+            BirthdayRoute::WalletDat(keys) => keys,
+            BirthdayRoute::Seed(_) => panic!("a zcashd wallet has no mnemonic"),
+        }
+    }
+
+    /// A zcashd wallet.dat has no seed, but dates itself: every fixture key
+    /// carries a creation time, so the birthday comes from the file with no
+    /// network, and says so.
     #[test]
-    fn seedless_wallet_file_refuses_birthday_detection() {
-        let err = wallet_file_mnemonic(&fixture("modern-plaintext.dat"), None)
-            .expect_err("a zcashd wallet has no mnemonic");
-        assert!(err.contains("seed phrase"), "{err}");
-        assert!(err.contains("height") && err.contains("date"), "{err}");
+    fn a_zcashd_wallet_is_dated_from_its_key_times() {
+        for (name, passphrase) in [
+            ("sprout-plaintext.dat", None),
+            ("modern-plaintext.dat", None),
+            (
+                "modern-encrypted.dat",
+                Some(SecretString::from("argos-test-passphrase".to_owned())),
+            ),
+        ] {
+            let keys = wallet_dat_keys(
+                birthday_route_for_file(
+                    &fixture(name),
+                    passphrase.as_ref(),
+                    &[],
+                    ZeckNetwork::Mainnet,
+                )
+                .expect(name),
+            );
+            let found =
+                argos_core::wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet);
+            let result = wallet_dat_birthday_result(found, ZeckNetwork::Mainnet).expect(name);
+            assert_eq!(result.method, "wallet_metadata", "{name}");
+            assert!(result.birthday > 1, "{name}");
+            assert!(
+                result.message.contains("key creation times"),
+                "{}",
+                result.message
+            );
+            assert!(
+                result.message.contains("(about 2026-"),
+                "{}",
+                result.message
+            );
+        }
+    }
+
+    /// Testnet times are never converted: the user is told, not handed a
+    /// guess.
+    #[test]
+    fn a_testnet_wallet_dat_gets_no_birthday() {
+        let keys = wallet_dat_keys(
+            birthday_route_for_file(
+                &fixture("sprout-plaintext.dat"),
+                None,
+                &[],
+                ZeckNetwork::Testnet,
+            )
+            .unwrap(),
+        );
+        let found =
+            argos_core::wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Testnet);
+        let err = wallet_dat_birthday_result(found, ZeckNetwork::Testnet).unwrap_err();
+        assert!(err.contains("mainnet"), "{err}");
+    }
+
+    /// A pasted Sapling key is scanned with the file's, and has no time, so
+    /// it must count: otherwise the file's dated keys could set a birthday
+    /// later than the pasted key's notes.
+    #[test]
+    fn a_pasted_sapling_key_counts_as_undated() {
+        let pasted = [TEST_SAPLING_KEY_MAINNET.to_owned()];
+        let keys = wallet_dat_keys(
+            birthday_route_for_file(
+                &fixture("modern-plaintext.dat"),
+                None,
+                &pasted,
+                ZeckNetwork::Mainnet,
+            )
+            .unwrap(),
+        );
+        let found =
+            argos_core::wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet);
+        assert_eq!(found.source, argos_core::WalletBirthdaySource::None);
+        assert_eq!(found.height, None);
+    }
+
+    /// The chain fallback is labelled as what it is.
+    #[test]
+    fn the_utxo_fallback_says_it_may_be_late() {
+        let found = argos_core::WalletFileBirthday {
+            height: Some(1_200_000),
+            source: argos_core::WalletBirthdaySource::TransparentUtxos,
+            keys_without_time: 3,
+            message: "core message".to_owned(),
+            sprout_skip_height: None,
+            sprout_skip_reason: String::new(),
+        };
+        let result = wallet_dat_birthday_result(found, ZeckNetwork::Mainnet).unwrap();
+        assert_eq!(result.method, "transparent_utxos");
+        assert_eq!(result.birthday, 1_200_000);
+        assert!(result.message.contains("unspent"), "{}", result.message);
+        assert!(result.message.contains("later than"), "{}", result.message);
     }
 
     #[test]
-    fn wallet_keys_with_a_mnemonic_yield_it_for_detection() {
-        let keys = argos_core::argos_wallet_import::ImportedKeys {
+    fn a_mnemonic_takes_the_seed_route_and_a_seedless_zwl_is_refused() {
+        let keys = ImportedKeys {
             mnemonic: Some(SecretString::from("abandon art".to_owned())),
             ..Default::default()
         };
-        let phrase = mnemonic_of(keys).expect("mnemonic present");
-        assert_eq!(phrase.expose_secret(), "abandon art");
-        assert!(mnemonic_of(Default::default()).is_err());
+        match birthday_route(keys, WalletFormat::ZecwalletLite).expect("mnemonic present") {
+            BirthdayRoute::Seed(phrase) => assert_eq!(phrase.expose_secret(), "abandon art"),
+            BirthdayRoute::WalletDat(_) => panic!("a mnemonic is probed as a seed"),
+        }
+        let err = match birthday_route(ImportedKeys::default(), WalletFormat::ZecwalletLite) {
+            Err(err) => err,
+            Ok(_) => panic!("a seedless ZWL file has nothing dated"),
+        };
+        assert!(err.contains("height") && err.contains("date"), "{err}");
+        assert!(matches!(
+            birthday_route(ImportedKeys::default(), WalletFormat::Zcashd),
+            Ok(BirthdayRoute::WalletDat(_))
+        ));
+    }
+
+    /// The Sprout panel skips only on the wallet's own dated Sprout keys; a
+    /// pasted key, testnet, or either opt-out removes or lowers the skip.
+    #[test]
+    fn the_sprout_panel_skip_follows_the_wallets_own_key_times() {
+        let bytes =
+            argos_core::wallet_file::read_wallet_file(fixture("sprout-plaintext.dat")).unwrap();
+        let wallet = argos_core::argos_wallet_import::import_wallet_file(&bytes, None).unwrap();
+        let net = ZeckNetwork::Mainnet;
+        let skip = sprout_scan_plan(Some(&wallet), &[], net, None, false)
+            .decrypt_from
+            .expect("dated mainnet wallet skips");
+        assert!(skip > 1);
+        assert_eq!(
+            sprout_scan_plan(Some(&wallet), &[[9u8; 32]], net, None, false).decrypt_from,
+            None
+        );
+        assert_eq!(
+            sprout_scan_plan(None, &[[9u8; 32]], net, None, false).decrypt_from,
+            None
+        );
+        assert_eq!(
+            sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Testnet, None, false).decrypt_from,
+            None
+        );
+        assert_eq!(
+            sprout_scan_plan(Some(&wallet), &[], net, None, true).decrypt_from,
+            None
+        );
+        assert_eq!(
+            sprout_scan_plan(Some(&wallet), &[], net, Some(1_000), false).decrypt_from,
+            Some(1_000)
+        );
+        assert_eq!(
+            sprout_scan_plan(Some(&wallet), &[], net, Some(skip + 5), false).decrypt_from,
+            Some(skip)
+        );
+    }
+
+    /// The scan and the sweep-from-scan must derive the same keys and the
+    /// same pasted set from the same inputs, or the sweep's resume would
+    /// ask for a different bound and be refused.
+    #[test]
+    fn scan_keys_keep_the_pasted_keys_apart() {
+        let keys = collect_scan_keys(
+            Some(&fixture("sprout-plaintext.dat")),
+            None,
+            &[],
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        assert!(keys.typed.is_empty());
+        assert_eq!(keys.all.len(), keys.wallet.as_ref().unwrap().sprout.len());
     }
 
     fn spent_note() -> SpentSproutNote {

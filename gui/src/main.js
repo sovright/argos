@@ -1041,6 +1041,34 @@ function sproutScanPeers() {
   return peers;
 }
 
+// What the Sprout scan is asked to decrypt. The backend derives any skip
+// from the wallet file's key times; this only carries what the user chose
+// to undo it. The panel's own birthday wins; otherwise the main birthday
+// field counts only once the user has set it, because its 419200 default
+// would otherwise cap every later skip. Either can only lower the skip.
+function sproutDecryptRequest(panelText, everyBlock, mainText, mainTouched) {
+  const panel = String(panelText || "").trim();
+  let birthdayFloor = null;
+  if (panel) {
+    if (!/^\d+$/.test(panel)) {
+      return { error: "The Sprout scan birthday must be a block number." };
+    }
+    birthdayFloor = Number(panel);
+  } else if (mainTouched && /^\d+$/.test(String(mainText || "").trim())) {
+    birthdayFloor = Number(String(mainText).trim());
+  }
+  return { birthdayFloor, decryptEveryBlock: !!everyBlock };
+}
+
+function currentSproutDecryptRequest() {
+  return sproutDecryptRequest(
+    $("sprout-scan-birthday").value,
+    $("sprout-scan-every-block").checked,
+    $("birthday-height").value,
+    birthdayTouched,
+  );
+}
+
 async function checkSproutKeys() {
   const list = $("sprout-scan-addresses");
   list.innerHTML = "";
@@ -1089,9 +1117,16 @@ async function runSproutScan() {
     return;
   }
 
+  const decrypt = currentSproutDecryptRequest();
+  if (decrypt.error) {
+    setStatus("sprout-scan-status", `✗ ${decrypt.error}`, "error");
+    return;
+  }
+
   const button = $("sprout-scan-run");
   button.disabled = true;
   $("sprout-scan-bar").hidden = false;
+  $("sprout-scan-plan").textContent = "";
   setStatus("sprout-scan-status", "Connecting to the Zcash network…", "");
 
   try {
@@ -1107,8 +1142,15 @@ async function runSproutScan() {
       // itself reads blocks from the p2p network.
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       peers,
+      birthdayFloor: decrypt.birthdayFloor,
+      decryptEveryBlock: decrypt.decryptEveryBlock,
     });
     $("sprout-scan-bar").hidden = true;
+    // The bound actually used: after a resume, the saved scan's.
+    $("sprout-scan-plan").textContent =
+      report.decrypt_from_height != null
+        ? `${report.decrypt_line} Trial decryption ran from block ${Number(report.decrypt_from_height).toLocaleString()}.`
+        : report.decrypt_line;
     // The core's own sentence, so the GUI and CLI give the same caveat.
     const caveat = report.tip_warning ? ` ${report.tip_warning}` : "";
     setStatus(
@@ -1158,6 +1200,14 @@ async function runSproutScanSweep() {
     return;
   }
 
+  // The same request the scan used, so the sweep's resume asks for the
+  // same bound and is not refused.
+  const decrypt = currentSproutDecryptRequest();
+  if (decrypt.error) {
+    setStatus("sprout-scan-status", `✗ ${decrypt.error}`, "error");
+    return;
+  }
+
   const button = $("sprout-scan-sweep-run");
   button.disabled = true;
   const list = $("sprout-scan-sweep-results");
@@ -1178,6 +1228,8 @@ async function runSproutScanSweep() {
       dataDir: $("data-dir").value.trim(),
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       peers,
+      birthdayFloor: decrypt.birthdayFloor,
+      decryptEveryBlock: decrypt.decryptEveryBlock,
     });
 
     for (const sent of report.sent) {
@@ -1258,6 +1310,10 @@ $("sprout-scan-run").addEventListener("click", runSproutScan);
 
 (async () => {
   try {
+    // The backend's sentence on where decryption starts, before the hours.
+    await listen("sprout-scan-plan", (event) => {
+      $("sprout-scan-plan").textContent = event.payload;
+    });
     await listen("sprout-scan-progress", (event) => {
       const p = event.payload;
       const pct = p.target ? (p.height / p.target) * 100 : 0;
@@ -1469,7 +1525,9 @@ const APPROX_CHAIN_TIP = 2_730_000;
 const BLOCKS_PER_MINUTE = 38_000;
 
 function updateScanEstimate() {
-  const birthday = parseInt($("birthday-height").value, 10) || 419200;
+  // The Sapling scan starts no earlier than activation, so a pre-Sapling
+  // birthday (which only the Sprout scan uses) costs no extra here.
+  const birthday = Math.max(parseInt($("birthday-height").value, 10) || 0, 419200);
   const blocks = Math.max(0, APPROX_CHAIN_TIP - birthday);
   const minutes = Math.round(blocks / BLOCKS_PER_MINUTE);
   const el = $("birthday-scan-estimate");
@@ -1494,8 +1552,13 @@ const BLOSSOM_ACTIVATION_DATE_JS = Date.UTC(2019, 11, 11); // Dec 11 2019
 const PRE_BLOSSOM_BLOCK_SECONDS = 150;
 const POST_BLOSSOM_BLOCK_SECONDS = 75;
 
+// Below Sapling it counts back at the same 150 s, floored at the genesis
+// date: a wallet.dat birthday can be pre-Sapling, and a hint stuck at 2018
+// beside it would misstate the wallet's age.
+const MAINNET_GENESIS_DATE_JS = Date.UTC(2016, 9, 28); // Oct 28 2016
+
 function approxDateFromHeight(height) {
-  if (!Number.isFinite(height) || height <= SAPLING_ACTIVATION_HEIGHT_JS) {
+  if (!Number.isFinite(height)) {
     return new Date(SAPLING_ACTIVATION_DATE_JS);
   }
   let anchorMs, anchorHeight, blockSeconds;
@@ -1508,7 +1571,9 @@ function approxDateFromHeight(height) {
     anchorHeight = BLOSSOM_ACTIVATION_HEIGHT_JS;
     blockSeconds = POST_BLOSSOM_BLOCK_SECONDS;
   }
-  return new Date(anchorMs + (height - anchorHeight) * blockSeconds * 1000);
+  return new Date(
+    Math.max(MAINNET_GENESIS_DATE_JS, anchorMs + (height - anchorHeight) * blockSeconds * 1000),
+  );
 }
 
 function formatApproxMonth(date) {
@@ -1534,7 +1599,13 @@ function updateBirthdayHint() {
   setBirthdayHint(`Block ${height.toLocaleString()} ≈ ${approx}.`, "");
 }
 
+// Whether the birthday field holds a value the user chose (typed, estimated
+// or auto-detected) rather than its 419200 starting value. Only a chosen
+// value may lower where the Sprout scan starts decrypting.
+let birthdayTouched = false;
+
 $("birthday-height").addEventListener("input", () => {
+  birthdayTouched = true;
   updateScanEstimate();
   updateBirthdayHint();
 });
@@ -1544,17 +1615,28 @@ updateBirthdayHint();
 // Which seed auto-detect can use. A loaded wallet file wins over the typed
 // box because the scan will use the file's keys; its mnemonic stays in the
 // backend, so the frontend only chooses the command.
+// A seedless zcashd wallet.dat is dated from its key creation times, so a
+// loaded file always goes to the backend, which refuses a seedless ZecWallet
+// Lite file itself.
 function birthdayAutodetectSource(seedText, wallet) {
-  if (wallet) {
-    if (wallet.summary && wallet.summary.has_mnemonic) return { kind: "wallet" };
-    return {
-      kind: "none",
-      message:
-        "Auto-detect needs a seed phrase, and this wallet file has none. Enter a block height or a date instead.",
-    };
-  }
+  if (wallet) return { kind: "wallet" };
   if (String(seedText || "").trim()) return { kind: "seed" };
   return { kind: "none", message: "Enter your seed phrase on step 2 first." };
+}
+
+// The hint for an auto-detected birthday. A seed-path result keeps its short
+// form; a wallet-file result carries the backend's sentence, which names the
+// source and the caveat.
+function birthdayDetectHint(result, approxMonth) {
+  const block = Number(result.birthday).toLocaleString();
+  if (result.method === "wallet_metadata" || result.method === "transparent_utxos") {
+    let text = `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}). ${result.message}`;
+    if (result.method === "transparent_utxos" && !/on-chain unspent outputs/.test(text)) {
+      text += " This comes from on-chain unspent outputs and may be later than the wallet's real age.";
+    }
+    return text;
+  }
+  return `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}).`;
 }
 
 $("birthday-autodetect").addEventListener("click", async () => {
@@ -1584,15 +1666,15 @@ $("birthday-autodetect").addEventListener("click", async () => {
             ...probe,
             path: walletFile.path,
             passphrase: walletFile.passphrase,
+            // Scanned with the file, and undated, so they must be counted.
+            saplingKeys: hasSaplingScanKeys() ? saplingScanKeyLines() : [],
           })
         : await invoke("detect_birthday", { ...probe, seed: seedVal.toLowerCase() });
     $("birthday-height").value = result.birthday;
+    birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
-    setBirthdayHint(
-      `✓ Auto-detected birthday: block ${Number(result.birthday).toLocaleString()} (≈ ${approx}).`,
-      "success",
-    );
+    setBirthdayHint(birthdayDetectHint(result, approx), "success");
   } catch (err) {
     setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
   } finally {
@@ -1617,6 +1699,7 @@ $("birthday-estimate").addEventListener("click", async () => {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
     });
     $("birthday-height").value = height;
+    birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(height));
     setBirthdayHint(

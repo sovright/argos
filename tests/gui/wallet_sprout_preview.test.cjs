@@ -68,7 +68,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     sweep: () => vm.runInContext("runSproutSweep()", context),
     peek: (expr) => vm.runInContext(expr, context),
     // The scan-sweep handler lives outside the slices above; load it on its
-    // own, with its two input helpers stubbed only if not already present.
+    // own, with its input helpers stubbed only if not already present.
     scanSweep() {
       const start = source.indexOf("async function runSproutScanSweep()");
       const end = source.indexOf("\n}\n", start) + 3;
@@ -77,6 +77,12 @@ function harness(intercept = (_, __, fallback) => fallback()) {
         if (vm.runInContext(`typeof ${helper}`, context) !== "function") {
           vm.runInContext(`function ${helper}() { return []; }`, context);
         }
+      }
+      if (vm.runInContext("typeof currentSproutDecryptRequest", context) !== "function") {
+        vm.runInContext(
+          "function currentSproutDecryptRequest() { return { birthdayFloor: null, decryptEveryBlock: false }; }",
+          context,
+        );
       }
       return vm.runInContext("runSproutScanSweep()", context);
     },

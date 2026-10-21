@@ -27,13 +27,11 @@ test("a wallet file with a recovered mnemonic is detected from the backend", () 
   assert.deepEqual(plain(pick("typed seed", wallet)), { kind: "wallet" });
 });
 
-test("a seedless wallet file explains the other two routes", () => {
+test("a seedless wallet file is detected from the backend too", () => {
+  // A zcashd wallet.dat dates itself from its key creation times; the
+  // backend decides, and refuses a seedless ZecWallet Lite file itself.
   const wallet = { path: "/w", passphrase: null, summary: { has_mnemonic: false } };
-  const out = plain(pick("", wallet));
-  assert.equal(out.kind, "none");
-  assert.match(out.message, /seed phrase/);
-  assert.match(out.message, /height/);
-  assert.match(out.message, /date/);
+  assert.deepEqual(plain(pick("", wallet)), { kind: "wallet" });
 });
 
 test("nothing loaded keeps the original prompt", () => {
