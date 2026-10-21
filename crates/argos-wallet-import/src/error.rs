@@ -39,6 +39,13 @@ pub enum ImportDiagnostic {
          also stores them individually"
     )]
     UnrecoveredSeed { record_type: String },
+
+    /// A key's creation-time record (`keymeta`, `zkeymeta`, `sapzkeymeta`)
+    /// could not be read. The key itself is unaffected; it just has no
+    /// creation time, so nothing about where to start scanning for it is
+    /// inferred from the file.
+    #[error("skipped unreadable {record_type} record: {reason}; the key it describes has no creation time")]
+    UnreadableKeyMetadata { record_type: String, reason: String },
 }
 
 impl ImportDiagnostic {

@@ -84,7 +84,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     sweep: () => vm.runInContext("runSproutSweep()", context),
     peek: (expr) => vm.runInContext(expr, context),
     // The scan-sweep handler lives outside the slices above; load it on its
-    // own, with its two input helpers stubbed only if not already present.
+    // own, with its input helpers stubbed only if not already present.
     scanSweep() {
       const start = source.indexOf("async function runSproutScanSweep()");
       const end = source.indexOf("\n}\n", start) + 3;
@@ -102,6 +102,11 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       const start = source.indexOf("// ─── Sprout scan ─");
       const end = source.indexOf('$("sprout-scan-sweep-run").addEventListener', start);
       assert.ok(start > 0 && end > start);
+      // Declared on the settings step, outside every slice: the main birthday
+      // field counts toward the Sprout decrypt bound only once it was set.
+      if (vm.runInContext("typeof birthdayTouched", context) === "undefined") {
+        vm.runInContext("var birthdayTouched = false;", context);
+      }
       vm.runInContext(source.slice(start, end), context);
     },
     scan: () => vm.runInContext("runSproutScan()", context),
@@ -781,6 +786,35 @@ test("the scan sweep keeps the caveat when a note was refused", async () => {
   }
 });
 
+// The sweep resumes the saved scan, and the backend reads the bound that
+// scan used from its checkpoint. The form may have changed since — an
+// auto-detected or retyped main birthday below the scan's skip — and
+// re-deriving the bound from it would make the resume conflict after hours
+// of scanning. So the sweep must send no decrypt request at all, and must
+// not be stopped by a form value it no longer reads.
+test("the scan sweep sends no decrypt bound, whatever the form says now", async () => {
+  for (const formNow of [
+    "{ birthdayFloor: 1000, decryptEveryBlock: true }",
+    "{ error: 'The Sprout scan birthday must be a block number.' }",
+  ]) {
+    const sent = [];
+    const h = harness((command, args, fallback) => {
+      if (command === "sweep_sprout_from_scan") {
+        sent.push({ ...args });
+        return { sent: [], total_swept: 0, skipped: [], rejected: [], error: null };
+      }
+      return fallback();
+    });
+    h.peek(`function currentSproutDecryptRequest() { return ${formNow}; }`);
+    h.$("sprout-scan-destination").value = "fixture-destination";
+    h.$("sprout-scan-confirm").checked = true;
+    await h.scanSweep();
+    assert.equal(sent.length, 1, formNow);
+    assert.equal("birthdayFloor" in sent[0], false, JSON.stringify(sent[0]));
+    assert.equal("decryptEveryBlock" in sent[0], false, JSON.stringify(sent[0]));
+  }
+});
+
 test("a scan sweep that broadcast switches the NU7 warning to confirming it is mined", async () => {
   const h = harness(async (command, args, fallback) =>
     command === "sweep_sprout_from_scan"
@@ -962,6 +996,7 @@ test("a no-file scan sends only the pasted lines, with no wallet path or passphr
   h.$("sprout-scan-peers").value = "";
   h.$("lightwalletd-url").value = "https://zec.rocks:443";
   h.$("data-dir").value = "";
+  h.$("birthday-height").value = "419200";
   await h.scan();
   assert.equal(calls.length, 1);
   // The fields that make this a no-file scan; other request fields (the
@@ -974,6 +1009,11 @@ test("a no-file scan sends only the pasted lines, with no wallet path or passphr
   assert.equal(sent.dataDir, "");
   assert.equal(sent.lightwalletdUrl, "https://zec.rocks:443");
   assert.deepEqual(sent.peers, []);
+  // #260's decrypt request, at its default with no wallet file: no key dates,
+  // so no floor, and the skip left on. The untouched 419200 default in the
+  // main birthday field must not become a floor.
+  assert.equal(sent.birthdayFloor, null);
+  assert.equal(sent.decryptEveryBlock, false);
   assert.equal(h.$("sprout-scan-sweep").hidden, false);
 });
 
@@ -1071,7 +1111,11 @@ test("Start over clears the raw Sprout key box and closes the panel", async () =
   h.$("sprout-scan-destination").value = "fixture-destination";
   h.$("sprout-scan-confirm").checked = true;
   h.$("sprout-scan-sweep").hidden = false;
+  h.$("sprout-scan-birthday").value = "300000";
+  h.$("sprout-scan-every-block").checked = true;
   h.peek("forgetSproutScanInputs()");
+  assert.equal(h.$("sprout-scan-birthday").value, "");
+  assert.equal(h.$("sprout-scan-every-block").checked, false);
   assert.equal(h.$("sprout-scan-keys").value, "");
   assert.equal(h.$("sprout-scan-destination").value, "");
   assert.equal(h.$("sprout-scan-confirm").checked, false);

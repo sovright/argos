@@ -27,6 +27,7 @@ use crate::{
     keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
     zcashd::{
         crypto::MasterKey,
+        metadata::{KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
     },
 };
@@ -101,6 +102,9 @@ fn read_length_prefixed(value: &[u8]) -> Option<(&[u8], usize)> {
 /// A record that fails to decrypt is reported and skipped. One corrupt
 /// record must never cost the user the keys beside it.
 pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: &mut ImportedKeys) {
+    // Metadata is stored in plaintext even in an encrypted wallet. Damaged
+    // records are reported by `collect_plaintext`, so not again here.
+    let metadata = KeyMetadataIndex::build(pairs, None);
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             continue;
@@ -148,6 +152,7 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                         a_sk: Secret::new(a_sk),
                         address,
                         provenance: Provenance::Standalone,
+                        created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
                     }),
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "czkey".to_owned(),
@@ -182,6 +187,7 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                     Some(secret) => out.transparent.push(TransparentKey {
                         secret: Secret::new(secret),
                         provenance: Provenance::HdDerived,
+                        created_at: metadata.created_at(MetadataKind::Transparent, &rec.rest),
                     }),
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "ckey".to_owned(),
@@ -242,6 +248,7 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                     Some(extsk) if extsk.len() == EXTSK_LEN => out.sapling.push(SaplingKey {
                         extsk: Secret::new(extsk),
                         provenance: Provenance::HdDerived,
+                        created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
                     }),
                     Some(mut wrong_length) => {
                         let got = wrong_length.len();

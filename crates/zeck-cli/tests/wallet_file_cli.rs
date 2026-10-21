@@ -942,3 +942,315 @@ fn a_scan_says_how_it_ended_on_stderr_when_stdout_is_captured() {
         "and where the full result went:\n{stderr}"
     );
 }
+
+/// Run `argos`, killing it at a deadline: a build that does not stop where
+/// the test expects goes on to dial public peers for hours.
+fn argos_with_deadline(args: &[&str], secs: u64) -> (Option<std::process::ExitStatus>, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_argos"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("argos binary should run");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().expect("piped"), &mut stderr)
+        .expect("stderr");
+    (status, stderr)
+}
+
+/// A zcashd wallet.dat has no seed, but it records when each key was made.
+/// Auto-detect reads that, offline: every fixture key is dated, so the chain
+/// is never asked, and the run only stops when the scan itself refuses the
+/// unusable server.
+#[test]
+fn auto_detect_dates_a_seedless_wallet_from_its_key_times() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("utf-8"),
+        "--accept-tos",
+        "--birthday-auto-detect",
+        "--lightwalletd-url",
+        "nonono",
+        "--data-dir",
+        &scratch_dir("autodetect-mainnet"),
+        "scan",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("needs a seed phrase") && !stderr.contains("HD-derived addresses"),
+        "a zcashd wallet must no longer be refused:\n{stderr}"
+    );
+    assert!(stderr.contains("Birthday: block "), "{stderr}");
+    assert!(
+        stderr.contains("(about 2026-"),
+        "the date must be shown:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("from the wallet file's key creation times"),
+        "the source must be named:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Checking the wallet file's transparent addresses on chain"),
+        "complete metadata must not consult the chain:\n{stderr}"
+    );
+}
+
+/// Testnet times are never converted, so there is no birthday to offer;
+/// the scan goes ahead from the start rather than guessing.
+#[test]
+fn auto_detect_on_testnet_scans_from_the_start() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().expect("utf-8"),
+        "--accept-tos",
+        "--network",
+        "testnet",
+        "--birthday-auto-detect",
+        "--lightwalletd-url",
+        "nonono",
+        "--data-dir",
+        &scratch_dir("autodetect-testnet"),
+        "scan",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("only converted to heights on mainnet"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("from the start"), "{stderr}");
+    // Testnet Sapling activation, not the mainnet default or block 1.
+    assert!(stderr.contains("Sapling pool (block 280000)"), "{stderr}");
+    assert!(!stderr.contains("Birthday: block "), "{stderr}");
+}
+
+/// The Sprout scan states where trial decryption starts, and why, before
+/// any network step -- here it is stopped by the unusable server right
+/// after. The fixture's Sprout key is dated, so on mainnet there is a skip.
+#[test]
+fn scan_sprout_states_the_skip_and_can_turn_it_off() {
+    let dir = std::env::temp_dir().join(format!("argos-sprout-skip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let destination = test_vector_sapling_address(&dir);
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let base = [
+        "--wallet-file",
+        wallet.to_str().expect("utf-8"),
+        "--data-dir",
+        dir.to_str().expect("utf-8"),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "nonono",
+        "scan-sprout",
+        "--destination",
+        &destination,
+    ];
+
+    let (status, stderr) = argos_with_deadline(&base, 20);
+    assert!(status.is_some_and(|s| !s.success()), "must stop:\n{stderr}");
+    assert!(
+        stderr.contains("Trial decryption starts at block "),
+        "the skip must be stated:\n{stderr}"
+    );
+    assert!(stderr.contains("creation times"), "and why:\n{stderr}");
+    assert!(
+        stderr.contains("--no-birthday-skip"),
+        "and how to undo it:\n{stderr}"
+    );
+
+    let mut off = base.to_vec();
+    off.push("--no-birthday-skip");
+    let (status, stderr) = argos_with_deadline(&off, 20);
+    assert!(status.is_some_and(|s| !s.success()), "must stop:\n{stderr}");
+    assert!(stderr.contains("every block from 1"), "{stderr}");
+    assert!(
+        !stderr.contains("Trial decryption starts at block "),
+        "{stderr}"
+    );
+
+    let mut lower = base.to_vec();
+    lower.extend(["--birthday", "500000"]);
+    let (status, stderr) = argos_with_deadline(&lower, 20);
+    assert!(status.is_some_and(|s| !s.success()), "must stop:\n{stderr}");
+    assert!(
+        stderr.contains("Trial decryption starts at block 500000, the birthday given"),
+        "a lower --birthday wins:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only scan-sprout skips trial decryption, so the flag anywhere else
+/// would be silently ignored.
+#[test]
+fn no_birthday_skip_is_refused_where_nothing_is_skipped() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let wallet = path.to_str().expect("utf-8");
+    for args in [
+        vec![
+            "--wallet-file",
+            wallet,
+            "inspect-wallet",
+            "--no-birthday-skip",
+        ],
+        vec![
+            "--wallet-file",
+            wallet,
+            "scan",
+            "--no-birthday-skip",
+            "--accept-tos",
+        ],
+        vec![
+            "--wallet-file",
+            wallet,
+            "sweep-sprout",
+            "--destination",
+            "zs1x",
+            "--no-birthday-skip",
+            "--accept-tos",
+        ],
+        vec!["show-keys", "--no-birthday-skip"],
+    ] {
+        let out = argos(&args);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--no-birthday-skip is not used by"),
+            "{args:?}: got:\n{stderr}"
+        );
+    }
+}
+
+/// Kristi's #3 on #260: `scan-sprout` takes its decrypt floor from
+/// --birthday only. --birthday-date and --birthday-auto-detect were accepted
+/// and silently ignored, though the help says the date overrides --birthday;
+/// a user passing one would believe it lowered the floor. Refused before any
+/// network step.
+#[test]
+fn scan_sprout_refuses_birthday_date_and_auto_detect() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let wallet = path.to_str().expect("utf-8");
+    let dir = scratch_dir("scan-sprout-birthday-flags");
+    for flag in [
+        vec!["--birthday-date", "2017-01-01"],
+        vec!["--birthday-auto-detect"],
+    ] {
+        let mut args = vec![
+            "--wallet-file",
+            wallet,
+            "--accept-tos",
+            "--data-dir",
+            &dir,
+            "--lightwalletd-url",
+            "nonono",
+        ];
+        args.extend(flag.iter().copied());
+        args.extend(["scan-sprout", "--destination", "zs1x"]);
+        let (status, stderr) = argos_with_deadline(&args, 20);
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "{flag:?} must be refused:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("{} is not used by `argos scan-sprout`", flag[0])),
+            "{flag:?}: got:\n{stderr}"
+        );
+        assert!(stderr.contains("--birthday <height>"), "{stderr}");
+        assert!(
+            !stderr.contains("Trial decryption"),
+            "refused before the plan is stated:\n{stderr}"
+        );
+    }
+}
+
+/// Kristi's test gap on #260: `scan` and `sweep` must land on the same
+/// birthday, or they key different workspaces. For a fully dated wallet.dat
+/// detection is offline and deterministic, so the two agree; the
+/// chain-dependent fallback is tracked separately.
+#[test]
+fn scan_and_sweep_auto_detect_the_same_birthday() {
+    let dir = std::env::temp_dir().join(format!("argos-scan-sweep-bday-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let destination = test_vector_sapling_address(&dir);
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let base = [
+        "--wallet-file",
+        wallet.to_str().expect("utf-8"),
+        "--data-dir",
+        dir.to_str().expect("utf-8"),
+        "--accept-tos",
+        "--birthday-auto-detect",
+        "--lightwalletd-url",
+        "nonono",
+    ];
+    let birthday_line = |stderr: &str| -> String {
+        stderr
+            .lines()
+            .find(|l| l.contains("Birthday: block "))
+            .unwrap_or_else(|| panic!("no birthday line:\n{stderr}"))
+            .to_owned()
+    };
+
+    let mut scan = base.to_vec();
+    scan.push("scan");
+    let (_, scan_stderr) = argos_with_deadline(&scan, 20);
+
+    let mut sweep = base.to_vec();
+    sweep.extend(["sweep", "--destination", &destination, "--dry-run"]);
+    let (_, sweep_stderr) = argos_with_deadline(&sweep, 20);
+
+    assert_eq!(birthday_line(&scan_stderr), birthday_line(&sweep_stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Kristi's #1 on #260, CLI paste route: a `--sapling-key-file` key has no
+/// creation time and could hold notes from any height after activation. The
+/// file's dated transparent keys must not let a transparent output decide
+/// where Sapling starts, so the chain is never asked (with an unusable
+/// server, a chain check would say "could not be checked").
+#[test]
+fn auto_detect_with_a_sapling_key_file_does_not_use_the_chain() {
+    let wallet = fixture("modern-plaintext.dat");
+    let key = key_file(
+        "sapling-key-autodetect.txt",
+        &format!("{TEST_SAPLING_KEY_MAINNET}\n"),
+    );
+    let out = argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("utf-8"),
+        "--sapling-key-file",
+        key.to_str().expect("utf-8"),
+        "--accept-tos",
+        "--birthday-auto-detect",
+        "--lightwalletd-url",
+        "nonono",
+        "--data-dir",
+        &scratch_dir("autodetect-sapling-key-file"),
+        "scan",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Checking the wallet file's transparent addresses on chain"),
+        "an undated Sapling key must rule out the chain fallback:\n{stderr}"
+    );
+    assert!(!stderr.contains("could not be checked"), "{stderr}");
+    assert!(stderr.contains("Sapling activation"), "{stderr}");
+    assert!(stderr.contains("No birthday could be detected"), "{stderr}");
+    // Kristi's #2 on #260: the same height a plain `scan` with no --birthday
+    // uses on mainnet, so the two key the same workspace and a resume holds.
+    assert!(stderr.contains("Sapling pool (block 419200)"), "{stderr}");
+    assert!(!stderr.contains("Birthday: block "), "{stderr}");
+}

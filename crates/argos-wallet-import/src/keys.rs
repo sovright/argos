@@ -25,6 +25,16 @@ pub enum Provenance {
 pub struct TransparentKey {
     pub secret: Secret<[u8; 32]>,
     pub provenance: Provenance,
+    /// When zcashd recorded creating this key, in Unix seconds, from the
+    /// wallet's `CKeyMetadata`. `None` when the file does not say — no
+    /// metadata record, zcashd's own "unknown" marker (`importprivkey` /
+    /// `z_importkey` write 1), or a record that did not parse — and always
+    /// `None` for a key that arrived as text rather than in a wallet file.
+    ///
+    /// The wallet's own claim, from the machine's clock at the time: a lower
+    /// bound on where funds can be is derived from it with a margin, never
+    /// used as a height directly.
+    pub created_at: Option<i64>,
 }
 
 impl std::fmt::Debug for TransparentKey {
@@ -32,6 +42,7 @@ impl std::fmt::Debug for TransparentKey {
         f.debug_struct("TransparentKey")
             .field("secret", &"<redacted>")
             .field("provenance", &self.provenance)
+            .field("created_at", &self.created_at)
             .finish()
     }
 }
@@ -40,6 +51,16 @@ pub struct SaplingKey {
     /// Raw extended spending key bytes, as stored by zcashd.
     pub extsk: Secret<Vec<u8>>,
     pub provenance: Provenance,
+    /// When zcashd recorded creating this key, in Unix seconds, from the
+    /// wallet's `CKeyMetadata`. `None` when the file does not say — no
+    /// metadata record, zcashd's own "unknown" marker (`importprivkey` /
+    /// `z_importkey` write 1), or a record that did not parse — and always
+    /// `None` for a key that arrived as text rather than in a wallet file.
+    ///
+    /// The wallet's own claim, from the machine's clock at the time: a lower
+    /// bound on where funds can be is derived from it with a margin, never
+    /// used as a height directly.
+    pub created_at: Option<i64>,
 }
 
 impl std::fmt::Debug for SaplingKey {
@@ -47,6 +68,7 @@ impl std::fmt::Debug for SaplingKey {
         f.debug_struct("SaplingKey")
             .field("extsk", &"<redacted>")
             .field("provenance", &self.provenance)
+            .field("created_at", &self.created_at)
             .finish()
     }
 }
@@ -57,6 +79,16 @@ pub struct SproutKey {
     /// 64-byte Sprout payment address this key unlocks.
     pub address: [u8; 64],
     pub provenance: Provenance,
+    /// When zcashd recorded creating this key, in Unix seconds, from the
+    /// wallet's `CKeyMetadata`. `None` when the file does not say — no
+    /// metadata record, zcashd's own "unknown" marker (`importprivkey` /
+    /// `z_importkey` write 1), or a record that did not parse — and always
+    /// `None` for a key that arrived as text rather than in a wallet file.
+    ///
+    /// The wallet's own claim, from the machine's clock at the time: a lower
+    /// bound on where funds can be is derived from it with a margin, never
+    /// used as a height directly.
+    pub created_at: Option<i64>,
 }
 
 impl std::fmt::Debug for SproutKey {
@@ -65,6 +97,7 @@ impl std::fmt::Debug for SproutKey {
             .field("a_sk", &"<redacted>")
             .field("address", &self.address)
             .field("provenance", &self.provenance)
+            .field("created_at", &self.created_at)
             .finish()
     }
 }
@@ -252,6 +285,10 @@ impl ImportCoverage {
             ImportDiagnostic::UnparseableRecord { .. }
             | ImportDiagnostic::DecryptionFailed { .. } => Self::KeysUnread,
             ImportDiagnostic::UnknownRecord { .. } => Self::UnknownRecordsSkipped,
+            // A key without a creation time is still a key, and is scanned
+            // from the start of the chain. Nothing can be missed for want
+            // of one, so there is nothing to warn about beyond the listing.
+            ImportDiagnostic::UnreadableKeyMetadata { .. } => Self::Complete,
         }
     }
 
@@ -334,6 +371,7 @@ mod coverage_tests {
             a_sk: secrecy::Secret::new([1; 32]),
             address: [2; 64],
             provenance: Provenance::Standalone,
+            created_at: None,
         });
         keys
     }

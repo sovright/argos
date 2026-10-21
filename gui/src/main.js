@@ -640,6 +640,10 @@ function forgetSproutScanInputs() {
   $("sprout-scan-addresses").innerHTML = "";
   $("sprout-scan-destination").value = "";
   $("sprout-scan-confirm").checked = false;
+  // The decrypt-bound overrides belong to the run they were set for.
+  $("sprout-scan-birthday").value = "";
+  $("sprout-scan-every-block").checked = false;
+  $("sprout-scan-plan").textContent = "";
   $("sprout-scan-sweep").hidden = true;
   $("sprout-scan-sweep-results").innerHTML = "";
   setStatus("sprout-scan-status", "", "");
@@ -1311,6 +1315,46 @@ function sproutScanPeers() {
   return peers;
 }
 
+// What the Sprout scan is asked to decrypt. The backend derives any skip
+// from the wallet file's key times; this only carries what the user chose
+// to undo it. The panel's own birthday wins; otherwise the main birthday
+// field counts only once the user has set it, because its 419200 default
+// would otherwise cap every later skip. Either can only lower the skip.
+//
+// The backend takes the bound as a u32, and a larger number fails Tauri's
+// deserialisation with a raw serde error the user cannot act on, so it is
+// refused here in words. Number() of a long digit string is not exact past
+// 2^53, which is why the safe-integer check comes first.
+function sproutDecryptRequest(panelText, everyBlock, mainText, mainTouched) {
+  const MAX_BLOCK_HEIGHT = 4294967295;
+  const tooLarge = (n) => !Number.isSafeInteger(n) || n > MAX_BLOCK_HEIGHT;
+  const tooLargeError = (field) => ({
+    error: `The ${field} is too large: no block number is above ${MAX_BLOCK_HEIGHT.toLocaleString("en-US")}.`,
+  });
+  const panel = String(panelText || "").trim();
+  let birthdayFloor = null;
+  if (panel) {
+    if (!/^\d+$/.test(panel)) {
+      return { error: "The Sprout scan birthday must be a block number." };
+    }
+    birthdayFloor = Number(panel);
+    if (tooLarge(birthdayFloor)) return tooLargeError("Sprout scan birthday");
+  } else if (mainTouched && /^\d+$/.test(String(mainText || "").trim())) {
+    birthdayFloor = Number(String(mainText).trim());
+    if (tooLarge(birthdayFloor)) return tooLargeError("wallet birthday");
+  }
+  return { birthdayFloor, decryptEveryBlock: !!everyBlock };
+}
+
+function currentSproutDecryptRequest() {
+  return sproutDecryptRequest(
+    $("sprout-scan-birthday").value,
+    $("sprout-scan-every-block").checked,
+    $("birthday-height").value,
+    birthdayTouched,
+  );
+}
+
 async function checkSproutKeys() {
   const list = $("sprout-scan-addresses");
   list.innerHTML = "";
@@ -1359,9 +1403,16 @@ async function runSproutScan() {
     return;
   }
 
+  const decrypt = currentSproutDecryptRequest();
+  if (decrypt.error) {
+    setStatus("sprout-scan-status", `✗ ${decrypt.error}`, "error");
+    return;
+  }
+
   const button = $("sprout-scan-run");
   button.disabled = true;
   $("sprout-scan-bar").hidden = false;
+  $("sprout-scan-plan").textContent = "";
   setStatus("sprout-scan-status", "Connecting to the Zcash network…", "");
 
   try {
@@ -1377,8 +1428,15 @@ async function runSproutScan() {
       // itself reads blocks from the p2p network.
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       peers,
+      birthdayFloor: decrypt.birthdayFloor,
+      decryptEveryBlock: decrypt.decryptEveryBlock,
     });
     $("sprout-scan-bar").hidden = true;
+    // The bound actually used: after a resume, the saved scan's.
+    $("sprout-scan-plan").textContent =
+      report.decrypt_from_height != null
+        ? `${report.decrypt_line} Trial decryption ran from block ${Number(report.decrypt_from_height).toLocaleString()}.`
+        : report.decrypt_line;
     // The core's own sentence, so the GUI and CLI give the same caveat.
     const caveat = report.tip_warning ? ` ${report.tip_warning}` : "";
     setStatus(
@@ -1427,6 +1485,13 @@ async function runSproutScanSweep() {
     setStatus("sprout-scan-status", `✗ ${err.message}`, "error");
     return;
   }
+
+  // No decrypt bound is sent: the backend resumes under the one the saved
+  // scan used, read from its checkpoint. Re-deriving it from the form would
+  // pick up any birthday change made since — auto-detect, an estimate, a
+  // retyped field — and a lower one makes the resume conflict after hours
+  // of scanning. Lowering the bound means starting a new scan, which says
+  // why when it has to refuse.
 
   const button = $("sprout-scan-sweep-run");
   button.disabled = true;
@@ -1530,6 +1595,10 @@ $("sprout-scan-entry")?.addEventListener("toggle", onSproutScanEntryToggle);
 
 (async () => {
   try {
+    // The backend's sentence on where decryption starts, before the hours.
+    await listen("sprout-scan-plan", (event) => {
+      $("sprout-scan-plan").textContent = event.payload;
+    });
     await listen("sprout-scan-progress", (event) => {
       const p = event.payload;
       const pct = p.target ? (p.height / p.target) * 100 : 0;
@@ -1750,7 +1819,9 @@ const APPROX_CHAIN_TIP = 2_730_000;
 const BLOCKS_PER_MINUTE = 38_000;
 
 function updateScanEstimate() {
-  const birthday = parseInt($("birthday-height").value, 10) || 419200;
+  // The Sapling scan starts no earlier than activation, so a pre-Sapling
+  // birthday (which only the Sprout scan uses) costs no extra here.
+  const birthday = Math.max(parseInt($("birthday-height").value, 10) || 0, 419200);
   const blocks = Math.max(0, APPROX_CHAIN_TIP - birthday);
   const minutes = Math.round(blocks / BLOCKS_PER_MINUTE);
   const el = $("birthday-scan-estimate");
@@ -1775,8 +1846,13 @@ const BLOSSOM_ACTIVATION_DATE_JS = Date.UTC(2019, 11, 11); // Dec 11 2019
 const PRE_BLOSSOM_BLOCK_SECONDS = 150;
 const POST_BLOSSOM_BLOCK_SECONDS = 75;
 
+// Below Sapling it counts back at the same 150 s, floored at the genesis
+// date: a wallet.dat birthday can be pre-Sapling, and a hint stuck at 2018
+// beside it would misstate the wallet's age.
+const MAINNET_GENESIS_DATE_JS = Date.UTC(2016, 9, 28); // Oct 28 2016
+
 function approxDateFromHeight(height) {
-  if (!Number.isFinite(height) || height <= SAPLING_ACTIVATION_HEIGHT_JS) {
+  if (!Number.isFinite(height)) {
     return new Date(SAPLING_ACTIVATION_DATE_JS);
   }
   let anchorMs, anchorHeight, blockSeconds;
@@ -1789,7 +1865,9 @@ function approxDateFromHeight(height) {
     anchorHeight = BLOSSOM_ACTIVATION_HEIGHT_JS;
     blockSeconds = POST_BLOSSOM_BLOCK_SECONDS;
   }
-  return new Date(anchorMs + (height - anchorHeight) * blockSeconds * 1000);
+  return new Date(
+    Math.max(MAINNET_GENESIS_DATE_JS, anchorMs + (height - anchorHeight) * blockSeconds * 1000),
+  );
 }
 
 function formatApproxMonth(date) {
@@ -1815,7 +1893,13 @@ function updateBirthdayHint() {
   setBirthdayHint(`Block ${height.toLocaleString()} ≈ ${approx}.`, "");
 }
 
+// Whether the birthday field holds a value the user chose (typed, estimated
+// or auto-detected) rather than its 419200 starting value. Only a chosen
+// value may lower where the Sprout scan starts decrypting.
+let birthdayTouched = false;
+
 $("birthday-height").addEventListener("input", () => {
+  birthdayTouched = true;
   updateScanEstimate();
   updateBirthdayHint();
 });
@@ -1824,9 +1908,11 @@ updateBirthdayHint();
 
 // Which seed auto-detect can use. A loaded wallet file wins over the typed
 // box because the scan will use the file's keys; its mnemonic stays in the
-// backend, so the frontend only chooses the command. Whether the file holds a
-// mnemonic at all is the backend's call (`mnemonic_of`), so its refusal is
-// shown as returned rather than restated here where it could drift.
+// backend, so the frontend only chooses the command. A seedless zcashd
+// wallet.dat is dated from its key creation times, so a loaded file always
+// goes to the backend; whether it has a mnemonic, or is a seedless ZecWallet
+// Lite file to refuse, is the backend's call, so its refusal is shown as
+// returned rather than restated here where it could drift.
 function birthdayAutodetectSource(seedText, wallet) {
   if (wallet) {
     // The passphrase is dropped once a scan starts (T-S2), so after
@@ -1842,6 +1928,21 @@ function birthdayAutodetectSource(seedText, wallet) {
   }
   if (String(seedText || "").trim()) return { kind: "seed" };
   return { kind: "none", message: "Enter your seed phrase on step 2 first." };
+}
+
+// The hint for an auto-detected birthday. A seed-path result keeps its short
+// form; a wallet-file result carries the backend's sentence, which names the
+// source and the caveat.
+function birthdayDetectHint(result, approxMonth) {
+  const block = Number(result.birthday).toLocaleString();
+  if (result.method === "wallet_metadata" || result.method === "transparent_utxos") {
+    let text = `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}). ${result.message}`;
+    if (result.method === "transparent_utxos" && !/on-chain unspent outputs/.test(text)) {
+      text += " This comes from on-chain unspent outputs and may be later than the wallet's real age.";
+    }
+    return text;
+  }
+  return `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}).`;
 }
 
 async function runBirthdayAutodetect() {
@@ -1877,6 +1978,8 @@ async function runBirthdayAutodetect() {
             ...probe,
             path: walletFile.path,
             passphrase: walletFile.passphrase,
+            // Scanned with the file, and undated, so they must be counted.
+            saplingKeys: hasSaplingScanKeys() ? saplingScanKeyLines() : [],
           })
         : await invoke("detect_birthday", { ...probe, seed: seedVal.toLowerCase() });
     if (!isCurrent()) {
@@ -1884,12 +1987,10 @@ async function runBirthdayAutodetect() {
       return;
     }
     $("birthday-height").value = result.birthday;
+    birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
-    setBirthdayHint(
-      `✓ Auto-detected birthday: block ${Number(result.birthday).toLocaleString()} (≈ ${approx}).`,
-      "success",
-    );
+    setBirthdayHint(birthdayDetectHint(result, approx), "success");
   } catch (err) {
     if (isCurrent()) setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
   } finally {
@@ -1916,6 +2017,7 @@ $("birthday-estimate").addEventListener("click", async () => {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
     });
     $("birthday-height").value = height;
+    birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(height));
     setBirthdayHint(
