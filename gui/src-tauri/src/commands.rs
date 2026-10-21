@@ -426,9 +426,12 @@ async fn compute_sprout_summary(
     // stored address must not be counted, shown, or spent with.
     let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(keys);
 
-    // Opening a wallet makes no network contact: a saved scan is named, not
-    // used, until a sweep preview verifies it against live peers.
-    let recovered = recover_with_scan(app, keys, network_from(network_name), data_dir, None).await;
+    let recovered = recover_for_wallet_open(
+        keys,
+        network_from(network_name),
+        resolve_data_dir(app, data_dir),
+    )
+    .await;
     let SproutScreen {
         nothing_left,
         needs_scan: _,
@@ -1722,6 +1725,18 @@ async fn recover_with_scan(
     peers: Option<&[String]>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
     recover_with_scan_in_dir(keys, network, resolve_data_dir(app, data_dir), peers).await
+}
+
+/// Recovery for opening a wallet (`inspect_wallet_file`), which makes no
+/// network contact: a saved scan is named, not used, until a sweep preview
+/// verifies it against live peers. Its own function so the no-network
+/// wiring is tested rather than only the lower layer it delegates to.
+async fn recover_for_wallet_open(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    dir: Option<PathBuf>,
+) -> argos_core::sprout_recovery::SproutRecovery {
+    recover_with_scan_in_dir(keys, network, dir, None).await
 }
 
 async fn recover_with_scan_in_dir(
@@ -3155,7 +3170,11 @@ mod tests {
         assert!(recovered.spent.is_empty());
 
         // With a scan present, opening the wallet still makes no network
-        // contact: the scan is named and its evidence is not used.
+        // contact: the scan is named and its evidence is not used. Driven
+        // through `recover_for_wallet_open`, the helper `inspect_wallet_file`
+        // uses, so a change that makes wallet open dial peers fails here: it
+        // would reach `chain_spends_for_wallet`, which cannot answer "not
+        // verified offline" and, with no network, cannot answer promptly.
         let mut scanner = argos_core::sprout_scan::SproutScanner::new(&[a_sk]);
         scanner.scan_block_at(&[], [0xCD; 32], 2_000_000).unwrap();
         argos_core::sprout_scan_run::save_checkpoint(
@@ -3164,13 +3183,12 @@ mod tests {
             &checkpoint,
         )
         .unwrap();
-        let recovered = recover_with_scan_in_dir(
-            &keys,
-            argos_core::ZeckNetwork::Mainnet,
-            Some(dir.clone()),
-            None,
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recover_for_wallet_open(&keys, argos_core::ZeckNetwork::Mainnet, Some(dir.clone())),
         )
-        .await;
+        .await
+        .expect("opening a wallet makes no network attempt, so it returns at once");
         let accounting = recovered.accounting_lines().join(" ");
         assert!(accounting.contains("not verified offline"), "{accounting}");
         assert!(accounting.contains(&checkpoint.display().to_string()));
