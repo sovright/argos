@@ -184,7 +184,7 @@ async fn local_proxy_lost_reply_keeps_unknown_and_restarts_with_exact_bytes() {
         txid,
         raw_tx: raw.clone(),
         fee_zatoshis: 12_345,
-        expiry_height: Some(100),
+        expiry_height: Some(200),
     };
     let upstream = FakeLightwalletd::builder()
         .accept_submissions_for_test()
@@ -366,6 +366,15 @@ async fn fake_lightwalletd_scripts_consistent_transaction_tip_and_block_evidence
     let mut client = CompactTxStreamerClient::connect(fake.url).await.unwrap();
     let info = client.get_lightd_info(Empty {}).await.unwrap().into_inner();
     assert_eq!(info.block_height, 124);
+    let parsed = zcash_primitives::transaction::Transaction::read(
+        &mut std::io::Cursor::new(raw_tx.as_slice()),
+        zcash_protocol::consensus::BranchId::Nu5,
+    )
+    .unwrap();
+    assert!(
+        u64::from(u32::from(parsed.expiry_height())) > info.block_height,
+        "scripted transaction must remain valid at the claimed tip"
+    );
     let raw = client
         .get_transaction(TxFilter {
             block: None,
@@ -495,7 +504,7 @@ fn test_v5_transaction() -> (zcash_primitives::transaction::TxId, Vec<u8>) {
         TxVersion::V5,
         BranchId::Nu5,
         0,
-        BlockHeight::from_u32(100),
+        BlockHeight::from_u32(200),
         None,
         None,
         None,
