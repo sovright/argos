@@ -1772,8 +1772,11 @@ fn consume_page(
         .is_some_and(|cursor| page.parent != cursor.last_block_hash)
     {
         return Err(ZeckError::ScanNotReady(format!(
-            "a reorg changed the chain before height {height}. The scan is incomplete; \
-             progress is saved and the next run will reconcile its cursor."
+            "a chain reorganization was detected before height {height}: the peer's \
+             next blocks no longer follow the last block scanned. The scan is \
+             incomplete and stopped without using them. Progress is saved. Re-run the \
+             scan and it will verify its cursor, roll back to the common ancestor \
+             and continue on the current chain."
         )));
     }
     let pins = PinRules {
@@ -3490,7 +3493,10 @@ mod tests {
         let err = consume_page(&mut scanner, &page, P2pNetwork::Regtest, None, &mut height)
             .expect_err("a page from the other branch must be refused");
         assert!(matches!(&err, ZeckError::ScanNotReady(_)));
-        assert!(err.to_string().contains("reorg"), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("reorganization was detected"), "{text}");
+        assert!(text.contains("Re-run"), "{text}");
+        assert!(text.contains("common ancestor"), "{text}");
         save_before_stopping(&scanner, P2pNetwork::Regtest, &path);
         assert_eq!(scanner.cursor().unwrap().last_height, 3);
         assert_eq!(height, 4);
