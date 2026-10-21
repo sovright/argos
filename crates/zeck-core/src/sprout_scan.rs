@@ -1028,9 +1028,9 @@ impl SproutScanner {
         self.encode(CHECKPOINT_VERSION)
     }
 
-    /// Write the given layout. Only [`CHECKPOINT_VERSION`] (4, body-authenticated)
-    /// is written outside tests; older layouts are generated to test that
-    /// they are refused.
+    /// Write the given layout. Only [`CHECKPOINT_VERSION`] (5:
+    /// body-authenticated, with rollback history) is written outside tests;
+    /// older layouts are generated to test that they are refused.
     fn encode(&self, version: u8) -> SproutScanCheckpoint {
         use codec::{put_bytes, put_u64};
 
