@@ -2904,7 +2904,7 @@ fn assemble_imported_sweep_outcome_for_legs(
             txid: Some(txid),
             status: "broadcast".to_owned(),
             detail: format!(
-                "transparent UTXOs from the imported wallet ({} zatoshis, {} fee)",
+                "standalone transparent UTXOs sent directly to the destination Sapling receiver ({} zatoshis, {} fee)",
                 outcome.transparent_zatoshis, outcome.transparent_fee_zatoshis
             ),
             confirmed_height: None,
@@ -2912,7 +2912,7 @@ fn assemble_imported_sweep_outcome_for_legs(
         None => {
             if transparent_expected && outcome.transparent_leg_completed {
                 skipped_accounts.push(SkippedSweepAccount {
-                    account_index: 0,
+                    account_index: outcome.transparent_display_index.unwrap_or(0),
                     reason: "the imported wallet holds no spendable transparent funds".to_owned(),
                     gross_zatoshis: 0,
                 });
@@ -3921,7 +3921,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.transactions[0].source_account, 5);
+        assert!(outcome.transactions[0].detail.contains("direct"));
         assert!(outcome.skipped_accounts.is_empty());
+    }
+
+    #[test]
+    fn filtered_transparent_empty_leg_skip_uses_its_display_id() {
+        let outcome = super::assemble_imported_sweep_outcome_for_legs(
+            crate::imported_sweep::ImportedSweepOutcome {
+                sapling_leg_completed: true,
+                transparent_leg_completed: true,
+                transparent_display_index: Some(5),
+                ..Default::default()
+            },
+            Ok(()),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(outcome.skipped_accounts.len(), 1);
+        assert_eq!(outcome.skipped_accounts[0].account_index, 5);
     }
 
     #[test]

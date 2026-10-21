@@ -686,7 +686,7 @@ async fn sweep_imported_sapling_leg(
             ),
             None,
         );
-        register_imported_accounts(&mut wallet_db, keys, &birthday)?
+        unique_registered_accounts(register_imported_accounts(&mut wallet_db, keys, &birthday)?)?
             .into_iter()
             .enumerate()
             .map(|(index, account)| (index as u32, account))
@@ -787,6 +787,32 @@ async fn sweep_imported_sapling_leg(
     }
 
     Ok(())
+}
+
+/// A wallet file may contain repeated records for one Sapling key. Registration
+/// reuses its UUID; the executor must visit that UUID only once.
+fn unique_registered_accounts(
+    accounts: Vec<crate::imported::ImportedWalletAccount>,
+) -> ZeckResult<Vec<crate::imported::ImportedWalletAccount>> {
+    let mut seen = std::collections::HashMap::new();
+    let mut unique = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let identity = account
+            .sapling_extsk
+            .as_ref()
+            .map(|key| key.to_diversifiable_full_viewing_key().to_bytes());
+        if let Some(previous) = seen.get(&account.wallet_account_id) {
+            if previous != &identity {
+                return Err(ZeckError::Wallet(
+                    "one registered Sapling account has conflicting key identities".to_owned(),
+                ));
+            }
+            continue;
+        }
+        seen.insert(account.wallet_account_id, identity);
+        unique.push(account);
+    }
+    Ok(unique)
 }
 
 #[cfg(test)]
@@ -976,6 +1002,24 @@ mod fee_cap_tests {
             enforce_sapling_fee_floor(Some(crate::service::MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1)),
             Err(ZeckError::MaxFeeExceeded(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod registered_account_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_registered_sapling_uuid_is_swept_once() {
+        let extsk = || sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let make_account = || crate::imported::ImportedWalletAccount {
+            wallet_account_id: AccountUuid::default(),
+            sapling_extsk: Some(extsk()),
+            transparent_addresses: Vec::new(),
+        };
+        let unique = super::unique_registered_accounts(vec![make_account(), make_account()])
+            .expect("the same key may appear in more than one wallet record");
+        assert_eq!(unique.len(), 1);
     }
 }
 
