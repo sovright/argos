@@ -14,7 +14,10 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function harness(propose = async () => review("proposal-current")) {
+function harness(
+  propose = async () => review("proposal-current"),
+  execute = async () => ({ transactions: [], skipped_accounts: [], total_donation_zatoshis: 0 }),
+) {
   const elements = new Map();
   const calls = [];
   const chips = ["10", "99", "custom"].map((pct) => element({ pct }));
@@ -47,6 +50,7 @@ function harness(propose = async () => review("proposal-current")) {
     memo: "reviewed memo", maxFeeZec: "0.01", donationEnabled: true,
     scanConfig: { network: "mainnet" }, lastProgress: { phase: "complete" },
     sweepReview: null, proposalGeneration: 0, proposalPending: false,
+    sweepExecutionPending: false,
   };
   const context = vm.createContext({
     state, $, fmt: (value) => String(value),
@@ -58,9 +62,7 @@ function harness(propose = async () => review("proposal-current")) {
     invoke: async (command, args) => {
       calls.push({ command, args });
       if (command === "propose_sweep") return propose(args);
-      if (command === "execute_sweep") return {
-        transactions: [], skipped_accounts: [], total_donation_zatoshis: 0,
-      };
+      if (command === "execute_sweep") return execute(args);
       throw new Error(`unexpected command ${command}`);
     },
     setStatus: (id, message) => { $(id).textContent = message; },
@@ -179,4 +181,31 @@ test("execute_sweep sends no mutable request fields", async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(h.executeArgs())), [{
     handle: { id: "scan-current" }, proposalId: "proposal-current",
   }]);
+});
+
+test("donation edits cannot enable another sweep during execution", async () => {
+  const inFlight = deferred();
+  const h = harness(async () => review("proposal-next"), () => inFlight.promise);
+  await accepted(h);
+  const first = h.fire("execute-sweep", "click");
+  assert.equal(h.executeArgs().length, 1);
+
+  h.$("donate-rate").value = "99";
+  h.fire("donate-rate", "input");
+  h.fire("donate-rate", "change");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.$("irreversible-check").disabled, true);
+  assert.equal(h.$("execute-sweep").disabled, true);
+  assert.equal(h.calls.filter((call) => call.command === "propose_sweep").length, 1);
+
+  h.$("irreversible-check").checked = true;
+  h.fire("irreversible-check", "change");
+  await h.fire("execute-sweep", "click");
+  assert.equal(h.executeArgs().length, 1);
+  inFlight.reject(new Error("first sweep failed"));
+  await first;
+  assert.equal(h.state.sweepExecutionPending, false);
+  assert.equal(h.state.sweepReview, null);
+  await h.refresh();
+  assert.equal(h.state.sweepReview.proposal_id, "proposal-next");
 });

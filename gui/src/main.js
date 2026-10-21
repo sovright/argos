@@ -32,6 +32,7 @@ const state = {
   sweepReview: null,
   proposalGeneration: 0,
   proposalPending: false,
+  sweepExecutionPending: false,
   destination: null,
   memo: null,
   maxFeeZec: null,
@@ -2194,7 +2195,7 @@ function invalidateSweepReview() {
   $("irreversible-check").checked = false;
   $("irreversible-check").disabled = true;
   $("execute-sweep").disabled = true;
-  setStatus("sweep-execute-status", "", "");
+  if (!state.sweepExecutionPending) setStatus("sweep-execute-status", "", "");
 }
 
 function setSweepProposalPending(pending) {
@@ -2221,6 +2222,7 @@ function sweepRequestFromForm() {
 }
 
 async function refreshSweepProposal() {
+  if (state.sweepExecutionPending) return null;
   invalidateSweepReview();
   setSweepProposalPending(true);
   const generation = state.proposalGeneration;
@@ -2242,7 +2244,7 @@ async function refreshSweepProposal() {
 }
 
 async function maybeRefreshProposal() {
-  if (!state.scanHandle || state.lastProgress?.phase !== "complete") return;
+  if (state.sweepExecutionPending || !state.scanHandle || state.lastProgress?.phase !== "complete") return;
   try {
     await refreshSweepProposal();
   } catch (err) {
@@ -2251,6 +2253,7 @@ async function maybeRefreshProposal() {
 }
 
 $("review-sweep").addEventListener("click", async () => {
+  if (state.sweepExecutionPending) return;
   setStatus("scan-message", "Fetching sweep proposal…", "");
   $("review-sweep").disabled = true;
 
@@ -2441,25 +2444,28 @@ $("sweep-rows").addEventListener("click", (e) => {
 });
 
 $("irreversible-check").addEventListener("change", () => {
-  $("execute-sweep").disabled = !state.sweepReview || state.proposalPending ||
+  $("execute-sweep").disabled = state.sweepExecutionPending || !state.sweepReview || state.proposalPending ||
     state.sweepReview.handleId !== state.scanHandle?.id || !$("irreversible-check").checked;
 });
 
 $("execute-sweep").addEventListener("click", async () => {
   const review = state.sweepReview;
-  if (!review || state.proposalPending || review.handleId !== state.scanHandle?.id ||
+  if (state.sweepExecutionPending || !review || state.proposalPending ||
+      review.handleId !== state.scanHandle?.id ||
       !$("irreversible-check").checked) return;
   const handle = state.scanHandle;
+  state.sweepExecutionPending = true;
   state.sweepReview = null;
   $("execute-sweep").disabled = true;
   $("irreversible-check").disabled = true;
-  setStatus("sweep-execute-status", "Broadcasting transactions to the Zcash network… this may take up to 2 minutes.", "");
 
   try {
+    setStatus("sweep-execute-status", "Broadcasting transactions to the Zcash network… this may take up to 2 minutes.", "");
     // `execute_sweep` rejects only when nothing was broadcast. A mid-sequence
     // abort after one or more broadcasts resolves with `{ transactions, error }`
     // so the already-broadcast transaction IDs are still shown (audit Issue E).
     const outcome = await invoke("execute_sweep", { handle, proposalId: review.proposal_id });
+    if (handle.id !== state.scanHandle?.id) return;
     setStatus("sweep-execute-status", "", "");
     renderCompleteScreen(
       outcome.transactions,
@@ -2471,8 +2477,11 @@ $("execute-sweep").addEventListener("click", async () => {
     );
     goTo("complete");
   } catch (err) {
+    if (handle.id !== state.scanHandle?.id) return;
     invalidateSweepReview();
     setStatus("sweep-execute-status", `✗ Sweep failed: ${err}`, "error");
+  } finally {
+    state.sweepExecutionPending = false;
   }
 });
 
