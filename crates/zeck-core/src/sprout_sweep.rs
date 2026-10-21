@@ -497,6 +497,10 @@ impl SweepJournal {
     /// that does not parse — one torn by a crash mid-write — is skipped: the
     /// worst it costs is that one note proved again and refused.
     pub fn load(&self) -> ZeckResult<SweptNotes> {
+        crate::sprout_sweep_journal::with_sweep_journal_lock(&self.path, || self.load_unlocked())
+    }
+
+    fn load_unlocked(&self) -> ZeckResult<SweptNotes> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(SweptNotes::new()),
@@ -521,6 +525,17 @@ impl SweepJournal {
 
     /// Append one broadcast and sync it before returning.
     pub fn record(
+        &self,
+        outpoint: &argos_wallet_import::keys::JsOutPoint,
+        sweep_txid: &str,
+    ) -> ZeckResult<()> {
+        crate::sprout_sweep_journal::with_sweep_journal_lock(&self.path, || {
+            self.load_unlocked()?;
+            self.record_unlocked(outpoint, sweep_txid)
+        })
+    }
+
+    fn record_unlocked(
         &self,
         outpoint: &argos_wallet_import::keys::JsOutPoint,
         sweep_txid: &str,
@@ -897,7 +912,7 @@ pub fn classify_refusal(code: i32, reason: &str) -> Refusal {
 /// How many blocks after the tip read just before building a note its
 /// transaction may still be mined. Read per note, so a long sweep never
 /// builds against a tip that has moved on.
-const EXPIRY_DELTA: u32 = 40;
+const EXPIRY_DELTA: u32 = crate::sprout_sweep_journal::SPROUT_EXPIRY_DELTA;
 
 /// The highest expiry height consensus accepts: zcashd refuses
 /// `nExpiryHeight >= TX_EXPIRY_HEIGHT_THRESHOLD` (500,000,000), and Zebra's

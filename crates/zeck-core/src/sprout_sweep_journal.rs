@@ -3,14 +3,16 @@
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use argos_wallet_import::keys::JsOutPoint;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use zcash_primitives::transaction::TxId;
+use zcash_primitives::transaction::{Transaction, TxId};
+use zcash_protocol::consensus::BranchId;
 
 use crate::{
     broadcast::{
@@ -23,6 +25,7 @@ use crate::{
 };
 
 pub const SPROUT_SWEEP_JOURNAL_VERSION: u32 = 2;
+pub const SPROUT_EXPIRY_DELTA: u32 = 40;
 pub type SproutNoteId = ([u8; 32], u64, u8);
 
 pub fn note_id(outpoint: &JsOutPoint) -> SproutNoteId {
@@ -39,6 +42,79 @@ fn outpoint(id: SproutNoteId) -> JsOutPoint {
 
 fn journal_error(message: impl Into<String>) -> ZeckError {
     ZeckError::Storage(message.into())
+}
+
+/// The lock inode is stable across the v1-to-v2 rename. Both the temporary
+/// legacy writer and v2 journal take this same SQLite process lock.
+pub(crate) fn with_sweep_journal_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> ZeckResult<T>,
+) -> ZeckResult<T> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock.sqlite");
+    let lock_path = PathBuf::from(name);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        options.open(&lock_path).map_err(|err| {
+            journal_error(format!(
+                "opening sweep journal lock {}: {err}",
+                lock_path.display()
+            ))
+        })?;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+            journal_error(format!(
+                "securing sweep journal lock {}: {err}",
+                lock_path.display()
+            ))
+        })?;
+    }
+    #[cfg(not(unix))]
+    options.open(&lock_path).map_err(|err| {
+        journal_error(format!(
+            "opening sweep journal lock {}: {err}",
+            lock_path.display()
+        ))
+    })?;
+    let connection = rusqlite::Connection::open(&lock_path).map_err(|err| {
+        journal_error(format!(
+            "opening sweep journal lock {}: {err}",
+            lock_path.display()
+        ))
+    })?;
+    connection
+        .busy_timeout(Duration::from_secs(10))
+        .map_err(|err| journal_error(format!("setting sweep journal lock timeout: {err}")))?;
+    connection
+        .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
+        .map_err(|err| {
+            journal_error(format!("sweep journal {} is in use: {err}", path.display()))
+        })?;
+    let result = operation();
+    drop(connection);
+    result
+}
+
+fn validate_prepared(tx: &PreparedTransaction) -> ZeckResult<()> {
+    if txid_from_raw(&tx.raw_tx)? != tx.txid {
+        return Err(journal_error(format!(
+            "raw transaction does not match {}",
+            tx.txid
+        )));
+    }
+    let parsed = Transaction::read(&mut Cursor::new(&tx.raw_tx), BranchId::Nu5)
+        .map_err(|err| journal_error(format!("cannot decode journal transaction expiry: {err}")))?;
+    let encoded_expiry = u32::from(parsed.expiry_height());
+    if tx.expiry_height != Some(encoded_expiry) {
+        return Err(journal_error(format!(
+            "journal expiry {:?} does not match transaction expiry {encoded_expiry}",
+            tx.expiry_height
+        )));
+    }
+    Ok(())
 }
 
 fn decode_txid(text: &str) -> ZeckResult<TxId> {
@@ -63,12 +139,7 @@ struct JournalPreparedTransaction {
 
 impl JournalPreparedTransaction {
     fn from_prepared(tx: &PreparedTransaction) -> ZeckResult<Self> {
-        if txid_from_raw(&tx.raw_tx)? != tx.txid {
-            return Err(journal_error(format!(
-                "raw transaction does not match {}",
-                tx.txid
-            )));
-        }
+        validate_prepared(tx)?;
         Ok(Self {
             txid: tx.txid.to_string(),
             raw_tx_base64: STANDARD.encode(&tx.raw_tx),
@@ -82,17 +153,14 @@ impl JournalPreparedTransaction {
         let raw_tx = STANDARD
             .decode(self.raw_tx_base64)
             .map_err(|err| journal_error(format!("invalid journal raw transaction: {err}")))?;
-        if txid_from_raw(&raw_tx)? != txid {
-            return Err(journal_error(format!(
-                "raw transaction does not match {txid}"
-            )));
-        }
-        Ok(PreparedTransaction {
+        let tx = PreparedTransaction {
             txid,
             raw_tx,
             fee_zatoshis: self.fee_zatoshis,
             expiry_height: self.expiry_height,
-        })
+        };
+        validate_prepared(&tx)?;
+        Ok(tx)
     }
 }
 
@@ -153,6 +221,7 @@ impl SproutJournalEntry {
 pub struct SproutJournalSnapshot {
     by_note: HashMap<SproutNoteId, SproutJournalEntry>,
     by_txid: HashMap<TxId, SproutNoteId>,
+    seen_transactions: HashMap<TxId, (SproutNoteId, u64, PreparedTransaction)>,
 }
 
 impl SproutJournalSnapshot {
@@ -193,6 +262,26 @@ impl SproutJournalSnapshot {
                 transaction,
             } => {
                 let tx = transaction.into_prepared()?;
+                if let Some((seen_note, seen_value, seen_tx)) = self.seen_transactions.get(&tx.txid)
+                {
+                    if *seen_note != note_id || *seen_value != value_zatoshis || seen_tx != &tx {
+                        return Err(journal_error(format!(
+                            "immutable metadata changed for transaction {}",
+                            tx.txid
+                        )));
+                    }
+                    return if self
+                        .by_note
+                        .get(&note_id)
+                        .is_some_and(|entry| entry.transaction.as_ref() == Some(&tx))
+                    {
+                        Ok(())
+                    } else {
+                        Err(journal_error(
+                            "superseded transaction cannot be prepared again",
+                        ))
+                    };
+                }
                 if self
                     .by_txid
                     .get(&tx.txid)
@@ -204,11 +293,6 @@ impl SproutJournalSnapshot {
                     )));
                 }
                 if let Some(existing) = self.by_note.get(&note_id) {
-                    if existing.transaction.as_ref() == Some(&tx)
-                        && existing.value_zatoshis == Some(value_zatoshis)
-                    {
-                        return Ok(());
-                    }
                     if !matches!(
                         existing.state,
                         TxLifecycleState::Expired | TxLifecycleState::Rejected
@@ -219,6 +303,8 @@ impl SproutJournalSnapshot {
                     }
                     self.by_txid.remove(&existing.txid());
                 }
+                self.seen_transactions
+                    .insert(tx.txid, (note_id, value_zatoshis, tx.clone()));
                 self.by_txid.insert(tx.txid, note_id);
                 self.by_note.insert(
                     note_id,
@@ -342,7 +428,7 @@ impl SproutJournalSnapshot {
                     .ok_or_else(|| journal_error("expiry bound without legacy entry"))?;
                 let entry = self.by_note.get_mut(&id).expect("indexed note exists");
                 if entry.transaction.is_some()
-                    || verified_tip >= expiry_bound
+                    || verified_tip.checked_add(SPROUT_EXPIRY_DELTA) != Some(expiry_bound)
                     || entry
                         .legacy_expiry_bound
                         .is_some_and(|old| old != expiry_bound)
@@ -392,6 +478,10 @@ impl SweepJournal {
     }
 
     pub fn load_or_migrate(&self) -> ZeckResult<SproutJournalSnapshot> {
+        with_sweep_journal_lock(&self.path, || self.load_or_migrate_unlocked())
+    }
+
+    fn load_or_migrate_unlocked(&self) -> ZeckResult<SproutJournalSnapshot> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -522,11 +612,11 @@ impl SweepJournal {
                 .map_err(|err| journal_error(format!("encoding journal: {err}")))?;
             data.push(b'\n');
         }
-        self.atomic_replace(&data)?;
+        self.atomic_replace_if_unchanged(text.as_bytes(), &data)?;
         Ok(snapshot)
     }
 
-    fn atomic_replace(&self, bytes: &[u8]) -> ZeckResult<()> {
+    fn atomic_replace_if_unchanged(&self, expected: &[u8], bytes: &[u8]) -> ZeckResult<()> {
         let parent = self
             .path
             .parent()
@@ -546,6 +636,14 @@ impl SweepJournal {
             file.write_all(bytes)
                 .and_then(|_| file.sync_all())
                 .map_err(|err| journal_error(format!("syncing migration file: {err}")))?;
+            if fs::read(&self.path)
+                .map_err(|err| journal_error(format!("rechecking legacy journal: {err}")))?
+                != expected
+            {
+                return Err(journal_error(
+                    "legacy journal changed during migration; retry after preserving the source",
+                ));
+            }
             fs::rename(&temporary, &self.path)
                 .map_err(|err| journal_error(format!("replacing journal: {err}")))?;
             fs::File::open(parent)
@@ -558,14 +656,8 @@ impl SweepJournal {
         result
     }
 
-    fn append(&self, record: &SproutJournalRecord) -> ZeckResult<()> {
+    fn append_unlocked(&self, record: &SproutJournalRecord) -> ZeckResult<()> {
         let missing = !self.path.exists();
-        if !missing {
-            // A caller may have retained an old snapshot or opened the same
-            // short-name path under another network. Check the disk identity
-            // and reducer before adding any bytes to an existing file.
-            self.load_or_migrate()?;
-        }
         let mut options = OpenOptions::new();
         options.append(true).create(true);
         #[cfg(unix)]
@@ -613,6 +705,24 @@ impl SweepJournal {
         }
     }
 
+    fn mutate(
+        &self,
+        snapshot: &mut SproutJournalSnapshot,
+        record: SproutJournalRecord,
+    ) -> ZeckResult<()> {
+        with_sweep_journal_lock(&self.path, || {
+            // The caller may have loaded before another process wrote.
+            // Replay under the lock; only this current durable state can
+            // authorize the next event.
+            let mut durable = self.load_or_migrate_unlocked()?;
+            *snapshot = durable.clone();
+            durable.apply(record.clone(), &self.source_fingerprint)?;
+            self.append_unlocked(&record)?;
+            *snapshot = durable;
+            Ok(())
+        })
+    }
+
     pub fn append_transition(
         &self,
         snapshot: &mut SproutJournalSnapshot,
@@ -627,11 +737,7 @@ impl SweepJournal {
             submission: submission.cloned(),
             observation: observation.cloned(),
         };
-        let mut next = snapshot.clone();
-        next.apply(record.clone(), &self.source_fingerprint)?;
-        self.append(&record)?;
-        *snapshot = next;
-        Ok(())
+        self.mutate(snapshot, record)
     }
 
     pub fn append_legacy_expiry_bound(
@@ -646,11 +752,7 @@ impl SweepJournal {
             verified_tip,
             expiry_bound,
         };
-        let mut next = snapshot.clone();
-        next.apply(record.clone(), &self.source_fingerprint)?;
-        self.append(&record)?;
-        *snapshot = next;
-        Ok(())
+        self.mutate(snapshot, record)
     }
 }
 
@@ -667,11 +769,7 @@ impl BroadcastStore for SproutBroadcastStore<'_> {
             value_zatoshis: self.note.value_zatoshis,
             transaction: JournalPreparedTransaction::from_prepared(tx)?,
         };
-        let mut next = self.snapshot.clone();
-        next.apply(record.clone(), &self.journal.source_fingerprint)?;
-        self.journal.append(&record)?;
-        *self.snapshot = next;
-        Ok(())
+        self.journal.mutate(self.snapshot, record)
     }
 
     fn transition(
@@ -728,6 +826,28 @@ mod tests {
             raw_tx,
             fee_zatoshis: 12_345,
             expiry_height: Some(100),
+        }
+    }
+
+    fn confirmed_absence(expiry_height: u32) -> TxObservation {
+        use crate::broadcast::{EndpointTxEvidence, TxObservationState};
+        TxObservation {
+            state: TxObservationState::Absent,
+            mined_height: None,
+            expiry_height: Some(expiry_height),
+            primary_tip: Some(expiry_height + 1),
+            secondary_tip: Some(expiry_height + 1),
+            evidence: ["a", "b"]
+                .into_iter()
+                .map(|label| EndpointTxEvidence {
+                    operator_id: label.to_owned(),
+                    endpoint: format!("https://{label}.example"),
+                    tip_height: Some(expiry_height + 1),
+                    reported_height: None,
+                    block_hash: None,
+                    tx_in_block: false,
+                })
+                .collect(),
         }
     }
 
@@ -906,7 +1026,7 @@ mod tests {
         std::fs::write(journal.path(), &original).unwrap();
         assert!(journal.load_or_migrate().is_err());
         assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), original);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[cfg(unix)]
@@ -923,7 +1043,11 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        let lock_path =
+            std::path::PathBuf::from(format!("{}.lock.sqlite", journal.path().display()));
+        let lock_mode = std::fs::metadata(lock_path).unwrap().permissions().mode();
+        assert_eq!(lock_mode & 0o777, 0o600);
     }
 
     #[test]
@@ -1065,5 +1189,290 @@ mod tests {
                 None
             )
             .is_err());
+    }
+
+    #[test]
+    fn independently_loaded_handles_cannot_prepare_competing_transactions_for_one_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_handle = journal(dir.path());
+        let second_handle = journal(dir.path());
+        let mut first_snapshot = first_handle.load_or_migrate().unwrap();
+        let mut stale_snapshot = second_handle.load_or_migrate().unwrap();
+        let first = fixture();
+        let competing = fixture_with_lock_time(1);
+        first_handle
+            .scoped_store(context(), &mut first_snapshot)
+            .persist_prepared(&first)
+            .unwrap();
+        assert!(second_handle
+            .scoped_store(context(), &mut stale_snapshot)
+            .persist_prepared(&competing)
+            .is_err());
+        let durable = first_handle.load_or_migrate().unwrap();
+        assert_eq!(
+            durable
+                .entry_for_note(&outpoint())
+                .unwrap()
+                .transaction
+                .as_ref(),
+            Some(&first)
+        );
+    }
+
+    #[test]
+    fn stale_transition_cannot_append_invalid_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_handle = journal(dir.path());
+        let second_handle = journal(dir.path());
+        let tx = fixture();
+        let mut first_snapshot = first_handle.load_or_migrate().unwrap();
+        first_handle
+            .scoped_store(context(), &mut first_snapshot)
+            .persist_prepared(&tx)
+            .unwrap();
+        let mut stale_snapshot = second_handle.load_or_migrate().unwrap();
+        first_handle
+            .append_transition(
+                &mut first_snapshot,
+                tx.txid,
+                TxLifecycleState::SubmissionUnknown,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(second_handle
+            .append_transition(
+                &mut stale_snapshot,
+                tx.txid,
+                TxLifecycleState::NotSubmitted,
+                None,
+                None
+            )
+            .is_err());
+        assert_eq!(
+            first_handle
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(tx.txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[test]
+    fn separate_connection_lock_blocks_migration_and_append() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        std::fs::write(journal.path(), legacy_line(&fixture().txid.to_string())).unwrap();
+        let lock_path =
+            std::path::PathBuf::from(format!("{}.lock.sqlite", journal.path().display()));
+        let connection = rusqlite::Connection::open(&lock_path).unwrap();
+        connection
+            .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let other = journal.clone();
+        let worker =
+            std::thread::spawn(move || sender.send(other.load_or_migrate().is_ok()).unwrap());
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        connection.execute_batch("COMMIT").unwrap();
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap());
+        worker.join().unwrap();
+        let tx = fixture_with_lock_time(1);
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let another_note = JournalNoteContext {
+            outpoint: JsOutPoint {
+                txid: [0x43; 32],
+                js_index: 2,
+                output_index: 0,
+            },
+            value_zatoshis: 2_000_000,
+        };
+        connection
+            .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let other = journal.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(
+                    other
+                        .scoped_store(another_note, &mut snapshot)
+                        .persist_prepared(&tx)
+                        .is_ok(),
+                )
+                .unwrap();
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        connection.execute_batch("COMMIT").unwrap();
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap());
+        worker.join().unwrap();
+        assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 2);
+    }
+
+    #[test]
+    fn terminal_note_cannot_reuse_same_txid_with_changed_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let first = fixture();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&first)
+            .unwrap();
+        journal
+            .append_transition(
+                &mut snapshot,
+                first.txid,
+                TxLifecycleState::Expired,
+                None,
+                Some(&confirmed_absence(100)),
+            )
+            .unwrap();
+        let mut changed = first.clone();
+        changed.fee_zatoshis += 1;
+        assert!(journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&changed)
+            .is_err());
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(first.txid)
+                .unwrap()
+                .transaction
+                .as_ref(),
+            Some(&first)
+        );
+    }
+
+    #[test]
+    fn encoded_transaction_expiry_must_match_prepared_metadata_on_write_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let valid = fixture();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let mut forged = valid.clone();
+        forged.expiry_height = Some(1);
+        assert!(journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&forged)
+            .is_err());
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&valid)
+            .unwrap();
+        let text = std::fs::read_to_string(journal.path()).unwrap();
+        std::fs::write(
+            journal.path(),
+            text.replace("\"expiry_height\":100", "\"expiry_height\":1"),
+        )
+        .unwrap();
+        assert!(journal.load_or_migrate().is_err());
+    }
+
+    #[test]
+    fn legacy_expiry_bound_must_be_exactly_the_protocol_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let txid = fixture().txid;
+        std::fs::write(journal.path(), legacy_line(&txid.to_string())).unwrap();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        assert!(journal
+            .append_legacy_expiry_bound(&mut snapshot, txid, 100, 101)
+            .is_err());
+        assert_eq!(
+            snapshot.entry_for_txid(txid).unwrap().legacy_expiry_bound,
+            None
+        );
+        journal
+            .append_legacy_expiry_bound(&mut snapshot, txid, 100, 140)
+            .unwrap();
+        assert_eq!(
+            snapshot.entry_for_txid(txid).unwrap().legacy_expiry_bound,
+            Some(140)
+        );
+    }
+
+    #[test]
+    fn migration_rechecks_original_bytes_before_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let original = legacy_line(&fixture().txid.to_string());
+        let appended = legacy_line(&TxId::from_bytes([0x55; 32]).to_string());
+        std::fs::write(journal.path(), &original).unwrap();
+        std::fs::write(journal.path(), format!("{original}{appended}")).unwrap();
+        assert!(journal
+            .atomic_replace_if_unchanged(original.as_bytes(), b"replacement\n")
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(journal.path()).unwrap(),
+            format!("{original}{appended}")
+        );
+    }
+
+    #[test]
+    fn compatibility_journal_uses_the_same_process_lock() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let current = journal(dir.path());
+        let legacy = crate::sprout_sweep::SweepJournal::for_keys(dir.path(), &[[0x42; 32]]);
+        std::fs::write(legacy.path(), legacy_line(&fixture().txid.to_string())).unwrap();
+        let lock_path =
+            std::path::PathBuf::from(format!("{}.lock.sqlite", current.path().display()));
+        let connection = rusqlite::Connection::open(lock_path).unwrap();
+        connection
+            .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(legacy.load().is_ok()).unwrap());
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        connection.execute_batch("COMMIT").unwrap();
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap());
+        worker.join().unwrap();
+        connection
+            .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
+            .unwrap();
+        let record = crate::sprout_sweep::SweepJournal::for_keys(dir.path(), &[[0x42; 32]]);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(
+                    record
+                        .record(
+                            &JsOutPoint {
+                                txid: [0x44; 32],
+                                js_index: 1,
+                                output_index: 0,
+                            },
+                            &fixture_with_lock_time(1).txid.to_string(),
+                        )
+                        .is_ok(),
+                )
+                .unwrap()
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        connection.execute_batch("COMMIT").unwrap();
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap());
+        worker.join().unwrap();
     }
 }
