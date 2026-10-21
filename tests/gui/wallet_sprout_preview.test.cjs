@@ -964,10 +964,16 @@ test("a no-file scan sends only the pasted lines, with no wallet path or passphr
   h.$("data-dir").value = "";
   await h.scan();
   assert.equal(calls.length, 1);
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0])), {
-    keys: ["# paper backup", "SKfixture", ""], path: null, passphrase: null,
-    network: "mainnet", dataDir: "", lightwalletdUrl: "https://zec.rocks:443", peers: [],
-  });
+  // The fields that make this a no-file scan; other request fields (the
+  // decrypt bound, for one) are owned by their own tests.
+  const sent = JSON.parse(JSON.stringify(calls[0]));
+  assert.deepEqual(sent.keys, ["# paper backup", "SKfixture", ""]);
+  assert.equal(sent.path, null);
+  assert.equal(sent.passphrase, null);
+  assert.equal(sent.network, "mainnet");
+  assert.equal(sent.dataDir, "");
+  assert.equal(sent.lightwalletdUrl, "https://zec.rocks:443");
+  assert.deepEqual(sent.peers, []);
   assert.equal(h.$("sprout-scan-sweep").hidden, false);
 });
 
@@ -1017,6 +1023,25 @@ test("a wallet file needing a scan opens the panel, under its own NU7 alert", as
   assert.equal(h.$("wallet-summary").hidden, true);
   assert.equal(h.$("sprout-scan-panel").hidden, true);
   assert.doesNotMatch(h.$("sprout-scan-keys").placeholder ?? "", /wallet file/);
+});
+
+test("a failed open of another file drops the previous file's scan offer", async () => {
+  const noNotes = inspected({ sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0 });
+  const h = harness(async (command, args, fallback) => {
+    if (command === "inspect_wallet_file" && args.path === "/fixture/broken.dat") {
+      throw new Error("not a wallet file");
+    }
+    return noNotes(command, args, fallback);
+  });
+  await h.open("/fixture/keys-only.dat");
+  await flush();
+  assert.equal(h.$("sprout-scan-entry").open, true);
+  await h.open("/fixture/broken.dat");
+  assert.equal(h.peek("walletFile"), null);
+  assert.ok(!h.$("sprout-scan-entry").open);
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+  assert.doesNotMatch(h.$("sprout-scan-entry-label").textContent, /this wallet/);
+  assert.doesNotMatch(h.$("sprout-scan-keys").placeholder, /wallet file/);
 });
 
 test("forgetting a wallet file keeps a typed Sprout key and its panel", async () => {

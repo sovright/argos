@@ -1041,6 +1041,12 @@ async function openWalletFile() {
   $("sprout-sweep-pool").textContent = "";
   $("sprout-sweep-params").textContent = "";
   showSproutNu7Warning("");
+  // The panel is outside #wallet-summary now, so hiding the summary no longer
+  // takes it along: drop the previous file's offer here, so a failed open
+  // (wrong passphrase, no keys, unreadable) cannot leave it in place.
+  sproutScanOfferedForFile = false;
+  if (!hasTypedSproutScanText()) $("sprout-scan-entry").open = false;
+  renderSproutScanPanel();
   $("wallet-open").disabled = false;
   const path = $("wallet-path").value.trim();
   if (!path) {
@@ -1670,6 +1676,8 @@ document.addEventListener("address-match-recovery", async (event) => {
     forgetSproutScanInputs();
     $("network-select").value = snapshot.network;
     $("network-select").disabled = true;
+    // The Sprout panel's network mirror follows the now-locked picker.
+    renderSproutScanPanel();
     $("server-preset").value = "recommended";
     $("lightwalletd-url").value = SERVER_PRESETS[snapshot.network] ?? SERVER_PRESETS.mainnet;
     $("birthday-autodetect").disabled = true;
