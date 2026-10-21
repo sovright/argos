@@ -150,6 +150,26 @@ fn header_merkle_root(block: &[u8]) -> Result<[u8; 32], BlockError> {
         .map_err(|_| BlockError::Malformed)
 }
 
+/// The Bitcoin-style transaction Merkle root zcashd commits to in
+/// `hashMerkleRoot`, refusing the duplicated-sibling mutation
+/// (CVE-2012-2459).
+///
+/// # The 64-byte inner-node ambiguity
+///
+/// An inner node is the double SHA-256 of 64 bytes — two child hashes — and
+/// a transaction that is exactly 64 bytes long hashes the same way. A body
+/// that replaced two sibling transactions with one "transaction" whose bytes
+/// are their two txids would therefore reproduce the root. That is not
+/// exploitable by a peer here: the 64 bytes are hashes fixed by the
+/// authenticated header's history, not chosen by the peer, and they must
+/// also parse under `Transaction::read` as a complete transaction consuming
+/// exactly those 64 bytes — a valid version and version group, consistent
+/// counts — which fixed hash output cannot be ground into. Even if it did
+/// parse, the effect would be to drop the two real transactions, never to
+/// inject chosen JoinSplit data. A peer that could grind txids would have to
+/// mine its own proof-of-work chain, which the checkpoints and the
+/// lightwalletd `TipAnchor` bound, and past which T-N7 already documents
+/// that the scan rests on the peer.
 fn transaction_merkle_root(txids: &[[u8; 32]]) -> Result<[u8; 32], BlockError> {
     if txids.is_empty() {
         return Err(BlockError::NoTransactions);
@@ -273,6 +293,121 @@ mod tests {
                     .expect("valid hex")
             })
             .collect()
+    }
+
+    /// A real mainnet block, pinned byte for byte.
+    ///
+    /// Fetched on 2026-10-21 from the Blockchair API,
+    /// `https://api.blockchair.com/zcash/raw/block/<height>` (`raw_block`,
+    /// with the explorer's `decoded_raw_block.tx` for the txids). Every
+    /// value is in explorer display order (byte-reversed). The bytes check
+    /// themselves: the header's double SHA-256 must be the published block
+    /// hash, and that header must carry valid mainnet proof of work, so a
+    /// corrupted fixture cannot pass as real.
+    struct RealBlock {
+        height: u32,
+        bytes: &'static [u8],
+        hash: &'static str,
+        merkle_root: &'static str,
+        txids: &'static [&'static str],
+    }
+
+    /// Odd transaction count (3): the last txid is paired with itself.
+    const MAINNET_452: RealBlock = RealBlock {
+        height: 452,
+        bytes: include_bytes!("testdata/mainnet-block-452.bin"),
+        hash: "00000035e8c77a3238088ec78b35454cd43985f0ddb6a7cc2d6094c652e75e55",
+        merkle_root: "10dfad86b6845674712b11c2905babaf4393234aa936d393d32e3a31fb312171",
+        txids: &[
+            "0ee57d194663bbba14d9d828de00c21c4c1b72c4f368e1ce256394fe56aeffb5",
+            "a32ab2d594ba1bc68ad3f4d7208b6abfac8059fc1308dffac281167d8ae359c6",
+            "ea82f6992f92a3a29fbe90a4b920278beb43eea8d7c021b2d6fb9fffec995dab",
+        ],
+    };
+
+    /// Even transaction count (4): two full levels, no self-pairing.
+    const MAINNET_464: RealBlock = RealBlock {
+        height: 464,
+        bytes: include_bytes!("testdata/mainnet-block-464.bin"),
+        hash: "0000006ff2f6862ef99905be7fcbdeeff246201a1215f311202283e9b123373d",
+        merkle_root: "f0113965c77321ef08da778c4cd38d8be63f21439714654dd42c49c9dd219979",
+        txids: &[
+            "75a52a987a198910182046eac20f2775dd8af41ab3d30ff90c0422cd6eb28b3f",
+            "5d16df2c6e11f01c50bd6651aed258a8bd42e30d6535ec076fbd322e97af3cc0",
+            "a232b009eaae4c1971253a518be04c2de785af08b761a25f7bbcda189ada1ca7",
+            "831b5fa2c10cabdd2677578de9ac0b9903baaa6d695100d96b68febe7fa71539",
+        ],
+    };
+
+    /// Display order (as explorers print hashes) to wire order.
+    fn wire_order(display: &str) -> [u8; 32] {
+        let mut bytes: [u8; 32] = decode_hex(display).try_into().expect("32 bytes");
+        bytes.reverse();
+        bytes
+    }
+
+    /// The fixture is the real block: its header hashes to the published
+    /// block hash and carries valid mainnet proof of work.
+    fn assert_genuine(block: &RealBlock) {
+        let header_end = skip_block_header(block.bytes).expect("header");
+        let hash = block_hash(block.bytes).expect("hash");
+        assert_eq!(hash, wire_order(block.hash), "block {}", block.height);
+        let header = crate::p2p::wire::BlockHeader {
+            hash,
+            prev_hash: block.bytes[4..36].try_into().unwrap(),
+            raw: block.bytes[..header_end].to_vec(),
+        };
+        crate::p2p::wire::verify_header_pow(crate::p2p::wire::P2pNetwork::Mainnet, &header)
+            .unwrap_or_else(|err| panic!("block {}: {err:?}", block.height));
+        assert_eq!(
+            header_merkle_root(block.bytes).unwrap(),
+            wire_order(block.merkle_root),
+            "block {}",
+            block.height
+        );
+    }
+
+    /// Review of #265: the Merkle tests compared production against a copy
+    /// of itself, so a shared mistake in pairing or byte order would pass.
+    /// These are real mainnet blocks whose roots were computed by zcashd.
+    #[test]
+    fn real_mainnet_txids_reproduce_the_header_merkle_root() {
+        assert_eq!(MAINNET_452.txids.len() % 2, 1, "an odd count");
+        assert_eq!(MAINNET_464.txids.len() % 2, 0, "an even count");
+        for block in [&MAINNET_452, &MAINNET_464] {
+            assert_genuine(block);
+            let txids: Vec<[u8; 32]> = block.txids.iter().map(|t| wire_order(t)).collect();
+            assert_eq!(
+                transaction_merkle_root(&txids).unwrap(),
+                header_merkle_root(block.bytes).unwrap(),
+                "block {}",
+                block.height
+            );
+        }
+    }
+
+    /// The whole path on real bytes: every transaction parsed, its txid
+    /// derived by upstream, and the root checked against the header.
+    #[test]
+    fn real_mainnet_blocks_authenticate_end_to_end() {
+        for block in [&MAINNET_452, &MAINNET_464] {
+            assert_genuine(block);
+            let result = joinsplits_in_block(block.bytes, BranchId::Canopy);
+            assert!(result.is_ok(), "block {}: {result:?}", block.height);
+
+            // One flipped bit in the last transaction's body breaks it.
+            let mut tampered = block.bytes.to_vec();
+            let last = tampered.len() - 5; // inside the final transaction
+            tampered[last] ^= 1;
+            assert!(
+                matches!(
+                    joinsplits_in_block(&tampered, BranchId::Canopy),
+                    Err(BlockError::MerkleRootMismatch)
+                ),
+                "block {}",
+                block.height
+            );
+        }
     }
 
     #[test]
