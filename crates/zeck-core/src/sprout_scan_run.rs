@@ -971,7 +971,7 @@ impl CursorVerifier for NetworkCursorVerifier<'_> {
             let failure = match result {
                 Ok(headers) if headers.is_empty() => {
                     if crate::p2p::wire::empty_reply_is_chain_tip(
-                        locators[0].last_height,
+                        first_scan_height(Some(locators[0])),
                         self.floor,
                         self.peer.peer_height,
                     ) {
@@ -1960,6 +1960,72 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn a_saved_tip_at_the_anchor_accepts_empty_headers() {
+        use crate::p2p::wire::{encode_message, encode_version};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 24];
+            while stream.read_exact(&mut header).await.is_ok() {
+                let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+                let mut payload = vec![0u8; len];
+                if stream.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                if header[4..11] == *b"version" {
+                    let version = encode_version(170_160, "/tip-test/", 3, 1, 0);
+                    stream
+                        .write_all(&encode_message(P2pNetwork::Regtest, "version", &version))
+                        .await
+                        .unwrap();
+                    stream
+                        .write_all(&encode_message(P2pNetwork::Regtest, "verack", &[]))
+                        .await
+                        .unwrap();
+                } else if header[4..14] == *b"getheaders" {
+                    stream
+                        .write_all(&encode_message(P2pNetwork::Regtest, "headers", &[0]))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let mut peer = Peer::connect(&addr, P2pNetwork::Regtest).await.unwrap();
+        assert_eq!(peer.peer_height, 3);
+        let mut waits = Vec::new();
+        let mut verifier = NetworkCursorVerifier {
+            peer: &mut peer,
+            network: P2pNetwork::Regtest,
+            peers: &[],
+            floor: 4, // TipAnchor at 3 requires fetching through height 3.
+            tip_anchor: Some(TipAnchor {
+                height: 3,
+                hash: [3; 32],
+            }),
+            checkpoint_file: Path::new("unused.checkpoint"),
+            waits: &mut waits,
+        };
+        let saved = ScanCursor {
+            last_height: 3,
+            last_block_hash: [3; 32],
+        };
+        let continuation = verifier
+            .continuation(&[saved])
+            .await
+            .expect("the empty reply is the tip after the saved anchor");
+        assert!(matches!(
+            continuation,
+            CanonicalContinuation::Current {
+                chain_has_more: false
+            }
+        ));
     }
 
     #[tokio::test]
