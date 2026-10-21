@@ -450,7 +450,7 @@ pub fn classify_send_response(response: &SendResponse) -> SubmissionDisposition 
     SubmissionDisposition::AmbiguousTransport
 }
 
-fn txid_from_raw(raw_tx: &[u8]) -> ZeckResult<TxId> {
+pub(crate) fn txid_from_raw(raw_tx: &[u8]) -> ZeckResult<TxId> {
     let mut cursor = Cursor::new(raw_tx);
     // V5/V6 carry their branch in the header. For older transactions the
     // branch supplied here does not affect the serialized transaction ID.
@@ -1136,7 +1136,7 @@ impl DurableBroadcastLog {
     }
 }
 
-fn validate_transition(
+pub(crate) fn validate_transition(
     existing: &PersistedTransaction,
     state: TxLifecycleState,
     submission: Option<&SubmissionDisposition>,

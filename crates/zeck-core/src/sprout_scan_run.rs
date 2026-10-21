@@ -898,6 +898,12 @@ pub fn checkpoint_path(data_dir: &Path, spending_keys: &[[u8; 32]]) -> PathBuf {
 /// Names the scan checkpoint and the sweep journal alike, so both files for
 /// one wallet sit side by side and never collide with another wallet's.
 pub fn key_set_fingerprint(spending_keys: &[[u8; 32]]) -> String {
+    full_key_set_fingerprint(spending_keys)[..16].to_owned()
+}
+
+/// Full digest bound into a sweep journal header, guarding even a collision
+/// in the short fingerprint used by deployed checkpoint and journal names.
+pub fn full_key_set_fingerprint(spending_keys: &[[u8; 32]]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     // Deduplicated as well as sorted: [A, A] is the scan of [A], and must
@@ -905,10 +911,7 @@ pub fn key_set_fingerprint(spending_keys: &[[u8; 32]]) -> String {
     for key in &scan_key_set(spending_keys, &[]) {
         h.update(key);
     }
-    h.finalize()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A block near the chain tip, learned from lightwalletd rather than from

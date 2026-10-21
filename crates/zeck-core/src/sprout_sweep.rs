@@ -507,6 +507,15 @@ impl SweepJournal {
                 )))
             }
         };
+        // Tasks 2-4 replace these callers with the v2 lifecycle adapter.
+        // Until then, fail closed: the legacy parser would silently skip
+        // every JSON event and re-prove a transaction already in flight.
+        if text.trim_start().starts_with('{') {
+            return Err(ZeckError::TransactionBuild(format!(
+                "sweep journal {} needs lifecycle reconciliation before another sweep",
+                self.path.display()
+            )));
+        }
         Ok(text.lines().filter_map(parse_journal_line).collect())
     }
 
@@ -1339,6 +1348,52 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "it links Sprout notes to their sweep");
         }
+    }
+
+    #[test]
+    fn legacy_sweep_refuses_a_v2_journal_instead_of_reproving_notes() {
+        let dir = temp_dir("v2-compat");
+        let current = crate::sprout_sweep_journal::SweepJournal::for_keys(
+            &dir,
+            &[[0x42; 32]],
+            crate::ZeckNetwork::Mainnet,
+        );
+        let mut snapshot = current.load_or_migrate().unwrap();
+        let tx = {
+            use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+            let tx = TransactionData::<Authorized>::from_parts(
+                TxVersion::V5,
+                BranchId::Nu5,
+                0,
+                BlockHeight::from_u32(100),
+                None,
+                None,
+                None,
+                None,
+            )
+            .freeze()
+            .unwrap();
+            let mut raw_tx = Vec::new();
+            tx.write(&mut raw_tx).unwrap();
+            crate::broadcast::PreparedTransaction {
+                txid: tx.txid(),
+                raw_tx,
+                fee_zatoshis: 12_345,
+                expiry_height: Some(100),
+            }
+        };
+        use crate::broadcast::BroadcastStore;
+        current
+            .scoped_store(
+                crate::sprout_sweep_journal::JournalNoteContext {
+                    outpoint: outpoint(1),
+                    value_zatoshis: 1_000_000,
+                },
+                &mut snapshot,
+            )
+            .persist_prepared(&tx)
+            .unwrap();
+        assert!(SweepJournal::for_keys(&dir, &[[0x42; 32]]).load().is_err());
     }
 
     /// Keyed like the scan checkpoint: another wallet's sweep must not make
