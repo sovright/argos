@@ -493,10 +493,11 @@ fn load_wallet_file(path: &Path, network: ZeckNetwork) -> Result<ImportedKeys> {
         }
         // The parser reports a locked wallet and a wrong passphrase with
         // the same variant. Here it can only mean "locked", because we
-        // supplied no passphrase to be wrong.
-        Err(argos_core::ZeckError::Import(ref message))
-            if message == &argos_wallet_import::ImportError::WrongPassphrase.to_string() =>
-        {
+        // supplied no passphrase to be wrong. Matched by type, not message
+        // text, so rewording the error cannot silently stop the prompt.
+        Err(argos_core::ZeckError::WalletFile(
+            argos_wallet_import::ImportError::WrongPassphrase,
+        )) => {
             eprintln!("This wallet is encrypted.");
             let passphrase = Password::new()
                 .with_prompt("Enter the wallet passphrase")

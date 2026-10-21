@@ -24,6 +24,17 @@ pub enum ImportError {
         selected: EmbeddedNetwork,
         embedded: EmbeddedNetwork,
     },
+
+    /// The file names two different networks. Either could be the forged
+    /// one, so no selection is safe to bind it to.
+    #[error(
+        "wallet records conflicting networks ({first} and {second}), so it cannot be bound \
+         to either. Keep the original wallet file."
+    )]
+    ConflictingNetwork {
+        first: EmbeddedNetwork,
+        second: EmbeddedNetwork,
+    },
 }
 
 /// Non-fatal, per-record problems. Always surfaced to the user with counts
@@ -268,6 +279,7 @@ impl std::fmt::Debug for ImportError {
             Self::UnwalkableBtree(_) => "UnwalkableBtree",
             Self::DamagedEncryptionMetadata(_) => "DamagedEncryptionMetadata",
             Self::NetworkMismatch { .. } => "NetworkMismatch",
+            Self::ConflictingNetwork { .. } => "ConflictingNetwork",
         })
     }
 }
