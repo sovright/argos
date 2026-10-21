@@ -14,11 +14,11 @@ local substitute.
 ### Step 1: Welcome Screen
 - [ ] App launches and window renders at correct size (1180×860, min 940×720)
 - [ ] Both entry paths visible: seed phrase and wallet file / standalone key
-- [ ] "I have my 24-word seed phrase" navigates to seed entry
+- [ ] "I have my seed phrase" navigates to seed entry
 - [ ] "I have a wallet file" navigates to wallet-file entry
 
 ### Step 2: Seed Entry
-- [ ] 24-word textarea accepts input
+- [ ] Seed textarea accepts a 12- or 24-word phrase
 - [ ] Show/hide words toggle works
 - [ ] `validate_seed` called on button click — valid seed shows green confirmation
 - [ ] Bad checksum caught (e.g. swap last word with another valid BIP-39 word)

@@ -10,10 +10,20 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 argos-wallet-import = { path = ".." }
+# Same version as the workspace pin; already in this lockfile through
+# argos-wallet-import, so it adds no new crate.
+secrecy = "0.8.0"
 
 [[bin]]
 name = "bdb_walk"
 path = "fuzz_targets/bdb_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_zcashd"
+path = "fuzz_targets/import_zcashd.rs"
 test = false
 doc = false
 bench = false

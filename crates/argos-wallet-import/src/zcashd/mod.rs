@@ -2,17 +2,22 @@
 
 pub mod crypto;
 pub mod encrypted;
+pub mod metadata;
 pub mod plaintext;
 pub mod records;
+pub mod seed;
 pub mod sprout;
 
 pub use crypto::{
     classify_encryption, derive_master_key, find_mkey, EncryptionMetadata, MasterKey, MkeyRecord,
 };
 pub use encrypted::collect_encrypted;
+pub use metadata::{KeyMetadataIndex, MetadataKind, UNKNOWN_CREATE_TIME_AT_OR_BEFORE};
 pub use plaintext::collect_plaintext;
 pub use records::{compact_size, parse_record_key, RecordKey};
 pub use sprout::collect_sprout_notes;
+
+use std::collections::HashSet;
 
 use secrecy::SecretString;
 
@@ -44,30 +49,28 @@ pub fn import_zcashd(
     passphrase: Option<&SecretString>,
 ) -> Result<ImportedKeys, ImportError> {
     let walk = bdb::walk(bytes)?;
-    let pairs = walk.records;
-    let encryption = classify_encryption(&pairs);
-    if let EncryptionMetadata::Damaged { reason } = encryption {
-        return Err(ImportError::DamagedEncryptionMetadata(reason));
-    }
-    let mut out = ImportedKeys {
-        diagnostics: walk.diagnostics,
-        ..Default::default()
-    };
-
-    collect_plaintext(&pairs, &mut out);
-    collect_sprout_notes(&pairs, &mut out);
-
-    if let EncryptionMetadata::Encrypted(mkey) = encryption {
+    let walk_diagnostics = walk.diagnostics;
+    let pairs = Records(walk.records);
+    let master = match classify_encryption(&pairs) {
+        EncryptionMetadata::Damaged { reason } => {
+            return Err(ImportError::DamagedEncryptionMetadata(reason));
+        }
         // Encrypted wallet: without a passphrase the encrypted records are
         // unreachable, and reporting partial plaintext results would let a
         // user believe they had recovered everything.
-        let passphrase = passphrase.ok_or(ImportError::WrongPassphrase)?;
-        let master = derive_master_key(passphrase, &mkey)?;
-        collect_encrypted(&pairs, &master, &mut out);
-    }
+        EncryptionMetadata::Encrypted(mkey) => Some(derive_master_key(
+            passphrase.ok_or(ImportError::WrongPassphrase)?,
+            &mkey,
+        )?),
+        EncryptionMetadata::Unencrypted => None,
+    };
+    let mut out = import_records(&pairs, master.as_ref());
+    out.diagnostics.splice(0..0, walk_diagnostics);
 
     let absence_already_explained = out.diagnostics.iter().any(|diagnostic| match diagnostic {
-        ImportDiagnostic::UnrecoveredSeed { .. } => true,
+        ImportDiagnostic::UnrecoveredSeed { .. }
+        | ImportDiagnostic::UnscannedSeedAccounts { .. }
+        | ImportDiagnostic::MissingDerivedKeys { .. } => true,
         ImportDiagnostic::UnparseableRecord { record_type, .. }
         | ImportDiagnostic::DecryptionFailed { record_type, .. }
         | ImportDiagnostic::PublicIdentifierMismatch { record_type, .. }
@@ -87,9 +90,72 @@ pub fn import_zcashd(
     Ok(out)
 }
 
+/// Every pass over the walked records. `master` is `Some` exactly when the
+/// wallet is encrypted.
+fn import_records(pairs: &[(Vec<u8>, Vec<u8>)], master: Option<&MasterKey>) -> ImportedKeys {
+    let mut out = ImportedKeys::default();
+    let mut recovered = collect_plaintext(pairs, &mut out);
+    collect_sprout_notes(pairs, &mut out);
+    if let Some(master) = master {
+        recovered.extend(collect_encrypted(pairs, master, &mut out));
+    }
+    // Last: coverage is judged by key identity — a derived key counts only
+    // if its metadata names this seed *and* the passes above actually
+    // recovered it. A key record that merely exists but could not be read
+    // or decrypted is not a key the user has.
+    seed::assess_seed(pairs, master, &recovered, &mut out);
+    out
+}
+
+/// The keys a collector actually recovered, named by the remainder of
+/// their record key after the type: the serialized public key for
+/// `key`/`ckey`, the incoming viewing key for `sapzkey`/`csapzkey`. Those
+/// are byte-for-byte the keys of the matching `keymeta`/`sapzkeymeta`
+/// records, which is how seed coverage joins the two.
+#[derive(Default)]
+pub struct RecoveredKeyIds {
+    pub(crate) transparent: HashSet<Vec<u8>>,
+    pub(crate) sapling: HashSet<Vec<u8>>,
+}
+
+impl RecoveredKeyIds {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.transparent.extend(other.transparent);
+        self.sapling.extend(other.sapling);
+    }
+}
+
+/// The walked records, scrubbed when dropped — on every exit, including the
+/// early one for a missing passphrase.
+///
+/// They hold the plaintext `mnemonicphrase` (which zcashd v6.20.0 leaves in
+/// place even after `encryptwallet`) and, for an unencrypted wallet, every
+/// raw key. The parsed keys the caller keeps are wrapped in `Secret`; these
+/// copies were otherwise left in freed heap for the life of the process.
+struct Records(Vec<(Vec<u8>, Vec<u8>)>);
+
+impl std::ops::Deref for Records {
+    type Target = [(Vec<u8>, Vec<u8>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for Records {
+    fn drop(&mut self) {
+        use secrecy::Zeroize;
+        for (key, value) in &mut self.0 {
+            key.zeroize();
+            value.zeroize();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ImportDiagnostic;
     use secrecy::SecretString;
 
     fn read(name: &str) -> Vec<u8> {
@@ -374,6 +440,124 @@ mod tests {
         );
     }
 
+    /// The record key, after its type, of the first key whose metadata
+    /// names a legacy-account keypath containing `branch`.
+    fn derived_key_id(pairs: &[(Vec<u8>, Vec<u8>)], branch: &str) -> Vec<u8> {
+        pairs
+            .iter()
+            .find_map(|(k, v)| {
+                let r = parse_record_key(k)?;
+                (r.record_type == "keymeta" && String::from_utf8_lossy(v).contains(branch))
+                    .then_some(r.rest)
+            })
+            .expect("a derived key")
+    }
+
+    /// Cut the value of the `record_type` record whose key is `id` to `len`
+    /// bytes: the record is still there, its key is not readable.
+    fn truncate_record(pairs: &mut [(Vec<u8>, Vec<u8>)], record_type: &str, id: &[u8], len: usize) {
+        let mut hit = 0;
+        for (k, v) in pairs.iter_mut() {
+            if parse_record_key(k).is_some_and(|r| r.record_type == record_type && r.rest == id) {
+                v.truncate(len);
+                hit += 1;
+            }
+        }
+        assert_eq!(hit, 1, "exactly one {record_type} record is damaged");
+    }
+
+    fn assert_not_claimed_complete(keys: &ImportedKeys, pool: &str) {
+        assert!(keys.seed_verified, "{:?}", keys.diagnostics);
+        let note = keys
+            .verified_seed_note()
+            .expect("a verified seed has a note");
+        assert!(
+            !note.contains("every key it derived is read"),
+            "an unread derived key must withdraw the claim, got: {note}"
+        );
+        assert!(keys.coverage().may_hide_funds(), "{:?}", keys.coverage());
+        assert!(
+            keys.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::MissingDerivedKeys { pool: p, expected, found }
+                    if p.contains(pool) && *found + 1 == *expected
+            )),
+            "the unread key must not count as present: {:?}",
+            keys.diagnostics
+        );
+    }
+
+    /// Review round 3 on #230, finding 1. A derived key whose record merely
+    /// existed counted as present, so a legacy external `key` record cut
+    /// short — unreadable, its key not recovered — still read as "verified —
+    /// every key it derived is read from this file".
+    #[test]
+    fn an_unreadable_derived_key_withdraws_the_verified_claim() {
+        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap().records;
+        let id = derived_key_id(&pairs, "/2147483647'/0/");
+        truncate_record(&mut pairs, "key", &id, 10);
+        let keys = import_records(&pairs, None);
+        assert!(
+            keys.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "key"
+            )),
+            "{:?}",
+            keys.diagnostics
+        );
+        assert_not_claimed_complete(&keys, "external");
+    }
+
+    /// An unreadable `keymeta` costs its key only a creation time, so by
+    /// itself it grades Complete and is not a seed finding. But it can no
+    /// longer vouch for a derived key, and that shortfall is graded where it
+    /// belongs: as a missing derived key, not by the metadata diagnostic.
+    #[test]
+    fn unreadable_metadata_on_a_derived_key_is_graded_by_the_seed_check() {
+        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap().records;
+        let id = derived_key_id(&pairs, "/2147483647'/1/");
+        truncate_record(&mut pairs, "keymeta", &id, 20);
+        let keys = import_records(&pairs, None);
+        let unreadable: Vec<_> = keys
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, ImportDiagnostic::UnreadableKeyMetadata { .. }))
+            .collect();
+        assert_eq!(unreadable.len(), 1, "reported once: {:?}", keys.diagnostics);
+        assert!(!unreadable[0].is_about_seed());
+        assert_eq!(
+            crate::keys::ImportCoverage::of(unreadable[0]),
+            crate::keys::ImportCoverage::Complete
+        );
+        assert_not_claimed_complete(&keys, "change");
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::DerivedKeysMissing
+        );
+    }
+
+    /// The same through decryption: a change `ckey` whose ciphertext is cut
+    /// short does not decrypt. (Flipping a ciphertext byte would not do —
+    /// CBC decrypts it to 32 bytes of garbage with no diagnostic.)
+    #[test]
+    fn an_undecryptable_derived_key_withdraws_the_verified_claim() {
+        let mut pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
+        let pass = SecretString::new("argos-test-passphrase".to_owned());
+        let master = derive_master_key(&pass, &find_mkey(&pairs).unwrap()).unwrap();
+        let id = derived_key_id(&pairs, "/2147483647'/1/");
+        truncate_record(&mut pairs, "ckey", &id, 5);
+        let keys = import_records(&pairs, Some(&master));
+        assert!(
+            keys.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::DecryptionFailed { record_type, .. } if record_type == "ckey"
+            )),
+            "{:?}",
+            keys.diagnostics
+        );
+        assert_not_claimed_complete(&keys, "change");
+    }
+
     #[test]
     fn detects_which_wallets_need_a_passphrase() {
         assert!(needs_passphrase(&read("modern-encrypted")).unwrap());
@@ -404,11 +588,12 @@ mod tests {
     }
 
     /// zcashd 5.0+ keeps its HD seed in `mnemonicphrase` (plaintext) or
-    /// `cmnemonicphrase` (encrypted). Argos does not recover it, so the
-    /// user must be told — these used to be skipped with no diagnostic at
-    /// all, which made the wallet read as completely recovered.
+    /// `cmnemonicphrase` (encrypted). Every golden wallet's seed must decode,
+    /// match the fingerprint zcashd stored it under, and — because none of
+    /// them ever created a unified account and every legacy key the seed
+    /// derived is stored — leave the import complete rather than warned.
     #[test]
-    fn a_zcashd_5_wallet_reports_its_unrecovered_seed() {
+    fn a_zcashd_5_wallets_seed_is_verified_and_its_coverage_is_complete() {
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         for (name, passphrase) in [
             ("modern-plaintext", None),
@@ -417,17 +602,21 @@ mod tests {
             ("sprout-encrypted", Some(&pass)),
         ] {
             let keys = import_zcashd(&read(name), passphrase).unwrap();
-            let seeds = keys
-                .diagnostics
-                .iter()
-                .filter(|d| d.is_unrecovered_seed())
-                .count();
-            assert_eq!(seeds, 1, "{name}: expected one unrecovered-seed diagnostic");
+            assert!(keys.seed_verified, "{name}: seed was not verified");
+            assert!(
+                keys.diagnostics.is_empty(),
+                "{name}: unexpected diagnostics {:?}",
+                keys.diagnostics
+            );
             assert_eq!(
                 keys.coverage(),
-                crate::keys::ImportCoverage::SeedNotRecovered,
+                crate::keys::ImportCoverage::Complete,
                 "{name}"
             );
+            // Verified is not "used for derivation": routing a zcashd wallet
+            // down the HD path would drop every key it stores under the
+            // legacy account, which the HD scan never enumerates.
+            assert!(keys.mnemonic.is_none(), "{name}: mnemonic must stay unset");
         }
     }
 

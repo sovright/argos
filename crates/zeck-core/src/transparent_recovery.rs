@@ -1070,6 +1070,7 @@ mod seedless_destination_tests {
             transparent: vec![argos_wallet_import::keys::TransparentKey {
                 secret: secrecy::Secret::new([1u8; 32]),
                 provenance: argos_wallet_import::Provenance::Standalone,
+                created_at: None,
             }],
             ..Default::default()
         }
