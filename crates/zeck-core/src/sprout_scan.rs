@@ -1278,6 +1278,72 @@ mod tests {
     }
 
     #[test]
+    fn hundred_frame_checkpoint_records_only_per_block_spent_undo() {
+        let key = [0x42; 32];
+        let mut scanner = SproutScanner::new(&[key]);
+        let mut first_block = Vec::new();
+        for seed in (10..100u8).step_by(3) {
+            let recipient = if seed == 10 { key } else { [0x77; 32] };
+            first_block.push(joinsplit_paying(&recipient, 100, 0, seed).0);
+        }
+        scanner.scan_block_at(&first_block, [1; 32], 1).unwrap();
+        for height in 2..=100u32 {
+            let joinsplits = match height {
+                2 | 3 => vec![joinsplit_paying(&key, 100, 0, 100 + 3 * height as u8).0],
+                _ => Vec::new(),
+            };
+            scanner
+                .scan_block_at(&joinsplits, [height as u8; 32], height)
+                .unwrap();
+        }
+        assert_eq!(scanner.history.len(), SPROUT_REORG_WINDOW);
+        assert_eq!(scanner.pending.len(), 3);
+        assert_eq!(scanner.spent.len(), 64);
+        assert_eq!(scanner.history[0].spent_before.len(), 60);
+        assert_eq!(scanner.history[1].spent_before.len(), 2);
+        assert_eq!(scanner.history[2].spent_before.len(), 2);
+        assert!(scanner
+            .history
+            .iter()
+            .skip(3)
+            .all(|f| f.spent_before.is_empty()));
+
+        let v2_bytes = scanner.encode(2).as_bytes().len();
+        let v3 = scanner.checkpoint();
+        let v3_bytes = v3.as_bytes().len();
+        // A frame contains its own tree/witness snapshots and only the
+        // nullifiers changed in that block. Account for every encoded byte:
+        // an added copy of the global spent map in any frame fails this.
+        let frames_bytes: usize = scanner
+            .history
+            .iter()
+            .map(|frame| {
+                40 + 1
+                    + usize::from(frame.cursor_before.is_some()) * 40
+                    + 8
+                    + frame.tree_before.to_bytes().len()
+                    + 8
+                    + 8
+                    + frame
+                        .witnesses_before
+                        .iter()
+                        .map(|w| 8 + w.to_bytes().len())
+                        .sum::<usize>()
+                    + 8
+                    + frame
+                        .spent_before
+                        .iter()
+                        .map(|undo| 33 + usize::from(matches!(undo.previous, Some(Some(_)))) * 32)
+                        .sum::<usize>()
+                    + 40
+            })
+            .sum();
+        assert_eq!(v3_bytes, v2_bytes + 8 + frames_bytes);
+        assert_eq!(SproutScanner::resume(&v3).unwrap().history.len(), 100);
+        eprintln!("100-frame checkpoint with three pending notes and 64 spent nullifiers: v2-equivalent={v2_bytes} bytes, v3={v3_bytes} bytes");
+    }
+
+    #[test]
     fn v3_rejects_oversized_and_noncontiguous_history() {
         let mut scanner = SproutScanner::new(&[[0x42; 32]]);
         for height in 1..=2u32 {
