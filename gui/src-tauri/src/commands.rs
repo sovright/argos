@@ -1052,31 +1052,7 @@ pub async fn execute_sprout_sweep(
     .await
     .map_err(|err| err.to_string())?;
 
-    Ok(SproutSweepReport {
-        sent: outcome
-            .sent
-            .into_iter()
-            .map(|s| SproutSweepResult {
-                txid: s.txid,
-                value_swept: s.value_swept,
-            })
-            .collect(),
-        total_swept: outcome.total_swept,
-        landed_in_unified_sapling: outcome.destination_kind
-            == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
-        skipped: outcome.skipped,
-        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
-        already_held: outcome
-            .already_held
-            .iter()
-            .map(|h| SproutSweepResult {
-                txid: h.txid.clone(),
-                value_swept: h.value_swept,
-            })
-            .collect(),
-        warnings: outcome.warnings,
-        error: outcome.error,
-    })
+    Ok(sweep_report(outcome, None))
 }
 
 /// A Sprout scan's outcome, for the frontend.
@@ -1456,6 +1432,70 @@ async fn sprout_tip_anchor(
     }
 }
 
+/// The sweep goes through lightwalletd, which `sweep_sprout_notes` probes
+/// only after the catch-up scan. A server address that cannot work is
+/// refused here, before that scan, as the CLI does. Syntax only: an
+/// unreachable or wrong-network server is still caught by that probe.
+fn validate_sweep_endpoint(lightwalletd_url: &str) -> Result<(), String> {
+    argos_core::lightwalletd::validated_lightwalletd_endpoints(lightwalletd_url)
+        .map(|_| ())
+        .map_err(|err| {
+            format!(
+                "the sweep is broadcast through the lightwalletd server, and that address \
+                 cannot work ({err}). Fix it before sweeping."
+            )
+        })
+}
+
+/// What a sweep can be refused for on its own inputs: a destination with no
+/// Sapling receiver, or a server address that cannot work. Neither needs the
+/// keys, so both are checked before the wallet file is decrypted.
+fn validate_sweep_request(
+    destination: &str,
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+) -> Result<(), String> {
+    argos_core::sprout_sweep::parse_sapling_destination(destination, network)
+        .map_err(|err| err.to_string())?;
+    validate_sweep_endpoint(lightwalletd_url)
+}
+
+/// A sweep's outcome, for the frontend.
+///
+/// `tip_warning` leads the warnings when the catch-up scan before a sweep
+/// could not confirm it reached the chain tip: a user told nothing would
+/// take the result for a confirmed one.
+fn sweep_report(
+    outcome: argos_core::sprout_sweep::SproutSweepOutcome,
+    tip_warning: Option<String>,
+) -> SproutSweepReport {
+    SproutSweepReport {
+        sent: outcome
+            .sent
+            .into_iter()
+            .map(|s| SproutSweepResult {
+                txid: s.txid,
+                value_swept: s.value_swept,
+            })
+            .collect(),
+        total_swept: outcome.total_swept,
+        landed_in_unified_sapling: outcome.destination_kind
+            == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
+        skipped: outcome.skipped,
+        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
+        already_held: outcome
+            .already_held
+            .iter()
+            .map(|h| SproutSweepResult {
+                txid: h.txid.clone(),
+                value_swept: h.value_swept,
+            })
+            .collect(),
+        warnings: tip_warning.into_iter().chain(outcome.warnings).collect(),
+        error: outcome.error,
+    }
+}
+
 /// Sweep the notes a scan found.
 ///
 /// Resuming a saved scan is a short catch-up, not a rescan: it continues from
@@ -1482,13 +1522,12 @@ pub async fn sweep_sprout_from_scan(
     ensure_tos_accepted(&app)?;
     let net = network_from(&network);
     let peers = parse_custom_peers(&peers)?;
+    // Validated before anything else, the wallet file's decryption included:
+    // an address with no Sapling receiver or a server address that cannot
+    // work should fail here, not after the notes are re-derived.
+    validate_sweep_request(&destination, net, &lightwalletd_url)?;
     let scan_keys = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, net)?;
     let decoded = scan_keys.all;
-
-    // Validated before anything else: an address with no Sapling receiver
-    // should fail here, not after the notes are re-derived.
-    argos_core::sprout_sweep::parse_sapling_destination(&destination, net)
-        .map_err(|err| err.to_string())?;
 
     let p2p: argos_core::p2p::wire::P2pNetwork = net.into();
     // Blank resolves to the app default, as it does for inspection, preview
@@ -1513,7 +1552,7 @@ pub async fn sweep_sprout_from_scan(
         );
     };
 
-    let (tip_anchor, _) = sprout_tip_anchor(net, &lightwalletd_url).await;
+    let (tip_anchor, tip_warning) = sprout_tip_anchor(net, &lightwalletd_url).await;
     let emitter = app.clone();
     let result = argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
         &decoded,
@@ -1564,31 +1603,7 @@ pub async fn sweep_sprout_from_scan(
     .await
     .map_err(|err| err.to_string())?;
 
-    Ok(SproutSweepReport {
-        sent: outcome
-            .sent
-            .into_iter()
-            .map(|s| SproutSweepResult {
-                txid: s.txid,
-                value_swept: s.value_swept,
-            })
-            .collect(),
-        total_swept: outcome.total_swept,
-        landed_in_unified_sapling: outcome.destination_kind
-            == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified),
-        skipped: outcome.skipped,
-        rejected: outcome.rejected.iter().map(|r| r.to_string()).collect(),
-        already_held: outcome
-            .already_held
-            .iter()
-            .map(|h| SproutSweepResult {
-                txid: h.txid.clone(),
-                value_swept: h.value_swept,
-            })
-            .collect(),
-        warnings: outcome.warnings,
-        error: outcome.error,
-    })
+    Ok(sweep_report(outcome, tip_warning))
 }
 
 // Not gated on `sprout`: `check_sapling_key` is a core-Sapling command and
@@ -2368,7 +2383,10 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_unreachable_sweep_destination;
+    use super::{
+        refuse_unreachable_sweep_destination, sweep_report, validate_sweep_endpoint,
+        validate_sweep_request,
+    };
     use argos_core::argos_wallet_import::{keys::TransparentKey, ImportedKeys, Provenance};
     use argos_core::sprout_recovery::{SpentSproutNote, SproutRecovery};
     use secrecy::ExposeSecret;
@@ -2749,6 +2767,60 @@ mod tests {
         seeded.mnemonic = Some(secrecy::SecretString::new("abandon".to_owned()));
         refuse_unreachable_sweep_destination(&seeded, ORCHARD_ONLY_UA, ZeckNetwork::Mainnet)
             .expect("seeded wallets sweep through the HD path");
+    }
+
+    #[test]
+    fn sweep_refuses_an_unusable_lightwalletd_url_up_front() {
+        for bad in ["nonono", "", "http://wallet.example:9067"] {
+            let err = validate_sweep_endpoint(bad).expect_err(bad);
+            assert!(err.contains("lightwalletd"), "{bad}: {err}");
+        }
+        validate_sweep_endpoint("https://zec.rocks:443").expect("a real endpoint passes");
+    }
+
+    #[test]
+    fn the_tip_warning_leads_the_sweep_report() {
+        let outcome = argos_core::sprout_sweep::SproutSweepOutcome {
+            warnings: vec!["journal".to_owned()],
+            ..Default::default()
+        };
+        let report = sweep_report(outcome.clone(), Some("tip unconfirmed".to_owned()));
+        assert_eq!(report.warnings, vec!["tip unconfirmed", "journal"]);
+
+        // A tip the catch-up scan did confirm adds nothing.
+        assert_eq!(sweep_report(outcome, None).warnings, vec!["journal"]);
+    }
+
+    #[test]
+    fn a_sweep_request_is_refused_on_its_own_inputs() {
+        // Checked before the wallet file is decrypted: neither check needs
+        // the keys, so a bad address or server is reported without them.
+        let err = validate_sweep_request("not-an-address", ZeckNetwork::Mainnet, "nonono")
+            .expect_err("an undecodable destination is refused");
+        assert!(
+            !err.contains("lightwalletd"),
+            "destination is checked first: {err}"
+        );
+
+        // The test seed's account-0 Sapling address (see derivation.rs).
+        let good = "zs16uhd4mux24se6wkm74vld0ec63d4dxt3d7m80l5xytreplkkllrrf9c7fj859mhp8tkcq9hxfvj";
+        let err = validate_sweep_request(good, ZeckNetwork::Mainnet, "nonono")
+            .expect_err("an unusable server is refused");
+        assert!(err.contains("lightwalletd"), "{err}");
+
+        validate_sweep_request(good, ZeckNetwork::Mainnet, "https://zec.rocks:443")
+            .expect("a real address and server pass");
+    }
+
+    #[test]
+    fn a_wrong_network_server_is_left_to_the_sweeps_own_probe() {
+        // The up-front check is syntax only: no network access, so it cannot
+        // tell a testnet server from a mainnet one. That is caught by the
+        // probe `sweep_sprout_notes` runs before loading the proving
+        // parameters (`validate_lightwalletd_network`, tested in core as
+        // `network_validation_rejects_wrong_chain`).
+        validate_sweep_endpoint("https://testnet.zec.rocks:443")
+            .expect("a well-formed testnet URL passes the syntax check");
     }
 
     fn spent_note() -> SpentSproutNote {
