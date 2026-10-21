@@ -295,6 +295,7 @@ fn load_checkpoint(
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
 ) -> ZeckResult<Option<SproutScanner>> {
+    remove_stale_temp_files(checkpoint_file);
     let Some(bytes) = read_checkpoint_file(checkpoint_file)? else {
         return Ok(None);
     };
@@ -2168,6 +2169,7 @@ pub fn save_checkpoint(
     // that would turn a recoverable pause into a restart from genesis.
     // A unique, create-new sibling keeps separate scan processes from
     // removing or renaming each other's partially written checkpoints.
+    remove_stale_temp_files(path);
     let tmp = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
     let mut bytes = vec![NETWORK_TAGGED, network_tag(network)];
     bytes.extend_from_slice(scanner.checkpoint().as_bytes());
@@ -2234,7 +2236,9 @@ fn write_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     let mut file = options.open(path).map_err(|err| {
         ZeckError::TransactionBuild(format!("creating {}: {err}", path.display()))
     })?;
-    if let Err(err) = file.write_all(bytes) {
+    // Flushed to disk before the caller renames it into place, so a power
+    // loss cannot leave the new name pointing at bytes never written.
+    if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = std::fs::remove_file(path);
         return Err(ZeckError::TransactionBuild(format!(
@@ -2252,30 +2256,61 @@ pub fn discard_checkpoint(path: &Path) {
     let _ = std::fs::remove_file(path);
     // Checkpoints written before unique temp names used this fixed sibling.
     let _ = std::fs::remove_file(path.with_extension("checkpoint.tmp"));
+    for (temp, _) in unique_temp_siblings(path) {
+        let _ = std::fs::remove_file(temp);
+    }
+}
+
+/// How old a unique temp sibling must be before it is taken for a crashed
+/// writer's leftover. A save writes and renames within seconds; this is far
+/// past that, so a concurrent scan's file in progress is never touched.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Remove unique temp siblings of `path` that a crash left behind. Each is a
+/// 0600 copy of the checkpoint: spending keys and note plaintexts. Best
+/// effort; anything that cannot be read or removed is left alone.
+fn remove_stale_temp_files(path: &Path) {
+    let now = std::time::SystemTime::now();
+    for (temp, modified) in unique_temp_siblings(path) {
+        let stale = modified
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TEMP_AGE);
+        if stale {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
+/// `<checkpoint>.<uuid>.tmp` files beside `path`, as [`save_checkpoint`]
+/// names them, with their modification times.
+fn unique_temp_siblings(path: &Path) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let temp_base = path.with_extension("checkpoint");
     let Some(name) = temp_base.file_name().and_then(|name| name.to_str()) else {
-        return;
+        return Vec::new();
     };
     let prefix = format!("{name}.");
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(id) = file_name
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
                 .to_str()
                 .and_then(|name| name.strip_prefix(&prefix))
                 .and_then(|name| name.strip_suffix(".tmp"))
-            else {
-                continue;
-            };
-            if uuid::Uuid::parse_str(id).is_ok() {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        })
+        .map(|entry| {
+            let modified = entry.metadata().ok().and_then(|meta| meta.modified().ok());
+            (entry.path(), modified)
+        })
+        .collect()
 }
 
 /// Take a peer, racing candidates.
@@ -3022,6 +3057,43 @@ mod tests {
         assert!(!path.exists());
         assert!(!abandoned.exists(), "a crash can leave private temp bytes");
         assert_eq!(std::fs::read(unrelated).unwrap(), b"keep");
+    }
+
+    /// A crash between writing a unique temp file and renaming it leaves a
+    /// spend-capable 0600 file behind. Saving and loading sweep away such
+    /// leftovers once they are clearly abandoned, and never a temp file a
+    /// concurrent writer may still be filling.
+    #[test]
+    fn stale_unique_temp_files_are_removed_and_fresh_ones_kept() {
+        let dir = ScratchDir::new("stale-unique-temp");
+        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
+        let temp = |label: &str| {
+            let tmp = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
+            std::fs::write(&tmp, label).unwrap();
+            tmp
+        };
+        let age = |tmp: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(tmp)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE * 2)
+                .unwrap();
+        };
+        let stale = temp("crashed writer");
+        age(&stale);
+        let fresh = temp("writer in progress");
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        assert!(!stale.exists(), "an abandoned temp file is removed on save");
+        assert!(fresh.exists(), "a concurrent writer's temp file is kept");
+
+        let stale = temp("crashed writer");
+        age(&stale);
+        load_checkpoint(&path, P2pNetwork::Regtest, &[[0x11; 32]])
+            .unwrap()
+            .unwrap();
+        assert!(!stale.exists(), "an abandoned temp file is removed on load");
+        assert!(fresh.exists());
     }
 
     #[tokio::test]
