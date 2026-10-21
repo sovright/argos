@@ -154,6 +154,10 @@ pub async fn estimate_birthday_from_date(date: &str, lightwalletd_url: &str) -> 
 
 /// Inverse of the offline estimator: given a block height, return the
 /// approximate calendar date as `YYYY-MM-DD`.
+///
+/// Below Sapling activation it counts back from Sapling at the same 150 s
+/// target, floored at the mainnet genesis date: a wallet.dat birthday can be
+/// pre-Sapling, and a date stuck at 2018 beside it would misstate its age.
 pub fn estimate_date_from_height_offline(height: u32) -> String {
     let (anchor_date, anchor_height, block_seconds) = if height <= BLOSSOM_ACTIVATION_HEIGHT {
         (
@@ -169,13 +173,21 @@ pub fn estimate_date_from_height_offline(height: u32) -> String {
         )
     };
 
-    let delta_blocks = i64::from(height.saturating_sub(anchor_height));
-    let delta_days = (delta_blocks * block_seconds) / DAY_SECONDS;
+    let delta_blocks = i64::from(height) - i64::from(anchor_height);
+    let delta_days = (delta_blocks * block_seconds).div_euclid(DAY_SECONDS);
     let absolute_days = anchor_date
         .days_since_unix_epoch()
-        .saturating_add(delta_days);
+        .saturating_add(delta_days)
+        .max(MAINNET_GENESIS_DATE.days_since_unix_epoch());
     CalendarDate::from_days_since_unix_epoch(absolute_days).format()
 }
+
+/// The day the mainnet genesis block was mined; no height is dated earlier.
+const MAINNET_GENESIS_DATE: CalendarDate = CalendarDate {
+    year: 2016,
+    month: 10,
+    day: 28,
+};
 
 /// Caution appended to an auto-detected birthday that was derived from
 /// server-reported history (transparent UTXOs or shielded-window probes).
@@ -463,6 +475,65 @@ fn sprout_skip_reason(
         "at least one Sprout key being scanned has no recorded creation time"
     };
     format!("The Sprout scan will try to decrypt every block, because {reason}.")
+}
+
+/// The bound a Sprout scan decrypts from, and the one line that says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SproutDecryptPlan {
+    /// `None` decrypts every block.
+    pub decrypt_from: Option<u32>,
+    pub line: String,
+}
+
+/// Combine the wallet file's Sprout skip with what the user asked for.
+///
+/// `skip` and `skip_reason` come from [`wallet_file_birthday_from_metadata`]
+/// for the keys being scanned. A birthday the user gave can only lower the
+/// bound, never raise it or create one: the skip is allowed to exist only
+/// because every scanned key is dated, and a typed height is no evidence of
+/// that. A floor of 0 or 1 therefore means every block. Shared by both
+/// surfaces so they make the same decision and say it the same way; each
+/// appends its own words for how to turn the skip off.
+pub fn plan_sprout_decrypt(
+    skip: Option<u32>,
+    skip_reason: &str,
+    birthday_floor: Option<u32>,
+    decrypt_every_block: bool,
+) -> SproutDecryptPlan {
+    let every = |why: &str| SproutDecryptPlan {
+        decrypt_from: None,
+        line: format!("Trial decryption will cover every block from 1: {why}."),
+    };
+    let Some(skip) = skip else {
+        return SproutDecryptPlan {
+            decrypt_from: None,
+            line: skip_reason.to_owned(),
+        };
+    };
+    if decrypt_every_block {
+        return every("the birthday skip was turned off");
+    }
+    match birthday_floor {
+        Some(floor) if floor <= 1 => every("the birthday given is block 1 or earlier"),
+        Some(floor) if floor < skip => SproutDecryptPlan {
+            decrypt_from: Some(floor),
+            line: format!(
+                "Trial decryption starts at block {floor}, the birthday given, rather than \
+                 block {skip}, which the wallet file's Sprout key creation times would allow. \
+                 The walk itself still starts at block 1."
+            ),
+        },
+        _ => SproutDecryptPlan {
+            decrypt_from: Some(skip),
+            line: format!(
+                "Trial decryption starts at block {skip} (about {date}), because the wallet \
+                 file's creation times put every Sprout key being scanned after then. The walk \
+                 itself still starts at block 1, but a note paid to these keys below block \
+                 {skip} would not be found.",
+                date = estimate_date_from_height_offline(skip),
+            ),
+        },
+    }
 }
 
 /// Whether the chain should be asked: the file could not date every key,
@@ -1283,6 +1354,64 @@ mod tests {
                 "round-trip drift {drift} days for {date} -> {back}"
             );
         }
+    }
+
+    /// A wallet.dat birthday can now be below Sapling activation, and the
+    /// date shown beside it must move with it rather than stick at 2018.
+    #[test]
+    fn pre_sapling_heights_get_pre_sapling_dates() {
+        let one = estimate_date_from_height_offline(1);
+        assert!(one.starts_with("2016-1"), "block 1 -> {one}");
+        assert!(one.as_str() >= "2016-10-28", "never before genesis: {one}");
+        let zero = estimate_date_from_height_offline(0);
+        assert!(
+            zero.starts_with("2016-10-") && zero.as_str() >= "2016-10-28",
+            "{zero}"
+        );
+        // Block 200,000 was mined in late 2017.
+        let mid = estimate_date_from_height_offline(200_000);
+        assert!(mid.starts_with("2017-"), "block 200000 -> {mid}");
+        let dates: Vec<String> = [1, 100_000, 300_000, 419_199, 419_200]
+            .into_iter()
+            .map(estimate_date_from_height_offline)
+            .collect();
+        assert!(dates.windows(2).all(|w| w[0] <= w[1]), "{dates:?}");
+    }
+
+    #[test]
+    fn the_decrypt_plan_follows_the_skip_and_only_lowers_it() {
+        let reason = "The Sprout scan will try to decrypt every block, because x.";
+        // No skip: decrypt everything, whatever birthday is given, and say why.
+        let plan = plan_sprout_decrypt(None, reason, Some(900_000), false);
+        assert_eq!(plan.decrypt_from, None);
+        assert_eq!(plan.line, reason);
+
+        let plan = plan_sprout_decrypt(Some(500_000), reason, None, false);
+        assert_eq!(plan.decrypt_from, Some(500_000));
+        assert!(plan.line.contains("500000"), "{}", plan.line);
+        assert!(plan.line.contains("creation times"), "{}", plan.line);
+
+        // A later birthday never raises the bound above the file's.
+        let plan = plan_sprout_decrypt(Some(500_000), reason, Some(900_000), false);
+        assert_eq!(plan.decrypt_from, Some(500_000));
+
+        // A lower one wins, and the line says it was the birthday.
+        let plan = plan_sprout_decrypt(Some(500_000), reason, Some(300_000), false);
+        assert_eq!(plan.decrypt_from, Some(300_000));
+        assert!(plan.line.contains("300000"), "{}", plan.line);
+        assert!(plan.line.contains("birthday"), "{}", plan.line);
+
+        for floor in [0, 1] {
+            let plan = plan_sprout_decrypt(Some(500_000), reason, Some(floor), false);
+            assert_eq!(plan.decrypt_from, None, "birthday {floor}");
+            assert!(plan.line.contains("every block"), "{}", plan.line);
+        }
+
+        // Turned off: nothing is skipped.
+        let plan = plan_sprout_decrypt(Some(500_000), reason, None, true);
+        assert_eq!(plan.decrypt_from, None);
+        assert!(plan.line.contains("every block"), "{}", plan.line);
+        assert!(plan.line.contains("turned off"), "{}", plan.line);
     }
 
     #[test]

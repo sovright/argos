@@ -57,7 +57,8 @@ pub mod workspace;
 pub use address::validate_destination_address;
 pub use birthday::{
     detect_birthday, detect_wallet_file_birthday, estimate_birthday_from_date,
-    height_at_or_before_time, sprout_skip_height, wallet_file_birthday_from_metadata,
+    estimate_date_from_height_offline, height_at_or_before_time, plan_sprout_decrypt,
+    sprout_skip_height, wallet_file_birthday_from_metadata, SproutDecryptPlan,
     WalletBirthdaySource, WalletFileBirthday,
 };
 pub use derivation::{derive_accounts, validate_mnemonic_words};
