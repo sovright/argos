@@ -839,17 +839,78 @@ fn transaction_summaries(snapshot: &SproutJournalSnapshot) -> Vec<SproutSweepTra
 }
 
 fn reliable_observed_tip(observation: &TxObservation) -> Option<u32> {
-    (crate::broadcast::observe_transaction(observation.evidence.clone(), observation.expiry_height)
-        .state
-        == TxObservationState::Absent)
-        .then(|| {
-            observation
-                .evidence
-                .iter()
-                .filter_map(|item| item.tip_height)
-                .max()
-        })
+    let reduced = crate::broadcast::observe_transaction(
+        observation.evidence.clone(),
+        observation.expiry_height,
+    );
+    (reduced.state == TxObservationState::Absent)
+        .then(|| highest_corroborated_absent_tip(&reduced))
         .flatten()
+}
+
+fn independently_administered_absence(
+    first: &crate::broadcast::EndpointTxEvidence,
+    second: &crate::broadcast::EndpointTxEvidence,
+) -> bool {
+    let first_operator =
+        crate::models::canonical_confirmation_operator_id(&first.operator_id, &first.endpoint);
+    let second_operator =
+        crate::models::canonical_confirmation_operator_id(&second.operator_id, &second.endpoint);
+    if first_operator.is_empty() || second_operator.is_empty() || first_operator == second_operator
+    {
+        return false;
+    }
+    let (Some(first_authority), Some(second_authority)) = (
+        crate::models::normalized_confirmation_authority(&first.endpoint),
+        crate::models::normalized_confirmation_authority(&second.endpoint),
+    ) else {
+        return false;
+    };
+    first_authority != second_authority
+}
+
+fn is_absent_evidence(item: &crate::broadcast::EndpointTxEvidence) -> bool {
+    item.tip_height.is_some()
+        && item.reported_height.is_none()
+        && item.block_hash.is_none()
+        && !item.tx_in_block
+}
+
+fn highest_corroborated_absent_tip(observation: &TxObservation) -> Option<u32> {
+    let absent = observation
+        .evidence
+        .iter()
+        .filter(|item| is_absent_evidence(item))
+        .collect::<Vec<_>>();
+    let mut highest = None;
+    for (index, first) in absent.iter().enumerate() {
+        for second in absent.iter().skip(index + 1) {
+            if independently_administered_absence(first, second) {
+                let corroborated = first.tip_height?.min(second.tip_height?);
+                highest = Some(highest.map_or(corroborated, |tip: u32| tip.max(corroborated)));
+            }
+        }
+    }
+    highest
+}
+
+fn expired_absence_from_reorg(
+    observation: &TxObservation,
+    expiry_height: u32,
+) -> Option<TxObservation> {
+    if observation.state != TxObservationState::Reorged {
+        return None;
+    }
+    let absence = crate::broadcast::observe_transaction(
+        observation
+            .evidence
+            .iter()
+            .filter(|item| is_absent_evidence(item))
+            .cloned()
+            .collect(),
+        Some(expiry_height),
+    );
+    absence.is_expired().then_some(absence)
 }
 
 fn valid_for_exact_retry(observation: &TxObservation, expiry: u32) -> bool {
@@ -959,6 +1020,18 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             )?;
             continue;
         }
+        if let Some(expired_absence) =
+            expiry.and_then(|expiry_height| expired_absence_from_reorg(&observation, expiry_height))
+        {
+            journal.append_transition(
+                &mut snapshot,
+                entry.txid(),
+                TxLifecycleState::Expired,
+                None,
+                Some(&expired_absence),
+            )?;
+            continue;
+        }
 
         let Some(transaction) = entry.transaction.clone() else {
             if entry.legacy_expiry_bound.is_none() {
@@ -1015,7 +1088,9 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             }
             retries.push((entry.outpoint, value_zatoshis, transaction));
         } else {
-            if entry.state == TxLifecycleState::Pending {
+            if entry.state == TxLifecycleState::Pending
+                || (entry.state == TxLifecycleState::Mined && !mined_was_displaced)
+            {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -1081,6 +1156,15 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
     })
 }
 
+async fn with_sprout_operation_guard<T>(
+    data_dir: &Path,
+    network: crate::ZeckNetwork,
+    operation: impl std::future::Future<Output = ZeckResult<T>>,
+) -> ZeckResult<T> {
+    let _operation_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
+    operation.await
+}
+
 /// Prove and broadcast a sweep of every recoverable note.
 ///
 /// One transaction per note, because a JoinSplit takes two inputs and
@@ -1104,9 +1188,37 @@ pub async fn sweep_sprout_notes(
         .path()
         .parent()
         .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
-    let _operation_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
+    with_sprout_operation_guard(
+        data_dir,
+        network,
+        sweep_sprout_notes_guarded(
+            notes,
+            network,
+            lightwalletd_url,
+            sapling_dest,
+            destination_kind,
+            params_path,
+            options,
+            progress,
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sweep_sprout_notes_guarded(
+    notes: &[SpendableSproutNote],
+    network: crate::ZeckNetwork,
+    lightwalletd_url: &str,
+    sapling_dest: sapling_crypto::PaymentAddress,
+    destination_kind: DestinationKind,
+    params_path: &Path,
+    options: SweepOptions<'_>,
+    progress: impl FnMut(String),
+) -> ZeckResult<SproutSweepOutcome> {
     // Migration and identity validation must finish before any network I/O or
-    // proving work. `run_sweep` reloads under the same outer operation guard.
+    // proving work. `run_sweep` reloads while the outer operation guard held
+    // by `with_sprout_operation_guard` remains live.
     options.journal.load_or_migrate()?;
 
     // Every other fund-moving path checks that lightwalletd serves the chain
@@ -1633,6 +1745,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn public_sweep_fails_before_network_work_when_operation_guard_is_held() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(data_dir.path());
+        let guard = crate::service::NetworkOperationGuard::acquire(
+            data_dir.path(),
+            crate::ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let destination =
+            crate::sapling_key::default_sapling_address(&extsk, crate::ZeckNetwork::Mainnet);
+
+        let err = sweep_sprout_notes(
+            &[note(1_000_000)],
+            crate::ZeckNetwork::Mainnet,
+            "nonono",
+            &destination,
+            Path::new("/nonexistent/sprout-groth16.params"),
+            SweepOptions {
+                source: NoteSource::WalletFile,
+                journal: &journal,
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("the held operation guard must stop the sweep before network work");
+        assert!(matches!(err, ZeckError::ScanNotReady(_)), "{err}");
+
+        drop(guard);
+        let released = crate::service::NetworkOperationGuard::acquire(
+            data_dir.path(),
+            crate::ZeckNetwork::Mainnet,
+        );
+        assert!(
+            released.is_ok(),
+            "failed acquisition must not retain the lock"
+        );
+    }
+
     /// Orchard-only and transparent destinations must be refused with the
     /// reason, since sending there would strand the value in the transparent
     /// pool for whoever mines next.
@@ -1776,6 +1928,7 @@ mod tests {
         observed: Vec<zcash_primitives::transaction::TxId>,
         shared_observed:
             Option<std::sync::Arc<std::sync::Mutex<Vec<zcash_primitives::transaction::TxId>>>>,
+        before_observe: Option<Box<dyn FnMut() + Send>>,
     }
 
     impl LifecycleObserver {
@@ -1791,6 +1944,7 @@ mod tests {
                 observations: observations.into_iter().collect(),
                 observed: Vec::new(),
                 shared_observed: None,
+                before_observe: None,
             }
         }
     }
@@ -1803,6 +1957,9 @@ mod tests {
             txid: zcash_primitives::transaction::TxId,
             expiry_height: Option<u32>,
         ) -> ZeckResult<crate::broadcast::TxObservation> {
+            if let Some(before_observe) = self.before_observe.as_mut() {
+                before_observe();
+            }
             self.observed.push(txid);
             if let Some(shared) = &self.shared_observed {
                 shared.lock().unwrap().push(txid);
@@ -1908,6 +2065,21 @@ mod tests {
             ],
             expiry,
         )
+    }
+
+    fn reorged_with_absent_sources(
+        expiry: Option<u32>,
+        tip: u32,
+        absent_sources: usize,
+    ) -> crate::broadcast::TxObservation {
+        let mut evidence = vec![endpoint("primary", tip, Some(u32::MAX), false)];
+        evidence.extend(
+            ["alpha", "bravo"]
+                .into_iter()
+                .take(absent_sources)
+                .map(|operator| endpoint(operator, tip, None, false)),
+        );
+        crate::broadcast::observe_transaction(evidence, expiry)
     }
 
     fn lifecycle_journal(dir: &Path) -> crate::sprout_sweep_journal::SweepJournal {
@@ -2145,6 +2317,82 @@ mod tests {
         assert_eq!(node.sent, vec![first.raw_tx, second.raw_tx]);
     }
 
+    #[tokio::test]
+    async fn operation_guard_remains_held_through_observe_retry_build_and_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let pending_note = lifecycle_note(1_000_000, 31);
+        let ready_note = lifecycle_note(1_100_000, 32);
+        let pending = fixture_transaction(310, 140);
+        seed_entry(
+            &journal,
+            &pending_note,
+            &pending,
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+
+        let observe_path = dir.path().to_path_buf();
+        let mut observer =
+            LifecycleObserver::new([(pending.txid, absent(pending.expiry_height, 120))]);
+        observer.before_observe = Some(Box::new(move || {
+            assert!(crate::service::NetworkOperationGuard::acquire(
+                &observe_path,
+                crate::ZeckNetwork::Mainnet,
+            )
+            .is_err());
+        }));
+
+        let send_path = dir.path().to_path_buf();
+        let mut node = LifecycleNode::accepted(120, 2);
+        node.before_send = Some(Box::new(move |_| {
+            assert!(crate::service::NetworkOperationGuard::acquire(
+                &send_path,
+                crate::ZeckNetwork::Mainnet,
+            )
+            .is_err());
+        }));
+
+        let build_path = dir.path().to_path_buf();
+        let mut build_count = 0;
+        let outcome = with_sprout_operation_guard(dir.path(), crate::ZeckNetwork::Mainnet, async {
+            Ok(run_sweep(
+                &[pending_note, ready_note],
+                &mut node,
+                &mut observer,
+                crate::ZeckNetwork::Mainnet,
+                |note: &SpendableSproutNote, expiry: BlockHeight, _| {
+                    assert!(crate::service::NetworkOperationGuard::acquire(
+                        &build_path,
+                        crate::ZeckNetwork::Mainnet,
+                    )
+                    .is_err());
+                    build_count += 1;
+                    let tx = fixture_transaction(320, expiry.into());
+                    Ok(BuiltSproutSweep {
+                        txid: tx.txid.to_string(),
+                        raw: tx.raw_tx,
+                        value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                    })
+                },
+                NoteSource::WalletFile,
+                &journal,
+                |_| {},
+            )
+            .await)
+        })
+        .await
+        .unwrap();
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(build_count, 1);
+        assert_eq!(node.sent.len(), 2, "one retry and one new submission");
+        assert!(crate::service::NetworkOperationGuard::acquire(
+            dir.path(),
+            crate::ZeckNetwork::Mainnet,
+        )
+        .is_ok());
+    }
+
     #[test]
     fn absence_at_expiry_height_does_not_release_the_note() {
         let dir = tempfile::tempdir().unwrap();
@@ -2312,6 +2560,67 @@ mod tests {
     }
 
     #[test]
+    fn reorged_mined_transaction_expires_only_from_two_absences_past_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 33);
+        let old = fixture_transaction(330, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &old,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        let observation = reorged_with_absent_sources(old.expiry_height, 141, 2);
+        assert_eq!(
+            observation.state,
+            crate::broadcast::TxObservationState::Reorged
+        );
+        let mut node = LifecycleNode::accepted(150, 1);
+        let mut observer = LifecycleObserver::new([(old.txid, observation)]);
+
+        let (_, builds, raw) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            331,
+        );
+
+        assert_eq!(builds, 1);
+        assert_eq!(node.sent, raw);
+        assert_ne!(node.sent[0], old.raw_tx);
+        let durable = std::fs::read_to_string(journal.path()).unwrap();
+        assert!(durable.contains(&old.txid.to_string()));
+        assert!(durable.contains("\"state\":\"expired\""));
+
+        let one_source_dir = tempfile::tempdir().unwrap();
+        let one_source_journal = lifecycle_journal(one_source_dir.path());
+        seed_entry(
+            &one_source_journal,
+            &note,
+            &old,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        let one_source = reorged_with_absent_sources(old.expiry_height, 141, 1);
+        let mut node = LifecycleNode::accepted(150, 0);
+        let mut observer = LifecycleObserver::new([(old.txid, one_source)]);
+        let (_, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &one_source_journal, 332);
+        assert_eq!(builds, 0);
+        assert!(raw.is_empty() && node.sent.is_empty());
+        assert_eq!(
+            one_source_journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(old.txid)
+                .unwrap()
+                .state,
+            crate::broadcast::TxLifecycleState::Pending
+        );
+    }
+
+    #[test]
     fn stored_mined_entry_is_reobserved_before_fresh_all_mined() {
         let dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(dir.path());
@@ -2343,6 +2652,55 @@ mod tests {
         assert_eq!(builds, 0);
         assert!(raw.is_empty() && node.sent.is_empty());
         assert!(outcome.fresh_all_mined);
+    }
+
+    #[test]
+    fn stored_mined_contested_or_unavailable_is_durably_downgraded() {
+        for (offset, fresh_observation) in
+            [unavailable(Some(140), 150), contested(Some(140), 110, 150)]
+                .into_iter()
+                .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = lifecycle_journal(dir.path());
+            let note = lifecycle_note(1_000_000, 40 + offset as u8);
+            let tx = fixture_transaction(400 + offset as u32, 140);
+            seed_entry(
+                &journal,
+                &note,
+                &tx,
+                crate::broadcast::TxLifecycleState::Mined,
+            );
+            let mut node = LifecycleNode::accepted(150, 0);
+            let mut observer = LifecycleObserver::new([(tx.txid, fresh_observation)]);
+
+            let (outcome, builds, raw) = run_lifecycle(
+                std::slice::from_ref(&note),
+                &mut node,
+                &mut observer,
+                &journal,
+                410 + offset as u32,
+            );
+
+            assert_eq!(builds, 0);
+            assert!(raw.is_empty() && node.sent.is_empty());
+            assert!(!outcome.fresh_all_mined);
+            assert_eq!(outcome.mined_zatoshis, 0);
+            assert_eq!(outcome.pending_zatoshis, note.note.value - SPROUT_SWEEP_FEE);
+            assert_eq!(
+                outcome.transactions[0].state,
+                crate::broadcast::TxLifecycleState::Pending
+            );
+            assert_eq!(
+                journal
+                    .load_or_migrate()
+                    .unwrap()
+                    .entry_for_txid(tx.txid)
+                    .unwrap()
+                    .state,
+                crate::broadcast::TxLifecycleState::Pending
+            );
+        }
     }
 
     #[test]
@@ -2406,6 +2764,61 @@ mod tests {
         let (_, builds, raw) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 141);
         assert_eq!(builds, 1);
         assert_eq!(node.sent, raw);
+    }
+
+    #[test]
+    fn legacy_expiry_bound_uses_the_highest_tip_corroborated_by_a_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 34);
+        let legacy_txid = zcash_primitives::transaction::TxId::from_bytes([0xbc; 32]);
+        let note_txid: String = note
+            .outpoint
+            .txid
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        std::fs::write(
+            journal.path(),
+            format!(
+                "{note_txid}:{}:{} {legacy_txid}\n",
+                note.outpoint.js_index, note.outpoint.output_index
+            ),
+        )
+        .unwrap();
+        let observation = crate::broadcast::observe_transaction(
+            vec![
+                endpoint("alpha", 100, None, false),
+                endpoint("bravo", 100, None, false),
+                endpoint("mallory-high", 4_000_000_000, None, false),
+                endpoint("mallory-low", 1, None, false),
+            ],
+            None,
+        );
+        let mut node = LifecycleNode::accepted(100, 0);
+        let mut observer = LifecycleObserver::new([(legacy_txid, observation)]);
+
+        let (outcome, builds, raw) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            340,
+        );
+
+        assert_eq!(builds, 0);
+        assert!(raw.is_empty() && node.sent.is_empty());
+        assert!(outcome.error.is_some());
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_note(&note.outpoint)
+                .unwrap()
+                .legacy_expiry_bound,
+            Some(140)
+        );
     }
 
     #[test]
