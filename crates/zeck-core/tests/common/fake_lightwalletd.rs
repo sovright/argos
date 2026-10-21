@@ -97,6 +97,8 @@ pub struct FakeLightwalletd {
     pub url: String,
     captured_submissions: Arc<Mutex<Vec<Vec<u8>>>>,
     scripted_transaction_evidence: Arc<Mutex<Option<ScriptedTxEvidence>>>,
+    scripted_address_utxos:
+        Arc<Mutex<Option<Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>>>>,
     /// JoinHandle for the tonic server task; dropping shuts the server down.
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -119,6 +121,18 @@ impl FakeLightwalletd {
             .scripted_transaction_evidence
             .lock()
             .expect("scripted evidence mutex") = Some(evidence);
+    }
+
+    /// Replace the live UTXO view after review without changing the scanned
+    /// balance, so callers can prove they bind outpoints before signing.
+    pub fn set_scripted_address_utxos(
+        &self,
+        utxos: Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>,
+    ) {
+        *self
+            .scripted_address_utxos
+            .lock()
+            .expect("scripted UTXO mutex") = Some(utxos);
     }
 }
 
@@ -213,6 +227,7 @@ pub struct FakeLightwalletdBuilder {
     accept_submissions_for_test: bool,
     reject_submissions_for_test: Option<i32>,
     scripted_transaction_evidence: Option<ScriptedTxEvidence>,
+    scripted_address_utxos: Option<Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>>,
 }
 
 impl Default for FakeLightwalletdBuilder {
@@ -231,6 +246,7 @@ impl Default for FakeLightwalletdBuilder {
             accept_submissions_for_test: false,
             reject_submissions_for_test: None,
             scripted_transaction_evidence: None,
+            scripted_address_utxos: None,
         }
     }
 }
@@ -294,6 +310,15 @@ impl FakeLightwalletdBuilder {
         self
     }
 
+    /// Script the unary transparent UTXO query for a local, node-free scan.
+    pub fn scripted_address_utxos(
+        mut self,
+        utxos: Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>,
+    ) -> Self {
+        self.scripted_address_utxos = Some(utxos);
+        self
+    }
+
     /// Sleep `latency` before each compact block on `GetBlockRange`. Models
     /// a high-RTT link. Composes with `bandwidth_bytes_per_sec`. Drives
     /// R-N13.
@@ -347,6 +372,7 @@ impl FakeLightwalletdBuilder {
         let service = FakeService::new(self).await;
         let captured_submissions = service.captured_submissions.clone();
         let scripted_transaction_evidence = service.scripted_transaction_evidence.clone();
+        let scripted_address_utxos = service.scripted_address_utxos.clone();
         let server = CompactTxStreamerServer::new(service);
 
         let incoming = TcpListenerStream::new(listener);
@@ -361,6 +387,7 @@ impl FakeLightwalletdBuilder {
             url,
             captured_submissions,
             scripted_transaction_evidence,
+            scripted_address_utxos,
             _handle: handle,
         })
     }
@@ -423,6 +450,8 @@ struct FakeService {
     accept_submissions_for_test: bool,
     reject_submissions_for_test: Option<i32>,
     scripted_transaction_evidence: Arc<Mutex<Option<ScriptedTxEvidence>>>,
+    scripted_address_utxos:
+        Arc<Mutex<Option<Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>>>>,
 }
 
 impl FakeService {
@@ -490,6 +519,7 @@ impl FakeService {
             scripted_transaction_evidence: Arc::new(Mutex::new(
                 builder.scripted_transaction_evidence,
             )),
+            scripted_address_utxos: Arc::new(Mutex::new(builder.scripted_address_utxos)),
         }
     }
 
@@ -898,6 +928,21 @@ impl CompactTxStreamer for FakeService {
         &self,
         request: Request<GetAddressUtxosArg>,
     ) -> Result<Response<GetAddressUtxosReplyList>, Status> {
+        if let Some(scripted) = self
+            .scripted_address_utxos
+            .lock()
+            .expect("scripted UTXO mutex")
+            .as_ref()
+        {
+            let addresses = &request.get_ref().addresses;
+            return Ok(Response::new(GetAddressUtxosReplyList {
+                address_utxos: scripted
+                    .iter()
+                    .filter(|utxo| addresses.contains(&utxo.address))
+                    .map(reencode::<_, GetAddressUtxosReply>)
+                    .collect(),
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req = reencode::<_, zcash_client_backend::proto::service::GetAddressUtxosArg>(
             request.get_ref(),

@@ -490,14 +490,14 @@ pub struct ProposedTx {
     pub memo: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedSweepAccount {
     pub account_index: u32,
     pub gross_zatoshis: u64,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SweepProposal {
     pub transactions: Vec<ProposedTx>,
     /// Set when this route can never send a donation, saying why — so a

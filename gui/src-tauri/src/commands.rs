@@ -2183,6 +2183,30 @@ mod tests {
     use argos_core::sprout_recovery::{SpentSproutNote, SproutRecovery};
     use argos_core::ZeckNetwork;
 
+    #[tokio::test]
+    async fn delete_workspace_command_uses_guarded_recovery_service() {
+        use tauri::Manager;
+        let app = tauri::test::mock_builder()
+            .manage(super::AppState {
+                service: argos_core::RecoveryService::new(),
+                address_search: argos_core::address_search::AddressSearchService::default(),
+                reviewed_intent: crate::reviewed_intent::ReviewedIntentStore::default(),
+            })
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let missing = argos_core::ScanHandle::new();
+        let backend = app
+            .state::<super::AppState>()
+            .service
+            .delete_workspace(&missing)
+            .await
+            .unwrap_err();
+        let command = super::delete_workspace(app.state(), missing)
+            .await
+            .unwrap_err();
+        assert_eq!(command, backend.to_string());
+    }
+
     // Orchard-only and Orchard+Sapling mainnet unified addresses. The first
     // is built from a fixed key in `transparent_recovery`'s tests.
     const ORCHARD_ONLY_UA: &str =

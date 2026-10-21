@@ -720,6 +720,7 @@ pub async fn sweep_transparent_only(
         max_fee_zatoshis,
         prior_fee_zatoshis,
         None,
+        None,
     )
     .await
 }
@@ -734,6 +735,7 @@ pub(crate) async fn sweep_transparent_only_reviewed(
     max_fee_zatoshis: Option<u64>,
     prior_fee_zatoshis: u64,
     reviewed_fee_zatoshis: Option<u64>,
+    reviewed_inputs: Option<(&[TransparentUtxo], &TransparentSweepPlan, u32)>,
 ) -> ZeckResult<Option<TransparentSweepOutcome>> {
     use zcash_proofs::prover::LocalTxProver;
     use zcash_protocol::consensus::BlockHeight;
@@ -748,13 +750,19 @@ pub(crate) async fn sweep_transparent_only_reviewed(
 
     let chain_tip = u32::try_from(info.block_height)
         .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
-    let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
-
     let params = crate::workspace::consensus_network(network);
-    let target_height = BlockHeight::from_u32(chain_tip.saturating_add(1));
-
-    let Some(plan) = plan_sweep(&params, target_height, &utxos)? else {
-        return Ok(None);
+    let target_height = execution_target_height(
+        BlockHeight::from_u32(chain_tip.saturating_add(1)),
+        reviewed_inputs.map(|(_, _, height)| BlockHeight::from_u32(height)),
+    );
+    let (utxos, plan) = if let Some((utxos, plan, _)) = reviewed_inputs {
+        (utxos.to_vec(), plan.clone())
+    } else {
+        let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+        let Some(plan) = plan_sweep(&params, target_height, &utxos)? else {
+            return Ok(None);
+        };
+        (utxos, plan)
     };
 
     if let Some(reviewed) = reviewed_fee_zatoshis {
@@ -807,6 +815,16 @@ pub(crate) async fn sweep_transparent_only_reviewed(
         )
         .await?,
     ))
+}
+
+fn execution_target_height(
+    current: zcash_protocol::consensus::BlockHeight,
+    reviewed: Option<zcash_protocol::consensus::BlockHeight>,
+) -> zcash_protocol::consensus::BlockHeight {
+    // The caller validated this concrete target with the reviewed UTXOs and
+    // version. A newer lightwalletd tip must not alter the signed transaction
+    // after the final quote comparison.
+    reviewed.unwrap_or(current)
 }
 
 async fn submit_transparent_prepared<S: BroadcastStore, N: TxSubmitter>(
@@ -965,6 +983,23 @@ mod sweep_tests {
     use super::*;
     use crate::TxLifecycleState;
     use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK};
+
+    #[test]
+    fn reviewed_direct_build_keeps_validated_height_across_version_boundary() {
+        use zcash_primitives::transaction::TxVersion;
+        use zcash_protocol::consensus::{BranchId, NetworkUpgrade, Parameters as _};
+
+        let activation = MAIN_NETWORK.activation_height(NetworkUpgrade::Nu5).unwrap();
+        let reviewed = BlockHeight::from_u32(u32::from(activation) - 1);
+        let later = activation;
+        let selected = execution_target_height(later, Some(reviewed));
+        assert_eq!(selected, reviewed);
+        assert_eq!(execution_target_height(later, None), later);
+        assert_ne!(
+            TxVersion::suggested_for_branch(BranchId::for_height(&MAIN_NETWORK, selected)),
+            TxVersion::suggested_for_branch(BranchId::for_height(&MAIN_NETWORK, later)),
+        );
+    }
 
     #[tokio::test]
     async fn transparent_record_keeps_txid_fee_and_warning_when_final_sync_fails() {

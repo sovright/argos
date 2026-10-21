@@ -52,6 +52,20 @@ use crate::{
     models::{TxBroadcastResult, TxLifecycleState},
 };
 
+/// Builder inputs supplied by the service's validated post-sync plan.
+#[derive(Clone, Default)]
+pub(crate) struct ImportedExecutionPlan {
+    pub sapling: std::collections::HashMap<
+        AccountUuid,
+        zcash_client_backend::proposal::Proposal<StandardFeeRule, ReceivedNoteId>,
+    >,
+    pub transparent: Option<(
+        Vec<crate::transparent_recovery::TransparentUtxo>,
+        crate::transparent_recovery::TransparentSweepPlan,
+        u32,
+    )>,
+}
+
 /// Errors from the proof-generation-key step.
 ///
 /// `sign_sapling_with` requires the closure's error to absorb its own parse
@@ -168,6 +182,7 @@ where
         max_fee_zatoshis,
         prior_fee_zatoshis,
         None,
+        None,
     )
 }
 
@@ -182,6 +197,9 @@ fn build_imported_sapling_sweep_reviewed<P>(
     max_fee_zatoshis: Option<u64>,
     prior_fee_zatoshis: u64,
     reviewed_fee_zatoshis: Option<u64>,
+    planned_proposal: Option<
+        &zcash_client_backend::proposal::Proposal<StandardFeeRule, ReceivedNoteId>,
+    >,
 ) -> ZeckResult<Transaction>
 where
     P: zcash_protocol::consensus::Parameters + Clone,
@@ -194,7 +212,11 @@ where
     // keys come from the same parameters that produced them rather than
     // being passed in alongside and risking a mismatch.
     let (spend_vk, output_vk) = prover.verifying_keys();
-    let proposal = propose_imported_sapling_sweep(wallet_db, params, account_id, destination)?;
+    let proposal = if let Some(planned) = planned_proposal {
+        planned.clone()
+    } else {
+        propose_imported_sapling_sweep(wallet_db, params, account_id, destination)?
+    };
 
     // First gate, before proving parameters are put to work.
     let planned_fee_zatoshis = crate::service::proposal_fee_zatoshis(&proposal)?;
@@ -562,6 +584,7 @@ struct RealSaplingAccountRunner<'a> {
     prover: &'a LocalTxProver,
     max_fee_zatoshis: Option<u64>,
     reviewed_sapling_fees: Option<&'a std::collections::HashMap<AccountUuid, u64>>,
+    planned: Option<&'a ImportedExecutionPlan>,
     broadcast_log: &'a mut DurableBroadcastLog,
 }
 
@@ -575,6 +598,12 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
         let Some(extsk) = account.sapling_extsk.as_ref() else {
             return Ok(None);
         };
+        if self
+            .planned
+            .is_some_and(|plan| !plan.sapling.contains_key(&account.wallet_account_id))
+        {
+            return Ok(None);
+        }
         let built = {
             let mut wallet_db =
                 crate::workspace::open_wallet_db(self.workspace.wallet_db_path(), self.params)?;
@@ -589,6 +618,11 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
                 prior_fee_zatoshis,
                 self.reviewed_sapling_fees
                     .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0)),
+                if let Some(plan) = self.planned {
+                    plan.sapling.get(&account.wallet_account_id)
+                } else {
+                    None
+                },
             )
         };
         let tx = match built {
@@ -668,7 +702,16 @@ pub async fn sweep_imported_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
-    sweep_imported_wallet_reviewed(runtime, keys, destination, max_fee_zatoshis, None, None).await
+    sweep_imported_wallet_reviewed(
+        runtime,
+        keys,
+        destination,
+        max_fee_zatoshis,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn sweep_imported_wallet_reviewed(
@@ -678,6 +721,7 @@ pub(crate) async fn sweep_imported_wallet_reviewed(
     max_fee_zatoshis: Option<u64>,
     reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
     reviewed_transparent_fee: Option<u64>,
+    planned: Option<&ImportedExecutionPlan>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome::default();
     let result = sweep_imported_wallet_into(
@@ -686,8 +730,8 @@ pub(crate) async fn sweep_imported_wallet_reviewed(
         destination,
         max_fee_zatoshis,
         &mut outcome,
-        reviewed_sapling_fees,
-        reviewed_transparent_fee,
+        (reviewed_sapling_fees, reviewed_transparent_fee),
+        planned,
     )
     .await;
     (outcome, result)
@@ -715,6 +759,7 @@ pub async fn sweep_imported_filtered_wallet(
         max_fee_zatoshis,
         None,
         None,
+        None,
     )
     .await
 }
@@ -730,6 +775,7 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
     max_fee_zatoshis: Option<u64>,
     reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
     reviewed_transparent_fee: Option<u64>,
+    planned: Option<&ImportedExecutionPlan>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome {
         sapling_empty_display_index: sapling_accounts.first().map(|account| account.0),
@@ -746,10 +792,12 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
             Some(sapling_accounts),
             &mut log,
             reviewed_sapling_fees,
+            planned,
         )
         .await?;
         outcome.sapling_leg_completed = true;
-        if may_start_transparent_leg(&outcome) && !transparent_indices.is_empty() {
+        if may_start_transparent_leg(&outcome) && !transparent_indices.is_empty() &&
+            planned.is_none_or(|plan| plan.transparent.is_some()) {
             let all_keys = crate::imported::imported_transparent_keys(keys)?;
             let selected = transparent_indices
                 .iter()
@@ -775,6 +823,7 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
                 max_fee_zatoshis,
                 crate::service::at_risk_fee_total(&outcome.transactions)?,
                 reviewed_transparent_fee,
+                planned.and_then(|plan| plan.transparent.as_ref().map(|(utxos, cost, height)| (utxos.as_slice(), cost, *height))),
             )
             .await?
             {
@@ -816,10 +865,14 @@ async fn sweep_imported_wallet_into(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
     outcome: &mut ImportedSweepOutcome,
-    reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
-    reviewed_transparent_fee: Option<u64>,
+    reviewed_fees: (
+        Option<&std::collections::HashMap<AccountUuid, u64>>,
+        Option<u64>,
+    ),
+    planned: Option<&ImportedExecutionPlan>,
 ) -> ZeckResult<()> {
     use crate::imported::imported_transparent_keys;
+    let (reviewed_sapling_fees, reviewed_transparent_fee) = reviewed_fees;
     let mut log = open_imported_broadcast_log(runtime)?;
 
     // Sapling first. A definite failure may leave the independent transparent
@@ -833,6 +886,7 @@ async fn sweep_imported_wallet_into(
         None,
         &mut log,
         reviewed_sapling_fees,
+        planned,
     )
     .await;
     outcome.sapling_leg_completed = sapling_result.is_ok();
@@ -840,7 +894,7 @@ async fn sweep_imported_wallet_into(
     // Transparent, through the path that needs no account at all.
     let transparent_result = run_transparent_followup(may_start_transparent_leg(outcome), || async {
         let transparent = imported_transparent_keys(keys)?;
-        if !transparent.is_empty() {
+        if !transparent.is_empty() && planned.is_none_or(|plan| plan.transparent.is_some()) {
             if let Some(swept) = crate::transparent_recovery::sweep_transparent_only_reviewed(
                 &mut log,
                 &transparent,
@@ -850,6 +904,7 @@ async fn sweep_imported_wallet_into(
                 max_fee_zatoshis,
                 crate::service::at_risk_fee_total(&outcome.transactions)?,
                 reviewed_transparent_fee,
+                planned.and_then(|plan| plan.transparent.as_ref().map(|(utxos, cost, height)| (utxos.as_slice(), cost, *height))),
             )
             .await?
             {
@@ -904,6 +959,7 @@ async fn sweep_imported_sapling_leg(
     registered_accounts: Option<&[(u32, AccountUuid, usize)]>,
     broadcast_log: &mut DurableBroadcastLog,
     reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
+    planned: Option<&ImportedExecutionPlan>,
 ) -> ZeckResult<()> {
     use crate::imported::register_imported_accounts;
     use crate::workspace::{consensus_network, open_wallet_db, RecoveryWorkspace};
@@ -1007,6 +1063,7 @@ async fn sweep_imported_sapling_leg(
         prover: &prover,
         max_fee_zatoshis,
         reviewed_sapling_fees,
+        planned,
         broadcast_log,
     };
     run_sapling_accounts(&accounts, outcome, &mut runner).await

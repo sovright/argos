@@ -28,6 +28,36 @@ pub use crate::models::TxLifecycleState;
 pub const BROADCAST_LOG_SCHEMA_VERSION: u32 = 1;
 pub const BROADCAST_LOG_FILE_NAME: &str = "broadcasts-v1.jsonl";
 
+/// The lock lives beside the workspace, so renaming or deleting that
+/// workspace cannot unlink the lock inode while a submitter holds it.
+fn broadcast_lock_path(path: &Path) -> ZeckResult<PathBuf> {
+    let workspace = path.parent().ok_or_else(|| {
+        ZeckError::Storage(format!("broadcast log {} has no workspace", path.display()))
+    })?;
+    let parent = workspace.parent().ok_or_else(|| {
+        ZeckError::Storage(format!("workspace {} has no parent", workspace.display()))
+    })?;
+    let name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ZeckError::Storage(format!(
+                "workspace {} has no valid name",
+                workspace.display()
+            ))
+        })?;
+    let log_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ZeckError::Storage(format!(
+                "broadcast log {} has no valid name",
+                path.display()
+            ))
+        })?;
+    Ok(parent.join(format!("{name}.{log_name}.lock.sqlite")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TxObservationState {
@@ -457,13 +487,11 @@ where
         Ok(Err(_)) | Err(_) => SubmissionDisposition::AmbiguousTransport,
     };
     let state = match disposition {
-        SubmissionDisposition::Accepted | SubmissionDisposition::RetryableRejection { .. } => {
-            TxLifecycleState::Pending
-        }
+        SubmissionDisposition::Accepted => TxLifecycleState::Pending,
         SubmissionDisposition::DeterministicRejection { .. } => TxLifecycleState::Rejected,
-        SubmissionDisposition::AmbiguousTransport | SubmissionDisposition::AlreadyKnown => {
-            TxLifecycleState::SubmissionUnknown
-        }
+        SubmissionDisposition::AmbiguousTransport
+        | SubmissionDisposition::AlreadyKnown
+        | SubmissionDisposition::RetryableRejection { .. } => TxLifecycleState::SubmissionUnknown,
     };
     let persistence_warning = store
         .transition(tx.txid, state, Some(&disposition), None)
@@ -511,28 +539,38 @@ pub struct DurableBroadcastLog {
 }
 
 impl DurableBroadcastLog {
-    /// A prior ambiguous or retryable submission must be reconciled before a
-    /// fresh sweep can construct or submit another transaction.
+    /// Any unresolved submission must be reconciled before a fresh sweep can
+    /// construct or submit another transaction.
     pub fn blocking_submission(&self) -> Option<TxId> {
         self.latest.iter().find_map(|(txid, persisted)| {
             (persisted.state == TxLifecycleState::SubmissionUnknown
-                || (persisted.state == TxLifecycleState::Pending
-                    && matches!(
-                        persisted.last_submission,
-                        Some(SubmissionDisposition::RetryableRejection { .. })
-                    )))
-            .then_some(*txid)
+                || persisted.state == TxLifecycleState::Pending)
+                .then_some(*txid)
+        })
+    }
+
+    pub fn has_unresolved_history(&self) -> bool {
+        self.blocking_submission().is_some()
+            || self
+                .latest
+                .values()
+                .any(|record| record.state == TxLifecycleState::NotSubmitted)
+    }
+
+    pub fn contains_mined_txid(&self, txid: &str) -> bool {
+        self.latest.values().any(|record| {
+            record.state == TxLifecycleState::Mined
+                && record.prepared.txid.to_string() == txid
+                && record
+                    .observation
+                    .as_ref()
+                    .is_some_and(TxObservation::has_canonical_mined_evidence)
         })
     }
 
     pub fn open(path: impl AsRef<Path>) -> ZeckResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let lock_path = path.with_file_name(format!(
-            "{}.lock.sqlite",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("broadcast")
-        ));
+        let lock_path = broadcast_lock_path(&path)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -632,7 +670,7 @@ impl DurableBroadcastLog {
                     path.display()
                 ))
             })?;
-            self.apply_event(event)?;
+            self.apply_event(event, true)?;
         }
         Ok(())
     }
@@ -644,6 +682,7 @@ impl DurableBroadcastLog {
                 self.path.display()
             )));
         }
+        self.validate_new_event(&event)?;
         let bytes = serde_json::to_vec(&event).map_err(|err| {
             ZeckError::Serialization(format!("serializing broadcast log event: {err}"))
         })?;
@@ -651,10 +690,67 @@ impl DurableBroadcastLog {
             self.write_failed = true;
             return Err(err);
         }
-        self.apply_event(event)
+        let applied = self.apply_event(event, false);
+        if applied.is_err() {
+            self.write_failed = true;
+        }
+        applied
     }
 
-    fn apply_event(&mut self, event: BroadcastLogEvent) -> ZeckResult<()> {
+    fn validate_new_event(&self, event: &BroadcastLogEvent) -> ZeckResult<()> {
+        match event {
+            BroadcastLogEvent::Prepared {
+                txid,
+                raw_tx,
+                fee_zatoshis,
+                expiry_height,
+                ..
+            } => {
+                let txid = TxId::from_bytes(*txid);
+                let prepared = PreparedTransaction {
+                    txid,
+                    raw_tx: STANDARD.decode(raw_tx).map_err(|err| {
+                        ZeckError::Storage(format!("invalid base64 transaction for {txid}: {err}"))
+                    })?,
+                    fee_zatoshis: *fee_zatoshis,
+                    expiry_height: *expiry_height,
+                };
+                if self
+                    .latest
+                    .get(&txid)
+                    .is_some_and(|existing| existing.prepared != prepared)
+                {
+                    return Err(ZeckError::Storage(format!(
+                        "conflicting prepared transaction for {txid}"
+                    )));
+                }
+                Ok(())
+            }
+            BroadcastLogEvent::StateChanged {
+                txid,
+                state,
+                submission,
+                observation,
+                ..
+            } => {
+                let txid = TxId::from_bytes(*txid);
+                let existing = self.latest.get(&txid).ok_or_else(|| {
+                    ZeckError::Storage(format!(
+                        "state transition without prepared transaction for {txid}"
+                    ))
+                })?;
+                validate_transition(
+                    existing,
+                    *state,
+                    submission.as_ref(),
+                    observation.as_ref(),
+                    false,
+                )
+            }
+        }
+    }
+
+    fn apply_event(&mut self, event: BroadcastLogEvent, legacy_replay: bool) -> ZeckResult<()> {
         match event {
             BroadcastLogEvent::Prepared {
                 txid,
@@ -705,7 +801,13 @@ impl DurableBroadcastLog {
                         "state transition without prepared transaction for {txid}"
                     ))
                 })?;
-                validate_transition(existing, state, submission.as_ref(), observation.as_ref())?;
+                validate_transition(
+                    existing,
+                    state,
+                    submission.as_ref(),
+                    observation.as_ref(),
+                    legacy_replay,
+                )?;
                 let existing = self.latest.get_mut(&txid).expect("checked above");
                 existing.state = state;
                 if let Some(submission) = submission {
@@ -725,6 +827,7 @@ fn validate_transition(
     state: TxLifecycleState,
     submission: Option<&SubmissionDisposition>,
     observation: Option<&TxObservation>,
+    legacy_replay: bool,
 ) -> ZeckResult<()> {
     let supported = match state {
         TxLifecycleState::NotSubmitted => {
@@ -743,29 +846,59 @@ fn validate_transition(
                     submission,
                     None | Some(SubmissionDisposition::AmbiguousTransport)
                         | Some(SubmissionDisposition::AlreadyKnown)
+                        | Some(SubmissionDisposition::RetryableRejection { .. })
                 )
         }
         TxLifecycleState::Pending => {
             let effective_observation = observation.or(existing.observation.as_ref());
-            let effective_submission = submission.or(existing.last_submission.as_ref());
-            let non_final_observation = matches!(
-                effective_observation.map(|item| &item.state),
-                Some(
-                    TxObservationState::PresentUnmined
-                        | TxObservationState::Absent
-                        | TxObservationState::Reorged
-                        | TxObservationState::Contested
-                        | TxObservationState::Unavailable
-                )
-            );
-            let accepted_or_retryable = matches!(
-                effective_submission,
-                Some(
-                    SubmissionDisposition::Accepted
-                        | SubmissionDisposition::RetryableRejection { .. }
-                )
-            );
-            (non_final_observation || accepted_or_retryable)
+            let positive_presence = effective_observation.is_some_and(|item| {
+                item.state == TxObservationState::PresentUnmined
+                    && observe_transaction(item.evidence.clone(), item.expiry_height).state
+                        == TxObservationState::PresentUnmined
+                    && item.evidence.iter().any(|source| {
+                        source.reported_height == Some(0)
+                            && normalized_confirmation_authority(&source.endpoint).is_some()
+                    })
+            });
+            let already_pending_nonfinal = existing.state == TxLifecycleState::Pending
+                && matches!(
+                    effective_observation.map(|item| &item.state),
+                    None | Some(
+                        TxObservationState::PresentUnmined
+                            | TxObservationState::Absent
+                            | TxObservationState::Reorged
+                            | TxObservationState::Contested
+                            | TxObservationState::Unavailable
+                    )
+                );
+            let mined_reorg = existing.state == TxLifecycleState::Mined
+                && matches!(
+                    observation.map(|item| &item.state),
+                    Some(
+                        TxObservationState::Reorged
+                            | TxObservationState::Contested
+                            | TxObservationState::Absent
+                    )
+                );
+            // An earlier acceptance cannot resolve a later Unknown recorded
+            // before an exact-byte resend whose outcome has not arrived.
+            let accepted = matches!(submission, Some(SubmissionDisposition::Accepted));
+            let legacy_nonfinal = legacy_replay
+                && matches!(
+                    effective_observation.map(|item| &item.state),
+                    Some(
+                        TxObservationState::PresentUnmined
+                            | TxObservationState::Absent
+                            | TxObservationState::Reorged
+                            | TxObservationState::Contested
+                            | TxObservationState::Unavailable
+                    )
+                );
+            (positive_presence
+                || accepted
+                || already_pending_nonfinal
+                || mined_reorg
+                || legacy_nonfinal)
                 && !effective_observation.is_some_and(|item| {
                     item.expiry_height == existing.prepared.expiry_height && item.is_expired()
                 })
@@ -887,7 +1020,7 @@ impl BroadcastStore for DurableBroadcastLog {
                 "state transition without prepared transaction for {txid}"
             ))
         })?;
-        validate_transition(existing, state, submission, observation)?;
+        validate_transition(existing, state, submission, observation, false)?;
         self.append_event(BroadcastLogEvent::StateChanged {
             schema_version: BROADCAST_LOG_SCHEMA_VERSION,
             txid: txid.into(),
@@ -959,6 +1092,213 @@ mod tests {
         drop(log);
         let reopened = DurableBroadcastLog::open(&path).unwrap();
         assert_eq!(reopened.blocking_submission(), Some(tx.txid));
+    }
+
+    #[test]
+    fn accepted_pending_reopen_blocks_a_new_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        log.transition(
+            tx.txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+        drop(log);
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(reopened.blocking_submission(), Some(tx.txid));
+        assert_eq!(reopened.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
+    }
+
+    #[test]
+    fn no_presence_evidence_cannot_clear_unknown_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        for state in [
+            TxObservationState::Absent,
+            TxObservationState::Unavailable,
+            TxObservationState::Contested,
+        ] {
+            let observation = TxObservation {
+                state,
+                mined_height: None,
+                expiry_height: tx.expiry_height,
+                primary_tip: Some(1),
+                secondary_tip: Some(1),
+                evidence: vec![],
+            };
+            assert!(log
+                .transition(tx.txid, TxLifecycleState::Pending, None, Some(&observation))
+                .is_err());
+            assert_eq!(
+                log.latest(tx.txid).unwrap().state,
+                TxLifecycleState::SubmissionUnknown
+            );
+        }
+        drop(log);
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .blocking_submission(),
+            Some(tx.txid)
+        );
+    }
+
+    #[test]
+    fn prior_acceptance_does_not_clear_a_later_unknown_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(
+            tx.txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        let absent = TxObservation {
+            state: TxObservationState::Absent,
+            mined_height: None,
+            expiry_height: tx.expiry_height,
+            primary_tip: Some(1),
+            secondary_tip: Some(1),
+            evidence: vec![],
+        };
+        assert!(log
+            .transition(tx.txid, TxLifecycleState::Pending, None, Some(&absent))
+            .is_err());
+        assert_eq!(
+            log.latest(tx.txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[test]
+    fn legacy_unknown_to_absent_pending_log_reopens_and_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        drop(log);
+        let event = BroadcastLogEvent::StateChanged {
+            schema_version: BROADCAST_LOG_SCHEMA_VERSION,
+            txid: tx.txid.into(),
+            state: TxLifecycleState::Pending,
+            submission: None,
+            observation: Some(TxObservation {
+                state: TxObservationState::Absent,
+                mined_height: None,
+                expiry_height: tx.expiry_height,
+                primary_tip: Some(1),
+                secondary_tip: Some(1),
+                evidence: vec![],
+            }),
+        };
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+        drop(file);
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(
+            reopened.latest(tx.txid).unwrap().state,
+            TxLifecycleState::Pending
+        );
+        assert_eq!(reopened.blocking_submission(), Some(tx.txid));
+    }
+
+    #[test]
+    fn invalid_new_state_event_does_not_poison_durable_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let invalid = BroadcastLogEvent::StateChanged {
+            schema_version: BROADCAST_LOG_SCHEMA_VERSION,
+            txid: tx.txid.into(),
+            state: TxLifecycleState::Pending,
+            submission: None,
+            observation: Some(TxObservation {
+                state: TxObservationState::Unavailable,
+                mined_height: None,
+                expiry_height: tx.expiry_height,
+                primary_tip: None,
+                secondary_tip: None,
+                evidence: vec![],
+            }),
+        };
+        assert!(log.append_event(invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(log);
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .blocking_submission(),
+            Some(tx.txid)
+        );
+    }
+
+    #[test]
+    fn positive_unmined_presence_can_reconcile_unknown_without_mining_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        let forged = TxObservation {
+            state: TxObservationState::PresentUnmined,
+            mined_height: None,
+            expiry_height: tx.expiry_height,
+            primary_tip: Some(99),
+            secondary_tip: None,
+            evidence: vec![],
+        };
+        assert!(log
+            .transition(tx.txid, TxLifecycleState::Pending, None, Some(&forged))
+            .is_err());
+        let witnessed = observe_transaction(
+            vec![EndpointTxEvidence {
+                operator_id: "one".to_owned(),
+                endpoint: "https://one.example".to_owned(),
+                tip_height: Some(99),
+                reported_height: Some(0),
+                block_hash: None,
+                tx_in_block: false,
+            }],
+            tx.expiry_height,
+        );
+        assert_eq!(witnessed.state, TxObservationState::PresentUnmined);
+        log.transition(tx.txid, TxLifecycleState::Pending, None, Some(&witnessed))
+            .unwrap();
+        drop(log);
+        let reopened = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(reopened.blocking_submission(), Some(tx.txid));
+        assert_eq!(
+            reopened.latest(tx.txid).unwrap().state,
+            TxLifecycleState::Pending
+        );
     }
 
     #[derive(Default, Clone)]
@@ -1180,7 +1520,7 @@ mod tests {
         assert_eq!(result.disposition, SubmissionDisposition::AlreadyKnown);
     }
     #[tokio::test]
-    async fn retryable_policy_rejection_remains_pending() {
+    async fn retryable_policy_rejection_remains_unknown_and_exact_byte_eligible() {
         let mut store = RecordingStore::default();
         let tx = fixture();
         let mut node = network(&store, Script::Response(-26, "mempool full"));
@@ -1188,7 +1528,11 @@ mod tests {
             submit_prepared_transaction(&mut store, &mut node, tx, Duration::from_secs(30))
                 .await
                 .unwrap();
-        assert_eq!(result.state, TxLifecycleState::Pending);
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(
+            store.latest(result.txid).unwrap().prepared.raw_tx,
+            fixture().raw_tx
+        );
         assert!(matches!(
             result.disposition,
             SubmissionDisposition::RetryableRejection { .. }
@@ -1410,7 +1754,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let lock_path = dir.path().join("broadcasts-v1.jsonl.lock.sqlite");
+            let lock_path = broadcast_lock_path(&path).unwrap();
             assert_eq!(
                 fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -1418,6 +1762,21 @@ mod tests {
         }
         assert!(DurableBroadcastLog::open(&path).is_err());
         drop(first);
+        assert!(DurableBroadcastLog::open(&path).is_ok());
+    }
+
+    #[test]
+    fn lock_survives_workspace_rename_and_recreation() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let path = workspace.join(BROADCAST_LOG_FILE_NAME);
+        let held = DurableBroadcastLog::open(&path).unwrap();
+        let tombstone = parent.path().join("workspace-deleting");
+        fs::rename(&workspace, &tombstone).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        assert!(DurableBroadcastLog::open(&path).is_err());
+        drop(held);
         assert!(DurableBroadcastLog::open(&path).is_ok());
     }
 

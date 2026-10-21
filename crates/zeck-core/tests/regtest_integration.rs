@@ -82,6 +82,112 @@ use secrecy::SecretString;
 /// watchdog accounts for in-flight batch progress.
 const LATENCY_WINDOW_BLOCKS: u64 = 100;
 
+#[tokio::test]
+async fn local_public_transparent_review_binds_live_outpoint_before_submission() {
+    use argos_core::key_source::ImportedKeySource;
+    use argos_core::{
+        argos_wallet_import::keys::{Provenance, TransparentKey},
+        derive_accounts,
+    };
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use secrecy::Secret;
+    use std::sync::Arc;
+    use zcash_client_backend::proto::service::GetAddressUtxosReply;
+
+    let key = common::standalone_transparent::standalone_transparent_key();
+    let address =
+        argos_core::imported::encode_transparent_address(&key.address, ZeckNetwork::Testnet);
+    let mut utxo = GetAddressUtxosReply {
+        address,
+        txid: vec![0x51; 32],
+        index: 0,
+        script: Vec::new(),
+        value_zat: 250_000,
+        height: 3_500_000,
+    };
+    let fake = FakeLightwalletd::builder()
+        .chain_name("test")
+        .sapling_activation_height(280_000)
+        .block_height(3_500_000)
+        .scripted_address_utxos(vec![utxo.clone()])
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+    keys.transparent.push(TransparentKey {
+        secret: Secret::new(common::standalone_transparent::STANDALONE_TRANSPARENT_SECRET),
+        provenance: Provenance::Standalone,
+    });
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: 1_000_000,
+                num_accounts: None,
+                gap_limit: 20,
+                transparent_scan: None,
+                lightwalletd_url: fake.url.clone(),
+                confirmation_sources: Vec::new(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "local direct quote binding".to_owned(),
+            },
+            Arc::new(ImportedKeySource::new(keys)),
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            if progress.phase.is_terminal() {
+                break progress;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(progress.phase, ScanPhase::Complete, "{:?}", progress.error);
+    assert_eq!(progress.accounts[0].transparent_zatoshis, 250_000);
+
+    let destination = derive_accounts(&SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned()), ZeckNetwork::Testnet, 1).unwrap()[0].unified_address.clone();
+    let reviewed = service
+        .propose_sweep(
+            &handle,
+            SweepRequest {
+                destination,
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                reviewed_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reviewed.proposal.transactions.len(), 1);
+    let quoted = &reviewed.proposal.transactions[0];
+    let fee =
+        argos_core::transparent_recovery::transparent_sweep_fee(ZeckNetwork::Testnet, 1).unwrap();
+    assert_eq!(quoted.gross_zatoshis, 250_000);
+    assert_eq!(quoted.fee_zatoshis, fee);
+    assert_eq!(quoted.net_zatoshis, 250_000 - fee);
+
+    utxo.txid = vec![0x52; 32];
+    fake.set_scripted_address_utxos(vec![utxo]);
+    let error = service
+        .execute_sweep(&handle, &reviewed.proposal_id)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("selected sweep inputs changed"),
+        "{error}"
+    );
+    assert!(fake.captured_submissions().lock().unwrap().is_empty());
+}
+
 // This local RPC test runs without the external regtest node. A missing
 // capture or a response dropped before upstream acceptance breaks it.
 #[tokio::test]
