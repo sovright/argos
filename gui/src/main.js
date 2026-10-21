@@ -3131,8 +3131,10 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("sapling-scan-keys").value = "";
   $("sapling-key-addresses").replaceChildren();
   $("sprout-scan-keys").value = "";
+  $("sprout-scan-destination").value = "";
   $("sprout-scan-peers").value = "";
   $("sprout-scan-addresses").replaceChildren();
+  $("sprout-destination").value = "";
   seedVisibility.checked = false;
   seedInput.classList.add("masked");
   seedNextBtn.disabled = true;

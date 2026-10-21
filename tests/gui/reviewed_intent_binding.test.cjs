@@ -751,6 +751,24 @@ test("start over still drops the loaded wallet", () => {
   assert.equal(h.$("sweep-skipped").innerHTML, "");
 });
 
+test("start over clears the wallet Sprout sweep destination", () => {
+  const h = flowHarness();
+  h.$("sprout-destination").value = "zs-old-wallet-destination";
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, "function resetRecoveryFlowState(", "// ─── Donate");
+  h.$("restart-flow").fire("click");
+  assert.equal(h.$("sprout-destination").value, "");
+});
+
+test("start over clears the scanned Sprout sweep destination", () => {
+  const h = flowHarness();
+  h.$("sprout-scan-destination").value = "zs-old-scan-destination";
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, "function resetRecoveryFlowState(", "// ─── Donate");
+  h.$("restart-flow").fire("click");
+  assert.equal(h.$("sprout-scan-destination").value, "");
+});
+
 test("start over restores every scan source setting to its documented default", () => {
   const h = flowHarness();
   h.context.defaultScanLabel = () => "today's scan";
