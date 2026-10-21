@@ -5,13 +5,75 @@
 //! `get()` and every length is bounds-checked before it is used to size
 //! an allocation.
 
-use crate::error::ImportError;
+use crate::error::{ImportDiagnostic, ImportError};
 
 const BDB_BTREE_MAGIC: u32 = 0x0005_3162;
 
 /// A raw key/value record as stored in the Berkeley DB btree.
 /// Uninterpreted here — `bdb.rs` has no Zcash knowledge.
 pub type RawRecord = (Vec<u8>, Vec<u8>);
+
+#[derive(Default)]
+pub struct BdbWalk {
+    pub records: Vec<RawRecord>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+// Raw records may contain spending authority.
+impl std::fmt::Debug for BdbWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BdbWalk")
+            .field("record_count", &self.records.len())
+            .field("diagnostic_count", &self.diagnostics.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WalkLimits {
+    max_records: usize,
+    max_pages: usize,
+    max_value_len: usize,
+}
+
+const MAX_DIAGNOSTICS: usize = 1_000;
+
+#[derive(Default)]
+struct DamageLog {
+    diagnostics: Vec<ImportDiagnostic>,
+    suppressed: usize,
+    suppressed_location: Option<String>,
+}
+
+impl DamageLog {
+    fn push(&mut self, location: String, reason: &'static str) {
+        if self.diagnostics.len() < MAX_DIAGNOSTICS - 1 {
+            self.diagnostics.push(ImportDiagnostic::ContainerDamage {
+                format: "Berkeley DB",
+                location,
+                reason: reason.to_owned(),
+            });
+        } else {
+            if self.suppressed_location.is_none() {
+                self.suppressed_location = Some(location);
+            }
+            self.suppressed = self.suppressed.saturating_add(1);
+        }
+    }
+
+    fn finish(mut self) -> Vec<ImportDiagnostic> {
+        if self.suppressed > 0 {
+            self.diagnostics.push(ImportDiagnostic::ContainerDamage {
+                format: "Berkeley DB",
+                location: self
+                    .suppressed_location
+                    .unwrap_or_else(|| "page 0".to_owned()),
+                reason: format!("suppressed {} further damage reports", self.suppressed),
+            });
+        }
+        self.diagnostics
+    }
+}
 
 pub(crate) const MIN_PAGE_SIZE: u32 = 512;
 pub(crate) const MAX_PAGE_SIZE: u32 = 65_536;
@@ -199,9 +261,11 @@ fn read_overflow(
     first_page: u32,
     total_len: u32,
     visited: &mut BTreeSet<u32>,
+    budget: &mut usize,
+    max_value_len: usize,
 ) -> Result<Vec<u8>, ImportError> {
     let total_len = total_len as usize;
-    if total_len > MAX_VALUE_LEN {
+    if total_len > max_value_len {
         return Err(unwalkable(format!(
             "overflow value of {total_len} bytes is implausible"
         )));
@@ -227,13 +291,26 @@ fn read_overflow(
     let mut page = first_page;
 
     while page != 0 && out.len() < total_len {
+        if page > meta.last_page {
+            return Err(unwalkable("overflow page is beyond last page"));
+        }
+        if *budget == 0 {
+            return Err(unwalkable("page visit limit exceeded"));
+        }
+        *budget -= 1;
         if !visited.insert(page) {
             return Err(unwalkable(format!("overflow chain revisits page {page}")));
         }
         let p = page_slice(bytes, page, meta.page_size)?;
+        if p.get(OFF_PAGE_TYPE) != Some(&PAGE_TYPE_OVERFLOW) {
+            return Err(unwalkable("unexpected overflow page type"));
+        }
         let next = read_u32(p, 16, meta.swapped)?;
         let this_len = read_u16(p, OFF_OVERFLOW_LEN, meta.swapped)? as usize;
 
+        if this_len == 0 || this_len > p.len().saturating_sub(SIZEOF_PAGE) {
+            return Err(unwalkable("invalid overflow payload length"));
+        }
         let want = this_len.min(total_len - out.len());
         let data = p
             .get(SIZEOF_PAGE..SIZEOF_PAGE + want)
@@ -242,6 +319,9 @@ fn read_overflow(
         page = next;
     }
 
+    if out.len() != total_len {
+        return Err(unwalkable("overflow chain ended early"));
+    }
     Ok(out)
 }
 
@@ -277,7 +357,7 @@ fn resolve_subdb_root(bytes: &[u8], meta: &BdbMeta, value: &[u8]) -> Option<u32>
         let Ok(root) = read_u32(page_bytes, 88, meta.swapped) else {
             continue;
         };
-        if root <= meta.last_page {
+        if root != 0 && root <= meta.last_page {
             return Some(root);
         }
     }
@@ -293,134 +373,214 @@ fn resolve_subdb_root(bytes: &[u8], meta: &BdbMeta, value: &[u8]) -> Option<u32>
 /// [`walk`]) so that one sub-tree's traversal can never cause another's to
 /// be silently skipped; `budget` is shared across every invocation in a
 /// single `walk` call and bounds total work across all of them.
-fn walk_from(
-    bytes: &[u8],
-    meta: &BdbMeta,
-    root: u32,
-    visited: &mut BTreeSet<u32>,
-    budget: &mut usize,
-    out: &mut Vec<RawRecord>,
-) {
-    let mut stack = vec![root];
+struct WalkState<'a> {
+    visited: &'a mut BTreeSet<u32>,
+    budget: &'a mut usize,
+    limits: WalkLimits,
+    out: &'a mut Vec<RawRecord>,
+    damage: &'a mut DamageLog,
+}
 
+fn walk_from(bytes: &[u8], meta: &BdbMeta, root: u32, state: WalkState<'_>) {
+    let WalkState {
+        visited,
+        budget,
+        limits,
+        out,
+        damage,
+    } = state;
+    let mut stack = vec![root];
     while let Some(page) = stack.pop() {
-        if out.len() >= MAX_RECORDS {
+        if out.len() >= limits.max_records {
+            damage.push(format!("page {page}"), "record limit exceeded");
+            for pending in stack.drain(..) {
+                damage.push(format!("page {pending}"), "record limit exceeded");
+            }
             break;
         }
         if *budget == 0 {
+            damage.push(format!("page {page}"), "page visit limit exceeded");
+            for pending in stack.drain(..) {
+                damage.push(format!("page {pending}"), "page visit limit exceeded");
+            }
             break;
         }
-        if !visited.insert(page) {
+        if page == 0 || page > meta.last_page {
+            damage.push(format!("page {page}"), "page offset is out of bounds");
             continue;
         }
-        if page > meta.last_page {
+        if !visited.insert(page) {
+            damage.push(format!("page {page}"), "page is revisited");
             continue;
         }
         *budget -= 1;
-
-        let p = match page_slice(bytes, page, meta.page_size) {
-            Ok(p) => p,
-            // Partial recovery: a bad page must not abort the whole walk.
-            Err(_) => continue,
+        let Ok(p) = page_slice(bytes, page, meta.page_size) else {
+            damage.push(format!("page {page}"), "page offset is out of bounds");
+            continue;
         };
-
-        let page_type = match p.get(OFF_PAGE_TYPE) {
-            Some(t) => *t,
-            None => continue,
+        let Some(&page_type) = p.get(OFF_PAGE_TYPE) else {
+            damage.push(format!("page {page}"), "page header is truncated");
+            continue;
         };
-        let count = match read_u16(p, OFF_ENTRY_COUNT, meta.swapped) {
-            Ok(c) => c as usize,
-            Err(_) => continue,
+        let Ok(count) = read_u16(p, OFF_ENTRY_COUNT, meta.swapped).map(usize::from) else {
+            damage.push(format!("page {page}"), "page header is truncated");
+            continue;
         };
-
+        if count > p.len().saturating_sub(OFF_INDEX_START) / 2 {
+            damage.push(format!("page {page}"), "page header is truncated");
+            continue;
+        }
         match page_type {
             PAGE_TYPE_IBTREE => {
-                // BINTERNAL entry: len:u16, type:u8, pad:u8, pgno:u32, ...
-                // — the child page number sits at off+4, not off itself.
+                // Push children in index order, preserving the previous traversal order.
                 for i in 0..count {
+                    let location = format!("page {page} slot {i}");
                     let Ok(off) = read_u16(p, OFF_INDEX_START + i * 2, meta.swapped) else {
+                        damage.push(location, "page offset is out of bounds");
                         continue;
                     };
-                    let Ok(child) = read_u32(p, off as usize + 4, meta.swapped) else {
+                    let off = usize::from(off);
+                    match p.get(off.saturating_add(2)).copied() {
+                        Some(ENTRY_KEYDATA | ENTRY_OVERFLOW) => {}
+                        Some(_) => {
+                            damage.push(location, "unexpected entry type");
+                            continue;
+                        }
+                        None => {
+                            damage.push(location, "entry extends past the page");
+                            continue;
+                        }
+                    }
+                    let Ok(child) = read_u32(p, off.saturating_add(4), meta.swapped) else {
+                        damage.push(location, "entry extends past the page");
                         continue;
                     };
                     stack.push(child);
                 }
             }
             PAGE_TYPE_LBTREE => {
-                // Leaf entries alternate key, value. Each slot's read result
-                // is kept at its own index — `None` for a failed read — so a
-                // single corrupted entry cannot shift the key/value pairing
-                // of any entry after it. Compacting successful reads into a
-                // dense vector before pairing (e.g. `chunks_exact` over only
-                // the `Some`s) would desynchronize every later entry on the
-                // page; see the leaf-desync regression test below.
-                let mut entries: Vec<Option<Vec<u8>>> = Vec::with_capacity(count.min(1024));
+                let mut entries: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
                 for i in 0..count {
+                    let location = format!("page {page} slot {i}");
                     let Ok(off) = read_u16(p, OFF_INDEX_START + i * 2, meta.swapped) else {
+                        damage.push(location, "page offset is out of bounds");
                         entries.push(None);
                         continue;
                     };
-                    let off = off as usize;
-                    let Some(&kind) = p.get(off + 2) else {
+                    let off = usize::from(off);
+                    let Some(&kind) = p.get(off.saturating_add(2)) else {
+                        damage.push(location, "page offset is out of bounds");
                         entries.push(None);
                         continue;
                     };
                     let Ok(len) = read_u16(p, off, meta.swapped) else {
+                        damage.push(location, "leaf entry is truncated");
                         entries.push(None);
                         continue;
                     };
-
                     let item = match kind {
-                        ENTRY_KEYDATA => p.get(off + 3..off + 3 + len as usize).map(<[u8]>::to_vec),
-                        ENTRY_OVERFLOW => {
-                            let Ok(pgno) = read_u32(p, off + 4, meta.swapped) else {
-                                entries.push(None);
-                                continue;
-                            };
-                            let Ok(tlen) = read_u32(p, off + 8, meta.swapped) else {
-                                entries.push(None);
-                                continue;
-                            };
-                            let mut seen = BTreeSet::new();
-                            read_overflow(bytes, meta, pgno, tlen, &mut seen).ok()
+                        ENTRY_KEYDATA => {
+                            let start = off.saturating_add(3);
+                            let end = start.saturating_add(usize::from(len));
+                            match p.get(start..end) {
+                                Some(data) => Some(data.to_vec()),
+                                None => {
+                                    damage.push(location, "entry extends past the page");
+                                    None
+                                }
+                            }
                         }
-                        _ => None,
+                        ENTRY_OVERFLOW => {
+                            let pointer = read_u32(p, off.saturating_add(4), meta.swapped);
+                            let length = read_u32(p, off.saturating_add(8), meta.swapped);
+                            match (pointer, length) {
+                                (Ok(pgno), Ok(tlen)) => {
+                                    let mut seen = BTreeSet::new();
+                                    match read_overflow(
+                                        bytes,
+                                        meta,
+                                        pgno,
+                                        tlen,
+                                        &mut seen,
+                                        budget,
+                                        limits.max_value_len,
+                                    ) {
+                                        Ok(value) => Some(value),
+                                        Err(_) => {
+                                            damage.push(
+                                                location,
+                                                if tlen as usize > limits.max_value_len {
+                                                    "value length limit exceeded"
+                                                } else {
+                                                    "overflow chain is truncated"
+                                                },
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    damage.push(location, "leaf entry is truncated");
+                                    None
+                                }
+                            }
+                        }
+                        _ => {
+                            damage.push(location, "unexpected page type");
+                            None
+                        }
                     };
-
                     entries.push(item);
                 }
-                for pair in entries.chunks(2) {
-                    if let [Some(k), Some(v)] = pair {
-                        out.push((k.clone(), v.clone()));
+                let mut slots = entries.into_iter();
+                while let Some(key) = slots.next() {
+                    let value = slots.next();
+                    match (key, value) {
+                        (Some(k), Some(Some(v))) => {
+                            if out.len() < limits.max_records {
+                                out.push((k, v));
+                            } else {
+                                damage.push(format!("page {page}"), "record limit exceeded");
+                            }
+                        }
+                        (_, None) => damage.push(format!("page {page}"), "leaf entry is truncated"),
+                        _ => {}
                     }
                 }
             }
-            PAGE_TYPE_OVERFLOW => {}
-            _ => {}
+            _ => damage.push(format!("page {page}"), "unexpected page type"),
         }
     }
 }
 
-/// Walk the btree and return all `(key, value)` pairs.
-///
-/// The top-level meta page's root is the master database, not the real
-/// records (see [`resolve_subdb_root`]). Each master-db value that
-/// resolves to a subdatabase is walked for its real records; anything
-/// that does not resolve is kept as-is, which also covers wallets that
-/// were never wrapped in a named subdatabase.
-pub fn walk(bytes: &[u8]) -> Result<Vec<RawRecord>, ImportError> {
-    let meta = read_meta(bytes)?;
-    let mut budget = MAX_PAGES_VISITED;
+/// Walk the btree and return records and any structural damage found.
+pub fn walk(bytes: &[u8]) -> Result<BdbWalk, ImportError> {
+    walk_with_limits(
+        bytes,
+        WalkLimits {
+            max_records: MAX_RECORDS,
+            max_pages: MAX_PAGES_VISITED,
+            max_value_len: MAX_VALUE_LEN,
+        },
+    )
+}
 
+fn walk_with_limits(bytes: &[u8], limits: WalkLimits) -> Result<BdbWalk, ImportError> {
+    let meta = read_meta(bytes)?;
+    let mut budget = limits.max_pages;
+    let mut damage = DamageLog::default();
     let mut top = Vec::new();
     walk_from(
         bytes,
         &meta,
         meta.root_page,
-        &mut BTreeSet::new(),
-        &mut budget,
-        &mut top,
+        WalkState {
+            visited: &mut BTreeSet::new(),
+            budget: &mut budget,
+            limits,
+            out: &mut top,
+            damage: &mut damage,
+        },
     );
 
     let mut out = Vec::new();
@@ -428,38 +588,38 @@ pub fn walk(bytes: &[u8]) -> Result<Vec<RawRecord>, ImportError> {
     for (k, v) in top {
         match resolve_subdb_root(bytes, &meta, &v) {
             Some(root) => real_roots.push(root),
+            None if k == b"main" => {
+                // zcashd's named database lives behind this master key.
+                // A broken pointer must not masquerade as an ordinary record.
+                damage.push(
+                    format!("page {}", meta.root_page),
+                    "page offset is out of bounds",
+                );
+            }
             None => out.push((k, v)),
         }
     }
-
-    if real_roots.is_empty() {
-        // No subdatabase indirection resolved; the master-db page(s)
-        // already collected above are the real records.
-        return Ok(out);
-    }
-
-    // A resolved subdatabase supersedes whatever unresolved pairs were
-    // collected alongside it at the master-db level.
-    out.clear();
-    for root in real_roots {
-        if out.len() >= MAX_RECORDS || budget == 0 {
-            break;
+    if !real_roots.is_empty() {
+        out.clear();
+        for root in real_roots {
+            walk_from(
+                bytes,
+                &meta,
+                root,
+                WalkState {
+                    visited: &mut BTreeSet::new(),
+                    budget: &mut budget,
+                    limits,
+                    out: &mut out,
+                    damage: &mut damage,
+                },
+            );
         }
-        // Each subdatabase gets its own `visited` set: a root that
-        // collides with a page number touched elsewhere (by another
-        // sub-tree, or by the master-level walk above) must not cause
-        // this sub-tree to be skipped as "already visited".
-        walk_from(
-            bytes,
-            &meta,
-            root,
-            &mut BTreeSet::new(),
-            &mut budget,
-            &mut out,
-        );
     }
-
-    Ok(out)
+    Ok(BdbWalk {
+        records: out,
+        diagnostics: damage.finish(),
+    })
 }
 
 #[cfg(test)]
@@ -560,7 +720,9 @@ mod tests {
     fn walking_golden_fixtures_yields_records() {
         for name in ["sprout-plaintext", "modern-encrypted"] {
             let bytes = std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap();
-            let pairs = walk(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let pairs = walk(&bytes)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .records;
             assert!(!pairs.is_empty(), "{name} yielded no records");
         }
     }
@@ -568,7 +730,7 @@ mod tests {
     #[test]
     fn golden_sprout_wallet_contains_a_zkey_record() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
-        let pairs = walk(&bytes).unwrap();
+        let pairs = walk(&bytes).unwrap().records;
         // zcashd keys records as a serialized pair whose first element is
         // the type string, length-prefixed by a CompactSize byte.
         let found = pairs
@@ -608,7 +770,7 @@ mod tests {
             v[start + 3..start + 7].copy_from_slice(&tag);
         }
 
-        let pairs = walk(&v).unwrap();
+        let pairs = walk(&v).unwrap().records;
         assert!(
             !pairs.iter().any(|(k, val)| k == b"AAAA" && val == b"CCCC"),
             "leaf entry desync: AAAA paired with CCCC instead of \
@@ -664,7 +826,7 @@ mod tests {
         v[base2 + 12..base2 + 16].copy_from_slice(&BDB_BTREE_MAGIC.to_le_bytes());
         v[base2 + 88..base2 + 92].copy_from_slice(&1u32.to_le_bytes());
 
-        let pairs = walk(&v).unwrap();
+        let pairs = walk(&v).unwrap().records;
         assert!(
             pairs
                 .iter()
@@ -681,8 +843,12 @@ mod tests {
         let expected = [("sprout-plaintext", 325), ("sprout-encrypted", 331)];
         for (name, want) in expected {
             let bytes = std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap();
-            let pairs = walk(&bytes).unwrap();
+            let pairs = walk(&bytes).unwrap().records;
             assert_eq!(pairs.len(), want, "{name}: record count changed");
+            assert!(
+                walk(&bytes).unwrap().diagnostics.is_empty(),
+                "{name}: container damage"
+            );
         }
     }
 
@@ -743,12 +909,15 @@ mod tests {
         put_overflow_page(&mut v, page_size, 3, 0, &second);
 
         let meta = read_meta(&v).unwrap();
+        let mut budget = MAX_PAGES_VISITED;
         let got = read_overflow(
             &v,
             &meta,
             2,
             expected.len() as u32,
             &mut std::collections::BTreeSet::new(),
+            &mut budget,
+            MAX_VALUE_LEN,
         )
         .expect("a well-formed overflow chain must reassemble");
 
@@ -804,7 +973,7 @@ mod tests {
         put_overflow_page(&mut v, page_size, 3, 4, &payload[..400]);
         put_overflow_page(&mut v, page_size, 4, 0, &payload[400..]);
 
-        let pairs = walk(&v).unwrap();
+        let pairs = walk(&v).unwrap().records;
         assert!(
             pairs.iter().any(|(k, val)| k == key && *val == payload),
             "an overflowing value must reach the caller intact; got {:?}",
@@ -815,12 +984,253 @@ mod tests {
         );
     }
 
+    fn put_leaf_entry(v: &mut [u8], page_size: u32, page: u32, slot: usize, off: u16, data: &[u8]) {
+        let base = page as usize * page_size as usize;
+        let index = base + OFF_INDEX_START + slot * 2;
+        v[index..index + 2].copy_from_slice(&off.to_le_bytes());
+        let start = base + off as usize;
+        v[start..start + 2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        v[start + 2] = ENTRY_KEYDATA;
+        v[start + 3..start + 3 + data.len()].copy_from_slice(data);
+    }
+
+    fn two_record_leaf() -> Vec<u8> {
+        let mut v = meta_page(512, 1, 1);
+        v[512 + OFF_PAGE_TYPE] = PAGE_TYPE_LBTREE;
+        v[512 + OFF_ENTRY_COUNT..512 + OFF_ENTRY_COUNT + 2].copy_from_slice(&4u16.to_le_bytes());
+        for (slot, off, data) in [
+            (0, 40, b"bad".as_slice()),
+            (1, 60, b"value"),
+            (2, 80, b"good"),
+            (3, 100, b"kept"),
+        ] {
+            put_leaf_entry(&mut v, 512, 1, slot, off, data);
+        }
+        v
+    }
+
+    fn assert_damage_at(result: &BdbWalk, coordinate: &str) {
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.to_string().contains(coordinate)),
+            "missing damage at {coordinate}: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn diagnostic_cap_reports_suppressed_count_without_untrusted_values() {
+        let mut log = DamageLog::default();
+        for _ in 0..1_001 {
+            log.push("page 2 slot 1".to_owned(), "entry extends past the page");
+        }
+        let diagnostics = log.finish();
+        assert_eq!(diagnostics.len(), MAX_DIAGNOSTICS);
+        assert!(diagnostics
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("suppressed 2 further damage reports"));
+    }
+
+    #[test]
+    fn bad_leaf_slot_keeps_neighbor_and_reports_damage() {
+        let mut v = two_record_leaf();
+        v[512 + OFF_INDEX_START + 2..512 + OFF_INDEX_START + 4]
+            .copy_from_slice(&5000u16.to_le_bytes());
+        let result = walk(&v).unwrap();
+        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_damage_at(&result, "page 1 slot 1");
+        let imported = crate::zcashd::import_zcashd(&v, None).unwrap();
+        assert!(imported
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, ImportDiagnostic::ContainerDamage { .. })));
+        assert_ne!(imported.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn broken_overflow_chain_drops_only_that_record_and_reports_damage() {
+        let mut v = two_record_leaf();
+        v.resize(512 * 3, 0);
+        v[32..36].copy_from_slice(&2u32.to_le_bytes());
+        let entry = 512 + 60;
+        v[entry + 2] = ENTRY_OVERFLOW;
+        v[entry + 4..entry + 8].copy_from_slice(&2u32.to_le_bytes());
+        v[entry + 8..entry + 12].copy_from_slice(&8u32.to_le_bytes());
+        put_overflow_page(&mut v, 512, 2, 0, b"short");
+        let result = walk(&v).unwrap();
+        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_damage_at(&result, "page 1 slot 1");
+    }
+
+    #[test]
+    fn early_overflow_terminator_is_not_a_complete_value() {
+        let mut v = meta_page(512, 2, 1);
+        put_overflow_page(&mut v, 512, 2, 0, b"short");
+        let meta = read_meta(&v).unwrap();
+        let mut budget = MAX_PAGES_VISITED;
+        assert!(read_overflow(
+            &v,
+            &meta,
+            2,
+            8,
+            &mut BTreeSet::new(),
+            &mut budget,
+            MAX_VALUE_LEN
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn overflow_pages_share_the_walk_page_budget() {
+        let mut v = two_record_leaf();
+        v.resize(512 * 3, 0);
+        v[32..36].copy_from_slice(&2u32.to_le_bytes());
+        let entry = 512 + 60;
+        v[entry + 2] = ENTRY_OVERFLOW;
+        v[entry + 4..entry + 8].copy_from_slice(&2u32.to_le_bytes());
+        v[entry + 8..entry + 12].copy_from_slice(&5u32.to_le_bytes());
+        put_overflow_page(&mut v, 512, 2, 0, b"value");
+        let result = walk_with_limits(
+            &v,
+            WalkLimits {
+                max_records: 10,
+                max_pages: 1,
+                max_value_len: MAX_VALUE_LEN,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_damage_at(&result, "page 1 slot 1");
+    }
+
+    #[test]
+    fn overflow_pointer_beyond_last_page_is_rejected() {
+        let mut v = meta_page(512, 2, 1);
+        v.resize(512 * 4, 0);
+        put_overflow_page(&mut v, 512, 3, 0, b"hidden");
+        let meta = read_meta(&v).unwrap();
+        let mut budget = MAX_PAGES_VISITED;
+        assert!(read_overflow(
+            &v,
+            &meta,
+            3,
+            6,
+            &mut BTreeSet::new(),
+            &mut budget,
+            MAX_VALUE_LEN
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn record_budget_exhaustion_reports_incomplete_recovery() {
+        let v = two_record_leaf();
+        let result = walk_with_limits(
+            &v,
+            WalkLimits {
+                max_records: 1,
+                max_pages: 10,
+                max_value_len: MAX_VALUE_LEN,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_damage_at(&result, "page 1");
+    }
+
+    fn two_child_tree() -> Vec<u8> {
+        let mut v = meta_page(512, 3, 1);
+        v[512 + OFF_PAGE_TYPE] = PAGE_TYPE_IBTREE;
+        v[512 + OFF_ENTRY_COUNT..512 + OFF_ENTRY_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
+        for (slot, child) in [(0, 2u32), (1, 3)] {
+            let off = 40 + slot * 12;
+            v[512 + OFF_INDEX_START + slot * 2..512 + OFF_INDEX_START + slot * 2 + 2]
+                .copy_from_slice(&(off as u16).to_le_bytes());
+            v[512 + off + 2] = ENTRY_KEYDATA;
+            v[512 + off + 4..512 + off + 8].copy_from_slice(&child.to_le_bytes());
+            let base = child as usize * 512;
+            v[base + OFF_PAGE_TYPE] = PAGE_TYPE_LBTREE;
+            v[base + OFF_ENTRY_COUNT..base + OFF_ENTRY_COUNT + 2]
+                .copy_from_slice(&2u16.to_le_bytes());
+            put_leaf_entry(
+                &mut v,
+                512,
+                child,
+                0,
+                40,
+                if child == 2 { b"bad" } else { b"good" },
+            );
+            put_leaf_entry(&mut v, 512, child, 1, 60, b"value");
+        }
+        v
+    }
+
+    #[test]
+    fn page_budget_exhaustion_reports_incomplete_recovery() {
+        let v = two_child_tree();
+        let result = walk_with_limits(
+            &v,
+            WalkLimits {
+                max_records: 10,
+                max_pages: 2,
+                max_value_len: MAX_VALUE_LEN,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.records, vec![(b"good".to_vec(), b"value".to_vec())]);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.to_string().contains("page ")));
+    }
+
+    #[test]
+    fn broken_main_subdatabase_pointer_reports_damage_and_keeps_neighbor() {
+        for invalid_page in [99u32, 0] {
+            let mut v = two_record_leaf();
+            put_leaf_entry(&mut v, 512, 1, 0, 40, b"main");
+            put_leaf_entry(&mut v, 512, 1, 1, 60, &invalid_page.to_be_bytes());
+            let result = walk(&v).unwrap();
+            assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+            assert_damage_at(&result, "page 1");
+        }
+    }
+
+    #[test]
+    fn subdatabase_metadata_root_zero_keeps_neighbor_and_reports_damage() {
+        let mut v = two_record_leaf();
+        v.resize(512 * 3, 0);
+        v[32..36].copy_from_slice(&2u32.to_le_bytes());
+        put_leaf_entry(&mut v, 512, 1, 0, 40, b"main");
+        put_leaf_entry(&mut v, 512, 1, 1, 60, &2u32.to_be_bytes());
+        v[1024 + 12..1024 + 16].copy_from_slice(&BDB_BTREE_MAGIC.to_le_bytes());
+        let result = walk(&v).unwrap();
+        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_damage_at(&result, "page 1");
+    }
+
+    #[test]
+    fn malformed_internal_child_keeps_sibling_and_reports_slot() {
+        let mut v = two_child_tree();
+        v[512 + 40 + 2] = 0; // invalid internal entry kind
+        let result = walk(&v).unwrap();
+        assert_eq!(result.records, vec![(b"good".to_vec(), b"value".to_vec())]);
+        assert_damage_at(&result, "page 1 slot 0");
+    }
+
     #[test]
     fn a_truncated_wallet_still_yields_the_records_it_has() {
         // Partial recovery: truncation must not zero the result.
         let bytes = std::fs::read("tests/fixtures/modern-plaintext-truncated.dat").unwrap();
         match walk(&bytes) {
-            Ok(pairs) => assert!(!pairs.is_empty(), "truncated wallet yielded nothing"),
+            Ok(result) => assert!(
+                !result.records.is_empty(),
+                "truncated wallet yielded nothing"
+            ),
             Err(ImportError::UnwalkableBtree(_)) => {
                 // Acceptable only if the metadata page itself was lost.
             }

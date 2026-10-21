@@ -145,12 +145,21 @@ fn safe_field(field: &str) -> bool {
     )
 }
 
-fn safe_damage_reason(raw: &str) -> &'static str {
+fn safe_damage_reason(raw: &str) -> String {
+    if let Some(count) = raw
+        .strip_prefix("suppressed ")
+        .and_then(|value| value.strip_suffix(" further damage reports"))
+    {
+        if safe_coordinate(count) {
+            return format!("suppressed {count} further damage reports");
+        }
+    }
     match raw {
         "entry extends past the page" => "entry extends past the page",
         "page header is truncated" => "page header is truncated",
         "page offset is out of bounds" => "page offset is out of bounds",
         "unexpected page type" => "unexpected page type",
+        "unexpected entry type" => "unexpected entry type",
         "leaf entry is truncated" => "leaf entry is truncated",
         "overflow chain is truncated" => "overflow chain is truncated",
         "overflow chain ended early" => "overflow chain ended early",
@@ -159,8 +168,10 @@ fn safe_damage_reason(raw: &str) -> &'static str {
         "value length limit exceeded" => "value length limit exceeded",
         "truncated field" => "truncated field",
         "unexpected end of file" => "unexpected end of file",
+        "page is revisited" => "page is revisited",
         _ => "wallet structure could not be read",
     }
+    .to_owned()
 }
 
 fn locked_key_guidance(provenance: &Provenance) -> &'static str {

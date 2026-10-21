@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn extracts_sprout_keys_from_the_golden_fixture() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mut out = ImportedKeys::default();
         collect_plaintext(&pairs, &mut out);
         assert!(

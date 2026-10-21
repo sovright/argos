@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn golden_sprout_wallet_record_types_include_zkey_and_key() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let types: std::collections::BTreeSet<String> = pairs
             .iter()
             .filter_map(|(k, _)| parse_record_key(k))
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn golden_encrypted_sprout_wallet_has_czkey_and_mkey() {
         let bytes = std::fs::read("tests/fixtures/sprout-encrypted.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let types: std::collections::BTreeSet<String> = pairs
             .iter()
             .filter_map(|(k, _)| parse_record_key(k))

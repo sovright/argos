@@ -386,7 +386,7 @@ mod tests {
 
         // Ground truth: every "key" record's remainder is the serialized
         // pubkey the wallet filed that secret under.
-        let records = bdb::walk(&bytes).expect("fixture must walk");
+        let records = bdb::walk(&bytes).expect("fixture must walk").records;
         let mut stored: std::collections::HashSet<TransparentAddress> =
             std::collections::HashSet::new();
         for (raw_key, _) in &records {

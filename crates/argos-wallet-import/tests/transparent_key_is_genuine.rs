@@ -19,7 +19,9 @@ const FIXTURE_PASSPHRASE: &str = "argos-test-passphrase";
 fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
-    bdb::walk(&bytes).unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+    bdb::walk(&bytes)
+        .unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+        .records
 }
 
 /// The raw (unprefixed) serialized public key stored in a `record_type`

@@ -21,7 +21,7 @@ use crate::{bdb, error::ImportError, keys::ImportedKeys};
 /// the wallet does not use.
 pub fn needs_passphrase(bytes: &[u8]) -> bool {
     bdb::walk(bytes)
-        .map(|pairs| find_mkey(&pairs).is_some())
+        .map(|walk| find_mkey(&walk.records).is_some())
         .unwrap_or(false)
 }
 
@@ -33,8 +33,12 @@ pub fn import_zcashd(
     bytes: &[u8],
     passphrase: Option<&SecretString>,
 ) -> Result<ImportedKeys, ImportError> {
-    let pairs = bdb::walk(bytes)?;
-    let mut out = ImportedKeys::default();
+    let walk = bdb::walk(bytes)?;
+    let pairs = walk.records;
+    let mut out = ImportedKeys {
+        diagnostics: walk.diagnostics,
+        ..Default::default()
+    };
 
     collect_plaintext(&pairs, &mut out);
     collect_sprout_notes(&pairs, &mut out);

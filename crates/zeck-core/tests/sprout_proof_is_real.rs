@@ -44,7 +44,7 @@ fn recovered_sprout_key() -> [u8; 32] {
         env!("CARGO_MANIFEST_DIR")
     );
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"));
-    let records = bdb::walk(&bytes).expect("walk the wallet file");
+    let records = bdb::walk(&bytes).expect("walk the wallet file").records;
     let mut keys = ImportedKeys::default();
     zcashd::collect_plaintext(&records, &mut keys);
     *keys

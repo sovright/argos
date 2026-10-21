@@ -277,7 +277,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn unlock(fixture: &str) -> (Vec<(Vec<u8>, Vec<u8>)>, MasterKey) {
         let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat")).unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mkey = crate::zcashd::find_mkey(&pairs).expect("no mkey");
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         let master = crate::zcashd::derive_master_key(&pass, &mkey).unwrap();

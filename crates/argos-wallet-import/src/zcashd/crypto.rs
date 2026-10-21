@@ -205,7 +205,7 @@ mod tests {
         // Not as corruption. A user with a correct passphrase and a
         // damaged wallet must not be told their passphrase is wrong.
         let bytes = std::fs::read("tests/fixtures/modern-encrypted.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mkey = find_mkey(&pairs).expect("encrypted wallet must have an mkey");
         let err = derive_master_key(&SecretString::new("definitely-wrong".to_owned()), &mkey)
             .unwrap_err();
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn the_correct_passphrase_derives_a_master_key() {
         let bytes = std::fs::read("tests/fixtures/modern-encrypted.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mkey = find_mkey(&pairs).expect("encrypted wallet must have an mkey");
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         assert!(derive_master_key(&pass, &mkey).is_ok());

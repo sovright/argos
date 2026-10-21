@@ -82,7 +82,9 @@ fn a_pk_from(a_sk: &[u8; 32]) -> [u8; 32] {
 fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
-    bdb::walk(&bytes).unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+    bdb::walk(&bytes)
+        .unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+        .records
 }
 
 fn assert_keys_control_their_addresses(keys: &ImportedKeys, what: &str) {

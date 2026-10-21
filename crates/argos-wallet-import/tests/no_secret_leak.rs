@@ -100,7 +100,9 @@ fn master_key_debug_is_redacted() {
     // the test would pass while proving nothing at all.
     let bytes = std::fs::read("tests/fixtures/modern-encrypted.dat")
         .expect("modern-encrypted.dat fixture must exist");
-    let records = argos_wallet_import::bdb::walk(&bytes).expect("fixture must walk");
+    let records = argos_wallet_import::bdb::walk(&bytes)
+        .expect("fixture must walk")
+        .records;
     let mkey: MkeyRecord = argos_wallet_import::zcashd::find_mkey(&records)
         .expect("encrypted wallet must have an mkey");
 
