@@ -5,6 +5,7 @@
 //!     cargo test -p argos-core --test sprout_scan_reorg -- --ignored --nocapture
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 #[path = "common/sprout_note_fixture.rs"]
 mod sprout_note_fixture;
@@ -37,6 +38,10 @@ fn display_hash(mut wire_hash: [u8; 32]) -> String {
 fn saved_scanner(path: &Path) -> SproutScanner {
     let bytes = std::fs::read(path).expect("saved checkpoint");
     assert_eq!(&bytes[..2], &[0xA5, 3], "network-tagged regtest checkpoint");
+    assert_eq!(
+        bytes[2], 5,
+        "current checkpoint layout, with rollback history"
+    );
     SproutScanner::resume(&SproutScanCheckpoint::from_bytes(bytes[2..].to_vec()))
         .expect("read saved scanner")
 }
@@ -54,12 +59,53 @@ async fn tip() -> (u32, String) {
     (height, hash)
 }
 
+/// What the test changed on the shared node, so it can be put back whether
+/// the test passes or panics, and other regtest tests do not depend on
+/// running before this one.
+#[derive(Default)]
+struct NodeChanges {
+    /// The block `invalidateblock` was called on (display hex).
+    invalidated: Option<String>,
+    /// The transaction deprioritised out of the replacement blocks.
+    deprioritised: Option<String>,
+}
+
+/// Undo [`NodeChanges`]: clear the invalid flag (the replacement branch is
+/// longer, so the node stays on it), give the held-back JoinSplit its
+/// priority back, and mine it so the next test finds an empty mempool.
+async fn restore_node(changes: NodeChanges) {
+    if let Some(txid) = &changes.deprioritised {
+        rpc(
+            "prioritisetransaction",
+            serde_json::json!([txid, 0, 1_000_000_000]),
+        )
+        .await;
+    }
+    if let Some(hash) = &changes.invalidated {
+        rpc("reconsiderblock", serde_json::json!([hash])).await;
+    }
+    if changes.invalidated.is_some() || changes.deprioritised.is_some() {
+        rpc("generate", serde_json::json!([1])).await;
+    }
+}
+
 /// Invalidation three blocks deep must discard the old suffix, then resume
 /// the same checkpoint to the replacement tip and its independently computed
-/// Sprout root.
+/// Sprout root. The node is restored afterwards, pass or fail.
 #[tokio::test]
 #[ignore = "needs the regtest sprout node; see the module docs"]
 async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
+    let changes = Arc::new(Mutex::new(NodeChanges::default()));
+    // Run on its own task so a panic is caught and the node still restored.
+    let outcome = tokio::spawn(rewind_and_resume(changes.clone())).await;
+    let changes = std::mem::take(&mut *changes.lock().unwrap_or_else(|e| e.into_inner()));
+    restore_node(changes).await;
+    if let Err(err) = outcome {
+        std::panic::resume_unwind(err.into_panic());
+    }
+}
+
+async fn rewind_and_resume(changes: Arc<Mutex<NodeChanges>>) {
     // The fixture mines 110 funding blocks, then a funding block and the
     // JoinSplit block. Two more empty blocks put its commitments exactly
     // three deep, with well over five fresh blocks in the recent suffix.
@@ -114,6 +160,7 @@ async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
         serde_json::json!([display_hash(orphaned[0])]),
     )
     .await;
+    changes.lock().unwrap().invalidated = Some(display_hash(orphaned[0]));
     // zcashd returns the invalidated JoinSplit to its mempool. Keep it out
     // of the replacement blocks so its commitments are genuinely orphaned.
     assert_eq!(
@@ -125,6 +172,7 @@ async fn sprout_checkpoint_rewinds_and_resumes_on_the_nodes_new_branch() {
         serde_json::json!(true),
         "deprioritise the orphaned JoinSplit for replacement mining"
     );
+    changes.lock().unwrap().deprioritised = Some(planted.txid.clone());
     rpc("generate", serde_json::json!([5])).await;
     let (new_height, new_tip) = tip().await;
     assert_eq!(
