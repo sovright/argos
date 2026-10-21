@@ -1226,37 +1226,16 @@ pub async fn run_sprout_scan_with_decrypt_from(
         // assembles the page in the order the headers came in and treats a
         // missing block as a hard error, because a short page still looks
         // well-formed and would land every later commitment at the wrong
-        // position. Re-deriving a hash list and a lookup map here only undid
-        // that work.
-        for (hash, joinsplits) in &page {
-            // A pinned block must be the block we were handed. This is what
-            // makes a fabricated chain pointless: cheap forged headers link
-            // to each other fine, but they cannot reproduce a real mainnet
-            // hash at a real height without doing the work. Checked against
-            // this block's own height, before the counter advances — the
-            // checkpoints are keyed by true heights (genesis = 0).
-            let expected = crate::p2p::wire::checkpoint_at(network, height).or(tip_anchor
-                .filter(|anchor| anchor.height == height)
-                .map(|anchor| anchor.hash));
-            if let Some(expected) = expected {
-                if *hash != expected {
-                    return Err(ZeckError::Broadcast(format!(
-                        "the chain this peer served does not match Zcash at height \
-                         {height}. It is serving a different or fabricated chain, so the \
-                         scan stops rather than search it. Re-run to pick another peer, \
-                         or pass --peer with a node you trust."
-                    )));
-                }
-            }
-
-            scanner
-                .scan_block_at(joinsplits, *hash, height)
-                .map_err(|err| {
-                    ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
-                })?;
-            since_checkpoint += 1;
-            height += 1;
-        }
+        // position.
+        consume_page(
+            &mut scanner,
+            &page,
+            &mut height,
+            network,
+            tip_anchor,
+            checkpoint_file,
+        )?;
+        since_checkpoint += page.len() as u64;
 
         if since_checkpoint >= CHECKPOINT_EVERY {
             save_checkpoint(&scanner, network, checkpoint_file)?;
@@ -1287,6 +1266,58 @@ pub async fn run_sprout_scan_with_decrypt_from(
     scanner
         .finish()
         .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")))
+}
+
+/// Check one page against the pinned checkpoints and the [`TipAnchor`], then
+/// scan it, advancing `height` past it.
+///
+/// Every hash in the page is checked before any block of it is scanned. A
+/// pinned block must be the block we were handed: cheap forged headers link
+/// to each other fine, but they cannot reproduce a real mainnet hash at a
+/// real height without doing the work. The checkpoints are keyed by true
+/// heights (genesis = 0), so each block is checked at its own height.
+///
+/// On a mismatch the scan stops — fail closed — but saves first, and the
+/// state it saves ends at the last block of the previous page. Checking the
+/// whole page up front is what makes that possible: no block of the
+/// mismatching page, including those before the mismatch (they came from the
+/// same peer, and the forgery may begin anywhere in the page), has reached
+/// the scanner when it is saved. Without the save a mismatch lost up to a
+/// page of work, despite the message telling the user to re-run.
+fn consume_page(
+    scanner: &mut SproutScanner,
+    page: &Page,
+    height: &mut u32,
+    network: P2pNetwork,
+    tip_anchor: Option<TipAnchor>,
+    checkpoint_file: &Path,
+) -> ZeckResult<()> {
+    for (offset, (hash, _)) in page.iter().enumerate() {
+        let at = *height + offset as u32;
+        let expected = crate::p2p::wire::checkpoint_at(network, at).or(tip_anchor
+            .filter(|anchor| anchor.height == at)
+            .map(|anchor| anchor.hash));
+        if expected.is_some_and(|expected| *hash != expected) {
+            save_before_stopping(scanner, network, checkpoint_file);
+            return Err(ZeckError::Broadcast(format!(
+                "the chain this peer served does not match Zcash at height {at}. It is \
+                 serving a different or fabricated chain, so the scan stops rather than \
+                 search it. Progress up to height {} is saved. Re-run to pick another \
+                 peer, or pass --peer with a node you trust.",
+                height.saturating_sub(1)
+            )));
+        }
+    }
+
+    for (hash, joinsplits) in page {
+        scanner
+            .scan_block_at(joinsplits, *hash, *height)
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
+            })?;
+        *height += 1;
+    }
+    Ok(())
 }
 
 /// One page of blocks, in chain order: each block's hash and the JoinSplits
@@ -3294,5 +3325,79 @@ mod tests {
         // The file is kept: it is still a valid scan under its own bound.
         assert!(path.exists());
         discard_checkpoint(&path);
+    }
+
+    /// Review of #265, round 2: a hash mismatch against a pinned checkpoint
+    /// or the [`TipAnchor`] used to return without saving, losing up to a
+    /// page of work. It must still stop — fail closed — but first save what
+    /// was consumed before the mismatching page, and none of that page.
+    #[test]
+    fn a_hash_mismatch_saves_progress_before_the_page_and_none_of_it() {
+        let dir = ScratchDir::new("mismatch-save");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut scanner = SproutScanner::new(&keys);
+        let mut height = 1u32;
+
+        // An anchor further up, so the first page is checked against nothing
+        // and consumed. Nothing is saved yet: the page is under
+        // CHECKPOINT_EVERY.
+        let anchor = TipAnchor {
+            height: 5,
+            hash: [0xAA; 32],
+        };
+        let good: Page = vec![
+            ([1; 32], Vec::new()),
+            ([2; 32], Vec::new()),
+            ([3; 32], Vec::new()),
+        ];
+        consume_page(
+            &mut scanner,
+            &good,
+            &mut height,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &path,
+        )
+        .expect("an unanchored page is consumed");
+        assert_eq!(height, 4);
+        assert!(!path.exists(), "no checkpoint is due yet");
+
+        // The next page disagrees with the anchor at height 5. Height 4,
+        // before it in the same page, is from the same peer and is not kept.
+        let forged: Page = vec![
+            ([4; 32], Vec::new()),
+            ([5; 32], Vec::new()),
+            ([6; 32], Vec::new()),
+        ];
+        let err = consume_page(
+            &mut scanner,
+            &forged,
+            &mut height,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &path,
+        )
+        .expect_err("a mismatch stops the scan");
+        let text = err.to_string();
+        assert!(text.contains("height 5"), "{text}");
+        assert!(text.contains("Re-run"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert!(text.contains("saved"), "{text}");
+        assert_eq!(height, 4, "the scan does not advance into the forged page");
+
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+            .expect("the checkpoint loads")
+            .expect("progress before the forged page was saved");
+        let cursor = saved.cursor().expect("a cursor");
+        assert_eq!(
+            cursor.last_height, 3,
+            "up to the last block before the page"
+        );
+        assert_eq!(cursor.last_block_hash, [3; 32]);
+        assert!(
+            !saved.is_complete(),
+            "a stopped scan never reads as complete"
+        );
     }
 }
