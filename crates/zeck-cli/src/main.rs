@@ -1532,7 +1532,10 @@ fn print_wallet_inspection(
         if keys.mnemonic.is_some() {
             "recovered"
         } else {
-            "not recovered from this file"
+            // Verified, not scanned from: zcashd's own keys sit under a
+            // legacy account the HD scan never reaches (#229).
+            keys.verified_seed_note()
+                .unwrap_or("not recovered from this file")
         }
     );
     println!();
@@ -1593,12 +1596,31 @@ fn print_wallet_inspection(
         Some(notice) => {
             println!("Recovery coverage: {notice}");
             println!();
-            println!("{} record(s) could not be read:", keys.diagnostics.len());
-            for diagnostic in &keys.diagnostics {
-                println!("  {diagnostic}");
+            // Two different kinds of finding, printed apart. A record that
+            // could not be read exists only in the file; a note about the
+            // seed (an unscanned account, keys its chain derived that the
+            // file lacks) is not a record that failed to read, and calling
+            // it one told the user something false about both.
+            let (unread, seed): (Vec<_>, Vec<_>) =
+                keys.diagnostics.iter().partition(|d| !d.is_about_seed());
+            if !unread.is_empty() {
+                println!("{} record(s) could not be read:", unread.len());
+                for diagnostic in &unread {
+                    println!("  {diagnostic}");
+                }
+                println!();
             }
-            println!();
-            println!("Keep the original wallet file. Anything listed above exists only there.");
+            if !seed.is_empty() {
+                println!("About this wallet's seed:");
+                for diagnostic in &seed {
+                    println!("  {diagnostic}");
+                }
+                println!();
+            }
+            println!(
+                "Keep the original wallet file: it is the only copy of these records and of \
+                 its seed."
+            );
         }
     }
     println!();
@@ -1630,8 +1652,8 @@ fn print_wallet_inspection(
         argos_core::key_source::RecoveryRoute::ImportedAccounts => {
             println!(
                 "Next: run `argos scan --wallet-file <path>` to check these keys for funds. \
-                 This wallet has no HD seed, so its Sapling keys are scanned as imported \
-                 accounts; balances are visible and transparent funds can be swept."
+                 Its stored Sapling keys are scanned as imported accounts, one per key; \
+                 balances are visible and transparent funds can be swept."
             );
         }
         argos_core::key_source::RecoveryRoute::TransparentOnly => {

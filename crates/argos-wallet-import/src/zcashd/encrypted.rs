@@ -29,6 +29,7 @@ use crate::{
         crypto::MasterKey,
         metadata::{KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
+        RecoveredKeyIds,
     },
 };
 
@@ -79,7 +80,7 @@ fn sapling_fvfp_iv(fvk: &[u8]) -> [u8; 16] {
 /// caller's to protect — callers wrap it in a `Secret`.
 ///
 /// The IV is not secret: it is derived from a public record identifier.
-fn decrypt(master: &MasterKey, iv: [u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn decrypt(master: &MasterKey, iv: [u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
     let mut buf = ciphertext.to_vec();
     let mut key: [u8; 32] = *master.expose_secret();
     let plain = Aes256CbcDec::new(&key.into(), &iv.into())
@@ -101,7 +102,12 @@ fn read_length_prefixed(value: &[u8]) -> Option<(&[u8], usize)> {
 ///
 /// A record that fails to decrypt is reported and skipped. One corrupt
 /// record must never cost the user the keys beside it.
-pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: &mut ImportedKeys) {
+pub fn collect_encrypted(
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    master: &MasterKey,
+    out: &mut ImportedKeys,
+) -> RecoveredKeyIds {
+    let mut recovered = RecoveredKeyIds::default();
     // Metadata is stored in plaintext even in an encrypted wallet. Damaged
     // records are reported by `collect_plaintext`, so not again here.
     let metadata = KeyMetadataIndex::build(pairs, None);
@@ -184,11 +190,14 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                         let s: [u8; 32] = p.get(..32)?.try_into().ok()?;
                         Some(s)
                     }) {
-                    Some(secret) => out.transparent.push(TransparentKey {
-                        secret: Secret::new(secret),
-                        provenance: Provenance::HdDerived,
-                        created_at: metadata.created_at(MetadataKind::Transparent, &rec.rest),
-                    }),
+                    Some(secret) => {
+                        out.transparent.push(TransparentKey {
+                            secret: Secret::new(secret),
+                            provenance: Provenance::HdDerived,
+                            created_at: metadata.created_at(MetadataKind::Transparent, &rec.rest),
+                        });
+                        recovered.transparent.insert(rec.rest);
+                    }
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "ckey".to_owned(),
                         reason: "ciphertext did not decrypt to a 32-byte key".to_owned(),
@@ -245,11 +254,14 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                     .and_then(read_length_prefixed)
                     .and_then(|(ct, _)| decrypt(master, iv, ct))
                 {
-                    Some(extsk) if extsk.len() == EXTSK_LEN => out.sapling.push(SaplingKey {
-                        extsk: Secret::new(extsk),
-                        provenance: Provenance::HdDerived,
-                        created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
-                    }),
+                    Some(extsk) if extsk.len() == EXTSK_LEN => {
+                        out.sapling.push(SaplingKey {
+                            extsk: Secret::new(extsk),
+                            provenance: Provenance::HdDerived,
+                            created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
+                        });
+                        recovered.sapling.insert(rec.rest);
+                    }
                     Some(mut wrong_length) => {
                         let got = wrong_length.len();
                         // Plaintext derived from the master key: scrub it
@@ -274,6 +286,7 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
             _ => {}
         }
     }
+    recovered
 }
 
 #[cfg(test)]
