@@ -152,7 +152,8 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
                             out.transparent.push(TransparentKey {
                                 secret: Secret::new(secret),
                                 provenance: Provenance::HdDerived,
-                                created_at: metadata.created_at(MetadataKind::Transparent, &rec.rest),
+                                created_at: metadata
+                                    .created_at(MetadataKind::Transparent, &rec.rest),
                             });
                             recovered.transparent.insert(rec.rest);
                         }

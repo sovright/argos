@@ -192,6 +192,34 @@ mod tests {
         assert_not_claimed_complete(&keys, "external");
     }
 
+    /// An unreadable `keymeta` costs its key only a creation time, so by
+    /// itself it grades Complete and is not a seed finding. But it can no
+    /// longer vouch for a derived key, and that shortfall is graded where it
+    /// belongs: as a missing derived key, not by the metadata diagnostic.
+    #[test]
+    fn unreadable_metadata_on_a_derived_key_is_graded_by_the_seed_check() {
+        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap();
+        let id = derived_key_id(&pairs, "/2147483647'/1/");
+        truncate_record(&mut pairs, "keymeta", &id, 20);
+        let keys = import_records(&pairs, None);
+        let unreadable: Vec<_> = keys
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, ImportDiagnostic::UnreadableKeyMetadata { .. }))
+            .collect();
+        assert_eq!(unreadable.len(), 1, "reported once: {:?}", keys.diagnostics);
+        assert!(!unreadable[0].is_about_seed());
+        assert_eq!(
+            crate::keys::ImportCoverage::of(unreadable[0]),
+            crate::keys::ImportCoverage::Complete
+        );
+        assert_not_claimed_complete(&keys, "change");
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::DerivedKeysMissing
+        );
+    }
+
     /// The same through decryption: a change `ckey` whose ciphertext is cut
     /// short does not decrypt. (Flipping a ciphertext byte would not do —
     /// CBC decrypts it to 32 bytes of garbage with no diagnostic.)

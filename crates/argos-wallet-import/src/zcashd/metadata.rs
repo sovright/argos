@@ -20,6 +20,12 @@
 //! The time is used to decide where a scan may start, and a time later than
 //! the key's real age would hide notes from that scan. Anything that does not
 //! parse cleanly therefore yields no time at all rather than a best guess.
+//!
+//! The HD fields — keypath and seed fingerprint — are what `seed` judges
+//! coverage by: a key the seed's chain says was derived counts as present
+//! only if a single, cleanly parsed record names its keypath under that
+//! seed. The same strictness applies: a record that does not parse, or a
+//! key with two records, yields no HD data either.
 
 use std::collections::HashMap;
 
@@ -64,14 +70,30 @@ impl MetadataKind {
     }
 }
 
-/// Creation times, keyed by pool and the record-key remainder that names
-/// the key.
+/// The HD derivation a key's metadata names, from `VERSION_WITH_HDDATA` on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HdData {
+    /// `m/...`; empty for a key zcashd did not derive (`importprivkey`).
+    pub keypath: String,
+    /// The fingerprint of the seed the key was derived from.
+    pub seed_fp: [u8; 32],
+}
+
+/// What one cleanly parsed `CKeyMetadata` record says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Metadata {
+    created_at: Option<i64>,
+    hd: Option<HdData>,
+}
+
+/// Creation times and HD data, keyed by pool and the record-key remainder
+/// that names the key.
 #[derive(Debug, Default)]
 pub struct KeyMetadataIndex {
-    /// `None` is a tombstone: the key had a record, but its time is not
-    /// trusted (unknown, unparseable, or contradicted by a second record).
-    /// It must stay in the map so a later record cannot revive a time.
-    times: HashMap<(MetadataKind, Vec<u8>), Option<i64>>,
+    /// `None` is a tombstone: the key had a record, but nothing in it is
+    /// trusted (unparseable, or contradicted by a second record). It must
+    /// stay in the map so a later record cannot revive it.
+    entries: HashMap<(MetadataKind, Vec<u8>), Option<Metadata>>,
 }
 
 impl KeyMetadataIndex {
@@ -98,8 +120,8 @@ impl KeyMetadataIndex {
             let Some(kind) = MetadataKind::of_record(&rec.record_type) else {
                 continue;
             };
-            let time = match parse_create_time(value) {
-                Ok(time) => time,
+            let parsed = match parse_metadata(value) {
+                Ok(parsed) => Some(parsed),
                 Err(reason) => {
                     if let Some(diagnostics) = diagnostics.as_deref_mut() {
                         diagnostics.push(ImportDiagnostic::UnreadableKeyMetadata {
@@ -111,10 +133,10 @@ impl KeyMetadataIndex {
                 }
             };
             index
-                .times
+                .entries
                 .entry((kind, rec.rest))
                 .and_modify(|seen| *seen = None)
-                .or_insert(time);
+                .or_insert(parsed);
         }
         index
     }
@@ -122,10 +144,19 @@ impl KeyMetadataIndex {
     /// The creation time recorded for the key whose record-key remainder is
     /// `identifier`, if one is known.
     pub fn created_at(&self, kind: MetadataKind, identifier: &[u8]) -> Option<i64> {
-        self.times
-            .get(&(kind, identifier.to_vec()))
-            .copied()
-            .flatten()
+        self.entries
+            .get(&(kind, identifier.to_vec()))?
+            .as_ref()?
+            .created_at
+    }
+
+    /// Every key whose single, cleanly parsed record carries HD data, with
+    /// the record-key remainder that names it. Tombstoned keys — a damaged
+    /// record, or two records for one key — are not among them.
+    pub fn hd_keys(&self) -> impl Iterator<Item = (MetadataKind, &[u8], &HdData)> + '_ {
+        self.entries.iter().filter_map(|((kind, id), entry)| {
+            Some((*kind, id.as_slice(), entry.as_ref()?.hd.as_ref()?))
+        })
     }
 }
 
@@ -137,10 +168,21 @@ pub fn is_metadata_record(record_type: &str) -> bool {
 /// Read `nCreateTime` from a `CKeyMetadata` value.
 ///
 /// `Ok(None)` for zcashd's own "unknown" marker; `Err` for a value that is
-/// not a well-formed `CKeyMetadata`. Trailing bytes are allowed, as zcashd's
-/// deserializer allows them, so a later version that appends fields still
-/// reads.
+/// not a well-formed `CKeyMetadata`.
+#[cfg(test)]
 fn parse_create_time(value: &[u8]) -> Result<Option<i64>, &'static str> {
+    parse_metadata(value).map(|m| m.created_at)
+}
+
+/// Read a `CKeyMetadata` value: its creation time and, from version 10, its
+/// HD keypath and seed fingerprint.
+///
+/// A creation time of `None` is zcashd's own "unknown" marker; `Err` is a
+/// value that is not a well-formed `CKeyMetadata`. Trailing bytes are
+/// allowed, as zcashd's deserializer allows them, so a later version that
+/// appends fields still reads. A keypath that is not UTF-8 yields no HD
+/// data; zcashd writes ASCII, so it is not a derivation Argos can place.
+fn parse_metadata(value: &[u8]) -> Result<Metadata, &'static str> {
     let version = value
         .get(..4)
         .and_then(|b| b.try_into().ok())
@@ -155,9 +197,10 @@ fn parse_create_time(value: &[u8]) -> Result<Option<i64>, &'static str> {
         .map(i64::from_le_bytes)
         .ok_or("value is too short for a creation time")?;
 
+    let mut hd = None;
     if version >= VERSION_WITH_HDDATA {
-        // Not used, but required to be present: a value cut short here is a
-        // damaged record, and a damaged record's time is not trusted either.
+        // Required to be present: a value cut short here is a damaged
+        // record, and a damaged record's time is not trusted either.
         let rest = value.get(12..).ok_or("HD data is missing")?;
         let (len, consumed) = compact_size(rest).ok_or("HD keypath length is missing")?;
         let path_end = usize::try_from(len)
@@ -167,17 +210,27 @@ fn parse_create_time(value: &[u8]) -> Result<Option<i64>, &'static str> {
         let fp_end = path_end
             .checked_add(32)
             .ok_or("HD keypath length overflows")?;
-        rest.get(path_end..fp_end)
+        let seed_fp: [u8; 32] = rest
+            .get(path_end..fp_end)
+            .and_then(|fp| fp.try_into().ok())
             .ok_or("HD keypath or seed fingerprint is truncated")?;
+        hd = rest
+            .get(consumed..path_end)
+            .and_then(|path| std::str::from_utf8(path).ok())
+            .map(|keypath| HdData {
+                keypath: keypath.to_owned(),
+                seed_fp,
+            });
     }
 
-    if time <= UNKNOWN_CREATE_TIME_AT_OR_BEFORE {
-        return Ok(None);
-    }
-    if time > LATEST_PLAUSIBLE_CREATE_TIME {
+    let created_at = if time <= UNKNOWN_CREATE_TIME_AT_OR_BEFORE {
+        None
+    } else if time > LATEST_PLAUSIBLE_CREATE_TIME {
         return Err("creation time is implausibly far in the future");
-    }
-    Ok(Some(time))
+    } else {
+        Some(time)
+    };
+    Ok(Metadata { created_at, hd })
 }
 
 #[cfg(test)]
@@ -327,6 +380,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn hd_of(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<(MetadataKind, Vec<u8>, HdData)> {
+        let mut v: Vec<_> = KeyMetadataIndex::build(pairs, None)
+            .hd_keys()
+            .map(|(k, id, hd)| (k, id.to_vec(), hd.clone()))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
+    const DERIVED: &str = "m/44'/1'/2147483647'/1/7";
+
+    /// `seed` judges coverage by these fields, so they come out exactly as
+    /// written: the keypath and the seed fingerprint that follows it.
+    #[test]
+    fn hd_data_is_read_from_version_10() {
+        let hd = hd_of(&[record(
+            "keymeta",
+            &[0x21; 33],
+            metadata_v10(1_700_000_000, DERIVED),
+        )]);
+        assert_eq!(
+            hd,
+            vec![(
+                MetadataKind::Transparent,
+                vec![0x21; 33],
+                HdData {
+                    keypath: DERIVED.to_owned(),
+                    seed_fp: [0x5A; 32],
+                }
+            )]
+        );
+        // An unknown creation time is not damage: the HD data still stands.
+        let unknown_time = hd_of(&[record("keymeta", &[0x21; 33], metadata_v10(1, DERIVED))]);
+        assert_eq!(unknown_time.len(), 1);
+
+        // Version 1 has no HD fields to read.
+        let mut v1 = 1i32.to_le_bytes().to_vec();
+        v1.extend_from_slice(&1_600_000_000i64.to_le_bytes());
+        assert!(hd_of(&[record("keymeta", &[0x21; 33], v1)]).is_empty());
+    }
+
+    /// The same strictness as the time: nothing from a record that does not
+    /// parse (a negative `int32` version included), and nothing for a key
+    /// with two records, which could otherwise let one key stand for two
+    /// derived positions.
+    #[test]
+    fn hd_data_is_withheld_where_the_time_is() {
+        let good = || metadata_v10(1_700_000_000, DERIVED);
+        let mut negative = good();
+        negative[..4].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(hd_of(&[record("keymeta", &[0x21; 33], negative)]).is_empty());
+        let truncated = good()[..30].to_vec();
+        assert!(hd_of(&[record("keymeta", &[0x21; 33], truncated)]).is_empty());
+        let other = metadata_v10(1_700_000_000, "m/44'/1'/2147483647'/1/8");
+        let twice = [
+            record("keymeta", &[0x21; 33], good()),
+            record("keymeta", &[0x21; 33], other),
+        ];
+        assert!(hd_of(&twice).is_empty());
+
+        let mut not_utf8 = good();
+        not_utf8[14] = 0xFF;
+        assert!(hd_of(&[record("keymeta", &[0x21; 33], not_utf8.clone())]).is_empty());
+        assert_eq!(
+            parse_create_time(&not_utf8),
+            Ok(Some(1_700_000_000)),
+            "the time does not depend on the keypath's encoding"
+        );
     }
 
     /// A Sapling ivk and the first bytes of something else must not collide:

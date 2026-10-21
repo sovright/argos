@@ -86,6 +86,8 @@ impl ImportDiagnostic {
     /// Findings about the wallet's HD seed, as opposed to records that failed
     /// to read. Both surfaces list them apart: calling "this wallet has 2
     /// unified accounts" an unread record tells the user something false.
+    /// `UnreadableKeyMetadata` is not one: it *is* a record that failed to
+    /// read, and it is listed as such.
     pub fn is_about_seed(&self) -> bool {
         matches!(
             self,

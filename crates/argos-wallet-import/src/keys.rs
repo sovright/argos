@@ -347,6 +347,9 @@ impl ImportCoverage {
             // A key without a creation time is still a key, and is scanned
             // from the start of the chain. Nothing can be missed for want
             // of one, so there is nothing to warn about beyond the listing.
+            // If the record described a seed-derived key, that key can no
+            // longer be vouched for and the seed check reports it as
+            // `MissingDerivedKeys` — graded there, not twice.
             ImportDiagnostic::UnreadableKeyMetadata { .. } => Self::Complete,
         }
     }

@@ -35,7 +35,11 @@ use crate::{
     error::ImportDiagnostic,
     keys::ImportedKeys,
     zcashd::{
-        compact_size, crypto::MasterKey, encrypted::decrypt, records::parse_record_key,
+        compact_size,
+        crypto::MasterKey,
+        encrypted::decrypt,
+        metadata::{KeyMetadataIndex, MetadataKind},
+        records::parse_record_key,
         RecoveredKeyIds,
     },
 };
@@ -92,7 +96,9 @@ pub fn assess_seed(
         crypted: Vec::new(),
         chain: None,
         recovered,
-        metadata: Vec::new(),
+        // Unreadable metadata was already reported by `collect_plaintext`,
+        // which builds the same index; it is not reported twice.
+        metadata: KeyMetadataIndex::build(pairs, None),
     };
     let mut pre_5_0_seed = None;
     for (raw_key, value) in pairs {
@@ -106,8 +112,6 @@ pub fn assess_seed(
             "mnemonicphrase" => records.plain.push((rec.rest, value.as_slice())),
             "cmnemonicphrase" => records.crypted.push((rec.rest, value.as_slice())),
             "mnemonichdchain" => records.chain = Some(value.as_slice()),
-            "keymeta" => records.metadata.push((false, rec.rest, value.as_slice())),
-            "sapzkeymeta" => records.metadata.push((true, rec.rest, value.as_slice())),
             _ => {}
         }
     }
@@ -140,8 +144,25 @@ struct SeedRecords<'a> {
     /// The keys the collectors recovered: what a derived key must be among
     /// to count as present.
     recovered: &'a RecoveredKeyIds,
-    /// `(is_sapling, record key after the type, value)`.
-    metadata: Vec<(bool, Vec<u8>, &'a [u8])>,
+    /// Every key's `keymeta`/`sapzkeymeta`, parsed strictly: a damaged
+    /// record, or a second record for one key, yields no HD data at all.
+    metadata: KeyMetadataIndex,
+}
+
+impl SeedRecords<'_> {
+    /// Each transparent or Sapling key whose metadata names a legacy-account
+    /// derivation: its record-key remainder, seed fingerprint and position.
+    fn legacy_derivations(&self) -> impl Iterator<Item = (bool, &[u8], &[u8; 32], (Chain, u32))> {
+        self.metadata.hd_keys().filter_map(|(kind, id, hd)| {
+            let sapling = match kind {
+                MetadataKind::Transparent => false,
+                MetadataKind::Sapling => true,
+                MetadataKind::Sprout => return None,
+            };
+            let position = legacy_position(&hd.keypath, sapling)?;
+            Some((sapling, id, &hd.seed_fp, position))
+        })
+    }
 }
 
 /// Verify the 5.x seed, and grade coverage from its chain record.
@@ -271,19 +292,16 @@ fn check_coverage(
     // the same record key — not merely a key record, which may be one that
     // could not be read or decrypted.
     let mut present: HashSet<(Chain, u32)> = HashSet::new();
-    for (sapling, rest, value) in &records.metadata {
-        let Some((keypath, fp)) = parse_key_metadata(value) else {
-            continue;
-        };
-        if &fp != seed_fp {
+    for (sapling, id, fp, position) in records.legacy_derivations() {
+        if fp != seed_fp {
             continue;
         }
-        let backed = if *sapling {
-            records.recovered.sapling.contains(rest)
+        let backed = if sapling {
+            records.recovered.sapling.contains(id)
         } else {
-            records.recovered.transparent.contains(rest)
+            records.recovered.transparent.contains(id)
         };
-        if let (true, Some(position)) = (backed, legacy_position(&keypath, *sapling)) {
+        if backed {
             present.insert(position);
         }
     }
@@ -346,25 +364,6 @@ fn verify_record(
     verify_phrase(serialized, &fp).map(|()| fp)
 }
 
-/// A key's metadata: its HD keypath and the fingerprint of the seed it came
-/// from. zcashd's `CKeyMetadata` (the same layout for `keymeta` and
-/// `sapzkeymeta`): `i32 version || i64 create_time || CompactSize keypath ||
-/// 32-byte seed fingerprint`; the HD fields exist from version 10.
-fn parse_key_metadata(value: &[u8]) -> Option<(String, [u8; 32])> {
-    let version = u32::from_le_bytes(value.get(..4)?.try_into().ok()?);
-    if version < 10 {
-        return None;
-    }
-    let rest = value.get(12..)?;
-    let (len, consumed) = compact_size(rest)?;
-    let end = consumed.checked_add(usize::try_from(len).ok()?)?;
-    let keypath = std::str::from_utf8(rest.get(consumed..end)?)
-        .ok()?
-        .to_owned();
-    let fp = rest.get(end..end.checked_add(32)?)?.try_into().ok()?;
-    Some((keypath, fp))
-}
-
 /// Where a legacy-account keypath puts a key: `m/44'/c'/2147483647'/{0,1}/i`
 /// for transparent, `m/32'/c'/2147483647'/i'` for Sapling. Anything else —
 /// an imported key's empty path, a unified account — is not a legacy
@@ -394,15 +393,10 @@ fn legacy_position(keypath: &str, sapling: bool) -> Option<(Chain, u32)> {
 /// seedless, Complete wallet. Reported once per seed, however many keys name
 /// it.
 fn push_orphaned_derivations(records: &SeedRecords, out: &mut ImportedKeys) {
-    let mut seeds = std::collections::BTreeSet::new();
-    for (sapling, _, value) in &records.metadata {
-        let Some((keypath, fp)) = parse_key_metadata(value) else {
-            continue;
-        };
-        if legacy_position(&keypath, *sapling).is_some() {
-            seeds.insert(fp);
-        }
-    }
+    let seeds: std::collections::BTreeSet<&[u8; 32]> = records
+        .legacy_derivations()
+        .map(|(_, _, fp, _)| fp)
+        .collect();
     for _ in seeds {
         out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
             record_type: "mnemonicphrase".to_owned(),
@@ -965,9 +959,7 @@ mod tests {
         p.retain(|(k, v)| {
             parse_record_key(k).is_none_or(|r| {
                 !matches!(r.record_type.as_str(), "keymeta" | "sapzkeymeta")
-                    || parse_key_metadata(v).is_none_or(|(path, _)| {
-                        legacy_position(&path, r.record_type == "sapzkeymeta").is_none()
-                    })
+                    || !String::from_utf8_lossy(v).contains("/2147483647'/")
             })
         });
         // The fixture's chain counts 104 derived keys (2 external, 101
