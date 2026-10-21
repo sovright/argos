@@ -141,7 +141,8 @@ struct Cli {
     birthday: Option<u32>,
 
     /// Wallet creation date (YYYY-MM-DD). Estimates the birthday height from
-    /// it, using lightwalletd. Overrides --birthday.
+    /// it, using lightwalletd. Overrides --birthday. Refused by `scan-sprout`,
+    /// which takes --birthday <height> alone.
     #[arg(long, global = true, conflicts_with = "birthday_auto_detect")]
     birthday_date: Option<String>,
 
@@ -152,7 +153,9 @@ struct Cli {
     /// the file's key creation times, which can reach before Sapling; when
     /// some keys are undated it asks lightwalletd for the earliest unspent
     /// output of the file's transparent keys, which is only an upper bound
-    /// on the wallet's age.
+    /// on the wallet's age -- unless a Sapling key is undated, in which case
+    /// there is no birthday and Sapling is scanned from activation. Refused
+    /// by `scan-sprout`.
     #[arg(long, global = true, conflicts_with = "birthday_date")]
     birthday_auto_detect: bool,
 
@@ -450,6 +453,25 @@ fn refuse_unconsumed_birthday_skip(cli: &Cli) -> Result<()> {
             "--no-birthday-skip is not used by this command: only `argos scan-sprout` skips \
              trial decryption."
         );
+    }
+    if matches!(cli.command, Commands::ScanSprout { .. }) {
+        // The Sprout decrypt floor comes from --birthday alone. These two
+        // would otherwise be accepted and ignored, leaving a user who meant
+        // to lower the floor believing they had.
+        let ignored = if cli.birthday_date.is_some() {
+            Some("--birthday-date")
+        } else if cli.birthday_auto_detect {
+            Some("--birthday-auto-detect")
+        } else {
+            None
+        };
+        if let Some(flag) = ignored {
+            bail!(
+                "{flag} is not used by `argos scan-sprout`. Its walk always starts at block 1; \
+                 to lower the block trial decryption starts from, pass --birthday <height>, or \
+                 --no-birthday-skip to decrypt every block."
+            );
+        }
     }
     Ok(())
 }

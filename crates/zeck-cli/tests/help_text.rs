@@ -60,6 +60,12 @@ fn top_level_help_matches_behaviour() {
     );
     // `collect_sprout_scan_keys` is its only reader.
     assert!(h.contains("Read only by `scan-sprout`"), "{h}");
+    // `refuse_unconsumed_birthday_skip` refuses the date and auto-detect
+    // flags on `scan-sprout`, which reads --birthday alone.
+    assert!(h.contains("Refused by `scan-sprout`"), "{h}");
+    // `needs_chain_fallback`: an undated Sapling key rules out the UTXO
+    // fallback, so Sapling is scanned from activation.
+    assert!(h.contains("unless a Sapling key is undated"), "{h}");
 }
 
 #[test]

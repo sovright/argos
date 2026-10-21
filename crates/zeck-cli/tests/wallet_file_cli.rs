@@ -958,6 +958,48 @@ fn no_birthday_skip_is_refused_where_nothing_is_skipped() {
     }
 }
 
+/// Kristi's #3 on #260: `scan-sprout` takes its decrypt floor from
+/// --birthday only. --birthday-date and --birthday-auto-detect were accepted
+/// and silently ignored, though the help says the date overrides --birthday;
+/// a user passing one would believe it lowered the floor. Refused before any
+/// network step.
+#[test]
+fn scan_sprout_refuses_birthday_date_and_auto_detect() {
+    let path = fixture(SPROUT_PLAINTEXT);
+    let wallet = path.to_str().expect("utf-8");
+    let dir = scratch_dir("scan-sprout-birthday-flags");
+    for flag in [
+        vec!["--birthday-date", "2017-01-01"],
+        vec!["--birthday-auto-detect"],
+    ] {
+        let mut args = vec![
+            "--wallet-file",
+            wallet,
+            "--accept-tos",
+            "--data-dir",
+            &dir,
+            "--lightwalletd-url",
+            "nonono",
+        ];
+        args.extend(flag.iter().copied());
+        args.extend(["scan-sprout", "--destination", "zs1x"]);
+        let (status, stderr) = argos_with_deadline(&args, 20);
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "{flag:?} must be refused:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("{} is not used by `argos scan-sprout`", flag[0])),
+            "{flag:?}: got:\n{stderr}"
+        );
+        assert!(stderr.contains("--birthday <height>"), "{stderr}");
+        assert!(
+            !stderr.contains("Trial decryption"),
+            "refused before the plan is stated:\n{stderr}"
+        );
+    }
+}
+
 /// Kristi's #1 on #260, CLI paste route: a `--sapling-key-file` key has no
 /// creation time and could hold notes from any height after activation. The
 /// file's dated transparent keys must not let a transparent output decide
