@@ -347,8 +347,10 @@
                 <hr />
                 <p><strong>Move these funds now</strong></p>
                 <p class="muted">
-                  No scan is needed — the note data is in this file. The destination must
-                  have a Sapling receiver.
+                  Argos checks any saved transaction before creating a new one. Keep the
+                  original wallet file and private scan checkpoint until every transaction
+                  is freshly confirmed mined. New transactions require recovered note data,
+                  and the destination must have a Sapling receiver.
                 </p>
                 <label for="sprout-destination">Destination address</label>
                 <input
@@ -364,7 +366,7 @@
                 <p id="sprout-sweep-spent-status" class="muted"></p>
                 <label class="checkbox-row">
                   <input type="checkbox" id="sprout-sweep-confirm" disabled />
-                  I understand this moves funds and cannot be undone.
+                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
                 </label>
                 <button id="sprout-sweep-run" type="button" disabled>
                   Sweep Sprout funds
@@ -488,7 +490,7 @@
                 <p id="sprout-scan-sweep-plan" class="muted"></p>
                 <label class="checkbox-row">
                   <input type="checkbox" id="sprout-scan-confirm" disabled />
-                  I understand this moves funds and cannot be undone.
+                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
                 </label>
                 <button id="sprout-scan-sweep-run" type="button" disabled>Sweep found funds</button>
                 <ul id="sprout-scan-sweep-results" class="session-list"></ul>

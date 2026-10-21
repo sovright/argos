@@ -447,10 +447,19 @@ function invalidateWalletSproutReview() {
   $("sprout-sweep-confirm").checked = false;
   $("sprout-sweep-confirm").disabled = true;
   $("sprout-sweep-run").disabled = true;
+  $("sprout-sweep-run").textContent = "Sweep Sprout funds";
+}
+
+function sproutReviewHasLifecycleStatus(review) {
+  return (review?.active ?? []).length > 0 || (review?.mined ?? []).length > 0;
+}
+
+function sproutReviewMayRun(review) {
+  return !!review && (sproutReviewHasLifecycleStatus(review) || review.params_present === true);
 }
 
 function updateWalletSproutSweepButton() {
-  $("sprout-sweep-run").disabled = !walletSproutReview ||
+  $("sprout-sweep-run").disabled = !sproutReviewMayRun(walletSproutReview) ||
     walletSproutReviewDestination !== $("sprout-destination").value.trim() ||
     !walletSproutConfigMatches(walletSproutReviewConfig) ||
     sproutPreviewWallet !== walletFile || !$("sprout-sweep-confirm").checked ||
@@ -526,12 +535,20 @@ function renderWalletSummary(summary) {
 
   if (summary.sprout_keys > 0) {
     const recoverable = summary.sprout_spendable_notes > 0;
+    const hasLifecycleStatus = summary.sprout_has_lifecycle_status === true;
     if (recoverable) {
       sproutHeadline.textContent = "Sprout funds were recovered from this file.";
       sproutDetail.textContent =
         ` ${summary.sprout_spendable_notes} note(s), ` +
         `${fmt(summary.sprout_spendable_zatoshis)}. No scan is needed — the ` +
         `note data was in the wallet file itself.`;
+      showSproutSweep();
+    } else if (hasLifecycleStatus) {
+      sproutHeadline.textContent = "Sprout transaction status is available for this file.";
+      sproutDetail.textContent =
+        " Check the saved transaction before creating another. Keep the original" +
+        " wallet file and private scan checkpoint until fresh canonical evidence" +
+        " shows every transaction mined.";
       showSproutSweep();
     } else if (summary.sprout_nothing_left) {
       // Not a case for the scan: the file holds the note data, and every
@@ -728,6 +745,7 @@ async function showSproutSweep() {
   $("sprout-sweep-plan").textContent = "";
   $("sprout-sweep-pool").textContent = "";
   $("sprout-sweep-params").textContent = "";
+  $("sprout-sweep-run").textContent = "Sweep Sprout funds";
   if (!source) return;
   const panel = $("wallet-sprout-sweep");
   panel.hidden = false;
@@ -767,9 +785,15 @@ async function showSproutSweep() {
       showSproutNu7Warning(preview.nu7_warning);
     }
 
-    $("sprout-sweep-plan").textContent =
-      `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
-      `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.` +
+    const lifecycleCount = (preview.active ?? []).length + (preview.mined ?? []).length;
+    const readyPlan = preview.notes > 0
+      ? `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
+        `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.`
+      : "No note is ready for a new transaction.";
+    const lifecyclePlan = lifecycleCount > 0
+      ? ` ${lifecycleCount} saved transaction(s) will be checked first.`
+      : "";
+    $("sprout-sweep-plan").textContent = readyPlan + lifecyclePlan +
       // Keys dropped as forged, in inspect's words: the quote is for the
       // genuine keys' notes only, and says why the rest are not in it.
       (preview.warnings ?? []).map((warning) => ` ${warning}`).join("");
@@ -781,8 +805,17 @@ async function showSproutSweep() {
 
     // Said before the user commits, not discovered halfway through: without
     // the parameters the sweep cannot start at all.
-    if (preview.params_present) {
+    const canCheckLifecycle = sproutReviewHasLifecycleStatus(preview);
+    $("sprout-sweep-run").textContent = canCheckLifecycle
+      ? "Check status and continue"
+      : "Sweep Sprout funds";
+    if (sproutReviewMayRun(preview)) {
       $("sprout-sweep-params").textContent = "";
+      if (!preview.params_present) {
+        $("sprout-sweep-params").textContent =
+          "Sprout proving parameters are missing. Saved transaction status and exact-byte " +
+          "retries can still be checked; a new transaction cannot be proved.";
+      }
       sproutPreviewWallet = source;
       walletSproutReview = preview;
       walletSproutReviewDestination = destination;
@@ -838,7 +871,9 @@ async function runSproutSweep() {
     $("sprout-sweep-results").innerHTML = "";
     setStatus(
       "sprout-sweep-status",
-      "Proving… this takes a few minutes per note and cannot be interrupted safely.",
+      sproutReviewHasLifecycleStatus(walletSproutReview)
+        ? "Checking saved transaction status before any new proof…"
+        : "Proving… this takes a few minutes per note and cannot be interrupted safely.",
       "",
     );
 
@@ -848,76 +883,14 @@ async function runSproutSweep() {
 
     const list = $("sprout-sweep-results");
     const nu7Refresh = noteSproutBroadcast(report);
-    for (const sent of report.sent) {
-      const li = document.createElement("li");
-      li.textContent = `${fmt(sent.value_swept)} — ${sent.txid}`;
-      list.appendChild(li);
-    }
-    // Skipped notes are shown, not summarised away: a user seeing less than
-    // expected needs to know which notes stayed behind and why.
-    for (const reason of report.skipped ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent = `not swept — ${reason}`;
-      list.appendChild(li);
-    }
-    // Refused notes are listed: the sweep carried on past each, and a user
-    // must be able to see which moved and which did not.
-    for (const reason of report.rejected ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent = reason;
-      list.appendChild(li);
-    }
-    for (const held of report.already_held ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent =
-        `${fmt(held.value_swept)} — ${held.txid}: the node already holds this transaction. ` +
-        `Not counted as swept until it is mined; if it never is, sweeping again retries it.`;
-      list.appendChild(li);
-    }
-    for (const warning of report.warnings ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent = warning;
-      list.appendChild(li);
-    }
-
-    const refused = (report.rejected ?? []).length;
-    const skipped = (report.skipped ?? []).length;
-    // A sweep that stopped partway is shown as stopped, with the reason —
-    // never as a green tick over what did go through.
-    if (report.error) {
-      setStatus(
-        "sprout-sweep-status",
-        `✗ The sweep did not finish: ${report.error} Swept ${fmt(report.total_swept)} ` +
-          `before it stopped.`,
-        "error",
-      );
-    } else {
-      setStatus(
-        "sprout-sweep-status",
-        `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
-          (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
-        "success",
-      );
-    }
-    // Those funds have moved, so the later screens should stop warning
-    // about them. Left standing it would become noise, and a warning people
-    // learn to ignore is worse than none — but only clear it when the sweep
-    // actually finished, since a partial one leaves notes behind, and a
-    // refused note may not have been spent at all.
-    if (sweepLeftNothingBehind(report)) {
+    renderSproutSweepReport(report, {
+      list,
+      statusId: "sprout-sweep-status",
+      destination,
+    });
+    if (sproutSourceWarningMayClear(report)) {
       uncoveredSproutKeys = 0;
       renderSproutUncoveredBanners();
-    }
-    if (report.landed_in_unified_sapling) {
-      const li = document.createElement("li");
-      li.textContent =
-        "These funds are in the Sapling receiver of that unified address. " +
-        "To finish moving them to Orchard, shield them from within your own wallet.";
-      list.appendChild(li);
     }
     await nu7Refresh;
   } catch (err) {
@@ -1020,29 +993,146 @@ async function refreshWalletSproutNu7Warning() {
   renderSproutUncoveredBanners();
 }
 
-/// After a Sprout sweep: once anything was broadcast, switch the warning to
-/// "broadcast, but must be mined before activation". A scan sweep also
-/// switches the scan panel's own alert, which outlives the wallet file.
+/// After a Sprout submission could have reached the network, switch the
+/// warning to "broadcast, but must be mined before activation". A scan sweep
+/// also switches the scan panel's own alert, which outlives the wallet file.
 function noteSproutBroadcast(report, fromScan = false) {
-  if ((report.sent ?? []).length === 0) return;
+  const mayHaveBeenBroadcast = (report.transactions ?? []).some((transaction) =>
+    ["pending", "submission_unknown", "mined"].includes(transaction.state));
+  if (!mayHaveBeenBroadcast) return;
   sproutNu7Broadcast = true;
   if (fromScan) sproutScanNu7Broadcast = true;
   return refreshSproutNu7Warning();
 }
 
-/// Whether a Sprout sweep left nothing behind, so the "keep the original
-/// wallet file" caveat may go. Shared by both sweep handlers so they cannot
-/// drift: it goes only if something was sent and nothing stopped the sweep,
-/// was refused, or was skipped — a refused note may not be spent at all, and
-/// a sweep that sent nothing moved nothing.
-function sweepLeftNothingBehind(report) {
+/// Fresh canonical mined evidence is the only basis for clearing the source
+/// warning. The checks around the backend's aggregate flag fail closed if the
+/// payload is incomplete or internally inconsistent.
+function sproutSourceWarningMayClear(report) {
+  const transactions = report?.transactions;
   return (
-    (report.sent ?? []).length > 0 &&
+    report?.fresh_all_mined === true &&
+    Array.isArray(transactions) &&
+    transactions.length > 0 &&
+    transactions.every((transaction) =>
+      transaction?.state === "mined" &&
+      Number.isInteger(transaction.mined_height) &&
+      transaction.mined_height >= 0) &&
     !report.error &&
     (report.rejected ?? []).length === 0 &&
     (report.skipped ?? []).length === 0 &&
-    (report.already_held ?? []).length === 0
+    (report.ready ?? []).length === 0 &&
+    (report.ready_notes ?? []).length === 0
   );
+}
+
+function sproutLifecycleAmount(transaction) {
+  return transaction.value_zatoshis == null
+    ? "amount unknown"
+    : fmt(transaction.value_zatoshis);
+}
+
+function sproutLifecycleRow(transaction) {
+  const subject = `${sproutLifecycleAmount(transaction)} — ${transaction.txid}`;
+  switch (transaction.state) {
+    case "pending":
+      return `${subject}: broadcast pending; it is not mined. Keep the source and checkpoint.`;
+    case "submission_unknown":
+      return `${subject}: submission status unknown; it may have reached the network. ` +
+        "Later notes were not attempted. Keep the source and checkpoint.";
+    case "mined":
+      return transaction.mined_height == null
+        ? `${subject}: mined; the block height was not reported.`
+        : `${subject}: mined at block ${Number(transaction.mined_height).toLocaleString()}.`;
+    case "expired":
+      return `${subject}: expired without canonical mined confirmation. ` +
+        "Recover or rescan the note before creating a replacement.";
+    case "rejected":
+      return `${subject}: rejected. Recover or rescan the note before creating a replacement.`;
+    case "not_submitted":
+      return `${subject}: saved but not submitted. No funds were moved.`;
+    default:
+      return `${subject}: lifecycle status is unknown. Keep the source and checkpoint.`;
+  }
+}
+
+/// Shared by wallet-file and saved-scan execution. No lifecycle state is
+/// translated into "swept": pending and uncertain submissions remain open,
+/// and only a fresh all-mined report receives a green completion status.
+function renderSproutSweepReport(report, { list, statusId, destination, statusPrefix = "" }) {
+  // The reviewed destination is intentionally not repeated in lifecycle
+  // results: a saved raw transaction may predate the value now in the form.
+  void destination;
+  const transactions = Array.isArray(report?.transactions) ? report.transactions : [];
+  for (const transaction of transactions) {
+    const li = document.createElement("li");
+    li.className = transaction.state === "mined" ? "" : "muted";
+    li.textContent = sproutLifecycleRow(transaction);
+    list.appendChild(li);
+  }
+  for (const reason of report?.skipped ?? []) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = `not moved — ${reason}`;
+    list.appendChild(li);
+  }
+  for (const reason of report?.rejected ?? []) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = `rejected — ${reason} Recover or rescan before creating a replacement.`;
+    list.appendChild(li);
+  }
+  for (const warning of report?.warnings ?? []) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = warning;
+    list.appendChild(li);
+  }
+
+  const count = (state) => transactions.filter((transaction) => transaction.state === state).length;
+  const unknown = count("submission_unknown");
+  const pending = count("pending");
+  const expired = count("expired");
+  const rejected = count("rejected") + (report?.rejected ?? []).length;
+  const mined = count("mined");
+  let text;
+  let kind = "";
+  if (report?.error) {
+    text = `✗ The sweep did not finish: ${report.error} ` +
+      "Reconcile every saved transaction before another proposal.";
+    kind = "error";
+  } else if (unknown > 0) {
+    text = `Submission status unknown for ${unknown} transaction(s). ` +
+      "Later notes were not attempted; reconcile this transaction before continuing.";
+    kind = "error";
+  } else if (pending > 0) {
+    text = `${pending} transaction(s) broadcast pending. They are not mined; check status again.`;
+  } else if (expired > 0 || rejected > 0) {
+    text = `${expired + rejected} transaction(s) need recovery or a rescan before replacement.`;
+  } else if (sproutSourceWarningMayClear(report)) {
+    const allAmountsKnown = transactions.every((transaction) => transaction.value_zatoshis != null);
+    const hasKnownTotal = Number.isSafeInteger(report.mined_zatoshis) && report.mined_zatoshis >= 0;
+    text = allAmountsKnown && hasKnownTotal
+      ? `✓ Mined ${fmt(report.mined_zatoshis)}. Fresh canonical evidence covers every transaction.`
+      : `✓ All ${mined} transaction(s) mined. ` +
+        "Fresh canonical evidence covers every transaction; an amount was not recorded.";
+    kind = "success";
+  } else if (mined > 0) {
+    text = `${mined} transaction(s) appear mined, but fresh canonical evidence does not cover every transaction.`;
+  } else {
+    text = "No transaction reached fresh canonical mined status. Keep the source and checkpoint.";
+  }
+  setStatus(statusId, `${statusPrefix}${text}`, kind);
+
+  if (report?.landed_in_unified_sapling) {
+    const li = document.createElement("li");
+    li.textContent = sproutSourceWarningMayClear(report)
+      ? "The mined funds are in the Sapling receiver of that unified address. " +
+        "To move them to Orchard, shield them from within your own wallet."
+      : "If mined, these funds land in the Sapling receiver of that unified address. " +
+        "Wait for canonical confirmation before moving them again.";
+    list.appendChild(li);
+  }
 }
 
 function noteUncoveredSproutKeys(summary) {
@@ -1388,11 +1478,12 @@ function invalidateSproutScanReview() {
   $("sprout-scan-confirm").checked = false;
   $("sprout-scan-confirm").disabled = true;
   $("sprout-scan-sweep-run").disabled = true;
+  $("sprout-scan-sweep-run").textContent = "Sweep found funds";
 }
 
 function updateSproutScanSweepButton() {
   $("sprout-scan-sweep-run").disabled = !sproutScanResult || !sproutScanReview ||
-    !sproutScanReview.params_present ||
+    !sproutReviewMayRun(sproutScanReview) ||
     sproutScanReviewDestination !== $("sprout-scan-destination").value.trim() ||
     !$("sprout-scan-confirm").checked || sproutScanExecutionPending;
 }
@@ -1461,13 +1552,24 @@ async function refreshSproutScanReview() {
     }
     sproutScanReview = review;
     sproutScanReviewDestination = destination;
+    const lifecycleCount = (review.active ?? []).length + (review.mined ?? []).length;
     $("sprout-scan-sweep-plan").textContent =
-      `${review.notes} note(s): ${fmt(review.gross_zatoshis)} gross, ` +
-      `${fmt(review.fee_zatoshis)} fee, ${fmt(review.net_zatoshis)} to your address. ` +
+      (review.notes > 0
+        ? `${review.notes} note(s): ${fmt(review.gross_zatoshis)} gross, ` +
+          `${fmt(review.fee_zatoshis)} fee, ${fmt(review.net_zatoshis)} to your address. `
+        : "No note is ready for a new transaction. ") +
+      (lifecycleCount > 0 ? `${lifecycleCount} saved transaction(s) will be checked first. ` : "") +
       `${review.lands_in_sapling}`;
-    $("sprout-scan-confirm").disabled = !review.params_present;
+    const canCheckLifecycle = sproutReviewHasLifecycleStatus(review);
+    $("sprout-scan-sweep-run").textContent = canCheckLifecycle
+      ? "Check status and continue"
+      : "Sweep found funds";
+    $("sprout-scan-confirm").disabled = !sproutReviewMayRun(review);
     if (!review.params_present) {
-      $("sprout-scan-sweep-plan").textContent += ` Sprout proving parameters are missing: ${review.params_path}`;
+      $("sprout-scan-sweep-plan").textContent += canCheckLifecycle
+        ? " Sprout proving parameters are missing. Saved transaction status and exact-byte retries " +
+          "can still be checked; a new transaction cannot be proved."
+        : ` Sprout proving parameters are missing: ${review.params_path}`;
     }
     updateSproutScanSweepButton();
   } catch (err) {
@@ -1692,7 +1794,7 @@ async function runSproutScanSweep() {
     return;
   }
   if (!sproutScanHandle || !sproutScanResult || !sproutScanReview ||
-      !sproutScanReview.params_present ||
+      !sproutReviewMayRun(sproutScanReview) ||
       sproutScanReviewDestination !== destination || !$("sprout-scan-confirm").checked) {
     setStatus(
       "sprout-scan-status",
@@ -1720,7 +1822,9 @@ async function runSproutScanSweep() {
   list.innerHTML = "";
   setStatus(
     "sprout-scan-status",
-    "Proving… a few minutes per note. Do not close the app.",
+    sproutReviewHasLifecycleStatus(sproutScanReview)
+      ? "Checking saved transaction status before any new proof…"
+      : "Proving… a few minutes per note. Do not close the app.",
     "",
   );
 
@@ -1736,75 +1840,20 @@ async function runSproutScanSweep() {
       const li = document.createElement("li");
       li.className = "muted";
       li.textContent =
-        "This result belongs to the earlier Sprout scan, swept before its keys or settings changed.";
+        "This result belongs to the earlier Sprout scan started before its keys or settings changed.";
       list.appendChild(li);
     }
 
-    noteSproutBroadcast(report, true);
-    for (const sent of report.sent) {
-      const li = document.createElement("li");
-      li.textContent = `${fmt(sent.value_swept)} — ${sent.txid}`;
-      list.appendChild(li);
-    }
-    for (const reason of report.skipped ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent = `not swept — ${reason}`;
-      list.appendChild(li);
-    }
-    // Refused notes are listed: the sweep carried on past each, and a user
-    // must be able to see which moved and which did not.
-    for (const reason of report.rejected ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent = reason;
-      list.appendChild(li);
-    }
-    for (const held of report.already_held ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent =
-        `${fmt(held.value_swept)} — ${held.txid}: the node already holds this transaction. ` +
-        `Not counted as swept until it is mined; if it never is, sweeping again retries it.`;
-      list.appendChild(li);
-    }
-    for (const warning of report.warnings ?? []) {
-      const li = document.createElement("li");
-      li.className = "muted";
-      li.textContent = warning;
-      list.appendChild(li);
-    }
-    if (report.landed_in_unified_sapling) {
-      const li = document.createElement("li");
-      li.textContent =
-        "These funds are in the Sapling receiver of that unified address. " +
-        "To finish moving them to Orchard, shield them from within your own wallet.";
-      list.appendChild(li);
-    }
-
-    if (report.error) {
-      // The transactions listed above are already broadcast. Saying "failed"
-      // without them would send someone hunting for funds that have moved.
-      const li = document.createElement("li");
-      li.textContent =
-        `The sweep stopped: ${report.error} ` +
-        (report.sent.length
-          ? `The ${report.sent.length} transaction(s) above were already broadcast and cannot be undone.`
-          : "");
-      list.appendChild(li);
-      setStatus("sprout-scan-status", `${prefix}✗ The sweep did not finish.`, "error");
-    } else {
-      const refused = (report.rejected ?? []).length;
-      setStatus(
-        "sprout-scan-status",
-        `${prefix}✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
-          (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
-        "success",
-      );
-      if (sweepLeftNothingBehind(report)) {
-        uncoveredSproutKeys = 0;
-        renderSproutUncoveredBanners();
-      }
+    if (!earlier) noteSproutBroadcast(report, true);
+    renderSproutSweepReport(report, {
+      list,
+      statusId: "sprout-scan-status",
+      destination,
+      statusPrefix: prefix,
+    });
+    if (!earlier && sproutSourceWarningMayClear(report)) {
+      uncoveredSproutKeys = 0;
+      renderSproutUncoveredBanners();
     }
   } catch (err) {
     // Execution refuses only when nothing was broadcast; still say so, for
