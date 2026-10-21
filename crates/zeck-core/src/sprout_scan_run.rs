@@ -2659,19 +2659,21 @@ mod tests {
 
     #[test]
     fn a_legacy_covering_scan_is_reported_but_not_used() {
-        let dir = ScratchDir::new("legacy-superset");
-        let (a, b) = ([0x31; 32], [0x32; 32]);
-        let path = write_scan(&dir.0, &[a, b], 3_000_000, true);
-        let mut old_bytes = std::fs::read(&path).unwrap();
-        old_bytes[2] = 2;
-        std::fs::write(&path, &old_bytes).unwrap();
+        for legacy in [2u8, 3] {
+            let dir = ScratchDir::new(&format!("legacy-superset-v{legacy}"));
+            let (a, b) = ([0x31; 32], [0x32; 32]);
+            let path = write_scan(&dir.0, &[a, b], 3_000_000, true);
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
 
-        let (chain, notice) = chain_spends_for_wallet(&dir.0, P2pNetwork::Mainnet, &[a]);
-        assert!(chain.is_none());
-        let notice = notice.expect("old covering scan must be reported");
-        assert!(notice.contains("fresh scan"), "{notice}");
-        assert!(notice.contains(&path.display().to_string()), "{notice}");
-        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+            let (chain, notice) = chain_spends_for_wallet(&dir.0, P2pNetwork::Mainnet, &[a]);
+            assert!(chain.is_none(), "v{legacy}");
+            let notice = notice.expect("old covering scan must be reported");
+            assert!(notice.contains("fresh scan"), "{notice}");
+            assert!(notice.contains(&path.display().to_string()), "{notice}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
     }
 
     /// #240 finding 9, remaining half: opening a wallet asks for the scan
@@ -2867,19 +2869,21 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_v2_checkpoint_cannot_answer_wallet_file_spends() {
-        let dir = ScratchDir::new("legacy-spends");
-        let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
-        save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
-        let mut old_bytes = std::fs::read(&path).unwrap();
-        old_bytes[2] = 2;
-        std::fs::write(&path, &old_bytes).unwrap();
+    fn a_legacy_checkpoint_cannot_answer_wallet_file_spends() {
+        for legacy in [2u8, 3] {
+            let dir = ScratchDir::new(&format!("legacy-spends-v{legacy}"));
+            let keys = [[0x11; 32]];
+            let path = checkpoint_path(&dir.0, &keys);
+            save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
 
-        let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
-            .expect_err("v2 nullifiers predate body authentication");
-        assert!(err.to_string().contains("fresh scan"), "{err}");
-        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+            let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+                .expect_err("pre-v4 nullifiers predate body authentication");
+            assert!(err.to_string().contains("fresh scan"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
     }
 
     /// Kristi, #240 #10: the revealing txid is carried to the caller, so a
