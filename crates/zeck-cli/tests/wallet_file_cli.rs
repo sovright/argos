@@ -1000,6 +1000,46 @@ fn scan_sprout_refuses_birthday_date_and_auto_detect() {
     }
 }
 
+/// Kristi's test gap on #260: `scan` and `sweep` must land on the same
+/// birthday, or they key different workspaces. For a fully dated wallet.dat
+/// detection is offline and deterministic, so the two agree; the
+/// chain-dependent fallback is tracked separately.
+#[test]
+fn scan_and_sweep_auto_detect_the_same_birthday() {
+    let dir = std::env::temp_dir().join(format!("argos-scan-sweep-bday-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let destination = test_vector_sapling_address(&dir);
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let base = [
+        "--wallet-file",
+        wallet.to_str().expect("utf-8"),
+        "--data-dir",
+        dir.to_str().expect("utf-8"),
+        "--accept-tos",
+        "--birthday-auto-detect",
+        "--lightwalletd-url",
+        "nonono",
+    ];
+    let birthday_line = |stderr: &str| -> String {
+        stderr
+            .lines()
+            .find(|l| l.contains("Birthday: block "))
+            .unwrap_or_else(|| panic!("no birthday line:\n{stderr}"))
+            .to_owned()
+    };
+
+    let mut scan = base.to_vec();
+    scan.push("scan");
+    let (_, scan_stderr) = argos_with_deadline(&scan, 20);
+
+    let mut sweep = base.to_vec();
+    sweep.extend(["sweep", "--destination", &destination, "--dry-run"]);
+    let (_, sweep_stderr) = argos_with_deadline(&sweep, 20);
+
+    assert_eq!(birthday_line(&scan_stderr), birthday_line(&sweep_stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Kristi's #1 on #260, CLI paste route: a `--sapling-key-file` key has no
 /// creation time and could hold notes from any height after activation. The
 /// file's dated transparent keys must not let a transparent output decide
