@@ -109,7 +109,9 @@ use crate::{
         pool::{connect_to_any_except, PoolError, PEER_RECONNECT_DELAY},
         wire::P2pNetwork,
     },
-    sprout_scan::{ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner},
+    sprout_scan::{
+        CheckpointError, ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner,
+    },
 };
 use zcash_protocol::consensus::BranchId;
 
@@ -301,12 +303,13 @@ fn load_checkpoint(
         _ => (None, bytes),
     };
     let checkpoint = SproutScanCheckpoint::from_bytes(body);
-    let resumed = SproutScanner::resume(&checkpoint).map_err(|err| {
-        ZeckError::TransactionBuild(format!(
+    let resumed = SproutScanner::resume(&checkpoint).map_err(|err| match err {
+        CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(checkpoint_file),
+        _ => ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} could not be read ({err}). Delete it to \
              start a fresh scan, or restore a good copy — it holds hours of work.",
             checkpoint_file.display()
-        ))
+        )),
     })?;
 
     // The checkpoint must be for *these* keys. The default path is
@@ -340,6 +343,16 @@ fn load_checkpoint(
         )));
     }
     Ok(Some(resumed))
+}
+
+fn legacy_checkpoint_error(path: &Path) -> ZeckError {
+    ZeckError::TransactionBuild(format!(
+        "the scan checkpoint at {} predates Sprout block-body authentication and cannot \
+         be trusted for resume or spend evidence. Preserve this file and the original \
+         spending-key source; start a fresh scan in a new data directory or move this \
+         checkpoint aside first.",
+        path.display()
+    ))
 }
 
 /// Read a checkpoint file. `Ok(None)` only when there is no file: any other
@@ -418,18 +431,20 @@ pub fn lookup_chain_spends(
     let [NETWORK_TAGGED, tag, body @ ..] = bytes.as_slice() else {
         return Err(ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} does not record its network, so its spends \
-             cannot be trusted for this one. It was written by an older Argos; running \
-             the scan again updates it.",
+             cannot be trusted for this one. Preserve the file and the original \
+             spending-key source; start a fresh scan in a new data directory or \
+             move this checkpoint aside first.",
             path.display()
         )));
     };
     let evidence =
         crate::sprout_scan::read_chain_evidence(&SproutScanCheckpoint::from_bytes(body.to_vec()))
-            .map_err(|err| {
-            ZeckError::TransactionBuild(format!(
+            .map_err(|err| match err {
+            CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(&path),
+            _ => ZeckError::TransactionBuild(format!(
                 "the scan checkpoint at {} could not be read ({err}).",
                 path.display()
-            ))
+            )),
         })?;
     if evidence.spending_keys != scan_key_set(spending_keys, &[]) {
         return Err(ZeckError::TransactionBuild(format!(
@@ -2322,6 +2337,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_legacy_covering_scan_is_reported_but_not_used() {
+        let dir = ScratchDir::new("legacy-superset");
+        let (a, b) = ([0x31; 32], [0x32; 32]);
+        let path = write_scan(&dir.0, &[a, b], 3_000_000, true);
+        let mut old_bytes = std::fs::read(&path).unwrap();
+        old_bytes[2] = 2;
+        std::fs::write(&path, &old_bytes).unwrap();
+
+        let (chain, notice) = chain_spends_for_wallet(&dir.0, P2pNetwork::Mainnet, &[a]);
+        assert!(chain.is_none());
+        let notice = notice.expect("old covering scan must be reported");
+        assert!(notice.contains("fresh scan"), "{notice}");
+        assert!(notice.contains(&path.display().to_string()), "{notice}");
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    }
+
     /// #240 finding 9, remaining half: opening a wallet asks for the scan
     /// twice (inspection, then preview). The second is served from memory
     /// until the file changes.
@@ -2490,6 +2522,40 @@ mod tests {
         assert!(chain.nullifiers.contains_key(&[0x99; 32]));
         assert!(chain.nullifiers.contains_key(&[0x72; 32]));
         assert_eq!(chain.scanned_to, 2_000_000);
+    }
+
+    #[test]
+    fn a_legacy_v2_checkpoint_cannot_resume_a_scan() {
+        let dir = ScratchDir::new("legacy-resume");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+        let mut old_bytes = std::fs::read(&path).unwrap();
+        old_bytes[2] = 2;
+        std::fs::write(&path, &old_bytes).unwrap();
+
+        let err = match load_checkpoint(&path, P2pNetwork::Mainnet, &keys) {
+            Err(err) => err,
+            Ok(_) => panic!("v2 state predates body authentication"),
+        };
+        assert!(err.to_string().contains("fresh scan"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn a_legacy_v2_checkpoint_cannot_answer_wallet_file_spends() {
+        let dir = ScratchDir::new("legacy-spends");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+        let mut old_bytes = std::fs::read(&path).unwrap();
+        old_bytes[2] = 2;
+        std::fs::write(&path, &old_bytes).unwrap();
+
+        let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+            .expect_err("v2 nullifiers predate body authentication");
+        assert!(err.to_string().contains("fresh scan"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
     }
 
     /// Kristi, #240 #10: the revealing txid is carried to the caller, so a
