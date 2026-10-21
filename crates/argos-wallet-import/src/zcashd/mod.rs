@@ -234,6 +234,51 @@ mod tests {
     }
 
     #[test]
+    fn recognized_zcashd_without_spend_authority_is_key_material_missing() {
+        // One valid BDB leaf containing only a zcashd `version` metadata
+        // record. The container and record parse cleanly but have no keys.
+        let mut bytes = vec![0u8; 1024];
+        bytes[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&512u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&1u32.to_le_bytes());
+        let page = 512;
+        bytes[page + 20..page + 22].copy_from_slice(&2u16.to_le_bytes());
+        bytes[page + 25] = bdb::PAGE_TYPE_LBTREE;
+        let key = b"\x07version";
+        let value = 1u32.to_le_bytes();
+        for (slot, offset, data) in [(0, 40u16, key.as_slice()), (1, 60, value.as_slice())] {
+            let index = page + 26 + slot * 2;
+            bytes[index..index + 2].copy_from_slice(&offset.to_le_bytes());
+            let start = page + usize::from(offset);
+            bytes[start..start + 2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+            bytes[start + 2] = 1; // BDB key/data leaf entry
+            bytes[start + 3..start + 3 + data.len()].copy_from_slice(data);
+        }
+
+        let walk = bdb::walk(&bytes).expect("metadata-only BDB must parse");
+        assert_eq!(walk.records.len(), 1);
+        assert_eq!(
+            parse_record_key(&walk.records[0].0).unwrap().record_type,
+            "version"
+        );
+        assert!(walk.diagnostics.is_empty());
+
+        let keys = import_zcashd(&bytes, None).unwrap();
+        assert!(keys.is_empty());
+        assert!(keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ImportDiagnostic::MissingSpendAuthority {
+                format: "Berkeley DB"
+            }
+        )));
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::KeyMaterialMissing
+        );
+    }
+
+    #[test]
     fn detects_which_wallets_need_a_passphrase() {
         assert!(needs_passphrase(&read("modern-encrypted")).unwrap());
         assert!(needs_passphrase(&read("sprout-encrypted")).unwrap());
