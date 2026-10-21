@@ -3945,6 +3945,7 @@ mod propose_workspace_guard_tests {
         keys.transparent.push(TransparentKey {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
+            created_at: None,
         });
         assert_eq!(
             crate::key_source::classify_recovery_route(&keys),

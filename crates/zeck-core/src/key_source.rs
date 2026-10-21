@@ -336,6 +336,7 @@ mod tests {
         keys.transparent.push(TransparentKey {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
+            created_at: None,
         });
         let one = ImportedKeySource::new(keys);
 
@@ -357,6 +358,7 @@ mod tests {
             sapling: vec![SaplingKey {
                 extsk: Secret::new(vec![0x11; 169]),
                 provenance: Provenance::Standalone,
+                created_at: None,
             }],
             ..Default::default()
         };
@@ -366,6 +368,7 @@ mod tests {
             sapling: vec![SaplingKey {
                 extsk: Secret::new(vec![0x99; 169]),
                 provenance: Provenance::Standalone,
+                created_at: None,
             }],
             ..Default::default()
         };
@@ -456,6 +459,7 @@ mod tests {
         keys.transparent.push(TransparentKey {
             secret: Secret::new([0x42; 32]),
             provenance: Provenance::Standalone,
+            created_at: None,
         });
         let source = ImportedKeySource::new(keys);
 

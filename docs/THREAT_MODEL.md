@@ -145,7 +145,7 @@ Where the two unavoidably touch — for example, an asset in the model (§3) ref
 
 In rough priority order:
 
-1. **The 24-word seed phrase.** Sole authority to spend any funds derivable from it.
+1. **The seed phrase** (12 to 24 words). Sole authority to spend any funds derivable from it.
 2. **The user's wallet file.** A single artifact containing every spending key the wallet ever held, including standalone keys imported with `z_importkey` that appear in no seed. For a zcashd user this is a higher-value asset than a seed phrase, because a seed cannot reconstruct it.
 3. **Standalone spending-key files and pasted keys.** A Sapling or Sprout spending key is direct authority over one legacy address and must be protected like a seed.
 4. **The Sprout scan checkpoint.** Contains raw Sprout spending keys, recovered note plaintexts, witnesses, and the commitment-tree cursor. It is spend-capable, not merely scan metadata.

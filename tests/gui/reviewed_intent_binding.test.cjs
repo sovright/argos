@@ -327,6 +327,16 @@ function flowHarness() {
     // exercised by the dedicated wallet and scan VM suites.
     invalidateWalletSproutReview() {},
     invalidateSproutScanSource() {},
+    // Main's raw-key Sprout panel (#273) and scan banner: owned by their own
+    // suites, stubbed here so the ordinary-flow slices load.
+    hasTypedSproutScanText() { return false; },
+    renderSproutScanPanel() {},
+    forgetSproutScanInputs() {
+      for (const id of ["sprout-scan-keys", "sprout-scan-destination"]) $(id).value = "";
+    },
+    showScanWarning() {},
+    scanWarningVariant() { return "shielded"; },
+    birthdayTouched: false,
     updateTransparentScanSummary() {}, clearMatchedRecoveryUi() {},
     goTo() {}, updateScanUI(progress) { state.lastProgress = progress; },
     notifyScanComplete() {},

@@ -51,6 +51,60 @@ const ACTIONS_PER_SWEEP: u64 = 2 + 2;
 /// The fee for a one-JoinSplit Sprout sweep.
 pub const SPROUT_SWEEP_FEE: u64 = ACTIONS_PER_SWEEP * ZAT_PER_ACTION;
 
+/// Where the NU7 deadline stands on mainnet, as text.
+///
+/// The date is the ecosystem's announced target, not a consensus constant:
+/// the height is proposed in zcash/zips#1405 and is not yet in ZIP 259.
+/// Do not state a height here until that PR merges.
+const MAINNET_NU7_SCHEDULE: &str = "Mainnet activation is targeted for about November 5, \
+     2026; the final height is not yet assigned (proposed in zcash/zips#1405).";
+
+/// Kept last in a message, with no punctuation after it, so a copied link
+/// does not pick up a trailing full stop.
+const MAINNET_NU7_TIMELINE: &str =
+    "NU7 timeline: https://forum.zcashcommunity.com/t/nu7-timeline/57655";
+
+const TESTNET_NU7_SCHEDULE: &str = "The testnet NU7 activation height is 4,465,026.";
+
+/// The NU7 spending deadline, shared by every Sprout recovery interface.
+///
+/// This is guidance, not a consensus activation check.
+pub fn nu7_recovery_warning(network: crate::ZeckNetwork) -> String {
+    let rules = "NU7 disables all version 4 transactions, the only format that can spend \
+                 Sprout funds. Funds remaining in Sprout at activation become unspendable \
+                 under NU7 rules.";
+    match network {
+        crate::ZeckNetwork::Mainnet => format!(
+            "URGENT: {rules} {MAINNET_NU7_SCHEDULE} Start recovery promptly: recovery \
+             transactions must be mined before activation; broadcast alone is not enough. \
+             Full-block scans and proving can take substantial time. Check \
+             https://zips.z.cash/zip-0259 for the assigned mainnet activation height and \
+             upgrade status. {MAINNET_NU7_TIMELINE}"
+        ),
+        crate::ZeckNetwork::Testnet => format!(
+            "{rules} {TESTNET_NU7_SCHEDULE} At or after this height you cannot spend \
+             Sprout funds. Recovery transactions needed to be mined before activation; \
+             broadcast alone is not enough. Check https://zips.z.cash/zip-0259 for the \
+             current upgrade status."
+        ),
+    }
+}
+
+/// The NU7 deadline after a Sprout sweep has broadcast at least one
+/// transaction. "Start recovery promptly" no longer fits: the remaining risk
+/// is a broadcast transaction that is not mined before activation.
+pub fn nu7_broadcast_warning(network: crate::ZeckNetwork) -> String {
+    let schedule = match network {
+        crate::ZeckNetwork::Mainnet => format!("{MAINNET_NU7_SCHEDULE} {MAINNET_NU7_TIMELINE}"),
+        crate::ZeckNetwork::Testnet => TESTNET_NU7_SCHEDULE.to_owned(),
+    };
+    format!(
+        "Your Sprout recovery transaction was broadcast, but it must be mined before NU7 \
+         activation; confirm it is mined by checking its txid in a block explorer. A \
+         version 4 transaction still unmined at activation can never be mined. {schedule}"
+    )
+}
+
 /// Where to find the Sprout proving parameters.
 ///
 /// Checks `ARGOS_SPROUT_PARAMS` first, then the conventional zcashd location,
@@ -1157,6 +1211,61 @@ mod tests {
     use super::*;
     use crate::sprout::SproutPaymentAddress;
     use argos_wallet_import::keys::JsOutPoint;
+
+    /// PR #263 review item 1: the mainnet warning must give the targeted
+    /// date and say the height is not yet assigned, or a user facing a
+    /// days-long scan cannot judge how urgent this is.
+    #[test]
+    fn mainnet_nu7_warning_gives_the_target_date_and_unassigned_height() {
+        let text = nu7_recovery_warning(crate::ZeckNetwork::Mainnet);
+        assert!(text.starts_with("URGENT:"), "{text}");
+        assert!(text.contains("all version 4 transactions"), "{text}");
+        assert!(
+            text.contains(
+                "Mainnet activation is targeted for about November 5, 2026; the final \
+                 height is not yet assigned (proposed in zcash/zips#1405)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://forum.zcashcommunity.com/t/nu7-timeline/57655"),
+            "{text}"
+        );
+        assert!(text.contains("mined before activation"), "{text}");
+        assert!(text.contains("broadcast alone is not enough"), "{text}");
+        assert!(text.contains("Start recovery promptly"), "{text}");
+        assert!(text.contains("https://zips.z.cash/zip-0259"), "{text}");
+        // No height may be stated as fact until zcash/zips#1405 merges.
+        assert!(!text.contains("3,543,405") && !text.contains("3543405"));
+        // A copied link must not pick up trailing punctuation.
+        assert!(text.ends_with("/t/nu7-timeline/57655"), "{text}");
+        assert!(nu7_broadcast_warning(crate::ZeckNetwork::Mainnet).ends_with("/57655"));
+    }
+
+    #[test]
+    fn testnet_nu7_warning_states_the_assigned_height_without_urgency() {
+        let text = nu7_recovery_warning(crate::ZeckNetwork::Testnet);
+        assert!(text.contains("4,465,026"), "{text}");
+        assert!(!text.contains("URGENT"), "{text}");
+        assert!(!text.contains("Start recovery promptly"), "{text}");
+        assert!(!text.contains("November 5"), "{text}");
+    }
+
+    /// PR #263 review item 3: once a sweep has broadcast, "start recovery
+    /// promptly" is wrong advice; the remaining risk is that it is not mined.
+    #[test]
+    fn post_broadcast_nu7_warning_asks_to_confirm_mining_not_to_start() {
+        for network in [crate::ZeckNetwork::Mainnet, crate::ZeckNetwork::Testnet] {
+            let text = nu7_broadcast_warning(network);
+            assert!(text.contains("broadcast"), "{text}");
+            assert!(text.contains("must be mined before"), "{text}");
+            assert!(text.contains("confirm"), "{text}");
+            assert!(!text.contains("URGENT"), "{text}");
+            assert!(!text.contains("Start recovery promptly"), "{text}");
+        }
+        assert!(nu7_broadcast_warning(crate::ZeckNetwork::Mainnet).contains("November 5, 2026"));
+        assert!(nu7_broadcast_warning(crate::ZeckNetwork::Testnet).contains("4,465,026"));
+    }
 
     /// Kristi's F5 on #239: the plan printed before confirmation must not
     /// wrap. Two notes near half of `u64::MAX` saturate rather than show a

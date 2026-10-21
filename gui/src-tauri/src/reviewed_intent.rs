@@ -65,6 +65,8 @@ pub struct ReviewedSproutSweep {
     pub params_present: bool,
     pub params_path: String,
     pub lands_in_sapling: String,
+    /// NU7's Sprout spending deadline, shown before the user commits.
+    pub nu7_warning: String,
 }
 
 #[derive(PartialEq, Eq)]
@@ -80,6 +82,9 @@ pub struct SproutSweepIntent {
     pub network: ZeckNetwork,
     pub lightwalletd_url: String,
     pub journal: Option<SweepJournal>,
+    /// Set when the catch-up scan behind a scan-derived proposal could not
+    /// confirm the chain tip; it leads the sweep report's warnings.
+    pub tip_warning: Option<String>,
 }
 
 pub struct ScanMaterial {
@@ -362,6 +367,7 @@ impl ReviewedIntentStore {
                 return Err("Sprout proposal source changed".into());
             }
         }
+        let nu7_warning = argos_core::sprout_sweep::nu7_recovery_warning(intent.network);
         let proposal_id = SproutProposalId(Uuid::new_v4().to_string());
         inner.proposals.insert(proposal_id.clone(), intent);
         Ok(ReviewedSproutSweep {
@@ -370,6 +376,7 @@ impl ReviewedIntentStore {
             params_present,
             params_path,
             lands_in_sapling: argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING.to_owned(),
+            nu7_warning,
         })
     }
 
@@ -463,6 +470,8 @@ mod tests {
                         spent_notes: 0,
                         total_zatoshis: 100_000,
                         tip_warning: None,
+                        decrypt_from_height: None,
+                        decrypt_line: String::new(),
                     }),
                 );
             })
@@ -489,6 +498,7 @@ mod tests {
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: endpoint,
                     journal: None,
+                    tip_warning: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,
@@ -578,6 +588,7 @@ mod tests {
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: "https://node-a".into(),
                     journal: None,
+                    tip_warning: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,
@@ -636,6 +647,7 @@ mod tests {
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: "https://node".into(),
                     journal: None,
+                    tip_warning: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,

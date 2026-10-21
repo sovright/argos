@@ -69,6 +69,9 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
   const start = source.indexOf("let sproutScanHandle = null;");
   const end = source.indexOf("// ─── Step 3: Configuration", start);
   vm.runInContext("let walletFile = null; let uncoveredSproutKeys = 0; function renderSproutUncoveredBanners() {} function checkSaplingKeys() {} function invalidateWalletSproutReview() {}", context);
+  // Defined outside the scan section on main: the NU7 panel toggle, the
+  // broadcast hook, and the settings step's birthday-touched flag.
+  vm.runInContext("var broadcastsNoted = []; function onSproutScanEntryToggle() {} function noteSproutBroadcast(report, fromScan) { broadcastsNoted.push({ report, fromScan }); } var birthdayTouched = false;", context);
   vm.runInContext(source.slice(source.indexOf("function sweepLeftNothingBehind(report)"),
     source.indexOf("function noteUncoveredSproutKeys(summary)")), context);
   vm.runInContext(source.slice(start, end), context);

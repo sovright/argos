@@ -539,6 +539,18 @@ button:disabled {
   overflow: auto;
 }
 
+/* The Sprout scan disclosure on the wallet screen: reachable with no wallet
+   file, so it reads as an entry point rather than a hidden panel. */
+#sprout-scan-entry {
+  margin-top: 16px;
+}
+
+#sprout-scan-entry > summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 4px 0;
+}
+
 /* Wallet-file drop target. Dashed rather than solid to read as "put
    something here" instead of "this is a panel". */
 .drop-zone {

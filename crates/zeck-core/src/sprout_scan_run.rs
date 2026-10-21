@@ -342,6 +342,122 @@ fn load_checkpoint(
     Ok(Some(resumed))
 }
 
+/// A resumed scan asked to decrypt blocks its checkpoint walked past
+/// without decrypting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecryptBoundConflict {
+    /// The bound the checkpoint was scanned under.
+    pub stored: u32,
+    /// The bound now asked for; `None` is "decrypt every block".
+    pub requested: Option<u32>,
+    /// The last block the checkpoint walked.
+    pub cursor_height: u32,
+}
+
+impl DecryptBoundConflict {
+    fn into_error(self, checkpoint_file: &Path) -> ZeckError {
+        let asked = match self.requested {
+            Some(height) => format!("decryption from block {height}"),
+            None => "decryption of every block".to_owned(),
+        };
+        ZeckError::TransactionBuild(format!(
+            "the scan checkpoint at {} was saved by a scan that did not try to decrypt \
+             notes below block {stored}, and has already walked to block {cursor}. This \
+             scan asks for {asked}, so resuming would leave the blocks between unchecked \
+             and miss any notes in them. Delete the checkpoint to scan from the start, or \
+             run again with a birthday of block {stored} or later.",
+            checkpoint_file.display(),
+            stored = self.stored,
+            cursor = self.cursor_height,
+        ))
+    }
+}
+
+/// The decrypt-from bound a scan continues under, given the bound its
+/// checkpoint was scanned under, how far that checkpoint walked, and the
+/// bound now requested.
+///
+/// A resumed scan must never silently change which blocks were decrypted.
+/// Nothing walked yet: the request stands. A request at or above the stored
+/// bound: the stored one is kept, since every block it covers was decrypted
+/// anyway and it is the bound that truly applies. A request below it is
+/// accepted only while the walk has not reached the requested bound —
+/// otherwise blocks the request wants decrypted were already passed over.
+pub fn reconcile_decrypt_from(
+    stored: Option<u32>,
+    cursor_height: Option<u32>,
+    requested: Option<u32>,
+) -> Result<Option<u32>, DecryptBoundConflict> {
+    let Some(cursor_height) = cursor_height else {
+        return Ok(requested);
+    };
+    let (stored_floor, requested_floor) = (stored.unwrap_or(0), requested.unwrap_or(0));
+    if requested_floor >= stored_floor {
+        return Ok(stored);
+    }
+    // Blocks 1..=cursor were walked; those in [requested, stored) were not
+    // decrypted but the request needs them to be.
+    if cursor_height < requested_floor.max(1) {
+        return Ok(requested);
+    }
+    Err(DecryptBoundConflict {
+        stored: stored_floor,
+        requested,
+        cursor_height,
+    })
+}
+
+/// The decrypt-from bound a scan may apply, given a height the chain is
+/// known to have reached.
+///
+/// A bound above the tip would decrypt nothing at all, and can only come
+/// from creation times written by a machine whose clock ran ahead. Such a
+/// bound is evidence of nothing, so it is dropped and every block is
+/// decrypted. With no tip to compare against, the bound passes through:
+/// the creation-time check against the current time
+/// (`birthday::sprout_skip_height`) is then the only guard.
+pub fn bound_within_tip(decrypt_from: Option<u32>, tip: Option<u32>) -> Option<u32> {
+    match (decrypt_from, tip) {
+        (Some(bound), Some(tip)) if bound > tip => None,
+        _ => decrypt_from,
+    }
+}
+
+/// What to tell the user when [`bound_within_tip`] drops the requested
+/// skip for the tip the scan was given. The line printed before the scan
+/// promised a skip, and must not be left standing. Asked of the same inputs
+/// rather than inferred from the bound the scan reports, because a resume of
+/// a scan that decrypted every block also reports no bound, for a different
+/// reason.
+pub fn dropped_bound_line(requested: Option<u32>, tip: Option<u32>) -> Option<String> {
+    match (requested, bound_within_tip(requested, tip)) {
+        (Some(bound), None) => Some(format!(
+            "Trial decryption covered every block from 1: the requested start, block \
+             {bound}, is above the chain tip lightwalletd reported, so the wallet file's \
+             creation times cannot be right and were not used."
+        )),
+        _ => None,
+    }
+}
+
+/// The decrypt-from bound the saved scan for `spending_keys` ran under, or
+/// `None` when there is no checkpoint. `Some(None)` is a scan that
+/// decrypted every block.
+///
+/// For a resume that must continue exactly as the scan ran — the sweep
+/// after a scan — rather than re-deriving the bound from inputs that may
+/// have changed since, which [`reconcile_decrypt_from`] would refuse. The
+/// checkpoint is checked as a resume checks it: wrong keys or network is an
+/// error.
+pub fn saved_decrypt_from(
+    checkpoint_file: &Path,
+    network: P2pNetwork,
+    spending_keys: &[[u8; 32]],
+) -> ZeckResult<Option<Option<u32>>> {
+    Ok(load_checkpoint(checkpoint_file, network, spending_keys)?
+        .map(|scanner| scanner.decrypt_from_height()))
+}
+
 /// Read a checkpoint file. `Ok(None)` only when there is no file: any other
 /// failure — permissions, I/O, a directory in its place — is an error, so a
 /// scan that ran for hours never reads as one that never ran.
@@ -886,6 +1002,40 @@ pub async fn run_sprout_scan(
     extra_peers: &[String],
     tip_anchor: Option<TipAnchor>,
     checkpoint_file: &Path,
+    progress: impl FnMut(ScanTick),
+) -> ZeckResult<SproutScanResult> {
+    run_sprout_scan_with_decrypt_from(
+        spending_keys,
+        network,
+        extra_peers,
+        tip_anchor,
+        checkpoint_file,
+        None,
+        progress,
+    )
+    .await
+}
+
+/// [`run_sprout_scan`], not trial-decrypting blocks below `decrypt_from`.
+///
+/// The walk is unchanged: it still starts at block 1 and appends every
+/// commitment, so the tree, its root and every witness are exactly those of
+/// an unbounded scan — only notes paid below the bound go unfound. The bound
+/// must therefore come from evidence that the keys did not exist before it
+/// (`birthday::sprout_skip_height`), and the bound actually used is returned
+/// in [`SproutScanResult::decrypt_from_height`] for the caller to state.
+///
+/// The bound is saved in the checkpoint. A resume continues under it, or
+/// fails with [`DecryptBoundConflict`]'s explanation when the request would
+/// need blocks already walked to be decrypted — see
+/// [`reconcile_decrypt_from`].
+pub async fn run_sprout_scan_with_decrypt_from(
+    spending_keys: &[[u8; 32]],
+    network: P2pNetwork,
+    extra_peers: &[String],
+    tip_anchor: Option<TipAnchor>,
+    checkpoint_file: &Path,
+    decrypt_from: Option<u32>,
     mut progress: impl FnMut(ScanTick),
 ) -> ZeckResult<SproutScanResult> {
     if spending_keys.is_empty() {
@@ -900,21 +1050,38 @@ pub async fn run_sprout_scan(
         .map_or(0, |anchor| anchor.height.saturating_add(1))
         .max(network.sprout_scan_minimum_tip());
 
+    // lightwalletd's tip is the one height known to be on the chain before
+    // any peer is reached. A requested bound above it is dropped here, before
+    // the resume check, so a checkpoint that walked under such a bound is
+    // refused rather than continued under it.
+    let decrypt_from = bound_within_tip(decrypt_from, tip_anchor.map(|anchor| anchor.height));
+
     // Resume if we can. A checkpoint that will not load is reported rather
     // than silently discarded: starting a six-hour scan over because a file
     // was quietly ignored is worse than stopping to say so.
-    let mut scanner = load_checkpoint(checkpoint_file, network, spending_keys)?
-        .unwrap_or_else(|| SproutScanner::new(spending_keys));
+    let mut scanner = match load_checkpoint(checkpoint_file, network, spending_keys)? {
+        Some(mut resumed) => {
+            let bound = reconcile_decrypt_from(
+                resumed.decrypt_from_height(),
+                resumed.cursor().map(|c| c.last_height),
+                decrypt_from,
+            )
+            .map_err(|conflict| conflict.into_error(checkpoint_file))?;
+            resumed.set_decrypt_from(bound);
+            resumed
+        }
+        None => SproutScanner::with_decrypt_from(spending_keys, decrypt_from),
+    };
 
     let cursor = scanner.cursor();
-    // An all-zero locator asks the peer to start from genesis.
+    // An all-zero locator asks the peer for the headers after genesis.
     let locator = cursor.map_or([0u8; 32], |c| c.last_block_hash);
     // `height` is the height of the *next* block to scan, and the block being
     // scanned is checkpointed and recorded at this value before it is
-    // incremented. A fresh scan begins at genesis (height 0): the all-zero
-    // locator makes the peer include genesis as `headers[0]`, so the first
-    // block scanned is height 0, not 1. A resumed scan continues one past the
-    // last block it recorded.
+    // incremented. A fresh scan begins at height 1: the peer never serves
+    // genesis itself, so the first header of a fresh walk is the child of
+    // genesis (see `first_scan_height`). A resumed scan continues one past
+    // the last block it recorded.
     let mut height = first_scan_height(cursor);
     let mut since_checkpoint = 0u64;
 
@@ -2755,5 +2922,127 @@ mod tests {
             "the message must say what happened and what to do: {text}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── decrypt-from bound across a resume ───────────────────────────────────
+
+    #[test]
+    fn a_fresh_scan_takes_the_requested_bound() {
+        assert_eq!(
+            reconcile_decrypt_from(Some(50), None, Some(10)),
+            Ok(Some(10))
+        );
+        assert_eq!(reconcile_decrypt_from(Some(50), None, None), Ok(None));
+    }
+
+    /// Asking for a later bound than the checkpoint was scanned under is
+    /// safe — the earlier blocks were decrypted anyway — and keeps the
+    /// checkpoint's, so the reported bound is the one actually used.
+    #[test]
+    fn a_resume_keeps_a_lower_stored_bound() {
+        assert_eq!(
+            reconcile_decrypt_from(Some(10), Some(500), Some(10)),
+            Ok(Some(10))
+        );
+        assert_eq!(
+            reconcile_decrypt_from(Some(10), Some(500), Some(90)),
+            Ok(Some(10))
+        );
+        assert_eq!(reconcile_decrypt_from(None, Some(500), Some(90)), Ok(None));
+    }
+
+    /// Lowering the bound is only possible while the walk has not yet
+    /// reached the new bound: past it, blocks the new bound wants decrypted
+    /// were walked without decryption, and resuming would miss their notes.
+    #[test]
+    fn a_resume_refuses_a_lower_bound_it_has_already_passed() {
+        assert_eq!(
+            reconcile_decrypt_from(Some(100), Some(49), Some(50)),
+            Ok(Some(50))
+        );
+        assert!(reconcile_decrypt_from(Some(100), Some(50), Some(50)).is_err());
+        assert!(reconcile_decrypt_from(Some(100), Some(99), Some(50)).is_err());
+        // Turning the skip off entirely, once any block has been walked.
+        let conflict = reconcile_decrypt_from(Some(100), Some(1), None).unwrap_err();
+        assert_eq!(conflict.stored, 100);
+        assert_eq!(conflict.requested, None);
+    }
+
+    /// A bound above the tip lightwalletd reported would decrypt nothing at
+    /// all. Such a bound can only come from wrong creation times, so it is
+    /// dropped and every block is decrypted. With no tip to compare against
+    /// the bound passes through; the creation-time check already ran.
+    #[test]
+    fn a_bound_above_the_known_tip_is_not_applied() {
+        assert_eq!(bound_within_tip(Some(500), Some(400)), None);
+        assert_eq!(bound_within_tip(Some(400), Some(400)), Some(400));
+        assert_eq!(bound_within_tip(Some(300), Some(400)), Some(300));
+        assert_eq!(bound_within_tip(Some(500), None), Some(500));
+        assert_eq!(bound_within_tip(None, Some(400)), None);
+    }
+
+    #[test]
+    fn a_dropped_skip_is_said_and_a_kept_one_is_not() {
+        let line = dropped_bound_line(Some(500), Some(400)).expect("the skip was dropped");
+        assert!(
+            line.contains("every block") && line.contains("500"),
+            "{line}"
+        );
+        assert_eq!(dropped_bound_line(Some(500), Some(500)), None);
+        assert_eq!(dropped_bound_line(Some(500), None), None);
+        assert_eq!(dropped_bound_line(None, Some(400)), None);
+    }
+
+    /// The sweep resumes under the bound the scan actually used, read from
+    /// the checkpoint, so no later change to the form can make it conflict.
+    #[test]
+    fn the_saved_bound_is_read_back_for_the_same_keys_only() {
+        let keys = [[0x13; 32]];
+        let dir = fresh_dir("saved-decrypt-from");
+
+        let missing = dir.join("missing.checkpoint");
+        assert_eq!(
+            saved_decrypt_from(&missing, P2pNetwork::Regtest, &keys).unwrap(),
+            None
+        );
+
+        for (name, bound) in [("skip", Some(300)), ("every", None)] {
+            let mut scanner = SproutScanner::with_decrypt_from(&keys, bound);
+            scanner
+                .scan_block_at(&[], [0xCF; 32], 400)
+                .expect("an empty block");
+            let path = dir.join(format!("{name}.checkpoint"));
+            save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+            assert_eq!(
+                saved_decrypt_from(&path, P2pNetwork::Regtest, &keys).unwrap(),
+                Some(bound),
+                "{name}"
+            );
+            // Another key set's checkpoint is refused, not read.
+            assert!(saved_decrypt_from(&path, P2pNetwork::Regtest, &[[0x14; 32]]).is_err());
+            discard_checkpoint(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn resuming_a_skipping_scan_without_the_skip_is_refused_before_any_peer() {
+        let keys = [[0x12; 32]];
+        let mut scanner = SproutScanner::with_decrypt_from(&keys, Some(300));
+        scanner
+            .scan_block_at(&[], [0xCE; 32], 400)
+            .expect("an empty block");
+        let dir = fresh_dir("decrypt-bound-resume");
+        let path = dir.join("skip.checkpoint");
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+
+        let err = run_sprout_scan(&keys, P2pNetwork::Regtest, &[], None, &path, |_| {})
+            .await
+            .expect_err("blocks below 300 were never decrypted");
+        let message = err.to_string();
+        assert!(message.contains("300"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        // The file is kept: it is still a valid scan under its own bound.
+        assert!(path.exists());
+        discard_checkpoint(&path);
     }
 }
