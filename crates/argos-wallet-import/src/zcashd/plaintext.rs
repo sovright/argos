@@ -5,7 +5,10 @@ use secrecy::Secret;
 use crate::{
     error::ImportDiagnostic,
     keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
-    zcashd::records::{compact_size, parse_record_key},
+    zcashd::{
+        metadata::{is_metadata_record, KeyMetadataIndex, MetadataKind},
+        records::{compact_size, parse_record_key},
+    },
 };
 
 /// Record types we knowingly ignore: wallet bookkeeping with no key
@@ -20,7 +23,6 @@ const IGNORED: &[&str] = &[
     "bestblock",
     "bestblock_nomerkle",
     "defaultkey",
-    "keymeta",
     "minversion",
     "mnemonichdchain",
     "name",
@@ -29,11 +31,9 @@ const IGNORED: &[&str] = &[
     "orderposnext",
     "pool",
     "purpose",
-    "sapzkeymeta",
     "tx",
     "version",
     "witnesscachesize",
-    "zkeymeta",
 ];
 
 /// Record types that hold the wallet's HD seed: `hdseed`/`chdseed` for
@@ -81,6 +81,10 @@ fn secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
 /// A record we cannot parse is recorded as a diagnostic and skipped; it
 /// must never prevent a record we *can* parse from being recovered.
 pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
+    // Unreadable metadata is reported from here and not from
+    // `collect_encrypted`, which builds the same index: this collector runs
+    // for every zcashd wallet, so each damaged record is reported once.
+    let metadata = KeyMetadataIndex::build(pairs, Some(&mut out.diagnostics));
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             // Do not include any bytes from the record key itself: it can
@@ -108,6 +112,7 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                         address,
                         // zcashd Sprout keys were never HD-derived.
                         provenance: Provenance::Standalone,
+                        created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
                     }),
                     _ => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                         record_type: "zkey".to_owned(),
@@ -123,6 +128,7 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                 Some(extsk) => out.sapling.push(SaplingKey {
                     extsk: Secret::new(extsk.to_vec()),
                     provenance: Provenance::Standalone,
+                    created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
                 }),
                 None => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                     record_type: "sapzkey".to_owned(),
@@ -146,6 +152,7 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                         Ok(secret) => out.transparent.push(TransparentKey {
                             secret: Secret::new(secret),
                             provenance: Provenance::HdDerived,
+                            created_at: metadata.created_at(MetadataKind::Transparent, &rec.rest),
                         }),
                         Err(_) => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                             record_type: "key".to_owned(),
@@ -162,7 +169,9 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
             // Encrypted variants are handled in Task 10 once the master
             // key is available; skip silently here rather than reporting
             // them as unknown.
-            "ckey" | "czkey" | "csapzkey" | "mkey" | "hdchain" | "sapzaddr" | "zkeymeta" => {}
+            "ckey" | "czkey" | "csapzkey" | "mkey" | "hdchain" | "sapzaddr" => {}
+            // Read into `metadata` above.
+            other if is_metadata_record(other) => {}
             other if SEED_BEARING.contains(&other) => {
                 // An encrypted 5.x wallet carries both `mnemonicphrase` and
                 // `cmnemonicphrase` for one seed; report the seed once.
@@ -211,6 +220,58 @@ mod tests {
         let k = &out.sprout[0];
         assert_eq!(k.address, addr);
         assert_eq!(k.a_sk.expose_secret(), &[0xCD; 32]);
+    }
+
+    fn metadata(time: i64) -> Vec<u8> {
+        let mut v = 10i32.to_le_bytes().to_vec();
+        v.extend_from_slice(&time.to_le_bytes());
+        v.push(0); // empty HD keypath
+        v.extend_from_slice(&[0u8; 32]);
+        v
+    }
+
+    /// Each key gets the time stored under its own identifier, an imported
+    /// key's "unknown" marker gives no time, and a damaged record gives no
+    /// time plus one diagnostic — while every key is still recovered.
+    #[test]
+    fn creation_times_attach_to_their_own_keys() {
+        let (known, unknown, damaged) = ([0x01; 64], [0x02; 64], [0x03; 64]);
+        let mut truncated = metadata(1_700_000_300);
+        truncated.truncate(10);
+        let pairs = vec![
+            record("zkey", &known, &[0xA1; 32]),
+            record("zkey", &unknown, &[0xA2; 32]),
+            record("zkey", &damaged, &[0xA3; 32]),
+            record("zkeymeta", &known, &metadata(1_700_000_100)),
+            // What `z_importkey` writes for a key of unknown age.
+            record("zkeymeta", &unknown, &metadata(1)),
+            record("zkeymeta", &damaged, &truncated),
+            // Same bytes, other pool: must not leak onto a Sprout key.
+            record("sapzkeymeta", &[0x02; 32], &metadata(1_700_000_200)),
+        ];
+
+        let mut out = ImportedKeys::default();
+        collect_plaintext(&pairs, &mut out);
+
+        let time_of = |addr: [u8; 64]| {
+            out.sprout
+                .iter()
+                .find(|k| k.address == addr)
+                .map(|k| k.created_at)
+                .unwrap()
+        };
+        assert_eq!(out.sprout.len(), 3, "metadata never costs a key");
+        assert_eq!(time_of(known), Some(1_700_000_100));
+        assert_eq!(time_of(unknown), None);
+        assert_eq!(time_of(damaged), None);
+        assert_eq!(
+            out.diagnostics,
+            vec![ImportDiagnostic::UnreadableKeyMetadata {
+                record_type: "zkeymeta".to_owned(),
+                reason: "value is too short for a creation time".to_owned(),
+            }]
+        );
+        assert_eq!(out.coverage(), crate::keys::ImportCoverage::Complete);
     }
 
     #[test]

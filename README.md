@@ -4,6 +4,16 @@ Argos is a recovery workspace for legacy Zcash wallets. It recovers from
 ZecWallet Lite seed phrases and wallet files, zcashd `wallet.dat` files, and
 standalone Sapling or Sprout spending keys.
 
+> **Urgent: recover Sprout funds before NU7 activates.** NU7 disables version 4
+> transactions, including all Sprout spends. Your recovery transaction must be
+> **mined before activation**; broadcasting it is not enough. Start promptly:
+> a full Sprout scan can take days. Mainnet activation is targeted for about
+> November 5, 2026; the final height is not yet assigned (proposed in
+> [zcash/zips#1405](https://github.com/zcash/zips/pull/1405); see the
+> [NU7 timeline](https://forum.zcashcommunity.com/t/nu7-timeline/57655)). Check
+> [ZIP 259](https://zips.z.cash/zip-0259) for the assigned height. Funds remaining in
+> Sprout after activation will be unspendable under the current NU7 rules.
+
 This repository now contains:
 
 - `crates/zeck-core`: shared Rust library for key handling, scanning, and recovery session orchestration (package name `argos-core`).
@@ -110,6 +120,17 @@ cannot authorize the sweep Argos is promising.
 
 ## Recovering Sprout funds
 
+> **Sprout recovery deadline:** the sweep must be **mined before NU7 activation**.
+> NU7 disables version 4 transactions and therefore Sprout spends. A broadcast
+> or completed scan alone does not meet this deadline. Mainnet activation is
+> targeted for about November 5, 2026; the final height is not yet assigned
+> (proposed in [zcash/zips#1405](https://github.com/zcash/zips/pull/1405); see the
+> [NU7 timeline](https://forum.zcashcommunity.com/t/nu7-timeline/57655)). Start
+> promptly and check [ZIP 259](https://zips.z.cash/zip-0259) for the assigned height.
+> After a sweep broadcasts, confirm the transaction is mined before activation.
+> Remaining Sprout funds will be unspendable under the current NU7 rules.
+> Historical scanning and reporting can still identify funds after activation.
+
 Sprout support is part of normal Argos builds and requires no Cargo feature.
 It is intentionally separate from the ordinary compact-block scan:
 
@@ -119,8 +140,9 @@ It is intentionally separate from the ordinary compact-block scan:
   `scan-sprout` trial-decrypts every historical JoinSplit. Compact blocks do
   not contain those ciphertexts, so this reads full blocks directly from the
   Zcash P2P network from genesis to the chain tip. It does not stop at
-  Canopy: that upgrade only stopped new value entering Sprout, and Sprout
-  notes are still created and spent after it. On mainnet that is about 3.5
+  Canopy: that upgrade only stopped new value entering Sprout. Sprout notes
+  could still be created and spent after Canopy, until NU7 disables Sprout
+  spends. On mainnet that is about 3.5
   million blocks, roughly 280 GB of transfer, likely days of work, and under
   500 MB retained on disk. Progress is checkpointed and resumable, and
   re-running a finished scan catches up to the new tip.

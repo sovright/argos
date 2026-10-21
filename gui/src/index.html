@@ -304,6 +304,7 @@
 
           <div class="inline-actions">
             <button class="ghost" id="wallet-open">Open wallet file</button>
+            <button class="ghost" id="wallet-forget" type="button">Forget this file</button>
           </div>
           <p id="wallet-status" class="status-line"></p>
 
@@ -329,6 +330,7 @@
             <h3>What Argos found</h3>
             <ul id="wallet-summary-list" class="session-list"></ul>
             <div id="wallet-sprout-warning" class="guide-warning" hidden>
+              <p id="wallet-sprout-nu7-warning" role="alert" hidden></p>
               <strong id="wallet-sprout-headline"></strong>
               <span id="wallet-sprout-detail"></span>
               <div id="wallet-sprout-accounting" hidden></div>
@@ -369,8 +371,32 @@
                   </p>
                 </details>
 
+                <!-- Mirrors `scan-sprout --no-birthday-skip` / `--birthday`.
+                     A wallet.dat whose Sprout keys are all dated skips
+                     trial decryption before them; the file's times are its
+                     own claim, so the user can always undo the skip. -->
+                <details id="sprout-scan-skip">
+                  <summary>Where decryption starts</summary>
+                  <p class="muted">
+                    If every Sprout key in your wallet file records when it was created, the
+                    scan still reads every block but does not try to decrypt notes in blocks
+                    made before then, which saves hours. Keys pasted above have no creation time,
+                    so with any of them every block is decrypted.
+                  </p>
+                  <label class="checkbox-row">
+                    <input type="checkbox" id="sprout-scan-every-block" />
+                    Decrypt every block (ignore the wallet file's key creation times)
+                  </label>
+                  <label for="sprout-scan-birthday">
+                    Birthday for this scan (optional; can only move the start earlier)
+                  </label>
+                  <input id="sprout-scan-birthday" type="number" min="0" inputmode="numeric"
+                    placeholder="Block height" />
+                </details>
+
                 <button id="sprout-scan-run" type="button">Start scan</button>
                 <p id="sprout-scan-status" class="status-line"></p>
+                <p id="sprout-scan-plan" class="muted"></p>
                 <progress id="sprout-scan-bar" value="0" max="100" hidden></progress>
 
                 <!-- Revealed only once a scan has actually found notes. A
@@ -610,10 +636,15 @@
         <section class="screen" data-step="scan">
           <p class="eyebrow">Step 4</p>
           <h2>Recovery scan</h2>
-          <div class="banner warning" id="scan-warning">
+          <div class="banner warning" id="scan-warning-shielded">
             Transparent funds are detected within seconds. Argos must still finish the full
             shielded block sync before sweeping — <strong>Review &amp; Sweep unlocks when the
             phase reads "Complete".</strong>
+          </div>
+          <div class="banner info" id="scan-warning-transparent-only" hidden>
+            This wallet holds only transparent keys, so there is no shielded block sync. Argos
+            asks the server for its funds directly, which takes seconds —
+            <strong>Review &amp; Sweep unlocks when the phase reads "Complete".</strong>
           </div>
           <div class="banner info" id="scan-resume-info">
             <strong>Safe to interrupt.</strong> Progress is saved automatically — quit Argos or

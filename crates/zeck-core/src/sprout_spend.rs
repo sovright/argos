@@ -323,8 +323,9 @@ impl JoinSplitSigningKey {
 /// Assemble a V4 transaction carrying a Sprout bundle, and sign it.
 ///
 /// Sprout can only live in a V4 transaction: ZIP 225 rewrote the encoding
-/// for V5 and dropped JoinSplits entirely. V4 remains consensus-valid, which
-/// is what makes recovery possible at all.
+/// for V5 and dropped JoinSplits entirely. NU7 disables all V4 transactions,
+/// so a Sprout recovery transaction must be mined before that network's
+/// NU7 activation; broadcasting it before activation is not sufficient.
 ///
 /// The signature covers a sighash of the whole transaction, and the
 /// transaction contains the signature — the circularity is broken by

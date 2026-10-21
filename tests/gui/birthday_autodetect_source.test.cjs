@@ -34,6 +34,13 @@ test("a loaded wallet file is detected from the backend, which decides whether i
   assert.deepEqual(plain(pick("", seedless)), { kind: "wallet" });
 });
 
+test("a seedless wallet file is detected from the backend too", () => {
+  // A zcashd wallet.dat dates itself from its key creation times; the
+  // backend decides, and refuses a seedless ZecWallet Lite file itself.
+  const wallet = { path: "/w", passphrase: null, summary: { has_mnemonic: false } };
+  assert.deepEqual(plain(pick("", wallet)), { kind: "wallet" });
+});
+
 test("the frontend does not carry its own copy of the seedless refusal", () => {
   assert.doesNotMatch(source, /Auto-detect needs a seed phrase, and this wallet file has none/);
 });
@@ -79,10 +86,22 @@ function harness({ walletFile, seed = "", invoke }) {
     updateScanEstimate: () => {},
     formatApproxMonth: () => "Jan 2020",
     approxDateFromHeight: () => null,
+    birthdayTouched: false,
   };
   vm.createContext(ctx);
+  // The real helpers, not stubs: the pasted-Sapling-key plumbing is what
+  // carries undated keys to the backend (#260's fix 1).
   const run = vm.runInContext(
-    `${declaration("birthdayAutodetectSource")}\n${declaration("runBirthdayAutodetect")}\nrunBirthdayAutodetect`,
+    [
+      "saplingScanKeyLines",
+      "isSaplingKeyLine",
+      "hasSaplingScanKeys",
+      "birthdayDetectHint",
+      "birthdayAutodetectSource",
+      "runBirthdayAutodetect",
+    ]
+      .map(declaration)
+      .join("\n") + "\nrunBirthdayAutodetect",
     ctx,
   );
   return { run, ctx, els, hints };
@@ -107,6 +126,37 @@ test("the click handler passes the wallet path and passphrase to the backend", a
   assert.equal(calls[0].args.network, "mainnet");
   assert.ok(!("seed" in calls[0].args), "the typed seed must not go with a wallet file");
   assert.equal(h.els.get("birthday-height").value, 1234567);
+});
+
+test("pasted Sapling keys go to the backend with the wallet file, so undated keys are counted", async () => {
+  // #260 fix 1: an undated Sapling key must block the transparent-UTXO
+  // fallback, and the backend only knows about a pasted key if it is sent.
+  const calls = [];
+  const h = harness({
+    walletFile: { path: "/wallets/wallet.dat", passphrase: null, summary: { has_mnemonic: false } },
+    invoke: async (cmd, args) => {
+      calls.push({ cmd, args: plain(args) });
+      return { birthday: 500000, method: "wallet_metadata", message: "core sentence" };
+    },
+  });
+  h.els.set("sapling-scan-keys", { value: "# note\nsecret-extended-key-main1abc\n", disabled: false });
+  await h.run();
+  assert.equal(calls[0].cmd, "detect_birthday_from_wallet_file");
+  assert.deepEqual(calls[0].args.saplingKeys, ["# note", "secret-extended-key-main1abc", ""]);
+  assert.match(h.hints.at(-1).text, /core sentence/);
+
+  // An empty box sends none.
+  const none = [];
+  const h2 = harness({
+    walletFile: { path: "/wallets/wallet.dat", passphrase: null, summary: { has_mnemonic: false } },
+    invoke: async (cmd, args) => {
+      none.push(plain(args));
+      return { birthday: 500000, method: "wallet_metadata", message: "m" };
+    },
+  });
+  h2.els.set("sapling-scan-keys", { value: "\n# only a comment\n", disabled: false });
+  await h2.run();
+  assert.deepEqual(none[0].saplingKeys, []);
 });
 
 test("the click handler sends the typed seed lower-cased when no wallet is loaded", async () => {

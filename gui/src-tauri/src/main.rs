@@ -55,6 +55,7 @@ fn main() {
             commands::start_sprout_scan,
             commands::sweep_sprout_from_scan,
             commands::preview_sprout_sweep,
+            commands::sprout_nu7_warning,
             commands::execute_sprout_sweep,
             commands::default_data_dir,
             commands::notify_user,

@@ -53,6 +53,7 @@ fn transparent_key_debug_is_redacted() {
     let k = TransparentKey {
         secret: Secret::new([TRANSPARENT_MARKER; 32]),
         provenance: Provenance::HdDerived,
+        created_at: None,
     };
     let rendered = format!("{k:?}");
     assert_no_marker(&rendered, TRANSPARENT_MARKER, "transparent");
@@ -71,6 +72,7 @@ fn sprout_key_debug_is_redacted() {
         a_sk: Secret::new([SPROUT_MARKER; 32]),
         address: [0x11; 64],
         provenance: Provenance::Standalone,
+        created_at: None,
     };
     let rendered = format!("{k:?}");
     assert_no_marker(&rendered, SPROUT_MARKER, "sprout a_sk");
@@ -82,6 +84,7 @@ fn sapling_key_debug_is_redacted() {
     let k = SaplingKey {
         extsk: Secret::new(vec![SAPLING_MARKER; 169]),
         provenance: Provenance::Standalone,
+        created_at: None,
     };
     let rendered = format!("{k:?}");
     assert_no_marker(&rendered, SAPLING_MARKER, "sapling extsk");
@@ -128,15 +131,18 @@ fn an_imported_key_set_does_not_leak_through_debug() {
     keys.transparent.push(TransparentKey {
         secret: Secret::new([TRANSPARENT_MARKER; 32]),
         provenance: Provenance::HdDerived,
+        created_at: None,
     });
     keys.sprout.push(SproutKey {
         a_sk: Secret::new([SPROUT_MARKER; 32]),
         address: [0x11; 64],
         provenance: Provenance::Standalone,
+        created_at: None,
     });
     keys.sapling.push(SaplingKey {
         extsk: Secret::new(vec![SAPLING_MARKER; 169]),
         provenance: Provenance::Standalone,
+        created_at: None,
     });
 
     // ImportedKeys has its own manual Debug impl (Result::unwrap_err needs
