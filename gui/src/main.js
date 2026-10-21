@@ -29,7 +29,9 @@ document.addEventListener("DOMContentLoaded", () => {
 const state = {
   scanHandle: null,
   lastProgress: null,
-  sweepProposal: null,
+  sweepReview: null,
+  proposalGeneration: 0,
+  proposalPending: false,
   destination: null,
   memo: null,
   maxFeeZec: null,
@@ -2112,7 +2114,7 @@ function returnToAddressMatches() {
   clearMatchedRecoveryUi();
   state.scanHandle = null;
   state.lastProgress = null;
-  state.sweepProposal = null;
+  invalidateSweepReview();
   state.addressMatchRecoveryLocked = false;
   $("start-scan").disabled = false;
   setStatus("config-status", "", "");
@@ -2155,6 +2157,7 @@ function appendCell(tr, text) {
 
 $("back-to-config").addEventListener("click", () => {
   cleanupListeners();
+  invalidateSweepReview();
   state.scanHandle = null;
   $("back-to-config").style.display = "none";
   $("start-scan").disabled = false;
@@ -2184,26 +2187,66 @@ function donationParamsFromForm() {
   return { donationRate, donorEmail };
 }
 
-async function refreshSweepProposal() {
+function invalidateSweepReview() {
+  state.proposalGeneration += 1;
+  state.sweepReview = null;
+  state.proposalPending = false;
+  $("irreversible-check").checked = false;
+  $("irreversible-check").disabled = true;
+  $("execute-sweep").disabled = true;
+  setStatus("sweep-execute-status", "", "");
+}
+
+function setSweepProposalPending(pending) {
+  state.proposalPending = pending;
+  if (pending) {
+    state.sweepReview = null;
+    $("irreversible-check").checked = false;
+    $("irreversible-check").disabled = true;
+    $("execute-sweep").disabled = true;
+    setStatus("sweep-execute-status", "", "");
+  }
+}
+
+function sweepRequestFromForm() {
   const { donationRate, donorEmail } = donationParamsFromForm();
-  const proposal = await invoke("propose_sweep", {
+  return {
     handle: state.scanHandle,
-    destination: state.destination,
-    memo: state.memo,
-    maxFeeZec: state.maxFeeZec,
+    destination: $("destination-input").value.trim(),
+    memo: $("sweep-memo").value.trim() || null,
+    maxFeeZec: $("max-fee-zec").value.trim() || null,
     donationRate,
     donorEmail,
-  });
-  state.sweepProposal = proposal;
-  renderSweepProposal(proposal);
+  };
+}
+
+async function refreshSweepProposal() {
+  invalidateSweepReview();
+  setSweepProposalPending(true);
+  const generation = state.proposalGeneration;
+  const handleId = state.scanHandle?.id;
+  const request = sweepRequestFromForm();
+  try {
+    const review = await invoke("propose_sweep", request);
+    if (generation !== state.proposalGeneration || handleId !== state.scanHandle?.id) return null;
+    state.sweepReview = { ...review, handleId, donationRateForDisplay: request.donationRate };
+    setSweepProposalPending(false);
+    renderSweepProposal(review.proposal);
+    return review;
+  } catch (err) {
+    if (generation !== state.proposalGeneration || handleId !== state.scanHandle?.id) return null;
+    invalidateSweepReview();
+    setStatus("sweep-execute-status", `✗ ${err}`, "error");
+    throw err;
+  }
 }
 
 async function maybeRefreshProposal() {
-  if (!state.sweepProposal) return;
+  if (!state.scanHandle || state.lastProgress?.phase !== "complete") return;
   try {
     await refreshSweepProposal();
   } catch (err) {
-    setStatus("sweep-execute-status", `✗ ${err}`, "error");
+    // refreshSweepProposal displays errors only for the current generation.
   }
 }
 
@@ -2212,8 +2255,7 @@ $("review-sweep").addEventListener("click", async () => {
   $("review-sweep").disabled = true;
 
   try {
-    await refreshSweepProposal();
-    goTo("sweep");
+    if (await refreshSweepProposal()) goTo("sweep");
   } catch (err) {
     setStatus("scan-message", `✗ ${err}`, "error");
     $("review-sweep").disabled = false;
@@ -2233,7 +2275,7 @@ $("sweep-back").addEventListener("click", () => {
 // donation. Only the *selected* rate is ever sent to the backend; the chips
 // just preview amounts so we don't fan out three propose_sweep calls.
 function estimateDonationZat(pct) {
-  const p = state.sweepProposal;
+  const p = state.sweepReview?.proposal;
   if (!p) return null;
   const base = (p.net_received_zatoshis || 0) + (p.total_donation_zatoshis || 0);
   return Math.round((base * pct) / 100);
@@ -2252,6 +2294,7 @@ function selectDonationPreset(pctValue) {
       String(chip.dataset.pct === String(pctValue)),
     );
   });
+  invalidateSweepReview();
   maybeRefreshProposal();
 }
 
@@ -2261,6 +2304,7 @@ document.querySelectorAll("#donate-presets .preset-chip").forEach((chip) => {
 
 // Custom field: keep its chip highlighted while typing; re-propose on change.
 $("donate-rate").addEventListener("input", () => {
+  invalidateSweepReview();
   document.querySelectorAll("#donate-presets .preset-chip").forEach((chip) => {
     chip.setAttribute("aria-pressed", String(chip.dataset.pct === "custom"));
   });
@@ -2278,13 +2322,18 @@ $("donate-skip").addEventListener("click", () => {
       chip.setAttribute("aria-pressed", "false");
     });
     $("donate-skip").textContent = "Changed your mind? Add a donation";
+    invalidateSweepReview();
     maybeRefreshProposal();
   } else {
     $("donate-skip").textContent = "No thanks, skip donation";
     selectDonationPreset("10"); // re-enables, un-collapses, and re-proposes
   }
 });
-// email does not affect amounts; it's read fresh at propose/execute time, no re-propose needed
+
+for (const id of ["destination-input", "sweep-memo", "max-fee-zec", "donate-email", "donate-enabled"]) {
+  $(id).addEventListener("input", invalidateSweepReview);
+  $(id).addEventListener("change", maybeRefreshProposal);
+}
 
 // ─── Step 5: Sweep Review ─────────────────────────────────────────────────────
 
@@ -2373,9 +2422,6 @@ function renderSweepProposal(proposal) {
   }
 
   $("irreversible-check").checked = false;
-  // Re-enable the checkbox: a prior sweep's execute click disables it (and only
-  // the error path re-enables it), so without this a second proposal in the
-  // same session leaves the checkbox stuck disabled and the sweep unclickable.
   $("irreversible-check").disabled = false;
   $("execute-sweep").disabled = true;
 }
@@ -2395,40 +2441,37 @@ $("sweep-rows").addEventListener("click", (e) => {
 });
 
 $("irreversible-check").addEventListener("change", () => {
-  $("execute-sweep").disabled = !$("irreversible-check").checked;
+  $("execute-sweep").disabled = !state.sweepReview || state.proposalPending ||
+    state.sweepReview.handleId !== state.scanHandle?.id || !$("irreversible-check").checked;
 });
 
 $("execute-sweep").addEventListener("click", async () => {
+  const review = state.sweepReview;
+  if (!review || state.proposalPending || review.handleId !== state.scanHandle?.id ||
+      !$("irreversible-check").checked) return;
+  const handle = state.scanHandle;
+  state.sweepReview = null;
   $("execute-sweep").disabled = true;
   $("irreversible-check").disabled = true;
   setStatus("sweep-execute-status", "Broadcasting transactions to the Zcash network… this may take up to 2 minutes.", "");
 
   try {
-    const { donationRate, donorEmail } = donationParamsFromForm();
     // `execute_sweep` rejects only when nothing was broadcast. A mid-sequence
     // abort after one or more broadcasts resolves with `{ transactions, error }`
     // so the already-broadcast transaction IDs are still shown (audit Issue E).
-    const outcome = await invoke("execute_sweep", {
-      handle: state.scanHandle,
-      destination: state.destination,
-      memo: state.memo,
-      maxFeeZec: state.maxFeeZec,
-      donationRate,
-      donorEmail,
-    });
+    const outcome = await invoke("execute_sweep", { handle, proposalId: review.proposal_id });
     setStatus("sweep-execute-status", "", "");
     renderCompleteScreen(
       outcome.transactions,
       outcome.skipped_accounts,
       outcome.total_donation_zatoshis || 0,
-      donationRate,
+      review.donationRateForDisplay,
       outcome.error,
       outcome.donation_note,
     );
     goTo("complete");
   } catch (err) {
-    $("execute-sweep").disabled = false;
-    $("irreversible-check").disabled = false;
+    invalidateSweepReview();
     setStatus("sweep-execute-status", `✗ Sweep failed: ${err}`, "error");
   }
 });
@@ -2707,6 +2750,7 @@ $("delete-workspace").addEventListener("click", async () => {
 
 $("restart-flow").addEventListener("click", () => {
   cleanupListeners();
+  invalidateSweepReview();
   if (state.retainedAddressSearchId || state.matchedRecovery) {
     const searchId = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
     state.retainedAddressSearchId = null;
@@ -2717,7 +2761,8 @@ $("restart-flow").addEventListener("click", () => {
   Object.assign(state, {
     scanHandle: null,
     lastProgress: null,
-    sweepProposal: null,
+    sweepReview: null,
+    proposalPending: false,
     destination: null,
     memo: null,
     maxFeeZec: null,
