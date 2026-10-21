@@ -2817,6 +2817,100 @@ fn powershell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn inspection_does_not_count_an_unverified_orphan_only_nullifier_as_spent() {
+        use argos_core::argos_wallet_import::keys::{
+            JsOutPoint, Provenance, SproutJoinSplit, SproutKey, SproutNoteData,
+        };
+        use argos_core::sprout::{self, SproutNotePlaintext, SproutPaymentAddress};
+        use argos_core::sprout_witness::{IncrementalMerkleTree, IncrementalWitness};
+
+        let dir =
+            std::env::temp_dir().join(format!("argos-cli-orphan-sprout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_sk = [0x42; 32];
+        let address = SproutPaymentAddress::from_spending_key(&a_sk);
+        let note = SproutNotePlaintext {
+            value: 1_000_000,
+            rho: [0x11; 32],
+            r: [0x22; 32],
+            memo: [0; 512],
+        };
+        let random_seed = [0x33; 32];
+        let nullifiers = [[0x44; 32], [0x55; 32]];
+        let joinsplit_pubkey = [0x66; 32];
+        let esk = [0x77; 32];
+        let h_sig = sprout::h_sig(&random_seed, &nullifiers, &joinsplit_pubkey);
+        let ciphertext =
+            sprout::encrypt_note(&esk, address.pk_enc(), &h_sig, 0, &note.to_bytes()).unwrap();
+        let commitment = sprout::note_commitment(address.a_pk(), note.value, &note.rho, &note.r);
+        let outpoint = JsOutPoint {
+            txid: [0x99; 32],
+            js_index: 0,
+            output_index: 0,
+        };
+        let mut tree = IncrementalMerkleTree::default();
+        tree.append(commitment).unwrap();
+        let witness = IncrementalWitness::from_tree(tree);
+        let mut witness_blob = vec![1];
+        witness_blob.extend_from_slice(&witness.to_bytes());
+        witness_blob.extend_from_slice(&0i32.to_le_bytes());
+        let mut keys = ImportedKeys::default();
+        keys.sprout.push(SproutKey {
+            a_sk: secrecy::Secret::new(a_sk),
+            address: address.to_bytes(),
+            provenance: Provenance::Standalone,
+        });
+        let joinsplit = SproutJoinSplit {
+            txid: outpoint.txid,
+            js_index: 0,
+            anchor: [0; 32],
+            nullifiers,
+            commitments: [commitment, [0; 32]],
+            ephemeral_key: sprout::epk_for(&esk),
+            random_seed,
+            joinsplit_pubkey,
+            ciphertexts: [ciphertext, vec![0; 601]],
+        };
+        keys.sprout_joinsplits.push(joinsplit.clone());
+        keys.sprout_notes.push(SproutNoteData {
+            address: address.to_bytes(),
+            nullifier: None,
+            witness: witness_blob,
+            outpoint,
+        });
+        let note_nullifier = sprout::prf_nf(&a_sk, &note.rho);
+        let mut orphan_spend = joinsplit;
+        orphan_spend.txid = [0xAB; 32];
+        orphan_spend.nullifiers[0] = note_nullifier;
+        let mut scanner = argos_core::sprout_scan::SproutScanner::new(&[a_sk]);
+        scanner
+            .scan_block_at(&[orphan_spend], [0xCD; 32], 2_000_000)
+            .unwrap();
+        assert!(scanner.spent_nullifiers().contains_key(&note_nullifier));
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        argos_core::sprout_scan_run::save_checkpoint(
+            &scanner,
+            argos_core::p2p::wire::P2pNetwork::Mainnet,
+            &checkpoint,
+        )
+        .unwrap();
+
+        let recovered = recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir).await;
+        assert_eq!(
+            recovered.notes.len(),
+            1,
+            "unverified cached spend reduced wallet balance"
+        );
+        assert!(recovered.spent.is_empty());
+        assert!(recovered
+            .chain_notice
+            .unwrap()
+            .contains("will not use its spent-note evidence"));
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {
         let dir = std::env::temp_dir().join(format!(
             "argos-cli-unverified-sprout-{}",

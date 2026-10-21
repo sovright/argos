@@ -397,6 +397,50 @@ test("deep reorg notice names the preserved checkpoint and source wallet", async
   assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /sprout-scan-456\.checkpoint/);
 });
 
+test("preview shows its fresh verification warning and execute shows a newer one", async () => {
+  const previewNotice = "Preview: checkpoint verification is unavailable; use wallet-file evidence.";
+  const executeNotice = "Execute: checkpoint changed after preview; use wallet-file evidence.";
+  const calls = [];
+  const h = harness(async (command, args, fallback) => {
+    if (command === "preview_sprout_sweep") {
+      calls.push(command);
+      return { ...(await fallback()), scan_warning: previewNotice };
+    }
+    if (command === "execute_sprout_sweep") {
+      calls.push(command);
+      return {
+        sent: [], total_swept: 0, skipped: [], rejected: [],
+        warnings: [executeNotice], error: null,
+      };
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-status").textContent, /Preview: checkpoint verification/);
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  assert.deepEqual(calls, ["preview_sprout_sweep", "execute_sprout_sweep"]);
+  assert.ok(texts(h.$("sprout-sweep-results")).includes(executeNotice));
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /Preview: checkpoint/);
+});
+
+test("execute displays a changed spent verdict after a spendable preview", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "execute_sprout_sweep") {
+      throw new Error("nothing is left to sweep; fresh checkpoint verification found this note spent");
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-plan").textContent, /1 note\(s\)/);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweep();
+  assert.match(h.$("sprout-sweep-status").textContent, /fresh checkpoint verification found this note spent/);
+});
+
 test("a wallet that spent every Sprout note says so instead of asking for note data", async () => {
   const h = harness(inspected({
     sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,

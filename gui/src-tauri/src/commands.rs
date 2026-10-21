@@ -887,6 +887,16 @@ pub struct SproutSweepPreview {
     /// commits, because pasting a unified address reasonably creates the
     /// opposite expectation.
     pub lands_in_sapling: String,
+    /// The verification result from this preview, which may differ from the
+    /// earlier inspection if the checkpoint or chain changed.
+    pub scan_warning: Option<String>,
+}
+
+fn plan_wallet_sprout_preview(
+    recovered: &argos_core::sprout_recovery::SproutRecovery,
+) -> Result<argos_core::sprout_sweep::SproutSweepPlan, String> {
+    argos_core::sprout_sweep::plan_sweep(&recovered.notes)
+        .map_err(|err| with_chain_notice(err.to_string(), recovered.chain_notice.as_deref()))
 }
 
 /// Preview a Sprout sweep.
@@ -913,7 +923,7 @@ pub async fn preview_sprout_sweep(
 
     let network = network_from(network.as_deref().unwrap_or("mainnet"));
     let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref()).await;
-    let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
+    let plan = plan_wallet_sprout_preview(&recovered)?;
 
     let params_path = argos_core::sprout_sweep::default_params_path();
     Ok(SproutSweepPreview {
@@ -924,6 +934,7 @@ pub async fn preview_sprout_sweep(
         params_present: params_path.exists(),
         params_path: params_path.display().to_string(),
         lands_in_sapling: argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING.to_owned(),
+        scan_warning: recovered.chain_notice,
     })
 }
 
@@ -959,6 +970,30 @@ pub struct SproutSweepReport {
     pub error: Option<String>,
 }
 
+fn with_chain_notice(message: String, notice: Option<&str>) -> String {
+    match notice {
+        Some(notice) => format!("{message}. {notice}"),
+        None => message,
+    }
+}
+
+fn append_chain_notice(warnings: &mut Vec<String>, notice: Option<String>) {
+    if let Some(notice) = notice {
+        warnings.push(notice);
+    }
+}
+
+fn no_sprout_notes_error(recovered: &argos_core::sprout_recovery::SproutRecovery) -> String {
+    let message = if recovered.nothing_left_to_sweep() {
+        "nothing is left to sweep: every Sprout note in this wallet file is spent (by the \
+         file's own record, or by this wallet's full-block scan), already swept, or worth \
+         less than the fee"
+    } else {
+        "no spendable Sprout notes could be recovered from this wallet file"
+    };
+    with_chain_notice(message.to_owned(), recovered.chain_notice.as_deref())
+}
+
 /// Prove and broadcast a Sprout sweep.
 ///
 /// Progress is emitted as `sprout-sweep-progress` events because proving
@@ -989,16 +1024,7 @@ pub async fn execute_sprout_sweep(
 
     let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref()).await;
     if recovered.notes.is_empty() {
-        // Said by cause: a file Argos could not read, and a wallet whose
-        // notes the file or the scan show as spent, need different next steps.
-        return Err(if recovered.nothing_left_to_sweep() {
-            "nothing is left to sweep: every Sprout note in this wallet file is spent (by the \
-             file's own record, or by this wallet's full-block scan), already swept, or worth \
-             less than the fee"
-                .to_owned()
-        } else {
-            "no spendable Sprout notes could be recovered from this wallet file".to_owned()
-        });
+        return Err(no_sprout_notes_error(&recovered));
     }
 
     let params_path = argos_core::sprout_sweep::default_params_path();
@@ -1021,7 +1047,9 @@ pub async fn execute_sprout_sweep(
         },
     )
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| with_chain_notice(err.to_string(), recovered.chain_notice.as_deref()))?;
+    let mut warnings = outcome.warnings;
+    append_chain_notice(&mut warnings, recovered.chain_notice);
 
     Ok(SproutSweepReport {
         sent: outcome
@@ -1045,7 +1073,7 @@ pub async fn execute_sprout_sweep(
                 value_swept: h.value_swept,
             })
             .collect(),
-        warnings: outcome.warnings,
+        warnings,
         error: outcome.error,
     })
 }
@@ -2104,6 +2132,74 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use argos_core::sprout_recovery::{SpentSproutNote, SproutRecovery};
+
+    #[test]
+    fn preview_response_serializes_its_current_scan_warning() {
+        let preview = SproutSweepPreview {
+            notes: 1,
+            gross_zatoshis: 100_000,
+            fee_zatoshis: 10_000,
+            net_zatoshis: 90_000,
+            params_present: true,
+            params_path: "/fixture/params".to_owned(),
+            lands_in_sapling: "Lands in Sapling".to_owned(),
+            scan_warning: Some("fresh checkpoint verification failed".to_owned()),
+        };
+        let json = serde_json::to_value(preview).unwrap();
+        assert_eq!(json["scan_warning"], "fresh checkpoint verification failed");
+    }
+
+    #[test]
+    fn preview_error_carries_fresh_verification_notice_when_no_note_is_available() {
+        let mut recovered = SproutRecovery::default();
+        recovered.chain_notice = Some("preview verification found a deep reorg".to_owned());
+        let error = plan_wallet_sprout_preview(&recovered).unwrap_err();
+        assert!(
+            error.contains("preview verification found a deep reorg"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn execute_uses_its_current_notice_even_when_preview_had_a_different_verdict() {
+        let a_sk = [0x42; 32];
+        let mut preview = SproutRecovery::default();
+        preview
+            .notes
+            .push(argos_core::sprout_recovery::SpendableSproutNote {
+                note: argos_core::sprout::SproutNotePlaintext {
+                    value: 1_000_000,
+                    rho: [0x11; 32],
+                    r: [0x22; 32],
+                    memo: [0; 512],
+                },
+                a_sk,
+                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk),
+                commitment: [0x33; 32],
+                anchor: [0x44; 32],
+                witness_path: vec![],
+                outpoint: spent_note().outpoint,
+            });
+        preview.chain_notice = Some("preview verification saw a spendable note".to_owned());
+        assert_eq!(plan_wallet_sprout_preview(&preview).unwrap().notes, 1);
+
+        let mut current = SproutRecovery::default();
+        current.spent.push(spent_note());
+        current.chain_notice = Some("execute verification found a new reorg".to_owned());
+        let mut warnings = vec!["journal warning".to_owned()];
+        append_chain_notice(&mut warnings, current.chain_notice.clone());
+        assert_eq!(
+            warnings,
+            vec!["journal warning", "execute verification found a new reorg"]
+        );
+        let error = no_sprout_notes_error(&current);
+        assert!(
+            error.contains("execute verification found a new reorg"),
+            "{error}"
+        );
+        assert!(error.contains("nothing is left to sweep"), "{error}");
+        assert!(!error.contains("preview verification"), "{error}");
+    }
 
     #[tokio::test]
     async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {

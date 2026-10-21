@@ -552,6 +552,10 @@ async function showSproutSweep() {
 
     if (walletFile !== source) return;
 
+    // Verification runs again for this preview. Show its current verdict
+    // beside the plan, even if inspection used an earlier checkpoint view.
+    setStatus("sprout-sweep-status", preview.scan_warning || "", "");
+
     $("sprout-sweep-plan").textContent =
       `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
       `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.`;
