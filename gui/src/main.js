@@ -312,6 +312,19 @@ seedVisibility.addEventListener("change", () => {
   seedInput.classList.toggle("masked", !seedVisibility.checked);
 });
 
+// ZecWallet Lite only generated 24-word phrases, so a shorter one came from
+// another wallet. Argos derives the standard paths (ZIP 32 shielded accounts,
+// BIP-44 account 0 transparent receive addresses), so a wallet that used
+// other paths scans to zero.
+function seedValidMessage(wordCount) {
+  const valid = "✓ Seed phrase is valid.";
+  if (wordCount === 24) return valid;
+  return `${valid} ZecWallet Lite only made 24-word phrases, so this ${wordCount}-word ` +
+    "phrase is from another wallet. Argos checks the standard paths: ZIP 32 shielded " +
+    "accounts and BIP-44 transparent addresses m/44'/133'/0'/0/0–999. If that wallet " +
+    "used a different derivation path, the scan will find no funds.";
+}
+
 // Which scan-screen banner applies. Only a wallet file whose keys are all
 // transparent skips the block sync: pasted Sapling keys move the scan onto
 // the imported-account route, and matched-address recovery ignores the file.
@@ -331,7 +344,7 @@ async function validateSeed() {
   seedNextBtn.disabled = true;
   try {
     await invoke("validate_seed", { words });
-    setStatus("seed-status", "✓ Seed phrase is valid.", "success");
+    setStatus("seed-status", seedValidMessage(words.length), "success");
     seedNextBtn.disabled = false;
   } catch (err) {
     setStatus("seed-status", `✗ ${err}`, "error");
