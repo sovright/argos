@@ -19,6 +19,7 @@ use zcash_protocol::consensus::BranchId;
 
 use crate::{
     error::{ZeckError, ZeckResult},
+    models::normalized_confirmation_authority,
     workspace::append_private_file,
 };
 
@@ -58,6 +59,30 @@ pub struct TxObservation {
     pub evidence: Vec<EndpointTxEvidence>,
 }
 
+fn independent_evidence_sources(a: &EndpointTxEvidence, b: &EndpointTxEvidence) -> bool {
+    let a_operator = a.operator_id.trim();
+    let b_operator = b.operator_id.trim();
+    if a_operator.is_empty() || b_operator.is_empty() || a_operator == b_operator {
+        return false;
+    }
+    let (Some(a_authority), Some(b_authority)) = (
+        normalized_confirmation_authority(&a.endpoint),
+        normalized_confirmation_authority(&b.endpoint),
+    ) else {
+        return false;
+    };
+    a_authority != b_authority
+}
+
+fn has_independent_pair(evidence: &[&EndpointTxEvidence]) -> bool {
+    evidence.iter().enumerate().any(|(index, first)| {
+        evidence
+            .iter()
+            .skip(index + 1)
+            .any(|second| independent_evidence_sources(first, second))
+    })
+}
+
 impl TxObservation {
     pub fn has_canonical_mined_evidence(&self) -> bool {
         self.state == TxObservationState::Mined
@@ -79,16 +104,15 @@ impl TxObservation {
         }) {
             return false;
         }
-        self.evidence
+        let absent_after_expiry = self
+            .evidence
             .iter()
             .filter(|item| {
                 !item.operator_id.trim().is_empty()
                     && item.tip_height.is_some_and(|tip| tip > expiry_height)
             })
-            .map(|item| item.operator_id.as_str())
-            .collect::<HashSet<_>>()
-            .len()
-            >= 2
+            .collect::<Vec<_>>();
+        has_independent_pair(&absent_after_expiry)
     }
 }
 
@@ -100,10 +124,18 @@ pub fn observe_transaction(
     evidence: Vec<EndpointTxEvidence>,
     expiry_height: Option<u32>,
 ) -> TxObservation {
+    let evidence = evidence
+        .into_iter()
+        .map(|mut item| {
+            item.operator_id = item.operator_id.trim().to_owned();
+            item
+        })
+        .collect::<Vec<_>>();
     let primary_tip = evidence.first().and_then(|item| item.tip_height);
     let secondary_tip = evidence.get(1).and_then(|item| item.tip_height);
-    let mut claims: Vec<(u32, &[u8], &str)> = Vec::new();
-    let mut absent_operators = HashSet::new();
+    let mut claims: Vec<&EndpointTxEvidence> = Vec::new();
+    let mut reported_heights = HashSet::new();
+    let mut absent_sources = Vec::new();
     let mut any_absent = false;
     let mut present_unmined = false;
     let mut reorged = false;
@@ -115,9 +147,16 @@ pub fn observe_transaction(
             Some(0) => present_unmined = true,
             Some(height) => {
                 claimed_height = true;
-                if let Some(hash) = item.block_hash.as_deref().filter(|hash| !hash.is_empty()) {
+                reported_heights.insert(height);
+                if item
+                    .block_hash
+                    .as_deref()
+                    .is_some_and(|hash| hash.len() == 32)
+                {
                     if item.tx_in_block {
-                        claims.push((height, hash, item.operator_id.as_str()));
+                        if normalized_confirmation_authority(&item.endpoint).is_some() {
+                            claims.push(item);
+                        }
                     } else {
                         contested = true;
                     }
@@ -125,42 +164,39 @@ pub fn observe_transaction(
             }
             None if item.tip_height.is_some() => {
                 any_absent = true;
-                if !item.operator_id.trim().is_empty() {
-                    absent_operators.insert(item.operator_id.as_str());
+                if normalized_confirmation_authority(&item.endpoint).is_some() {
+                    absent_sources.push(item);
                 }
             }
             None => {}
         }
     }
-    if let Some((height, hash, _)) = claims.first() {
-        if claims
-            .iter()
-            .any(|(other_height, other_hash, _)| other_height != height || other_hash != hash)
-            || present_unmined
+    if let Some(first) = claims.first() {
+        if claims.iter().any(|other| {
+            other.reported_height != first.reported_height || other.block_hash != first.block_hash
+        }) || present_unmined
             || any_absent
         {
             contested = true;
         }
     }
-    let distinct_mined_operators = claims
-        .iter()
-        .filter_map(|(_, _, operator)| (!operator.trim().is_empty()).then_some(*operator))
-        .collect::<HashSet<_>>()
-        .len();
+    if reported_heights.len() > 1 {
+        contested = true;
+    }
     let (state, mined_height) = if contested {
         (TxObservationState::Contested, None)
     } else if reorged {
         (TxObservationState::Reorged, None)
-    } else if distinct_mined_operators >= 2 {
+    } else if has_independent_pair(&claims) {
         (
             TxObservationState::Mined,
-            claims.first().map(|(height, _, _)| *height),
+            claims.first().and_then(|item| item.reported_height),
         )
     } else if claimed_height {
         (TxObservationState::Unavailable, None)
     } else if present_unmined {
         (TxObservationState::PresentUnmined, None)
-    } else if absent_operators.len() >= 2 {
+    } else if has_independent_pair(&absent_sources) {
         (TxObservationState::Absent, None)
     } else {
         (TxObservationState::Unavailable, None)
@@ -1634,6 +1670,7 @@ mod tests {
         };
         assert!(!observation.is_expired());
         observation.evidence[1].operator_id = "two".to_owned();
+        observation.evidence[1].endpoint = "https://two.example".to_owned();
         observation.evidence[1].tip_height = Some(100);
         assert!(!observation.is_expired());
         observation.evidence[1].tip_height = Some(101);
@@ -1777,6 +1814,173 @@ mod tests {
         );
         assert_eq!(observation.state, TxObservationState::Mined);
         assert_eq!(observation.mined_height, Some(100));
+    }
+
+    #[test]
+    fn review_trimmed_operator_ids_are_one_mining_source() {
+        let mut second = confirmation_evidence(" one ", Some(100), Some(&[1; 32]), true);
+        second.endpoint = "https://other.example".to_owned();
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                second,
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Unavailable);
+    }
+
+    #[test]
+    fn review_trimmed_operator_ids_are_one_expiry_source() {
+        let mut second = confirmation_evidence(" one ", None, None, false);
+        second.endpoint = "https://other.example".to_owned();
+        let evidence = vec![confirmation_evidence("one", None, None, false), second];
+        let observation = observe_transaction(evidence.clone(), Some(100));
+        assert_ne!(observation.state, TxObservationState::Absent);
+        let forged = TxObservation {
+            state: TxObservationState::Absent,
+            evidence,
+            ..observation
+        };
+        assert!(!forged.is_expired());
+    }
+
+    #[test]
+    fn review_reported_height_disagreement_contests_even_without_block() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("three", Some(101), None, false),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Contested);
+        let mut unavailable = confirmation_evidence("three", None, None, false);
+        unavailable.tip_height = None;
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(100), Some(&[1; 32]), true),
+                unavailable,
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Mined);
+    }
+
+    #[test]
+    fn review_short_block_hashes_cannot_confirm() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1, 2]), true),
+                confirmation_evidence("two", Some(100), Some(&[1, 2]), true),
+            ],
+            Some(130),
+        );
+        assert_ne!(observation.state, TxObservationState::Mined);
+    }
+
+    #[test]
+    fn review_missing_endpoint_cannot_finalize_mining_or_expiry() {
+        let mut invalid_mined = confirmation_evidence("two", Some(100), Some(&[1; 32]), true);
+        invalid_mined.endpoint.clear();
+        let mined = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                invalid_mined,
+            ],
+            Some(130),
+        );
+        assert_ne!(mined.state, TxObservationState::Mined);
+        let mut invalid_absent = confirmation_evidence("two", None, None, false);
+        invalid_absent.endpoint.clear();
+        let absent = observe_transaction(
+            vec![
+                confirmation_evidence("one", None, None, false),
+                invalid_absent,
+            ],
+            Some(100),
+        );
+        assert_ne!(absent.state, TxObservationState::Absent);
+        let forged = TxObservation {
+            state: TxObservationState::Absent,
+            ..absent
+        };
+        assert!(!forged.is_expired());
+    }
+
+    #[test]
+    fn review_zero_port_endpoint_cannot_finalize_mining() {
+        let mut invalid = confirmation_evidence("two", Some(100), Some(&[1; 32]), true);
+        invalid.endpoint = "https://two.example:0".to_owned();
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                invalid,
+            ],
+            Some(130),
+        );
+        assert_ne!(observation.state, TxObservationState::Mined);
+    }
+
+    #[test]
+    fn review_durable_log_rejects_mined_same_authority_relabel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([45; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![45],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(130),
+        })
+        .unwrap();
+        let mut second = confirmation_evidence("two", Some(100), Some(&[1; 32]), true);
+        second.endpoint = "https://ONE.example:443/".to_owned();
+        let observation = TxObservation {
+            state: TxObservationState::Mined,
+            mined_height: Some(100),
+            expiry_height: Some(130),
+            primary_tip: Some(120),
+            secondary_tip: Some(120),
+            evidence: vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                second,
+            ],
+        };
+        assert!(log
+            .transition(txid, TxLifecycleState::Mined, None, Some(&observation))
+            .is_err());
+    }
+
+    #[test]
+    fn review_durable_log_rejects_expired_same_authority_relabel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let txid = TxId::from_bytes([46; 32]);
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![46],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(100),
+        })
+        .unwrap();
+        let mut second = confirmation_evidence("two", None, None, false);
+        second.endpoint = "https://ONE.example:443/".to_owned();
+        let observation = TxObservation {
+            state: TxObservationState::Absent,
+            mined_height: None,
+            expiry_height: Some(100),
+            primary_tip: Some(120),
+            secondary_tip: Some(120),
+            evidence: vec![confirmation_evidence("one", None, None, false), second],
+        };
+        assert!(log
+            .transition(txid, TxLifecycleState::Expired, None, Some(&observation))
+            .is_err());
     }
 
     #[test]

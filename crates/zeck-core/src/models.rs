@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
 
 use crate::key_source::KeySource;
@@ -116,6 +117,30 @@ pub fn default_transparent_scan() -> Option<TransparentScanConfig> {
 pub struct ConfirmationEndpoint {
     pub operator_id: String,
     pub endpoint: String,
+}
+
+/// Identity used when independent transaction evidence is counted. Keep this
+/// below both the network adapter and the broadcast log so they apply the
+/// same authority rules without depending on each other.
+pub(crate) fn normalized_confirmation_authority(endpoint: &str) -> Option<String> {
+    let url = Url::parse(endpoint).ok()?;
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let loopback = host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]"
+        || host.ends_with(".localhost");
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    if port == 0 {
+        return None;
+    }
+    Some(format!("{}://{}:{}", url.scheme(), host, port))
 }
 
 #[derive(Clone)]

@@ -11,7 +11,9 @@ use zcash_primitives::transaction::TxId;
 use crate::{
     broadcast::{observe_transaction, EndpointTxEvidence, TxObservation, TxObserver},
     error::{ZeckError, ZeckResult},
-    models::{ConfirmationEndpoint, LightwalletdProbe, ZeckNetwork},
+    models::{
+        normalized_confirmation_authority, ConfirmationEndpoint, LightwalletdProbe, ZeckNetwork,
+    },
 };
 
 const MAINNET_SAPLING_ACTIVATION: u64 = 419_200;
@@ -69,23 +71,19 @@ pub const DEFAULT_TESTNET_LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
 const CONFIRMATION_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn normalized_endpoint_authority(endpoint: &str) -> ZeckResult<String> {
-    let url = Url::parse(endpoint).map_err(|err| {
-        ZeckError::InvalidConfig(format!("invalid confirmation endpoint '{endpoint}': {err}"))
-    })?;
-    let host = url.host_str().ok_or_else(|| {
-        ZeckError::InvalidConfig(format!("confirmation endpoint '{endpoint}' has no host"))
-    })?;
-    Ok(format!(
-        "{}://{}:{}",
-        url.scheme().to_ascii_lowercase(),
-        host.to_ascii_lowercase(),
-        url.port_or_known_default().unwrap_or(0)
-    ))
+    normalized_confirmation_authority(endpoint).ok_or_else(|| {
+        ZeckError::InvalidConfig(format!("invalid confirmation endpoint '{endpoint}'"))
+    })
 }
 
 fn builtin_operator(endpoint: &str) -> Option<&'static str> {
     let url = Url::parse(endpoint).ok()?;
-    match url.host_str()?.to_ascii_lowercase().as_str() {
+    match url
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "zec.rocks" | "na.zec.rocks" | "testnet.zec.rocks" => Some("zec.rocks"),
         _ => None,
     }
@@ -144,7 +142,7 @@ pub fn confirmation_endpoints(
         }
         result.push(ConfirmationEndpoint {
             operator_id: builtin_operator(&endpoint)
-                .unwrap_or(&source.operator_id)
+                .unwrap_or(source.operator_id.trim())
                 .to_owned(),
             endpoint,
         });
@@ -594,6 +592,32 @@ mod tests {
     fn confirmation_sources_cannot_relabel_builtin_host() {
         let sources = parse_confirmation_sources(&["independent=https://zec.rocks:443"]).unwrap();
         assert_eq!(sources[0].operator_id, "zec.rocks");
+    }
+
+    #[test]
+    fn review_trailing_dot_builtin_hosts_share_one_operator() {
+        let sources = parse_confirmation_sources(&[
+            "first=https://zec.rocks.:443",
+            "second=https://na.zec.rocks.:443",
+            "third=https://testnet.zec.rocks.:443",
+        ])
+        .unwrap();
+        assert!(sources
+            .iter()
+            .all(|source| source.operator_id == "zec.rocks"));
+    }
+
+    #[test]
+    fn review_direct_config_operator_id_is_trimmed() {
+        let sources = confirmation_endpoints(
+            "https://scan.example",
+            &[crate::models::ConfirmationEndpoint {
+                operator_id: " one ".to_owned(),
+                endpoint: "https://one.example".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(sources[0].operator_id, "one");
     }
 
     #[test]
