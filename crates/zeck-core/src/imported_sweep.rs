@@ -517,7 +517,7 @@ where
     submit().await
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 trait SaplingAccountRunner {
     async fn build_and_submit(
         &mut self,
@@ -565,7 +565,7 @@ struct RealSaplingAccountRunner<'a> {
     broadcast_log: &'a mut DurableBroadcastLog,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
     async fn build_and_submit(
         &mut self,
@@ -1262,7 +1262,7 @@ mod tests {
         submissions: usize,
     }
 
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl SaplingAccountRunner for CountingRunner {
         async fn build_and_submit(
             &mut self,

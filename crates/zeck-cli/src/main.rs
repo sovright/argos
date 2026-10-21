@@ -2087,13 +2087,19 @@ async fn main() -> Result<()> {
                         println!();
                         for result in &outcome.transactions {
                             println!(
-                                "  account {}  {}  txid {}  fee {}  {}",
+                                "  account {}  {} ({})  txid {}  fee {}",
                                 result.source_account,
                                 result.status,
+                                sweep_status_label(result.status),
                                 result.txid.as_deref().unwrap_or("unknown"),
                                 format_zec(result.fee_zatoshis),
-                                result.detail
                             );
+                            if result.status == argos_core::TxLifecycleState::Mined {
+                                if let Some(height) = result.confirmed_height {
+                                    println!("    mined at block {height}");
+                                }
+                            }
+                            println!("    evidence: {}", result.detail);
                         }
                         println!();
                         // Accounts that held a balance but moved nothing (all
@@ -2128,11 +2134,16 @@ async fn main() -> Result<()> {
                             );
                             println!();
                         }
+                        let statuses: Vec<_> =
+                            outcome.transactions.iter().map(|tx| tx.status).collect();
                         match outcome.error {
-                            None if outcome.follow_up_review_required => println!(
-                                "Shielding stage submitted. After it mines, rescan and review a new proposal before sending the shielded funds."
+                            None => println!(
+                                "{}",
+                                sweep_completion_guidance(
+                                    &statuses,
+                                    outcome.follow_up_review_required
+                                )
                             ),
-                            None => println!("Sweep complete."),
                             // A mid-sequence abort: the transactions above were
                             // already broadcast and are irreversible, but the
                             // remaining accounts were not swept (audit Issue E).
@@ -2144,7 +2155,7 @@ async fn main() -> Result<()> {
                                 }) {
                                     eprintln!("A listed transaction may already have reached the network; do not retry or discard the source wallet. Reconcile its txid before any further sweep.");
                                 } else {
-                                    eprintln!("Sweep aborted with the transaction results listed above. Verify their txids before retrying; remaining accounts were not swept.");
+                                    eprintln!("Sweep aborted with the transaction results listed above. Keep the source wallet and recovery workspace; verify each txid before a new proposal. Remaining accounts were not swept.");
                                 }
                                 eprintln!("Error: {message}");
                                 std::process::exit(1);
@@ -2757,6 +2768,52 @@ fn print_scan_result(progress: &argos_core::ScanProgress) {
     }
 }
 
+fn sweep_status_label(status: argos_core::TxLifecycleState) -> &'static str {
+    use argos_core::TxLifecycleState as State;
+    match status {
+        State::NotSubmitted => "Not submitted.",
+        State::SubmissionUnknown => {
+            "Submission uncertain — may already be on the network. Do not retry."
+        }
+        State::Pending => "Broadcast — awaiting independent confirmation.",
+        State::Mined => "Mined — independently confirmed.",
+        State::Expired => "Expired — rescan before rebuilding.",
+        State::Rejected => "Rejected by the node.",
+    }
+}
+
+fn sweep_completion_guidance(
+    states: &[argos_core::TxLifecycleState],
+    follow_up_review_required: bool,
+) -> &'static str {
+    use argos_core::TxLifecycleState as State;
+    if follow_up_review_required {
+        if states.contains(&State::SubmissionUnknown) {
+            return "Shielding submission may already have moved. Do not retry. Keep the source wallet and recovery workspace; reconcile the txid, then rescan and review a new proposal after mining.";
+        }
+        return "Shielding stage submitted. Keep the source wallet and recovery workspace. After every shielding transaction mines, rescan and review a new proposal before sending shielded funds.";
+    }
+    if states.contains(&State::SubmissionUnknown) {
+        return "A transaction may already have moved. Do not retry. Keep the source wallet and recovery workspace; reconcile its txid before a new proposal.";
+    }
+    if states.contains(&State::Pending) {
+        return "A transaction is awaiting independent confirmation. Keep the source wallet and recovery workspace until every submitted transaction mines.";
+    }
+    if states.contains(&State::Expired) {
+        return "A transaction expired. Keep the source wallet and recovery workspace; rescan before rebuilding.";
+    }
+    if states.contains(&State::Rejected) {
+        return "A transaction was rejected by the node. Review the evidence before a new proposal.";
+    }
+    if !states.is_empty() && states.iter().all(|state| *state == State::Mined) {
+        return "Sweep complete. Every submitted transaction was independently confirmed as mined.";
+    }
+    if states.contains(&State::Mined) {
+        return "A transaction mined, but this sweep did not finish. Keep the source wallet and recovery workspace; review the remaining results before a new proposal.";
+    }
+    "No transaction was submitted. Review the details before trying again."
+}
+
 fn print_sweep_preview(proposal: &SweepProposal) {
     println!();
     println!("Sweep preview:");
@@ -2925,6 +2982,49 @@ fn powershell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_sweep_status_copy_preserves_uncertain_and_mined_boundaries() {
+        use argos_core::TxLifecycleState as State;
+        assert_eq!(sweep_status_label(State::NotSubmitted), "Not submitted.");
+        assert_eq!(
+            sweep_status_label(State::SubmissionUnknown),
+            "Submission uncertain — may already be on the network. Do not retry."
+        );
+        assert_eq!(
+            sweep_status_label(State::Pending),
+            "Broadcast — awaiting independent confirmation."
+        );
+        assert_eq!(
+            sweep_status_label(State::Mined),
+            "Mined — independently confirmed."
+        );
+        assert_eq!(
+            sweep_status_label(State::Expired),
+            "Expired — rescan before rebuilding."
+        );
+        assert_eq!(sweep_status_label(State::Rejected), "Rejected by the node.");
+        assert!(
+            sweep_completion_guidance(&[State::SubmissionUnknown], false)
+                .contains("Keep the source wallet")
+        );
+        assert!(
+            sweep_completion_guidance(&[State::Pending], false).contains("Keep the source wallet")
+        );
+        assert!(
+            !sweep_completion_guidance(&[State::Mined, State::Pending], false)
+                .contains("Sweep complete")
+        );
+        assert!(!sweep_completion_guidance(&[State::Mined], true).contains("Sweep complete"));
+        assert!(sweep_completion_guidance(&[State::Mined], false).contains("Sweep complete"));
+        assert!(
+            sweep_completion_guidance(&[State::SubmissionUnknown], true).contains("Do not retry")
+        );
+        assert!(
+            sweep_completion_guidance(&[State::Mined, State::NotSubmitted], false)
+                .contains("mined, but")
+        );
+    }
 
     #[tokio::test]
     async fn empty_transparent_scan_reports_prior_blocking_txid() {

@@ -598,9 +598,9 @@
               <small>A short note attached to the recovery transaction. Visible only to the sender and recipient. <span id="memo-byte-count"></span></small>
             </label>
             <label class="field">
-              <span>Max transaction fee in ZEC (optional)</span>
+              <span>Maximum total sweep fee in ZEC (optional)</span>
               <input id="max-fee-zec" type="text" inputmode="decimal" placeholder="0.0002" />
-              <small>Leave blank to use the standard fee (~0.0002 ZEC). Only change this if you know what you're doing.</small>
+              <small>Leave blank to use the exact total fee shown in your reviewed proposal.</small>
             </label>
           </div>
           <div class="inline-actions">
@@ -783,8 +783,8 @@
 
         <section class="screen" data-step="complete">
           <p class="eyebrow">Step 6</p>
-          <h2>Recovery complete</h2>
-          <p class="lead" id="complete-summary">Transactions broadcast successfully.</p>
+          <h2 id="complete-heading">Sweep status</h2>
+          <p class="lead" id="complete-summary"></p>
           <!-- Repeated here deliberately: this screen is where the "Delete
                workspace" button lives, and the wallet file is the only copy
                of any Sprout key it holds. -->
@@ -792,10 +792,8 @@
           <div id="complete-txids" class="complete-txids"></div>
           <p id="complete-donation" hidden></p>
           <div class="report-card" id="complete-skipped"></div>
-          <!-- Audit Issue B: confirmation is attested by the single connected
-               lightwalletd server, so this advises independent verification. -->
           <p class="status-line" id="complete-confirmation-note">
-            Confirmation status is reported by the lightwalletd server you connected to. Before treating your recovery as final, verify each transaction ID on an independent Zcash block explorer or a second node.
+            Keep the source wallet and recovery workspace until submitted transactions are independently verified as mined.
           </p>
           <div class="report-card" id="complete-report" style="display:none"></div>
           <div class="donate-card report-card">

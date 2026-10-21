@@ -2558,6 +2558,12 @@ async function refreshSweepProposal() {
   try {
     const review = await invoke("propose_sweep", request);
     if (generation !== state.proposalGeneration || handleId !== state.scanHandle?.id) return null;
+    if (!$("max-fee-zec").value.trim()) {
+      const zatoshis = BigInt(review.proposal.total_fee_zatoshis);
+      const exactCap = `${zatoshis / 100000000n}.${String(zatoshis % 100000000n).padStart(8, "0")}`;
+      $("max-fee-zec").value = exactCap;
+      state.maxFeeZec = exactCap;
+    }
     state.sweepReview = { ...review, handleId, donationRateForDisplay: request.donationRate };
     setSweepProposalPending(false);
     renderSweepProposal(review.proposal);
@@ -2806,7 +2812,7 @@ $("execute-sweep").addEventListener("click", async () => {
       review.donationRateForDisplay,
       outcome.error,
       outcome.donation_note,
-      completionContext,
+      { ...completionContext, followUpReviewRequired: outcome.follow_up_review_required },
     );
     if (state.scanHandle?.id !== handle.id) {
       $("complete-summary").textContent =
@@ -2824,59 +2830,63 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
-// The seed-phrase route reports "pending" then "confirmed"; the seedless
-// routes (imported wallet file, pasted Sapling key, transparent-only) report
-// "broadcast" and do not poll for confirmation. Both mean the transaction is
-// on the network and cannot be undone, so they must never read as failed: a
-// user told a sent transaction failed may retry and attempt a double spend.
+// Older seedless results used "broadcast". Keep that as pending when showing
+// saved results; current core outcomes use the six lifecycle states below.
 function txStatusKind(status) {
-  if (status === "confirmed") return "confirmed";
-  if (status === "pending" || status === "broadcast") return "sent";
-  return "failed";
+  if (status === "broadcast") return "pending";
+  if (status === "confirmed") return "pending";
+  if (status === "failed") return "rejected";
+  if (["not_submitted", "submission_unknown", "pending", "mined", "expired", "rejected"].includes(status)) return status;
+  return "submission_unknown";
 }
 
 function txStatusLabel(status) {
-  const kind = txStatusKind(status);
-  if (kind === "confirmed") return "Confirmed";
-  if (kind === "sent") return "Broadcast — awaiting confirmation";
-  return "Failed";
+  return {
+    not_submitted: "Not submitted.",
+    submission_unknown: "Submission uncertain — may already be on the network. Do not retry.",
+    pending: "Broadcast — awaiting independent confirmation.",
+    mined: "Mined — independently confirmed.",
+    expired: "Expired — rescan before rebuilding.",
+    rejected: "Rejected by the node.",
+  }[txStatusKind(status)];
 }
 
 function sweepStatusCounts(results) {
-  const counts = { confirmed: 0, pending: 0, failed: 0, broadcast: 0 };
+  const counts = { not_submitted: 0, unknown: 0, pending: 0, mined: 0, expired: 0, rejected: 0, broadcast: 0 };
   for (const r of results) {
     const kind = txStatusKind(r.status);
-    if (kind === "confirmed") counts.confirmed += 1;
-    else if (kind === "sent") counts.pending += 1;
-    else counts.failed += 1;
+    if (kind === "submission_unknown") counts.unknown += 1;
+    else counts[kind] += 1;
   }
-  counts.broadcast = counts.confirmed + counts.pending;
+  counts.broadcast = counts.unknown + counts.pending + counts.mined + counts.expired;
   return counts;
 }
 
-function sweepCompleteSummary(results, error) {
-  const { confirmed, failed, broadcast } = sweepStatusCounts(results);
+function sweepCompleteSummary(results, error, followUpReviewRequired = false) {
+  const { unknown, pending, mined, expired, rejected, broadcast } = sweepStatusCounts(results);
+  const walletWarning = "Keep the source wallet and its recovery workspace until every submitted transaction is independently verified as mined.";
   if (error) {
-    // The sweep aborted partway. The transactions below were already
-    // broadcast and are irreversible; the remaining accounts were not swept.
-    // Surface this so the user does not assume nothing was sent and retry
-    // (which would double-broadcast) — audit Issue E.
-    return `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
-      `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
+    const sent = broadcast > 0 ? `${broadcast} transaction${broadcast === 1 ? " may" : "s may"} already have moved. ` : "";
+    return `The sweep stopped before completing. ${sent}${unknown ? "A submission may already have moved; do not retry it. " : ""}${walletWarning} Rescan and reconcile each txid before any new proposal. Error: ${error}`;
   }
   if (results.length === 0) {
-    // Nothing was broadcast because every account with a balance was skipped
-    // (below the fee floor, or transparent funds that couldn't be shielded).
-    // The reasons are listed below — this is NOT a broadcast failure.
     return "No funds were swept — every account with a balance was skipped (reasons below).";
   }
-  if (failed === results.length) {
-    return "All transactions failed to broadcast. No funds were moved.";
+  if (followUpReviewRequired) {
+    const uncertainty = unknown ? "A shielding transaction may already have moved; do not retry it. " : "";
+    return `Shielding stage submitted. ${uncertainty}${mined ? `${mined} transaction${mined === 1 ? "" : "s"} mined. ` : ""}${walletWarning} Once shielding is mined, rescan and review a new proposal before sending shielded funds.`;
   }
-  if (confirmed > 0) {
-    return `${confirmed} transaction${confirmed > 1 ? "s" : ""} confirmed on-chain. Your funds are on their way.`;
+  if (unknown) {
+    return `${unknown} submission${unknown === 1 ? "" : "s"} uncertain — transaction${unknown === 1 ? " may" : "s may"} already have moved. Do not retry. ${walletWarning}`;
   }
-  return `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
+  if (pending) {
+    return `${pending} transaction${pending === 1 ? "" : "s"} broadcast, awaiting independent confirmation. ${walletWarning}`;
+  }
+  if (expired) return `${expired} transaction${expired === 1 ? "" : "s"} expired. Rescan before rebuilding. ${walletWarning}`;
+  if (rejected) return `${rejected} transaction${rejected === 1 ? " was" : "s were"} rejected by the node. Review the details before a new proposal.`;
+  if (mined === results.length) return `${mined} transaction${mined === 1 ? "" : "s"} mined and independently confirmed. Recovery complete.`;
+  if (mined) return `${mined} transaction${mined === 1 ? "" : "s"} mined, but this sweep did not finish. ${walletWarning} Review the remaining results before a new proposal.`;
+  return "No transaction was submitted. Review the details before trying again.";
 }
 
 function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote, completionContext = null) {
@@ -2886,13 +2896,23 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
   }
   const { broadcast } = sweepStatusCounts(results);
-  $("complete-summary").textContent = sweepCompleteSummary(results, error);
+  const followUpReviewRequired = !!completionContext?.followUpReviewRequired;
+  const allMined = !error && !followUpReviewRequired && results.length > 0 &&
+    results.every((r) => txStatusKind(r.status) === "mined");
+  $("complete-heading").textContent = allMined ? "Recovery complete" : "Sweep status";
+  $("complete-summary").textContent = sweepCompleteSummary(results, error, followUpReviewRequired);
+  $("complete-confirmation-note").textContent = allMined
+    ? "Every submitted transaction has independent mining evidence. Verify the destination balance before deleting your recovery workspace."
+    : "Keep the source wallet and recovery workspace. A pending or uncertain transaction may still mine; check the txids and rescan before making a new proposal.";
+  $("delete-workspace").disabled = !allMined;
+  $("delete-workspace-zone").hidden = !allMined;
+  $("restart-flow").textContent = followUpReviewRequired ? "Rescan and review" : "Start over";
 
   const container = $("complete-txids");
   container.innerHTML = "";
   results.forEach((r) => {
     const card = document.createElement("div");
-    card.className = "txid-card" + (txStatusKind(r.status) === "failed" ? " txid-card--failed" : "");
+    card.className = "txid-card" + (["rejected", "expired", "not_submitted"].includes(txStatusKind(r.status)) ? " txid-card--failed" : "");
 
     const label = document.createElement("div");
     label.className = "txid-label";
@@ -2919,18 +2939,20 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
       card.appendChild(row);
     }
 
-    if (r.confirmed_height) {
+    if (r.fee_zatoshis != null) {
+      const fee = document.createElement("div");
+      fee.className = "txid-note";
+      fee.textContent = `Fee: ${fmt(r.fee_zatoshis)}`;
+      card.appendChild(fee);
+    }
+
+    if (txStatusKind(r.status) === "mined" && r.confirmed_height) {
       const note = document.createElement("div");
       note.className = "txid-note";
       note.textContent = `Mined at block ${r.confirmed_height.toLocaleString()}`;
       card.appendChild(note);
-      if (r.detail) {
-        const detail = document.createElement("div");
-        detail.className = "txid-note";
-        detail.textContent = r.detail;
-        card.appendChild(detail);
-      }
-    } else if (r.detail && r.status !== "confirmed") {
+    }
+    if (r.detail) {
       const note = document.createElement("div");
       note.className = "txid-note";
       note.textContent = r.detail;
@@ -3016,10 +3038,11 @@ function buildReport(results, completionContext = null) {
     "Transaction Results",
     "──────────────────",
     ...results.map((r) => {
-      let line = `Account ${r.source_account}: ${r.status}`;
+      let line = `Account ${r.source_account}: ${txStatusKind(r.status)}`;
       if (r.txid) line += `\n  txid: ${r.txid}`;
-      if (r.confirmed_height) line += `\n  confirmed at block ${r.confirmed_height}`;
-      if (r.detail) line += `\n  detail: ${r.detail}`;
+      if (r.fee_zatoshis != null) line += `\n  fee: ${fmt(r.fee_zatoshis)}`;
+      if (txStatusKind(r.status) === "mined" && r.confirmed_height) line += `\n  mined at block ${r.confirmed_height}`;
+      if (r.detail) line += `\n  evidence: ${r.detail}`;
       return line;
     }),
   ].join("\n");
@@ -3062,6 +3085,7 @@ $("copy-report-path").addEventListener("click", () => {
 });
 
 $("delete-workspace").addEventListener("click", async () => {
+  if ($("delete-workspace").disabled) return;
   const handle = state.completedScanHandle || state.scanHandle;
   if (!handle) {
     setStatus("delete-workspace-status", "No workspace to delete.", "error");
@@ -3123,6 +3147,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   });
   $("copy-report-path").style.display = "none";
   $("delete-workspace").disabled = false;
+  $("delete-workspace-zone").hidden = false;
   $("save-report").disabled = false;
   setStatus("delete-workspace-status", "", "");
 
