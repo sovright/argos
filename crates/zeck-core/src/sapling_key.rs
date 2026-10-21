@@ -191,38 +191,29 @@ pub fn merge_sapling_keys(into: &mut ImportedKeys, extra: ImportedKeys) -> usize
     added
 }
 
-/// Merge standalone Sapling keys into the key set a wallet file produced,
-/// refusing the one combination that would silently scan the wrong thing.
+/// Merge standalone Sapling keys into the key set a wallet file produced.
 ///
-/// A wallet file that yields a BIP-39 mnemonic takes the HD route
-/// (`classify_recovery_route` puts the mnemonic first, and
-/// `ImportedKeySource::wallet_seed` returns `Some`), and that route derives
-/// every key it scans from the seed. A standalone key has no place in it:
-/// it would be counted in "imported N key(s)", carried into the key set,
-/// and then never read — the user would see a successful scan and a zero
-/// balance for the very key they supplied. Argos exists for people who have
-/// already lost access to funds once, so that silence is the worst possible
-/// outcome; refuse instead, and say which invocation does work.
+/// A seedless wallet takes the imported-account route, which scans
+/// `keys.sapling` directly. A wallet file with a seed phrase (ZecWallet
+/// Lite) takes the Combined route (`classify_recovery_route`): the seed's
+/// accounts are scanned as HD accounts and every standalone key is
+/// registered beside them in the same wallet database, so a supplied key is
+/// scanned and swept with the rest rather than dropped.
 ///
-/// Only that intersection is refused. A seedless wallet plus standalone
-/// keys is the case this feature exists for and merges normally, and a
-/// wallet file on its own is unaffected.
+/// A supplied key is undated, and the wallet file's recorded birthday
+/// (`ImportedKeys::birthday_height`) bounds only the keys that were in the
+/// file. When a new key is added that bound is withdrawn, so the scan starts
+/// the standalone keys at Sapling activation rather than miss the new
+/// key's older notes. Returns how many keys were added.
 pub fn merge_standalone_sapling_keys(
     wallet_keys: &mut ImportedKeys,
     standalone: ImportedKeys,
 ) -> ZeckResult<usize> {
-    if wallet_keys.mnemonic.is_some() && !standalone.sapling.is_empty() {
-        return Err(ZeckError::Import(
-            "this wallet file contains a seed phrase, so it is scanned as an HD wallet — \
-             every key comes from the seed, and a separately supplied Sapling spending key \
-             cannot be scanned alongside it. It would be accepted and then never looked at. \
-             Run them as two scans: one with the wallet file alone, and one with the \
-             Sapling key alone (CLI: --sapling-key-file with no --wallet-file; GUI: paste \
-             the key with no wallet file open)."
-                .to_owned(),
-        ));
+    let added = merge_sapling_keys(wallet_keys, standalone);
+    if added > 0 {
+        wallet_keys.birthday_height = None;
     }
-    Ok(merge_sapling_keys(wallet_keys, standalone))
+    Ok(added)
 }
 
 #[cfg(test)]
@@ -582,30 +573,47 @@ mod tests {
         }
     }
 
-    /// The critical case: a mnemonic-bearing wallet takes the HD route, which
-    /// never reads `keys.sapling`, so merging a standalone key in would drop
-    /// it silently. Refuse instead, and name the reason.
+    /// Review finding 6 on #275: a wallet with a seed phrase plus a key
+    /// file used to be refused, because the HD route never read
+    /// `keys.sapling`. The Combined route registers standalone keys beside
+    /// the HD accounts, so the key merges, routes Combined, and — being
+    /// undated — withdraws the file's birthday as a bound on it.
     #[test]
-    fn a_mnemonic_wallet_refuses_a_standalone_sapling_key() {
+    fn a_mnemonic_wallet_merges_a_standalone_sapling_key_into_the_combined_route() {
         let mut wallet = ImportedKeys {
             mnemonic: Some(secrecy::SecretString::new(A_MNEMONIC.to_owned())),
+            birthday_height: Some(1_500_000),
             ..Default::default()
         };
-        let err = merge_standalone_sapling_keys(&mut wallet, standalone_set([1u8; 32]))
-            .expect_err("this combination must be refused, not silently dropped")
-            .to_string();
-        assert!(
-            err.contains("seed phrase") && err.contains("HD"),
-            "the message should name why the HD route cannot carry the key, got: {err}"
+        let added = merge_standalone_sapling_keys(&mut wallet, standalone_set([1u8; 32]))
+            .expect("a seed wallet plus a supplied key is scanned as one Combined recovery");
+        assert_eq!(added, 1);
+        assert_eq!(wallet.sapling.len(), 1);
+        assert_eq!(
+            wallet.sapling[0].provenance,
+            argos_wallet_import::Provenance::Standalone
         );
-        assert!(
-            err.contains("two scans") || err.contains("--sapling-key-file"),
-            "the message should say what to do next, got: {err}"
+        assert_eq!(
+            crate::key_source::classify_recovery_route(&wallet),
+            crate::key_source::RecoveryRoute::Combined
         );
-        assert!(
-            wallet.sapling.is_empty(),
-            "a refused merge must leave the wallet key set untouched"
+        assert_eq!(
+            wallet.birthday_height, None,
+            "the file's birthday says nothing about a key from outside it"
         );
+
+        // A key the wallet already holds adds nothing and changes nothing.
+        let mut held = ImportedKeys {
+            mnemonic: Some(secrecy::SecretString::new(A_MNEMONIC.to_owned())),
+            sapling: vec![imported_sapling_key([1u8; 32])],
+            birthday_height: Some(1_500_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_standalone_sapling_keys(&mut held, standalone_set([1u8; 32])).unwrap(),
+            0
+        );
+        assert_eq!(held.birthday_height, Some(1_500_000));
     }
 
     /// The over-refusal guard, which matters as much as the refusal: a

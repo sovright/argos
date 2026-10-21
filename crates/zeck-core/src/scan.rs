@@ -588,9 +588,9 @@ async fn run_recovery_scan_inner(
         guard.workspace = Some(workspace.clone());
     }
 
-    let max_accounts = resolve_max_account_count(&config)?;
+    let (max_accounts, mut target_accounts) =
+        hd_scan_bounds(&config, config.key_source.imported_keys())?;
     let mut imported_accounts = 0u32;
-    let mut target_accounts = initial_batch_size(&config, max_accounts);
     let mut gap_extension_pass = 0u32;
     let network = consensus_network(config.network);
     let initial_accounts = derive_scan_accounts(
@@ -851,48 +851,202 @@ async fn run_recovery_scan_inner(
         target_accounts = new_target;
     }
 
-    if let Some(keys) = config.key_source.imported_keys() {
-        if crate::key_source::classify_recovery_route(keys)
-            == crate::key_source::RecoveryRoute::Combined
-            && register_mixed_keys(
-                &state,
-                &workspace,
-                keys,
-                &seed,
-                &account_birthday,
-                config.network,
-                imported_accounts,
-            )
-            .await?
-        {
-            {
-                let mut guard = state.lock().await;
-                guard.progress.phase = ScanPhase::ScanningShielded;
-                guard.progress.message =
-                    Some("Syncing standalone keys alongside the recovered HD accounts.".to_owned());
-            }
-            let poller = ProgressPoller::start(
-                workspace.clone(),
-                config.network,
-                state.clone(),
-                effective_birthday,
-            );
-            let result = run_wallet_sync_with_retry(
-                &workspace,
-                &network,
-                config.network,
-                &mut client,
-                &config.lightwalletd_url,
-                &state,
-            )
-            .await;
-            poller.stop().await;
-            result?;
-            refresh_scan_progress(&state, &workspace, config.network, effective_birthday).await?;
-        }
-    }
+    run_standalone_leg(
+        StandaloneLeg {
+            state: &state,
+            workspace: &workspace,
+            config: &config,
+            seed: &seed,
+            hd_birthday: &account_birthday,
+            hd_start: effective_birthday,
+            sapling_floor,
+            hd_accounts: imported_accounts,
+        },
+        &mut LightwalletdChain {
+            client: &mut client,
+            chain_tip_height,
+            workspace: &workspace,
+            network: &network,
+            config: &config,
+            state: &state,
+        },
+    )
+    .await?;
 
     finish_scan(&state, &workspace).await
+}
+
+/// The account range the HD scan walks: `(max_accounts, first batch)`.
+///
+/// A wallet file that numbers its HD keys (ZecWallet Lite derives a new
+/// account per address) says how many accounts exist. The first batch
+/// covers the highest index it records, so an account past the gap limit
+/// is scanned rather than lost; an explicit account count is widened to
+/// it, never narrowed. Capped at the scan's own ceiling, so a hostile
+/// index cannot make the scan unbounded.
+fn hd_scan_bounds(
+    config: &RuntimeScanConfig,
+    keys: Option<&argos_wallet_import::ImportedKeys>,
+) -> ZeckResult<(u32, u32)> {
+    let configured = resolve_max_account_count(config)?;
+    let floor = keys
+        .and_then(|keys| keys.highest_hd_index)
+        .map_or(0, |index| {
+            index.saturating_add(1).min(MAX_ACCOUNT_SCAN_COUNT)
+        });
+    let max_accounts = configured.max(floor);
+    let first_batch = initial_batch_size(config, max_accounts)
+        .max(floor)
+        .min(max_accounts);
+    Ok((max_accounts, first_batch))
+}
+
+/// Where a Combined scan starts syncing its standalone keys.
+///
+/// A standalone Sapling key exists in no seed, so the seed's birthday says
+/// nothing about it. ZecWallet Lite lowers its wallet-tail birthday to that
+/// of every Sapling key imported into it, so the earlier of that and the
+/// seed's start covers them; with no birthday on file the key is undated and
+/// starts at Sapling activation, as #274 does for an undated imported key.
+/// Standalone transparent keys need no lower start: `GetAddressUtxos`
+/// reports their outputs at any height.
+fn standalone_scan_start(
+    keys: &argos_wallet_import::ImportedKeys,
+    hd_start: u32,
+    sapling_floor: u32,
+) -> u32 {
+    let has_standalone_sapling = keys
+        .sapling
+        .iter()
+        .any(|key| key.provenance == argos_wallet_import::Provenance::Standalone);
+    if !has_standalone_sapling {
+        return hd_start;
+    }
+    match keys.birthday_height {
+        Some(height) => height.max(sapling_floor).min(hd_start),
+        None => sapling_floor.min(hd_start),
+    }
+}
+
+/// What the standalone leg needs from the chain. The scan drives it with
+/// lightwalletd; tests drive the same leg with a recorder.
+trait StandaloneChain {
+    /// The account birthday for an account first scanned from `height`.
+    async fn birthday_at(&mut self, height: u32) -> ZeckResult<AccountBirthday>;
+    /// Sync the wallet database, reporting progress from `start`.
+    async fn sync_from(&mut self, start: u32) -> ZeckResult<()>;
+}
+
+struct LightwalletdChain<'a> {
+    client: &'a mut CompactTxStreamerClient<tonic::transport::Channel>,
+    chain_tip_height: u32,
+    workspace: &'a RecoveryWorkspace,
+    network: &'a crate::workspace::ArgosParams,
+    config: &'a RuntimeScanConfig,
+    state: &'a SharedScanTaskState,
+}
+
+impl StandaloneChain for LightwalletdChain<'_> {
+    async fn birthday_at(&mut self, height: u32) -> ZeckResult<AccountBirthday> {
+        let treestate = self
+            .client
+            .get_tree_state(BlockId {
+                height: u64::from(height.saturating_sub(1)),
+                hash: vec![],
+            })
+            .await
+            .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+            .into_inner();
+        AccountBirthday::from_treestate(
+            treestate,
+            Some(BlockHeight::from_u32(self.chain_tip_height)),
+        )
+        .map_err(|_| ZeckError::Wallet("constructing account birthday from treestate".to_owned()))
+    }
+
+    async fn sync_from(&mut self, start: u32) -> ZeckResult<()> {
+        self.state.lock().await.progress.blocks_total = block_delta(self.chain_tip_height, start);
+        let poller = ProgressPoller::start(
+            self.workspace.clone(),
+            self.config.network,
+            self.state.clone(),
+            start,
+        );
+        let result = run_wallet_sync_with_retry(
+            self.workspace,
+            self.network,
+            self.config.network,
+            self.client,
+            &self.config.lightwalletd_url,
+            self.state,
+        )
+        .await;
+        poller.stop().await;
+        result?;
+        refresh_scan_progress(self.state, self.workspace, self.config.network, start).await
+    }
+}
+
+/// The standalone-key leg of a scan, run after the HD gap is resolved.
+struct StandaloneLeg<'a> {
+    state: &'a SharedScanTaskState,
+    workspace: &'a RecoveryWorkspace,
+    config: &'a RuntimeScanConfig,
+    seed: &'a [u8; 64],
+    /// The birthday the HD accounts were registered with.
+    hd_birthday: &'a AccountBirthday,
+    /// The height the HD accounts were scanned from.
+    hd_start: u32,
+    sapling_floor: u32,
+    hd_accounts: u32,
+}
+
+/// For a Combined source (a seed plus standalone keys), register the
+/// standalone keys beside the HD accounts and sync once more so both are in
+/// one wallet database. Standalone Sapling keys are registered from
+/// [`standalone_scan_start`], which may be below the HD birthday. Returns
+/// whether there was a leg to run.
+async fn run_standalone_leg(
+    leg: StandaloneLeg<'_>,
+    chain: &mut impl StandaloneChain,
+) -> ZeckResult<bool> {
+    let Some(keys) = leg.config.key_source.imported_keys() else {
+        return Ok(false);
+    };
+    if crate::key_source::classify_recovery_route(keys)
+        != crate::key_source::RecoveryRoute::Combined
+    {
+        return Ok(false);
+    }
+    let start = standalone_scan_start(keys, leg.hd_start, leg.sapling_floor);
+    let lowered;
+    let birthday = if start < leg.hd_start {
+        lowered = chain.birthday_at(start).await?;
+        &lowered
+    } else {
+        leg.hd_birthday
+    };
+    if !register_mixed_keys(
+        leg.state,
+        leg.workspace,
+        keys,
+        leg.seed,
+        birthday,
+        leg.config.network,
+        leg.hd_accounts,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    {
+        let mut guard = leg.state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningShielded;
+        guard.progress.message =
+            Some("Syncing standalone keys alongside the recovered HD accounts.".to_owned());
+    }
+    chain.sync_from(start).await?;
+    Ok(true)
 }
 
 /// Register independently imported keys after the HD gap has been resolved.
@@ -3578,7 +3732,7 @@ mod tests {
 
         use super::super::{
             import_accounts, import_accounts_scoped, register_mixed_keys, MemoryBlockCache,
-            ScanTaskState, TransparentImportMode,
+            ScanTaskState, TrackedSpendAuthority, TransparentImportMode,
         };
         use crate::{
             derivation::{
@@ -3747,6 +3901,223 @@ mod tests {
                 ChainState::empty(BlockHeight::from_u32(419_199), BlockHash([0u8; 32])),
                 None,
             )
+        }
+
+        /// A chain double for the standalone leg: hands out an empty-tree
+        /// birthday at whatever height is asked, and records what the leg
+        /// asked for and synced from. No network.
+        #[derive(Default)]
+        struct RecordingChain {
+            birthdays_at: Vec<u32>,
+            synced_from: Vec<u32>,
+        }
+
+        impl super::super::StandaloneChain for RecordingChain {
+            async fn birthday_at(
+                &mut self,
+                height: u32,
+            ) -> crate::error::ZeckResult<AccountBirthday> {
+                self.birthdays_at.push(height);
+                Ok(AccountBirthday::from_parts(
+                    ChainState::empty(BlockHeight::from_u32(height - 1), BlockHash([0u8; 32])),
+                    None,
+                ))
+            }
+
+            async fn sync_from(&mut self, start: u32) -> crate::error::ZeckResult<()> {
+                self.synced_from.push(start);
+                Ok(())
+            }
+        }
+
+        fn standalone_sapling(seed: u8) -> argos_wallet_import::SaplingKey {
+            argos_wallet_import::SaplingKey {
+                extsk: secrecy::Secret::new(
+                    sapling_crypto::zip32::ExtendedSpendingKey::master(&[seed; 32])
+                        .to_bytes()
+                        .to_vec(),
+                ),
+                provenance: argos_wallet_import::Provenance::Standalone,
+                created_at: None,
+            }
+        }
+
+        /// A ZecWallet Lite shape: the seed plus one imported Sapling key,
+        /// with the wallet-tail birthday the file recorded.
+        fn mixed_keys(birthday_height: Option<u32>) -> argos_wallet_import::ImportedKeys {
+            argos_wallet_import::ImportedKeys {
+                mnemonic: Some(test_seed_phrase()),
+                sapling: vec![standalone_sapling(0x61)],
+                birthday_height,
+                ..Default::default()
+            }
+        }
+
+        /// Review finding 3 on #275: the Combined branch of
+        /// `run_recovery_scan_inner` must register the standalone keys and
+        /// sync them. Driven through the leg the scan itself runs, with the
+        /// chain replaced by a recorder.
+        #[tokio::test]
+        async fn a_combined_scan_registers_and_syncs_its_standalone_keys() {
+            use crate::key_source::ImportedKeySource;
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.birthday = 1_000_000;
+            config.key_source = Arc::new(ImportedKeySource::new(mixed_keys(Some(600_000))));
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize_from_source(config.network, config.key_source.as_ref())
+                .unwrap();
+            let hd = derive_accounts_from_seed(&seed, config.network, 1).unwrap();
+            let t_account =
+                legacy_transparent_account_key_from_seed(config.network, &seed).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts(
+                &workspace,
+                config.network,
+                &seed,
+                &test_birthday(),
+                &t_account,
+                &hd,
+                &state,
+            )
+            .await
+            .unwrap();
+
+            let mut chain = RecordingChain::default();
+            let ran = super::super::run_standalone_leg(
+                super::super::StandaloneLeg {
+                    state: &state,
+                    workspace: &workspace,
+                    config: &config,
+                    seed: &seed,
+                    hd_birthday: &test_birthday(),
+                    hd_start: 1_000_000,
+                    sapling_floor: 419_201,
+                    hd_accounts: 1,
+                },
+                &mut chain,
+            )
+            .await
+            .unwrap();
+
+            assert!(ran, "a Combined source has a standalone leg");
+            let guard = state.lock().await;
+            assert_eq!(guard.standalone_sapling_indices, vec![0]);
+            let imported: Vec<_> = guard
+                .tracked_accounts
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.spend_authority,
+                        TrackedSpendAuthority::ImportedSapling { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(imported.len(), 1, "the standalone key is tracked");
+            assert_eq!(chain.synced_from, vec![600_000], "and synced, once");
+
+            // Review finding 1: registered from the file's birthday, below
+            // the seed's, not from the HD birthday.
+            assert_eq!(chain.birthdays_at, vec![600_000]);
+            let db = open_wallet_db(
+                workspace.wallet_db_path(),
+                consensus_network(config.network),
+            )
+            .unwrap();
+            assert_eq!(
+                db.get_account_birthday(imported[0].wallet_account_id)
+                    .unwrap(),
+                BlockHeight::from_u32(600_000)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_hd_only_source_has_no_standalone_leg() {
+            let tempdir = tempfile::tempdir().unwrap();
+            let config = test_config(tempdir.path().to_owned());
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let mut chain = RecordingChain::default();
+            let ran = super::super::run_standalone_leg(
+                super::super::StandaloneLeg {
+                    state: &state,
+                    workspace: &workspace,
+                    config: &config,
+                    seed: &seed,
+                    hd_birthday: &test_birthday(),
+                    hd_start: 1_000_000,
+                    sapling_floor: 419_201,
+                    hd_accounts: 2,
+                },
+                &mut chain,
+            )
+            .await
+            .unwrap();
+            assert!(!ran);
+            assert!(chain.synced_from.is_empty() && chain.birthdays_at.is_empty());
+        }
+
+        #[test]
+        fn standalone_keys_start_from_the_earlier_of_the_file_and_seed_birthdays() {
+            use super::super::standalone_scan_start;
+            let floor = 419_201;
+            // The file's birthday below the seed's wins.
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(Some(600_000)), 1_000_000, floor),
+                600_000
+            );
+            // A file birthday above the seed's never raises the start.
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(Some(1_200_000)), 1_000_000, floor),
+                1_000_000
+            );
+            // Below Sapling activation is clamped to it (writers store 1).
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(Some(1)), 1_000_000, floor),
+                floor
+            );
+            // No birthday: the key is undated and scanned from activation.
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(None), 1_000_000, floor),
+                floor
+            );
+            // Standalone transparent keys only: GetAddressUtxos finds them at
+            // any height, so the seed's start stands.
+            let mut transparent_only = mixed_keys(None);
+            transparent_only.sapling.clear();
+            assert_eq!(
+                standalone_scan_start(&transparent_only, 1_000_000, floor),
+                1_000_000
+            );
+        }
+
+        /// Review finding 8 on #275: ZecWallet Lite derives an account per
+        /// address, so an HD key the file records at index 12 must be inside
+        /// the scanned range even with a gap limit of 5.
+        #[test]
+        fn the_scan_covers_the_highest_hd_index_the_file_records() {
+            use super::super::hd_scan_bounds;
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.num_accounts = None;
+            config.gap_limit = 5;
+            let mut keys = mixed_keys(None);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (500, 5));
+            keys.highest_hd_index = Some(12);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (500, 13));
+            // An explicit account count is widened, never narrowed.
+            config.num_accounts = Some(3);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (13, 13));
+            config.num_accounts = Some(20);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (20, 20));
+            // A hostile index cannot push past the scan's own ceiling.
+            config.num_accounts = None;
+            keys.highest_hd_index = Some(u32::MAX);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (500, 500));
+            assert_eq!(hd_scan_bounds(&config, None).unwrap(), (500, 5));
         }
 
         #[tokio::test]

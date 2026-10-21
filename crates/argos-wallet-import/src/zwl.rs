@@ -5,14 +5,16 @@
 //! little-endian u64 `external_version`, followed by a `Keys` struct that
 //! carries its own, separate version word.
 //!
-//! Layout confirmed against `zingolabs/zewif-zwl` (`src/zwl_parser.rs` and
-//! `src/keys.rs`, default branch `master`):
+//! Layout confirmed against the upstream writer, `zingolabs/zwl-lib` (MIT;
+//! `lib/src/lightwallet.rs` `LightWallet::read`/`write` and
+//! `lib/src/lightwallet/{keys,walletokey,walletzkey,wallettkey}.rs`).
+//! `zingolabs/zewif-zwl` is not used as a reference: it carries no licence.
 //!
 //! ```text
-//! u64            external_version      (max known: 31, ZwlParser::serialized_version)
+//! u64            external_version      (zwl-lib writes 25; accepted through 31)
 //! Keys:
 //!   u64          keys version          (its own version word; max known: 22,
-//!                                       Keys::serialized_version)
+//!                                       Keys::serialized_version in zwl-lib)
 //!   u8           encrypted flag
 //!   [u8; 48]     enc_seed              (encrypted seed when locked)
 //!   Vector<u8>   nonce
@@ -41,18 +43,19 @@
 //!
 //! ZWL never held Sprout keys, so nothing here contributes to sub-spec 3.
 //!
-//! ## Encrypted wallets: the seed, not the keys
+//! ## Encrypted wallets: one key for the seed and every imported key
 //!
 //! ZWL encrypts with a libsodium `secretbox` (XSalsa20-Poly1305), a
 //! different primitive than zcashd's AES-256-CBC master key scheme this
 //! crate already implements for `zcashd::crypto`. Confirmed against
-//! `zingolabs/zewif-zwl`'s `src/keys.rs` (`master` branch, ~lines
-//! 299-330):
+//! `Keys::encrypt` in `zwl-lib`'s `lib/src/lightwallet/keys.rs`, and
+//! `WalletZKey::encrypt` / `WalletTKey::encrypt` beside it:
 //!
 //! ```text
-//! key   = double_sha256(passphrase)         // no salt, no work factor
-//! nonce = self.nonce                        // 24 bytes, stored in the file
-//! seed  = secretbox_open(enc_seed, nonce, key)
+//! key     = double_sha256(passphrase)         // no salt, no work factor
+//! seed    = secretbox_open(enc_seed, nonce, key)          // nonce in the header
+//! imported zkey = secretbox_open(enc_key, its nonce, key) // 169-byte extsk
+//! imported tkey = secretbox_open(enc_key, its nonce, key) // 32-byte secret
 //! ```
 //!
 //! **The KDF is unsalted double-SHA-256 with no work factor.** That is
@@ -60,17 +63,17 @@
 //! brute-forceable at plain hashing speed — worth stating plainly since
 //! this crate exists to handle wallets whose threat model includes that.
 //!
-//! A decrypted ZWL wallet does not yield a flat set of keys: ZWL stores no
-//! per-key ciphertext for its HD-derived keys, only this one encrypted
-//! seed, and re-derives every HD key from it on load. So decryption here
-//! produces a BIP-39 mnemonic (`ImportedKeys::mnemonic`), not spending
-//! keys — zip32/Sapling/Orchard re-derivation from that mnemonic belongs
-//! in `argos-core`, which already does it for the unencrypted case, not in
-//! this deliberately minimal, network-free leaf crate. Per-record
-//! ciphertext on an individual locked `zkey`/`tkey` entry (`enc_key` +
-//! its own `nonce`) is a separate, still-unimplemented scheme; those
-//! entries keep surfacing as diagnostics exactly as before, since the
-//! seed does not unlock them at this layer.
+//! ZWL stores no per-key ciphertext for its HD-derived keys: locking drops
+//! them, and the wallet re-derives each from the seed on unlock. So for HD
+//! keys decryption here produces a BIP-39 mnemonic
+//! (`ImportedKeys::mnemonic`), not spending keys — zip32/Sapling/Orchard
+//! re-derivation from that mnemonic belongs in `argos-core`, not in this
+//! deliberately minimal, network-free leaf crate. Imported keys exist in no
+//! seed, so `encrypt` seals each one into its record's `enc_key` under the
+//! same wallet key; those are opened here and accepted only if they match
+//! the extended full viewing key or address stored beside them, exactly as
+//! a plaintext record is. One that does not open is a per-record
+//! `DecryptionFailed`, never a fabricated key.
 //!
 //! The network parser is checked against three deterministic, no-funds
 //! wallets written by the upstream ZWL writer, including one with nonempty
@@ -94,10 +97,11 @@ use crate::{
     },
 };
 
-/// Highest `external_version` this parser understands, matching
-/// `ZwlParser::serialized_version()` in zingolabs/zewif-zwl. Refusing a
-/// newer file is safer than misreading it: a wrong parse yields wrong
-/// keys silently, which is worse than a clear failure.
+/// Highest `external_version` this parser accepts. `zwl-lib`'s writer
+/// (`LightWallet::serialized_version`) emits 25; every field whose shape
+/// depends on the version is gated individually below. Refusing a newer
+/// file is safer than misreading it: a wrong parse yields wrong keys
+/// silently, which is worse than a clear failure.
 const MAX_SUPPORTED_VERSION: u64 = 31;
 
 /// Highest `Keys`-internal version this parser understands, matching
@@ -141,10 +145,9 @@ fn unreadable(msg: impl Into<String>) -> ImportError {
     ImportError::UnwalkableBtree(msg.into())
 }
 
-/// Per-record ciphertext on an individual locked `zkey`/`tkey` entry
-/// (`enc_key` + its own `nonce`) is a distinct, still-unimplemented
-/// scheme from the whole-wallet `enc_seed` this module now decrypts — see
-/// the module docs. These entries keep surfacing as diagnostics.
+/// A key whose spending authority is absent from the file: an HD key the
+/// wallet dropped while locked (re-derivable only from the seed), or a
+/// standalone key with no usable ciphertext.
 fn locked_key(record_type: &str, provenance: Provenance) -> ImportDiagnostic {
     ImportDiagnostic::LockedKey {
         record_type: record_type.to_owned(),
@@ -154,31 +157,46 @@ fn locked_key(record_type: &str, provenance: Provenance) -> ImportDiagnostic {
 
 /// ZWL's key-derivation function: unsalted double-SHA-256 over the raw
 /// passphrase bytes. See the module docs for why that is worth flagging.
-fn double_sha256(passphrase: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(passphrase);
-    Sha256::digest(first).into()
+/// The result is the one `secretbox` key for the whole wallet: it seals the
+/// seed and every imported key alike (`Keys::encrypt` in `zwl-lib`).
+fn wallet_key(passphrase: &SecretString) -> Secret<[u8; 32]> {
+    let first = Sha256::digest(passphrase.expose_secret().as_bytes());
+    Secret::new(Sha256::digest(first).into())
+}
+
+/// Open one `secretbox` sealed under the wallet key. `Err(())` on any
+/// failure — a malformed nonce or a Poly1305 authentication failure alike.
+/// The plaintext is wrapped at once so it is scrubbed when dropped.
+fn open_sealed(
+    key: &Secret<[u8; 32]>,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Secret<Vec<u8>>, ()> {
+    let nonce_bytes: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| ())?;
+    let cipher = XSalsa20Poly1305::new(&(*key.expose_secret()).into());
+    cipher
+        .decrypt(&SecretboxNonce::from(nonce_bytes), ciphertext)
+        .map(Secret::new)
+        .map_err(|_| ())
 }
 
 /// Decrypt `enc_seed` into raw BIP-39 entropy.
 ///
-/// Returns `Err(())` on any failure — a malformed nonce or a Poly1305
-/// authentication failure alike — leaving the caller to translate that
+/// Returns `Err(())` on any failure, leaving the caller to translate that
 /// into `ImportError::WrongPassphrase`, since a wrong passphrase is the
-/// overwhelmingly likely cause of either.
+/// overwhelmingly likely cause.
 fn decrypt_seed(
     enc_seed: &[u8; ENC_SEED_LEN],
     nonce: &[u8],
-    passphrase: &SecretString,
-) -> Result<[u8; SEED_LEN], ()> {
-    let nonce_bytes: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| ())?;
-    let key_bytes = double_sha256(passphrase.expose_secret().as_bytes());
-
-    let cipher = XSalsa20Poly1305::new(&key_bytes.into());
-    let plaintext = cipher
-        .decrypt(&SecretboxNonce::from(nonce_bytes), enc_seed.as_slice())
+    key: &Secret<[u8; 32]>,
+) -> Result<Secret<[u8; SEED_LEN]>, ()> {
+    let plaintext = open_sealed(key, nonce, enc_seed)?;
+    let entropy: [u8; SEED_LEN] = plaintext
+        .expose_secret()
+        .as_slice()
+        .try_into()
         .map_err(|_| ())?;
-
-    plaintext.try_into().map_err(|_| ())
+    Ok(Secret::new(entropy))
 }
 
 /// Minimal, bounds-checked cursor over attacker-controlled bytes.
@@ -337,10 +355,12 @@ fn read_keys_header(cur: &mut Cursor) -> ZwlReadResult<KeysHeader> {
 enum ZKeyEntry {
     /// A usable Sapling extended spending key.
     Recovered(SaplingKey),
-    /// The spending key exists but was omitted from the file because the
-    /// wallet was locked at write time. Recoverable only with a working
-    /// decryption path, which this build does not yet have.
+    /// The spending key is absent: an HD key the wallet dropped while
+    /// locked, or a standalone key with no ciphertext to open.
     Locked(Provenance),
+    /// A standalone key's per-record ciphertext did not open under the
+    /// wallet key that opened the seed: the record is damaged.
+    DecryptionFailed,
     /// A view-key-only entry (`WalletZKeyType::ImportedViewKey`, or an
     /// unrecognized key type). No spending key was ever present here —
     /// this is not a failure.
@@ -348,100 +368,207 @@ enum ZKeyEntry {
     Mismatch,
 }
 
-/// Read one `WalletZKey`. Field order confirmed against `WalletZKey::read`
-/// in `zingolabs/zewif-zwl`'s `src/walletzkey.rs`.
-fn read_zkey(cur: &mut Cursor) -> ZwlReadResult<ZKeyEntry> {
+/// A locked record's per-record ciphertext, present only on an imported
+/// key in an encrypted wallet (`WalletZKey::encrypt` / `WalletTKey::encrypt`
+/// in `zwl-lib`). HD keys are never sealed this way: the seed recreates them.
+struct SealedKey {
+    enc_key: Vec<u8>,
+    nonce: Vec<u8>,
+}
+
+impl Drop for SealedKey {
+    fn drop(&mut self) {
+        use secrecy::Zeroize;
+        self.enc_key.zeroize();
+    }
+}
+
+fn sealed(enc_key: Option<Vec<u8>>, nonce: Option<Vec<u8>>) -> Option<SealedKey> {
+    match (enc_key, nonce) {
+        (Some(enc_key), Some(nonce)) => Some(SealedKey { enc_key, nonce }),
+        (Some(mut enc_key), None) => {
+            use secrecy::Zeroize;
+            enc_key.zeroize();
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Open a standalone key's ciphertext. `None` when there is nothing to open
+/// (no ciphertext, or an unencrypted wallet with no key); `Some(Err)` when
+/// the ciphertext does not open or opens to the wrong length.
+fn open_standalone<const N: usize>(
+    sealed: Option<SealedKey>,
+    key: Option<&Secret<[u8; 32]>>,
+) -> Option<Result<Secret<[u8; N]>, ()>> {
+    let (sealed, key) = (sealed?, key?);
+    Some(
+        open_sealed(key, &sealed.nonce, &sealed.enc_key).and_then(|plain| {
+            let bytes: [u8; N] = plain
+                .expose_secret()
+                .as_slice()
+                .try_into()
+                .map_err(|_| ())?;
+            Ok(Secret::new(bytes))
+        }),
+    )
+}
+
+/// Read one `WalletZKey`, with its HD index when it has one. Field order
+/// confirmed against `WalletZKey::read` in `zingolabs/zwl-lib`'s
+/// `lib/src/lightwallet/walletzkey.rs`. `key` is the wallet key of an
+/// encrypted wallet, used to open an imported key's sealed `enc_key`.
+fn read_zkey(
+    cur: &mut Cursor,
+    key: Option<&Secret<[u8; 32]>>,
+) -> ZwlReadResult<(ZKeyEntry, Option<u32>)> {
     cur.u8("zkey")?;
     let keytype = cur.u32_le("zkey")?;
     cur.u8("zkey")?;
     let extsk = cur.optional("zkey", |c| c.array::<EXTSK_LEN>("zkey"))?;
     let extfvk = cur.take(EXTFVK_LEN, "zkey")?;
-    cur.optional("zkey", |c| c.u32_le("zkey"))?;
-    cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
-    cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
+    let hdkey_num = cur.optional("zkey", |c| c.u32_le("zkey"))?;
+    let enc_key = cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
+    let nonce = cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
+    let sealed = sealed(enc_key, nonce);
 
     let provenance = match keytype {
-        0 => Provenance::HdDerived,               // WalletZKeyType::HdKey
-        1 => Provenance::Standalone,              // WalletZKeyType::ImportedSpendingKey
-        2 => return Ok(ZKeyEntry::NoSpendingKey), // ImportedViewKey
+        0 => Provenance::HdDerived,                       // WalletZKeyType::HdKey
+        1 => Provenance::Standalone,                      // WalletZKeyType::ImportedSpendingKey
+        2 => return Ok((ZKeyEntry::NoSpendingKey, None)), // ImportedViewKey
         // Unrecognized discriminant: continuing would mean guessing at a
         // shape we do not know, exactly the risk this crate refuses to
         // take elsewhere (see zcashd::plaintext's DER header check).
         _ => return Err(cur.error("zkey", "wallet structure could not be read")),
     };
+    let hd_index = hdkey_num.filter(|_| provenance == Provenance::HdDerived);
 
-    Ok(match extsk {
-        Some(bytes) if identity::sapling_matches_extfvk(&bytes, extfvk) => {
+    let recovered = |bytes: &[u8]| {
+        if identity::sapling_matches_extfvk(bytes, extfvk) {
             ZKeyEntry::Recovered(SaplingKey {
                 extsk: Secret::new(bytes.to_vec()),
                 provenance,
                 // ZWL stores no per-key creation time.
                 created_at: None,
             })
+        } else {
+            ZKeyEntry::Mismatch
         }
-        Some(_) => ZKeyEntry::Mismatch,
+    };
+    let entry = match extsk {
+        Some(bytes) => recovered(&bytes),
+        None if provenance == Provenance::Standalone => {
+            match open_standalone::<EXTSK_LEN>(sealed, key) {
+                Some(Ok(bytes)) => recovered(bytes.expose_secret()),
+                Some(Err(())) => ZKeyEntry::DecryptionFailed,
+                None => ZKeyEntry::Locked(provenance),
+            }
+        }
         None => ZKeyEntry::Locked(provenance),
-    })
+    };
+    Ok((entry, hd_index))
 }
 
 enum TKeyEntry {
     Recovered(TransparentKey, EmbeddedNetwork),
     Locked(Provenance),
+    DecryptionFailed,
     Mismatch,
 }
 
-/// Read one `WalletTKey` in the post-version-20 shape. Field order
-/// confirmed against `WalletTKey::read` in `src/wallettkey.rs`.
-fn read_tkey(cur: &mut Cursor) -> ZwlReadResult<TKeyEntry> {
+/// Read one `WalletTKey` in the post-version-20 shape, with its HD index
+/// when it has one. Field order confirmed against `WalletTKey::read` in
+/// `zingolabs/zwl-lib`'s `lib/src/lightwallet/wallettkey.rs`.
+fn read_tkey(
+    cur: &mut Cursor,
+    wallet_key: Option<&Secret<[u8; 32]>>,
+) -> ZwlReadResult<(TKeyEntry, Option<u32>)> {
     cur.u8("tkey")?;
     let keytype = cur.u32_le("tkey")?;
     cur.u8("tkey")?;
     let key = cur.optional("tkey", |c| c.array::<TRANSPARENT_SECRET_LEN>("tkey"))?;
     let address = cur.zwl_string()?;
-    cur.optional("tkey", |c| c.u32_le("tkey"))?;
-    cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
-    cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
+    let hdkey_num = cur.optional("tkey", |c| c.u32_le("tkey"))?;
+    let enc_key = cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
+    let nonce = cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
+    let sealed = sealed(enc_key, nonce);
 
     let provenance = match keytype {
         0 => Provenance::HdDerived,  // WalletTKeyType::HdKey
         1 => Provenance::Standalone, // WalletTKeyType::ImportedKey
         _ => return Err(cur.error("tkey", "wallet structure could not be read")),
     };
+    let hd_index = hdkey_num.filter(|_| provenance == Provenance::HdDerived);
 
-    Ok(match key {
-        Some(secret) => match std::str::from_utf8(address)
+    let recovered =
+        |secret: Secret<[u8; TRANSPARENT_SECRET_LEN]>| match std::str::from_utf8(address)
             .ok()
-            .and_then(|s| identity::transparent_matches_address(&secret, s).ok())
+            .and_then(|s| identity::transparent_matches_address(secret.expose_secret(), s).ok())
         {
             Some(network) => TKeyEntry::Recovered(
                 TransparentKey {
-                    secret: Secret::new(secret),
+                    secret,
                     provenance,
                     created_at: None,
                 },
                 network,
             ),
             None => TKeyEntry::Mismatch,
-        },
+        };
+    let entry = match key {
+        Some(secret) => recovered(Secret::new(secret)),
+        None if provenance == Provenance::Standalone => {
+            match open_standalone::<TRANSPARENT_SECRET_LEN>(sealed, wallet_key) {
+                Some(Ok(secret)) => recovered(secret),
+                Some(Err(())) => TKeyEntry::DecryptionFailed,
+                None => TKeyEntry::Locked(provenance),
+            }
+        }
         None => TKeyEntry::Locked(provenance),
-    })
+    };
+    Ok((entry, hd_index))
 }
 
-/// Skip one `WalletOKey` (Orchard). `ImportedKeys` has no Orchard variant
-/// yet, so this only needs to advance the cursor correctly to keep the
-/// `zkeys`/`tkeys` vectors that follow aligned — nothing is extracted.
-/// Field order confirmed against `WalletOKey::read` in
-/// `src/walletokey.rs`.
-fn skip_okey(cur: &mut Cursor) -> ZwlReadResult<()> {
+enum OKeyEntry {
+    /// An HD Orchard key: the seed recreates it, so nothing is lost.
+    HdDerived(Option<u32>),
+    /// An imported Orchard spending key. Argos does not recover Orchard
+    /// spending keys, and this one exists in no seed.
+    StandaloneSpendingKey,
+    /// An imported full viewing key: no spending authority was ever here.
+    ViewOnly,
+}
+
+/// Read one `WalletOKey` (Orchard). `ImportedKeys` has no Orchard key
+/// field, so only the key type and HD index are kept; the cursor must still
+/// advance exactly to keep the `zkeys`/`tkeys` vectors aligned. Field order
+/// and key types confirmed against `WalletOKey::read` in
+/// `zingolabs/zwl-lib`'s `lib/src/lightwallet/walletokey.rs`.
+fn read_okey(cur: &mut Cursor) -> ZwlReadResult<OKeyEntry> {
     cur.u8("okey")?;
-    cur.u32_le("okey")?;
+    let keytype = cur.u32_le("okey")?;
     cur.u8("okey")?;
-    cur.optional("okey", |c| c.u32_le("okey"))?;
+    let hdkey_num = cur.optional("okey", |c| c.u32_le("okey"))?;
     cur.skip(ORCHARD_FVK_LEN, "okey")?;
-    cur.optional("okey", |c| c.array::<32>("okey"))?;
-    cur.optional("okey", |c| c.vector_bytes("okey"))?;
-    cur.optional("okey", |c| c.vector_bytes("okey"))?;
-    Ok(())
+    // Read into a scrubbed buffer: an imported Orchard spending key is
+    // still a spending key even though it is not recovered.
+    let _sk = cur.optional("okey", |c| c.array::<32>("okey").map(Secret::new))?;
+    let enc_key = cur.optional("okey", |c| c.vector_bytes("okey"))?;
+    let nonce = cur.optional("okey", |c| c.vector_bytes("okey"))?;
+    drop(sealed(enc_key, nonce));
+    match keytype {
+        0 => Ok(OKeyEntry::HdDerived(hdkey_num)), // WalletOKeyType::HdKey
+        1 => Ok(OKeyEntry::StandaloneSpendingKey), // ImportedSpendingKey
+        2 => Ok(OKeyEntry::ViewOnly),             // ImportedFullViewKey
+        _ => Err(cur.error("okey", "wallet structure could not be read")),
+    }
+}
+
+fn note_hd_index(out: &mut ImportedKeys, index: Option<u32>) {
+    if let Some(index) = index {
+        out.highest_hd_index = Some(out.highest_hd_index.map_or(index, |h| h.max(index)));
+    }
 }
 
 /// Read `okeys` (if the `Keys` version supports them), `zkeys`, and
@@ -450,39 +577,44 @@ fn skip_okey(cur: &mut Cursor) -> ZwlReadResult<()> {
 fn read_key_vectors(
     cur: &mut Cursor,
     keys_version: u64,
+    wallet_key: Option<&Secret<[u8; 32]>>,
     out: &mut ImportedKeys,
 ) -> ZwlReadResult<()> {
     if keys_version > 21 {
         let count = cur.compact_size("okeys")?;
         for _ in 0..count {
-            skip_okey(cur)?;
-        }
-        // `ImportedKeys` has no Orchard variant yet, so these records are
-        // dropped rather than recovered. Unlike a locked zkey/tkey (which
-        // at least leaves a diagnostic per entry), a purely-Orchard wallet
-        // would otherwise report `is_empty() == true` with an empty
-        // diagnostics list — indistinguishable from a wallet that never
-        // held funds. `keys.rs`'s contract is that diagnostics must never
-        // be empty silently, so record what was skipped, without leaking
-        // any key material.
-        if count > 0 {
-            out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
-                record_type: "zwl-okey".to_owned(),
-                reason: format!(
-                    "{count} Orchard key record(s) skipped: Orchard is not yet \
-                     supported by this wallet-recovery tool"
-                ),
-            });
+            // An HD Orchard key is recreated from the seed with the account
+            // it names, so it costs nothing. An imported one is a spending
+            // key Argos does not recover and no seed holds: say so, per key.
+            match read_okey(cur)? {
+                OKeyEntry::HdDerived(index) => note_hd_index(out, index),
+                OKeyEntry::StandaloneSpendingKey => {
+                    out.diagnostics
+                        .push(ImportDiagnostic::UnrecoveredStandaloneKey {
+                            record_type: "zwl-okey".to_owned(),
+                            pool: "Orchard",
+                        })
+                }
+                OKeyEntry::ViewOnly => {}
+            }
         }
     }
 
     let zkey_count = cur.compact_size("zkeys")?;
     for _ in 0..zkey_count {
-        let entry = read_zkey(cur)?;
+        let (entry, hd_index) = read_zkey(cur, wallet_key)?;
+        note_hd_index(out, hd_index);
         match entry {
             ZKeyEntry::Recovered(k) => out.sapling.push(k),
             ZKeyEntry::Locked(provenance) => {
                 out.diagnostics.push(locked_key("zwl-zkey", provenance))
+            }
+            ZKeyEntry::DecryptionFailed => {
+                out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
+                    record_type: "zwl-zkey".to_owned(),
+                    reason: "the imported key's ciphertext did not open under the wallet key"
+                        .to_owned(),
+                })
             }
             ZKeyEntry::NoSpendingKey => {}
             ZKeyEntry::Mismatch => {
@@ -539,8 +671,16 @@ fn read_key_vectors(
     } else {
         let tkey_count = cur.compact_size("tkeys")?;
         for _ in 0..tkey_count {
-            let entry = read_tkey(cur)?;
+            let (entry, hd_index) = read_tkey(cur, wallet_key)?;
+            note_hd_index(out, hd_index);
             match entry {
+                TKeyEntry::DecryptionFailed => {
+                    out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
+                        record_type: "zwl-tkey".to_owned(),
+                        reason: "the imported key's ciphertext did not open under the wallet key"
+                            .to_owned(),
+                    })
+                }
                 TKeyEntry::Recovered(k, network) => {
                     merge_embedded_network(out, network);
                     out.transparent.push(k);
@@ -562,20 +702,6 @@ fn read_key_vectors(
     Ok(())
 }
 
-/// Parse a ZecWallet Lite wallet file.
-///
-/// Takes a passphrase because ZWL wallets carry their own `encrypted`
-/// flag: an encrypted wallet with no passphrase refuses outright, the
-/// same contract `zcashd::import_zcashd` uses for a locked wallet. When a
-/// passphrase is supplied to an encrypted wallet, `enc_seed` is decrypted
-/// into a BIP-39 mnemonic (`ImportedKeys::mnemonic`) — see the module
-/// docs for why that, not flat keys, is what decryption yields here. A
-/// Poly1305 authentication failure on that decryption is reported as
-/// `ImportError::WrongPassphrase`, since a wrong passphrase is by far the
-/// most likely cause and is the actionable message for the user.
-/// Individual locked `zkey`/`tkey` entries — a different, per-record
-/// ciphertext this module still does not decrypt — keep surfacing as
-/// diagnostics rather than being silently dropped.
 fn skip_compact_block(cur: &mut Cursor) -> ZwlReadResult<()> {
     cur.skip(4 + 32, "blocks")?; // height and hash
                                  // Legacy Sapling CommitmentTree: optional left/right nodes, then
@@ -779,8 +905,8 @@ fn read_chain_network(
     external_version: u64,
     out: &mut ImportedKeys,
 ) -> ZwlReadResult<()> {
-    // zewif-zwl's ZwlParser uses Keys::read and WalletTxns::read for
-    // external versions 15..=31; the older read_old layout is outside scope.
+    // `LightWallet::read` in zwl-lib uses Keys::read and WalletTxns::read
+    // from external version 15; the older read_old layout is outside scope.
     if !(15..=31).contains(&external_version) {
         return Err(cur.error("txns", "wallet structure could not be read"));
     }
@@ -818,12 +944,16 @@ fn read_chain_network(
     }
     out.diagnostics
         .extend(history_damage.into_iter().map(damage));
-    read_wallet_tail(cur, external_version)
+    read_wallet_tail(cur, external_version, out)
 }
 
 /// The fields following the chain name in the upstream LightWallet writer.
 /// A recognized wallet is complete only if this versioned tail reaches EOF.
-fn read_wallet_tail(cur: &mut Cursor, external_version: u64) -> ZwlReadResult<()> {
+fn read_wallet_tail(
+    cur: &mut Cursor,
+    external_version: u64,
+    out: &mut ImportedKeys,
+) -> ZwlReadResult<()> {
     if external_version > 23 {
         let options_version = cur.u64_le("wallet_options")?;
         if options_version > 2 {
@@ -836,7 +966,12 @@ fn read_wallet_tail(cur: &mut Cursor, external_version: u64) -> ZwlReadResult<()
             cur.skip(8, "wallet_options")?; // spam threshold
         }
     }
-    cur.skip(8, "birthday")?;
+    // `LightWallet::write` stores `get_birthday()`: the creation height,
+    // lowered by `adjust_wallet_birthday` to the birthday of any Sapling key
+    // imported since, and by the first transaction seen. Zero means none
+    // was recorded.
+    let birthday = cur.u64_le("birthday")?;
+    out.birthday_height = u32::try_from(birthday).ok().filter(|&height| height > 0);
     if external_version <= 22 && cur.u8("sapling_tree_verified")? > 1 {
         return Err(cur.error(
             "sapling_tree_verified",
@@ -880,6 +1015,19 @@ fn read_wallet_tail(cur: &mut Cursor, external_version: u64) -> ZwlReadResult<()
     Ok(())
 }
 
+/// Parse a ZecWallet Lite wallet file.
+///
+/// Takes a passphrase because ZWL wallets carry their own `encrypted`
+/// flag: an encrypted wallet with no passphrase refuses outright, the
+/// same contract `zcashd::import_zcashd` uses for a locked wallet. When a
+/// passphrase is supplied to an encrypted wallet, `enc_seed` is decrypted
+/// into a BIP-39 mnemonic (`ImportedKeys::mnemonic`), and each imported
+/// `zkey`/`tkey` record's own `enc_key` is opened with the same wallet key
+/// and checked against the address or viewing key stored beside it. A
+/// Poly1305 authentication failure on the seed is reported as
+/// `ImportError::WrongPassphrase`, since a wrong passphrase is by far the
+/// most likely cause and is the actionable message for the user; a single
+/// imported key that does not open is a per-record `DecryptionFailed`.
 pub fn import_zwl(
     bytes: &[u8],
     passphrase: Option<&SecretString>,
@@ -931,24 +1079,29 @@ pub fn import_zwl(
         }
     };
 
+    let mut wallet_key_for_records = None;
     if header.encrypted {
         let Some(pass) = passphrase else {
             return Err(ImportError::WrongPassphrase);
         };
-        match decrypt_seed(&header.enc_seed, &header.nonce, pass) {
-            Ok(entropy) => match Mnemonic::<English>::from_entropy(entropy.to_vec()) {
-                Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
-                Err(_) => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
-                    record_type: "zwl-seed".to_owned(),
-                    reason: "decrypted seed is not a valid BIP-39 entropy length".to_owned(),
-                }),
-            },
+        let key = wallet_key(pass);
+        match decrypt_seed(&header.enc_seed, &header.nonce, &key) {
+            Ok(entropy) => {
+                match Mnemonic::<English>::from_entropy(entropy.expose_secret().to_vec()) {
+                    Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
+                    Err(_) => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
+                        record_type: "zwl-seed".to_owned(),
+                        reason: "decrypted seed is not a valid BIP-39 entropy length".to_owned(),
+                    }),
+                }
+            }
             // Authentication failure on the seed is fatal, not a
             // per-record diagnostic: it means the passphrase is wrong for
             // the whole wallet, the same contract zcashd's
             // `derive_master_key` uses for its master key.
             Err(()) => return Err(ImportError::WrongPassphrase),
         }
+        wallet_key_for_records = Some(key);
     } else {
         match Mnemonic::<English>::from_entropy(header.seed.to_vec()) {
             Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
@@ -962,7 +1115,12 @@ pub fn import_zwl(
         }
     }
 
-    match read_key_vectors(&mut cur, header.keys_version, &mut out) {
+    match read_key_vectors(
+        &mut cur,
+        header.keys_version,
+        wallet_key_for_records.as_ref(),
+        &mut out,
+    ) {
         Err(err) => {
             out.diagnostics.push(damage(err));
         }
@@ -1685,29 +1843,30 @@ mod tests {
     }
 
     #[test]
-    fn a_wallet_with_only_orchard_keys_reports_a_diagnostic_instead_of_looking_empty() {
+    fn a_wallet_with_only_hd_orchard_keys_is_covered_by_its_seed() {
         // A post-NU5 ZWL wallet whose funds are entirely Orchard-derived
-        // has no sapling or transparent keys at all. `ImportedKeys` has no
-        // Orchard field, so `is_empty()` would read `true` here — the
-        // diagnostics list is the only signal the caller has that
-        // anything was actually skipped, and `keys.rs`'s own contract is
-        // that diagnostics must never be empty silently.
+        // has no Sapling or transparent keys at all, and `ImportedKeys` has
+        // no Orchard field. An HD Orchard key is recreated from the seed
+        // with the account it names, so the recovered mnemonic is what
+        // carries it: the wallet is neither empty nor incomplete, and the
+        // key's index is kept so the scan covers that account.
         let mut vectors = cs(1);
         vectors.extend_from_slice(&okey_stub());
         vectors.extend_from_slice(&cs(0)); // zkeys: none
         vectors.extend_from_slice(&cs(0)); // tkeys: none
 
-        let body = keys_body(22, false, &vectors);
-        let bytes = wallet(25, &body);
-
-        let keys = import_zwl(&bytes, None).unwrap();
+        let keys = import_zwl(
+            &wallet_with_empty_history(25, &keys_body(22, false, &vectors)),
+            None,
+        )
+        .unwrap();
 
         assert!(keys.sapling.is_empty());
         assert!(keys.transparent.is_empty());
-        assert!(
-            !keys.diagnostics.is_empty(),
-            "a wallet holding only Orchard keys must not report as silently empty"
-        );
+        assert!(keys.mnemonic.is_some());
+        assert!(!keys.is_empty());
+        assert_eq!(keys.highest_hd_index, Some(0));
+        assert_eq!(keys.coverage(), crate::keys::ImportCoverage::Complete);
     }
 
     #[test]
@@ -1762,11 +1921,11 @@ mod tests {
 
     #[test]
     fn an_encrypted_wallet_with_a_passphrase_reports_locked_keys_as_diagnostics() {
-        // The seed decrypts fine (a correct passphrase), but individual
-        // locked zkey/tkey entries carry their own, still-unimplemented
-        // per-record ciphertext — see the module docs. A passphrase must
-        // not make those look recovered: every locked entry has to show
-        // up as a diagnostic, never a fabricated key.
+        // The seed decrypts fine (a correct passphrase), but these locked
+        // entries are HD keys: zwl-lib never seals an HD key per record (the
+        // junk `enc_key` here is ignored), so the seed is their only source.
+        // A passphrase must not make them look recovered: every locked
+        // entry has to show up as a diagnostic, never a fabricated key.
         // keys_version 21: no okeys vector at all (only present > 21).
         let mut vectors = cs(1);
         vectors.extend_from_slice(&zkey_locked());
@@ -1867,5 +2026,271 @@ mod tests {
             1,
             "the complete first tkey must survive"
         );
+    }
+
+    // --- Review findings on #275: per-record encryption, birthday, Orchard
+    // classification and HD indices. Layout per `zingolabs/zwl-lib` (MIT):
+    // `Keys::encrypt` seals each imported key with `secretbox` under
+    // `double_sha256(passphrase)`, the key that also seals the seed. ---
+
+    /// The ZWL wallet key, computed independently of the parser.
+    fn zwl_key(passphrase: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(Sha256::digest(passphrase.as_bytes())).into()
+    }
+
+    fn seal(key: &[u8; 32], nonce: [u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
+        XSalsa20Poly1305::new(&(*key).into())
+            .encrypt(&SecretboxNonce::from(nonce), plaintext)
+            .unwrap()
+    }
+
+    /// `WalletZKey::encrypt` for an `ImportedSpendingKey`, then `lock`: the
+    /// spending key is dropped and only `enc_key`/`nonce` remain.
+    fn zkey_standalone_sealed(extsk_byte: u8, key: &[u8; 32], nonce: [u8; NONCE_LEN]) -> Vec<u8> {
+        use sapling_crypto::zip32::ExtendedSpendingKey;
+        let extsk = ExtendedSpendingKey::master(&[extsk_byte; 32]);
+        let mut extfvk = Vec::new();
+        #[allow(deprecated)]
+        extsk
+            .to_extended_full_viewing_key()
+            .write(&mut extfvk)
+            .unwrap();
+        let mut v = vec![1u8];
+        v.extend_from_slice(&u32le(1)); // ImportedSpendingKey
+        v.push(1); // locked
+        v.extend_from_slice(&opt_none()); // extsk dropped by lock()
+        v.extend_from_slice(&extfvk);
+        v.extend_from_slice(&opt_none()); // no hdkey_num
+        v.extend_from_slice(&opt_some(vec_bytes(&seal(key, nonce, &extsk.to_bytes()))));
+        v.extend_from_slice(&opt_some(vec_bytes(&nonce)));
+        v
+    }
+
+    /// `WalletTKey::encrypt` for an `ImportedKey`, then `lock`.
+    fn tkey_standalone_sealed(secret_byte: u8, key: &[u8; 32], nonce: [u8; NONCE_LEN]) -> Vec<u8> {
+        let plain = tkey_hd(secret_byte);
+        let secret = [secret_byte; TRANSPARENT_SECRET_LEN];
+        let address_at = 1 + 4 + 1 + 1 + TRANSPARENT_SECRET_LEN;
+        let address_len =
+            u64::from_le_bytes(plain[address_at..address_at + 8].try_into().unwrap()) as usize;
+        let address = &plain[address_at..address_at + 8 + address_len];
+        let mut v = vec![1u8];
+        v.extend_from_slice(&u32le(1)); // ImportedKey
+        v.push(1); // locked
+        v.extend_from_slice(&opt_none()); // key dropped by lock()
+        v.extend_from_slice(address);
+        v.extend_from_slice(&opt_none()); // no hdkey_num
+        v.extend_from_slice(&opt_some(vec_bytes(&seal(key, nonce, &secret))));
+        v.extend_from_slice(&opt_some(vec_bytes(&nonce)));
+        v
+    }
+
+    fn encrypted_mixed_wallet(passphrase: &str, zkey: &[u8], tkey: &[u8]) -> Vec<u8> {
+        let mut vectors = cs(0); // okeys
+        vectors.extend_from_slice(&cs(1));
+        vectors.extend_from_slice(zkey);
+        vectors.extend_from_slice(&cs(1));
+        vectors.extend_from_slice(tkey);
+        let (enc_seed, nonce) = encrypt_test_seed(passphrase, &[0x5C; SEED_LEN], [0x31; NONCE_LEN]);
+        wallet_with_empty_history(
+            25,
+            &keys_body_with_seed(22, true, &enc_seed, &nonce, &vectors),
+        )
+    }
+
+    #[test]
+    fn encrypted_wallet_recovers_its_standalone_sapling_and_transparent_keys() {
+        let key = zwl_key("correct horse");
+        let bytes = encrypted_mixed_wallet(
+            "correct horse",
+            &zkey_standalone_sealed(0x41, &key, [0x01; NONCE_LEN]),
+            &tkey_standalone_sealed(0x42, &key, [0x02; NONCE_LEN]),
+        );
+        let keys =
+            import_zwl(&bytes, Some(&SecretString::new("correct horse".to_owned()))).unwrap();
+
+        assert!(keys.mnemonic.is_some());
+        assert_eq!(keys.sapling.len(), 1, "{:?}", keys.diagnostics);
+        assert_eq!(keys.sapling[0].provenance, Provenance::Standalone);
+        assert_eq!(
+            keys.sapling[0].extsk.expose_secret(),
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x41; 32]).to_bytes()
+        );
+        assert_eq!(keys.transparent.len(), 1, "{:?}", keys.diagnostics);
+        assert_eq!(keys.transparent[0].provenance, Provenance::Standalone);
+        assert_eq!(keys.transparent[0].secret.expose_secret(), &[0x42; 32]);
+        assert!(
+            !keys
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ImportDiagnostic::LockedKey { .. })),
+            "{:?}",
+            keys.diagnostics
+        );
+        assert_eq!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn encrypted_standalone_keys_still_need_the_right_passphrase() {
+        let key = zwl_key("correct horse");
+        let bytes = encrypted_mixed_wallet(
+            "correct horse",
+            &zkey_standalone_sealed(0x41, &key, [0x01; NONCE_LEN]),
+            &tkey_standalone_sealed(0x42, &key, [0x02; NONCE_LEN]),
+        );
+        let err = import_zwl(
+            &bytes,
+            Some(&SecretString::new("battery staple".to_owned())),
+        )
+        .expect_err("a wrong passphrase must not import");
+        assert_eq!(err, ImportError::WrongPassphrase);
+    }
+
+    #[test]
+    fn a_tampered_or_mismatched_standalone_ciphertext_is_reported_not_used() {
+        let key = zwl_key("correct horse");
+        let mut zkey = zkey_standalone_sealed(0x41, &key, [0x01; NONCE_LEN]);
+        // The ciphertext's last byte sits just before the nonce Optional.
+        let at = zkey.len() - (1 + 1 + NONCE_LEN) - 1;
+        zkey[at] ^= 0x80;
+        // A key sealed correctly, but filed under another key's address.
+        let mut tkey = tkey_standalone_sealed(0x42, &key, [0x02; NONCE_LEN]);
+        let other = tkey_standalone_sealed(0x43, &key, [0x02; NONCE_LEN]);
+        let cipher_len = TRANSPARENT_SECRET_LEN + 16;
+        let tail = 1 + 1 + cipher_len + 1 + 1 + NONCE_LEN;
+        let (t_at, o_at) = (tkey.len() - tail, other.len() - tail);
+        tkey[t_at..].copy_from_slice(&other[o_at..]);
+
+        let bytes = encrypted_mixed_wallet("correct horse", &zkey, &tkey);
+        let keys =
+            import_zwl(&bytes, Some(&SecretString::new("correct horse".to_owned()))).unwrap();
+        assert!(keys.sapling.is_empty());
+        assert!(keys.transparent.is_empty());
+        assert!(
+            keys.diagnostics.iter().any(|d| matches!(d,
+            ImportDiagnostic::DecryptionFailed { record_type, .. } if record_type == "zwl-zkey")),
+            "{:?}",
+            keys.diagnostics
+        );
+        assert!(keys.diagnostics.iter().any(|d| matches!(d,
+            ImportDiagnostic::PublicIdentifierMismatch { record_type, .. } if record_type == "zwl-tkey")),
+            "{:?}", keys.diagnostics);
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    /// Offset of the birthday within the writer fixtures' 256-byte layout:
+    /// after the chain name, options version, memo flag and spam threshold.
+    const WRITER_FIXTURE_BIRTHDAY_AT: usize = 229;
+
+    #[test]
+    fn the_wallet_tail_birthday_is_read_not_skipped() {
+        // The writer fixtures were created at height 0, which `LightWallet`
+        // stores as 1.
+        let bytes = include_bytes!("../tests/fixtures/zwl-mainnet-empty.dat");
+        assert_eq!(
+            bytes[WRITER_FIXTURE_BIRTHDAY_AT..WRITER_FIXTURE_BIRTHDAY_AT + 8],
+            1u64.to_le_bytes()
+        );
+        assert_eq!(import_zwl(bytes, None).unwrap().birthday_height, Some(1));
+
+        let mut patched = wallet_with_empty_history(25, &keys_body(22, false, &[0, 0, 0]));
+        let at = patched.len() - (bytes.len() - WRITER_FIXTURE_BIRTHDAY_AT);
+        patched[at..at + 8].copy_from_slice(&1_234_567u64.to_le_bytes());
+        let keys = import_zwl(&patched, None).unwrap();
+        assert_eq!(keys.birthday_height, Some(1_234_567));
+        assert_eq!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+
+        // Zero means "not recorded"; a value past u32 is not a height.
+        for unusable in [0u64, u64::from(u32::MAX) + 1] {
+            patched[at..at + 8].copy_from_slice(&unusable.to_le_bytes());
+            assert_eq!(import_zwl(&patched, None).unwrap().birthday_height, None);
+        }
+    }
+
+    fn okey(keytype: u32, hdkey_num: Option<u32>) -> Vec<u8> {
+        let mut v = vec![1u8];
+        v.extend_from_slice(&u32le(keytype));
+        v.push(0);
+        v.extend_from_slice(&match hdkey_num {
+            Some(n) => opt_some(u32le(n)),
+            None => opt_none(),
+        });
+        v.extend_from_slice(&[0u8; ORCHARD_FVK_LEN]);
+        v.extend_from_slice(&match keytype {
+            1 => opt_some(vec![0x55; 32]),
+            _ => opt_none(),
+        });
+        v.extend_from_slice(&opt_none());
+        v.extend_from_slice(&opt_none());
+        v
+    }
+
+    #[test]
+    fn hd_and_view_only_orchard_keys_do_not_mark_the_wallet_incomplete() {
+        let mut vectors = cs(2);
+        vectors.extend_from_slice(&okey(0, Some(0))); // HdKey, re-derived from the seed
+        vectors.extend_from_slice(&okey(2, None)); // ImportedFullViewKey, no spend authority
+        vectors.extend_from_slice(&[0, 0]);
+        let keys = import_zwl(
+            &wallet_with_empty_history(25, &keys_body(22, false, &vectors)),
+            None,
+        )
+        .unwrap();
+        assert!(keys.diagnostics.is_empty(), "{:?}", keys.diagnostics);
+        assert_eq!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn an_imported_orchard_spending_key_is_reported_as_unrecovered() {
+        let mut vectors = cs(2);
+        vectors.extend_from_slice(&okey(0, Some(0)));
+        vectors.extend_from_slice(&okey(1, None));
+        vectors.extend_from_slice(&[0, 0]);
+        let keys = import_zwl(
+            &wallet_with_empty_history(25, &keys_body(22, false, &vectors)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(keys.diagnostics.len(), 1, "{:?}", keys.diagnostics);
+        let shown = keys.diagnostics[0].to_string();
+        assert!(shown.contains("Orchard"), "{shown}");
+        assert!(shown.contains("not recovered"), "{shown}");
+        assert!(!shown.contains("85, 85"), "{shown}");
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::KeyMaterialMissing
+        );
+    }
+
+    #[test]
+    fn the_highest_hd_index_in_the_file_is_exposed() {
+        let with_index = |mut record: Vec<u8>, index: u32, at: usize| {
+            record[at..at + 5].copy_from_slice(&opt_some(u32le(index)));
+            record
+        };
+        let zkey_index_at = 1 + 4 + 1 + 1 + EXTSK_LEN + EXTFVK_LEN;
+        let tkey = tkey_hd(0x21);
+        let tkey_index_at = tkey.len() - 2 - 5;
+        let mut vectors = cs(1);
+        vectors.extend_from_slice(&okey(0, Some(4)));
+        vectors.extend_from_slice(&cs(2));
+        vectors.extend_from_slice(&zkey_hd(0x11));
+        vectors.extend_from_slice(&with_index(zkey_hd(0x12), 37, zkey_index_at));
+        vectors.extend_from_slice(&cs(1));
+        vectors.extend_from_slice(&with_index(tkey, 9, tkey_index_at));
+        let keys = import_zwl(
+            &wallet_with_empty_history(25, &keys_body(22, false, &vectors)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(keys.highest_hd_index, Some(37), "{:?}", keys.diagnostics);
+
+        let none = import_zwl(
+            &wallet_with_empty_history(25, &keys_body(22, false, &[0, 0, 0])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(none.highest_hd_index, None);
     }
 }

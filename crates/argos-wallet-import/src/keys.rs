@@ -247,6 +247,20 @@ pub struct ImportedKeys {
     /// the wallet down the HD path would drop them. Verification is what
     /// lets the import say whether the stored keys are the whole story.
     pub seed_verified: bool,
+    /// The block height the wallet file records as its birthday, when its
+    /// format stores one: ZecWallet Lite's wallet tail. ZWL lowers it to the
+    /// birthday given for any Sapling key imported into the wallet
+    /// (`adjust_wallet_birthday` in `add_imported_sk`), so it bounds the
+    /// file's standalone Sapling keys as well as its seed. `None` when the
+    /// format stores no birthday or the file records zero ("not recorded").
+    /// A block height, not a time: unrelated to the keys' `created_at`.
+    pub birthday_height: Option<u32>,
+    /// The largest HD index (`hdkey_num`) the file says it derived a key
+    /// at, for formats that number their HD keys: ZecWallet Lite derives a
+    /// new account per address, so a key at index 37 means accounts 0..=37
+    /// exist whatever the scan's gap limit would find. `None` when the file
+    /// records no HD index.
+    pub highest_hd_index: Option<u32>,
     /// Everything we could not read. Never empty silently — always shown
     /// to the user with counts.
     pub diagnostics: Vec<ImportDiagnostic>,
@@ -410,6 +424,7 @@ impl ImportCoverage {
                 ..
             }
             | ImportDiagnostic::UnsupportedWalletVersion { .. }
+            | ImportDiagnostic::UnrecoveredStandaloneKey { .. }
             | ImportDiagnostic::MissingSpendAuthority { .. } => Self::KeyMaterialMissing,
             // A transaction holds note data, never keys: every key was
             // still read, and the full-block scan recovers the notes.
@@ -512,6 +527,8 @@ impl std::fmt::Debug for ImportedKeys {
                     "None"
                 },
             )
+            .field("birthday_height", &self.birthday_height)
+            .field("highest_hd_index", &self.highest_hd_index)
             .field("diagnostics", &self.diagnostics)
             .finish()
     }

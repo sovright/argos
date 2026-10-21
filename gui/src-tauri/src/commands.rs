@@ -589,14 +589,14 @@ pub async fn inspect_wallet_file(
         }) {
             Ok(result) => result,
             // An encrypted wallet with a missing or wrong passphrase is an
-            // ordinary user situation, not a failure to show raw. The core
-            // wrapper carries parser errors in ZeckError::Import, so compare
-            // the parser's own canonical wrong-passphrase message.
-            Err(argos_core::ZeckError::Import(ref message))
-                if message
-                    == &argos_core::argos_wallet_import::ImportError::WrongPassphrase
-                        .to_string() =>
-            {
+            // ordinary user situation, not a failure to show raw. Matched on
+            // the parser's typed error, which the core wrapper carries in
+            // ZeckError::WalletFile, rather than on its message text: a
+            // reworded message must not turn the passphrase prompt into a
+            // raw error.
+            Err(argos_core::ZeckError::WalletFile(
+                argos_core::argos_wallet_import::ImportError::WrongPassphrase,
+            )) => {
                 return Ok(WalletFileSummary {
                     path,
                     transparent_keys: 0,
@@ -773,10 +773,10 @@ pub async fn start_scan_from_wallet_file(
             config.network,
         )
         .map_err(|err| err.to_string())?;
-        // Refuses before any scan work starts when the wallet file yielded a
-        // mnemonic: that wallet takes the HD route, which cannot carry a
-        // standalone key. The same helper the CLI calls, so the two surfaces
-        // cannot drift on which combinations are allowed.
+        // A wallet file with a mnemonic takes the Combined route, which
+        // registers pasted keys beside the seed's accounts. The same helper
+        // the CLI calls, so the two surfaces cannot drift on which
+        // combinations are allowed or on the birthday a pasted key gets.
         argos_core::sapling_key::merge_standalone_sapling_keys(&mut keys, typed)
             .map_err(|err| err.to_string())?;
     }

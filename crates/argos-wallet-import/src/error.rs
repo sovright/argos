@@ -24,6 +24,17 @@ pub enum ImportError {
         selected: EmbeddedNetwork,
         embedded: EmbeddedNetwork,
     },
+
+    /// The file names two different networks. Either could be the forged
+    /// one, so no selection is safe to bind it to.
+    #[error(
+        "wallet records conflicting networks ({first} and {second}), so it cannot be bound \
+         to either. Keep the original wallet file."
+    )]
+    ConflictingNetwork {
+        first: EmbeddedNetwork,
+        second: EmbeddedNetwork,
+    },
 }
 
 /// Non-fatal, per-record problems. Always surfaced to the user with counts
@@ -119,6 +130,18 @@ pub enum ImportDiagnostic {
     LockedKey {
         record_type: String,
         provenance: Provenance,
+    },
+
+    /// A standalone spending key of a pool Argos does not recover (an
+    /// Orchard key imported into ZecWallet Lite). It exists in no seed, so
+    /// the file is its only copy. The key bytes never reach this variant.
+    #[error(
+        "standalone {pool} spending key is not recovered by Argos and cannot be \
+         recreated from the seed; keep the original wallet file"
+    )]
+    UnrecoveredStandaloneKey {
+        record_type: String,
+        pool: &'static str,
     },
 
     #[error("{format} wallet has no recoverable spending authority")]
@@ -256,6 +279,7 @@ impl std::fmt::Debug for ImportError {
             Self::UnwalkableBtree(_) => "UnwalkableBtree",
             Self::DamagedEncryptionMetadata(_) => "DamagedEncryptionMetadata",
             Self::NetworkMismatch { .. } => "NetworkMismatch",
+            Self::ConflictingNetwork { .. } => "ConflictingNetwork",
         })
     }
 }
@@ -275,6 +299,7 @@ impl std::fmt::Debug for ImportDiagnostic {
             Self::UnsupportedWalletVersion { .. } => "UnsupportedWalletVersion",
             Self::PublicIdentifierMismatch { .. } => "PublicIdentifierMismatch",
             Self::LockedKey { .. } => "LockedKey",
+            Self::UnrecoveredStandaloneKey { .. } => "UnrecoveredStandaloneKey",
             Self::MissingSpendAuthority { .. } => "MissingSpendAuthority",
             Self::ConflictingNetworkMetadata { .. } => "ConflictingNetworkMetadata",
             Self::UnrecognizedNetworkMetadata { .. } => "UnrecognizedNetworkMetadata",
