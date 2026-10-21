@@ -389,11 +389,12 @@
                     spellcheck="false"
                     placeholder="zs1… or a Unified Address with a Sapling receiver"
                   />
+                  <p id="sprout-scan-sweep-plan" class="muted"></p>
                   <label class="checkbox-row">
-                    <input type="checkbox" id="sprout-scan-confirm" />
+                    <input type="checkbox" id="sprout-scan-confirm" disabled />
                     I understand this moves funds and cannot be undone.
                   </label>
-                  <button id="sprout-scan-sweep-run" type="button">Sweep found funds</button>
+                  <button id="sprout-scan-sweep-run" type="button" disabled>Sweep found funds</button>
                   <ul id="sprout-scan-sweep-results" class="session-list"></ul>
                 </div>
               </div>
@@ -421,6 +422,10 @@
                 <p id="sprout-sweep-pool" class="muted"></p>
                 <p id="sprout-sweep-params" class="muted"></p>
                 <p id="sprout-sweep-spent-status" class="muted"></p>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="sprout-sweep-confirm" disabled />
+                  I understand this moves funds and cannot be undone.
+                </label>
                 <button id="sprout-sweep-run" type="button" disabled>
                   Sweep Sprout funds
                 </button>
