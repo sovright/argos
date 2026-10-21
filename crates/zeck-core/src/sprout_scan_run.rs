@@ -76,11 +76,10 @@
 //! deliberately edited file. A checkpoint from another network fails on its
 //! first page, because no peer on this network recognises its block cursor.
 //!
-//! The checkpoint is also read with no network contact at all:
-//! [`lookup_chain_spends`] hands its nullifier set to the wallet-file path as
-//! evidence that notes were spent. That consumer is stricter — the network
-//! tag is required, the embedded key set must match, and whether the walk
-//! reached the tip (`complete`) is reported, not assumed. A MAC would still
+//! A wallet-file lookup reconciles the saved cursor with a live peer before
+//! using any cached nullifier as spend evidence. That consumer is stricter —
+//! the network tag is required, the embedded key set must match, and whether
+//! the walk reached the tip (`complete`) is reported, not assumed. A MAC would still
 //! add nothing against an attacker: marking a note spent needs a checkpoint
 //! holding the wallet's exact spending keys, and the note's nullifier needs
 //! its `a_sk`, which the checkpoint stores in the clear. Whoever can forge
@@ -164,6 +163,9 @@ const MAX_EMPTY_REPLIES: u32 = 8;
 /// blocking port 8233 — against a scan measured in hours, fifteen minutes is
 /// what a person will leave running unattended and still come back to.
 pub const PEER_ACQUISITION_BUDGET: Duration = Duration::from_secs(15 * 60);
+
+/// Wallet evidence must be checked promptly when opening or previewing a wallet.
+const WALLET_EVIDENCE_BUDGET: Duration = Duration::from_secs(45);
 
 /// How often a wait is re-announced while it runs.
 ///
@@ -359,7 +361,7 @@ fn read_checkpoint_file(path: &Path) -> ZeckResult<Option<Vec<u8>>> {
 /// What a scan checkpoint says about spends on chain, for the wallet-file
 /// path to consult.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanEvidence {
+struct ScanEvidence {
     /// The checkpoint this came from, so the surfaces can say which.
     pub path: PathBuf,
     /// Every nullifier the scan saw, with the transaction that revealed it
@@ -375,7 +377,7 @@ pub struct ScanEvidence {
 
 /// The outcome of looking for a scan of a key set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChainSpendsLookup {
+enum ChainSpendsLookup {
     /// No checkpoint at `path`: no scan of exactly these keys has run in this
     /// data directory.
     NotFound {
@@ -406,7 +408,7 @@ pub enum ChainSpendsLookup {
 ///
 /// An unreadable, untagged, wrong-network or wrong-key checkpoint is an
 /// error, never `NotFound`.
-pub fn lookup_chain_spends(
+fn lookup_chain_spends(
     data_dir: &Path,
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
@@ -458,7 +460,8 @@ pub fn lookup_chain_spends(
 
 /// [`lookup_chain_spends`] reduced to the nullifier set, for callers that
 /// need only the verdict. `Ok(None)` when no scan has read a block.
-pub fn chain_spends(
+#[cfg(test)]
+fn chain_spends(
     data_dir: &Path,
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
@@ -491,7 +494,7 @@ enum CachedLookup {
 /// so a resumed scan rewriting the checkpoint is re-read, and a deleted one
 /// is not served.
 #[derive(Default)]
-pub struct ChainSpendsCache {
+struct ChainSpendsCache {
     entries: std::sync::Mutex<Vec<CacheEntry>>,
 }
 
@@ -536,7 +539,8 @@ impl ChainSpendsCache {
 
     /// The scan evidence for exactly these keys, parsed at most once per
     /// version of the file. `Ok(None)` when there is none to use.
-    pub fn load(
+    #[cfg(test)]
+    fn load(
         &self,
         data_dir: &Path,
         network: P2pNetwork,
@@ -646,20 +650,132 @@ fn scans_covering(data_dir: &Path, network: P2pNetwork, wanted: &[[u8; 32]]) -> 
     found
 }
 
-/// What a wallet file's surfaces need from the scan: its evidence, and a
-/// sentence whenever the user should know something about it.
-///
-/// One helper for the CLI and the GUI, so both look for exactly the key set
-/// the scan fingerprints (sorted and deduplicated, via [`scan_key_set`]) and
-/// both explain themselves the same way. With no scan of exactly these keys,
-/// a scan of a larger set that includes all of them is used instead. It never
-/// fails: a checkpoint that cannot be used is reported in the notice, and the
-/// wallet file's own record stands. Parsed evidence is cached until its file
-/// changes ([`ChainSpendsCache`]).
-pub fn chain_spends_for_wallet(
+/// Select one checkpoint without exposing its parsed spends. Ranking a
+/// covering scan still parses its evidence, but that transient map is dropped
+/// here; only the selected file may later become wallet evidence.
+fn select_wallet_checkpoint(
+    data_dir: &Path,
+    network: P2pNetwork,
+    keys: &[[u8; 32]],
+) -> Result<(Vec<[u8; 32]>, Option<usize>), String> {
+    let path = checkpoint_path(data_dir, keys);
+    match std::fs::metadata(&path) {
+        Ok(_) => Ok((keys.to_vec(), None)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut unusable = Vec::new();
+            let best = scans_covering(data_dir, network, keys)
+                .into_iter()
+                .filter_map(|wider| match lookup_chain_spends(data_dir, network, &wider) {
+                    Ok(ChainSpendsLookup::Found(evidence)) => {
+                        Some((evidence.complete, evidence.scanned_to, wider))
+                    }
+                    Ok(_) => None,
+                    Err(err) => {
+                        unusable.push(format!("{} ({err})", checkpoint_path(data_dir, &wider).display()));
+                        None
+                    }
+                })
+                .max_by_key(|(complete, height, _)| (*complete, *height));
+            match best {
+                Some((_, _, wider)) => {
+                    let width = wider.len() - keys.len();
+                    Ok((wider, Some(width)))
+                }
+                None if !unusable.is_empty() => Err(format!(
+                    "A full-block scan covering this wallet's Sprout keys was found but could not be used: {}. Spent status is the wallet file's own record.",
+                    unusable.join("; ")
+                )),
+                None => Err(format!(
+                    "No full-block scan of this wallet's Sprout keys was found (looked for {} and any scan covering these keys in {}), so spent status is the wallet file's own record.",
+                    path.display(), data_dir.display()
+                )),
+            }
+        }
+        Err(err) => Err(format!(
+            "Not using the full-block scan checkpoint at {}: {err}. Spent status is the wallet file's own record.", path.display()
+        )),
+    }
+}
+
+/// Reconcile the selected checkpoint before the parse cache can be consulted.
+async fn verified_checkpoint_lookup<V: CursorVerifier>(
+    data_dir: &Path,
+    network: P2pNetwork,
+    keys: &[[u8; 32]],
+    verifier: &mut V,
+    cache: &ChainSpendsCache,
+) -> ZeckResult<CachedLookup> {
+    let path = checkpoint_path(data_dir, keys);
+    let original_stamp = stamp_of(&path);
+    let Some(mut scanner) = load_checkpoint(&path, network, keys)? else {
+        return Ok(CachedLookup::NotFound(path));
+    };
+    if scanner.cursor().is_none() {
+        return Ok(CachedLookup::NothingScanned(path));
+    }
+    if stamp_of(&path) != original_stamp {
+        return Err(ZeckError::ScanNotReady(format!(
+            "the scan checkpoint at {} changed while it was being opened; Argos will not use its spent-note evidence.", path.display()
+        )));
+    }
+    let original_cursor = scanner.cursor();
+    let original_complete = scanner.is_complete();
+    reconcile_cursor(&mut scanner, verifier, network, &path).await?;
+    let verified_stamp = stamp_of(&path);
+    if scanner.cursor() == original_cursor
+        && scanner.is_complete() == original_complete
+        && verified_stamp != original_stamp
+    {
+        return Err(ZeckError::ScanNotReady(format!(
+            "the scan checkpoint at {} changed during live verification; Argos will not use its spent-note evidence.", path.display()
+        )));
+    }
+    let lookup = cache.lookup(data_dir, network, keys)?;
+    if stamp_of(&path) != verified_stamp {
+        return Err(ZeckError::ScanNotReady(format!(
+            "the scan checkpoint at {} changed after live verification; Argos will not use its spent-note evidence.", path.display()
+        )));
+    }
+    Ok(lookup)
+}
+
+fn wallet_lookup_result(
+    lookup: ZeckResult<CachedLookup>,
+    wider_keys: Option<usize>,
+) -> (
+    Option<std::sync::Arc<crate::sprout_recovery::ChainSpends>>,
+    Option<String>,
+) {
+    match lookup {
+        Ok(CachedLookup::Found(spends, path)) => {
+            let mut notice = wider_keys.map(|width| format!(
+                "Using the full-block scan at {}, which scanned this wallet's Sprout keys together with {width} other key(s).", path.display()
+            ));
+            if !spends.complete {
+                let suffix = format!("It stopped at height {} before reaching the chain tip ({}).", spends.scanned_to, path.display());
+                notice = Some(match notice { Some(prefix) => format!("{prefix} {suffix}"), None => format!("Using this wallet's full-block scan. {suffix}") });
+            }
+            (Some(spends), notice)
+        }
+        Ok(CachedLookup::NotFound(path)) => (None, Some(format!(
+            "The selected full-block scan at {} disappeared before verification, so spent status is the wallet file's own record.", path.display()
+        ))),
+        Ok(CachedLookup::NothingScanned(path)) => (None, Some(format!(
+            "A full-block scan of these keys was started ({}) but has not read a block yet, so spent status is the wallet file's own record.", path.display()
+        ))),
+        Err(err) => (None, Some(format!(
+            "Not using the full-block scan checkpoint: {err} Argos will not use its spent-note evidence. Spent status is the wallet file's own record."
+        ))),
+    }
+}
+
+/// Wallet-file spend evidence is returned only after a live cursor check.
+/// Network acquisition and reconciliation share one 45-second deadline.
+pub async fn chain_spends_for_wallet(
     data_dir: &Path,
     network: P2pNetwork,
     wallet_keys: &[[u8; 32]],
+    extra_peers: &[String],
 ) -> (
     Option<std::sync::Arc<crate::sprout_recovery::ChainSpends>>,
     Option<String>,
@@ -668,90 +784,45 @@ pub fn chain_spends_for_wallet(
     if keys.is_empty() {
         return (None, None);
     }
-    let stopped_early = |path: &Path, spends: &crate::sprout_recovery::ChainSpends| {
-        (!spends.complete).then(|| {
-            format!(
-                "It stopped at height {} before reaching the chain tip ({}).",
-                spends.scanned_to,
-                path.display()
-            )
-        })
+    let (selected, wider_keys) = match select_wallet_checkpoint(data_dir, network, &keys) {
+        Ok(selected) => selected,
+        Err(notice) => return (None, Some(notice)),
     };
-    match CHAIN_SPENDS_CACHE.lookup(data_dir, network, &keys) {
-        Ok(CachedLookup::Found(spends, path)) => {
-            let notice = stopped_early(&path, &spends)
-                .map(|s| format!("Using this wallet's full-block scan. {s}"));
-            (Some(spends), notice)
-        }
-        Ok(CachedLookup::NotFound(path)) => {
-            // A scan of more keys than the wallet holds, if one covers them
-            // all: the most complete, then the furthest along.
-            // A covering checkpoint that cannot be used is kept and
-            // reported: hours of scan work must not read as absent.
-            let mut unusable = Vec::new();
-            let best = scans_covering(data_dir, network, &keys)
-                .into_iter()
-                .filter_map(
-                    |wider| match CHAIN_SPENDS_CACHE.lookup(data_dir, network, &wider) {
-                        Ok(CachedLookup::Found(spends, path)) => Some((spends, path, wider.len())),
-                        Ok(_) => None,
-                        Err(err) => {
-                            unusable.push(format!(
-                                "{} ({err})",
-                                checkpoint_path(data_dir, &wider).display()
-                            ));
-                            None
-                        }
-                    },
-                )
-                .max_by_key(|(spends, _, _)| (spends.complete, spends.scanned_to));
-            match best {
-                Some((spends, path, width)) => {
-                    let mut notice = format!(
-                        "Using the full-block scan at {}, which scanned this wallet's Sprout \
-                         keys together with {} other key(s).",
-                        path.display(),
-                        width - keys.len()
-                    );
-                    if let Some(s) = stopped_early(&path, &spends) {
-                        notice = format!("{notice} {s}");
-                    }
-                    (Some(spends), Some(notice))
-                }
-                None if !unusable.is_empty() => (
-                    None,
-                    Some(format!(
-                        "A full-block scan covering this wallet's Sprout keys was found but could \
-                         not be used: {}. Spent status is the wallet file's own record.",
-                        unusable.join("; ")
-                    )),
-                ),
-                None => (
-                    None,
-                    Some(format!(
-                        "No full-block scan of this wallet's Sprout keys was found (looked for \
-                         {} and any scan covering these keys in {}), so spent status is the \
-                         wallet file's own record.",
-                        path.display(),
-                        data_dir.display()
-                    )),
-                ),
-            }
-        }
-        Ok(CachedLookup::NothingScanned(path)) => (
-            None,
-            Some(format!(
-                "A full-block scan of these keys was started ({}) but has not read a block \
-                 yet, so spent status is the wallet file's own record.",
+    let path = checkpoint_path(data_dir, &selected);
+    let result = tokio::time::timeout(WALLET_EVIDENCE_BUDGET, async {
+        let mut waits = Vec::new();
+        let mut peer =
+            connect_peer_with_budget(network, extra_peers, &[], WALLET_EVIDENCE_BUDGET, |wait| {
+                waits.push(wait)
+            })
+            .await?;
+        let mut verifier = NetworkCursorVerifier {
+            peer: &mut peer,
+            network,
+            peers: extra_peers,
+            floor: network.sprout_scan_minimum_tip(),
+            tip_anchor: None,
+            checkpoint_file: &path,
+            waits: &mut waits,
+        };
+        verified_checkpoint_lookup(
+            data_dir,
+            network,
+            &selected,
+            &mut verifier,
+            &CHAIN_SPENDS_CACHE,
+        )
+        .await
+    })
+    .await;
+    match result {
+        Ok(lookup) => wallet_lookup_result(lookup, wider_keys),
+        Err(_) => wallet_lookup_result(
+            Err(ZeckError::ScanNotReady(format!(
+                "live verification of the scan checkpoint at {} timed out after 45 seconds",
                 path.display()
-            )),
-        ),
-        Err(err) => (
-            None,
-            Some(format!(
-                "Not using the full-block scan checkpoint: {err} Spent status is the wallet \
-                 file's own record."
-            )),
+            ))),
+            wider_keys,
         ),
     }
 }
@@ -1772,6 +1843,16 @@ async fn connect_peer(
     excluded: &[(String, tokio::time::Instant)],
     on_wait: impl FnMut(PeerWait),
 ) -> ZeckResult<Peer> {
+    connect_peer_with_budget(network, extra, excluded, PEER_ACQUISITION_BUDGET, on_wait).await
+}
+
+async fn connect_peer_with_budget(
+    network: P2pNetwork,
+    extra: &[String],
+    excluded: &[(String, tokio::time::Instant)],
+    requested_budget: Duration,
+    on_wait: impl FnMut(PeerWait),
+) -> ZeckResult<Peer> {
     // Regtest gets no patience. Its only candidates are the addresses the
     // caller named, there is no public capacity to free up, and a refusal
     // means the node is down — which a test should learn at once, not after
@@ -1779,7 +1860,7 @@ async fn connect_peer(
     let budget = if matches!(network, P2pNetwork::Regtest) {
         Duration::ZERO
     } else {
-        PEER_ACQUISITION_BUDGET
+        requested_budget
     };
     // `connect_to_any` resolves the seeds itself, so each pass re-resolves
     // them. That matters: the seeders rotate what they hand out, so a later
@@ -1917,7 +1998,9 @@ mod tests {
             locators: &[ScanCursor],
         ) -> ZeckResult<CanonicalContinuation> {
             self.seen = locators.to_vec();
-            Ok(self.response.take().unwrap())
+            self.response.take().ok_or_else(|| {
+                ZeckError::ScanNotReady("live cursor verification is unavailable".to_owned())
+            })
         }
     }
 
@@ -1934,6 +2017,220 @@ mod tests {
         }
         scanner.mark_complete();
         scanner
+    }
+
+    // Exercise the wallet evidence boundary with a deterministic chain view.
+    // The production implementation will route this seam through reconciliation.
+    async fn wallet_evidence_with_fake(
+        dir: &Path,
+        keys: &[[u8; 32]],
+        verifier: &mut FakeCursorVerifier,
+        cache: &ChainSpendsCache,
+    ) -> (
+        Option<std::sync::Arc<crate::sprout_recovery::ChainSpends>>,
+        Option<String>,
+    ) {
+        wallet_evidence_with_fake_on(dir, P2pNetwork::Regtest, keys, verifier, cache).await
+    }
+
+    async fn wallet_evidence_with_fake_on(
+        dir: &Path,
+        network: P2pNetwork,
+        keys: &[[u8; 32]],
+        verifier: &mut FakeCursorVerifier,
+        cache: &ChainSpendsCache,
+    ) -> (
+        Option<std::sync::Arc<crate::sprout_recovery::ChainSpends>>,
+        Option<String>,
+    ) {
+        let keys = scan_key_set(keys, &[]);
+        let (selected, wider_keys) = match select_wallet_checkpoint(dir, network, &keys) {
+            Ok(selected) => selected,
+            Err(notice) => return (None, Some(notice)),
+        };
+        wallet_lookup_result(
+            verified_checkpoint_lookup(dir, network, &selected, verifier, cache).await,
+            wider_keys,
+        )
+    }
+
+    async fn wallet_evidence_with_current(
+        dir: &Path,
+        network: P2pNetwork,
+        keys: &[[u8; 32]],
+    ) -> (
+        Option<std::sync::Arc<crate::sprout_recovery::ChainSpends>>,
+        Option<String>,
+    ) {
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::Current {
+                chain_has_more: false,
+            }),
+            seen: Vec::new(),
+        };
+        wallet_evidence_with_fake_on(
+            dir,
+            network,
+            keys,
+            &mut verifier,
+            &ChainSpendsCache::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn cached_spends_are_not_returned_before_live_cursor_verification() {
+        let dir = ScratchDir::new("evidence-unavailable");
+        let keys = [[0x11; 32]];
+        let scanner = reorg_scanner();
+        save_checkpoint(
+            &scanner,
+            P2pNetwork::Regtest,
+            &checkpoint_path(&dir.0, &keys),
+        )
+        .unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: None,
+            seen: Vec::new(),
+        };
+        let (chain, notice) =
+            wallet_evidence_with_fake(&dir.0, &keys, &mut verifier, &ChainSpendsCache::default())
+                .await;
+        assert!(
+            chain.is_none(),
+            "unverified checkpoint evidence must be refused"
+        );
+        assert!(notice.unwrap().contains("not use its spent-note evidence"));
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_nullifier_never_marks_a_wallet_note_spent() {
+        let dir = ScratchDir::new("evidence-orphan");
+        let keys = [[0x11; 32]];
+        let scanner = reorg_scanner();
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let parent = ScanCursor {
+            last_block_hash: [2; 32],
+            last_height: 2,
+        };
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::CommonAncestor(parent)),
+            seen: Vec::new(),
+        };
+        let (chain, _) =
+            wallet_evidence_with_fake(&dir.0, &keys, &mut verifier, &ChainSpendsCache::default())
+                .await;
+        let chain = chain.expect("the verified parent remains useful");
+        assert!(!chain.nullifiers.contains_key(&[3; 32]));
+        assert_eq!(chain.scanned_to, 2);
+        assert!(!chain.complete);
+        assert_eq!(
+            load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+                .unwrap()
+                .unwrap()
+                .cursor(),
+            Some(parent)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_still_revalidates_the_cursor() {
+        let dir = ScratchDir::new("evidence-cache-reorg");
+        let keys = [[0x11; 32]];
+        save_checkpoint(
+            &reorg_scanner(),
+            P2pNetwork::Regtest,
+            &checkpoint_path(&dir.0, &keys),
+        )
+        .unwrap();
+        let cache = ChainSpendsCache::default();
+        let mut current = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::Current {
+                chain_has_more: false,
+            }),
+            seen: Vec::new(),
+        };
+        let (first, _) = wallet_evidence_with_fake(&dir.0, &keys, &mut current, &cache).await;
+        assert!(first.unwrap().nullifiers.contains_key(&[3; 32]));
+        let mut reorg = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::CommonAncestor(ScanCursor {
+                last_block_hash: [2; 32],
+                last_height: 2,
+            })),
+            seen: Vec::new(),
+        };
+        let (second, _) = wallet_evidence_with_fake(&dir.0, &keys, &mut reorg, &cache).await;
+        assert!(!second.unwrap().nullifiers.contains_key(&[3; 32]));
+        assert_eq!(reorg.seen[0].last_height, 3);
+    }
+
+    #[tokio::test]
+    async fn legacy_checkpoint_on_a_fork_requires_a_safe_rescan() {
+        let dir = ScratchDir::new("evidence-legacy-fork");
+        let keys = [[0x11; 32]];
+        let mut scanner = SproutScanner::new(&keys);
+        scanner
+            .scan_block_at(&[joinsplit_revealing([0xEE; 32])], [0; 32], 7)
+            .unwrap();
+        let mut body = scanner.checkpoint().as_bytes().to_vec();
+        body[0] = 2;
+        body.truncate(body.len() - 8); // v3's empty rollback-history count
+        let cursor_hash = body.len() - 41;
+        body[cursor_hash..cursor_hash + 32].copy_from_slice(&[0xAA; 32]);
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut file = vec![NETWORK_TAGGED, network_tag(P2pNetwork::Regtest)];
+        file.extend_from_slice(&body);
+        std::fs::write(&path, &file).unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::CommonAncestor(ScanCursor {
+                last_block_hash: [0xBB; 32],
+                last_height: 6,
+            })),
+            seen: Vec::new(),
+        };
+        let (chain, notice) =
+            wallet_evidence_with_fake(&dir.0, &keys, &mut verifier, &ChainSpendsCache::default())
+                .await;
+        assert!(chain.is_none(), "a legacy fork has no rollback history");
+        let notice = notice.unwrap();
+        assert!(notice.contains("safe full rescan"), "{notice}");
+        assert!(
+            notice.contains("keep the original wallet or key"),
+            "{notice}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), file);
+    }
+
+    #[tokio::test]
+    async fn a_ranked_covering_scan_is_refused_when_live_verification_fails() {
+        let dir = ScratchDir::new("evidence-covering-unavailable");
+        let wallet_key = [0x11; 32];
+        let extra_key = [0x12; 32];
+        let mut scanner = SproutScanner::new(&[wallet_key, extra_key]);
+        scanner
+            .scan_block_at(&[joinsplit_revealing([0xEF; 32])], [1; 32], 1)
+            .unwrap();
+        scanner.mark_complete();
+        let path = checkpoint_path(&dir.0, &[wallet_key, extra_key]);
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: None,
+            seen: Vec::new(),
+        };
+        let (chain, notice) = wallet_evidence_with_fake(
+            &dir.0,
+            &[wallet_key],
+            &mut verifier,
+            &ChainSpendsCache::default(),
+        )
+        .await;
+        assert!(
+            chain.is_none(),
+            "ranking a covering scan cannot publish its spent map"
+        );
+        assert!(notice.unwrap().contains("not use its spent-note evidence"));
+        assert_eq!(verifier.seen[0].last_height, 1);
     }
 
     #[tokio::test]
@@ -2736,14 +3033,14 @@ mod tests {
     /// Kristi's #240 findings 1, 2 and 4: both surfaces look up the scan
     /// through one helper, keyed exactly as the scan fingerprints its keys,
     /// and it always says what it found — never an unexplained silence.
-    #[test]
-    fn a_wallets_scan_lookup_always_explains_itself() {
+    #[tokio::test]
+    async fn a_wallets_scan_lookup_always_explains_itself() {
         let dir = std::env::temp_dir().join(format!("argos-lookup-notice-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let keys = [[0x21; 32]];
 
-        let (chain, notice) = chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &keys);
+        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &keys).await;
         assert!(chain.is_none());
         let notice = notice.expect("no scan must be said, with where it looked");
         assert!(notice.contains(&dir.display().to_string()), "{notice}");
@@ -2754,13 +3051,13 @@ mod tests {
         scanner.scan_block_at(&[], [0xCD; 32], 300_000).unwrap();
         save_checkpoint(&scanner, P2pNetwork::Mainnet, &checkpoint_path(&dir, &keys)).unwrap();
         let (chain, notice) =
-            chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &[keys[0], keys[0]]);
+            wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[keys[0], keys[0]]).await;
         let chain = chain.expect("the duplicate must not hide the scan");
         assert!(!chain.complete);
         assert!(notice.unwrap().contains("before reaching the chain tip"));
 
         // Unusable evidence is said, not swallowed.
-        let (chain, notice) = chain_spends_for_wallet(&dir, P2pNetwork::Testnet, &keys);
+        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Testnet, &keys).await;
         assert!(chain.is_none());
         assert!(notice.unwrap().contains("different network"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2788,13 +3085,13 @@ mod tests {
     /// in beside the wallet file's is keyed by the larger set. The wallet's
     /// own lookup finds it, because it covers every one of the wallet's keys
     /// — and holding them is what keeps a planted checkpoint self-defeating.
-    #[test]
-    fn a_scan_of_more_keys_than_the_wallet_holds_is_found() {
+    #[tokio::test]
+    async fn a_scan_of_more_keys_than_the_wallet_holds_is_found() {
         let dir = fresh_dir("superset");
         let (a, b, c) = ([0x31; 32], [0x32; 32], [0x33; 32]);
         write_scan(&dir, &[a, b], 3_000_000, true);
 
-        let (chain, notice) = chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &[a]);
+        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[a]).await;
         let chain = chain.expect("a scan covering the wallet's keys must be used");
         assert_eq!(chain.scanned_to, 3_000_000);
         let notice = notice.expect("using a wider scan is said");
@@ -2803,7 +3100,7 @@ mod tests {
         // Not a superset: the wallet holds a key the scan never looked for —
         // even though the scan looked for more keys than the wallet has.
         write_scan(&dir, &[a, b, [0x35; 32]], 3_000_000, true);
-        let (chain, _) = chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &[a, c]);
+        let (chain, _) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[a, c]).await;
         assert!(
             chain.is_none(),
             "a scan missing one of the wallet's keys proves nothing"
@@ -2891,8 +3188,8 @@ mod tests {
 
     /// Finding 11: a covering checkpoint that cannot be used is reported as
     /// such, not as "no scan found" — hours of scan work must not look absent.
-    #[test]
-    fn an_unusable_covering_scan_is_reported_not_hidden() {
+    #[tokio::test]
+    async fn an_unusable_covering_scan_is_reported_not_hidden() {
         let dir = fresh_dir("covering-broken");
         let (a, b) = ([0x37; 32], [0x38; 32]);
         let path = write_scan(&dir, &[a, b], 3_000_000, true);
@@ -2900,7 +3197,7 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
 
-        let (chain, notice) = chain_spends_for_wallet(&dir, P2pNetwork::Mainnet, &[a]);
+        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[a]).await;
         assert!(chain.is_none());
         let notice = notice.unwrap();
         assert!(notice.contains("could not be used"), "{notice}");
