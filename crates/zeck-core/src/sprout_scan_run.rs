@@ -884,7 +884,7 @@ pub fn wallet_scan_notice_offline(
         format!(" (it scanned this wallet's Sprout keys together with {width} other key(s))")
     });
     Some(format!(
-        "A full-block scan of this wallet's Sprout keys exists at {}{wider}, but its spent-note evidence was not verified offline: a chain reorganization can orphan what it saw, and checking that needs live peers, which inspection never contacts. Spent status is the wallet file's own record. A sweep verifies the scan against live peers before using it.",
+        "A full-block scan of this wallet's Sprout keys exists at {}{wider}, but its spent-note evidence was not verified offline: a chain reorganization can orphan what it saw, and checking that needs live peers, which were not contacted. Spent status is the wallet file's own record. A sweep verifies the scan against live peers before using it.",
         path.display()
     ))
 }
@@ -2427,17 +2427,17 @@ fn unique_temp_siblings(path: &Path) -> Vec<(PathBuf, Option<std::time::SystemTi
 
 /// Take a peer, racing candidates.
 ///
-/// There is deliberately no "avoid the peer that just failed" list: an
-/// earlier version carried one and never used it, which made the module's
-/// claim about rotating away from a refusing peer fiction. `connect_to_any`
-/// races a fresh batch each round, so a peer inside its 119-second window
-/// simply loses the race rather than being excluded by name.
+/// `excluded` names peers to skip until their timestamp passes. The cursor
+/// verifier puts every peer it rotates away from on that list for
+/// [`PEER_RECONNECT_DELAY`], whether the peer went silent, faulted, or
+/// answered "beyond the retained window", so one fast hostile peer cannot win
+/// every race and block verification. Within a pass, `connect_to_any` races a
+/// fresh batch of the remaining addresses.
 ///
-/// That holds *within* a pass. Across passes there is still no list, because
-/// none is needed: when a whole pass is refused, [`acquire_with_retry`] waits
-/// out the reconnect window before the next one, so by the time any address
-/// is dialled again every peer has forgotten the last attempt. The window is
-/// respected by the clock rather than by bookkeeping per address.
+/// Across passes no further bookkeeping is needed: when a whole pass is
+/// refused, [`acquire_with_retry`] waits out the reconnect window before the
+/// next one, so by the time any address is dialled again every peer has
+/// forgotten the last attempt.
 ///
 /// `on_wait` hears about each such wait, so the caller can show that the scan
 /// is alive and waiting on purpose.
