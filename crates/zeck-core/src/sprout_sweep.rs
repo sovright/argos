@@ -777,6 +777,74 @@ pub struct SproutSweepInventory<'a> {
     pub ready: Vec<&'a SpendableSproutNote>,
     pub active: Vec<SproutJournalEntry>,
     pub mined: Vec<SproutJournalEntry>,
+    terminal: Vec<SproutJournalEntry>,
+}
+
+impl SproutSweepInventory<'_> {
+    /// Describe durable journal state without turning a broadcast into a
+    /// completed move. Values migrated from the v1 journal remain unknown
+    /// rather than entering arithmetic as zero.
+    pub fn accounting_lines(&self) -> Vec<String> {
+        const KEEP_SOURCE: &str = "Keep the original wallet or Sprout key and the scan checkpoint.";
+        let amount = |entry: &SproutJournalEntry| match entry.value_zatoshis {
+            Some(value) => zec(value),
+            None => "amount unknown".to_owned(),
+        };
+        let mut lines = Vec::new();
+        for entry in &self.active {
+            let txid = entry.txid();
+            match entry.state {
+                TxLifecycleState::Pending => lines.push(format!(
+                    "Sprout transaction {txid}: broadcast but not mined ({}). {KEEP_SOURCE}",
+                    amount(entry)
+                )),
+                TxLifecycleState::NotSubmitted | TxLifecycleState::SubmissionUnknown => {
+                    lines.push(format!(
+                        "Sprout transaction {txid}: submission status unknown ({}); it may or \
+                         may not have reached the network, so later work stopped. {KEEP_SOURCE}",
+                        amount(entry)
+                    ));
+                }
+                // A snapshot loaded through the journal reducer cannot put
+                // these states in `active`. Keep the conservative warning if
+                // a future producer violates that invariant.
+                _ => lines.push(format!(
+                    "Sprout transaction {txid}: current status is not independently final \
+                     ({}). {KEEP_SOURCE}",
+                    amount(entry)
+                )),
+            }
+        }
+        for entry in &self.mined {
+            let height = entry
+                .observation
+                .as_ref()
+                .and_then(|observation| observation.mined_height)
+                .expect("mined inventory requires canonical height evidence");
+            lines.push(format!(
+                "Sprout transaction {}: canonically confirmed at height {height} ({}).",
+                entry.txid(),
+                amount(entry)
+            ));
+        }
+        for entry in &self.terminal {
+            match entry.state {
+                TxLifecycleState::Expired => lines.push(format!(
+                    "Sprout transaction {}: the old transaction can no longer mine and the \
+                     note is ready for a new plan.",
+                    entry.txid()
+                )),
+                TxLifecycleState::Rejected => lines.push(format!(
+                    "Sprout transaction {} was rejected: nothing is counted as moved, note \
+                     material is retained, and the existing refusal classification determines \
+                     whether a later run may retry.",
+                    entry.txid()
+                )),
+                _ => {}
+            }
+        }
+        lines
+    }
 }
 
 pub fn classify_sprout_notes<'a>(
@@ -787,6 +855,7 @@ pub fn classify_sprout_notes<'a>(
         ready: Vec::new(),
         active: Vec::new(),
         mined: Vec::new(),
+        terminal: Vec::new(),
     };
     for note in notes {
         match journal.entry_for_note(&note.outpoint) {
@@ -797,9 +866,15 @@ pub fn classify_sprout_notes<'a>(
                     TxLifecycleState::Expired | TxLifecycleState::Rejected
                 ) =>
             {
-                inventory.ready.push(note)
+                inventory.ready.push(note);
+                inventory.terminal.push(entry.clone());
             }
-            Some(entry) if entry.state == TxLifecycleState::Mined => {
+            Some(entry)
+                if entry.state == TxLifecycleState::Mined
+                    && entry.observation.as_ref().is_some_and(
+                        crate::broadcast::TxObservation::has_canonical_mined_evidence,
+                    ) =>
+            {
                 inventory.mined.push(entry.clone())
             }
             Some(entry) => inventory.active.push(entry.clone()),

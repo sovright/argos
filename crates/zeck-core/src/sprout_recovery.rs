@@ -233,9 +233,6 @@ pub struct SproutRecovery {
     /// The height a full-block scan of these keys reached, when one was
     /// consulted. Spends at or below it are the chain's word, not the file's.
     pub chain_checked_to: Option<u32>,
-    /// Notes an earlier run of the sweep already broadcast, with its txid.
-    /// Taken out of `notes` by [`SproutRecovery::drop_already_swept`].
-    pub already_swept: Vec<(JsOutPoint, String)>,
     /// What looking for a full-block scan found, when it is worth saying:
     /// where it looked and found none, a scan that stopped early, or one
     /// that could not be used. Set by the surfaces from
@@ -285,11 +282,15 @@ impl SproutRecovery {
     /// Nothing to move, and nothing wrong: every note was spent by the
     /// wallet itself or is dust. Such a wallet must hear that, not the
     /// multi-day scan quote meant for keys without note data.
-    pub fn nothing_left_to_sweep(&self) -> bool {
-        self.notes.is_empty()
+    pub fn nothing_left_to_sweep(
+        &self,
+        inventory: &crate::sprout_sweep::SproutSweepInventory<'_>,
+    ) -> bool {
+        inventory.ready.is_empty()
+            && inventory.active.is_empty()
             && self.issues.is_empty()
             && self.unreadable_transactions == 0
-            && !(self.spent.is_empty() && self.dust.is_empty() && self.already_swept.is_empty())
+            && !(self.spent.is_empty() && self.dust.is_empty() && inventory.mined.is_empty())
     }
 
     /// The limit on spent status, as it applies to this result: the file's
@@ -360,23 +361,6 @@ impl SproutRecovery {
                     zec(sum(&by_chain))
                 ));
             }
-        }
-        if !self.already_swept.is_empty() {
-            let mut txids: Vec<&str> = self.already_swept.iter().map(|(_, t)| t.as_str()).collect();
-            txids.sort_unstable();
-            txids.dedup();
-            let shown = txids.iter().take(3).copied().collect::<Vec<_>>().join(", ");
-            let more = txids.len().saturating_sub(3);
-            lines.push(format!(
-                "{} note(s) were already swept by an earlier run of this sweep and are not \
-                 proved again ({shown}{}).",
-                self.already_swept.len(),
-                if more > 0 {
-                    format!(", and {more} more")
-                } else {
-                    String::new()
-                }
-            ));
         }
         // Named whenever some keys have note records and others none. When no
         // key has any, the file simply holds no note data, and the surfaces
@@ -794,6 +778,12 @@ mod tests {
     use argos_wallet_import::keys::{Provenance, SproutKey, SproutNoteData};
     use secrecy::Secret;
 
+    fn recovery_has_nothing_left(recovered: &SproutRecovery) -> bool {
+        let snapshot = crate::sprout_sweep_journal::SproutJournalSnapshot::default();
+        let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+        recovered.nothing_left_to_sweep(&inventory)
+    }
+
     /// Build a wallet holding one real, self-consistent Sprout note: the
     /// ciphertext is produced by the encryption path, so decryption here is
     /// checked against a genuine encryption rather than a canned blob.
@@ -1107,7 +1097,7 @@ mod tests {
         let spend = spend_of(&keys, &a_sk);
         keys.sprout_joinsplits.push(spend);
         let recovered = recover_spendable_sprout_notes(&keys);
-        assert!(recovered.nothing_left_to_sweep());
+        assert!(recovery_has_nothing_left(&recovered));
         let lines = recovered.accounting_lines();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("0.01000000 ZEC"), "{}", lines[0]);
@@ -1115,7 +1105,9 @@ mod tests {
 
         let (mut keys, _) = wallet_with_one_note(1_000_000);
         keys.sprout_notes[0].witness.truncate(3);
-        assert!(!recover_spendable_sprout_notes(&keys).nothing_left_to_sweep());
+        assert!(!recovery_has_nothing_left(&recover_spendable_sprout_notes(
+            &keys
+        )));
     }
 
     #[test]
@@ -1198,7 +1190,9 @@ mod tests {
         let (mut keys, a_sk) = wallet_with_one_note(1_000_000);
         let spend = spend_of(&keys, &a_sk);
         keys.sprout_joinsplits.push(spend);
-        assert!(recover_spendable_sprout_notes(&keys).nothing_left_to_sweep());
+        assert!(recovery_has_nothing_left(&recover_spendable_sprout_notes(
+            &keys
+        )));
 
         keys.diagnostics
             .push(argos_wallet_import::ImportDiagnostic::UnparseableRecord {
@@ -1207,7 +1201,7 @@ mod tests {
             });
         let recovered = recover_spendable_sprout_notes(&keys);
         assert_eq!(recovered.unreadable_transactions, 1);
-        assert!(!recovered.nothing_left_to_sweep());
+        assert!(!recovery_has_nothing_left(&recovered));
         let warning = unreadable_transactions_warning(&keys).unwrap();
         assert!(warning.contains("received"), "both directions: {warning}");
     }
@@ -1345,6 +1339,269 @@ mod tests {
         assert!(status.contains("3000000"), "{status}");
     }
 
+    fn inventory_journal(dir: &std::path::Path) -> crate::sprout_sweep_journal::SweepJournal {
+        crate::sprout_sweep_journal::SweepJournal::for_keys(
+            dir,
+            &[[0x42; 32]],
+            crate::ZeckNetwork::Mainnet,
+        )
+    }
+
+    fn inventory_transaction(seed: u32) -> crate::broadcast::PreparedTransaction {
+        use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+        use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::V5,
+            BranchId::Nu5,
+            seed,
+            BlockHeight::from_u32(140),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let mut raw_tx = Vec::new();
+        tx.write(&mut raw_tx).unwrap();
+        crate::broadcast::PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx,
+            fee_zatoshis: crate::sprout_sweep::SPROUT_SWEEP_FEE,
+            expiry_height: Some(140),
+        }
+    }
+
+    fn inventory_observation(
+        tx_in_block: bool,
+        reported_height: Option<u32>,
+        tip: u32,
+    ) -> crate::broadcast::TxObservation {
+        let evidence = ["alpha", "bravo"]
+            .into_iter()
+            .map(|operator| crate::broadcast::EndpointTxEvidence {
+                operator_id: operator.to_owned(),
+                endpoint: format!("https://{operator}.example"),
+                tip_height: Some(tip),
+                reported_height,
+                block_hash: reported_height.map(|height| vec![height as u8; 32]),
+                tx_in_block,
+            })
+            .collect();
+        crate::broadcast::observe_transaction(evidence, Some(140))
+    }
+
+    fn seed_inventory_state(
+        journal: &crate::sprout_sweep_journal::SweepJournal,
+        note: &SpendableSproutNote,
+        state: crate::broadcast::TxLifecycleState,
+    ) -> crate::sprout_sweep_journal::SproutJournalSnapshot {
+        use crate::broadcast::{BroadcastStore, SubmissionDisposition, TxLifecycleState};
+
+        let tx = inventory_transaction(u32::from(note.outpoint.txid[0]));
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(
+                crate::sprout_sweep_journal::JournalNoteContext {
+                    outpoint: note.outpoint,
+                    value_zatoshis: note.note.value - crate::sprout_sweep::SPROUT_SWEEP_FEE,
+                },
+                &mut snapshot,
+            )
+            .persist_prepared(&tx)
+            .unwrap();
+        journal
+            .append_transition(
+                &mut snapshot,
+                tx.txid,
+                TxLifecycleState::SubmissionUnknown,
+                None,
+                None,
+            )
+            .unwrap();
+        match state {
+            TxLifecycleState::SubmissionUnknown => {}
+            TxLifecycleState::Pending | TxLifecycleState::Mined | TxLifecycleState::Expired => {
+                journal
+                    .append_transition(
+                        &mut snapshot,
+                        tx.txid,
+                        TxLifecycleState::Pending,
+                        Some(&SubmissionDisposition::Accepted),
+                        None,
+                    )
+                    .unwrap();
+                if state == TxLifecycleState::Mined {
+                    let observation = inventory_observation(true, Some(90), 100);
+                    journal
+                        .append_transition(&mut snapshot, tx.txid, state, None, Some(&observation))
+                        .unwrap();
+                } else if state == TxLifecycleState::Expired {
+                    let observation = inventory_observation(false, None, 141);
+                    journal
+                        .append_transition(&mut snapshot, tx.txid, state, None, Some(&observation))
+                        .unwrap();
+                }
+            }
+            other => panic!("unsupported inventory fixture state: {other:?}"),
+        }
+        snapshot
+    }
+
+    #[test]
+    fn pending_note_is_active_not_ready_and_is_not_called_swept() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        let dir = tempfile::tempdir().unwrap();
+        let journal = inventory_journal(dir.path());
+        let snapshot = seed_inventory_state(
+            &journal,
+            &recovered.notes[0],
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+
+        let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+
+        assert_eq!(
+            recovered.notes.len(),
+            1,
+            "classification must retain note material"
+        );
+        assert!(inventory.ready.is_empty());
+        assert_eq!(inventory.active.len(), 1);
+        assert!(inventory.mined.is_empty());
+        let lines = inventory.accounting_lines().join(" ");
+        assert!(lines.contains("broadcast but not mined"), "{lines}");
+        assert!(lines.contains("Keep the original"), "{lines}");
+        assert!(!lines.to_ascii_lowercase().contains("swept"), "{lines}");
+    }
+
+    #[test]
+    fn submission_unknown_note_is_active_and_blocks_a_conflicting_plan() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        let dir = tempfile::tempdir().unwrap();
+        let journal = inventory_journal(dir.path());
+        let snapshot = seed_inventory_state(
+            &journal,
+            &recovered.notes[0],
+            crate::broadcast::TxLifecycleState::SubmissionUnknown,
+        );
+
+        let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+
+        assert!(inventory.ready.is_empty());
+        assert_eq!(inventory.active.len(), 1);
+        assert!(!snapshot.ready_for_new_plan(&recovered.notes[0].outpoint));
+        let lines = inventory.accounting_lines().join(" ");
+        assert!(
+            lines.contains("may or may not have reached the network"),
+            "{lines}"
+        );
+        assert!(lines.contains("later work stopped"), "{lines}");
+        assert!(lines.contains("scan checkpoint"), "{lines}");
+    }
+
+    #[test]
+    fn expired_note_returns_to_ready_inventory() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        let dir = tempfile::tempdir().unwrap();
+        let journal = inventory_journal(dir.path());
+        let snapshot = seed_inventory_state(
+            &journal,
+            &recovered.notes[0],
+            crate::broadcast::TxLifecycleState::Expired,
+        );
+
+        let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+
+        assert_eq!(recovered.notes.len(), 1);
+        assert_eq!(inventory.ready.len(), 1);
+        assert!(inventory.active.is_empty() && inventory.mined.is_empty());
+        let lines = inventory.accounting_lines().join(" ");
+        assert!(lines.contains("can no longer mine"), "{lines}");
+        assert!(lines.contains("ready for a new plan"), "{lines}");
+    }
+
+    #[test]
+    fn only_mined_note_enters_the_mined_inventory() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        let dir = tempfile::tempdir().unwrap();
+        let journal = inventory_journal(dir.path());
+        let snapshot = seed_inventory_state(
+            &journal,
+            &recovered.notes[0],
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+
+        let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+
+        assert_eq!(recovered.notes.len(), 1);
+        assert!(inventory.ready.is_empty() && inventory.active.is_empty());
+        assert_eq!(inventory.mined.len(), 1);
+        let lines = inventory.accounting_lines().join(" ");
+        assert!(
+            lines.contains("canonically confirmed at height 90"),
+            "{lines}"
+        );
+    }
+
+    #[test]
+    fn pending_only_wallet_is_not_nothing_left() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        let dir = tempfile::tempdir().unwrap();
+        let journal = inventory_journal(dir.path());
+        let snapshot = seed_inventory_state(
+            &journal,
+            &recovered.notes[0],
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+        let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+
+        assert!(!recovered.nothing_left_to_sweep(&inventory));
+    }
+
+    #[test]
+    fn legacy_unknown_value_is_described_without_a_zero_amount() {
+        let (keys, _) = wallet_with_one_note(1_000_000);
+        let recovered = recover_spendable_sprout_notes(&keys);
+        let dir = tempfile::tempdir().unwrap();
+        let journal = inventory_journal(dir.path());
+        let outpoint = recovered.notes[0].outpoint;
+        let note_txid: String = outpoint
+            .txid
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        std::fs::write(
+            journal.path(),
+            format!(
+                "{note_txid}:{}:{} {}\n",
+                outpoint.js_index,
+                outpoint.output_index,
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
+        let snapshot = journal.load_or_migrate().unwrap();
+
+        let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+        let lines = inventory.accounting_lines().join(" ");
+
+        assert_eq!(inventory.active[0].value_zatoshis, None);
+        assert!(lines.contains("amount unknown"), "{lines}");
+        assert!(
+            !lines.contains("0 ZEC") && !lines.contains("0 zatoshi"),
+            "{lines}"
+        );
+        assert!(lines.contains("Keep the original"), "{lines}");
+    }
+
     /// A second Sprout key with no note records — an unused
     /// `z_getnewaddress` address, or a key imported without a rescan. The
     /// file cannot tell which. Round 5 made it block "nothing left"; round 6
@@ -1367,7 +1624,7 @@ mod tests {
         let recovered = recover_spendable_sprout_notes(&keys);
         assert_eq!(recovered.keys_without_notes, 1);
         assert!(
-            recovered.nothing_left_to_sweep(),
+            recovery_has_nothing_left(&recovered),
             "an unused address must not strand the verdict"
         );
         assert!(
