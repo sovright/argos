@@ -47,6 +47,7 @@ const state = {
   matchedRecovery: null,
   retainedAddressSearchId: null,
   addressMatchRecoveryLocked: false,
+  addressMatchRecoveryStartGeneration: null,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1802,6 +1803,7 @@ go back and provide one.",
       matched = state.matchedRecovery;
       const matchedConfig = configForMatchedRecovery(config);
       state.addressMatchRecoveryLocked = true;
+      state.addressMatchRecoveryStartGeneration = generation;
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: true } }));
       handle = await invoke("start_matched_recovery", {
         searchId: matched.searchId,
@@ -1836,8 +1838,10 @@ go back and provide one.",
       // The backend may have started scan A after its form was edited into B.
       // It is no longer UI authority; ask it to stop without disturbing B.
       invoke("cancel_scan", { handle }).catch(() => {});
-      if (matched && state.matchedRecovery === matched) {
+      if (matched && state.matchedRecovery === matched &&
+          state.addressMatchRecoveryStartGeneration === generation) {
         state.addressMatchRecoveryLocked = false;
+        state.addressMatchRecoveryStartGeneration = null;
         document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
       }
       return;
@@ -1873,14 +1877,17 @@ go back and provide one.",
     await startProgressListeners(handle);
   } catch (err) {
     if (generation !== state.scanAuthorityGeneration) {
-      if (matched && state.matchedRecovery === matched) {
+      if (matched && state.matchedRecovery === matched &&
+          state.addressMatchRecoveryStartGeneration === generation) {
         state.addressMatchRecoveryLocked = false;
+        state.addressMatchRecoveryStartGeneration = null;
         document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
       }
       return;
     }
     if (state.matchedRecovery) {
       state.addressMatchRecoveryLocked = false;
+      state.addressMatchRecoveryStartGeneration = null;
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
     }
     setStatus("config-status", `✗ ${err}`, "error");
@@ -2887,6 +2894,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
     matchedRecovery: null,
     retainedAddressSearchId: null,
     addressMatchRecoveryLocked: false,
+    addressMatchRecoveryStartGeneration: null,
   });
   $("copy-report-path").style.display = "none";
   $("delete-workspace").disabled = false;

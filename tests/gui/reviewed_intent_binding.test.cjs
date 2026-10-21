@@ -479,6 +479,56 @@ test("a stale matched-start failure releases its address-search lock", async () 
   assert.equal(h.state.addressMatchRecoveryLocked, false);
 });
 
+for (const oldOutcome of ["resolved", "rejected"]) {
+  test(`an old matched start ${oldOutcome} cannot unlock a newer matched start`, async () => {
+    const h = flowHarness();
+    const firstStart = deferred();
+    const secondStart = deferred();
+    const commands = [];
+    h.state.matchedRecovery = { searchId: "search-A", matchId: "match-A" };
+    h.context.walletFile = null;
+    h.$("destination-input").value = "zs-destination";
+    h.$("data-dir").value = "/data";
+    h.$("network-select").value = "mainnet";
+    h.$("auto-gap-limit").checked = true;
+    h.$("gap-limit").value = "20";
+    h.$("birthday-height").value = "419200";
+    h.context.hasSaplingScanKeys = () => false;
+    h.context.shouldShowTransparentRange = () => false;
+    h.context.scanKeySourceConflict = () => null;
+    h.context.defaultScanLabel = () => "scan";
+    h.context.configForMatchedRecovery = (config) => config;
+    h.context.startProgressListeners = async () => {};
+    h.context.invoke = async (command, args) => {
+      commands.push({ command, args });
+      if (command === "validate_address") return { destination_ok: true };
+      if (command === "start_matched_recovery") {
+        return commands.filter((call) => call.command === "start_matched_recovery").length === 1
+          ? firstStart.promise : secondStart.promise;
+      }
+      if (command === "cancel_scan") return null;
+      throw new Error(`unexpected ${command}`);
+    };
+    loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+    loadFlow(h, '$("start-scan").addEventListener("click"', "// ─── Step 4: Scan Progress");
+    const first = h.$("start-scan").fire("click");
+    await new Promise((resolve) => setImmediate(resolve));
+    h.$("network-select").fire("input");
+    const second = h.$("start-scan").fire("click");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(commands.filter((call) => call.command === "start_matched_recovery").length, 2);
+    assert.equal(h.state.addressMatchRecoveryLocked, true);
+    if (oldOutcome === "resolved") firstStart.resolve({ id: "scan-A" });
+    else firstStart.reject(new Error("old start failed"));
+    await first;
+    assert.equal(h.state.addressMatchRecoveryLocked, true);
+    secondStart.resolve({ id: "scan-B" });
+    await second;
+    assert.equal(h.state.scanHandle.id, "scan-B");
+    assert.equal(h.state.addressMatchRecoveryLocked, true);
+  });
+}
+
 test("destination edit preserves completed scan authority", async () => {
   const h = harness();
   await accepted(h);
