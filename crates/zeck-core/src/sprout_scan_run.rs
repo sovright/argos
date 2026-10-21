@@ -1146,6 +1146,7 @@ trait CursorVerifier {
     async fn continuation(&mut self, locators: &[ScanCursor]) -> ZeckResult<CanonicalContinuation>;
 }
 
+#[derive(Debug)]
 enum CanonicalContinuation {
     Current { chain_has_more: bool },
     CommonAncestor(ScanCursor),
@@ -1200,9 +1201,6 @@ async fn reconcile_cursor_in_memory<V: CursorVerifier>(
             }
         }
         CanonicalContinuation::CommonAncestor(ancestor) => {
-            if !locators.contains(&ancestor) {
-                return Err(beyond_retained_window(&locators, checkpoint_file));
-            }
             scanner
                 .rewind_to(ancestor.last_block_hash)
                 .map_err(|err| match err {
@@ -1249,153 +1247,295 @@ struct NetworkCursorVerifier<'a> {
 #[async_trait::async_trait]
 impl CursorVerifier for NetworkCursorVerifier<'_> {
     async fn continuation(&mut self, locators: &[ScanCursor]) -> ZeckResult<CanonicalContinuation> {
-        let hashes: Vec<_> = locators.iter().map(|c| c.last_block_hash).collect();
-        let mut failures = 0u32;
-        let mut silent = Vec::new();
-        loop {
-            let mut tip_probe_parent = None;
-            let result = match self.peer.get_headers(&hashes).await {
-                Ok(headers)
-                    if headers.is_empty()
-                        && crate::p2p::wire::empty_reply_is_chain_tip(
-                            first_scan_height(Some(locators[0])),
-                            self.floor,
-                            self.peer.peer_height,
-                        ) =>
-                {
-                    let saved = locators[0];
-                    let pinned = crate::p2p::wire::checkpoint_at(self.network, saved.last_height)
-                        .is_none_or(|expected| expected == saved.last_block_hash)
-                        && self
-                            .tip_anchor
-                            .filter(|a| a.height == saved.last_height)
-                            .is_none_or(|anchor| anchor.hash == saved.last_block_hash);
-                    if !pinned {
-                        return Err(ZeckError::ScanNotReady(format!(
-                            "the saved Sprout cursor at {} disagrees with a pinned block at height {}; Argos will not use its spent-note evidence.",
-                            self.checkpoint_file.display(), saved.last_height
-                        )));
-                    }
-                    let Some(parent) = locators.get(1).copied() else {
-                        return Err(ZeckError::ScanNotReady(format!(
-                            "the peer returned no headers after the saved Sprout cursor at {}, and no retained predecessor can prove that cursor is on the current chain. Argos will not use its spent-note evidence; keep the original wallet or key and start a safe full rescan if needed.",
-                            self.checkpoint_file.display()
-                        )));
-                    };
-                    tip_probe_parent = Some(parent);
-                    self.peer.get_headers(&[parent.last_block_hash]).await
+        let rules = PinRules {
+            network: self.network,
+            floor: self.floor,
+            tip_anchor: self.tip_anchor,
+        };
+        let checkpoint_file = self.checkpoint_file;
+        let mut peer = NetworkHeaderPeer {
+            peer: self.peer,
+            network: self.network,
+            peers: self.peers,
+            silent: Vec::new(),
+            waits: self.waits,
+        };
+        verify_continuation(&mut peer, &rules, locators, checkpoint_file).await
+    }
+}
+
+/// How many distinct peers must independently answer from before every
+/// retained cursor before Argos concludes the fork is deeper than its
+/// rollback window. One peer saying so may simply not know this branch, or
+/// may be lying to force a costly rescan.
+const BEYOND_WINDOW_QUORUM: usize = 3;
+
+/// The independent pins a header must agree with: the network's fixed
+/// checkpoints and, when one was learned, the lightwalletd [`TipAnchor`].
+struct PinRules {
+    network: P2pNetwork,
+    floor: u32,
+    tip_anchor: Option<TipAnchor>,
+}
+
+impl PinRules {
+    /// True when no pin at `height` contradicts `hash`.
+    fn agrees(&self, height: u32, hash: [u8; 32]) -> bool {
+        crate::p2p::wire::checkpoint_at(self.network, height).is_none_or(|pin| pin == hash)
+            && self
+                .tip_anchor
+                .filter(|anchor| anchor.height == height)
+                .is_none_or(|anchor| anchor.hash == hash)
+    }
+}
+
+/// A source of headers that can move on to another peer. The network
+/// implementation validates proof of work, size and linkage before handing
+/// headers over, so [`verify_continuation`] judges only what they say.
+#[async_trait::async_trait]
+trait HeaderPeer: Send {
+    fn peer_height(&self) -> u32;
+    fn peer_id(&self) -> String;
+    /// Validated headers following `locators`, or why this peer's reply
+    /// could not be used.
+    async fn validated_headers(
+        &mut self,
+        locators: &[[u8; 32]],
+    ) -> Result<Vec<crate::p2p::wire::BlockHeader>, String>;
+    async fn next_peer(&mut self) -> ZeckResult<()>;
+}
+
+struct NetworkHeaderPeer<'a, 'b> {
+    peer: &'b mut Peer,
+    network: P2pNetwork,
+    peers: &'a [String],
+    silent: Vec<(String, tokio::time::Instant)>,
+    waits: &'b mut Vec<PeerWait>,
+}
+
+#[async_trait::async_trait]
+impl HeaderPeer for NetworkHeaderPeer<'_, '_> {
+    fn peer_height(&self) -> u32 {
+        self.peer.peer_height
+    }
+
+    fn peer_id(&self) -> String {
+        self.peer.dialled_as().to_owned()
+    }
+
+    async fn validated_headers(
+        &mut self,
+        locators: &[[u8; 32]],
+    ) -> Result<Vec<crate::p2p::wire::BlockHeader>, String> {
+        let headers = match self.peer.get_headers(locators).await {
+            Ok(headers) => headers,
+            Err(err) => {
+                if matches!(err, crate::p2p::peer::PeerError::Silent { .. }) {
+                    self.silent.push((
+                        self.peer.dialled_as().to_owned(),
+                        tokio::time::Instant::now() + PEER_RECONNECT_DELAY,
+                    ));
                 }
-                other => other,
-            };
-            let failure = match result {
-                Ok(headers) if headers.is_empty() => {
-                    if tip_probe_parent.is_some() {
-                        return Err(ZeckError::ScanNotReady(format!(
-                            "the peer supplied no validated header overlapping the saved Sprout cursor at {}; Argos will not use its spent-note evidence.",
-                            self.checkpoint_file.display()
-                        )));
-                    }
-                    format!(
-                        "peer reported no headers after height {} despite a known tip of {}",
-                        locators[0].last_height,
-                        self.floor.max(self.peer.peer_height)
-                    )
-                }
-                Ok(headers) => {
-                    let valid_work = headers.len() <= crate::p2p::peer::MAX_PAGE_BLOCKS
-                        && headers
-                            .iter()
-                            .all(|h| crate::p2p::wire::verify_header_pow(self.network, h).is_ok());
-                    let valid_links = headers
-                        .windows(2)
-                        .all(|pair| pair[1].prev_hash == pair[0].hash);
-                    if !valid_work || !valid_links {
-                        "peer returned invalid header work or linkage".to_owned()
-                    } else {
-                        // An answer from before every retained hash is a deep
-                        // reorg (or a peer that does not know this branch). No
-                        // height can be assigned to it safely.
-                        let Some(ancestor) = locators
-                            .iter()
-                            .find(|c| c.last_block_hash == headers[0].prev_hash)
-                            .copied()
-                        else {
-                            return Err(beyond_retained_window(locators, self.checkpoint_file));
-                        };
-                        let valid_ancestor_pin =
-                            crate::p2p::wire::checkpoint_at(self.network, ancestor.last_height)
-                                .is_none_or(|expected| expected == ancestor.last_block_hash)
-                                && self
-                                    .tip_anchor
-                                    .filter(|a| a.height == ancestor.last_height)
-                                    .is_none_or(|anchor| anchor.hash == ancestor.last_block_hash);
-                        let valid_pins = valid_ancestor_pin
-                            && headers.iter().enumerate().all(|(offset, header)| {
-                                let Some(height) = ancestor
-                                    .last_height
-                                    .checked_add(1)
-                                    .and_then(|h| h.checked_add(offset as u32))
-                                else {
-                                    return false;
-                                };
-                                crate::p2p::wire::checkpoint_at(self.network, height)
-                                    .is_none_or(|expected| expected == header.hash)
-                                    && self
-                                        .tip_anchor
-                                        .filter(|a| a.height == height)
-                                        .is_none_or(|anchor| anchor.hash == header.hash)
-                            });
-                        if valid_pins {
-                            if let Some(parent) = tip_probe_parent {
-                                if ancestor == parent
-                                    && headers[0].hash == locators[0].last_block_hash
-                                {
-                                    if headers.len() == 1 {
-                                        return Ok(CanonicalContinuation::Current {
-                                            chain_has_more: false,
-                                        });
-                                    }
-                                    return Err(ZeckError::ScanNotReady(format!(
-                                        "the peer contradicted its empty tip reply for the saved Sprout cursor at {}; Argos will not use its spent-note evidence.",
-                                        self.checkpoint_file.display()
-                                    )));
-                                }
-                                return Ok(CanonicalContinuation::CommonAncestor(ancestor));
-                            }
-                            return Ok(if ancestor == locators[0] {
-                                CanonicalContinuation::Current {
-                                    chain_has_more: true,
-                                }
-                            } else {
-                                CanonicalContinuation::CommonAncestor(ancestor)
-                            });
-                        }
-                        "peer returned a header that disagrees with a pinned block".to_owned()
-                    }
-                }
-                Err(err) => {
-                    if matches!(err, crate::p2p::peer::PeerError::Silent { .. }) {
-                        silent.push((
-                            self.peer.dialled_as().to_owned(),
-                            tokio::time::Instant::now() + PEER_RECONNECT_DELAY,
-                        ));
-                    }
-                    err.to_string()
-                }
-            };
-            failures += 1;
-            if failures > MAX_EMPTY_REPLIES {
-                return Err(ZeckError::Broadcast(format!(
-                    "{failures} attempts to verify the saved Sprout cursor failed; \
-                     the most recent: {failure}. The checkpoint was left unchanged."
-                )));
+                return Err(err.to_string());
             }
-            self.peer.close().await;
-            *self.peer = connect_peer(self.network, self.peers, &silent, |wait| {
-                self.waits.push(wait)
-            })
-            .await?;
+        };
+        let valid_work = headers.len() <= crate::p2p::peer::MAX_PAGE_BLOCKS
+            && headers
+                .iter()
+                .all(|h| crate::p2p::wire::verify_header_pow(self.network, h).is_ok());
+        let valid_links = headers
+            .windows(2)
+            .all(|pair| pair[1].prev_hash == pair[0].hash);
+        if valid_work && valid_links {
+            Ok(headers)
+        } else {
+            Err("peer returned invalid header work or linkage".to_owned())
         }
+    }
+
+    async fn next_peer(&mut self) -> ZeckResult<()> {
+        self.peer.close().await;
+        let waits = &mut *self.waits;
+        *self.peer = connect_peer(self.network, self.peers, &self.silent, |wait| {
+            waits.push(wait)
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+/// One peer's answer about the saved cursor.
+enum PeerVerdict {
+    Settled(CanonicalContinuation),
+    /// This peer's answer cannot be used; another may do better.
+    Fault(String),
+    /// This peer's headers start before every retained cursor.
+    BeyondWindow,
+}
+
+/// Ask one peer where the saved cursor stands.
+async fn judge_peer<P: HeaderPeer + ?Sized>(
+    peer: &mut P,
+    rules: &PinRules,
+    locators: &[ScanCursor],
+    checkpoint_file: &Path,
+) -> ZeckResult<PeerVerdict> {
+    let saved = locators[0];
+    let hashes: Vec<_> = locators.iter().map(|c| c.last_block_hash).collect();
+    let headers = match peer.validated_headers(&hashes).await {
+        Ok(headers) => headers,
+        Err(failure) => return Ok(PeerVerdict::Fault(failure)),
+    };
+    if headers.is_empty() {
+        if !crate::p2p::wire::empty_reply_is_chain_tip(
+            first_scan_height(Some(saved)),
+            rules.floor,
+            peer.peer_height(),
+        ) {
+            return Ok(PeerVerdict::Fault(format!(
+                "peer reported no headers after height {} despite a known tip of {}",
+                saved.last_height,
+                rules.floor.max(peer.peer_height())
+            )));
+        }
+        // "Nothing after it" is only believable for a block the pins accept,
+        // and only once a header fetched from a retained predecessor shows
+        // the saved block is on this peer's active chain.
+        if !rules.agrees(saved.last_height, saved.last_block_hash) {
+            return Ok(PeerVerdict::Fault(format!(
+                "peer called the saved cursor the tip, but it disagrees with a pinned block at height {}",
+                saved.last_height
+            )));
+        }
+        // Local, not the peer's fault: no other peer can supply history this
+        // checkpoint does not retain.
+        let Some(parent) = locators.get(1).copied() else {
+            return Err(ZeckError::ScanNotReady(format!(
+                "the peer returned no headers after the saved Sprout cursor at {}, and no retained predecessor can prove that cursor is on the current chain. Argos will not use its spent-note evidence; keep the original wallet or key and start a safe full rescan if needed.",
+                checkpoint_file.display()
+            )));
+        };
+        let probe = match peer.validated_headers(&[parent.last_block_hash]).await {
+            Ok(probe) => probe,
+            Err(failure) => return Ok(PeerVerdict::Fault(failure)),
+        };
+        let Some(first) = probe.first() else {
+            return Ok(PeerVerdict::Fault(
+                "peer supplied no validated header overlapping the saved Sprout cursor".to_owned(),
+            ));
+        };
+        if first.prev_hash != parent.last_block_hash {
+            return Ok(
+                if locators
+                    .iter()
+                    .any(|c| c.last_block_hash == first.prev_hash)
+                {
+                    PeerVerdict::Fault(
+                        "peer answered the tip probe from a block other than the one asked for"
+                            .to_owned(),
+                    )
+                } else {
+                    PeerVerdict::BeyondWindow
+                },
+            );
+        }
+        if !pins_agree(rules, parent, &probe) {
+            return Ok(PeerVerdict::Fault(
+                "peer returned a header that disagrees with a pinned block".to_owned(),
+            ));
+        }
+        return Ok(PeerVerdict::Settled(
+            if first.hash == saved.last_block_hash {
+                // The saved block is on the active chain. Anything after it in
+                // the probe arrived since the empty reply: an honest race, and
+                // the scan simply has more to read.
+                CanonicalContinuation::Current {
+                    chain_has_more: probe.len() > 1,
+                }
+            } else {
+                CanonicalContinuation::CommonAncestor(parent)
+            },
+        ));
+    }
+    // An answer from before every retained hash is a deep reorg, or a peer
+    // that does not know this branch. No height can be assigned to it.
+    let Some(ancestor) = locators
+        .iter()
+        .find(|c| c.last_block_hash == headers[0].prev_hash)
+        .copied()
+    else {
+        return Ok(PeerVerdict::BeyondWindow);
+    };
+    if !pins_agree(rules, ancestor, &headers) {
+        return Ok(PeerVerdict::Fault(
+            "peer returned a header that disagrees with a pinned block".to_owned(),
+        ));
+    }
+    Ok(PeerVerdict::Settled(if ancestor == saved {
+        CanonicalContinuation::Current {
+            chain_has_more: true,
+        }
+    } else {
+        CanonicalContinuation::CommonAncestor(ancestor)
+    }))
+}
+
+/// `ancestor` and every header after it agree with the pins at their heights.
+fn pins_agree(
+    rules: &PinRules,
+    ancestor: ScanCursor,
+    headers: &[crate::p2p::wire::BlockHeader],
+) -> bool {
+    rules.agrees(ancestor.last_height, ancestor.last_block_hash)
+        && headers.iter().enumerate().all(|(offset, header)| {
+            u32::try_from(offset)
+                .ok()
+                .and_then(|offset| ancestor.last_height.checked_add(1)?.checked_add(offset))
+                .is_some_and(|height| rules.agrees(height, header.hash))
+        })
+}
+
+/// Where the saved cursor stands on the live chain, asking peer after peer
+/// until one gives a usable answer. A single peer cannot end verification
+/// with a "rescan" verdict: an unusable answer only rotates to the next
+/// peer, and the fork is declared deeper than the retained window only when
+/// [`BEYOND_WINDOW_QUORUM`] distinct peers independently say so.
+async fn verify_continuation<P: HeaderPeer + ?Sized>(
+    peer: &mut P,
+    rules: &PinRules,
+    locators: &[ScanCursor],
+    checkpoint_file: &Path,
+) -> ZeckResult<CanonicalContinuation> {
+    let mut failures = 0u32;
+    let mut beyond: Vec<String> = Vec::new();
+    loop {
+        let failure = match judge_peer(peer, rules, locators, checkpoint_file).await? {
+            PeerVerdict::Settled(continuation) => return Ok(continuation),
+            PeerVerdict::Fault(failure) => failure,
+            PeerVerdict::BeyondWindow => {
+                let id = peer.peer_id();
+                if !beyond.contains(&id) {
+                    beyond.push(id);
+                }
+                if beyond.len() >= BEYOND_WINDOW_QUORUM {
+                    return Err(beyond_retained_window(locators, checkpoint_file));
+                }
+                "peer served headers that start before every retained Sprout cursor".to_owned()
+            }
+        };
+        failures += 1;
+        if failures > MAX_EMPTY_REPLIES {
+            return Err(ZeckError::Broadcast(format!(
+                "{failures} attempts to verify the saved Sprout cursor failed; \
+                 the most recent: {failure}. The checkpoint was left unchanged."
+            )));
+        }
+        peer.next_peer().await.map_err(|err| {
+            ZeckError::Broadcast(format!(
+                "verifying the saved Sprout cursor failed ({failure}), and no other \
+                 peer could be reached ({err}). The checkpoint was left unchanged."
+            ))
+        })?;
     }
 }
 
@@ -1711,14 +1851,14 @@ fn consume_page(
              progress is saved and the next run will reconcile its cursor."
         )));
     }
+    let pins = PinRules {
+        network,
+        floor: 0,
+        tip_anchor,
+    };
     let mut consumed = 0;
     for (hash, joinsplits) in &page.blocks {
-        if crate::p2p::wire::checkpoint_at(network, *height)
-            .is_some_and(|expected| *hash != expected)
-            || tip_anchor
-                .filter(|anchor| anchor.height == *height)
-                .is_some_and(|anchor| *hash != anchor.hash)
-        {
+        if !pins.agrees(*height, *hash) {
             return Err(ZeckError::Broadcast(format!(
                 "the chain this peer served does not match Zcash at height {height}. \
                  It is serving a different or fabricated chain, so the scan stops \
@@ -2397,6 +2537,266 @@ mod tests {
         }
     }
 
+    /// A scripted sequence of peers for [`verify_continuation`]. Headers are
+    /// handed over as already validated, which is what the network
+    /// implementation guarantees before the judgment runs.
+    struct ScriptedPeer {
+        id: &'static str,
+        height: u32,
+        replies: std::collections::VecDeque<Result<Vec<crate::p2p::wire::BlockHeader>, String>>,
+    }
+
+    struct ScriptedPeers {
+        current: ScriptedPeer,
+        next: std::collections::VecDeque<ScriptedPeer>,
+        asked: Vec<Vec<[u8; 32]>>,
+        rotations: usize,
+    }
+
+    impl ScriptedPeers {
+        fn new(mut peers: Vec<ScriptedPeer>) -> Self {
+            let current = peers.remove(0);
+            Self {
+                current,
+                next: peers.into(),
+                asked: Vec::new(),
+                rotations: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HeaderPeer for ScriptedPeers {
+        fn peer_height(&self) -> u32 {
+            self.current.height
+        }
+
+        fn peer_id(&self) -> String {
+            self.current.id.to_owned()
+        }
+
+        async fn validated_headers(
+            &mut self,
+            locators: &[[u8; 32]],
+        ) -> Result<Vec<crate::p2p::wire::BlockHeader>, String> {
+            self.asked.push(locators.to_vec());
+            self.current
+                .replies
+                .pop_front()
+                .unwrap_or_else(|| Err("script exhausted".to_owned()))
+        }
+
+        async fn next_peer(&mut self) -> ZeckResult<()> {
+            self.rotations += 1;
+            self.current = self
+                .next
+                .pop_front()
+                .ok_or_else(|| ZeckError::Broadcast("no more scripted peers".to_owned()))?;
+            Ok(())
+        }
+    }
+
+    fn scripted(
+        id: &'static str,
+        replies: Vec<Result<Vec<crate::p2p::wire::BlockHeader>, String>>,
+    ) -> ScriptedPeer {
+        ScriptedPeer {
+            id,
+            height: 0,
+            replies: replies.into(),
+        }
+    }
+
+    fn hdr(hash: u8, prev: u8) -> crate::p2p::wire::BlockHeader {
+        crate::p2p::wire::BlockHeader {
+            hash: [hash; 32],
+            prev_hash: [prev; 32],
+            raw: Vec::new(),
+        }
+    }
+
+    /// Newest first, as `rollback_locators` returns them: blocks 3, 2, 1
+    /// with hashes equal to their heights.
+    fn three_locators() -> Vec<ScanCursor> {
+        (1..=3u8)
+            .rev()
+            .map(|h| ScanCursor {
+                last_block_hash: [h; 32],
+                last_height: u32::from(h),
+            })
+            .collect()
+    }
+
+    fn regtest_rules() -> PinRules {
+        PinRules {
+            network: P2pNetwork::Regtest,
+            floor: 0,
+            tip_anchor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_hostile_peer_then_an_honest_one_verifies_the_cursor() {
+        let mut peers = ScriptedPeers::new(vec![
+            // Headers that start before every retained cursor.
+            scripted("hostile", vec![Ok(vec![hdr(0x99, 0x98)])]),
+            scripted("honest", vec![Ok(vec![hdr(4, 3)])]),
+        ]);
+        let outcome = verify_continuation(
+            &mut peers,
+            &regtest_rules(),
+            &three_locators(),
+            Path::new("scan.checkpoint"),
+        )
+        .await
+        .expect("one hostile peer must not end verification");
+        assert!(matches!(
+            outcome,
+            CanonicalContinuation::Current {
+                chain_has_more: true
+            }
+        ));
+        assert_eq!(peers.rotations, 1);
+    }
+
+    #[tokio::test]
+    async fn beyond_the_window_needs_independent_peers_to_agree() {
+        let mut peers = ScriptedPeers::new(vec![
+            scripted("a", vec![Ok(vec![hdr(0x99, 0x98)])]),
+            scripted("b", vec![Ok(vec![hdr(0x99, 0x98)])]),
+            scripted("c", vec![Ok(vec![hdr(0x99, 0x98)])]),
+        ]);
+        let err = verify_continuation(
+            &mut peers,
+            &regtest_rules(),
+            &three_locators(),
+            Path::new("scan.checkpoint"),
+        )
+        .await
+        .expect_err("three independent peers agree");
+        assert!(err.to_string().contains("safe full rescan"), "{err}");
+        assert_eq!(peers.rotations, BEYOND_WINDOW_QUORUM - 1);
+    }
+
+    #[tokio::test]
+    async fn one_peer_repeating_beyond_the_window_is_not_agreement() {
+        let repeats = (0..=MAX_EMPTY_REPLIES)
+            .map(|_| scripted("same", vec![Ok(vec![hdr(0x99, 0x98)])]))
+            .collect();
+        let mut peers = ScriptedPeers::new(repeats);
+        let err = verify_continuation(
+            &mut peers,
+            &regtest_rules(),
+            &three_locators(),
+            Path::new("scan.checkpoint"),
+        )
+        .await
+        .expect_err("the budget runs out");
+        let text = err.to_string();
+        assert!(!text.contains("safe full rescan"), "{text}");
+        assert!(text.contains("left unchanged"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_cannot_back_its_empty_tip_reply_is_rotated_away() {
+        let mut peers = ScriptedPeers::new(vec![
+            // Claims the saved block is the tip, then cannot show it.
+            scripted("hostile", vec![Ok(Vec::new()), Ok(Vec::new())]),
+            scripted("honest", vec![Ok(vec![hdr(4, 3)])]),
+        ]);
+        let outcome = verify_continuation(
+            &mut peers,
+            &regtest_rules(),
+            &three_locators(),
+            Path::new("scan.checkpoint"),
+        )
+        .await
+        .expect("an unbacked tip reply is the peer's fault");
+        assert!(matches!(
+            outcome,
+            CanonicalContinuation::Current {
+                chain_has_more: true
+            }
+        ));
+        assert_eq!(peers.rotations, 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_contradicting_a_pin_is_rotated_away() {
+        let rules = PinRules {
+            tip_anchor: Some(TipAnchor {
+                height: 3,
+                hash: [0x77; 32],
+            }),
+            ..regtest_rules()
+        };
+        let mut peers = ScriptedPeers::new(vec![
+            scripted("hostile", vec![Ok(Vec::new())]),
+            scripted("honest", vec![Ok(vec![hdr(0x77, 2)])]),
+        ]);
+        let outcome = verify_continuation(
+            &mut peers,
+            &rules,
+            &three_locators(),
+            Path::new("scan.checkpoint"),
+        )
+        .await
+        .expect("the pin decides against the peer, not the checkpoint");
+        assert!(matches!(
+            outcome,
+            CanonicalContinuation::CommonAncestor(ScanCursor { last_height: 2, .. })
+        ));
+        assert_eq!(peers.rotations, 1);
+    }
+
+    /// The honest race: the tip reply was empty, a block arrived, and the
+    /// probe from the parent now shows the saved block and its child.
+    #[tokio::test]
+    async fn a_block_arriving_between_tip_and_probe_is_not_a_contradiction() {
+        let mut peers = ScriptedPeers::new(vec![scripted(
+            "honest",
+            vec![Ok(Vec::new()), Ok(vec![hdr(3, 2), hdr(4, 3)])],
+        )]);
+        let outcome = verify_continuation(
+            &mut peers,
+            &regtest_rules(),
+            &three_locators(),
+            Path::new("scan.checkpoint"),
+        )
+        .await
+        .expect("an honest race verifies");
+        assert!(matches!(
+            outcome,
+            CanonicalContinuation::Current {
+                chain_has_more: true
+            }
+        ));
+        assert_eq!(peers.rotations, 0);
+        assert_eq!(peers.asked[1], vec![[2; 32]], "probed from the parent");
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_backed_by_the_probe_is_the_tip() {
+        let mut peers = ScriptedPeers::new(vec![scripted(
+            "honest",
+            vec![Ok(Vec::new()), Ok(vec![hdr(3, 2)])],
+        )]);
+        let outcome = verify_continuation(
+            &mut peers,
+            &regtest_rules(),
+            &three_locators(),
+            Path::new("scan.checkpoint"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            CanonicalContinuation::Current {
+                chain_has_more: false
+            }
+        ));
+    }
+
     struct ConcurrentWriteVerifier {
         path: PathBuf,
         replacement: SproutScanner,
@@ -2955,8 +3355,7 @@ mod tests {
         let err = verifier
             .continuation(&[saved])
             .await
-            .err()
-            .expect("matching a pin still needs positive chain evidence");
+            .expect_err("matching a pin still needs positive chain evidence");
         assert!(err.to_string().contains("not use its spent-note evidence"));
     }
 
@@ -2983,8 +3382,7 @@ mod tests {
         let err = verifier
             .continuation(&[saved])
             .await
-            .err()
-            .expect("the anchor contradicts the saved block at its height");
+            .expect_err("the anchor contradicts the saved block at its height");
         assert!(err.to_string().contains("pinned block"));
     }
 
