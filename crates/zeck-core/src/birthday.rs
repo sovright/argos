@@ -263,8 +263,10 @@ const EXTRAPOLATION_BLOCK_SECONDS: i64 = 77;
 /// Subtracted from a creation time before it is converted. Covers a wrong
 /// clock on the machine that created the key, uneven block production
 /// between anchors, and the mining delay before a first payment confirms.
-/// Two weeks of blocks is a few minutes of extra scanning.
-const CREATION_TIME_MARGIN_SECS: i64 = 14 * DAY_SECONDS;
+/// Four weeks: with nothing sampled between the anchors, the interpolation
+/// alone can only be trusted to within about two, and missing a note costs
+/// far more than four weeks of blocks of extra trial decryption.
+const CREATION_TIME_MARGIN_SECS: i64 = 28 * DAY_SECONDS;
 
 /// Seconds since the Unix epoch on this computer's clock.
 ///
@@ -278,7 +280,7 @@ pub fn unix_time_now() -> i64 {
 }
 
 /// The highest mainnet height that is certainly no later than the chain at
-/// `unix_time`, less a two-week margin. Clamped to at least 1.
+/// `unix_time`, less a four-week margin. Clamped to at least 1.
 ///
 /// Interpolates between [`MAINNET_HEIGHT_ANCHORS`] and extrapolates past the
 /// last at [`EXTRAPOLATION_BLOCK_SECONDS`], rounding down throughout. Pure;
@@ -1620,7 +1622,8 @@ mod tests {
             );
             // Not so conservative as to be useless. The 77 s extrapolation
             // falls about 2.6% further behind each year past NU6 (about 29
-            // days by late 2026), so this allows 60 days.
+            // days by late 2026) on top of the 28-day margin and the anchors'
+            // extra day, so this allows 60 days.
             let sixty_days_of_blocks = 60 * DAY_SECONDS as u32 / 75;
             assert!(
                 height.saturating_sub(bound) <= sixty_days_of_blocks,
@@ -1650,11 +1653,17 @@ mod tests {
     }
 
     /// The two choices that keep the bound below the chain: a margin of at
-    /// least a week, and an extrapolation slower than the 75 s target,
+    /// least four weeks, and an extrapolation slower than the 75 s target,
     /// because the chain has run about 0.5% slow since Blossom.
+    ///
+    /// Four weeks, not two (Kristi's #4 on #260): before Canopy the bound
+    /// sat only about 15 days of blocks below the true height, so safety
+    /// rested on the margin alone, and the anchor times come from an
+    /// explorer with nothing sampled between the 17 observed points. Two more
+    /// weeks of trial decryption is cheap next to a missed note.
     #[test]
     fn the_margin_and_extrapolation_err_early() {
-        const { assert!(CREATION_TIME_MARGIN_SECS >= 7 * DAY_SECONDS) };
+        const { assert!(CREATION_TIME_MARGIN_SECS >= 28 * DAY_SECONDS) };
         const { assert!(EXTRAPOLATION_BLOCK_SECONDS > POST_BLOSSOM_BLOCK_SECONDS) };
         for (height, time) in MAINNET_HEIGHT_ANCHORS {
             let at_anchor = height_at_or_before_time(ZeckNetwork::Mainnet, time).unwrap();
