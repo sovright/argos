@@ -198,11 +198,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Hand-built blocks for tests here and in the scan runner: a valid
+/// transaction list under a header whose `hashMerkleRoot` commits to it.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::{HEADER_FIXED_LEN, MERKLE_ROOT_RANGE};
+    use crate::p2p::wire::{sha256d, write_compact_size};
 
-    fn legacy_test_transaction(tag: u8) -> Vec<u8> {
+    /// A minimal Sprout v2 coinbase-shaped transaction, distinct per `tag`.
+    pub(crate) fn legacy_test_transaction(tag: u8) -> Vec<u8> {
         let mut tx = Vec::new();
         tx.extend_from_slice(&2u32.to_le_bytes()); // Sprout v2
         tx.push(1); // one input
@@ -219,7 +223,9 @@ mod tests {
         tx
     }
 
-    fn reference_merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
+    /// The Bitcoin-style Merkle root, written independently of the
+    /// production code (no mutation check), for building headers.
+    pub(crate) fn reference_merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
         let mut level = txids.to_vec();
         if level.is_empty() {
             return [0; 32];
@@ -237,17 +243,25 @@ mod tests {
         level[0]
     }
 
-    fn test_block(transactions: &[Vec<u8>]) -> Vec<u8> {
+    /// A block with an empty Equihash solution whose header commits to
+    /// exactly `transactions`.
+    pub(crate) fn test_block(transactions: &[Vec<u8>]) -> Vec<u8> {
         let txids: Vec<[u8; 32]> = transactions.iter().map(|tx| sha256d(tx)).collect();
         let mut block = vec![0u8; HEADER_FIXED_LEN];
-        block[36..68].copy_from_slice(&reference_merkle_root(&txids));
+        block[MERKLE_ROOT_RANGE].copy_from_slice(&reference_merkle_root(&txids));
         block.push(0); // empty Equihash solution
-        super::super::wire::write_compact_size(&mut block, transactions.len() as u64);
+        write_compact_size(&mut block, transactions.len() as u64);
         for tx in transactions {
             block.extend_from_slice(tx);
         }
         block
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{legacy_test_transaction, reference_merkle_root, test_block};
+    use super::*;
 
     fn decode_hex(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);
@@ -356,11 +370,11 @@ mod tests {
         assert_ne!(zip244_display, sha256d_display);
 
         let mut block = test_block(&[coinbase]);
-        block[36..68].copy_from_slice(&zip244_display.iter().rev().copied().collect::<Vec<_>>());
+        block[MERKLE_ROOT_RANGE].copy_from_slice(&zip244_display.iter().rev().copied().collect::<Vec<_>>());
         let result = joinsplits_in_block(&block, BranchId::Nu5);
         assert!(result.is_ok(), "v5 coinbase should parse: {result:?}");
 
-        block[36..68].copy_from_slice(&sha256d_display.iter().rev().copied().collect::<Vec<_>>());
+        block[MERKLE_ROOT_RANGE].copy_from_slice(&sha256d_display.iter().rev().copied().collect::<Vec<_>>());
         assert!(matches!(
             joinsplits_in_block(&block, BranchId::Nu5),
             Err(BlockError::MerkleRootMismatch)
