@@ -57,7 +57,7 @@ use crate::{
     models::{
         ProposedTx, ProposedTxKind, ReviewedSweepProposal, RuntimeScanConfig, ScanConfig,
         ScanHandle, ScanPhase, ScanProgress, SkippedSweepAccount, SweepOutcome, SweepProposal,
-        SweepProposalId, SweepRequest, TxBroadcastResult,
+        SweepProposalId, SweepRequest, TxBroadcastResult, TxLifecycleState,
     },
     scan::{
         refresh_scan_progress, run_recovery_scan, run_wallet_sync_with_retry,
@@ -2415,7 +2415,8 @@ async fn broadcast_transactions(
         results.push(TxBroadcastResult {
             source_account: account_index,
             txid: Some(txid.to_string()),
-            status: "pending".to_owned(),
+            status: TxLifecycleState::Pending,
+            fee_zatoshis: 0,
             detail: format!("{label} transaction broadcast; awaiting confirmation"),
             confirmed_height: None,
         });
@@ -2443,7 +2444,11 @@ async fn broadcast_transactions(
             detail
         };
         let entry = &mut results[result_index];
-        entry.status = status;
+        entry.status = if status == "confirmed" {
+            TxLifecycleState::Mined
+        } else {
+            TxLifecycleState::Pending
+        };
         entry.detail = detail;
         entry.confirmed_height = confirmed_height;
     }
@@ -2730,7 +2735,7 @@ fn last_account_broadcast_failed(results: &[TxBroadcastResult], account_index: u
         .iter()
         .rev()
         .find(|result| result.source_account == account_index)
-        .map(|result| result.status == "failed")
+        .map(|result| result.status == TxLifecycleState::Rejected)
         .unwrap_or(false)
 }
 
@@ -2898,7 +2903,8 @@ fn assemble_imported_sweep_outcome_for_legs(
                 .copied()
                 .unwrap_or(index as u32),
             txid: Some(txid.clone()),
-            status: "broadcast".to_owned(),
+            status: TxLifecycleState::Pending,
+            fee_zatoshis: 0,
             detail: "Sapling notes from the imported wallet".to_owned(),
             confirmed_height: None,
         });
@@ -2919,7 +2925,8 @@ fn assemble_imported_sweep_outcome_for_legs(
         Some(txid) => transactions.push(TxBroadcastResult {
             source_account: outcome.transparent_display_index.unwrap_or(0),
             txid: Some(txid),
-            status: "broadcast".to_owned(),
+            status: TxLifecycleState::Pending,
+            fee_zatoshis: outcome.transparent_fee_zatoshis,
             detail: format!(
                 "standalone transparent UTXOs sent directly to the destination Sapling receiver ({} zatoshis, {} fee)",
                 outcome.transparent_zatoshis, outcome.transparent_fee_zatoshis
@@ -3794,7 +3801,8 @@ mod tests {
         crate::models::TxBroadcastResult {
             source_account: account,
             txid: Some(format!("tx-{account}")),
-            status: "confirmed".to_owned(),
+            status: crate::models::TxLifecycleState::Mined,
+            fee_zatoshis: 0,
             detail: "mined".to_owned(),
             confirmed_height: Some(1_000_000),
         }
@@ -3966,7 +3974,8 @@ mod tests {
             transactions: vec![crate::models::TxBroadcastResult {
                 source_account: 7,
                 txid: Some("imported-tx".into()),
-                status: "broadcast".into(),
+                status: crate::models::TxLifecycleState::Pending,
+                fee_zatoshis: 0,
                 detail: "imported Sapling".into(),
                 confirmed_height: None,
             }],

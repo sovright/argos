@@ -3,6 +3,7 @@ pub mod address_match_recovery;
 pub mod address_search;
 pub mod address_search_shielded;
 pub mod birthday;
+pub mod broadcast;
 pub mod derivation;
 pub mod donation;
 pub mod error;

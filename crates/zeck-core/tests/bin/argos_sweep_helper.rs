@@ -177,7 +177,7 @@ enum HelperEvent<'a> {
     Broadcast {
         source_account: u32,
         txid: Option<&'a str>,
-        status: &'a str,
+        status: &'a argos_core::models::TxLifecycleState,
         detail: &'a str,
         confirmed_height: Option<u32>,
     },

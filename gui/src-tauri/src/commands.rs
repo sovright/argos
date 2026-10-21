@@ -900,7 +900,7 @@ pub async fn execute_sweep(
 
     for result in &outcome.transactions {
         let _ = app.emit("sweep-tx-broadcast", result);
-        if result.status == "confirmed" {
+        if result.status == argos_core::models::TxLifecycleState::Mined {
             let _ = app.emit("sweep-tx-confirmed", result);
         }
     }

@@ -160,6 +160,10 @@ impl RecoveryWorkspace {
     pub fn wallet_db_path(&self) -> &Path {
         &self.wallet_db_path
     }
+
+    pub fn broadcast_log_path(&self) -> PathBuf {
+        self.root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME)
+    }
 }
 
 /// The consensus parameter set Argos evaluates heights against.
@@ -414,6 +418,63 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     // during the write.
     set_private_file_permissions(path)?;
 
+    Ok(())
+}
+
+/// Append one complete JSONL event and make it durable before reporting success.
+/// The caller provides JSON bytes without a trailing newline.
+pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.append(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (mut file, created) = match options.open(path) {
+        Ok(file) => (file, true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|err| {
+                    ZeckError::Storage(format!("opening {} for append: {err}", path.display()))
+                })?;
+            (file, false)
+        }
+        Err(err) => {
+            return Err(ZeckError::Storage(format!(
+                "creating {}: {err}",
+                path.display()
+            )))
+        }
+    };
+    set_private_file_permissions(path)?;
+    file.write_all(bytes)
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+        .map_err(|err| {
+            ZeckError::Storage(format!("appending and syncing {}: {err}", path.display()))
+        })?;
+    if created {
+        let parent = path.parent().ok_or_else(|| {
+            ZeckError::Storage(format!(
+                "broadcast log {} has no parent directory",
+                path.display()
+            ))
+        })?;
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "syncing broadcast log parent {}: {err}",
+                    parent.display()
+                ))
+            })?;
+    }
     Ok(())
 }
 

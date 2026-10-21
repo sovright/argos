@@ -2725,8 +2725,12 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
     // here at all.
     for tx in &outcome.transactions {
         assert!(
-            matches!(tx.status.as_str(), "confirmed" | "broadcast"),
-            "post-Ironwood sweep was not accepted by the node: {} — {}",
+            matches!(
+                tx.status,
+                argos_core::models::TxLifecycleState::Mined
+                    | argos_core::models::TxLifecycleState::Pending
+            ),
+            "post-Ironwood sweep was not accepted by the node: {:?} — {}",
             tx.status,
             tx.detail
         );
@@ -3336,8 +3340,12 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
         .collect();
     for tx in &outcome.transactions {
         assert!(
-            matches!(tx.status.as_str(), "confirmed" | "broadcast"),
-            "{}: {}",
+            matches!(
+                tx.status,
+                argos_core::models::TxLifecycleState::Mined
+                    | argos_core::models::TxLifecycleState::Pending
+            ),
+            "{:?}: {}",
             tx.status,
             tx.detail
         );
