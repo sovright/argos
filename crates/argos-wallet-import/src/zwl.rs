@@ -805,13 +805,13 @@ mod tests {
         vectors.extend_from_slice(&okey_stub());
         vectors.extend_from_slice(&cs(1));
         vectors.extend_from_slice(&zkey_hd(0x12));
+        let vectors_start = 8 + 8 + 1 + ENC_SEED_LEN + 1 + SEED_LEN;
+        let first_zkey_end = vectors_start + vectors.len();
         vectors.extend_from_slice(&cs(2));
-        let first_tkey_end =
-            8 + 8 + 1 + ENC_SEED_LEN + 1 + SEED_LEN + vectors.len() + tkey_hd(0x34).len();
+        let first_tkey_end = vectors_start + vectors.len() + tkey_hd(0x34).len();
         vectors.extend_from_slice(&tkey_hd(0x34));
         vectors.extend_from_slice(&tkey_hd(0x56));
         let bytes = wallet(25, &keys_body(22, false, &vectors));
-        let vectors_start = 8 + 8 + 1 + ENC_SEED_LEN + 1 + SEED_LEN;
         for cut in 8..bytes.len() {
             let keys = import_zwl(&bytes[..cut], None).unwrap();
             assert_ne!(
@@ -821,6 +821,10 @@ mod tests {
             );
             if cut >= vectors_start {
                 assert!(keys.diagnostics.iter().any(|d| matches!(d, ImportDiagnostic::ContainerDamage { location, .. } if location.starts_with(&format!("byte {cut} ")))), "missing coordinate at cut {cut}: {:?}", keys.diagnostics);
+            }
+            if cut >= first_zkey_end {
+                assert_eq!(keys.sapling.len(), 1, "first zkey lost at cut {cut}");
+                assert_eq!(keys.sapling[0].extsk.expose_secret(), &[0x12; EXTSK_LEN]);
             }
             if cut >= first_tkey_end {
                 assert_eq!(keys.transparent.len(), 1, "first tkey lost at cut {cut}");
