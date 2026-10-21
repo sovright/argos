@@ -89,6 +89,191 @@ fn argos(args: &[&str]) -> std::process::Output {
         .expect("argos binary should run")
 }
 
+fn temporary_wallet(tag: &str, bytes: &[u8]) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("argos-cli-{tag}-{}.dat", std::process::id()));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+// A no-funds ZWL wallet using the writer's versioned layout. The seed is
+// public test entropy; these records have no chain history.
+fn zwl_with_tkeys(entries: &[(u32, bool, Option<[u8; 32]>, &str)]) -> Vec<u8> {
+    let mut bytes = 25u64.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&22u64.to_le_bytes());
+    bytes.push(0); // wallet is not encrypted
+    bytes.extend_from_slice(&[0; 48]); // encrypted seed slot
+    bytes.push(0); // nonce
+    bytes.extend_from_slice(&[0; 32]); // plaintext seed
+    bytes.push(0); // Orchard keys
+    bytes.push(0); // Sapling keys
+    bytes.push(entries.len() as u8);
+    for (kind, locked, secret, address) in entries {
+        bytes.push(1); // tkey record version
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.push(u8::from(*locked));
+        match secret {
+            Some(secret) => {
+                bytes.push(1);
+                bytes.extend_from_slice(secret);
+            }
+            None => bytes.push(0),
+        }
+        bytes.extend_from_slice(&(address.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(address.as_bytes());
+        bytes.push(0); // HD index
+        if *locked {
+            bytes.push(1);
+            bytes.push(48);
+            bytes.extend_from_slice(&[0xcc; 48]);
+            bytes.push(1);
+            bytes.push(24);
+            bytes.extend_from_slice(&[0xdd; 24]);
+        } else {
+            bytes.extend_from_slice(&[0, 0]); // no ciphertext or nonce
+        }
+    }
+    bytes.push(0); // empty block history
+    bytes.extend_from_slice(&21u64.to_le_bytes()); // WalletTxns version
+    bytes.push(0); // no transactions
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.extend_from_slice(b"main");
+    bytes
+}
+
+#[test]
+fn inspect_wallet_reports_structural_damage_and_preserve_file() {
+    let mut bytes = std::fs::read(fixture("zwl-mainnet-empty.dat")).unwrap();
+    bytes.truncate(20);
+    let path = temporary_wallet("truncated-zwl", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.contains("Recovery coverage: Incomplete"), "{shown}");
+    assert!(shown.contains("wallet container is damaged"), "{shown}");
+    assert!(shown.contains("Keep the original wallet file"), "{shown}");
+
+    // A zcashd BDB whose metadata names pages absent from the file is
+    // unrecoverable as a whole, but still needs the same preserve warning.
+    let bdb = fixture("modern-plaintext-truncated.dat");
+    let out = argos(&["--wallet-file", bdb.to_str().unwrap(), "inspect-wallet"]);
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains("wallet file structure is unreadable"),
+        "{error}"
+    );
+    assert!(error.contains("Keep the original wallet file"), "{error}");
+}
+
+#[test]
+fn inspect_wallet_distinguishes_locked_hd_and_standalone_keys() {
+    let hd_only = zwl_with_tkeys(&[(0, true, None, "t1LockedHd")]);
+    let hd_path = temporary_wallet("locked-hd-only", &hd_only);
+    let hd_out = argos(&["--wallet-file", hd_path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        hd_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hd_out.stderr)
+    );
+    let hd_shown = String::from_utf8_lossy(&hd_out.stdout);
+    assert!(
+        hd_shown.contains("recover the wallet seed to recreate it"),
+        "{hd_shown}"
+    );
+
+    let bytes = zwl_with_tkeys(&[
+        (0, true, None, "t1LockedHd"),
+        (1, true, None, "t1LockedStandalone"),
+    ]);
+    let path = temporary_wallet("locked-provenance", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        shown.contains("recover the wallet seed to recreate it"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("cannot be recreated from the seed"),
+        "{shown}"
+    );
+    assert!(shown.contains("Keep the original wallet file"), "{shown}");
+}
+
+#[test]
+fn inspect_wallet_redacts_identifier_mismatch() {
+    let bytes = zwl_with_tkeys(&[(0, false, Some([1; 32]), "t1SentinelWrongAddress")]);
+    let path = temporary_wallet("identifier-mismatch", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        shown.contains("stored public identifier does not match"),
+        "{shown}"
+    );
+    assert!(shown.contains("mismatched record was not used"), "{shown}");
+    assert!(
+        !shown.contains("t1SentinelWrongAddress") && !shown.contains("01010101"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn damaged_encryption_metadata_does_not_prompt_for_passphrase() {
+    use argos_core::argos_wallet_import::{bdb, zcashd::records::parse_record_key};
+    let mut bytes = std::fs::read(fixture("modern-encrypted.dat")).unwrap();
+    let value = bdb::walk(&bytes)
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|(key, _)| parse_record_key(key).is_some_and(|record| record.record_type == "mkey"))
+        .unwrap()
+        .1;
+    let offset = bytes
+        .windows(value.len())
+        .position(|window| window == value)
+        .unwrap();
+    bytes[offset] = 0xfc;
+    let path = temporary_wallet("damaged-mkey", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(!out.status.success());
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        shown.contains("wallet encryption metadata is damaged"),
+        "{shown}"
+    );
+    assert!(shown.contains("Keep the original wallet file"), "{shown}");
+    assert!(!shown.contains("Enter the wallet passphrase"), "{shown}");
+}
+
+#[test]
+fn wallet_network_mismatch_names_both_networks() {
+    let path = fixture("zwl-testnet-empty.dat");
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(!out.status.success());
+    let shown = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        shown.contains("selected mainnet") && shown.contains("embedded testnet"),
+        "{shown}"
+    );
+}
+
 #[test]
 fn inspect_wallet_reports_a_zcashd_wallets_contents_without_a_network() {
     let path = fixture(SPROUT_PLAINTEXT);

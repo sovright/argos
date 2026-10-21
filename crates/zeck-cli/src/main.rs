@@ -1430,13 +1430,15 @@ fn print_wallet_inspection(
     // material are skipped by design.
     match keys.coverage_notice() {
         None => println!("Every record that can hold a key was read."),
-        Some(notice) => {
-            println!("Recovery coverage: {notice}");
-            println!();
-            println!("{} record(s) could not be read:", keys.diagnostics.len());
-            for diagnostic in &keys.diagnostics {
-                println!("  {diagnostic}");
-            }
+        Some(notice) => println!("Recovery coverage: {notice}"),
+    }
+    if !keys.diagnostics.is_empty() {
+        println!();
+        println!("{} import diagnostic(s):", keys.diagnostics.len());
+        for diagnostic in &keys.diagnostics {
+            println!("  {diagnostic}");
+        }
+        if keys.coverage().may_hide_funds() {
             println!();
             println!("Keep the original wallet file. Anything listed above exists only there.");
         }

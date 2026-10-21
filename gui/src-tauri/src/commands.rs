@@ -566,7 +566,16 @@ pub async fn inspect_wallet_file(
             Err(err) => return Err(err.to_string()),
         };
 
-    Ok(WalletFileSummary {
+    Ok(wallet_summary_from_keys(path, keys, sprout))
+}
+
+/// Keep IPC coverage and diagnostics bound to the same parsed key set.
+fn wallet_summary_from_keys(
+    path: String,
+    keys: argos_core::argos_wallet_import::ImportedKeys,
+    sprout: SproutSummary,
+) -> WalletFileSummary {
+    WalletFileSummary {
         path,
         transparent_keys: keys.transparent.len(),
         sapling_keys: keys.sapling.len(),
@@ -587,7 +596,7 @@ pub async fn inspect_wallet_file(
         coverage_notice: keys.coverage_notice(),
         coverage_may_hide_funds: keys.coverage().may_hide_funds(),
         needs_passphrase: false,
-    })
+    }
 }
 
 // No `Debug`/`Serialize`/`Clone`, for the same reason as `ScanConfigInput`:
@@ -2383,6 +2392,161 @@ mod tests {
             crate::reviewed_intent::SproutScanStatus::Failed
         ));
         assert!(store.reserve_checkpoint(&material.checkpoint).is_ok());
+    }
+
+    fn summary_with_diagnostics(
+        diagnostics: Vec<argos_core::argos_wallet_import::ImportDiagnostic>,
+        has_mnemonic: bool,
+    ) -> serde_json::Value {
+        use argos_core::argos_wallet_import::ImportedKeys;
+        use secrecy::SecretString;
+
+        let mut keys = ImportedKeys {
+            diagnostics,
+            ..Default::default()
+        };
+        if has_mnemonic {
+            keys.mnemonic = Some(SecretString::new("public test seed".to_owned()));
+        }
+        let sprout = SproutSummary {
+            sprout_keys: 0,
+            sprout_addresses: Vec::new(),
+            sprout_spendable_notes: 0,
+            sprout_spendable_zatoshis: 0,
+            sprout_issues: Vec::new(),
+            sprout_scan_warning: Vec::new(),
+            sprout_accounting: Vec::new(),
+            sprout_nothing_left: false,
+            sprout_spent_status: String::new(),
+            sprout_history_read: false,
+        };
+        serde_json::to_value(wallet_summary_from_keys(
+            "test.dat".to_owned(),
+            keys,
+            sprout,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn wallet_summary_marks_container_damage_as_fund_hiding() {
+        use argos_core::argos_wallet_import::ImportDiagnostic;
+        let summary = summary_with_diagnostics(
+            vec![ImportDiagnostic::ContainerDamage {
+                format: "ZWL",
+                location: "byte 42".to_owned(),
+                reason: "truncated field".to_owned(),
+            }],
+            false,
+        );
+        assert_eq!(summary["coverage_may_hide_funds"], true);
+        assert!(summary["coverage_notice"]
+            .as_str()
+            .unwrap()
+            .contains("Incomplete"));
+        assert!(summary["diagnostics"][0]
+            .as_str()
+            .unwrap()
+            .contains("wallet container is damaged"));
+        assert!(!summary.to_string().contains("public test seed"));
+    }
+
+    #[test]
+    fn unwalkable_bdb_error_preserves_original_file() {
+        let bytes = include_bytes!(
+            "../../../crates/argos-wallet-import/tests/fixtures/modern-plaintext-truncated.dat"
+        );
+        let err = import_gui_wallet_then(bytes, None, argos_core::ZeckNetwork::Mainnet, |_| ())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("wallet file structure is unreadable"), "{err}");
+        assert!(err.contains("Keep the original wallet file"), "{err}");
+    }
+
+    #[test]
+    fn wallet_summary_keeps_locked_key_guidance() {
+        use argos_core::argos_wallet_import::{ImportDiagnostic, Provenance};
+        let summary = summary_with_diagnostics(
+            vec![
+                ImportDiagnostic::LockedKey {
+                    record_type: "zwl-tkey".to_owned(),
+                    provenance: Provenance::HdDerived,
+                },
+                ImportDiagnostic::LockedKey {
+                    record_type: "zwl-tkey".to_owned(),
+                    provenance: Provenance::Standalone,
+                },
+            ],
+            true,
+        );
+        let diagnostics = summary["diagnostics"].as_array().unwrap();
+        assert!(diagnostics[0]
+            .as_str()
+            .unwrap()
+            .contains("recover the wallet seed to recreate it"));
+        assert!(diagnostics[1]
+            .as_str()
+            .unwrap()
+            .contains("cannot be recreated from the seed"));
+        assert_eq!(summary["coverage_may_hide_funds"], true);
+    }
+
+    #[test]
+    fn wallet_summary_redacts_identifier_mismatch() {
+        use argos_core::argos_wallet_import::ImportDiagnostic;
+        let summary = summary_with_diagnostics(
+            vec![ImportDiagnostic::PublicIdentifierMismatch {
+                record_type: "zwl-tkey".to_owned(),
+                identifier: "transparent address",
+            }],
+            false,
+        );
+        let serialized = summary.to_string();
+        assert!(
+            serialized.contains("mismatched record was not used"),
+            "{serialized}"
+        );
+        assert!(!serialized.contains("01010101") && !serialized.contains("t1SentinelWrongAddress"));
+        assert_eq!(summary["coverage_may_hide_funds"], true);
+    }
+
+    #[test]
+    fn damaged_mkey_is_not_reported_as_needing_passphrase() {
+        use argos_core::argos_wallet_import::{bdb, zcashd::records::parse_record_key};
+        let mut bytes = include_bytes!(
+            "../../../crates/argos-wallet-import/tests/fixtures/modern-encrypted.dat"
+        )
+        .to_vec();
+        let value = bdb::walk(&bytes)
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|(key, _)| {
+                parse_record_key(key).is_some_and(|record| record.record_type == "mkey")
+            })
+            .unwrap()
+            .1;
+        let offset = bytes
+            .windows(value.len())
+            .position(|window| window == value)
+            .unwrap();
+        bytes[offset] = 0xfc;
+        let err = import_gui_wallet_then(&bytes, None, argos_core::ZeckNetwork::Mainnet, |keys| {
+            keys.total_keys()
+        })
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("wallet encryption metadata is damaged"),
+            "{err}"
+        );
+        assert!(err.contains("Keep the original wallet file"), "{err}");
+        assert_ne!(
+            err,
+            argos_core::argos_wallet_import::ImportError::WrongPassphrase.to_string()
+        );
     }
 
     fn spent_note() -> SpentSproutNote {

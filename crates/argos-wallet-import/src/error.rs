@@ -13,7 +13,7 @@ pub enum ImportError {
     #[error("incorrect passphrase for this wallet")]
     WrongPassphrase,
 
-    #[error("wallet file structure is unreadable: {0}")]
+    #[error("wallet file structure is unreadable: {0}. Recovery is incomplete. Keep the original wallet file.")]
     UnwalkableBtree(String),
 
     #[error("wallet encryption metadata is damaged. Keep the original wallet file.")]
