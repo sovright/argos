@@ -70,7 +70,8 @@ fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-const MAX_ACCOUNT_SCAN_COUNT: u32 = 500;
+use crate::wallet_file_import::MAX_ACCOUNT_SCAN_COUNT;
+
 /// Blocks downloaded and scanned per batch unless the caller chose otherwise.
 /// The in-memory block cache holds one batch, so this bounds its size.
 const SYNC_BATCH_SIZE: u32 = 1_000;
@@ -851,7 +852,7 @@ async fn run_recovery_scan_inner(
         target_accounts = new_target;
     }
 
-    run_standalone_leg(
+    finish_seeded_scan(
         StandaloneLeg {
             state: &state,
             workspace: &workspace,
@@ -871,9 +872,22 @@ async fn run_recovery_scan_inner(
             state: &state,
         },
     )
-    .await?;
+    .await
+}
 
-    finish_scan(&state, &workspace).await
+/// The tail of a seeded scan, once the HD gap is resolved: run the
+/// standalone-key leg (a no-op unless the source is Combined), then mark the
+/// scan complete. One function so a test can drive the exact path
+/// `run_recovery_scan_inner` takes with the chain replaced by a recorder:
+/// a Combined scan that completed without syncing its standalone keys would
+/// report their funds as absent.
+async fn finish_seeded_scan(
+    leg: StandaloneLeg<'_>,
+    chain: &mut impl StandaloneChain,
+) -> ZeckResult<()> {
+    let (state, workspace) = (leg.state, leg.workspace);
+    run_standalone_leg(leg, chain).await?;
+    finish_scan(state, workspace).await
 }
 
 /// The account range the HD scan walks: `(max_accounts, first batch)`.
@@ -892,6 +906,14 @@ fn hd_scan_bounds(
     let floor = keys
         .and_then(|keys| keys.highest_hd_index)
         .map_or(0, |index| {
+            if index >= MAX_ACCOUNT_SCAN_COUNT {
+                // The import grades this as a coverage gap
+                // (`note_hd_scan_limit`); say so in the scan log as well.
+                warn!(
+                    "wallet file records an HD key at account {index}; scanning only the \
+                     first {MAX_ACCOUNT_SCAN_COUNT} accounts"
+                );
+            }
             index.saturating_add(1).min(MAX_ACCOUNT_SCAN_COUNT)
         });
     let max_accounts = configured.max(floor);
@@ -4029,6 +4051,62 @@ mod tests {
                     .unwrap(),
                 BlockHeight::from_u32(600_000)
             );
+        }
+
+        /// Round-2 item A on #275: the scan's tail reaches the standalone
+        /// leg for a Combined source before it reports Complete. Driven
+        /// through `finish_seeded_scan`, the function
+        /// `run_recovery_scan_inner` calls once the HD gap is resolved.
+        #[tokio::test]
+        async fn a_combined_scan_syncs_its_standalone_keys_before_completing() {
+            use crate::key_source::ImportedKeySource;
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.birthday = 1_000_000;
+            config.key_source = Arc::new(ImportedKeySource::new(mixed_keys(Some(600_000))));
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize_from_source(config.network, config.key_source.as_ref())
+                .unwrap();
+            let hd = derive_accounts_from_seed(&seed, config.network, 1).unwrap();
+            let t_account =
+                legacy_transparent_account_key_from_seed(config.network, &seed).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts(
+                &workspace,
+                config.network,
+                &seed,
+                &test_birthday(),
+                &t_account,
+                &hd,
+                &state,
+            )
+            .await
+            .unwrap();
+            state.lock().await.workspace = Some(workspace.clone());
+
+            let mut chain = RecordingChain::default();
+            super::super::finish_seeded_scan(
+                super::super::StandaloneLeg {
+                    state: &state,
+                    workspace: &workspace,
+                    config: &config,
+                    seed: &seed,
+                    hd_birthday: &test_birthday(),
+                    hd_start: 1_000_000,
+                    sapling_floor: 419_201,
+                    hd_accounts: 1,
+                },
+                &mut chain,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(chain.synced_from, vec![600_000], "the standalone leg ran");
+            let guard = state.lock().await;
+            assert_eq!(guard.standalone_sapling_indices, vec![0]);
+            assert!(matches!(guard.progress.phase, crate::ScanPhase::Complete));
         }
 
         #[tokio::test]

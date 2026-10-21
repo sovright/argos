@@ -2085,8 +2085,19 @@ fn birthday_route_for_file(
     let bytes = argos_core::wallet_file::read_wallet_file(path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
     let format = argos_core::argos_wallet_import::sniff(&bytes).map_err(|err| err.to_string())?;
-    let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
+    let keys = import_gui_wallet_then(&bytes, passphrase, network, |keys| keys)
         .map_err(|err| err.to_string())?;
+    birthday_route_for_keys(keys, format, sapling_keys, network)
+}
+
+/// `birthday_route_for_file` once the file is imported and bound to
+/// `network`: merge any pasted Sapling keys and choose the route.
+fn birthday_route_for_keys(
+    mut keys: argos_core::argos_wallet_import::ImportedKeys,
+    format: argos_core::argos_wallet_import::WalletFormat,
+    sapling_keys: &[String],
+    network: ZeckNetwork,
+) -> Result<BirthdayRoute, String> {
     let mut pasted = 0;
     if keys.mnemonic.is_none() && sapling_keys.iter().any(|k| !k.trim().is_empty()) {
         let typed = argos_core::sapling_key::keys_from_sapling_strings(sapling_keys, network)
@@ -2662,6 +2673,23 @@ mod tests {
     use argos_core::sprout_recovery::{SpentSproutNote, SproutRecovery};
     use secrecy::ExposeSecret;
 
+    /// The birthday route for a regtest golden fixture standing in for a
+    /// real-network `wallet.dat`. The operational import refuses a regtest
+    /// file under mainnet or testnet, so these tests import it unbound and
+    /// exercise only the route choice after the import.
+    fn route_for_regtest_fixture(
+        name: &str,
+        passphrase: Option<&SecretString>,
+        typed: &[String],
+        network: ZeckNetwork,
+    ) -> BirthdayRoute {
+        let bytes = std::fs::read(fixture(name)).expect("fixture");
+        let format = argos_core::argos_wallet_import::sniff(&bytes).expect("sniff");
+        let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
+            .expect("import");
+        birthday_route_for_keys(keys, format, typed, network).unwrap()
+    }
+
     fn fixture(name: &str) -> String {
         format!(
             "{}/../../crates/argos-wallet-import/tests/fixtures/{name}",
@@ -2726,15 +2754,12 @@ mod tests {
                 Some(SecretString::from("argos-test-passphrase".to_owned())),
             ),
         ] {
-            let keys = wallet_dat_keys(
-                birthday_route_for_file(
-                    &fixture(name),
-                    passphrase.as_ref(),
-                    &[],
-                    ZeckNetwork::Mainnet,
-                )
-                .expect(name),
-            );
+            let keys = wallet_dat_keys(route_for_regtest_fixture(
+                name,
+                passphrase.as_ref(),
+                &[],
+                ZeckNetwork::Mainnet,
+            ));
             let found = argos_core::wallet_file_birthday_from_metadata(
                 &keys,
                 &[],
@@ -2762,15 +2787,12 @@ mod tests {
     /// guess.
     #[test]
     fn a_testnet_wallet_dat_gets_no_birthday() {
-        let keys = wallet_dat_keys(
-            birthday_route_for_file(
-                &fixture("sprout-plaintext.dat"),
-                None,
-                &[],
-                ZeckNetwork::Testnet,
-            )
-            .unwrap(),
-        );
+        let keys = wallet_dat_keys(route_for_regtest_fixture(
+            "sprout-plaintext.dat",
+            None,
+            &[],
+            ZeckNetwork::Testnet,
+        ));
         let found = argos_core::wallet_file_birthday_from_metadata(
             &keys,
             &[],
@@ -2788,15 +2810,12 @@ mod tests {
     #[test]
     fn a_pasted_sapling_key_counts_as_undated() {
         let pasted = [TEST_SAPLING_KEY_MAINNET.to_owned()];
-        let (keys, pasted) = wallet_dat_route(
-            birthday_route_for_file(
-                &fixture("modern-plaintext.dat"),
-                None,
-                &pasted,
-                ZeckNetwork::Mainnet,
-            )
-            .unwrap(),
-        );
+        let (keys, pasted) = wallet_dat_route(route_for_regtest_fixture(
+            "modern-plaintext.dat",
+            None,
+            &pasted,
+            ZeckNetwork::Mainnet,
+        ));
         assert_eq!(pasted, 1);
         let found = argos_core::wallet_file_birthday_from_metadata(
             &keys,
@@ -2844,15 +2863,12 @@ mod tests {
 
         // Pasted route.
         let typed = [TEST_SAPLING_KEY_MAINNET.to_owned()];
-        let (mut keys, pasted) = wallet_dat_route(
-            birthday_route_for_file(
-                &fixture("modern-plaintext.dat"),
-                None,
-                &typed,
-                ZeckNetwork::Mainnet,
-            )
-            .unwrap(),
-        );
+        let (mut keys, pasted) = wallet_dat_route(route_for_regtest_fixture(
+            "modern-plaintext.dat",
+            None,
+            &typed,
+            ZeckNetwork::Mainnet,
+        ));
         assert_eq!(pasted, 1);
         // Give the file an undated transparent key as well, so the chain
         // fallback would otherwise be taken.
@@ -2883,15 +2899,12 @@ mod tests {
 
         // File route: a Sapling key in the file itself with no time, as
         // zcashd leaves a `z_importkey`'d key.
-        let mut keys = wallet_dat_keys(
-            birthday_route_for_file(
-                &fixture("modern-plaintext.dat"),
-                None,
-                &[],
-                ZeckNetwork::Mainnet,
-            )
-            .unwrap(),
-        );
+        let mut keys = wallet_dat_keys(route_for_regtest_fixture(
+            "modern-plaintext.dat",
+            None,
+            &[],
+            ZeckNetwork::Mainnet,
+        ));
         assert!(!keys.sapling.is_empty(), "fixture holds a Sapling key");
         keys.sapling[0].created_at = None;
         keys.transparent.push(TransparentKey {
@@ -2984,6 +2997,43 @@ mod tests {
             "wrong passphrase"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-2 item C on #275: birthday detection binds the wallet file to
+    /// the selected network, as the scan and sweep paths do, so a mainnet
+    /// file is refused under testnet before anything is probed.
+    #[test]
+    fn birthday_detection_refuses_a_wallet_from_the_other_network() {
+        let dir = std::env::temp_dir().join(format!("argos-bday-net-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("zwl-mainnet.dat");
+        std::fs::write(
+            &path,
+            include_bytes!(
+                "../../../crates/argos-wallet-import/tests/fixtures/zwl-mainnet-empty.dat"
+            ),
+        )
+        .expect("write fixture");
+        let path_str = path.to_str().expect("utf-8 path").to_owned();
+
+        let err = match birthday_route_for_file(&path_str, None, &[], ZeckNetwork::Testnet) {
+            Err(err) => err,
+            Ok(_) => panic!("a mainnet wallet must not be dated under testnet"),
+        };
+        assert!(
+            err.contains("mainnet") && err.contains("testnet"),
+            "names both networks: {err}"
+        );
+        // Under its own network the file reaches the route decision.
+        let same = match birthday_route_for_file(&path_str, None, &[], ZeckNetwork::Mainnet) {
+            Err(err) => err,
+            Ok(_) => String::new(),
+        };
+        assert!(
+            !(same.contains("mainnet") && same.contains("testnet")),
+            "{same}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

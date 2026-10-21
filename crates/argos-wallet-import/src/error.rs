@@ -73,6 +73,16 @@ pub enum ImportDiagnostic {
     )]
     UnscannedSeedAccounts { accounts: u32 },
 
+    /// The file numbers an HD key at an account index the scan does not
+    /// reach: the scan walks at most `limit` HD accounts, so a key the file
+    /// records at `highest_index` (0-based) is past the end of the range.
+    /// Attached by the operational import, which knows the scan's ceiling.
+    #[error(
+        "this wallet records an HD key at account {highest_index}, past the {limit} \
+         HD accounts Argos scans; accounts beyond that limit are not scanned"
+    )]
+    HdAccountsBeyondScanLimit { highest_index: u32, limit: u32 },
+
     /// The seed's own counters say more legacy keys were derived than were
     /// recovered from the file — a truncated or damaged wallet. `found`
     /// counts keys actually read, not key records that merely exist.
@@ -292,6 +302,7 @@ impl std::fmt::Debug for ImportDiagnostic {
             Self::DecryptionFailed { .. } => "DecryptionFailed",
             Self::UnrecoveredSeed { .. } => "UnrecoveredSeed",
             Self::UnscannedSeedAccounts { .. } => "UnscannedSeedAccounts",
+            Self::HdAccountsBeyondScanLimit { .. } => "HdAccountsBeyondScanLimit",
             Self::MissingDerivedKeys { .. } => "MissingDerivedKeys",
             Self::UncheckedLegacySeed { .. } => "UncheckedLegacySeed",
             Self::UnreadableKeyMetadata { .. } => "UnreadableKeyMetadata",
@@ -322,6 +333,7 @@ impl ImportDiagnostic {
             self,
             Self::UnrecoveredSeed { .. }
                 | Self::UnscannedSeedAccounts { .. }
+                | Self::HdAccountsBeyondScanLimit { .. }
                 | Self::MissingDerivedKeys { .. }
                 | Self::UncheckedLegacySeed { .. }
         )
