@@ -144,6 +144,7 @@ pub fn keys_from_sapling_strings(
             sapling: vec![SaplingKey {
                 extsk: Secret::new(extsk.to_bytes().to_vec()),
                 provenance: Provenance::Standalone,
+                created_at: None,
             }],
             ..Default::default()
         };
@@ -503,6 +504,7 @@ mod tests {
         SaplingKey {
             extsk: Secret::new(extsk.to_bytes().to_vec()),
             provenance: Provenance::Standalone,
+            created_at: None,
         }
     }
 
@@ -612,6 +614,7 @@ mod tests {
             transparent: vec![TransparentKey {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
+                created_at: None,
             }],
             ..Default::default()
         };

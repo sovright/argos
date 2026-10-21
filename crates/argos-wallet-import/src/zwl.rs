@@ -341,6 +341,8 @@ fn read_zkey(cur: &mut Cursor) -> Option<ZKeyEntry> {
         Some(bytes) => ZKeyEntry::Recovered(SaplingKey {
             extsk: Secret::new(bytes.to_vec()),
             provenance,
+            // ZWL stores no per-key creation time.
+            created_at: None,
         }),
         None => ZKeyEntry::Locked,
     })
@@ -373,6 +375,7 @@ fn read_tkey(cur: &mut Cursor) -> Option<TKeyEntry> {
         Some(secret) => TKeyEntry::Recovered(TransparentKey {
             secret: Secret::new(secret),
             provenance,
+            created_at: None,
         }),
         None => TKeyEntry::Locked,
     })
@@ -452,6 +455,7 @@ fn read_key_vectors(cur: &mut Cursor, keys_version: u64, out: &mut ImportedKeys)
             out.transparent.push(TransparentKey {
                 secret: Secret::new(secret),
                 provenance: Provenance::HdDerived,
+                created_at: None,
             });
         }
     } else {
