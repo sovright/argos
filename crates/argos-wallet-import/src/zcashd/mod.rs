@@ -6,7 +6,9 @@ pub mod plaintext;
 pub mod records;
 pub mod sprout;
 
-pub use crypto::{derive_master_key, find_mkey, MasterKey, MkeyRecord};
+pub use crypto::{
+    classify_encryption, derive_master_key, find_mkey, EncryptionMetadata, MasterKey, MkeyRecord,
+};
 pub use encrypted::collect_encrypted;
 pub use plaintext::collect_plaintext;
 pub use records::{compact_size, parse_record_key, RecordKey};
@@ -20,13 +22,17 @@ use crate::{
     keys::ImportedKeys,
 };
 
-/// True when the wallet carries an `mkey` record and therefore needs a
-/// passphrase. Checked before prompting so we never ask for a passphrase
-/// the wallet does not use.
-pub fn needs_passphrase(bytes: &[u8]) -> bool {
-    bdb::walk(bytes)
-        .map(|walk| find_mkey(&walk.records).is_some())
-        .unwrap_or(false)
+/// Whether the wallet needs a passphrase. Reject damaged encryption metadata
+/// before prompting, so a missing `mkey` cannot masquerade as plaintext.
+pub fn needs_passphrase(bytes: &[u8]) -> Result<bool, ImportError> {
+    let walk = bdb::walk(bytes)?;
+    match classify_encryption(&walk.records) {
+        EncryptionMetadata::Unencrypted => Ok(false),
+        EncryptionMetadata::Encrypted(_) => Ok(true),
+        EncryptionMetadata::Damaged { reason } => {
+            Err(ImportError::DamagedEncryptionMetadata(reason))
+        }
+    }
 }
 
 /// Parse a zcashd `wallet.dat` into normalized key material.
@@ -39,6 +45,10 @@ pub fn import_zcashd(
 ) -> Result<ImportedKeys, ImportError> {
     let walk = bdb::walk(bytes)?;
     let pairs = walk.records;
+    let encryption = classify_encryption(&pairs);
+    if let EncryptionMetadata::Damaged { reason } = encryption {
+        return Err(ImportError::DamagedEncryptionMetadata(reason));
+    }
     let mut out = ImportedKeys {
         diagnostics: walk.diagnostics,
         ..Default::default()
@@ -47,7 +57,7 @@ pub fn import_zcashd(
     collect_plaintext(&pairs, &mut out);
     collect_sprout_notes(&pairs, &mut out);
 
-    if let Some(mkey) = find_mkey(&pairs) {
+    if let EncryptionMetadata::Encrypted(mkey) = encryption {
         // Encrypted wallet: without a passphrase the encrypted records are
         // unreachable, and reporting partial plaintext results would let a
         // user believe they had recovered everything.
@@ -75,6 +85,134 @@ mod tests {
         std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap()
     }
 
+    fn mkey_record(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        bdb::walk(bytes)
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .expect("golden encrypted wallet has an mkey")
+    }
+
+    fn replace_unique(bytes: &mut [u8], original: &[u8], replacement: &[u8]) {
+        assert_eq!(original.len(), replacement.len());
+        let offsets: Vec<_> = bytes
+            .windows(original.len())
+            .enumerate()
+            .filter_map(|(index, window)| (window == original).then_some(index))
+            .collect();
+        assert_eq!(offsets.len(), 1, "fixture record must occur exactly once");
+        bytes[offsets[0]..offsets[0] + original.len()].copy_from_slice(replacement);
+    }
+
+    fn assert_damaged_encryption(bytes: &[u8]) {
+        let err = import_zcashd(bytes, None).unwrap_err();
+        let ImportError::DamagedEncryptionMetadata(reason) = &err else {
+            panic!("expected damaged encryption metadata, got {err}");
+        };
+        assert!(reason.contains("mkey"), "reason must name mkey");
+        assert!(
+            reason.contains("encrypted records"),
+            "reason must name encrypted records"
+        );
+        assert!(err.to_string().contains("Keep the original wallet file"));
+    }
+
+    #[test]
+    fn encrypted_records_with_truncated_mkey_are_damaged_not_plaintext() {
+        let mut bytes = read("modern-encrypted");
+        let (_, value) = mkey_record(&bytes);
+        let mut malformed = value.clone();
+        malformed[0] = 0xfc; // impossible ciphertext length within this record
+        replace_unique(&mut bytes, &value, &malformed);
+        assert_damaged_encryption(&bytes);
+    }
+
+    #[test]
+    fn encrypted_records_without_mkey_are_damaged_not_plaintext() {
+        let mut bytes = read("modern-encrypted");
+        let (key, _) = mkey_record(&bytes);
+        let mut renamed = key.clone();
+        renamed[1..5].copy_from_slice(b"xkey");
+        replace_unique(&mut bytes, &key, &renamed);
+        assert_damaged_encryption(&bytes);
+    }
+
+    #[test]
+    fn encrypted_seed_record_without_mkey_is_damaged() {
+        let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
+        let seed = pairs
+            .into_iter()
+            .find(|(key, _)| {
+                parse_record_key(key).is_some_and(|r| {
+                    matches!(r.record_type.as_str(), "chdseed" | "cmnemonicphrase")
+                })
+            })
+            .expect("golden fixture has encrypted seed");
+        let classification = crate::zcashd::crypto::classify_encryption(&[seed]);
+        assert!(matches!(
+            classification,
+            crate::zcashd::crypto::EncryptionMetadata::Damaged { .. }
+        ));
+    }
+
+    #[test]
+    fn unsupported_mkey_kdf_is_damaged_metadata() {
+        let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
+        let mut mkey = pairs
+            .into_iter()
+            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .unwrap();
+        let value = &mut mkey.1;
+        let (key_len, key_offset) = compact_size(value).unwrap();
+        let salt_offset = key_offset + key_len as usize;
+        let method_offset = salt_offset + 1 + 8;
+        value[method_offset..method_offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            crate::zcashd::crypto::classify_encryption(&[mkey]),
+            crate::zcashd::crypto::EncryptionMetadata::Damaged { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_mkey_ciphertext_shape_is_damaged_metadata() {
+        let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
+        let mut mkey = pairs
+            .into_iter()
+            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .unwrap();
+        // Keep the serialized record well formed, but shrink the AES-CBC
+        // ciphertext from the fixture's 48 bytes to an impossible 32 bytes.
+        mkey.1.drain(33..49);
+        mkey.1[0] = 32;
+        assert!(matches!(
+            crate::zcashd::crypto::classify_encryption(&[mkey]),
+            crate::zcashd::crypto::EncryptionMetadata::Damaged { .. }
+        ));
+    }
+
+    #[test]
+    fn plaintext_wallet_without_encrypted_records_is_unencrypted() {
+        let pairs = bdb::walk(&read("modern-plaintext")).unwrap().records;
+        assert!(matches!(
+            crate::zcashd::crypto::classify_encryption(&pairs),
+            crate::zcashd::crypto::EncryptionMetadata::Unencrypted
+        ));
+    }
+
+    #[test]
+    fn needs_passphrase_propagates_damaged_encryption_metadata() {
+        let mut bytes = read("modern-encrypted");
+        let (key, _) = mkey_record(&bytes);
+        let mut renamed = key.clone();
+        renamed[1..5].copy_from_slice(b"xkey");
+        replace_unique(&mut bytes, &key, &renamed);
+        assert!(matches!(
+            needs_passphrase(&bytes),
+            Err(ImportError::DamagedEncryptionMetadata(_))
+        ));
+    }
+
     #[test]
     fn valid_empty_bdb_cannot_claim_complete_recovery() {
         let mut bytes = vec![0u8; 1024];
@@ -97,10 +235,10 @@ mod tests {
 
     #[test]
     fn detects_which_wallets_need_a_passphrase() {
-        assert!(needs_passphrase(&read("modern-encrypted")));
-        assert!(needs_passphrase(&read("sprout-encrypted")));
-        assert!(!needs_passphrase(&read("modern-plaintext")));
-        assert!(!needs_passphrase(&read("sprout-plaintext")));
+        assert!(needs_passphrase(&read("modern-encrypted")).unwrap());
+        assert!(needs_passphrase(&read("sprout-encrypted")).unwrap());
+        assert!(!needs_passphrase(&read("modern-plaintext")).unwrap());
+        assert!(!needs_passphrase(&read("sprout-plaintext")).unwrap());
     }
 
     #[test]
