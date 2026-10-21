@@ -207,7 +207,7 @@ impl<'a> Cursor<'a> {
             .pos
             .checked_add(n)
             .ok_or_else(|| self.error(field, "value length limit exceeded"))?;
-        let s = self.bytes.get(self.pos..end).ok_or_else(|| ZwlReadError {
+        let s = self.bytes.get(self.pos..end).ok_or(ZwlReadError {
             offset: self.bytes.len(),
             field,
             reason: "truncated field",
@@ -217,21 +217,32 @@ impl<'a> Cursor<'a> {
     }
 
     fn u8(&mut self, field: &'static str) -> ZwlReadResult<u8> {
-        Ok(self.take(1, field)?[0])
+        self.take(1, field)?
+            .first()
+            .copied()
+            .ok_or_else(|| self.error(field, "truncated field"))
     }
 
     fn u32_le(&mut self, field: &'static str) -> ZwlReadResult<u32> {
-        let arr: [u8; 4] = self.take(4, field)?.try_into().expect("fixed-size read");
+        let arr: [u8; 4] = self
+            .take(4, field)?
+            .try_into()
+            .map_err(|_| self.error(field, "truncated field"))?;
         Ok(u32::from_le_bytes(arr))
     }
 
     fn u64_le(&mut self, field: &'static str) -> ZwlReadResult<u64> {
-        let arr: [u8; 8] = self.take(8, field)?.try_into().expect("fixed-size read");
+        let arr: [u8; 8] = self
+            .take(8, field)?
+            .try_into()
+            .map_err(|_| self.error(field, "truncated field"))?;
         Ok(u64::from_le_bytes(arr))
     }
 
     fn array<const N: usize>(&mut self, field: &'static str) -> ZwlReadResult<[u8; N]> {
-        Ok(self.take(N, field)?.try_into().expect("fixed-size read"))
+        self.take(N, field)?
+            .try_into()
+            .map_err(|_| self.error(field, "truncated field"))
     }
 
     fn skip(&mut self, n: usize, field: &'static str) -> ZwlReadResult<()> {
@@ -243,7 +254,7 @@ impl<'a> Cursor<'a> {
     fn compact_size(&mut self, field: &'static str) -> ZwlReadResult<u64> {
         let (value, consumed) =
             crate::zcashd::records::compact_size(self.bytes.get(self.pos..).unwrap_or_default())
-                .ok_or_else(|| ZwlReadError {
+                .ok_or(ZwlReadError {
                     offset: self.bytes.len(),
                     field,
                     reason: "truncated field",
@@ -575,9 +586,16 @@ pub fn import_zwl(
             Err(()) => return Err(ImportError::WrongPassphrase),
         }
     } else {
-        let mnemonic = Mnemonic::<English>::from_entropy(header.seed.to_vec())
-            .expect("32 bytes are valid BIP-39 entropy");
-        out.mnemonic = Some(SecretString::new(mnemonic.into_phrase()));
+        match Mnemonic::<English>::from_entropy(header.seed.to_vec()) {
+            Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
+            // All 32-byte values are valid BIP-39 entropy. Retain a
+            // non-complete result if that library invariant ever changes.
+            Err(_) => out.diagnostics.push(ImportDiagnostic::ContainerDamage {
+                format: "ZecWallet Lite",
+                location: format!("byte {} seed", cur.pos.saturating_sub(SEED_LEN)),
+                reason: "wallet structure could not be read".to_owned(),
+            }),
+        }
     }
 
     if let Err(err) = read_key_vectors(&mut cur, header.keys_version, &mut out) {
