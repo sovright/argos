@@ -184,7 +184,16 @@ struct Cli {
 impl Cli {
     /// `--birthday`, or Sapling activation when none was given.
     fn birthday_or_default(&self) -> u32 {
-        self.birthday.unwrap_or(419_200)
+        self.birthday
+            .unwrap_or(sapling_activation_height(ZeckNetwork::Mainnet))
+    }
+}
+
+/// Sapling activation height: where a scan with no birthday starts.
+fn sapling_activation_height(network: ZeckNetwork) -> u32 {
+    match network {
+        ZeckNetwork::Mainnet => 419_200,
+        ZeckNetwork::Testnet => 280_000,
     }
 }
 
@@ -1679,9 +1688,16 @@ async fn detect_wallet_dat_birthday(
         for line in wrap_text(&found.message, 76) {
             eprintln!("  {line}");
         }
-        eprintln!("No birthday could be detected; scanning from the start of the Sapling pool.");
-        // Below any network's Sapling activation; the scan clamps it up.
-        return 1;
+        let start = sapling_activation_height(network);
+        eprintln!(
+            "No birthday could be detected; scanning from the start of the Sapling pool \
+             (block {start})."
+        );
+        // On mainnet this equals `birthday_or_default()`, so an auto-detect
+        // that finds nothing keys the same workspace as a plain `scan` and a
+        // resume across the two is not lost. Block 1 would clamp to the same
+        // start but key a different workspace.
+        return start;
     };
     let source = match found.source {
         WalletBirthdaySource::TransparentUtxos => {

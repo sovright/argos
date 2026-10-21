@@ -857,6 +857,8 @@ fn auto_detect_on_testnet_scans_from_the_start() {
         "{stderr}"
     );
     assert!(stderr.contains("from the start"), "{stderr}");
+    // Testnet Sapling activation, not the mainnet default or block 1.
+    assert!(stderr.contains("Sapling pool (block 280000)"), "{stderr}");
     assert!(!stderr.contains("Birthday: block "), "{stderr}");
 }
 
@@ -989,5 +991,8 @@ fn auto_detect_with_a_sapling_key_file_does_not_use_the_chain() {
     assert!(!stderr.contains("could not be checked"), "{stderr}");
     assert!(stderr.contains("Sapling activation"), "{stderr}");
     assert!(stderr.contains("No birthday could be detected"), "{stderr}");
+    // Kristi's #2 on #260: the same height a plain `scan` with no --birthday
+    // uses on mainnet, so the two key the same workspace and a resume holds.
+    assert!(stderr.contains("Sapling pool (block 419200)"), "{stderr}");
     assert!(!stderr.contains("Birthday: block "), "{stderr}");
 }
