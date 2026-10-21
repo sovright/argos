@@ -438,6 +438,13 @@ fn build_reviewable_proposal(
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Runs inside `propose_sweep` after the quote is built and before its id
+    /// is issued. Task-local so parallel tests cannot see each other's hook.
+    static PROPOSE_AFTER_BUILD: Box<dyn Fn(&ScanSession) + Send + Sync>;
+}
+
 /// Store a reviewed intent and issue its id, but only if `current` scan state
 /// still matches the state it was reviewed against. Proposal construction
 /// can read a wallet and take time; a progress refresh during that work must
@@ -756,6 +763,10 @@ impl RecoveryService {
         let proposal = build_reviewable_proposal(&session, &progress, request.clone(), mixed)?;
         let mut intent = ReviewedSweepIntent::capture(request, &proposal, &session, &progress);
         intent.authority = Some(authority);
+        // Test seam: lets a test move progress between the build above and
+        // the issue below, which is the window the re-check exists for.
+        #[cfg(test)]
+        let _ = PROPOSE_AFTER_BUILD.try_with(|hook| hook(&session));
         let state = session.state.lock().await;
         let proposal_id = issue_reviewed_proposal(&session, intent, &state).await?;
         Ok(ReviewedSweepProposal {
@@ -5115,6 +5126,42 @@ mod propose_workspace_guard_tests {
             .expect("unchanged progress issues an id");
         drop(state);
         assert!(session.reviewed_sweeps.lock().await.take(&id).is_ok());
+    }
+
+    /// The same re-check at its call site: `propose_sweep` must compare the
+    /// intent with the progress current at issue time, not the snapshot the
+    /// quote was built from. Progress is moved between build and issue; a
+    /// call site passing the stale snapshot would issue an id here.
+    #[tokio::test]
+    async fn propose_refuses_when_progress_moves_between_build_and_issue() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            transparent_only_source(),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+        let hook: Box<dyn Fn(&ScanSession) + Send + Sync> = Box::new(|session| {
+            session
+                .state
+                .try_lock()
+                .expect("nothing else holds the scan state")
+                .progress
+                .accounts[0]
+                .sapling_zatoshis += 1;
+        });
+        let result = PROPOSE_AFTER_BUILD
+            .scope(hook, service.propose_sweep(&handle, request()))
+            .await;
+        assert!(
+            matches!(result, Err(ZeckError::StaleSweepProposal(_))),
+            "got: {result:?}"
+        );
+        let session = service.session(&handle).await.expect("session");
+        assert!(
+            session.reviewed_sweeps.lock().await.entries.is_empty(),
+            "a refused proposal must not be stored"
+        );
     }
 
     /// The other half: the guard still refuses a route whose balances do come

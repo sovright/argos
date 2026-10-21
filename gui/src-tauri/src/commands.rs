@@ -999,17 +999,42 @@ pub async fn propose_wallet_sprout_sweep(
     validate_sweep_request(&destination, network, &lightwalletd_url)?;
     let bytes = argos_core::wallet_file::read_wallet_file(&path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
-    let (keys, recovered, forged_warnings) =
-        import_gui_wallet_then(&bytes, passphrase.as_ref(), network, |mut keys| {
-            // As inspect does: a forged key is dropped and named in the
-            // review, and the genuine keys' notes are still swept. A forged
-            // key controls no note of its own, and the commitment check
-            // stops it spending anyone else's.
-            let forged_warnings = drop_and_warn_forged_sprout_keys(&app, &mut keys);
-            let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
-            (keys, recovered, forged_warnings)
-        })
+    let mut keys = import_gui_wallet_then(&bytes, passphrase.as_ref(), network, |keys| keys)
         .map_err(|err| err.to_string())?;
+    let dir = resolve_data_dir(&app, data_dir.as_deref());
+    propose_wallet_sprout_sweep_core(
+        &state.reviewed_intent,
+        &mut keys,
+        dir,
+        destination,
+        network,
+        lightwalletd_url,
+        |warning| {
+            let _ = app.emit("sprout-forged-key", warning);
+        },
+    )
+}
+
+/// `propose_wallet_sprout_sweep` after the file is read and decrypted, with
+/// no `AppHandle`: drop forged keys (reporting each through `on_forged`),
+/// recover the notes, and store the reviewed proposal.
+fn propose_wallet_sprout_sweep_core(
+    store: &ReviewedIntentStore,
+    keys: &mut argos_core::argos_wallet_import::ImportedKeys,
+    dir: Option<PathBuf>,
+    destination: String,
+    network: ZeckNetwork,
+    lightwalletd_url: String,
+    on_forged: impl Fn(&str),
+) -> Result<ReviewedSproutSweep, String> {
+    // As inspect does: a forged key is dropped and named in the review, and
+    // the genuine keys' notes are still swept. A forged key controls no note
+    // of its own, and the commitment check stops it spending anyone else's.
+    let forged_warnings = drop_forged_sprout_keys(keys);
+    for warning in &forged_warnings {
+        on_forged(warning);
+    }
+    let recovered = recover_with_scan_in(keys, network, dir.clone());
     if recovered.notes.is_empty() {
         return Err(if recovered.nothing_left_to_sweep() {
             "nothing is left to sweep: the wallet file or scan shows its Sprout notes spent, already swept, or below the fee".into()
@@ -1018,13 +1043,13 @@ pub async fn propose_wallet_sprout_sweep(
         });
     }
     let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes).map_err(|e| e.to_string())?;
-    let journal = resolve_data_dir(&app, data_dir.as_deref()).map(|dir| {
-        argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(&keys))
+    let journal = dir.map(|dir| {
+        argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(keys))
     });
     // The reviewed notes, with their keys, are held in the proposal (see
     // `reviewed_intent`'s key-retention note), so execution never re-reads
     // the file and no file identity needs recording.
-    let mut review = state.reviewed_intent.insert_proposal(
+    let mut review = store.insert_proposal(
         SproutSweepIntent {
             source: SproutIntentSource::Wallet,
             notes: recovered.notes,
@@ -1381,6 +1406,23 @@ fn finish_sprout_scan_task(
     store.finish_scan(handle, result);
 }
 
+/// Run a scan on its own task, owned by the store: the abort handle is
+/// attached before the result is awaited, so releasing the scan stops the
+/// worker (and drops the checkpoint reservation the future owns) rather than
+/// leaving it to run on detached for hours. A release that lands before the
+/// attach is handled by `attach_worker`, which aborts the orphan.
+async fn run_attached_scan_worker<F>(
+    store: &ReviewedIntentStore,
+    handle: &SproutScanHandle,
+    scan: F,
+) where
+    F: std::future::Future<Output = Result<SproutScanReport, String>> + Send + 'static,
+{
+    let scan_task = tokio::spawn(scan);
+    store.attach_worker(handle, scan_task.abort_handle());
+    finish_sprout_scan_task(store, handle, scan_task.await);
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_sprout_scan(
@@ -1434,7 +1476,7 @@ pub async fn start_sprout_scan(
     tokio::spawn(async move {
         let scan_app = app.clone();
         let progress_handle = worker_handle.clone();
-        let scan_task = tokio::spawn(async move {
+        let scan = async move {
             let _checkpoint_reservation = checkpoint_reservation;
             let (tip_anchor, tip_warning) =
                 sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
@@ -1480,11 +1522,8 @@ pub async fn start_sprout_scan(
                 .unwrap_or(decrypt_line),
             })
             .map_err(|err| err.to_string())
-        });
-        // Released scans abort this worker (and free its checkpoint) through
-        // the store rather than run on detached for hours.
-        store.attach_worker(&worker_handle, scan_task.abort_handle());
-        finish_sprout_scan_task(&store, &worker_handle, scan_task.await);
+        };
+        run_attached_scan_worker(&store, &worker_handle, scan).await;
         if let Ok(snapshot) = store.snapshot(&worker_handle) {
             let _ = app.emit("sprout-scan-complete", snapshot);
         }
@@ -1776,8 +1815,16 @@ fn recover_with_scan(
     network: argos_core::ZeckNetwork,
     data_dir: Option<&str>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
+    recover_with_scan_in(keys, network, resolve_data_dir(app, data_dir))
+}
+
+/// `recover_with_scan` against an already-resolved data directory.
+fn recover_with_scan_in(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    dir: Option<PathBuf>,
+) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
-    let dir = resolve_data_dir(app, data_dir);
     // The lookup's notice is shown on the wallet screen, not logged: a scan
     // that exists but cannot be used must not look like no scan at all.
     let (chain, mut notice) = match &dir {
@@ -1818,12 +1865,18 @@ fn resolve_data_dir(app: &AppHandle, data_dir: Option<&str>) -> Option<PathBuf> 
 
 /// The wallet file's Sprout spending keys, as the checkpoint and the sweep
 /// journal are keyed.
-fn wallet_sprout_keys(keys: &argos_core::argos_wallet_import::ImportedKeys) -> Vec<[u8; 32]> {
+/// Wiped on drop: these are raw spending keys, copied out of their
+/// `Secret` wrappers for the journal and chain lookups.
+fn wallet_sprout_keys(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+) -> zeroize::Zeroizing<Vec<[u8; 32]>> {
     use secrecy::ExposeSecret;
-    keys.sprout
-        .iter()
-        .map(|k| *k.a_sk.expose_secret())
-        .collect()
+    zeroize::Zeroizing::new(
+        keys.sprout
+            .iter()
+            .map(|k| *k.a_sk.expose_secret())
+            .collect(),
+    )
 }
 
 #[tauri::command]
@@ -2998,6 +3051,48 @@ mod tests {
     /// wallet-file sweep while inspect dropped it and warned. The sweep now
     /// does what inspect does: the genuine keys stay, and the forged one is
     /// reported in the review rather than silently ignored.
+    /// The same rule at the propose path itself, not only its helper: a
+    /// forged key is dropped and reported, and the proposal goes on with the
+    /// genuine keys. The fixture holds no funded Sprout note (none can be
+    /// made; see the fixtures README), so the proposal ends at "no spendable
+    /// notes" rather than a review; a refusal on the forged key would fail
+    /// before that, with a different error and nothing reported.
+    #[test]
+    fn proposing_from_a_wallet_with_a_forged_key_drops_it_and_carries_on() {
+        let bytes =
+            argos_core::wallet_file::read_wallet_file(fixture("sprout-plaintext.dat")).unwrap();
+        let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None).unwrap();
+        let genuine = keys.sprout.len();
+        assert!(genuine > 0, "fixture holds Sprout keys");
+        let a_sk = *keys.sprout[0].a_sk.expose_secret();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: [0xAA; 64],
+                provenance: Provenance::Standalone,
+                created_at: None,
+            });
+        let store = ReviewedIntentStore::default();
+        let reported = std::cell::RefCell::new(Vec::new());
+        let dir = std::env::temp_dir().join(format!("argos-forged-{}", uuid::Uuid::new_v4()));
+        let err = super::propose_wallet_sprout_sweep_core(
+            &store,
+            &mut keys,
+            Some(dir),
+            "zs-reviewed".into(),
+            ZeckNetwork::Mainnet,
+            "https://zec.rocks:443".into(),
+            |warning| reported.borrow_mut().push(warning.to_owned()),
+        )
+        .err()
+        .expect("the fixture has no spendable note");
+        assert!(err.contains("no spendable Sprout notes"), "{err}");
+        assert_eq!(keys.sprout.len(), genuine, "genuine keys are kept");
+        let reported = reported.into_inner();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(reported[0].contains("does not control"), "{}", reported[0]);
+    }
+
     #[test]
     fn a_forged_sprout_key_is_dropped_with_a_warning_and_the_rest_kept() {
         let bytes =
@@ -3461,6 +3556,50 @@ mod tests {
             err,
             argos_core::argos_wallet_import::ImportError::WrongPassphrase.to_string()
         );
+    }
+
+    /// The wiring `start_sprout_scan` uses: a scan run through
+    /// `run_attached_scan_worker` is stopped by `release_scan`, freeing its
+    /// checkpoint. Without the attach, the never-ending scan below would
+    /// keep the driver (and the reservation) alive and the timeout would
+    /// fire. Covers both orderings: release after the attach, and release
+    /// before the worker task has been polled at all.
+    #[tokio::test]
+    async fn releasing_a_scan_stops_the_worker_started_for_it() {
+        for settle in [true, false] {
+            let store = ReviewedIntentStore::default();
+            let dir = std::env::temp_dir().join(format!("argos-attach-{}", uuid::Uuid::new_v4()));
+            let (handle, material, reservation) = super::begin_sprout_scan_session(
+                &store,
+                vec![[12; 32]],
+                &dir,
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+            )
+            .unwrap();
+            let (driver_store, driver_handle) = (store.clone(), handle.clone());
+            let driver = tokio::spawn(async move {
+                super::run_attached_scan_worker(&driver_store, &driver_handle, async move {
+                    let _reservation = reservation;
+                    std::future::pending::<Result<SproutScanReport, String>>().await
+                })
+                .await;
+            });
+            if settle {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(store.reserve_checkpoint(&material.checkpoint).is_err());
+            store.release_scan(&handle).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+                .await
+                .expect("release stops the attached worker")
+                .expect("the driver itself does not panic");
+            assert!(
+                store.reserve_checkpoint(&material.checkpoint).is_ok(),
+                "the released scan's checkpoint is free again"
+            );
+        }
     }
 
     #[test]
