@@ -8,9 +8,9 @@ use std::{
 };
 
 use crate::reviewed_intent::{
-    ReviewedIntentStore, ReviewedSproutSweep, SproutIntentSource, SproutProposalId,
-    SproutScanHandle, SproutScanProgressEvent, SproutScanSnapshot, SproutSweepIntent,
-    SproutSweepPreviewData,
+    CheckpointReservation, ReviewedIntentStore, ReviewedSproutSweep, ScanMaterial,
+    SproutIntentSource, SproutProposalId, SproutScanHandle, SproutScanProgressEvent,
+    SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData,
 };
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
@@ -1243,6 +1243,41 @@ fn validate_peer(entry: &str) -> Result<(), &'static str> {
 }
 
 /// Start a resumable Sprout scan and return its backend handle immediately.
+fn begin_sprout_scan_session(
+    store: &ReviewedIntentStore,
+    decoded: Vec<[u8; 32]>,
+    dir: &Path,
+    network: ZeckNetwork,
+    lightwalletd_url: String,
+    peers: Vec<String>,
+) -> Result<(SproutScanHandle, ScanMaterial, CheckpointReservation), String> {
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(dir, &decoded);
+    let reservation = store.reserve_checkpoint(&checkpoint)?;
+    let fingerprint = argos_core::sprout_scan_run::key_set_fingerprint(&decoded);
+    let handle = store.insert_scan(
+        decoded,
+        fingerprint,
+        checkpoint,
+        network,
+        lightwalletd_url,
+        peers,
+    )?;
+    let material = store.scan_material(&handle)?;
+    Ok((handle, material, reservation))
+}
+
+fn finish_sprout_scan_task(
+    store: &ReviewedIntentStore,
+    handle: &SproutScanHandle,
+    result: Result<Result<SproutScanReport, String>, tokio::task::JoinError>,
+) {
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => Err(format!("Sprout scan worker stopped unexpectedly: {err}")),
+    };
+    store.finish_scan(handle, result);
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_sprout_scan(
@@ -1262,56 +1297,51 @@ pub async fn start_sprout_scan(
     let decoded = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
     let dir = resolve_data_dir(&app, Some(&data_dir))
         .ok_or_else(|| "could not resolve the data directory".to_owned())?;
-    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &decoded);
-    let fingerprint = argos_core::sprout_scan_run::key_set_fingerprint(&decoded);
     let store = state.reviewed_intent.clone();
-    let handle = store.insert_scan(
-        decoded,
-        fingerprint,
-        checkpoint,
-        network,
-        lightwalletd_url,
-        peers,
-    )?;
-    let material = store.scan_material(&handle)?;
+    let (handle, material, checkpoint_reservation) =
+        begin_sprout_scan_session(&store, decoded, &dir, network, lightwalletd_url, peers)?;
     let worker_handle = handle.clone();
     tokio::spawn(async move {
-        let (tip_anchor, tip_warning) =
-            sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
-        let emitter = app.clone();
+        let scan_app = app.clone();
         let progress_handle = worker_handle.clone();
-        let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
-        let result = argos_core::sprout_scan_run::run_sprout_scan(
-            &material.keys,
-            p2p,
-            &material.peers,
-            tip_anchor,
-            &material.checkpoint,
-            move |tick| {
-                let _ = emitter.emit(
-                    "sprout-scan-progress",
-                    SproutScanProgressEvent {
-                        handle: progress_handle.clone(),
-                        height: tick.height,
-                        target: tick.target,
-                        notes_found: tick.notes_found,
-                        joinsplits_seen: tick.joinsplits_seen,
-                        peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
-                    },
-                );
-            },
-        )
-        .await
-        .map(|result| SproutScanReport {
-            blocks_scanned: result.progress.blocks_scanned,
-            joinsplits_seen: result.progress.joinsplits_seen,
-            notes_found: result.notes.len(),
-            spent_notes: result.spent_notes,
-            total_zatoshis: result.total_value(),
-            tip_warning,
-        })
-        .map_err(|err| err.to_string());
-        store.finish_scan(&worker_handle, result);
+        let scan_task = tokio::spawn(async move {
+            let _checkpoint_reservation = checkpoint_reservation;
+            let (tip_anchor, tip_warning) =
+                sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
+            let emitter = scan_app;
+            let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
+            argos_core::sprout_scan_run::run_sprout_scan(
+                &material.keys,
+                p2p,
+                &material.peers,
+                tip_anchor,
+                &material.checkpoint,
+                move |tick| {
+                    let _ = emitter.emit(
+                        "sprout-scan-progress",
+                        SproutScanProgressEvent {
+                            handle: progress_handle.clone(),
+                            height: tick.height,
+                            target: tick.target,
+                            notes_found: tick.notes_found,
+                            joinsplits_seen: tick.joinsplits_seen,
+                            peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
+                        },
+                    );
+                },
+            )
+            .await
+            .map(|result| SproutScanReport {
+                blocks_scanned: result.progress.blocks_scanned,
+                joinsplits_seen: result.progress.joinsplits_seen,
+                notes_found: result.notes.len(),
+                spent_notes: result.spent_notes,
+                total_zatoshis: result.total_value(),
+                tip_warning,
+            })
+            .map_err(|err| err.to_string())
+        });
+        finish_sprout_scan_task(&store, &worker_handle, scan_task.await);
         if let Ok(snapshot) = store.snapshot(&worker_handle) {
             let _ = app.emit("sprout-scan-complete", snapshot);
         }
@@ -1366,6 +1396,20 @@ async fn sprout_tip_anchor(
 }
 
 /// Catch up the exact saved scan and store the resulting notes for review.
+fn begin_sprout_catchup(
+    store: &ReviewedIntentStore,
+    handle: &SproutScanHandle,
+) -> Result<(ScanMaterial, CheckpointReservation), String> {
+    store.ensure_scan_proposal_capacity(handle)?;
+    let material = store.scan_material(handle)?;
+    if argos_core::sprout_scan_run::key_set_fingerprint(&material.keys) != material.key_fingerprint
+    {
+        return Err("Sprout scan key identity changed".into());
+    }
+    let reservation = store.reserve_checkpoint(&material.checkpoint)?;
+    Ok((material, reservation))
+}
+
 #[tauri::command]
 pub async fn propose_sprout_scan_sweep(
     app: AppHandle,
@@ -1374,18 +1418,8 @@ pub async fn propose_sprout_scan_sweep(
     destination: String,
 ) -> Result<ReviewedSproutSweep, String> {
     ensure_tos_accepted(&app)?;
-    let snapshot = state.reviewed_intent.snapshot(&scan_handle)?;
-    if !matches!(
-        snapshot.status,
-        crate::reviewed_intent::SproutScanStatus::Completed
-    ) {
-        return Err("wait for the Sprout scan to complete".into());
-    }
-    let material = state.reviewed_intent.scan_material(&scan_handle)?;
-    if argos_core::sprout_scan_run::key_set_fingerprint(&material.keys) != material.key_fingerprint
-    {
-        return Err("Sprout scan key identity changed".into());
-    }
+    let (material, _checkpoint_reservation) =
+        begin_sprout_catchup(&state.reviewed_intent, &scan_handle)?;
     argos_core::sprout_sweep::parse_sapling_destination(&destination, material.network)
         .map_err(|err| err.to_string())?;
     if !material.checkpoint.exists() {
@@ -2200,6 +2234,137 @@ mod tests {
             super::execute_wallet_sprout_sweep;
         let _scan: fn(AppHandle, State<'static, AppState>, SproutProposalId) -> _ =
             super::execute_sprout_scan_sweep;
+    }
+
+    #[test]
+    fn scan_start_reserves_the_checkpoint_before_inserting_another_session() {
+        let store = ReviewedIntentStore::default();
+        let dir = std::env::temp_dir().join(format!("argos-scan-start-{}", uuid::Uuid::new_v4()));
+        let (handle, _, reservation) = super::begin_sprout_scan_session(
+            &store,
+            vec![[7; 32]],
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://node".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(super::begin_sprout_scan_session(
+            &store,
+            vec![[7; 32]],
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://node".into(),
+            Vec::new()
+        )
+        .is_err());
+        assert!(store.snapshot(&handle).is_ok());
+        drop(reservation);
+    }
+
+    #[test]
+    fn catchup_cannot_overlap_its_scans_checkpoint() {
+        let store = ReviewedIntentStore::default();
+        let dir = std::env::temp_dir().join(format!("argos-catchup-{}", uuid::Uuid::new_v4()));
+        let (handle, _, reservation) = super::begin_sprout_scan_session(
+            &store,
+            vec![[9; 32]],
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://node".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        store.finish_scan(
+            &handle,
+            Ok(SproutScanReport {
+                blocks_scanned: 1,
+                joinsplits_seen: 1,
+                notes_found: 1,
+                spent_notes: 0,
+                total_zatoshis: 100_000,
+                tip_warning: None,
+            }),
+        );
+        assert!(super::begin_sprout_catchup(&store, &handle).is_err());
+        drop(reservation);
+        assert!(super::begin_sprout_catchup(&store, &handle).is_ok());
+    }
+
+    #[test]
+    fn full_proposal_store_rejects_catchup_before_work_starts() {
+        let store = ReviewedIntentStore::default();
+        let dir = std::env::temp_dir().join(format!("argos-cap-{}", uuid::Uuid::new_v4()));
+        let (handle, _, reservation) = super::begin_sprout_scan_session(
+            &store,
+            vec![[10; 32]],
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://node".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        store.finish_scan(
+            &handle,
+            Ok(SproutScanReport {
+                blocks_scanned: 1,
+                joinsplits_seen: 1,
+                notes_found: 1,
+                spent_notes: 0,
+                total_zatoshis: 100_000,
+                tip_warning: None,
+            }),
+        );
+        drop(reservation);
+        for i in 0..crate::reviewed_intent::MAX_PROPOSALS {
+            store
+                .insert_proposal(
+                    SproutSweepIntent {
+                        source: SproutIntentSource::Wallet(format!("wallet-{i}")),
+                        notes: Vec::new(),
+                        destination: "zs-reviewed".into(),
+                        network: ZeckNetwork::Mainnet,
+                        lightwalletd_url: "https://node".into(),
+                        journal: None,
+                    },
+                    SproutSweepPreviewData {
+                        notes: 1,
+                        gross_zatoshis: 100_000,
+                        fee_zatoshis: 10_000,
+                        net_zatoshis: 90_000,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(super::begin_sprout_catchup(&store, &handle).is_err());
+    }
+
+    #[tokio::test]
+    async fn panicked_scan_worker_releases_checkpoint_and_marks_session_failed() {
+        let store = ReviewedIntentStore::default();
+        let dir = std::env::temp_dir().join(format!("argos-panic-{}", uuid::Uuid::new_v4()));
+        let (handle, material, reservation) = super::begin_sprout_scan_session(
+            &store,
+            vec![[11; 32]],
+            &dir,
+            ZeckNetwork::Mainnet,
+            "https://node".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let _reservation = reservation;
+            panic!("simulated scan panic");
+            #[allow(unreachable_code)]
+            Err::<SproutScanReport, String>("unreachable".into())
+        });
+        super::finish_sprout_scan_task(&store, &handle, task.await);
+        let snapshot = store.snapshot(&handle).unwrap();
+        assert!(matches!(
+            snapshot.status,
+            crate::reviewed_intent::SproutScanStatus::Failed
+        ));
+        assert!(store.reserve_checkpoint(&material.checkpoint).is_ok());
     }
 
     fn spent_note() -> SpentSproutNote {

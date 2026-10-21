@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    path::PathBuf,
+    collections::{HashMap, HashSet},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -12,6 +12,7 @@ use crate::commands::SproutScanReport;
 
 pub const MAX_SCAN_SESSIONS: usize = 16;
 pub const MAX_PROPOSALS: usize = 32;
+pub const MAX_IN_FLIGHT_CHECKPOINTS: usize = 16;
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -107,6 +108,83 @@ struct SproutScanSession {
 struct StoreInner {
     scans: HashMap<SproutScanHandle, SproutScanSession>,
     proposals: HashMap<SproutProposalId, SproutSweepIntent>,
+    in_flight_checkpoints: HashSet<PathBuf>,
+}
+
+/// A scan or catch-up owns this reservation until its future finishes or is
+/// dropped. The guard also releases on unwinding; it never exposes keys.
+pub struct CheckpointReservation {
+    inner: Arc<Mutex<StoreInner>>,
+    identity: PathBuf,
+}
+
+impl Drop for CheckpointReservation {
+    fn drop(&mut self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.in_flight_checkpoints.remove(&self.identity);
+    }
+}
+
+fn checkpoint_identity(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("resolving checkpoint location: {err}"))?
+            .join(path)
+    };
+    let parent = absolute
+        .parent()
+        .ok_or("invalid Sprout checkpoint directory")?;
+    let filename = absolute
+        .file_name()
+        .ok_or("invalid Sprout checkpoint path")?;
+    if let Ok(canonical_parent) = parent.canonicalize() {
+        return Ok(canonical_parent.join(filename));
+    }
+    let mut lexical = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other.as_os_str()),
+        }
+    }
+    let filename = lexical
+        .file_name()
+        .ok_or("invalid Sprout checkpoint path")?
+        .to_os_string();
+    let mut ancestor = lexical
+        .parent()
+        .ok_or("invalid Sprout checkpoint directory")?
+        .to_path_buf();
+    let mut suffix = Vec::new();
+    let mut canonical = loop {
+        match ancestor.canonicalize() {
+            Ok(path) => break path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor
+                    .file_name()
+                    .ok_or("invalid Sprout checkpoint directory")?;
+                suffix.push(name.to_os_string());
+                ancestor = ancestor
+                    .parent()
+                    .ok_or("invalid Sprout checkpoint directory")?
+                    .to_path_buf();
+            }
+            Err(err) => return Err(format!("resolving Sprout checkpoint directory: {err}")),
+        }
+    };
+    for name in suffix.into_iter().rev() {
+        canonical.push(name);
+    }
+    canonical.push(filename);
+    Ok(canonical)
 }
 
 #[derive(Default)]
@@ -119,6 +197,46 @@ impl Clone for ReviewedIntentStore {
 }
 
 impl ReviewedIntentStore {
+    pub fn reserve_checkpoint(&self, checkpoint: &Path) -> Result<CheckpointReservation, String> {
+        let identity = checkpoint_identity(checkpoint)?;
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| "Sprout review store unavailable")?;
+        if inner.in_flight_checkpoints.contains(&identity) {
+            return Err("a Sprout scan or catch-up is already using this checkpoint".into());
+        }
+        if inner.in_flight_checkpoints.len() >= MAX_IN_FLIGHT_CHECKPOINTS {
+            return Err("too many Sprout scans or catch-ups are running".into());
+        }
+        inner.in_flight_checkpoints.insert(identity.clone());
+        Ok(CheckpointReservation {
+            inner: Arc::clone(&self.0),
+            identity,
+        })
+    }
+
+    pub fn ensure_scan_proposal_capacity(&self, handle: &SproutScanHandle) -> Result<(), String> {
+        let inner = self
+            .0
+            .lock()
+            .map_err(|_| "Sprout review store unavailable")?;
+        let scan = inner
+            .scans
+            .get(handle)
+            .ok_or("unknown or released Sprout scan")?;
+        if scan.released || !matches!(scan.status, SproutScanStatus::Completed) {
+            return Err("wait for the Sprout scan to complete".into());
+        }
+        let replaces_current = inner.proposals.values().any(
+            |intent| matches!(&intent.source, SproutIntentSource::Scan(source) if source == handle),
+        );
+        if inner.proposals.len() >= MAX_PROPOSALS && !replaces_current {
+            return Err("too many Sprout proposals; release an old proposal first".into());
+        }
+        Ok(())
+    }
+
     pub fn insert_scan(
         &self,
         keys: Vec<[u8; 32]>,
@@ -587,6 +705,78 @@ mod tests {
                 Vec::new()
             )
             .is_ok());
+    }
+
+    #[test]
+    fn checkpoint_reservation_rejects_overlapping_scan_and_catchup() {
+        let store = ReviewedIntentStore::default();
+        let checkpoint = PathBuf::from("/tmp/argos-reservation-a.checkpoint");
+        let running_scan = store.reserve_checkpoint(&checkpoint).unwrap();
+        assert!(store.reserve_checkpoint(&checkpoint).is_err());
+        drop(running_scan);
+        assert!(store.reserve_checkpoint(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_reservation_normalizes_path_aliases() {
+        let store = ReviewedIntentStore::default();
+        let checkpoint = PathBuf::from("/tmp/argos-reservation-b.checkpoint");
+        let _running = store.reserve_checkpoint(&checkpoint).unwrap();
+        assert!(store
+            .reserve_checkpoint(&PathBuf::from("/tmp/./argos-reservation-b.checkpoint"))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_reservation_resolves_symlinked_parent_before_file_exists() {
+        let root = std::env::temp_dir().join(format!("argos-reservation-link-{}", Uuid::new_v4()));
+        let real = root.join("real");
+        let alias = root.join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let store = ReviewedIntentStore::default();
+        let _reservation = store
+            .reserve_checkpoint(&real.join("scan.checkpoint"))
+            .unwrap();
+        assert!(store
+            .reserve_checkpoint(&alias.join("scan.checkpoint"))
+            .is_err());
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_reservations_bound_work_before_proposals_exist() {
+        let store = ReviewedIntentStore::default();
+        let reservations: Vec<_> = (0..MAX_IN_FLIGHT_CHECKPOINTS)
+            .map(|i| {
+                store
+                    .reserve_checkpoint(&PathBuf::from(format!(
+                        "/tmp/argos-reservation-{i}.checkpoint"
+                    )))
+                    .unwrap()
+            })
+            .collect();
+        assert!(store
+            .reserve_checkpoint(&PathBuf::from("/tmp/argos-reservation-overflow.checkpoint"))
+            .is_err());
+        drop(reservations);
+        assert!(store
+            .reserve_checkpoint(&PathBuf::from("/tmp/argos-reservation-overflow.checkpoint"))
+            .is_ok());
+    }
+
+    #[test]
+    fn checkpoint_reservation_releases_on_unwind() {
+        let store = ReviewedIntentStore::default();
+        let checkpoint = PathBuf::from("/tmp/argos-reservation-panic.checkpoint");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reservation = store.reserve_checkpoint(&checkpoint).unwrap();
+            panic!("worker stopped");
+        }));
+        assert!(result.is_err());
+        assert!(store.reserve_checkpoint(&checkpoint).is_ok());
     }
 
     #[test]
