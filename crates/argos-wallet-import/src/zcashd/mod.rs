@@ -14,7 +14,11 @@ pub use sprout::collect_sprout_notes;
 
 use secrecy::SecretString;
 
-use crate::{bdb, error::ImportError, keys::ImportedKeys};
+use crate::{
+    bdb,
+    error::{ImportDiagnostic, ImportError},
+    keys::ImportedKeys,
+};
 
 /// True when the wallet carries an `mkey` record and therefore needs a
 /// passphrase. Checked before prompting so we never ask for a passphrase
@@ -52,6 +56,13 @@ pub fn import_zcashd(
         collect_encrypted(&pairs, &master, &mut out);
     }
 
+    if out.is_empty() {
+        out.diagnostics
+            .push(ImportDiagnostic::MissingSpendAuthority {
+                format: "Berkeley DB",
+            });
+    }
+
     Ok(out)
 }
 
@@ -62,6 +73,26 @@ mod tests {
 
     fn read(name: &str) -> Vec<u8> {
         std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap()
+    }
+
+    #[test]
+    fn valid_empty_bdb_cannot_claim_complete_recovery() {
+        let mut bytes = vec![0u8; 1024];
+        bytes[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&512u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&1u32.to_le_bytes());
+        bytes[512 + 25] = bdb::PAGE_TYPE_LBTREE;
+
+        let keys = import_zcashd(&bytes, None).expect("valid empty btree must parse");
+        assert!(keys.is_empty());
+        assert!(keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            crate::error::ImportDiagnostic::MissingSpendAuthority {
+                format: "Berkeley DB"
+            }
+        )));
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
     }
 
     #[test]

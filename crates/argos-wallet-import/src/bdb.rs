@@ -364,20 +364,28 @@ fn resolve_subdb_root(bytes: &[u8], meta: &BdbMeta, value: &[u8]) -> Option<u32>
     None
 }
 
-/// Walk every leaf page reachable from `root` and append the `(key,
-/// value)` pairs found to `out`.
-///
-/// Page pointers form an attacker-controlled graph, so `visited` bounds
-/// traversal within this call: without it a crafted file is a trivial
-/// infinite loop. `visited` is private to each `walk_from` invocation (see
-/// [`walk`]) so that one sub-tree's traversal can never cause another's to
-/// be silently skipped; `budget` is shared across every invocation in a
-/// single `walk` call and bounds total work across all of them.
+// Walk every leaf page reachable from `root` and append the `(key,
+// value)` pairs found to `out`.
+//
+// Page pointers form an attacker-controlled graph, so `visited` bounds
+// traversal within this call: without it a crafted file is a trivial
+// infinite loop. `visited` is private to each `walk_from` invocation (see
+// [`walk`]) so that one sub-tree's traversal can never cause another's to
+// be silently skipped; `budget` is shared across every invocation in a
+// single `walk` call and bounds total work across all of them.
+// Retain the source coordinate only until master-database pointers are resolved.
+// Raw record bytes remain owned once and are moved into the public result.
+struct LocatedRecord {
+    record: RawRecord,
+    page: u32,
+    slot: usize,
+}
+
 struct WalkState<'a> {
     visited: &'a mut BTreeSet<u32>,
     budget: &'a mut usize,
     limits: WalkLimits,
-    out: &'a mut Vec<RawRecord>,
+    out: &'a mut Vec<LocatedRecord>,
     damage: &'a mut DamageLog,
 }
 
@@ -533,12 +541,17 @@ fn walk_from(bytes: &[u8], meta: &BdbMeta, root: u32, state: WalkState<'_>) {
                     entries.push(item);
                 }
                 let mut slots = entries.into_iter();
+                let mut slot = 0;
                 while let Some(key) = slots.next() {
                     let value = slots.next();
                     match (key, value) {
                         (Some(k), Some(Some(v))) => {
                             if out.len() < limits.max_records {
-                                out.push((k, v));
+                                out.push(LocatedRecord {
+                                    record: (k, v),
+                                    page,
+                                    slot,
+                                });
                             } else {
                                 damage.push(format!("page {page}"), "record limit exceeded");
                             }
@@ -546,6 +559,7 @@ fn walk_from(bytes: &[u8], meta: &BdbMeta, root: u32, state: WalkState<'_>) {
                         (_, None) => damage.push(format!("page {page}"), "leaf entry is truncated"),
                         _ => {}
                     }
+                    slot += 2;
                 }
             }
             _ => damage.push(format!("page {page}"), "unexpected page type"),
@@ -585,18 +599,18 @@ fn walk_with_limits(bytes: &[u8], limits: WalkLimits) -> Result<BdbWalk, ImportE
 
     let mut out = Vec::new();
     let mut real_roots = Vec::new();
-    for (k, v) in top {
-        match resolve_subdb_root(bytes, &meta, &v) {
+    for located in top {
+        match resolve_subdb_root(bytes, &meta, &located.record.1) {
             Some(root) => real_roots.push(root),
-            None if k == b"main" => {
+            None if located.record.0 == b"main" => {
                 // zcashd's named database lives behind this master key.
                 // A broken pointer must not masquerade as an ordinary record.
                 damage.push(
-                    format!("page {}", meta.root_page),
+                    format!("page {} slot {}", located.page, located.slot),
                     "page offset is out of bounds",
                 );
             }
-            None => out.push((k, v)),
+            None => out.push(located),
         }
     }
     if !real_roots.is_empty() {
@@ -617,7 +631,7 @@ fn walk_with_limits(bytes: &[u8], limits: WalkLimits) -> Result<BdbWalk, ImportE
         }
     }
     Ok(BdbWalk {
-        records: out,
+        records: out.into_iter().map(|located| located.record).collect(),
         diagnostics: damage.finish(),
     })
 }
@@ -1198,6 +1212,16 @@ mod tests {
             assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
             assert_damage_at(&result, "page 1");
         }
+    }
+
+    #[test]
+    fn broken_main_pointer_on_child_leaf_reports_its_own_slot() {
+        let mut v = two_child_tree();
+        put_leaf_entry(&mut v, 512, 2, 0, 40, b"main");
+        put_leaf_entry(&mut v, 512, 2, 1, 60, &99u32.to_be_bytes());
+        let result = walk(&v).unwrap();
+        assert_eq!(result.records, vec![(b"good".to_vec(), b"value".to_vec())]);
+        assert_damage_at(&result, "page 2 slot 0");
     }
 
     #[test]
