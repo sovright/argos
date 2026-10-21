@@ -188,14 +188,17 @@ struct SweepBalanceSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedAuthoritySnapshot {
+    account_index: u32,
+    wallet_account_id: AccountUuid,
+    spend_authority: TrackedSpendAuthority,
+    transparent_receivers: Vec<zcash_transparent::address::TransparentAddress>,
+    standalone_transparent_receivers: Vec<zcash_transparent::address::TransparentAddress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SweepAuthoritySnapshot {
-    tracked: Vec<(
-        u32,
-        AccountUuid,
-        TrackedSpendAuthority,
-        Vec<zcash_transparent::address::TransparentAddress>,
-        Vec<zcash_transparent::address::TransparentAddress>,
-    )>,
+    tracked: Vec<TrackedAuthoritySnapshot>,
     standalone_sapling_indices: Vec<usize>,
     standalone_transparent_indices: Vec<usize>,
     standalone_transparent_balances: Vec<(u32, crate::scan::StandaloneTransparentBalance)>,
@@ -212,16 +215,16 @@ impl SweepAuthoritySnapshot {
                 let mut standalone_transparent_receivers =
                     account.standalone_transparent_receivers.clone();
                 standalone_transparent_receivers.sort_unstable();
-                (
-                    account.derived.index,
-                    account.wallet_account_id,
-                    account.spend_authority,
+                TrackedAuthoritySnapshot {
+                    account_index: account.derived.index,
+                    wallet_account_id: account.wallet_account_id,
+                    spend_authority: account.spend_authority,
                     transparent_receivers,
                     standalone_transparent_receivers,
-                )
+                }
             })
             .collect::<Vec<_>>();
-        tracked.sort_by_key(|(index, _, _, _, _)| *index);
+        tracked.sort_by_key(|account| account.account_index);
         let mut standalone_transparent_balances = state
             .standalone_transparent_balances
             .iter()
