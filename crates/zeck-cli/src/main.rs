@@ -1423,9 +1423,9 @@ fn print_wallet_inspection(
     // the parser, and this adds what the recovery path can say about them.
     print_sprout_inspection(keys, network, show_spent, data_dir);
 
-    // Never summarized away: an unread record means key material that
-    // still exists only in the original file, and the user is the only
-    // one who can act on that.
+    // Never summarize diagnostics away: unrecovered material may still
+    // exist in the original file. A locked HD key is different because
+    // its recovered seed can recreate it.
     // "Every record" would be false: bookkeeping records with no key
     // material are skipped by design.
     match keys.coverage_notice() {
@@ -1440,7 +1440,9 @@ fn print_wallet_inspection(
         }
         if keys.coverage().may_hide_funds() {
             println!();
-            println!("Keep the original wallet file. Anything listed above exists only there.");
+            println!(
+                "Keep the original wallet file. It may contain keys or records Argos has not recovered."
+            );
         }
     }
     println!();

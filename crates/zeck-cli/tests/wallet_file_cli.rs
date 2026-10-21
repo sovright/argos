@@ -206,6 +206,14 @@ fn inspect_wallet_distinguishes_locked_hd_and_standalone_keys() {
         "{shown}"
     );
     assert!(shown.contains("Keep the original wallet file"), "{shown}");
+    assert!(
+        shown.contains("It may contain keys or records Argos has not recovered"),
+        "the fund-hiding banner must remain visible: {shown}"
+    );
+    assert!(
+        !shown.contains("Anything listed above exists only there"),
+        "recovered HD keys can be recreated from the seed: {shown}"
+    );
 }
 
 #[test]

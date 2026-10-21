@@ -2394,6 +2394,21 @@ mod tests {
         assert!(store.reserve_checkpoint(&material.checkpoint).is_ok());
     }
 
+    fn empty_sprout_summary() -> SproutSummary {
+        SproutSummary {
+            sprout_keys: 0,
+            sprout_addresses: Vec::new(),
+            sprout_spendable_notes: 0,
+            sprout_spendable_zatoshis: 0,
+            sprout_issues: Vec::new(),
+            sprout_scan_warning: Vec::new(),
+            sprout_accounting: Vec::new(),
+            sprout_nothing_left: false,
+            sprout_spent_status: String::new(),
+            sprout_history_read: false,
+        }
+    }
+
     fn summary_with_diagnostics(
         diagnostics: Vec<argos_core::argos_wallet_import::ImportDiagnostic>,
         has_mnemonic: bool,
@@ -2408,22 +2423,10 @@ mod tests {
         if has_mnemonic {
             keys.mnemonic = Some(SecretString::new("public test seed".to_owned()));
         }
-        let sprout = SproutSummary {
-            sprout_keys: 0,
-            sprout_addresses: Vec::new(),
-            sprout_spendable_notes: 0,
-            sprout_spendable_zatoshis: 0,
-            sprout_issues: Vec::new(),
-            sprout_scan_warning: Vec::new(),
-            sprout_accounting: Vec::new(),
-            sprout_nothing_left: false,
-            sprout_spent_status: String::new(),
-            sprout_history_read: false,
-        };
         serde_json::to_value(wallet_summary_from_keys(
             "test.dat".to_owned(),
             keys,
-            sprout,
+            empty_sprout_summary(),
         ))
         .unwrap()
     }
@@ -2495,19 +2498,47 @@ mod tests {
     #[test]
     fn wallet_summary_redacts_identifier_mismatch() {
         use argos_core::argos_wallet_import::ImportDiagnostic;
-        let summary = summary_with_diagnostics(
-            vec![ImportDiagnostic::PublicIdentifierMismatch {
-                record_type: "zwl-tkey".to_owned(),
-                identifier: "transparent address",
-            }],
-            false,
+        let mut bytes = include_bytes!(
+            "../../../crates/argos-wallet-import/tests/fixtures/zwl-mainnet-empty.dat"
+        )
+        .to_vec();
+        let original = b"t1dUDJ62ANtmebE8drFg7g2MWYwXHQ6Xu3F";
+        let sentinel = b"t1SentinelWrongAddressAAAAAAAAAAAAA";
+        assert_eq!(original.len(), sentinel.len());
+        let offsets: Vec<_> = bytes
+            .windows(original.len())
+            .enumerate()
+            .filter_map(|(index, window)| (window == original).then_some(index))
+            .collect();
+        assert_eq!(offsets.len(), 1, "writer fixture address changed");
+        bytes[offsets[0]..offsets[0] + original.len()].copy_from_slice(sentinel);
+
+        let keys =
+            import_gui_wallet_then(&bytes, None, argos_core::ZeckNetwork::Mainnet, |keys| keys)
+                .unwrap();
+        assert!(
+            keys.transparent.is_empty(),
+            "mismatched key must be rejected"
         );
+        assert!(keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ImportDiagnostic::PublicIdentifierMismatch { .. }
+        )));
+        let summary = serde_json::to_value(wallet_summary_from_keys(
+            "public-fixture.dat".to_owned(),
+            keys,
+            empty_sprout_summary(),
+        ))
+        .unwrap();
         let serialized = summary.to_string();
         assert!(
             serialized.contains("mismatched record was not used"),
             "{serialized}"
         );
-        assert!(!serialized.contains("01010101") && !serialized.contains("t1SentinelWrongAddress"));
+        assert!(
+            !serialized.contains("t1SentinelWrongAddress"),
+            "{serialized}"
+        );
         assert_eq!(summary["coverage_may_hide_funds"], true);
     }
 
