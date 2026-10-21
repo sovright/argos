@@ -66,7 +66,17 @@ pub fn import_zcashd(
         collect_encrypted(&pairs, &master, &mut out);
     }
 
-    if out.is_empty() {
+    let absence_already_explained = out.diagnostics.iter().any(|diagnostic| match diagnostic {
+        ImportDiagnostic::UnrecoveredSeed { .. }
+        | ImportDiagnostic::DecryptionFailed { .. }
+        | ImportDiagnostic::PublicIdentifierMismatch { .. }
+        | ImportDiagnostic::LockedKey { .. }
+        | ImportDiagnostic::ContainerDamage { .. }
+        | ImportDiagnostic::UnsupportedWalletVersion { .. } => true,
+        ImportDiagnostic::UnparseableRecord { record_type, .. } => record_type != "tx",
+        _ => false,
+    });
+    if out.is_empty() && !absence_already_explained {
         out.diagnostics
             .push(ImportDiagnostic::MissingSpendAuthority {
                 format: "Berkeley DB",
@@ -275,6 +285,45 @@ mod tests {
         assert_eq!(
             keys.coverage(),
             crate::keys::ImportCoverage::KeyMaterialMissing
+        );
+    }
+
+    #[test]
+    fn seed_only_wallet_keeps_its_specific_coverage_without_missing_authority() {
+        // A structurally valid BDB leaf with only an unrecovered plaintext
+        // HD seed. This specific warning already explains absent spend keys.
+        let mut bytes = vec![0u8; 1024];
+        bytes[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&512u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&1u32.to_le_bytes());
+        let page = 512;
+        bytes[page + 20..page + 22].copy_from_slice(&2u16.to_le_bytes());
+        bytes[page + 25] = bdb::PAGE_TYPE_LBTREE;
+        let key = b"\x06hdseed";
+        let value = [0x42u8; 32];
+        for (slot, offset, data) in [(0, 40u16, key.as_slice()), (1, 60, value.as_slice())] {
+            let index = page + 26 + slot * 2;
+            bytes[index..index + 2].copy_from_slice(&offset.to_le_bytes());
+            let start = page + usize::from(offset);
+            bytes[start..start + 2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+            bytes[start + 2] = 1;
+            bytes[start + 3..start + 3 + data.len()].copy_from_slice(data);
+        }
+
+        let keys = import_zcashd(&bytes, None).unwrap();
+        assert!(keys.is_empty());
+        assert!(keys
+            .diagnostics
+            .iter()
+            .any(ImportDiagnostic::is_unrecovered_seed));
+        assert!(!keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ImportDiagnostic::MissingSpendAuthority { .. }
+        )));
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::SeedNotRecovered
         );
     }
 
