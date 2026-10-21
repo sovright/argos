@@ -121,6 +121,18 @@ pub enum ImportDiagnostic {
         provenance: Provenance,
     },
 
+    /// A standalone spending key of a pool Argos does not recover (an
+    /// Orchard key imported into ZecWallet Lite). It exists in no seed, so
+    /// the file is its only copy. The key bytes never reach this variant.
+    #[error(
+        "standalone {pool} spending key is not recovered by Argos and cannot be \
+         recreated from the seed; keep the original wallet file"
+    )]
+    UnrecoveredStandaloneKey {
+        record_type: String,
+        pool: &'static str,
+    },
+
     #[error("{format} wallet has no recoverable spending authority")]
     MissingSpendAuthority { format: &'static str },
 
@@ -275,6 +287,7 @@ impl std::fmt::Debug for ImportDiagnostic {
             Self::UnsupportedWalletVersion { .. } => "UnsupportedWalletVersion",
             Self::PublicIdentifierMismatch { .. } => "PublicIdentifierMismatch",
             Self::LockedKey { .. } => "LockedKey",
+            Self::UnrecoveredStandaloneKey { .. } => "UnrecoveredStandaloneKey",
             Self::MissingSpendAuthority { .. } => "MissingSpendAuthority",
             Self::ConflictingNetworkMetadata { .. } => "ConflictingNetworkMetadata",
             Self::UnrecognizedNetworkMetadata { .. } => "UnrecognizedNetworkMetadata",
