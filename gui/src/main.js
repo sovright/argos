@@ -1046,7 +1046,17 @@ function sproutScanPeers() {
 // to undo it. The panel's own birthday wins; otherwise the main birthday
 // field counts only once the user has set it, because its 419200 default
 // would otherwise cap every later skip. Either can only lower the skip.
+//
+// The backend takes the bound as a u32, and a larger number fails Tauri's
+// deserialisation with a raw serde error the user cannot act on, so it is
+// refused here in words. Number() of a long digit string is not exact past
+// 2^53, which is why the safe-integer check comes first.
 function sproutDecryptRequest(panelText, everyBlock, mainText, mainTouched) {
+  const MAX_BLOCK_HEIGHT = 4294967295;
+  const tooLarge = (n) => !Number.isSafeInteger(n) || n > MAX_BLOCK_HEIGHT;
+  const tooLargeError = (field) => ({
+    error: `The ${field} is too large: no block number is above ${MAX_BLOCK_HEIGHT.toLocaleString("en-US")}.`,
+  });
   const panel = String(panelText || "").trim();
   let birthdayFloor = null;
   if (panel) {
@@ -1054,8 +1064,10 @@ function sproutDecryptRequest(panelText, everyBlock, mainText, mainTouched) {
       return { error: "The Sprout scan birthday must be a block number." };
     }
     birthdayFloor = Number(panel);
+    if (tooLarge(birthdayFloor)) return tooLargeError("Sprout scan birthday");
   } else if (mainTouched && /^\d+$/.test(String(mainText || "").trim())) {
     birthdayFloor = Number(String(mainText).trim());
+    if (tooLarge(birthdayFloor)) return tooLargeError("wallet birthday");
   }
   return { birthdayFloor, decryptEveryBlock: !!everyBlock };
 }
@@ -1200,13 +1212,12 @@ async function runSproutScanSweep() {
     return;
   }
 
-  // The same request the scan used, so the sweep's resume asks for the
-  // same bound and is not refused.
-  const decrypt = currentSproutDecryptRequest();
-  if (decrypt.error) {
-    setStatus("sprout-scan-status", `✗ ${decrypt.error}`, "error");
-    return;
-  }
+  // No decrypt bound is sent: the backend resumes under the one the saved
+  // scan used, read from its checkpoint. Re-deriving it from the form would
+  // pick up any birthday change made since — auto-detect, an estimate, a
+  // retyped field — and a lower one makes the resume conflict after hours
+  // of scanning. Lowering the bound means starting a new scan, which says
+  // why when it has to refuse.
 
   const button = $("sprout-scan-sweep-run");
   button.disabled = true;
@@ -1228,8 +1239,6 @@ async function runSproutScanSweep() {
       dataDir: $("data-dir").value.trim(),
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       peers,
-      birthdayFloor: decrypt.birthdayFloor,
-      decryptEveryBlock: decrypt.decryptEveryBlock,
     });
 
     for (const sent of report.sent) {

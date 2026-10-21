@@ -266,6 +266,17 @@ const EXTRAPOLATION_BLOCK_SECONDS: i64 = 77;
 /// Two weeks of blocks is a few minutes of extra scanning.
 const CREATION_TIME_MARGIN_SECS: i64 = 14 * DAY_SECONDS;
 
+/// Seconds since the Unix epoch on this computer's clock.
+///
+/// The only clock read in this module. The dating functions take `now` as a
+/// parameter instead, so tests can fix it and nothing about a birthday
+/// depends on when a test happens to run.
+pub fn unix_time_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// The highest mainnet height that is certainly no later than the chain at
 /// `unix_time`, less a two-week margin. Clamped to at least 1.
 ///
@@ -345,6 +356,20 @@ pub struct WalletFileBirthday {
     pub sprout_skip_reason: String,
 }
 
+/// A key's creation time if it can be trusted at `now`.
+///
+/// A time later than this computer's clock was written by a machine whose
+/// clock was wrong, and the true birth could be any time before it. Treated
+/// as no time, so it can only make a scan start earlier.
+fn trusted_time(created_at: Option<i64>, now: i64) -> Option<i64> {
+    created_at.filter(|&t| t <= now)
+}
+
+/// Whether a key records a creation time `trusted_time` throws away.
+fn is_future(created_at: Option<i64>, now: i64) -> bool {
+    created_at.is_some_and(|t| t > now)
+}
+
 /// The height below which the Sprout scan of `keys`' Sprout keys plus
 /// `extra_sprout_keys` may skip trial decryption.
 ///
@@ -353,10 +378,12 @@ pub struct WalletFileBirthday {
 /// An extra key (from a key file or pasted text) counts as dated only if it
 /// is one of the file's own dated keys. Never uses transparent or Sapling
 /// times — a Sprout key can be older than every other key in the wallet.
+/// A time later than `now` counts as no time (see [`trusted_time`]).
 pub fn sprout_skip_height(
     keys: &ImportedKeys,
     extra_sprout_keys: &[[u8; 32]],
     network: ZeckNetwork,
+    now: i64,
 ) -> Option<u32> {
     let dated = |a_sk: &[u8; 32]| -> Option<i64> {
         let mut matching = keys
@@ -367,7 +394,10 @@ pub fn sprout_skip_height(
         matching.peek()?;
         // A key stored twice with different metadata takes the most
         // cautious reading: any record without a time means no time.
-        matching.map(|k| k.created_at).min().flatten()
+        matching
+            .map(|k| trusted_time(k.created_at, now))
+            .min()
+            .flatten()
     };
     let mut earliest: Option<i64> = None;
     let scanned = keys
@@ -391,24 +421,26 @@ pub fn sprout_skip_height(
 ///
 /// `extra_sprout_keys` are Sprout keys that will be scanned alongside the
 /// file's (a `--sprout-key-file`, the GUI paste box); they affect only the
-/// Sprout skip.
+/// Sprout skip. `keys_added_outside_file` counts the keys in `keys` that did
+/// not come from the file (Sapling keys merged in from a key file or the
+/// paste box, which never carry a time), so the message can say where the
+/// undated keys came from. `now` is the current Unix time: a creation time
+/// later than it counts as no time.
 pub fn wallet_file_birthday_from_metadata(
     keys: &ImportedKeys,
     extra_sprout_keys: &[[u8; 32]],
     network: ZeckNetwork,
+    keys_added_outside_file: usize,
+    now: i64,
 ) -> WalletFileBirthday {
-    let times: Vec<Option<i64>> = keys
-        .transparent
-        .iter()
-        .map(|k| k.created_at)
-        .chain(keys.sapling.iter().map(|k| k.created_at))
-        .chain(keys.sprout.iter().map(|k| k.created_at))
-        .collect();
+    let recorded: Vec<Option<i64>> = all_created_at(keys).collect();
+    let times: Vec<Option<i64>> = recorded.iter().map(|&t| trusted_time(t, now)).collect();
     let total = times.len();
     let keys_without_time = times.iter().filter(|t| t.is_none()).count();
+    let future = recorded.iter().filter(|&&t| is_future(t, now)).count();
 
-    let sprout_skip = sprout_skip_height(keys, extra_sprout_keys, network);
-    let sprout_skip_reason = sprout_skip_reason(keys, extra_sprout_keys, network, sprout_skip);
+    let sprout_skip = sprout_skip_height(keys, extra_sprout_keys, network, now);
+    let sprout_skip_reason = sprout_skip_reason(keys, extra_sprout_keys, network, sprout_skip, now);
 
     let earliest = times.iter().copied().min().flatten();
     let dated_height = earliest.and_then(|t| height_at_or_before_time(network, t));
@@ -433,9 +465,8 @@ pub fn wallet_file_birthday_from_metadata(
                 "The wallet file holds no keys to date".to_owned()
             } else {
                 format!(
-                    "{keys_without_time} of {total} keys in the wallet file have no recorded \
-                     creation time (zcashd does not record one for imported keys), so the \
-                     file cannot say how old the wallet is"
+                    "{}, so the keys cannot all be dated",
+                    describe_undated(total, keys_without_time, future, keys_added_outside_file)
                 )
             };
             format!("{why}. Argos will scan from the start of each pool.")
@@ -452,11 +483,60 @@ pub fn wallet_file_birthday_from_metadata(
     }
 }
 
+/// Every key's recorded creation time, in no particular order.
+fn all_created_at(keys: &ImportedKeys) -> impl Iterator<Item = Option<i64>> + '_ {
+    keys.transparent
+        .iter()
+        .map(|k| k.created_at)
+        .chain(keys.sapling.iter().map(|k| k.created_at))
+        .chain(keys.sprout.iter().map(|k| k.created_at))
+}
+
+/// Which keys are undated and why, as the start of a sentence.
+///
+/// `total` and `undated` count every key in the set, including the
+/// `outside` ones added from a key file or the paste box. Those always lack
+/// a time, so they are named for what they are rather than counted as the
+/// file's, and zcashd is blamed only for keys that are in the file.
+fn describe_undated(total: usize, undated: usize, future: usize, outside: usize) -> String {
+    let outside = outside.min(undated);
+    let file_total = total.saturating_sub(outside);
+    let file_undated = undated - outside;
+    let added =
+        format!("{outside} key(s) added from a key file or paste box carry no creation time");
+    if file_undated == 0 {
+        return added;
+    }
+    let file_part = if future == 0 {
+        format!(
+            "{file_undated} of {file_total} keys in the wallet file have no recorded creation \
+             time (zcashd does not record one for imported keys)"
+        )
+    } else if future == file_undated {
+        format!(
+            "{file_undated} of {file_total} keys in the wallet file have no usable creation \
+             time ({future} record one later than this computer's clock, which cannot be right)"
+        )
+    } else {
+        format!(
+            "{file_undated} of {file_total} keys in the wallet file have no usable creation \
+             time ({future} record one later than this computer's clock, and zcashd does not \
+             record one for imported keys)"
+        )
+    };
+    if outside == 0 {
+        file_part
+    } else {
+        format!("{file_part}, and {added}")
+    }
+}
+
 fn sprout_skip_reason(
     keys: &ImportedKeys,
     extra_sprout_keys: &[[u8; 32]],
     network: ZeckNetwork,
     skip: Option<u32>,
+    now: i64,
 ) -> String {
     if let Some(height) = skip {
         return format!(
@@ -471,6 +551,9 @@ fn sprout_skip_reason(
         "there are no Sprout keys to scan"
     } else if network != ZeckNetwork::Mainnet {
         "creation times are only converted to heights on mainnet"
+    } else if keys.sprout.iter().any(|k| is_future(k.created_at, now)) {
+        "at least one Sprout key being scanned records a creation time later than this \
+         computer's clock, which cannot be right"
     } else {
         "at least one Sprout key being scanned has no recorded creation time"
     };
@@ -554,6 +637,8 @@ fn apply_utxo_fallback(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     earliest_utxo: Option<u32>,
+    keys_added_outside_file: usize,
+    now: i64,
 ) -> WalletFileBirthday {
     let Some(earliest_utxo) = earliest_utxo else {
         return WalletFileBirthday {
@@ -566,27 +651,28 @@ fn apply_utxo_fallback(
         };
     };
     let from_chain = earliest_utxo.saturating_sub(BIRTHDAY_BUFFER_BLOCKS).max(1);
-    let dated_min = keys
-        .transparent
-        .iter()
-        .map(|k| k.created_at)
-        .chain(keys.sapling.iter().map(|k| k.created_at))
-        .chain(keys.sprout.iter().map(|k| k.created_at))
-        .flatten()
+    let dated_min = all_created_at(keys)
+        .filter_map(|t| trusted_time(t, now))
         .filter_map(|t| height_at_or_before_time(network, t))
         .min();
+    let recorded: Vec<Option<i64>> = all_created_at(keys).collect();
+    let future = recorded.iter().filter(|&&t| is_future(t, now)).count();
+    let undated = describe_undated(
+        recorded.len(),
+        offline.keys_without_time,
+        future,
+        keys_added_outside_file,
+    );
     let height = dated_min.map_or(from_chain, |d| d.min(from_chain));
     WalletFileBirthday {
         height: Some(height),
         source: WalletBirthdaySource::TransparentUtxos,
         message: format!(
-            "{} of the wallet file's keys have no recorded creation time, so the birthday \
-             comes from the chain: the earliest unspent transparent output for this file's \
-             keys is at block {earliest_utxo}, and Argos will start from block {height}. \
-             That is an upper bound, not the wallet's age — funds received and later spent, \
-             or held only in shielded pools, can be older. If the wallet is older, enter an \
-             earlier birthday.",
-            offline.keys_without_time
+            "{undated}, so the birthday comes from the chain: the earliest unspent \
+             transparent output for this file's keys is at block {earliest_utxo}, and Argos \
+             will start from block {height}. That is an upper bound, not the wallet's age — \
+             funds received and later spent, or held only in shielded pools, can be older. \
+             If the wallet is older, enter an earlier birthday."
         ),
         ..offline
     }
@@ -603,13 +689,21 @@ pub async fn detect_wallet_file_birthday<F>(
     keys: &ImportedKeys,
     extra_sprout_keys: &[[u8; 32]],
     network: ZeckNetwork,
+    keys_added_outside_file: usize,
+    now: i64,
     lightwalletd_url: Option<&str>,
     on_progress: F,
 ) -> WalletFileBirthday
 where
     F: Fn(&str) + Send,
 {
-    let offline = wallet_file_birthday_from_metadata(keys, extra_sprout_keys, network);
+    let offline = wallet_file_birthday_from_metadata(
+        keys,
+        extra_sprout_keys,
+        network,
+        keys_added_outside_file,
+        now,
+    );
     let Some(url) = lightwalletd_url else {
         return offline;
     };
@@ -647,7 +741,14 @@ where
         &on_progress,
     )
     .await;
-    apply_utxo_fallback(offline, keys, network, earliest)
+    apply_utxo_fallback(
+        offline,
+        keys,
+        network,
+        earliest,
+        keys_added_outside_file,
+        now,
+    )
 }
 
 /// Earliest confirmed UTXO height for `keys`, the minimum across every
@@ -1565,6 +1666,8 @@ mod tests {
     const T_2017: i64 = 1_500_000_000; // 2017-07-14
     const T_2018: i64 = 1_530_000_000; // 2018-06-26
     const T_2019: i64 = 1_560_000_000; // 2019-06-08
+    /// The clock every test runs at, fixed so no test depends on today.
+    const NOW: i64 = 1_800_000_000; // 2027-01-15
 
     fn mainnet_bound(time: i64) -> u32 {
         height_at_or_before_time(ZeckNetwork::Mainnet, time).unwrap()
@@ -1578,7 +1681,7 @@ mod tests {
             sprout: vec![z_key(9, Some(T_2017))],
             ..ImportedKeys::default()
         };
-        let b = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet);
+        let b = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet, 0, NOW);
         assert_eq!(b.source, WalletBirthdaySource::WalletMetadata);
         assert_eq!(b.height, Some(mainnet_bound(T_2017)));
         assert!(
@@ -1603,7 +1706,7 @@ mod tests {
             sprout: vec![z_key(9, Some(T_2019))],
             ..ImportedKeys::default()
         };
-        let b = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet);
+        let b = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet, 0, NOW);
         assert_eq!(b.source, WalletBirthdaySource::None);
         assert_eq!(b.height, None);
         assert_eq!(b.keys_without_time, 1);
@@ -1624,7 +1727,7 @@ mod tests {
             ..ImportedKeys::default()
         };
         assert_eq!(
-            sprout_skip_height(&keys, &[], ZeckNetwork::Mainnet),
+            sprout_skip_height(&keys, &[], ZeckNetwork::Mainnet, NOW),
             Some(mainnet_bound(T_2018))
         );
     }
@@ -1635,9 +1738,15 @@ mod tests {
             sprout: vec![z_key(8, Some(T_2019)), z_key(9, None)],
             ..ImportedKeys::default()
         };
-        assert_eq!(sprout_skip_height(&keys, &[], ZeckNetwork::Mainnet), None);
+        assert_eq!(
+            sprout_skip_height(&keys, &[], ZeckNetwork::Mainnet, NOW),
+            None
+        );
         let none = ImportedKeys::default();
-        assert_eq!(sprout_skip_height(&none, &[], ZeckNetwork::Mainnet), None);
+        assert_eq!(
+            sprout_skip_height(&none, &[], ZeckNetwork::Mainnet, NOW),
+            None
+        );
     }
 
     /// A key supplied alongside the file (`--sprout-key-file`, the GUI paste
@@ -1650,19 +1759,25 @@ mod tests {
             ..ImportedKeys::default()
         };
         assert_eq!(
-            sprout_skip_height(&keys, &[[0x77; 32]], ZeckNetwork::Mainnet),
+            sprout_skip_height(&keys, &[[0x77; 32]], ZeckNetwork::Mainnet, NOW),
             None
         );
         assert_eq!(
-            sprout_skip_height(&keys, &[[8; 32]], ZeckNetwork::Mainnet),
+            sprout_skip_height(&keys, &[[8; 32]], ZeckNetwork::Mainnet, NOW),
             Some(mainnet_bound(T_2019))
         );
         // And with no file keys at all, only extras: nothing to date them by.
         assert_eq!(
-            sprout_skip_height(&ImportedKeys::default(), &[[8; 32]], ZeckNetwork::Mainnet),
+            sprout_skip_height(
+                &ImportedKeys::default(),
+                &[[8; 32]],
+                ZeckNetwork::Mainnet,
+                NOW
+            ),
             None
         );
-        let b = wallet_file_birthday_from_metadata(&keys, &[[0x77; 32]], ZeckNetwork::Mainnet);
+        let b =
+            wallet_file_birthday_from_metadata(&keys, &[[0x77; 32]], ZeckNetwork::Mainnet, 0, NOW);
         assert_eq!(b.sprout_skip_height, None);
         assert!(
             b.sprout_skip_reason.contains("no recorded creation time"),
@@ -1678,7 +1793,7 @@ mod tests {
             sprout: vec![z_key(9, Some(T_2018))],
             ..ImportedKeys::default()
         };
-        let b = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Testnet);
+        let b = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Testnet, 0, NOW);
         assert_eq!(b.source, WalletBirthdaySource::None);
         assert_eq!(b.height, None);
         assert_eq!(b.sprout_skip_height, None);
@@ -1695,11 +1810,18 @@ mod tests {
             sprout: vec![z_key(9, Some(T_2019))],
             ..ImportedKeys::default()
         };
-        let offline = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet);
+        let offline = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet, 0, NOW);
         let skip = offline.sprout_skip_height;
         assert!(skip.is_some());
 
-        let b = apply_utxo_fallback(offline.clone(), &keys, ZeckNetwork::Mainnet, Some(300_000));
+        let b = apply_utxo_fallback(
+            offline.clone(),
+            &keys,
+            ZeckNetwork::Mainnet,
+            Some(300_000),
+            0,
+            NOW,
+        );
         assert_eq!(b.source, WalletBirthdaySource::TransparentUtxos);
         assert_eq!(b.height, Some(300_000 - BIRTHDAY_BUFFER_BLOCKS));
         assert_eq!(b.sprout_skip_height, skip);
@@ -1711,17 +1833,161 @@ mod tests {
             &keys,
             ZeckNetwork::Mainnet,
             Some(3_000_000),
+            0,
+            NOW,
         );
         assert_eq!(late.height, Some(mainnet_bound(T_2019)));
 
         // Clamped at block 1, not at Sapling activation.
-        let early = apply_utxo_fallback(offline.clone(), &keys, ZeckNetwork::Mainnet, Some(5_000));
+        let early = apply_utxo_fallback(
+            offline.clone(),
+            &keys,
+            ZeckNetwork::Mainnet,
+            Some(5_000),
+            0,
+            NOW,
+        );
         assert_eq!(early.height, Some(1));
 
         // Nothing found on chain: still no birthday.
-        let none = apply_utxo_fallback(offline.clone(), &keys, ZeckNetwork::Mainnet, None);
+        let none = apply_utxo_fallback(offline.clone(), &keys, ZeckNetwork::Mainnet, None, 0, NOW);
         assert_eq!(none.source, WalletBirthdaySource::None);
         assert_eq!(none.height, None);
+    }
+
+    /// A creation time later than this computer's clock cannot be a real
+    /// birth: it comes from a machine whose clock was wrong. Trusted, it
+    /// would push the Sprout skip past every real note. So it counts as
+    /// undated, for the skip and for the birthday shown, while a time at
+    /// exactly `now` is still accepted.
+    #[test]
+    fn a_creation_time_later_than_now_is_undated() {
+        let future = NOW + 1;
+        let keys = ImportedKeys {
+            transparent: vec![t_key(1, Some(T_2018))],
+            sprout: vec![z_key(8, Some(T_2019)), z_key(9, Some(future))],
+            ..ImportedKeys::default()
+        };
+        assert_eq!(
+            sprout_skip_height(&keys, &[], ZeckNetwork::Mainnet, NOW),
+            None
+        );
+        let b = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet, 0, NOW);
+        assert_eq!(b.sprout_skip_height, None);
+        assert!(
+            b.sprout_skip_reason
+                .contains("later than this computer's clock"),
+            "{}",
+            b.sprout_skip_reason
+        );
+        assert_eq!(b.source, WalletBirthdaySource::None);
+        assert_eq!(b.height, None);
+        assert_eq!(b.keys_without_time, 1);
+        assert!(
+            b.message.contains("later than this computer's clock"),
+            "{}",
+            b.message
+        );
+
+        // The same file read with a clock past that time dates normally.
+        let later = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet, 0, future);
+        assert_eq!(later.source, WalletBirthdaySource::WalletMetadata);
+        assert_eq!(later.sprout_skip_height, Some(mainnet_bound(T_2019)));
+
+        // A future time never lowers or raises the chain fallback either:
+        // only the honest dated key can pull it down.
+        let only_future = ImportedKeys {
+            transparent: vec![t_key(1, None), t_key(2, Some(future))],
+            ..ImportedKeys::default()
+        };
+        let offline =
+            wallet_file_birthday_from_metadata(&only_future, &[], ZeckNetwork::Mainnet, 0, NOW);
+        let b = apply_utxo_fallback(
+            offline,
+            &only_future,
+            ZeckNetwork::Mainnet,
+            Some(3_000_000),
+            0,
+            NOW,
+        );
+        assert_eq!(b.height, Some(3_000_000 - BIRTHDAY_BUFFER_BLOCKS));
+    }
+
+    /// Keys supplied beside the file (a --sapling-key-file, the GUI paste
+    /// box) carry no time. The message must say so in those words, not
+    /// claim they are in the file or blame zcashd for them.
+    #[test]
+    fn the_message_names_where_undated_keys_came_from() {
+        // File-only: one of the file's three keys is undated.
+        let file_only = ImportedKeys {
+            transparent: vec![t_key(1, Some(T_2018)), t_key(2, None)],
+            sapling: vec![s_key(Some(T_2019))],
+            ..ImportedKeys::default()
+        };
+        let b = wallet_file_birthday_from_metadata(&file_only, &[], ZeckNetwork::Mainnet, 0, NOW);
+        assert!(
+            b.message.contains("1 of 3 keys in the wallet file"),
+            "{}",
+            b.message
+        );
+        assert!(b.message.contains("zcashd"), "{}", b.message);
+        assert!(
+            !b.message.contains("key file or paste box"),
+            "{}",
+            b.message
+        );
+
+        // Extra-only: every file key is dated; two keys were added.
+        let extra_only = ImportedKeys {
+            transparent: vec![t_key(1, Some(T_2018))],
+            sapling: vec![s_key(Some(T_2019)), s_key(None), s_key(None)],
+            ..ImportedKeys::default()
+        };
+        let b = wallet_file_birthday_from_metadata(&extra_only, &[], ZeckNetwork::Mainnet, 2, NOW);
+        assert_eq!(b.source, WalletBirthdaySource::None);
+        assert!(
+            b.message
+                .contains("2 key(s) added from a key file or paste box carry no creation time"),
+            "{}",
+            b.message
+        );
+        assert!(
+            !b.message.contains("in the wallet file have"),
+            "{}",
+            b.message
+        );
+        assert!(!b.message.contains("zcashd"), "{}", b.message);
+        let fallback =
+            apply_utxo_fallback(b, &extra_only, ZeckNetwork::Mainnet, Some(300_000), 2, NOW);
+        assert!(
+            fallback.message.contains("key file or paste box"),
+            "{}",
+            fallback.message
+        );
+        assert!(
+            !fallback.message.contains("of the wallet file's keys"),
+            "{}",
+            fallback.message
+        );
+
+        // Both: one of the file's two keys is undated, and one was added.
+        let both = ImportedKeys {
+            transparent: vec![t_key(1, Some(T_2018)), t_key(2, None)],
+            sapling: vec![s_key(None)],
+            ..ImportedKeys::default()
+        };
+        let b = wallet_file_birthday_from_metadata(&both, &[], ZeckNetwork::Mainnet, 1, NOW);
+        assert!(
+            b.message.contains("1 of 2 keys in the wallet file"),
+            "{}",
+            b.message
+        );
+        assert!(
+            b.message
+                .contains("1 key(s) added from a key file or paste box"),
+            "{}",
+            b.message
+        );
     }
 
     #[test]
@@ -1730,20 +1996,22 @@ mod tests {
             transparent: vec![t_key(1, Some(T_2019))],
             ..ImportedKeys::default()
         };
-        let offline = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet);
+        let offline = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet, 0, NOW);
         assert!(!needs_chain_fallback(&offline, &keys));
         let undated = ImportedKeys {
             transparent: vec![t_key(1, None)],
             ..ImportedKeys::default()
         };
-        let offline = wallet_file_birthday_from_metadata(&undated, &[], ZeckNetwork::Mainnet);
+        let offline =
+            wallet_file_birthday_from_metadata(&undated, &[], ZeckNetwork::Mainnet, 0, NOW);
         assert!(needs_chain_fallback(&offline, &undated));
         // No transparent keys: nothing to ask the chain about.
         let sapling_only = ImportedKeys {
             sapling: vec![s_key(None)],
             ..ImportedKeys::default()
         };
-        let offline = wallet_file_birthday_from_metadata(&sapling_only, &[], ZeckNetwork::Mainnet);
+        let offline =
+            wallet_file_birthday_from_metadata(&sapling_only, &[], ZeckNetwork::Mainnet, 0, NOW);
         assert!(!needs_chain_fallback(&offline, &sapling_only));
     }
 }

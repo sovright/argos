@@ -407,6 +407,57 @@ pub fn reconcile_decrypt_from(
     })
 }
 
+/// The decrypt-from bound a scan may apply, given a height the chain is
+/// known to have reached.
+///
+/// A bound above the tip would decrypt nothing at all, and can only come
+/// from creation times written by a machine whose clock ran ahead. Such a
+/// bound is evidence of nothing, so it is dropped and every block is
+/// decrypted. With no tip to compare against, the bound passes through:
+/// the creation-time check against the current time
+/// (`birthday::sprout_skip_height`) is then the only guard.
+pub fn bound_within_tip(decrypt_from: Option<u32>, tip: Option<u32>) -> Option<u32> {
+    match (decrypt_from, tip) {
+        (Some(bound), Some(tip)) if bound > tip => None,
+        _ => decrypt_from,
+    }
+}
+
+/// What to tell the user when [`bound_within_tip`] drops the requested
+/// skip for the tip the scan was given. The line printed before the scan
+/// promised a skip, and must not be left standing. Asked of the same inputs
+/// rather than inferred from the bound the scan reports, because a resume of
+/// a scan that decrypted every block also reports no bound, for a different
+/// reason.
+pub fn dropped_bound_line(requested: Option<u32>, tip: Option<u32>) -> Option<String> {
+    match (requested, bound_within_tip(requested, tip)) {
+        (Some(bound), None) => Some(format!(
+            "Trial decryption covered every block from 1: the requested start, block \
+             {bound}, is above the chain tip lightwalletd reported, so the wallet file's \
+             creation times cannot be right and were not used."
+        )),
+        _ => None,
+    }
+}
+
+/// The decrypt-from bound the saved scan for `spending_keys` ran under, or
+/// `None` when there is no checkpoint. `Some(None)` is a scan that
+/// decrypted every block.
+///
+/// For a resume that must continue exactly as the scan ran — the sweep
+/// after a scan — rather than re-deriving the bound from inputs that may
+/// have changed since, which [`reconcile_decrypt_from`] would refuse. The
+/// checkpoint is checked as a resume checks it: wrong keys or network is an
+/// error.
+pub fn saved_decrypt_from(
+    checkpoint_file: &Path,
+    network: P2pNetwork,
+    spending_keys: &[[u8; 32]],
+) -> ZeckResult<Option<Option<u32>>> {
+    Ok(load_checkpoint(checkpoint_file, network, spending_keys)?
+        .map(|scanner| scanner.decrypt_from_height()))
+}
+
 /// Read a checkpoint file. `Ok(None)` only when there is no file: any other
 /// failure — permissions, I/O, a directory in its place — is an error, so a
 /// scan that ran for hours never reads as one that never ran.
@@ -998,6 +1049,12 @@ pub async fn run_sprout_scan_with_decrypt_from(
     let floor = tip_anchor
         .map_or(0, |anchor| anchor.height.saturating_add(1))
         .max(network.sprout_scan_minimum_tip());
+
+    // lightwalletd's tip is the one height known to be on the chain before
+    // any peer is reached. A requested bound above it is dropped here, before
+    // the resume check, so a checkpoint that walked under such a bound is
+    // refused rather than continued under it.
+    let decrypt_from = bound_within_tip(decrypt_from, tip_anchor.map(|anchor| anchor.height));
 
     // Resume if we can. A checkpoint that will not load is reported rather
     // than silently discarded: starting a six-hour scan over because a file
@@ -2909,6 +2966,62 @@ mod tests {
         let conflict = reconcile_decrypt_from(Some(100), Some(1), None).unwrap_err();
         assert_eq!(conflict.stored, 100);
         assert_eq!(conflict.requested, None);
+    }
+
+    /// A bound above the tip lightwalletd reported would decrypt nothing at
+    /// all. Such a bound can only come from wrong creation times, so it is
+    /// dropped and every block is decrypted. With no tip to compare against
+    /// the bound passes through; the creation-time check already ran.
+    #[test]
+    fn a_bound_above_the_known_tip_is_not_applied() {
+        assert_eq!(bound_within_tip(Some(500), Some(400)), None);
+        assert_eq!(bound_within_tip(Some(400), Some(400)), Some(400));
+        assert_eq!(bound_within_tip(Some(300), Some(400)), Some(300));
+        assert_eq!(bound_within_tip(Some(500), None), Some(500));
+        assert_eq!(bound_within_tip(None, Some(400)), None);
+    }
+
+    #[test]
+    fn a_dropped_skip_is_said_and_a_kept_one_is_not() {
+        let line = dropped_bound_line(Some(500), Some(400)).expect("the skip was dropped");
+        assert!(
+            line.contains("every block") && line.contains("500"),
+            "{line}"
+        );
+        assert_eq!(dropped_bound_line(Some(500), Some(500)), None);
+        assert_eq!(dropped_bound_line(Some(500), None), None);
+        assert_eq!(dropped_bound_line(None, Some(400)), None);
+    }
+
+    /// The sweep resumes under the bound the scan actually used, read from
+    /// the checkpoint, so no later change to the form can make it conflict.
+    #[test]
+    fn the_saved_bound_is_read_back_for_the_same_keys_only() {
+        let keys = [[0x13; 32]];
+        let dir = fresh_dir("saved-decrypt-from");
+
+        let missing = dir.join("missing.checkpoint");
+        assert_eq!(
+            saved_decrypt_from(&missing, P2pNetwork::Regtest, &keys).unwrap(),
+            None
+        );
+
+        for (name, bound) in [("skip", Some(300)), ("every", None)] {
+            let mut scanner = SproutScanner::with_decrypt_from(&keys, bound);
+            scanner
+                .scan_block_at(&[], [0xCF; 32], 400)
+                .expect("an empty block");
+            let path = dir.join(format!("{name}.checkpoint"));
+            save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+            assert_eq!(
+                saved_decrypt_from(&path, P2pNetwork::Regtest, &keys).unwrap(),
+                Some(bound),
+                "{name}"
+            );
+            // Another key set's checkpoint is refused, not read.
+            assert!(saved_decrypt_from(&path, P2pNetwork::Regtest, &[[0x14; 32]]).is_err());
+            discard_checkpoint(&path);
+        }
     }
 
     #[tokio::test]

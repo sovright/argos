@@ -867,12 +867,17 @@ fn sprout_scan_plan(
     network: ZeckNetwork,
     birthday: Option<u32>,
     no_birthday_skip: bool,
+    now: i64,
 ) -> argos_core::SproutDecryptPlan {
     let empty = ImportedKeys::default();
+    // No Sapling keys are added here: --sprout-key-file keys are passed as
+    // Sprout extras, which only the skip reads.
     let dated = argos_core::wallet_file_birthday_from_metadata(
         wallet.unwrap_or(&empty),
         key_file_keys,
         network,
+        0,
+        now,
     );
     argos_core::plan_sprout_decrypt(
         dated.sprout_skip_height,
@@ -960,6 +965,7 @@ async fn scan_sprout(
     print_sprout_scan_cost_warning(network);
 
     let tip_anchor = sprout_tip_anchor(network, lightwalletd_url).await;
+    let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
 
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
     // Worded for what exists: nothing is written until the first
@@ -1017,6 +1023,11 @@ async fn scan_sprout(
     match result.decrypt_from_height {
         Some(height) => println!("  Decrypted from    block {height}"),
         None => println!("  Decrypted from    block 1 (every block)"),
+    }
+    // The plan printed before the scan promised a skip; say why it did not
+    // happen rather than leave that standing.
+    if let Some(line) = argos_core::sprout_scan_run::dropped_bound_line(decrypt_from, tip_height) {
+        println!("  {line}");
     }
     println!("  JoinSplits seen   {}", result.progress.joinsplits_seen);
     println!("  Notes found       {}", result.notes.len());
@@ -1588,6 +1599,7 @@ async fn resolve_birthday(
     cli: &Cli,
     seed_phrase: Option<&SecretString>,
     imported: Option<&ImportedKeys>,
+    keys_added_from_key_file: usize,
     network: ZeckNetwork,
 ) -> Result<u32> {
     if cli.birthday_auto_detect {
@@ -1603,7 +1615,9 @@ async fn resolve_birthday(
                      neither. Pass --birthday <height> or --birthday-date <YYYY-MM-DD> instead."
                 )
             })?;
-            return Ok(detect_wallet_dat_birthday(cli, keys, network).await);
+            return Ok(
+                detect_wallet_dat_birthday(cli, keys, keys_added_from_key_file, network).await,
+            );
         };
         eprintln!("Auto-detecting wallet birthday from on-chain history…");
         let result = detect_birthday(seed_phrase, network, &cli.lightwalletd_url, |msg| {
@@ -1636,7 +1650,16 @@ fn wallet_file_is_zcashd(path: &Path) -> Result<bool> {
 ///
 /// Never fails: when nothing can be dated, the scan starts from the
 /// beginning of the Sapling pool, which is slow but cannot miss a note.
-async fn detect_wallet_dat_birthday(cli: &Cli, keys: &ImportedKeys, network: ZeckNetwork) -> u32 {
+///
+/// `keys_added_from_key_file` is how many of `keys`' Sapling keys came from
+/// --sapling-key-file rather than the wallet file, so the message can say
+/// where the undated keys came from.
+async fn detect_wallet_dat_birthday(
+    cli: &Cli,
+    keys: &ImportedKeys,
+    keys_added_from_key_file: usize,
+    network: ZeckNetwork,
+) -> u32 {
     use argos_core::WalletBirthdaySource;
 
     eprintln!("Dating the wallet file from its key creation times…");
@@ -1646,15 +1669,12 @@ async fn detect_wallet_dat_birthday(cli: &Cli, keys: &ImportedKeys, network: Zec
         keys,
         &[],
         network,
+        keys_added_from_key_file,
+        argos_core::unix_time_now(),
         Some(&cli.lightwalletd_url),
         |msg| eprintln!("  {msg}"),
     )
     .await;
-    if cli.sapling_key_file.is_some() {
-        eprintln!(
-            "  Keys from --sapling-key-file carry no creation time, so they count as undated."
-        );
-    }
     let Some(height) = found.height else {
         for line in wrap_text(&found.message, 76) {
             eprintln!("  {line}");
@@ -1775,6 +1795,7 @@ async fn main() -> Result<()> {
             network,
             cli.birthday,
             cli.no_birthday_skip,
+            argos_core::unix_time_now(),
         );
         // Before anything touches the network, so the user sees what will
         // be left undecrypted even when the run stops early.
@@ -1803,6 +1824,10 @@ async fn main() -> Result<()> {
     // the same key material in the one form two local-only paths still
     // need it in — birthday auto-detection and `show-keys` — and is
     // absent for a wallet file with no recoverable mnemonic.
+    // Sapling keys merged in from --sapling-key-file. They carry no creation
+    // time, and the birthday message has to say they came from outside the
+    // wallet file rather than blame the file.
+    let mut keys_added_from_key_file = 0;
     let (key_source, seed_phrase, imported): (
         Arc<dyn KeySource>,
         Option<SecretString>,
@@ -1814,7 +1839,7 @@ async fn main() -> Result<()> {
                 // Refuses before any scan work starts when the wallet has a
                 // mnemonic: that wallet takes the HD route, which cannot
                 // carry a standalone key. See the helper for why.
-                argos_core::sapling_key::merge_standalone_sapling_keys(
+                keys_added_from_key_file = argos_core::sapling_key::merge_standalone_sapling_keys(
                     &mut keys,
                     load_sapling_key_file(key_path, network)?,
                 )?;
@@ -1975,6 +2000,7 @@ async fn main() -> Result<()> {
                 &cli,
                 seed_phrase.as_ref(),
                 imported.as_ref().map(|source| source.keys()),
+                keys_added_from_key_file,
                 network,
             )
             .await?,
@@ -3125,10 +3151,12 @@ mod tests {
     /// a key from --sprout-key-file, testnet, or the opt-outs remove it.
     #[test]
     fn the_sprout_skip_follows_the_wallets_own_key_times() {
+        // Fixed, and later than the fixtures' 2026 key times.
+        const NOW: i64 = 1_900_000_000;
         let wallet = fixture_keys("sprout-plaintext.dat");
         assert!(!wallet.sprout.is_empty(), "fixture holds a Sprout key");
 
-        let plan = sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Mainnet, None, false);
+        let plan = sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Mainnet, None, false, NOW);
         let skip = plan.decrypt_from.expect("a dated mainnet wallet skips");
         assert!(skip > 1, "{skip}");
 
@@ -3136,7 +3164,7 @@ mod tests {
         let own = [*secrecy::ExposeSecret::expose_secret(
             &wallet.sprout[0].a_sk,
         )];
-        let plan = sprout_scan_plan(Some(&wallet), &own, ZeckNetwork::Mainnet, None, false);
+        let plan = sprout_scan_plan(Some(&wallet), &own, ZeckNetwork::Mainnet, None, false, NOW);
         assert_eq!(plan.decrypt_from, Some(skip));
 
         // A key the file cannot date means decrypting everything.
@@ -3146,17 +3174,25 @@ mod tests {
             ZeckNetwork::Mainnet,
             None,
             false,
+            NOW,
         );
         assert_eq!(plan.decrypt_from, None, "{}", plan.line);
-        let plan = sprout_scan_plan(None, &[[9u8; 32]], ZeckNetwork::Mainnet, None, false);
+        let plan = sprout_scan_plan(None, &[[9u8; 32]], ZeckNetwork::Mainnet, None, false, NOW);
         assert_eq!(plan.decrypt_from, None, "{}", plan.line);
 
-        let plan = sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Testnet, None, false);
+        let plan = sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Testnet, None, false, NOW);
         assert_eq!(plan.decrypt_from, None, "{}", plan.line);
 
-        let plan = sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Mainnet, None, true);
+        let plan = sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Mainnet, None, true, NOW);
         assert_eq!(plan.decrypt_from, None);
-        let plan = sprout_scan_plan(Some(&wallet), &[], ZeckNetwork::Mainnet, Some(1_000), false);
+        let plan = sprout_scan_plan(
+            Some(&wallet),
+            &[],
+            ZeckNetwork::Mainnet,
+            Some(1_000),
+            false,
+            NOW,
+        );
         assert_eq!(plan.decrypt_from, Some(1_000));
         let plan = sprout_scan_plan(
             Some(&wallet),
@@ -3164,6 +3200,7 @@ mod tests {
             ZeckNetwork::Mainnet,
             Some(skip + 1),
             false,
+            NOW,
         );
         assert_eq!(
             plan.decrypt_from,

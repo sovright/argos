@@ -100,3 +100,18 @@ test("a birthday that is not a block number is refused, not ignored", () => {
   assert.ok(request("12ab", false, "", false).error);
   assert.ok(request("-5", false, "", false).error);
 });
+
+// The backend takes the bound as a u32. A larger number fails Tauri's
+// deserialisation with a raw serde error, so it is refused here, in words.
+test("a birthday above the largest block number is refused in words", () => {
+  for (const text of ["4294967296", "99999999999999999999", "1" + "0".repeat(400)]) {
+    const result = request(text, false, "", false);
+    assert.ok(result.error, text);
+    assert.match(result.error, /4,?294,?967,?295|too large/, result.error);
+    assert.equal(result.birthdayFloor, undefined, text);
+  }
+  assert.equal(request("4294967295", false, "", false).birthdayFloor, 4_294_967_295);
+  // The main birthday field, once set, is checked the same way.
+  assert.ok(request("", false, "4294967296", true).error);
+  assert.equal(request("", false, "4294967295", true).birthdayFloor, 4_294_967_295);
+});

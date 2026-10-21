@@ -166,15 +166,18 @@ pub fn keys_from_sapling_strings(
 }
 
 /// Fold `extra`'s Sapling keys into `into`, skipping any whose raw key
-/// material is already present.
+/// material is already present. Returns how many were added, which the
+/// birthday message needs: an added key has no creation time, and the
+/// message must say it came from outside the wallet file.
 ///
 /// A duplicate key would register a second wallet account for the same key
 /// and scan it twice for nothing — the CLI and GUI both need to merge a
 /// pasted key set into whatever a wallet file already produced, so the
 /// dedup lives once here instead of being re-implemented at each call site.
-pub fn merge_sapling_keys(into: &mut ImportedKeys, extra: ImportedKeys) {
+pub fn merge_sapling_keys(into: &mut ImportedKeys, extra: ImportedKeys) -> usize {
     use secrecy::ExposeSecret;
 
+    let mut added = 0;
     for key in extra.sapling {
         let already_present = into
             .sapling
@@ -182,8 +185,10 @@ pub fn merge_sapling_keys(into: &mut ImportedKeys, extra: ImportedKeys) {
             .any(|existing| existing.extsk.expose_secret() == key.extsk.expose_secret());
         if !already_present {
             into.sapling.push(key);
+            added += 1;
         }
     }
+    added
 }
 
 /// Merge standalone Sapling keys into the key set a wallet file produced,
@@ -205,7 +210,7 @@ pub fn merge_sapling_keys(into: &mut ImportedKeys, extra: ImportedKeys) {
 pub fn merge_standalone_sapling_keys(
     wallet_keys: &mut ImportedKeys,
     standalone: ImportedKeys,
-) -> ZeckResult<()> {
+) -> ZeckResult<usize> {
     if wallet_keys.mnemonic.is_some() && !standalone.sapling.is_empty() {
         return Err(ZeckError::Import(
             "this wallet file contains a seed phrase, so it is scanned as an HD wallet — \
@@ -217,8 +222,7 @@ pub fn merge_standalone_sapling_keys(
                 .to_owned(),
         ));
     }
-    merge_sapling_keys(wallet_keys, standalone);
-    Ok(())
+    Ok(merge_sapling_keys(wallet_keys, standalone))
 }
 
 #[cfg(test)]
@@ -515,7 +519,7 @@ mod tests {
             sapling: vec![imported_sapling_key([1u8; 32])],
             ..Default::default()
         };
-        merge_sapling_keys(&mut into, extra);
+        assert_eq!(merge_sapling_keys(&mut into, extra), 1);
         assert_eq!(into.sapling.len(), 1);
     }
 
@@ -529,7 +533,8 @@ mod tests {
             sapling: vec![imported_sapling_key([1u8; 32])],
             ..Default::default()
         };
-        merge_sapling_keys(&mut into, extra);
+        // Not counted as added: the file's copy, with its metadata, stays.
+        assert_eq!(merge_sapling_keys(&mut into, extra), 0);
         assert_eq!(into.sapling.len(), 1);
     }
 
@@ -543,7 +548,7 @@ mod tests {
             sapling: vec![imported_sapling_key([2u8; 32])],
             ..Default::default()
         };
-        merge_sapling_keys(&mut into, extra);
+        assert_eq!(merge_sapling_keys(&mut into, extra), 1);
         assert_eq!(into.sapling.len(), 2);
     }
 
