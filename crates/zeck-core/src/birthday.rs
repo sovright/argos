@@ -620,10 +620,34 @@ pub fn plan_sprout_decrypt(
 }
 
 /// Whether the chain should be asked: the file could not date every key,
-/// and it holds transparent keys whose outputs the chain can report.
-pub fn needs_chain_fallback(offline: &WalletFileBirthday, keys: &ImportedKeys) -> bool {
-    offline.source == WalletBirthdaySource::None && !keys.transparent.is_empty()
+/// it holds transparent keys whose outputs the chain can report, and every
+/// Sapling key is dated.
+///
+/// For imported keys the birthday drives only the Sapling scan: transparent
+/// funds are found by `GetAddressUtxos` whatever it says. An undated Sapling
+/// key (`z_importkey`'d into the file, or added from a key file or the paste
+/// box) could hold notes from any height after activation, and a transparent
+/// output says nothing about when they arrived -- the same reason the Sprout
+/// skip never uses one. So that case gets no birthday at all.
+pub fn needs_chain_fallback(offline: &WalletFileBirthday, keys: &ImportedKeys, now: i64) -> bool {
+    offline.source == WalletBirthdaySource::None
+        && !keys.transparent.is_empty()
+        && !has_undated_sapling_key(keys, now)
 }
+
+/// Whether any Sapling key lacks a creation time that can be trusted at
+/// `now`.
+fn has_undated_sapling_key(keys: &ImportedKeys, now: i64) -> bool {
+    keys.sapling
+        .iter()
+        .any(|k| trusted_time(k.created_at, now).is_none())
+}
+
+/// Appended to the birthday message when an undated Sapling key rules out
+/// the chain fallback.
+const UNDATED_SAPLING_NO_FALLBACK: &str = "A Sapling key with no creation time could have \
+     received notes at any height, and transparent outputs cannot date it, so the chain was \
+     not used for a birthday: Sapling will be scanned from Sapling activation.";
 
 /// Fold the chain's earliest unspent transparent output into a birthday the
 /// file could not give.
@@ -640,6 +664,12 @@ fn apply_utxo_fallback(
     keys_added_outside_file: usize,
     now: i64,
 ) -> WalletFileBirthday {
+    if has_undated_sapling_key(keys, now) {
+        return WalletFileBirthday {
+            message: format!("{} {UNDATED_SAPLING_NO_FALLBACK}", offline.message),
+            ..offline
+        };
+    }
     let Some(earliest_utxo) = earliest_utxo else {
         return WalletFileBirthday {
             message: format!(
@@ -707,7 +737,13 @@ where
     let Some(url) = lightwalletd_url else {
         return offline;
     };
-    if !needs_chain_fallback(&offline, keys) {
+    if offline.source == WalletBirthdaySource::None && has_undated_sapling_key(keys, now) {
+        return WalletFileBirthday {
+            message: format!("{} {UNDATED_SAPLING_NO_FALLBACK}", offline.message),
+            ..offline
+        };
+    }
+    if !needs_chain_fallback(&offline, keys, now) {
         return offline;
     }
     let transparent = match imported_transparent_keys(keys) {
@@ -1990,6 +2026,81 @@ mod tests {
         );
     }
 
+    /// Kristi's #1 on #260. For imported keys the birthday drives only the
+    /// Sapling scan (transparent funds are found by `GetAddressUtxos`
+    /// whatever it says), so a transparent output must never decide where
+    /// Sapling starts. An undated Sapling key — `z_importkey`'d into the
+    /// file (zcashd stores time 1), or pasted beside it — could hold notes
+    /// from any height after activation: no birthday, and no chain check.
+    #[test]
+    fn an_undated_sapling_key_blocks_the_utxo_fallback() {
+        // From the file: an undated Sapling key beside a dated t-key whose
+        // only unspent output is recent.
+        let file = ImportedKeys {
+            transparent: vec![t_key(1, Some(T_2019)), t_key(2, None)],
+            sapling: vec![s_key(None)],
+            ..ImportedKeys::default()
+        };
+        // Pasted: every file key is dated; the Sapling key came from outside.
+        let pasted = ImportedKeys {
+            transparent: vec![t_key(1, None)],
+            sapling: vec![s_key(Some(T_2019)), s_key(None)],
+            ..ImportedKeys::default()
+        };
+        // A future time counts as undated too.
+        let future = ImportedKeys {
+            transparent: vec![t_key(1, None)],
+            sapling: vec![s_key(Some(NOW + 1))],
+            ..ImportedKeys::default()
+        };
+        for (name, keys, outside) in [
+            ("file", &file, 0),
+            ("pasted", &pasted, 1),
+            ("future", &future, 0),
+        ] {
+            let offline =
+                wallet_file_birthday_from_metadata(keys, &[], ZeckNetwork::Mainnet, outside, NOW);
+            assert_eq!(offline.source, WalletBirthdaySource::None, "{name}");
+            assert!(!needs_chain_fallback(&offline, keys, NOW), "{name}");
+            let b = apply_utxo_fallback(
+                offline.clone(),
+                keys,
+                ZeckNetwork::Mainnet,
+                Some(2_500_000),
+                outside,
+                NOW,
+            );
+            assert_eq!(b.source, WalletBirthdaySource::None, "{name}");
+            assert_eq!(b.height, None, "{name}");
+            assert_eq!(b.sprout_skip_height, offline.sprout_skip_height, "{name}");
+            assert!(
+                b.message.contains("Sapling activation"),
+                "{name}: {}",
+                b.message
+            );
+        }
+
+        // Every Sapling key dated, an undated t-key: the fallback still runs.
+        let dated_sapling = ImportedKeys {
+            transparent: vec![t_key(1, None)],
+            sapling: vec![s_key(Some(T_2019))],
+            ..ImportedKeys::default()
+        };
+        let offline =
+            wallet_file_birthday_from_metadata(&dated_sapling, &[], ZeckNetwork::Mainnet, 0, NOW);
+        assert!(needs_chain_fallback(&offline, &dated_sapling, NOW));
+        let b = apply_utxo_fallback(
+            offline,
+            &dated_sapling,
+            ZeckNetwork::Mainnet,
+            Some(3_000_000),
+            0,
+            NOW,
+        );
+        assert_eq!(b.source, WalletBirthdaySource::TransparentUtxos);
+        assert_eq!(b.height, Some(mainnet_bound(T_2019)));
+    }
+
     #[test]
     fn complete_metadata_is_not_overridden_by_the_chain() {
         let keys = ImportedKeys {
@@ -1997,14 +2108,14 @@ mod tests {
             ..ImportedKeys::default()
         };
         let offline = wallet_file_birthday_from_metadata(&keys, &[], ZeckNetwork::Mainnet, 0, NOW);
-        assert!(!needs_chain_fallback(&offline, &keys));
+        assert!(!needs_chain_fallback(&offline, &keys, NOW));
         let undated = ImportedKeys {
             transparent: vec![t_key(1, None)],
             ..ImportedKeys::default()
         };
         let offline =
             wallet_file_birthday_from_metadata(&undated, &[], ZeckNetwork::Mainnet, 0, NOW);
-        assert!(needs_chain_fallback(&offline, &undated));
+        assert!(needs_chain_fallback(&offline, &undated, NOW));
         // No transparent keys: nothing to ask the chain about.
         let sapling_only = ImportedKeys {
             sapling: vec![s_key(None)],
@@ -2012,6 +2123,6 @@ mod tests {
         };
         let offline =
             wallet_file_birthday_from_metadata(&sapling_only, &[], ZeckNetwork::Mainnet, 0, NOW);
-        assert!(!needs_chain_fallback(&offline, &sapling_only));
+        assert!(!needs_chain_fallback(&offline, &sapling_only, NOW));
     }
 }

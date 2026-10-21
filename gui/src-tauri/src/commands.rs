@@ -1856,7 +1856,10 @@ fn birthday_route(
 /// Re-open a wallet file and choose how to date it, so a mnemonic stays in
 /// the backend and never crosses IPC. Pasted Sapling keys are merged in as
 /// the scan merges them: they carry no creation time, and leaving them out
-/// would let the file's dated keys set a birthday later than theirs.
+/// would let the file's dated keys set a birthday later than theirs. Being
+/// undated Sapling keys, they also rule out the transparent-UTXO fallback
+/// (see `argos_core::birthday::needs_chain_fallback`), so a wallet with one
+/// gets no birthday and Sapling is scanned from activation.
 fn birthday_route_for_file(
     path: &str,
     passphrase: Option<&SecretString>,
@@ -2502,6 +2505,97 @@ mod tests {
             found.message
         );
         assert!(!found.message.contains("zcashd"), "{}", found.message);
+    }
+
+    /// Kristi's #1 on #260: an undated Sapling key -- pasted, or imported
+    /// into the file without a time -- must not let a transparent output
+    /// decide where Sapling starts. Detection returns no birthday without
+    /// asking the chain (the URL here is unreachable on purpose: a chain
+    /// check would surface as "could not be checked"), and the field keeps
+    /// its value, which scans from Sapling activation.
+    #[test]
+    fn an_undated_sapling_key_gets_no_birthday_from_the_chain() {
+        let detect = |keys: &ImportedKeys, pasted: usize| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(argos_core::detect_wallet_file_birthday(
+                    keys,
+                    &[],
+                    ZeckNetwork::Mainnet,
+                    pasted,
+                    NOW,
+                    Some("https://127.0.0.1:9"),
+                    |_| {},
+                ))
+        };
+
+        // Pasted route.
+        let typed = [TEST_SAPLING_KEY_MAINNET.to_owned()];
+        let (mut keys, pasted) = wallet_dat_route(
+            birthday_route_for_file(
+                &fixture("modern-plaintext.dat"),
+                None,
+                &typed,
+                ZeckNetwork::Mainnet,
+            )
+            .unwrap(),
+        );
+        assert_eq!(pasted, 1);
+        // Give the file an undated transparent key as well, so the chain
+        // fallback would otherwise be taken.
+        if let Some(t) = keys.transparent.first_mut() {
+            t.created_at = None;
+        } else {
+            keys.transparent.push(TransparentKey {
+                secret: secrecy::Secret::new([1u8; 32]),
+                provenance: Provenance::Standalone,
+                created_at: None,
+            });
+        }
+        let found = detect(&keys, pasted);
+        assert_eq!(found.source, argos_core::WalletBirthdaySource::None);
+        assert_eq!(found.height, None);
+        assert!(
+            found.message.contains("Sapling activation"),
+            "{}",
+            found.message
+        );
+        assert!(
+            !found.message.contains("could not be checked"),
+            "{}",
+            found.message
+        );
+        let err = wallet_dat_birthday_result(found, ZeckNetwork::Mainnet).unwrap_err();
+        assert!(err.contains("Sapling activation"), "{err}");
+
+        // File route: a Sapling key in the file itself with no time, as
+        // zcashd leaves a `z_importkey`'d key.
+        let mut keys = wallet_dat_keys(
+            birthday_route_for_file(
+                &fixture("modern-plaintext.dat"),
+                None,
+                &[],
+                ZeckNetwork::Mainnet,
+            )
+            .unwrap(),
+        );
+        assert!(!keys.sapling.is_empty(), "fixture holds a Sapling key");
+        keys.sapling[0].created_at = None;
+        keys.transparent.push(TransparentKey {
+            secret: secrecy::Secret::new([2u8; 32]),
+            provenance: Provenance::Standalone,
+            created_at: None,
+        });
+        let found = detect(&keys, 0);
+        assert_eq!(found.source, argos_core::WalletBirthdaySource::None);
+        assert_eq!(found.height, None);
+        assert!(
+            found.message.contains("Sapling activation"),
+            "{}",
+            found.message
+        );
     }
 
     /// The chain fallback is labelled as what it is.

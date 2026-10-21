@@ -955,3 +955,39 @@ fn no_birthday_skip_is_refused_where_nothing_is_skipped() {
         );
     }
 }
+
+/// Kristi's #1 on #260, CLI paste route: a `--sapling-key-file` key has no
+/// creation time and could hold notes from any height after activation. The
+/// file's dated transparent keys must not let a transparent output decide
+/// where Sapling starts, so the chain is never asked (with an unusable
+/// server, a chain check would say "could not be checked").
+#[test]
+fn auto_detect_with_a_sapling_key_file_does_not_use_the_chain() {
+    let wallet = fixture("modern-plaintext.dat");
+    let key = key_file(
+        "sapling-key-autodetect.txt",
+        &format!("{TEST_SAPLING_KEY_MAINNET}\n"),
+    );
+    let out = argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("utf-8"),
+        "--sapling-key-file",
+        key.to_str().expect("utf-8"),
+        "--accept-tos",
+        "--birthday-auto-detect",
+        "--lightwalletd-url",
+        "nonono",
+        "--data-dir",
+        &scratch_dir("autodetect-sapling-key-file"),
+        "scan",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Checking the wallet file's transparent addresses on chain"),
+        "an undated Sapling key must rule out the chain fallback:\n{stderr}"
+    );
+    assert!(!stderr.contains("could not be checked"), "{stderr}");
+    assert!(stderr.contains("Sapling activation"), "{stderr}");
+    assert!(stderr.contains("No birthday could be detected"), "{stderr}");
+    assert!(!stderr.contains("Birthday: block "), "{stderr}");
+}
