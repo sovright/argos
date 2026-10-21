@@ -1364,6 +1364,23 @@ fn finish_sprout_scan_task(
     store.finish_scan(handle, result);
 }
 
+/// Run a scan on its own task, owned by the store: the abort handle is
+/// attached before the result is awaited, so releasing the scan stops the
+/// worker (and drops the checkpoint reservation the future owns) rather than
+/// leaving it to run on detached for hours. A release that lands before the
+/// attach is handled by `attach_worker`, which aborts the orphan.
+async fn run_attached_scan_worker<F>(
+    store: &ReviewedIntentStore,
+    handle: &SproutScanHandle,
+    scan: F,
+) where
+    F: std::future::Future<Output = Result<SproutScanReport, String>> + Send + 'static,
+{
+    let scan_task = tokio::spawn(scan);
+    store.attach_worker(handle, scan_task.abort_handle());
+    finish_sprout_scan_task(store, handle, scan_task.await);
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_sprout_scan(
@@ -1417,7 +1434,7 @@ pub async fn start_sprout_scan(
     tokio::spawn(async move {
         let scan_app = app.clone();
         let progress_handle = worker_handle.clone();
-        let scan_task = tokio::spawn(async move {
+        let scan = async move {
             let _checkpoint_reservation = checkpoint_reservation;
             let (tip_anchor, tip_warning) =
                 sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
@@ -1463,11 +1480,8 @@ pub async fn start_sprout_scan(
                 .unwrap_or(decrypt_line),
             })
             .map_err(|err| err.to_string())
-        });
-        // Released scans abort this worker (and free its checkpoint) through
-        // the store rather than run on detached for hours.
-        store.attach_worker(&worker_handle, scan_task.abort_handle());
-        finish_sprout_scan_task(&store, &worker_handle, scan_task.await);
+        };
+        run_attached_scan_worker(&store, &worker_handle, scan).await;
         if let Ok(snapshot) = store.snapshot(&worker_handle) {
             let _ = app.emit("sprout-scan-complete", snapshot);
         }
@@ -3210,6 +3224,50 @@ mod tests {
             crate::reviewed_intent::SproutScanStatus::Failed
         ));
         assert!(store.reserve_checkpoint(&material.checkpoint).is_ok());
+    }
+
+    /// The wiring `start_sprout_scan` uses: a scan run through
+    /// `run_attached_scan_worker` is stopped by `release_scan`, freeing its
+    /// checkpoint. Without the attach, the never-ending scan below would
+    /// keep the driver (and the reservation) alive and the timeout would
+    /// fire. Covers both orderings: release after the attach, and release
+    /// before the worker task has been polled at all.
+    #[tokio::test]
+    async fn releasing_a_scan_stops_the_worker_started_for_it() {
+        for settle in [true, false] {
+            let store = ReviewedIntentStore::default();
+            let dir = std::env::temp_dir().join(format!("argos-attach-{}", uuid::Uuid::new_v4()));
+            let (handle, material, reservation) = super::begin_sprout_scan_session(
+                &store,
+                vec![[12; 32]],
+                &dir,
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+            )
+            .unwrap();
+            let (driver_store, driver_handle) = (store.clone(), handle.clone());
+            let driver = tokio::spawn(async move {
+                super::run_attached_scan_worker(&driver_store, &driver_handle, async move {
+                    let _reservation = reservation;
+                    std::future::pending::<Result<SproutScanReport, String>>().await
+                })
+                .await;
+            });
+            if settle {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(store.reserve_checkpoint(&material.checkpoint).is_err());
+            store.release_scan(&handle).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+                .await
+                .expect("release stops the attached worker")
+                .expect("the driver itself does not panic");
+            assert!(
+                store.reserve_checkpoint(&material.checkpoint).is_ok(),
+                "the released scan's checkpoint is free again"
+            );
+        }
     }
 
     #[test]
