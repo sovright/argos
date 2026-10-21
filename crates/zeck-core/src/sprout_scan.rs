@@ -141,6 +141,14 @@ struct NullifierUndo {
     previous: Option<Option<[u8; 32]>>,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RewindError {
+    #[error("the common ancestor is older than this checkpoint's retained rollback window")]
+    BeyondRetainedWindow,
+    #[error("the checkpoint rollback history is internally inconsistent")]
+    CorruptHistory,
+}
+
 /// Scans blocks for notes belonging to a set of Sprout spending keys.
 pub struct SproutScanner {
     keys: Vec<ScanKey>,
@@ -196,6 +204,11 @@ impl SproutScanner {
         self.complete = true;
     }
 
+    /// A scan stopped before the chain tip cannot supply complete evidence.
+    pub fn mark_incomplete(&mut self) {
+        self.complete = false;
+    }
+
     /// Whether the walk ended at the chain tip rather than stopping early.
     pub fn is_complete(&self) -> bool {
         self.complete
@@ -244,18 +257,155 @@ impl SproutScanner {
         block_hash: [u8; 32],
         height: u32,
     ) -> Result<(), WitnessError> {
+        let located = height > 0 && block_hash != [0; 32];
+        let prior = self.cursor();
+        let contiguous = located
+            && prior.is_some_and(|cursor| {
+                cursor.last_height > 0
+                    && cursor.last_block_hash != [0; 32]
+                    && cursor.last_height.checked_add(1) == Some(height)
+            });
+        let applied = ScanCursor {
+            last_block_hash: block_hash,
+            last_height: height,
+        };
+        let mut seen_nullifiers = HashSet::new();
+        let spent_before = joinsplits
+            .iter()
+            .flat_map(|js| js.nullifiers)
+            .filter(|nf| seen_nullifiers.insert(*nf))
+            .map(|nullifier| NullifierUndo {
+                nullifier,
+                previous: self.spent.get(&nullifier).copied(),
+            })
+            .collect();
+        let cursor_before_raw = self.cursor;
+        let undo = BlockUndo {
+            applied,
+            cursor_before: if contiguous { prior } else { None },
+            tree_before: self.tree.clone(),
+            pending_len_before: self.pending.len(),
+            witnesses_before: self.pending.iter().map(|p| p.witness.clone()).collect(),
+            spent_before,
+            progress_before: self.progress,
+        };
+        let complete_before = self.complete;
         for js in joinsplits {
-            self.scan_joinsplit(js)?;
+            if let Err(err) = self.scan_joinsplit(js) {
+                self.restore_block(undo);
+                self.cursor = cursor_before_raw;
+                self.complete = complete_before;
+                return Err(err);
+            }
         }
         self.progress.blocks_scanned += 1;
         self.progress.last_height = height;
         // The tip has moved past wherever a previous run ended.
         self.complete = false;
-        self.cursor = ScanCursor {
-            last_block_hash: block_hash,
-            last_height: height,
-        };
+        self.cursor = applied;
+        if located {
+            if !contiguous {
+                self.history.clear();
+            }
+            self.history.push_back(undo);
+            if self.history.len() > SPROUT_REORG_WINDOW {
+                self.history.pop_front();
+            }
+        } else {
+            // An unlocated helper call changes state but proves no chain
+            // ancestry, so no earlier rollback frames can cross it.
+            self.history.clear();
+        }
         Ok(())
+    }
+
+    fn restore_block(&mut self, undo: BlockUndo) {
+        self.tree = undo.tree_before;
+        self.pending.truncate(undo.pending_len_before);
+        for (pending, witness) in self.pending.iter_mut().zip(undo.witnesses_before) {
+            pending.witness = witness;
+        }
+        for entry in undo.spent_before {
+            match entry.previous {
+                Some(previous) => {
+                    self.spent.insert(entry.nullifier, previous);
+                }
+                None => {
+                    self.spent.remove(&entry.nullifier);
+                }
+            }
+        }
+        self.progress = undo.progress_before;
+        self.cursor = undo.cursor_before.unwrap_or_default();
+    }
+
+    /// Candidate ancestors in newest-first order, limited to actual block
+    /// hashes. The oldest candidate is the cursor before the oldest undo.
+    pub fn rollback_locators(&self) -> Vec<ScanCursor> {
+        let Some(current) = self
+            .cursor()
+            .filter(|cursor| cursor.last_height > 0 && cursor.last_block_hash != [0; 32])
+        else {
+            return Vec::new();
+        };
+        let mut locators = vec![current];
+        let mut expected = current;
+        for frame in self.history.iter().rev() {
+            if frame.applied != expected {
+                break;
+            }
+            let Some(previous) = frame.cursor_before else {
+                break;
+            };
+            locators.push(previous);
+            expected = previous;
+        }
+        locators
+    }
+
+    /// Restore all state after a retained ancestor. Validate the whole
+    /// suffix first so a corrupt in-memory history cannot partially rewind.
+    pub fn rewind_to(&mut self, ancestor_hash: [u8; 32]) -> Result<u32, RewindError> {
+        let current = self
+            .cursor()
+            .filter(|cursor| cursor.last_height > 0 && cursor.last_block_hash != [0; 32]);
+        let Some(current) = current else {
+            return Err(RewindError::BeyondRetainedWindow);
+        };
+        let mut expected = current;
+        let mut pending_len = self.pending.len();
+        let mut blocks = 0usize;
+        if expected.last_block_hash != ancestor_hash {
+            for frame in self.history.iter().rev() {
+                if frame.applied != expected
+                    || frame.witnesses_before.len() != frame.pending_len_before
+                    || frame.pending_len_before > pending_len
+                    || frame.cursor_before.is_some_and(|previous| {
+                        previous.last_height.checked_add(1) != Some(frame.applied.last_height)
+                    })
+                {
+                    return Err(RewindError::CorruptHistory);
+                }
+                pending_len = frame.pending_len_before;
+                blocks += 1;
+                let Some(previous) = frame.cursor_before else {
+                    break;
+                };
+                expected = previous;
+                if expected.last_block_hash == ancestor_hash {
+                    break;
+                }
+            }
+            if expected.last_block_hash != ancestor_hash {
+                return Err(RewindError::BeyondRetainedWindow);
+            }
+        }
+        for _ in 0..blocks {
+            let frame = self.history.pop_back().expect("validated undo frame");
+            self.restore_block(frame);
+        }
+        self.complete = false;
+        Ok(blocks as u32)
     }
 
     fn scan_joinsplit(&mut self, js: &SproutJoinSplit) -> Result<(), WitnessError> {
@@ -987,36 +1137,128 @@ mod tests {
     use crate::sprout::SproutNotePlaintext;
 
     #[test]
+    fn orphaned_nullifier_is_removed_and_the_note_is_live_again() {
+        let key = [0x42; 32];
+        let (receipt, nullifier) = joinsplit_paying(&key, 1234, 0, 11);
+        let (mut spend, _) = joinsplit_paying(&[0x77; 32], 1, 0, 12);
+        spend.nullifiers[0] = nullifier;
+        let mut scanner = SproutScanner::new(&[key]);
+        scanner.scan_block_at(&[receipt], [1; 32], 1).unwrap();
+        scanner.scan_block_at(&[spend], [2; 32], 2).unwrap();
+        assert!(scanner.spent.contains_key(&nullifier));
+
+        assert_eq!(scanner.rewind_to([1; 32]), Ok(1));
+        assert!(!scanner.spent.contains_key(&nullifier));
+        let result = scanner.finish().unwrap();
+        assert_eq!(result.spent_notes, 0);
+        assert_eq!(result.total_value(), 1234);
+    }
+
+    #[test]
+    fn orphaned_received_note_is_removed_and_the_previous_anchor_is_restored() {
+        let key = [0x42; 32];
+        let mut scanner = SproutScanner::new(&[key]);
+        scanner.scan_block_at(&[], [1; 32], 1).unwrap();
+        let anchor_before = scanner.anchor();
+        let (receipt, _) = joinsplit_paying(&key, 1234, 0, 13);
+        scanner.scan_block_at(&[receipt], [2; 32], 2).unwrap();
+        assert_ne!(scanner.anchor(), anchor_before);
+
+        assert_eq!(scanner.rewind_to([1; 32]), Ok(1));
+        assert_eq!(scanner.anchor(), anchor_before);
+        assert!(scanner.finish().unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn rewind_removes_a_received_and_spent_orphan_note_atomically() {
+        let key = [0x42; 32];
+        let mut scanner = SproutScanner::new(&[key]);
+        let (original, _) = joinsplit_paying(&key, 42, 0, 14);
+        scanner.scan_block_at(&[original], [1; 32], 1).unwrap();
+        let expected = scanner.checkpoint().as_bytes().to_vec();
+        let (receipt, nullifier) = joinsplit_paying(&key, 1234, 0, 15);
+        let (mut spend, _) = joinsplit_paying(&[0x77; 32], 1, 0, 16);
+        spend.nullifiers[0] = nullifier;
+        scanner.scan_block_at(&[receipt], [2; 32], 2).unwrap();
+        scanner.scan_block_at(&[spend], [3; 32], 3).unwrap();
+        scanner.mark_complete();
+
+        assert_eq!(scanner.rewind_to([1; 32]), Ok(2));
+        assert_eq!(scanner.cursor().unwrap().last_block_hash, [1; 32]);
+        assert!(!scanner.is_complete());
+        // Completion is intentionally cleared by rewind; all other state is exact.
+        assert_eq!(scanner.checkpoint().as_bytes(), expected);
+        let result = scanner.finish().unwrap();
+        assert_eq!(result.total_value(), 42);
+        assert_eq!(result.spent_notes, 0);
+    }
+
+    #[test]
+    fn failed_block_scan_is_atomic() {
+        // A tree with one available leaf lets the first commitment through,
+        // then the second fails after nullifiers and progress have changed.
+        let mut almost_full = vec![1];
+        almost_full.extend_from_slice(&[1; 32]);
+        almost_full.push(0);
+        almost_full.push((crate::sprout_witness::TREE_DEPTH - 1) as u8);
+        for _ in 0..crate::sprout_witness::TREE_DEPTH - 1 {
+            almost_full.push(1);
+            almost_full.extend_from_slice(&[2; 32]);
+        }
+        let mut scanner = SproutScanner::new(&[[0x42; 32]]);
+        scanner.scan_block_at(&[], [1; 32], 1).unwrap();
+        scanner.tree = IncrementalMerkleTree::parse(&almost_full).unwrap();
+        scanner.mark_complete();
+        let before = scanner.checkpoint().as_bytes().to_vec();
+        let (js, _) = joinsplit_paying(&[0x77; 32], 1, 0, 17);
+
+        assert_eq!(
+            scanner.scan_block_at(&[js], [2; 32], 2),
+            Err(WitnessError::TreeFull)
+        );
+        assert_eq!(scanner.checkpoint().as_bytes(), before);
+    }
+
+    #[test]
+    fn rollback_history_keeps_exactly_one_hundred_blocks() {
+        let mut scanner = SproutScanner::new(&[]);
+        for height in 1..=101u32 {
+            scanner
+                .scan_block_at(&[], [height as u8; 32], height)
+                .unwrap();
+        }
+        assert_eq!(scanner.history.len(), SPROUT_REORG_WINDOW);
+        let locators = scanner.rollback_locators();
+        assert_eq!(locators.len(), 101);
+        assert_eq!(locators[0].last_height, 101);
+        assert_eq!(locators[100].last_height, 1);
+    }
+
+    #[test]
+    fn ancestor_older_than_the_window_is_refused_without_mutation() {
+        let mut scanner = SproutScanner::new(&[]);
+        for height in 1..=102u32 {
+            scanner
+                .scan_block_at(&[], [height as u8; 32], height)
+                .unwrap();
+        }
+        let before = scanner.checkpoint().as_bytes().to_vec();
+        assert_eq!(
+            scanner.rewind_to([1; 32]),
+            Err(RewindError::BeyondRetainedWindow)
+        );
+        assert_eq!(scanner.checkpoint().as_bytes(), before);
+    }
+
+    #[test]
     fn checkpoint_v3_round_trips_reorg_history() {
         let key = [0x42; 32];
         let mut scanner = SproutScanner::new(&[key]);
         for height in 1..=3u32 {
-            let cursor_before = scanner.cursor();
-            let tree_before = scanner.tree.clone();
-            let pending_len_before = scanner.pending.len();
-            let witnesses_before = scanner.pending.iter().map(|p| p.witness.clone()).collect();
-            let progress_before = scanner.progress();
             let (js, _) = joinsplit_paying(&key, 100 * u64::from(height), 0, height as u8);
-            let spent_before = js
-                .nullifiers
-                .iter()
-                .map(|nf| NullifierUndo {
-                    nullifier: *nf,
-                    previous: scanner.spent.get(nf).copied(),
-                })
-                .collect();
             scanner
                 .scan_block_at(&[js], [height as u8; 32], height)
                 .unwrap();
-            scanner.history.push_back(BlockUndo {
-                applied: scanner.cursor().unwrap(),
-                cursor_before,
-                tree_before,
-                pending_len_before,
-                witnesses_before,
-                spent_before,
-                progress_before,
-            });
         }
         scanner.mark_complete();
         let checkpoint = scanner.checkpoint();
@@ -1039,20 +1281,9 @@ mod tests {
     fn v3_rejects_oversized_and_noncontiguous_history() {
         let mut scanner = SproutScanner::new(&[[0x42; 32]]);
         for height in 1..=2u32 {
-            let cursor_before = scanner.cursor();
-            let progress_before = scanner.progress();
             scanner
                 .scan_block_at(&[], [height as u8; 32], height)
                 .unwrap();
-            scanner.history.push_back(BlockUndo {
-                applied: scanner.cursor().unwrap(),
-                cursor_before,
-                tree_before: IncrementalMerkleTree::default(),
-                pending_len_before: 0,
-                witnesses_before: vec![],
-                spent_before: vec![],
-                progress_before,
-            });
         }
         let offset = scanner.encode(2).as_bytes().len();
         let original = scanner.checkpoint().as_bytes().to_vec();
