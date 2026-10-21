@@ -82,6 +82,574 @@ use secrecy::SecretString;
 /// watchdog accounts for in-flight batch progress.
 const LATENCY_WINDOW_BLOCKS: u64 = 100;
 
+// This local RPC test runs without the external regtest node. A missing
+// capture or a response dropped before upstream acceptance breaks it.
+#[tokio::test]
+async fn fake_lightwalletd_drops_only_first_successful_upstream_reply() {
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction,
+    };
+
+    let upstream = FakeLightwalletd::builder()
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let proxy = FakeLightwalletd::builder()
+        .upstream(upstream.url.clone())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .unwrap();
+    let captured = proxy.captured_submissions();
+    let mut client = CompactTxStreamerClient::connect(proxy.url.clone())
+        .await
+        .unwrap();
+    let first = client
+        .send_transaction(RawTransaction {
+            data: vec![1, 2, 3],
+            height: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(first.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        *upstream.captured_submissions().lock().unwrap(),
+        vec![vec![1, 2, 3]]
+    );
+    assert_eq!(*captured.lock().unwrap(), vec![vec![1, 2, 3]]);
+
+    let second = client
+        .send_transaction(RawTransaction {
+            data: vec![4, 5, 6],
+            height: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.error_code, 0);
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![vec![1, 2, 3], vec![4, 5, 6]]
+    );
+}
+
+#[tokio::test]
+async fn fake_lightwalletd_does_not_drop_a_node_rejection() {
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction,
+    };
+
+    let upstream = FakeLightwalletd::builder()
+        .reject_submissions_for_test(-26)
+        .build()
+        .await
+        .unwrap();
+    let proxy = FakeLightwalletd::builder()
+        .upstream(upstream.url.clone())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .unwrap();
+    let mut client = CompactTxStreamerClient::connect(proxy.url).await.unwrap();
+    for raw in [vec![1], vec![2]] {
+        let response = client
+            .send_transaction(RawTransaction {
+                data: raw,
+                height: 0,
+            })
+            .await
+            .expect("node rejection is a delivered response")
+            .into_inner();
+        assert_eq!(response.error_code, -26);
+    }
+    assert_eq!(upstream.captured_submissions().lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn local_proxy_lost_reply_keeps_unknown_and_restarts_with_exact_bytes() {
+    use argos_core::broadcast::{
+        resubmit_prepared_transaction, submit_prepared_transaction, BroadcastStore,
+        DurableBroadcastLog, LightwalletdSubmitter, PreparedTransaction, SubmissionDisposition,
+    };
+    use argos_core::models::TxLifecycleState;
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTxEvidence};
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, TxFilter,
+    };
+    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    let tx = TransactionData::<Authorized>::from_parts(
+        TxVersion::V5,
+        BranchId::Nu5,
+        0,
+        BlockHeight::from_u32(100),
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+    let mut raw = Vec::new();
+    tx.write(&mut raw).unwrap();
+    let prepared = PreparedTransaction {
+        txid: tx.txid(),
+        raw_tx: raw.clone(),
+        fee_zatoshis: 12_345,
+        expiry_height: Some(100),
+    };
+    let upstream = FakeLightwalletd::builder()
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let proxy = FakeLightwalletd::builder()
+        .upstream(upstream.url.clone())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broadcasts-v1.jsonl");
+    let mut log = DurableBroadcastLog::open(&path).unwrap();
+    let mut client = CompactTxStreamerClient::connect(proxy.url.clone())
+        .await
+        .unwrap();
+    let first = submit_prepared_transaction(
+        &mut log,
+        &mut LightwalletdSubmitter {
+            client: &mut client,
+        },
+        prepared.clone(),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.state, TxLifecycleState::SubmissionUnknown);
+    assert_eq!(first.disposition, SubmissionDisposition::AmbiguousTransport);
+    assert_eq!(first.txid, prepared.txid);
+    assert_eq!(first.fee_zatoshis, 12_345);
+    assert_eq!(
+        *upstream.captured_submissions().lock().unwrap(),
+        vec![raw.clone()]
+    );
+    proxy.set_scripted_transaction_evidence(ScriptedTxEvidence {
+        txid: Vec::new(),
+        raw_tx: Vec::new(),
+        reported_height: 123,
+        tip_height: 124,
+        block_hash: vec![8; 32],
+        block_txids: Vec::new(),
+    });
+    let tip = client.get_lightd_info(Empty {}).await.unwrap().into_inner();
+    assert_eq!(tip.block_height, 124);
+    let reported = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: prepared.txid.as_ref().to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reported.data, raw);
+    assert_eq!(reported.height, 123);
+    let block = client
+        .get_block(BlockId {
+            height: 123,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(block.height, 123);
+    assert_eq!(block.hash, vec![8; 32]);
+    assert!(!block.vtx.iter().any(|tx| tx.txid == prepared.txid.as_ref()));
+    drop(log);
+
+    let mut reopened = DurableBroadcastLog::open(&path).unwrap();
+    let stored = reopened.latest(prepared.txid).unwrap();
+    assert_eq!(stored.prepared, prepared);
+    let second = resubmit_prepared_transaction(
+        &mut reopened,
+        &mut LightwalletdSubmitter {
+            client: &mut client,
+        },
+        &stored.prepared,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.txid, first.txid);
+    assert_eq!(
+        *proxy.captured_submissions().lock().unwrap(),
+        vec![raw.clone(), raw]
+    );
+}
+
+#[tokio::test]
+async fn fake_lightwalletd_scripts_consistent_transaction_tip_and_block_evidence() {
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTxEvidence};
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, TxFilter,
+    };
+
+    let txid = vec![7; 32];
+    let fake = FakeLightwalletd::builder()
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            txid: txid.clone(),
+            raw_tx: vec![0xaa, 0xbb],
+            reported_height: 123,
+            tip_height: 124,
+            block_hash: vec![8; 32],
+            block_txids: Vec::new(),
+        })
+        .build()
+        .await
+        .unwrap();
+    let mut client = CompactTxStreamerClient::connect(fake.url).await.unwrap();
+    let info = client.get_lightd_info(Empty {}).await.unwrap().into_inner();
+    assert_eq!(info.block_height, 124);
+    let raw = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(raw.data, vec![0xaa, 0xbb]);
+    assert_eq!(raw.height, 123);
+    let block = client
+        .get_block(BlockId {
+            height: 123,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(block.height, 123);
+    assert_eq!(block.hash, vec![8; 32]);
+    assert!(block.vtx.is_empty());
+    let missing = client
+        .get_block(BlockId {
+            height: 122,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+fn submitted_txid(raw: &[u8]) -> zcash_primitives::transaction::TxId {
+    let mut cursor = std::io::Cursor::new(raw);
+    let tx = zcash_primitives::transaction::Transaction::read(
+        &mut cursor,
+        zcash_protocol::consensus::BranchId::Nu5,
+    )
+    .expect("captured bytes are a serialized Zcash transaction");
+    assert_eq!(cursor.position(), raw.len() as u64);
+    tx.txid()
+}
+
+struct DroppedSweep {
+    _data_dir: tempfile::TempDir,
+    fixture: ScannedFixture,
+    fake: common::fake_lightwalletd::FakeLightwalletd,
+    reviewed: argos_core::models::ReviewedSweepProposal,
+    outcome: argos_core::models::SweepOutcome,
+}
+
+async fn dropped_response_sweep(
+    harness: &RegtestHarness,
+    fund_second_account: bool,
+) -> DroppedSweep {
+    common::regtest_harness::fund_test_account(0, 1_000_000).await;
+    if fund_second_account {
+        common::regtest_harness::fund_test_account(1, 1_000_000).await;
+    }
+    let fake = common::fake_lightwalletd::FakeLightwalletd::builder()
+        .upstream(harness.lightwalletd_url())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .expect("bind forwarding lightwalletd");
+    let data_dir = tempfile::tempdir().expect("wallet data dir");
+    let fixture = complete_scan_against_test_seed_at(
+        harness,
+        &data_dir,
+        "dropped-submission-response",
+        &fake.url,
+        Vec::new(),
+    )
+    .await;
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua.clone(),
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                donation_rate: None,
+                donor_email: None,
+                reviewed_fee_zatoshis: None,
+            },
+        )
+        .await
+        .expect("review sweep with funded account");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        fixture
+            .service
+            .execute_sweep(&fixture.handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("dropped-reply sweep timed out")
+    .expect("sweep should return its partial outcome");
+    DroppedSweep {
+        _data_dir: data_dir,
+        fixture,
+        fake,
+        reviewed,
+        outcome,
+    }
+}
+
+/// Real-node acceptance followed by a lost gRPC response must retain the
+/// transaction identity and fee and stop before another reviewed leg.
+#[tokio::test]
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+async fn accepted_transaction_with_dropped_response_is_unknown_and_stops_followup() {
+    let harness = RegtestHarness::require();
+    let run = dropped_response_sweep(&harness, true).await;
+    assert!(
+        run.reviewed.proposal.transactions.len() >= 2,
+        "both funded accounts must produce follow-up legs"
+    );
+    assert!(
+        run.reviewed.proposal.transactions.iter().any(|tx| {
+            tx.source_account != run.reviewed.proposal.transactions[0].source_account
+        }),
+        "the quote must include a later funded account"
+    );
+    assert_eq!(
+        run.outcome.transactions.len(),
+        1,
+        "must stop after first ambiguous submission"
+    );
+    let record = &run.outcome.transactions[0];
+    let captured = run.fake.captured_submissions();
+    let captured = captured.lock().unwrap().clone();
+    assert_eq!(
+        captured.len(),
+        1,
+        "no later account or transparent leg was submitted"
+    );
+    let computed_txid = submitted_txid(&captured[0]).to_string();
+    assert_eq!(record.txid.as_deref(), Some(computed_txid.as_str()));
+    assert_eq!(
+        record.status,
+        argos_core::models::TxLifecycleState::SubmissionUnknown
+    );
+    assert_eq!(
+        record.fee_zatoshis,
+        run.reviewed.proposal.transactions[0].fee_zatoshis
+    );
+    assert!(record.fee_zatoshis > 0);
+    assert_eq!(
+        run.outcome
+            .transactions
+            .iter()
+            .filter(|tx| tx.status.fee_is_at_risk())
+            .map(|tx| tx.fee_zatoshis)
+            .sum::<u64>(),
+        record.fee_zatoshis,
+        "the entire unknown fee must remain in the outcome's at-risk total"
+    );
+    assert!(run
+        .outcome
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains(&computed_txid));
+    let mempool = common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+    assert!(
+        mempool
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&computed_txid))),
+        "accepted raw transaction must be present in the real node mempool: {computed_txid}"
+    );
+}
+
+/// The journal's prepared bytes survive reopening and are the only bytes
+/// sent on the second attempt, even though the first reply was lost.
+#[tokio::test]
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+async fn restarting_resubmits_identical_raw_transaction() {
+    use argos_core::broadcast::{
+        resubmit_prepared_transaction, BroadcastStore, DurableBroadcastLog, LightwalletdSubmitter,
+    };
+    use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
+
+    let harness = RegtestHarness::require();
+    let run = dropped_response_sweep(&harness, false).await;
+    assert_eq!(run.outcome.transactions.len(), 1);
+    assert_eq!(
+        run.outcome.transactions[0].status,
+        argos_core::models::TxLifecycleState::SubmissionUnknown
+    );
+    let first_raw = run.fake.captured_submissions().lock().unwrap()[0].clone();
+    let txid = submitted_txid(&first_raw);
+    assert_eq!(
+        run.outcome.transactions[0].txid.as_deref(),
+        Some(txid.to_string().as_str())
+    );
+
+    let path = run.fixture.workspace_root.join("broadcasts-v1.jsonl");
+    let mut reopened = DurableBroadcastLog::open(&path).expect("reopen durable log after sweep");
+    let persisted = reopened
+        .latest(txid)
+        .expect("prepared transaction survives restart");
+    assert_eq!(persisted.prepared.raw_tx, first_raw);
+    let mut client = CompactTxStreamerClient::connect(run.fake.url.clone())
+        .await
+        .unwrap();
+    let second = resubmit_prepared_transaction(
+        &mut reopened,
+        &mut LightwalletdSubmitter {
+            client: &mut client,
+        },
+        &persisted.prepared,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("resubmit stored bytes");
+    let captured = run.fake.captured_submissions();
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        captured[0], captured[1],
+        "restart must resend exact raw bytes"
+    );
+    assert_eq!(second.txid, txid);
+    assert_eq!(
+        submitted_txid(&captured[1]),
+        txid,
+        "both sends have one txid"
+    );
+}
+
+/// One fabricated primary height and block cannot finalize a transaction
+/// when an independent server disagrees about its inclusion.
+#[tokio::test]
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+async fn hostile_primary_height_with_secondary_disagreement_is_not_mined() {
+    use argos_core::{
+        broadcast::{BroadcastStore, DurableBroadcastLog, TxObservationState},
+        models::{ConfirmationEndpoint, TxLifecycleState},
+    };
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTxEvidence};
+
+    let harness = RegtestHarness::require();
+    common::regtest_harness::fund_test_account(0, 1_000_000).await;
+    let fake = FakeLightwalletd::builder()
+        .upstream(harness.lightwalletd_url())
+        .build()
+        .await
+        .expect("bind hostile primary");
+    let confirmation_sources = vec![
+        ConfirmationEndpoint {
+            operator_id: "hostile-primary".to_owned(),
+            endpoint: fake.url.clone(),
+        },
+        ConfirmationEndpoint {
+            operator_id: "independent-secondary".to_owned(),
+            endpoint: harness.lightwalletd_url().to_owned(),
+        },
+    ];
+    let data_dir = tempfile::tempdir().unwrap();
+    let fixture = complete_scan_against_test_seed_at(
+        &harness,
+        &data_dir,
+        "contested-confirmation",
+        &fake.url,
+        confirmation_sources,
+    )
+    .await;
+    let tip = common::regtest_harness::zebra_rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .expect("regtest tip height");
+    fake.set_scripted_transaction_evidence(ScriptedTxEvidence {
+        // Bind this script to the next accepted submission, including its
+        // exact raw bytes and computed txid.
+        txid: Vec::new(),
+        raw_tx: Vec::new(),
+        reported_height: tip,
+        tip_height: tip,
+        block_hash: vec![9; 32],
+        block_txids: Vec::new(),
+    });
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua.clone(),
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                donation_rate: None,
+                donor_email: None,
+                reviewed_fee_zatoshis: None,
+            },
+        )
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        fixture
+            .service
+            .execute_sweep(&fixture.handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("confirmation poll timed out")
+    .expect("sweep should return pending outcome");
+    assert_eq!(outcome.transactions.len(), 1);
+    let record = &outcome.transactions[0];
+    assert_eq!(record.status, TxLifecycleState::Pending);
+    assert!(record.detail.contains("Contested"), "{:?}", record.detail);
+    assert_eq!(record.confirmed_height, None);
+    let txid = submitted_txid(&fake.captured_submissions().lock().unwrap()[0]);
+    assert_eq!(record.txid.as_deref(), Some(txid.to_string().as_str()));
+    let path = fixture.workspace_root.join("broadcasts-v1.jsonl");
+    let log = DurableBroadcastLog::open(&path).unwrap();
+    let persisted = log.latest(txid).unwrap();
+    assert_eq!(persisted.state, TxLifecycleState::Pending);
+    let observation = persisted.observation.unwrap();
+    assert_eq!(observation.state, TxObservationState::Contested);
+    assert_eq!(observation.evidence.len(), 2);
+    assert_eq!(observation.evidence[0].reported_height, Some(tip as u32));
+    assert!(observation.evidence[0].block_hash.is_some());
+    assert!(!observation.evidence[0].tx_in_block);
+    assert!(observation.evidence[1].tip_height.is_some());
+    assert_ne!(observation.evidence[1].reported_height, Some(tip as u32));
+    assert!(
+        fixture.workspace_root.exists(),
+        "contested outcome cannot clean up the wallet"
+    );
+    let events = std::fs::read_to_string(path).unwrap();
+    assert!(
+        !events.contains("\"state\":\"mined\""),
+        "no mined event may be journaled"
+    );
+}
+
 // ─── Shared setup helper ─────────────────────────────────────────────────────
 
 /// Boot a scan against the Argos network harness with the canonical test
@@ -95,6 +663,23 @@ async fn complete_scan_against_test_seed(
     harness: &RegtestHarness,
     temp_data_dir: &tempfile::TempDir,
     label: &str,
+) -> ScannedFixture {
+    complete_scan_against_test_seed_at(
+        harness,
+        temp_data_dir,
+        label,
+        harness.lightwalletd_url(),
+        Vec::new(),
+    )
+    .await
+}
+
+async fn complete_scan_against_test_seed_at(
+    harness: &RegtestHarness,
+    temp_data_dir: &tempfile::TempDir,
+    label: &str,
+    lightwalletd_url: &str,
+    confirmation_sources: Vec<argos_core::models::ConfirmationEndpoint>,
 ) -> ScannedFixture {
     // Build the runtime config first so we can compute the workspace path
     // deterministically without involving the service. RecoveryWorkspace's
@@ -115,8 +700,8 @@ async fn complete_scan_against_test_seed(
         num_accounts: Some(2),
         gap_limit: 5,
         transparent_scan: None,
-        lightwalletd_url: harness.lightwalletd_url().to_owned(),
-        confirmation_sources: Vec::new(),
+        lightwalletd_url: lightwalletd_url.to_owned(),
+        confirmation_sources: confirmation_sources.clone(),
         data_dir: temp_data_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: label.to_owned(),
@@ -137,7 +722,7 @@ async fn complete_scan_against_test_seed(
         num_accounts: runtime.num_accounts,
         gap_limit: runtime.gap_limit,
         lightwalletd_url: runtime.lightwalletd_url.clone(),
-        confirmation_sources: Vec::new(),
+        confirmation_sources,
         data_dir: runtime.data_dir.clone(),
         network: runtime.network,
         label: runtime.label.clone(),

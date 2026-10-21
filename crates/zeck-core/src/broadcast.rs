@@ -1115,6 +1115,44 @@ mod tests {
             SubmissionDisposition::AmbiguousTransport
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_deadline_bounds_a_stalled_submission() {
+        let mut store = RecordingStore::default();
+        let tx = fixture();
+        let mut node = network(&store, Script::Stall);
+        let start = tokio::time::Instant::now();
+        let result =
+            submit_prepared_transaction(&mut store, &mut node, tx, Duration::from_millis(25))
+                .await
+                .unwrap();
+        assert_eq!(start.elapsed(), Duration::from_millis(25));
+        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(
+            result.disposition,
+            SubmissionDisposition::AmbiguousTransport
+        );
+    }
+
+    #[tokio::test]
+    async fn mined_and_expired_transactions_are_not_resubmitted() {
+        for state in [TxLifecycleState::Mined, TxLifecycleState::Expired] {
+            let tx = fixture();
+            let mut store = RecordingStore::default();
+            store.persist_prepared(&tx).unwrap();
+            store.transition(tx.txid, state, None, None).unwrap();
+            let mut node = network(&store, Script::Response(0, ""));
+            assert!(resubmit_prepared_transaction(
+                &mut store,
+                &mut node,
+                &tx,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err());
+            assert_eq!(node.calls, 0, "{state:?} must not reach network I/O");
+        }
+    }
     #[tokio::test]
     async fn deterministic_node_refusal_is_rejected() {
         let mut store = RecordingStore::default();
@@ -1381,6 +1419,52 @@ mod tests {
         assert!(DurableBroadcastLog::open(&path).is_err());
         drop(first);
         assert!(DurableBroadcastLog::open(&path).is_ok());
+    }
+
+    #[test]
+    fn process_lock_releases_after_forced_child_exit() {
+        const CHILD_ENV: &str = "ARGOS_TEST_BROADCAST_LOCK_CHILD_PATH";
+        const READY_ENV: &str = "ARGOS_TEST_BROADCAST_LOCK_READY_PATH";
+        if let Some(path) = std::env::var_os(CHILD_ENV) {
+            let _held = DurableBroadcastLog::open(path).unwrap();
+            let ready = std::env::var_os(READY_ENV).expect("child ready path");
+            std::fs::write(ready, b"locked").unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let ready = dir.path().join("child-ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "broadcast::tests::process_lock_releases_after_forced_child_exit",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, &path)
+            .env(READY_ENV, &ready)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child never acquired lock");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            DurableBroadcastLog::open(&path).is_err(),
+            "child must hold the lock"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            DurableBroadcastLog::open(&path).is_ok(),
+            "OS must release lock on child death"
+        );
     }
 
     #[test]

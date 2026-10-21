@@ -24,6 +24,11 @@
 //!   - `hang_after_blocks(N)` — emit `N` blocks normally, then the
 //!     forwarder task parks itself indefinitely without sending or closing
 //!     the stream. Models a dead peer (TCP up, no h2 frames). Drives R-N15.
+//!   - `drop_send_response_after_forward_once()` — forward a submitted raw
+//!     transaction, require a successful upstream response, then return
+//!     `Unavailable` to the caller once. Captured bytes remain inspectable.
+//!   - `scripted_transaction_evidence(...)` — answer `GetTransaction`,
+//!     `GetLightdInfo`, and `GetBlock` from one coherent evidence script.
 //!
 //! For R-N17 (captive-portal-shaped MitM), the fixture has nothing useful
 //! to add — instead, see [`serve_captive_portal_shim`], a sibling helper
@@ -42,9 +47,10 @@
 #![cfg(feature = "argos-network")]
 #![allow(dead_code)] // Some helpers (e.g. the `latency` knob) await follow-up wiring.
 
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prost::Message as _;
@@ -53,6 +59,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
+use zcash_primitives::transaction::Transaction;
+use zcash_protocol::consensus::BranchId;
 
 // Re-export the generated proto code under a stable in-crate path. The
 // `cash.z.wallet.sdk.rpc` package name produces an output file whose name
@@ -87,6 +95,8 @@ pub struct FakeLightwalletd {
     /// `lightwalletd_url`. Argos's `validate_lightwalletd_endpoint` accepts
     /// `http://127.0.0.1:...` because the host is loopback.
     pub url: String,
+    captured_submissions: Arc<Mutex<Vec<Vec<u8>>>>,
+    scripted_transaction_evidence: Arc<Mutex<Option<ScriptedTxEvidence>>>,
     /// JoinHandle for the tonic server task; dropping shuts the server down.
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -95,6 +105,50 @@ impl FakeLightwalletd {
     /// Begin building a new fixture. See [`FakeLightwalletdBuilder`].
     pub fn builder() -> FakeLightwalletdBuilder {
         FakeLightwalletdBuilder::default()
+    }
+
+    /// Exact raw bytes received by SendTransaction, in arrival order.
+    pub fn captured_submissions(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        self.captured_submissions.clone()
+    }
+
+    /// Change only the confirmation RPCs after a normal scan has completed.
+    pub fn set_scripted_transaction_evidence(&self, evidence: ScriptedTxEvidence) {
+        evidence.validate();
+        *self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex") = Some(evidence);
+    }
+}
+
+/// Coherent answers for the three RPCs used by transaction confirmation.
+/// `reported_height` selects the only scripted block, whose `block_txids`
+/// explicitly decide whether the claimed transaction is actually included.
+#[derive(Clone, Debug)]
+pub struct ScriptedTxEvidence {
+    pub txid: Vec<u8>,
+    pub raw_tx: Vec<u8>,
+    pub reported_height: u64,
+    pub tip_height: u64,
+    pub block_hash: Vec<u8>,
+    pub block_txids: Vec<Vec<u8>>,
+}
+
+impl ScriptedTxEvidence {
+    fn validate(&self) {
+        assert!(
+            (self.txid.len() == 32 && !self.raw_tx.is_empty())
+                || (self.txid.is_empty() && self.raw_tx.is_empty()),
+            "scripted txid/raw bytes must be explicit or bind to the submitted transaction"
+        );
+        assert!(self.tip_height >= self.reported_height);
+        assert_eq!(
+            self.block_hash.len(),
+            32,
+            "scripted block hash must be 32 bytes"
+        );
+        assert!(self.block_txids.iter().all(|txid| txid.len() == 32));
     }
 }
 
@@ -141,6 +195,10 @@ pub struct FakeLightwalletdBuilder {
     /// without closing the stream. Models a dead peer (TCP up, no h2 frames).
     /// Used by R-N15.
     hang_after_blocks: Option<u64>,
+    drop_send_response_after_forward_once: bool,
+    accept_submissions_for_test: bool,
+    reject_submissions_for_test: Option<i32>,
+    scripted_transaction_evidence: Option<ScriptedTxEvidence>,
 }
 
 impl Default for FakeLightwalletdBuilder {
@@ -155,6 +213,10 @@ impl Default for FakeLightwalletdBuilder {
             inject_hostile_block_at_height: None,
             bandwidth_bytes_per_sec: None,
             hang_after_blocks: None,
+            drop_send_response_after_forward_once: false,
+            accept_submissions_for_test: false,
+            reject_submissions_for_test: None,
+            scripted_transaction_evidence: None,
         }
     }
 }
@@ -182,12 +244,39 @@ impl FakeLightwalletdBuilder {
         self
     }
 
-    /// Forward unknown RPCs to a real upstream lightwalletd. Required for
-    /// every RPC except `GetLightdInfo` in this skeleton PR; the follow-up
-    /// PR will add synthetic responders for the fault-injection cases that
-    /// don't need a real backend.
+    /// Forward RPCs to a real upstream lightwalletd. Local scripted
+    /// confirmation evidence and local send responders can override only
+    /// their named RPCs.
     pub fn upstream(mut self, url: impl Into<String>) -> Self {
         self.upstream_url = Some(url.into());
+        self
+    }
+
+    /// Return Unavailable once, after the upstream has accepted a submitted
+    /// transaction. A node-level rejection never consumes the one-shot fault.
+    pub fn drop_send_response_after_forward_once(mut self) -> Self {
+        self.drop_send_response_after_forward_once = true;
+        self
+    }
+
+    /// Local unit-test upstream that accepts raw bytes without a regtest node.
+    pub fn accept_submissions_for_test(mut self) -> Self {
+        self.accept_submissions_for_test = true;
+        self
+    }
+
+    /// Local unit-test upstream that returns a node rejection response.
+    pub fn reject_submissions_for_test(mut self, code: i32) -> Self {
+        assert_ne!(code, 0);
+        self.reject_submissions_for_test = Some(code);
+        self
+    }
+
+    /// Override confirmation evidence while retaining normal forwarding for
+    /// unrelated RPCs, including transaction submission.
+    pub fn scripted_transaction_evidence(mut self, evidence: ScriptedTxEvidence) -> Self {
+        evidence.validate();
+        self.scripted_transaction_evidence = Some(evidence);
         self
     }
 
@@ -242,6 +331,8 @@ impl FakeLightwalletdBuilder {
         let url = format!("http://{local_addr}");
 
         let service = FakeService::new(self).await;
+        let captured_submissions = service.captured_submissions.clone();
+        let scripted_transaction_evidence = service.scripted_transaction_evidence.clone();
         let server = CompactTxStreamerServer::new(service);
 
         let incoming = TcpListenerStream::new(listener);
@@ -254,6 +345,8 @@ impl FakeLightwalletdBuilder {
 
         Ok(FakeLightwalletd {
             url,
+            captured_submissions,
+            scripted_transaction_evidence,
             _handle: handle,
         })
     }
@@ -306,10 +399,16 @@ struct FakeService {
     chain_name: String,
     sapling_activation_height: u64,
     block_height: u64,
-    /// Lazily-connected upstream client. `None` means no proxy mode; every
-    /// RPC other than `GetLightdInfo` returns `unimplemented`.
+    /// Lazily-connected upstream client. `None` means no proxy mode; RPCs
+    /// without a local scripted responder return `unimplemented`.
     upstream: Option<UpstreamClient<Channel>>,
     fault: Arc<FaultState>,
+    captured_submissions: Arc<Mutex<Vec<Vec<u8>>>>,
+    drop_send_response_after_forward_once: bool,
+    send_response_dropped: AtomicBool,
+    accept_submissions_for_test: bool,
+    reject_submissions_for_test: Option<i32>,
+    scripted_transaction_evidence: Arc<Mutex<Option<ScriptedTxEvidence>>>,
 }
 
 impl FakeService {
@@ -343,10 +442,18 @@ impl FakeService {
                 latency: builder.latency,
                 bandwidth_bytes_per_sec: builder.bandwidth_bytes_per_sec,
             }),
+            captured_submissions: Arc::new(Mutex::new(Vec::new())),
+            drop_send_response_after_forward_once: builder.drop_send_response_after_forward_once,
+            send_response_dropped: AtomicBool::new(false),
+            accept_submissions_for_test: builder.accept_submissions_for_test,
+            reject_submissions_for_test: builder.reject_submissions_for_test,
+            scripted_transaction_evidence: Arc::new(Mutex::new(
+                builder.scripted_transaction_evidence,
+            )),
         }
     }
 
-    /// Return a fresh clone of the upstream client, or an `unavailable` Status
+    /// Return a fresh clone of the upstream client, or an `unimplemented` Status
     /// when proxy mode is disabled. The clone is cheap — tonic channels share
     /// the underlying HTTP/2 connection.
     fn upstream(&self) -> Result<UpstreamClient<Channel>, Status> {
@@ -470,7 +577,14 @@ impl CompactTxStreamer for FakeService {
         // claim its own chain identity (the upstream may legitimately be a
         // testnet or mainnet server; the fixture should still look like a
         // regtest to Argos under argos-network).
-        let block_height = if let Some(mut upstream) = self.upstream.clone() {
+        let script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex")
+            .clone();
+        let block_height = if let Some(script) = &script {
+            script.tip_height
+        } else if let Some(mut upstream) = self.upstream.clone() {
             // Best-effort: ask the upstream for its tip height so the proxy
             // mode reports a realistic value, but fall back to the configured
             // value if the upstream call fails.
@@ -495,6 +609,34 @@ impl CompactTxStreamer for FakeService {
     }
 
     async fn get_block(&self, request: Request<BlockId>) -> Result<Response<CompactBlock>, Status> {
+        let script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex")
+            .clone();
+        if let Some(script) = &script {
+            let requested = request.get_ref();
+            if requested.height != script.reported_height
+                || (!requested.hash.is_empty() && requested.hash != script.block_hash)
+            {
+                return Err(Status::not_found(
+                    "scripted block does not match requested ID",
+                ));
+            }
+            return Ok(Response::new(CompactBlock {
+                height: script.reported_height,
+                hash: script.block_hash.clone(),
+                vtx: script
+                    .block_txids
+                    .iter()
+                    .map(|txid| pb::CompactTx {
+                        txid: txid.clone(),
+                        ..pb::CompactTx::default()
+                    })
+                    .collect(),
+                ..CompactBlock::default()
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req = reencode::<_, zcash_client_backend::proto::service::BlockId>(request.get_ref());
         let resp = upstream.get_block(req).await?.into_inner();
@@ -598,6 +740,38 @@ impl CompactTxStreamer for FakeService {
         &self,
         request: Request<TxFilter>,
     ) -> Result<Response<RawTransaction>, Status> {
+        let script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex")
+            .clone();
+        if let Some(script) = &script {
+            let (txid, raw_tx) = if script.txid.is_empty() {
+                let raw = self
+                    .captured_submissions
+                    .lock()
+                    .expect("submission capture mutex")
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| Status::not_found("no submitted transaction to script"))?;
+                let tx = Transaction::read(&mut Cursor::new(raw.as_slice()), BranchId::Nu5)
+                    .map_err(|err| {
+                        Status::internal(format!("cannot parse captured transaction: {err}"))
+                    })?;
+                (tx.txid().as_ref().to_vec(), raw)
+            } else {
+                (script.txid.clone(), script.raw_tx.clone())
+            };
+            if request.get_ref().hash != txid {
+                return Err(Status::not_found(
+                    "scripted transaction does not match requested hash",
+                ));
+            }
+            return Ok(Response::new(RawTransaction {
+                data: raw_tx,
+                height: script.reported_height,
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req = reencode::<_, zcash_client_backend::proto::service::TxFilter>(request.get_ref());
         let resp = upstream.get_transaction(req).await?.into_inner();
@@ -608,10 +782,37 @@ impl CompactTxStreamer for FakeService {
         &self,
         request: Request<RawTransaction>,
     ) -> Result<Response<SendResponse>, Status> {
+        self.captured_submissions
+            .lock()
+            .expect("submission capture mutex")
+            .push(request.get_ref().data.clone());
+        if self.accept_submissions_for_test && self.upstream.is_none() {
+            return Ok(Response::new(SendResponse::default()));
+        }
+        if let Some(code) = self
+            .reject_submissions_for_test
+            .filter(|_| self.upstream.is_none())
+        {
+            return Ok(Response::new(SendResponse {
+                error_code: code,
+                error_message: "scripted test rejection".to_owned(),
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req =
             reencode::<_, zcash_client_backend::proto::service::RawTransaction>(request.get_ref());
         let resp = upstream.send_transaction(req).await?.into_inner();
+        if self.drop_send_response_after_forward_once
+            && resp.error_code == 0
+            && self
+                .send_response_dropped
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(Status::unavailable(
+                "FakeLightwalletd: upstream accepted the transaction, response dropped once",
+            ));
+        }
         Ok(Response::new(reencode::<_, SendResponse>(&resp)))
     }
 
