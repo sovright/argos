@@ -73,7 +73,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       const start = source.indexOf("async function runSproutScanSweep()");
       const end = source.indexOf("\n}\n", start) + 3;
       vm.runInContext(source.slice(start, end), context);
-      for (const helper of ["sproutScanPeers", "sproutScanKeys"]) {
+      for (const helper of ["sproutScanPeers", "sproutScanKeyLines", "sproutScanKeyEntries", "sproutScanKeys"]) {
         if (vm.runInContext(`typeof ${helper}`, context) !== "function") {
           vm.runInContext(`function ${helper}() { return []; }`, context);
         }

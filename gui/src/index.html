@@ -635,10 +635,15 @@
         <section class="screen" data-step="scan">
           <p class="eyebrow">Step 4</p>
           <h2>Recovery scan</h2>
-          <div class="banner warning" id="scan-warning">
+          <div class="banner warning" id="scan-warning-shielded">
             Transparent funds are detected within seconds. Argos must still finish the full
             shielded block sync before sweeping — <strong>Review &amp; Sweep unlocks when the
             phase reads "Complete".</strong>
+          </div>
+          <div class="banner info" id="scan-warning-transparent-only" hidden>
+            This wallet holds only transparent keys, so there is no shielded block sync. Argos
+            asks the server for its funds directly, which takes seconds —
+            <strong>Review &amp; Sweep unlocks when the phase reads "Complete".</strong>
           </div>
           <div class="banner info" id="scan-resume-info">
             <strong>Safe to interrupt.</strong> Progress is saved automatically — quit Argos or

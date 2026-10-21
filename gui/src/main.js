@@ -312,6 +312,19 @@ seedVisibility.addEventListener("change", () => {
   seedInput.classList.toggle("masked", !seedVisibility.checked);
 });
 
+// Which scan-screen banner applies. Only a wallet file whose keys are all
+// transparent skips the block sync: pasted Sapling keys move the scan onto
+// the imported-account route, and matched-address recovery ignores the file.
+function scanWarningVariant(walletFile, typedSaplingKeyCount, matchedRecovery) {
+  if (matchedRecovery || typedSaplingKeyCount > 0) return "shielded";
+  return walletFile?.summary?.transparent_only === true ? "transparent-only" : "shielded";
+}
+
+function showScanWarning(variant) {
+  $("scan-warning-shielded").hidden = variant !== "shielded";
+  $("scan-warning-transparent-only").hidden = variant !== "transparent-only";
+}
+
 async function validateSeed() {
   const words = seedInput.value.trim().toLowerCase().split(/\s+/);
   setStatus("seed-status", "Validating…", "");
@@ -1025,8 +1038,25 @@ async function checkSaplingKeys() {
 // The fallback for a wallet whose note data is missing, and the only route
 // for a raw key with no wallet file. Hours, so it checkpoints and resumes.
 
+// The raw lines of the key box, unfiltered. The backend (`collect_scan_keys`)
+// owns the skip rule and numbers a failure by the line the user can see, so
+// dropping blanks here would shift every reported number away from the box.
+function sproutScanKeyLines() {
+  const box = $("sprout-scan-keys");
+  if (!box) return [];
+  return box.value.split("\n");
+}
+
+// Each key paired with the line it sits on. Blank lines and `#` comments are
+// annotation, the same rule as the CLI key file and the Sapling box.
+function sproutScanKeyEntries() {
+  return sproutScanKeyLines()
+    .map((line, i) => ({ key: line.trim(), line: i + 1 }))
+    .filter(({ key }) => key !== "" && !key.startsWith("#"));
+}
+
 function sproutScanKeys() {
-  return $("sprout-scan-keys").value.split("\n").map((k) => k.trim()).filter(Boolean);
+  return sproutScanKeyEntries().map(({ key }) => key);
 }
 
 // Custom P2P peers, for when every public peer's inbound slots are full.
@@ -1107,7 +1137,7 @@ function currentSproutDecryptRequest() {
 async function checkSproutKeys() {
   const list = $("sprout-scan-addresses");
   list.innerHTML = "";
-  const keys = sproutScanKeys();
+  const keys = sproutScanKeyEntries();
   if (!keys.length) {
     setStatus(
       "sprout-scan-status",
@@ -1119,14 +1149,14 @@ async function checkSproutKeys() {
     return;
   }
   // Checked before the scan, not six hours into it.
-  for (const [i, key] of keys.entries()) {
+  for (const { key, line } of keys) {
     try {
       const addr = await invoke("check_sprout_key", { key, network: $("network-select").value });
       const li = document.createElement("li");
       li.textContent = addr;
       list.appendChild(li);
     } catch (err) {
-      setStatus("sprout-scan-status", `✗ key ${i + 1}: ${err}`, "error");
+      setStatus("sprout-scan-status", `✗ line ${line}: ${err}`, "error");
       return;
     }
   }
@@ -1166,7 +1196,7 @@ async function runSproutScan() {
 
   try {
     const report = await invoke("start_sprout_scan", {
-      keys,
+      keys: sproutScanKeyLines(),
       // The wallet file's own Sprout keys are merged in by the backend, so
       // leaving the box blank genuinely works now.
       path: walletFile ? walletFile.path : null,
@@ -1254,7 +1284,7 @@ async function runSproutScanSweep() {
 
   try {
     const report = await invoke("sweep_sprout_from_scan", {
-      keys: sproutScanKeys(),
+      keys: sproutScanKeyLines(),
       path: walletFile ? walletFile.path : null,
       passphrase: walletFile ? walletFile.passphrase : null,
       destination,
@@ -1642,12 +1672,24 @@ updateBirthdayHint();
 
 // Which seed auto-detect can use. A loaded wallet file wins over the typed
 // box because the scan will use the file's keys; its mnemonic stays in the
-// backend, so the frontend only chooses the command.
-// A seedless zcashd wallet.dat is dated from its key creation times, so a
-// loaded file always goes to the backend, which refuses a seedless ZecWallet
-// Lite file itself.
+// backend, so the frontend only chooses the command. A seedless zcashd
+// wallet.dat is dated from its key creation times, so a loaded file always
+// goes to the backend; whether it has a mnemonic, or is a seedless ZecWallet
+// Lite file to refuse, is the backend's call, so its refusal is shown as
+// returned rather than restated here where it could drift.
 function birthdayAutodetectSource(seedText, wallet) {
-  if (wallet) return { kind: "wallet" };
+  if (wallet) {
+    // The passphrase is dropped once a scan starts (T-S2), so after
+    // back-to-config the backend could not reopen an encrypted file.
+    if (wallet.passphraseCleared && wallet.passphrase == null) {
+      return {
+        kind: "none",
+        message:
+          "This wallet file is encrypted and its passphrase was cleared when the scan started. Re-enter the passphrase on the wallet screen, then try Auto-detect again.",
+      };
+    }
+    return { kind: "wallet" };
+  }
   if (String(seedText || "").trim()) return { kind: "seed" };
   return { kind: "none", message: "Enter your seed phrase on step 2 first." };
 }
@@ -1667,20 +1709,26 @@ function birthdayDetectHint(result, approxMonth) {
   return `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}).`;
 }
 
-$("birthday-autodetect").addEventListener("click", async () => {
+async function runBirthdayAutodetect() {
   const source = birthdayAutodetectSource(seedInput.value, walletFile);
   if (source.kind === "none") {
     setBirthdayHint(source.message, "error");
     return;
   }
   const seedVal = seedInput.value.trim();
+  // Phase-2 detection can run for minutes. If the user opens another wallet
+  // or edits the seed meanwhile, the result belongs to the old source.
+  const generation = walletOpenGeneration;
+  const isCurrent = () =>
+    generation === walletOpenGeneration &&
+    (source.kind === "wallet" || seedInput.value.trim() === seedVal);
   $("birthday-autodetect").disabled = true;
   $("birthday-estimate").disabled = true;
   setBirthdayHint("Starting detection…", "");
   setStatus("config-status", "", "");
 
   const unlistenProbe = await listen("birthday-probe-progress", (event) => {
-    setBirthdayHint(event.payload, "");
+    if (isCurrent()) setBirthdayHint(event.payload, "");
   });
 
   try {
@@ -1698,19 +1746,25 @@ $("birthday-autodetect").addEventListener("click", async () => {
             saplingKeys: hasSaplingScanKeys() ? saplingScanKeyLines() : [],
           })
         : await invoke("detect_birthday", { ...probe, seed: seedVal.toLowerCase() });
+    if (!isCurrent()) {
+      setBirthdayHint("Auto-detect result discarded: the wallet or seed changed while it ran.", "");
+      return;
+    }
     $("birthday-height").value = result.birthday;
     birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
     setBirthdayHint(birthdayDetectHint(result, approx), "success");
   } catch (err) {
-    setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
+    if (isCurrent()) setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
   } finally {
     $("birthday-autodetect").disabled = false;
     $("birthday-estimate").disabled = false;
     unlistenProbe();
   }
-});
+}
+
+$("birthday-autodetect").addEventListener("click", runBirthdayAutodetect);
 
 $("birthday-estimate").addEventListener("click", async () => {
   const dateVal = $("birthday-date").value;
@@ -1895,6 +1949,9 @@ go back and provide one.",
     // number the lines the user sees. Empty when the box holds nothing but
     // comments, so a wallet-file-only scan is not handed a key set to reject.
     const typedSaplingKeys = hasTypedSaplingKeys ? saplingScanKeyLines() : [];
+    showScanWarning(
+      scanWarningVariant(walletFile, typedSaplingKeys.length, !!state.matchedRecovery),
+    );
     if (state.matchedRecovery) {
       const matched = state.matchedRecovery;
       const matchedConfig = configForMatchedRecovery(config);
@@ -1939,7 +1996,10 @@ go back and provide one.",
     // keys (threat model T-S2). Only on success: the passphrase field lives
     // on the wallet screen, so clearing it after a failure would strand a
     // user who retries from the config screen with no way to re-enter it.
-    if (walletFile) walletFile.passphrase = null;
+    if (walletFile) {
+      if (walletFile.passphrase != null) walletFile.passphraseCleared = true;
+      walletFile.passphrase = null;
+    }
     const passphraseInput = $("wallet-passphrase");
     if (passphraseInput) passphraseInput.value = "";
     // The backend holds the decoded keys now; a spending key must not sit
@@ -3252,6 +3312,8 @@ $("resume-confirm").addEventListener("click", async () => {
   $("resume-confirm").disabled = true;
   setStatus("resume-modal-status", "Verifying seed and resuming…", "");
   try {
+    // Resume is seed-only, so it always runs the shielded block sync.
+    showScanWarning("shielded");
     const handle = await invoke("resume_session", {
       input: {
         workspace_path: pendingResumeRow.workspace_path,

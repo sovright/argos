@@ -1133,12 +1133,15 @@ fn collect_scan_keys(
 
     for (index, key) in typed.iter().enumerate() {
         let key = key.trim();
-        if key.is_empty() {
+        // Blank lines and `#` comments are annotation, as in the CLI key file
+        // and `keys_from_sapling_strings`. `typed` is the box's raw lines, so
+        // `index` is the line the user sees.
+        if key.is_empty() || key.starts_with('#') {
             continue;
         }
         keys.push(
             argos_core::sprout_key::decode_sprout_spending_key(key, network)
-                .map_err(|err| format!("key {}: {err}", index + 1))?,
+                .map_err(|err| format!("line {}: {err}", index + 1))?,
         );
     }
 
@@ -2383,6 +2386,30 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scan_keys_skip_comments_and_blank_lines() {
+        let typed = vec![
+            "# note".to_string(),
+            String::new(),
+            "  # indented".to_string(),
+        ];
+        // Comments are skipped rather than decoded, so what remains is the
+        // "nothing to scan" refusal, not a bad-key error on line 1.
+        let err = super::collect_scan_keys(None, None, &typed, argos_core::ZeckNetwork::Mainnet)
+            .err()
+            .expect("refused");
+        assert!(err.starts_with("no Sprout spending keys"), "{err}");
+    }
+
+    #[test]
+    fn scan_key_error_names_the_visible_line() {
+        let typed = vec!["# note".to_string(), String::new(), "not-a-key".to_string()];
+        let err = super::collect_scan_keys(None, None, &typed, argos_core::ZeckNetwork::Mainnet)
+            .err()
+            .expect("refused");
+        assert!(err.starts_with("line 3:"), "{err}");
+    }
+
     use super::{
         refuse_unreachable_sweep_destination, sweep_report, validate_sweep_endpoint,
         validate_sweep_request,
@@ -2632,6 +2659,66 @@ mod tests {
         assert_eq!(result.birthday, 1_200_000);
         assert!(result.message.contains("unspent"), "{}", result.message);
         assert!(result.message.contains("later than"), "{}", result.message);
+    }
+
+    /// Hand-built ZecWallet Lite v25 file with an encrypted seed. The seed
+    /// ciphertext is `encrypt_test_seed` from `argos-wallet-import`'s own
+    /// tests (XSalsa20-Poly1305, unsalted double-SHA-256 key) for entropy
+    /// `[0x11; 32]`, passphrase "some passphrase", nonce `[0x99; 24]`.
+    fn encrypted_zwl_bytes() -> Vec<u8> {
+        const ENC_SEED: &str = "01e1e103955249869a29a92fd73be26b58cbc0a722a5fb6d8124f72219bf9f2476f4776dac43f6828d54a4885bf435dc";
+        let mut bytes = 25u64.to_le_bytes().to_vec(); // external version
+        bytes.extend_from_slice(&21u64.to_le_bytes()); // keys version
+        bytes.push(1); // encrypted
+        bytes.extend(
+            (0..ENC_SEED.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&ENC_SEED[i..i + 2], 16).expect("hex")),
+        );
+        bytes.push(24); // nonce length (CompactSize)
+        bytes.extend_from_slice(&[0x99; 24]);
+        bytes.extend_from_slice(&[0u8; 32]); // plaintext seed slot, unused when encrypted
+        bytes.extend_from_slice(&[0, 0]); // no zkeys, no tkeys
+        bytes
+    }
+
+    /// The positive path through a real file on disk: the backend re-opens
+    /// the file, decrypts the seed and hands back the mnemonic, so it never
+    /// has to cross IPC.
+    #[test]
+    fn an_encrypted_zwl_file_yields_its_mnemonic_for_detection() {
+        let dir = std::env::temp_dir().join(format!("argos-birthday-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("zwl.dat");
+        std::fs::write(&path, encrypted_zwl_bytes()).expect("write fixture");
+        let path_str = path.to_str().expect("utf-8 path").to_owned();
+
+        let pass = SecretString::from("some passphrase".to_owned());
+        let route = birthday_route_for_file(&path_str, Some(&pass), &[], ZeckNetwork::Mainnet)
+            .expect("decrypts");
+        let phrase = match route {
+            BirthdayRoute::Seed(phrase) => phrase,
+            BirthdayRoute::WalletDat { .. } => panic!("a ZWL mnemonic is probed as a seed"),
+        };
+        // BIP-39 of entropy [0x11; 32].
+        assert_eq!(
+            phrase.expose_secret(),
+            "baby mass dust captain baby mass dust captain baby mass dust captain \
+             baby mass dust captain baby mass dust captain baby mass dust cake"
+        );
+
+        let err = match birthday_route_for_file(&path_str, None, &[], ZeckNetwork::Mainnet) {
+            Err(err) => err,
+            Ok(_) => panic!("needs the passphrase"),
+        };
+        assert!(!err.contains(phrase.expose_secret().as_str()), "{err}");
+        let wrong = SecretString::from("wrong".to_owned());
+        assert!(
+            birthday_route_for_file(&path_str, Some(&wrong), &[], ZeckNetwork::Mainnet).is_err(),
+            "wrong passphrase"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
