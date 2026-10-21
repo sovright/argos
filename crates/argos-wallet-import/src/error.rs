@@ -49,11 +49,12 @@ pub enum ImportDiagnostic {
     )]
     UnscannedSeedAccounts { accounts: u32 },
 
-    /// The seed's own counters say more legacy keys were derived than the
-    /// file holds — a truncated or damaged wallet.
+    /// The seed's own counters say more legacy keys were derived than were
+    /// recovered from the file — a truncated or damaged wallet. `found`
+    /// counts keys actually read, not key records that merely exist.
     #[error(
         "the wallet's seed derived {expected} {pool} key(s) but only {found} \
-         are stored in this file"
+         were read from this file"
     )]
     MissingDerivedKeys {
         pool: String,

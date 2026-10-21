@@ -13,6 +13,8 @@ pub use plaintext::collect_plaintext;
 pub use records::{compact_size, parse_record_key, RecordKey};
 pub use sprout::collect_sprout_notes;
 
+use std::collections::HashSet;
+
 use secrecy::SecretString;
 
 use crate::{bdb, error::ImportError, keys::ImportedKeys};
@@ -35,29 +37,52 @@ pub fn import_zcashd(
     passphrase: Option<&SecretString>,
 ) -> Result<ImportedKeys, ImportError> {
     let pairs = Records(bdb::walk(bytes)?);
-    let mut out = ImportedKeys::default();
-
-    collect_plaintext(&pairs, &mut out);
-    collect_sprout_notes(&pairs, &mut out);
-
     let master = match find_mkey(&pairs) {
-        Some(mkey) => {
-            // Encrypted wallet: without a passphrase the encrypted records
-            // are unreachable, and reporting partial plaintext results would
-            // let a user believe they had recovered everything.
-            let passphrase = passphrase.ok_or(ImportError::WrongPassphrase)?;
-            let master = derive_master_key(passphrase, &mkey)?;
-            collect_encrypted(&pairs, &master, &mut out);
-            Some(master)
-        }
+        // Encrypted wallet: without a passphrase the encrypted records are
+        // unreachable, and reporting partial plaintext results would let a
+        // user believe they had recovered everything.
+        Some(mkey) => Some(derive_master_key(
+            passphrase.ok_or(ImportError::WrongPassphrase)?,
+            &mkey,
+        )?),
         None => None,
     };
-    // Last, over the records themselves: coverage is judged by key
-    // identity (key records and their metadata), not by what the passes
-    // above happened to recover.
-    seed::assess_seed(&pairs, master.as_ref(), &mut out);
+    Ok(import_records(&pairs, master.as_ref()))
+}
 
-    Ok(out)
+/// Every pass over the walked records. `master` is `Some` exactly when the
+/// wallet is encrypted.
+fn import_records(pairs: &[(Vec<u8>, Vec<u8>)], master: Option<&MasterKey>) -> ImportedKeys {
+    let mut out = ImportedKeys::default();
+    let mut recovered = collect_plaintext(pairs, &mut out);
+    collect_sprout_notes(pairs, &mut out);
+    if let Some(master) = master {
+        recovered.extend(collect_encrypted(pairs, master, &mut out));
+    }
+    // Last: coverage is judged by key identity — a derived key counts only
+    // if its metadata names this seed *and* the passes above actually
+    // recovered it. A key record that merely exists but could not be read
+    // or decrypted is not a key the user has.
+    seed::assess_seed(pairs, master, &recovered, &mut out);
+    out
+}
+
+/// The keys a collector actually recovered, named by the remainder of
+/// their record key after the type: the serialized public key for
+/// `key`/`ckey`, the incoming viewing key for `sapzkey`/`csapzkey`. Those
+/// are byte-for-byte the keys of the matching `keymeta`/`sapzkeymeta`
+/// records, which is how seed coverage joins the two.
+#[derive(Default)]
+pub struct RecoveredKeyIds {
+    pub(crate) transparent: HashSet<Vec<u8>>,
+    pub(crate) sapling: HashSet<Vec<u8>>,
+}
+
+impl RecoveredKeyIds {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.transparent.extend(other.transparent);
+        self.sapling.extend(other.sapling);
+    }
 }
 
 /// The walked records, scrubbed when dropped — on every exit, including the
@@ -90,10 +115,101 @@ impl Drop for Records {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ImportDiagnostic;
     use secrecy::SecretString;
 
     fn read(name: &str) -> Vec<u8> {
         std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap()
+    }
+
+    /// The record key, after its type, of the first key whose metadata
+    /// names a legacy-account keypath containing `branch`.
+    fn derived_key_id(pairs: &[(Vec<u8>, Vec<u8>)], branch: &str) -> Vec<u8> {
+        pairs
+            .iter()
+            .find_map(|(k, v)| {
+                let r = parse_record_key(k)?;
+                (r.record_type == "keymeta" && String::from_utf8_lossy(v).contains(branch))
+                    .then_some(r.rest)
+            })
+            .expect("a derived key")
+    }
+
+    /// Cut the value of the `record_type` record whose key is `id` to `len`
+    /// bytes: the record is still there, its key is not readable.
+    fn truncate_record(pairs: &mut [(Vec<u8>, Vec<u8>)], record_type: &str, id: &[u8], len: usize) {
+        let mut hit = 0;
+        for (k, v) in pairs.iter_mut() {
+            if parse_record_key(k).is_some_and(|r| r.record_type == record_type && r.rest == id) {
+                v.truncate(len);
+                hit += 1;
+            }
+        }
+        assert_eq!(hit, 1, "exactly one {record_type} record is damaged");
+    }
+
+    fn assert_not_claimed_complete(keys: &ImportedKeys, pool: &str) {
+        assert!(keys.seed_verified, "{:?}", keys.diagnostics);
+        let note = keys
+            .verified_seed_note()
+            .expect("a verified seed has a note");
+        assert!(
+            !note.contains("every key it derived is read"),
+            "an unread derived key must withdraw the claim, got: {note}"
+        );
+        assert!(keys.coverage().may_hide_funds(), "{:?}", keys.coverage());
+        assert!(
+            keys.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::MissingDerivedKeys { pool: p, expected, found }
+                    if p.contains(pool) && *found + 1 == *expected
+            )),
+            "the unread key must not count as present: {:?}",
+            keys.diagnostics
+        );
+    }
+
+    /// Review round 3 on #230, finding 1. A derived key whose record merely
+    /// existed counted as present, so a legacy external `key` record cut
+    /// short — unreadable, its key not recovered — still read as "verified —
+    /// every key it derived is read from this file".
+    #[test]
+    fn an_unreadable_derived_key_withdraws_the_verified_claim() {
+        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap();
+        let id = derived_key_id(&pairs, "/2147483647'/0/");
+        truncate_record(&mut pairs, "key", &id, 10);
+        let keys = import_records(&pairs, None);
+        assert!(
+            keys.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "key"
+            )),
+            "{:?}",
+            keys.diagnostics
+        );
+        assert_not_claimed_complete(&keys, "external");
+    }
+
+    /// The same through decryption: a change `ckey` whose ciphertext is cut
+    /// short does not decrypt. (Flipping a ciphertext byte would not do —
+    /// CBC decrypts it to 32 bytes of garbage with no diagnostic.)
+    #[test]
+    fn an_undecryptable_derived_key_withdraws_the_verified_claim() {
+        let mut pairs = bdb::walk(&read("modern-encrypted")).unwrap();
+        let pass = SecretString::new("argos-test-passphrase".to_owned());
+        let master = derive_master_key(&pass, &find_mkey(&pairs).unwrap()).unwrap();
+        let id = derived_key_id(&pairs, "/2147483647'/1/");
+        truncate_record(&mut pairs, "ckey", &id, 5);
+        let keys = import_records(&pairs, Some(&master));
+        assert!(
+            keys.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::DecryptionFailed { record_type, .. } if record_type == "ckey"
+            )),
+            "{:?}",
+            keys.diagnostics
+        );
+        assert_not_claimed_complete(&keys, "change");
     }
 
     #[test]

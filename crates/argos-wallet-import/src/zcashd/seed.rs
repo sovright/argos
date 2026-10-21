@@ -34,7 +34,10 @@ use secrecy::Zeroize;
 use crate::{
     error::ImportDiagnostic,
     keys::ImportedKeys,
-    zcashd::{compact_size, crypto::MasterKey, encrypted::decrypt, records::parse_record_key},
+    zcashd::{
+        compact_size, crypto::MasterKey, encrypted::decrypt, records::parse_record_key,
+        RecoveredKeyIds,
+    },
 };
 
 /// Every record type this module owns. The plaintext pass skips these.
@@ -72,15 +75,25 @@ enum Chain {
 /// `key`/`ckey` record, `sapzkeymeta` keyed like `sapzkey`/`csapzkey`),
 /// carrying the HD keypath and the fingerprint of the seed it came from. A
 /// key the chain says was derived counts as present only if a key record
-/// exists whose metadata names exactly that keypath under this seed.
-/// Counting instead let every `importprivkey` key stand in for one missing
-/// derived key, so a damaged wallet with imports read as Complete.
+/// exists whose metadata names exactly that keypath under this seed, *and*
+/// the collectors actually recovered that key (`recovered`). Counting
+/// instead let every `importprivkey` key stand in for one missing derived
+/// key, so a damaged wallet with imports read as Complete; and a record
+/// that merely existed, but could not be read or decrypted, let an
+/// unreadable key pass for a recovered one.
 pub fn assess_seed(
     pairs: &[(Vec<u8>, Vec<u8>)],
     master: Option<&MasterKey>,
+    recovered: &RecoveredKeyIds,
     out: &mut ImportedKeys,
 ) {
-    let mut records = SeedRecords::default();
+    let mut records = SeedRecords {
+        plain: Vec::new(),
+        crypted: Vec::new(),
+        chain: None,
+        recovered,
+        metadata: Vec::new(),
+    };
     let mut pre_5_0_seed = None;
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
@@ -93,12 +106,6 @@ pub fn assess_seed(
             "mnemonicphrase" => records.plain.push((rec.rest, value.as_slice())),
             "cmnemonicphrase" => records.crypted.push((rec.rest, value.as_slice())),
             "mnemonichdchain" => records.chain = Some(value.as_slice()),
-            "key" | "ckey" => {
-                records.transparent.insert(rec.rest);
-            }
-            "sapzkey" | "csapzkey" => {
-                records.sapling.insert(rec.rest);
-            }
             "keymeta" => records.metadata.push((false, rec.rest, value.as_slice())),
             "sapzkeymeta" => records.metadata.push((true, rec.rest, value.as_slice())),
             _ => {}
@@ -126,13 +133,13 @@ pub fn assess_seed(
 }
 
 /// The records `assess_seed` reads, collected in one pass.
-#[derive(Default)]
 struct SeedRecords<'a> {
     plain: Vec<(Vec<u8>, &'a [u8])>,
     crypted: Vec<(Vec<u8>, &'a [u8])>,
     chain: Option<&'a [u8]>,
-    transparent: std::collections::HashSet<Vec<u8>>,
-    sapling: std::collections::HashSet<Vec<u8>>,
+    /// The keys the collectors recovered: what a derived key must be among
+    /// to count as present.
+    recovered: &'a RecoveredKeyIds,
     /// `(is_sapling, record key after the type, value)`.
     metadata: Vec<(bool, Vec<u8>, &'a [u8])>,
 }
@@ -254,7 +261,9 @@ fn check_coverage(
     }
 
     // The derived keys actually present: metadata naming this seed and a
-    // legacy-account keypath, backed by a key record under the same key.
+    // legacy-account keypath, backed by a key the collectors recovered under
+    // the same record key — not merely a key record, which may be one that
+    // could not be read or decrypted.
     let mut present: HashSet<(Chain, u32)> = HashSet::new();
     for (sapling, rest, value) in &records.metadata {
         let Some((keypath, fp)) = parse_key_metadata(value) else {
@@ -264,9 +273,9 @@ fn check_coverage(
             continue;
         }
         let backed = if *sapling {
-            records.sapling.contains(rest)
+            records.recovered.sapling.contains(rest)
         } else {
-            records.transparent.contains(rest)
+            records.recovered.transparent.contains(rest)
         };
         if let (true, Some(position)) = (backed, legacy_position(&keypath, *sapling)) {
             present.insert(position);
@@ -511,12 +520,21 @@ mod tests {
         move |(k, _)| parse_record_key(k).is_some_and(|r| r.record_type == record_type)
     }
 
-    /// Run only this module over `pairs`. Coverage is judged from the
-    /// records themselves (key, keymeta, chain), not from how many keys the
-    /// flat-key passes recovered, so nothing else needs to run first.
+    /// Run this module over `pairs`, with only its own diagnostics in the
+    /// result. The collectors run first, into a scratch result, because a
+    /// derived key counts as present only if they actually recovered it.
     fn assess(pairs: &[(Vec<u8>, Vec<u8>)], master: Option<&MasterKey>) -> ImportedKeys {
+        let mut scratch = ImportedKeys::default();
+        let mut recovered = crate::zcashd::collect_plaintext(pairs, &mut scratch);
+        if let Some(master) = master {
+            recovered.extend(crate::zcashd::collect_encrypted(
+                pairs,
+                master,
+                &mut scratch,
+            ));
+        }
         let mut out = ImportedKeys::default();
-        assess_seed(pairs, master, &mut out);
+        assess_seed(pairs, master, &recovered, &mut out);
         out
     }
 

@@ -28,6 +28,7 @@ use crate::{
     zcashd::{
         crypto::MasterKey,
         records::{compact_size, parse_record_key},
+        RecoveredKeyIds,
     },
 };
 
@@ -100,7 +101,12 @@ fn read_length_prefixed(value: &[u8]) -> Option<(&[u8], usize)> {
 ///
 /// A record that fails to decrypt is reported and skipped. One corrupt
 /// record must never cost the user the keys beside it.
-pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: &mut ImportedKeys) {
+pub fn collect_encrypted(
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    master: &MasterKey,
+    out: &mut ImportedKeys,
+) -> RecoveredKeyIds {
+    let mut recovered = RecoveredKeyIds::default();
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             continue;
@@ -179,10 +185,13 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                         let s: [u8; 32] = p.get(..32)?.try_into().ok()?;
                         Some(s)
                     }) {
-                    Some(secret) => out.transparent.push(TransparentKey {
-                        secret: Secret::new(secret),
-                        provenance: Provenance::HdDerived,
-                    }),
+                    Some(secret) => {
+                        out.transparent.push(TransparentKey {
+                            secret: Secret::new(secret),
+                            provenance: Provenance::HdDerived,
+                        });
+                        recovered.transparent.insert(rec.rest);
+                    }
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "ckey".to_owned(),
                         reason: "ciphertext did not decrypt to a 32-byte key".to_owned(),
@@ -239,10 +248,13 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                     .and_then(read_length_prefixed)
                     .and_then(|(ct, _)| decrypt(master, iv, ct))
                 {
-                    Some(extsk) if extsk.len() == EXTSK_LEN => out.sapling.push(SaplingKey {
-                        extsk: Secret::new(extsk),
-                        provenance: Provenance::HdDerived,
-                    }),
+                    Some(extsk) if extsk.len() == EXTSK_LEN => {
+                        out.sapling.push(SaplingKey {
+                            extsk: Secret::new(extsk),
+                            provenance: Provenance::HdDerived,
+                        });
+                        recovered.sapling.insert(rec.rest);
+                    }
                     Some(mut wrong_length) => {
                         let got = wrong_length.len();
                         // Plaintext derived from the master key: scrub it
@@ -267,6 +279,7 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
             _ => {}
         }
     }
+    recovered
 }
 
 #[cfg(test)]

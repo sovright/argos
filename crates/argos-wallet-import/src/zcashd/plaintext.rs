@@ -5,7 +5,10 @@ use secrecy::Secret;
 use crate::{
     error::ImportDiagnostic,
     keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
-    zcashd::records::{compact_size, parse_record_key},
+    zcashd::{
+        records::{compact_size, parse_record_key},
+        RecoveredKeyIds,
+    },
 };
 
 /// Record types we knowingly ignore: wallet bookkeeping with no key
@@ -73,7 +76,9 @@ fn secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
 ///
 /// A record we cannot parse is recorded as a diagnostic and skipped; it
 /// must never prevent a record we *can* parse from being recovered.
-pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
+/// Returns which transparent and Sapling keys were actually recovered.
+pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -> RecoveredKeyIds {
+    let mut recovered = RecoveredKeyIds::default();
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             // Do not include any bytes from the record key itself: it can
@@ -113,10 +118,13 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
             // parent_fvk_tag(4) + child_index(4) + chain_code(32) +
             // expsk(96) + dk(32). The key remainder is the 32-byte IVK.
             "sapzkey" => match value.get(..169) {
-                Some(extsk) => out.sapling.push(SaplingKey {
-                    extsk: Secret::new(extsk.to_vec()),
-                    provenance: Provenance::Standalone,
-                }),
+                Some(extsk) => {
+                    out.sapling.push(SaplingKey {
+                        extsk: Secret::new(extsk.to_vec()),
+                        provenance: Provenance::Standalone,
+                    });
+                    recovered.sapling.insert(rec.rest);
+                }
                 None => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                     record_type: "sapzkey".to_owned(),
                     reason: "extended spending key is truncated".to_owned(),
@@ -136,10 +144,13 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                 // of the long form zcashd always emits.
                 match read_length_prefixed(value).and_then(secret_from_key_der) {
                     Some(s) => match <[u8; 32]>::try_from(s) {
-                        Ok(secret) => out.transparent.push(TransparentKey {
-                            secret: Secret::new(secret),
-                            provenance: Provenance::HdDerived,
-                        }),
+                        Ok(secret) => {
+                            out.transparent.push(TransparentKey {
+                                secret: Secret::new(secret),
+                                provenance: Provenance::HdDerived,
+                            });
+                            recovered.transparent.insert(rec.rest);
+                        }
                         Err(_) => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                             record_type: "key".to_owned(),
                             reason: "secret is not 32 bytes".to_owned(),
@@ -164,6 +175,7 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
             }),
         }
     }
+    recovered
 }
 
 #[cfg(test)]

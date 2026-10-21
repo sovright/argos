@@ -599,7 +599,7 @@ test("a wallet with only seed findings shows no unread-records block", async () 
       needs_passphrase: false, transparent_keys: 3, sapling_keys: 1,
       sprout_keys: 0, has_mnemonic: false, sprout_spendable_notes: 0,
       sprout_spendable_zatoshis: 0, sprout_addresses: [], diagnostics: [],
-      seed_diagnostics: ["the wallet's seed derived 101 transparent (change) key(s) but only 91 are stored in this file"],
+      seed_diagnostics: ["the wallet's seed derived 101 transparent (change) key(s) but only 91 were read from this file"],
       coverage_notice: "Incomplete", coverage_may_hide_funds: true, seed_note: null,
     };
   });

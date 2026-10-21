@@ -200,12 +200,17 @@ impl ImportedKeys {
             )
         });
         // The completeness claim covers the whole file, so a second seed
-        // Argos could not verify withdraws it as surely as a missing key.
+        // Argos could not verify withdraws it as surely as a missing key —
+        // and so does anything else that may hide funds: the claim must
+        // never sit above a grade that contradicts it.
         Some(if seed_keys_missing {
-            "verified — but not every key it derived is in this file (see Recovery coverage)"
+            "verified — but not every key it derived was read from this file (see Recovery \
+             coverage)"
         } else if another_seed {
             "verified — but this file also holds a seed Argos could not verify (see Recovery \
              coverage)"
+        } else if self.coverage().may_hide_funds() {
+            "verified — but not every record in this file could be read (see Recovery coverage)"
         } else {
             "verified — every key it derived is read from this file"
         })
@@ -278,8 +283,9 @@ pub enum ImportCoverage {
     SproutNoteDataUnread,
     /// A record known to hold key material could not be read or decrypted.
     KeysUnread,
-    /// The file's own seed chain says keys were derived that it does not
-    /// hold — a truncated or damaged wallet. Not "unread": they are absent.
+    /// The file's own seed chain says keys were derived that were not
+    /// recovered from it — absent, or present only as a record that could
+    /// not be read or decrypted. A truncated or damaged wallet.
     DerivedKeysMissing,
     /// The seed is verified, but unified accounts derived from it hold
     /// keys the file does not store, so they are not scanned.
@@ -336,7 +342,7 @@ impl ImportCoverage {
             ),
             Self::DerivedKeysMissing => Some(
                 "Incomplete — this wallet's own records say its seed derived keys that \
-                 are not in this file, so balances may be missing funds.",
+                 were not read from this file, so balances may be missing funds.",
             ),
             Self::SeedAccountsNotScanned => Some(
                 "Incomplete — this wallet created unified accounts from its seed \
@@ -577,6 +583,34 @@ mod coverage_tests {
         keys.seed_verified = true;
         let note = keys.verified_seed_note().unwrap();
         assert!(!note.contains("every key it derived is read"), "{note}");
+    }
+
+    /// Review round 3 on #230, finding 1. Whatever else the file says, a
+    /// "verified — every key" line must never sit directly above a coverage
+    /// grade that says balances may be missing funds. The shortfall here is
+    /// not a derived key — an unreadable Sprout key, an unreadable
+    /// transaction beside Sprout keys — so the note must not blame the seed
+    /// either.
+    #[test]
+    fn coverage_that_may_hide_funds_withdraws_the_completeness_claim() {
+        for diagnostic in [
+            ImportDiagnostic::UnparseableRecord {
+                record_type: "zkey".to_owned(),
+                reason: "truncated".to_owned(),
+            },
+            ImportDiagnostic::DecryptionFailed {
+                record_type: "czkey".to_owned(),
+                reason: "did not decrypt".to_owned(),
+            },
+        ] {
+            let mut keys = with(vec![diagnostic]);
+            keys.seed_verified = true;
+            assert!(keys.coverage().may_hide_funds());
+            let note = keys.verified_seed_note().unwrap();
+            assert!(!note.contains("every key it derived is read"), "{note}");
+            assert!(!note.contains("not every key it derived"), "{note}");
+            assert!(note.contains("Recovery coverage"), "{note}");
+        }
     }
 
     /// Each notice used to end with the same call to action, so two failure
