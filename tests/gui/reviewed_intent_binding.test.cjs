@@ -235,6 +235,7 @@ test("source edit during execution clears authority but retains the old broadcas
 function flowHarness() {
   const elements = new Map();
   const events = new Map();
+  const documentEvents = new Map();
   const calls = [];
   const chips = ["10", "99"].map((pct) => ({
     dataset: { pct }, setAttribute(name, value) { this[name] = value; },
@@ -270,6 +271,7 @@ function flowHarness() {
     maxFeeZec: "0.5", donationEnabled: true,
     scanConfig: { network: "mainnet", data_dir: "/old", lightwalletd_url: "old" },
     savedReportPath: "/old/report", retainedAddressSearchId: null, matchedRecovery: null,
+    defaultDataDir: "/platform/default",
   };
   $("destination-input").value = "zs-old";
   $("sweep-memo").value = "old memo";
@@ -291,11 +293,13 @@ function flowHarness() {
     state, $, window: {}, seedInput: element(), seedVisibility: element(), seedNextBtn: element(),
     steps: ["welcome", "seed", "config", "scan"], furthestStep: 3,
     SERVER_PRESETS: { mainnet: "main.example", testnet: "test.example" },
-    eta: { reset() {} }, fmt: String,
+    eta: { reset() {} }, fmt: String, TextEncoder,
+    defaultScanLabel: () => "today's scan",
     document: {
       createElement: () => element(),
       querySelectorAll: () => chips,
       dispatchEvent() {},
+      addEventListener(name, handler) { documentEvents.set(name, handler); },
     },
     CustomEvent: class { constructor(name, opts) { this.type = name; this.detail = opts?.detail; } },
     invoke: async (command, args) => {
@@ -305,6 +309,8 @@ function flowHarness() {
         handle: { id: "scan-new" }, network: "testnet", data_dir: "/resumed",
         lightwalletd_url: "resumed.example",
       };
+      if (command === "get_scan_progress") return null;
+      if (command === "cancel_scan") return null;
       throw new Error(`unexpected ${command}`);
     },
     listen: async (name, callback) => { events.set(name, callback); return () => events.delete(name); },
@@ -331,7 +337,7 @@ function flowHarness() {
   const forgetStart = source.indexOf("function forgetLoadedWalletFile(");
   const forgetEnd = source.indexOf("function renderSproutUncoveredBanners(", forgetStart);
   vm.runInContext(source.slice(forgetStart, forgetEnd), context);
-  return { $, state, context, events, calls, chips };
+  return { $, state, context, events, documentEvents, calls, chips };
 }
 
 function loadFlow(h, start, end) {
@@ -360,6 +366,42 @@ test("scan discovery from another handle is ignored", async () => {
   assert.match(h.$("scan-discoveries").children[0].textContent, /account 1/);
   h.events.get("scan-progress")({ payload: { handle: { id: "scan-old" }, phase: "complete" } });
   assert.equal(h.state.lastProgress.phase, "complete");
+});
+
+test("a scan completed before listeners register is recovered from its handle snapshot", async () => {
+  const h = flowHarness();
+  let notices = 0;
+  h.context.notifyScanComplete = () => { notices++; };
+  h.context.invoke = async (command, args) => {
+    if (command === "get_scan_progress") return {
+      handle: args.handle, phase: "complete", accounts: [],
+    };
+    throw new Error(`unexpected ${command}`);
+  };
+  loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
+  await vm.runInContext('startProgressListeners({ id: "scan-old" })', h.context);
+  assert.equal(h.state.lastProgress.phase, "complete");
+  assert.equal(notices, 1);
+});
+
+test("a delayed scan snapshot cannot publish after source invalidation", async () => {
+  const h = flowHarness();
+  const pending = deferred();
+  let snapshots = 0;
+  h.context.invoke = async (command) => {
+    if (command === "get_scan_progress") { snapshots++; return pending.promise; }
+    throw new Error(`unexpected ${command}`);
+  };
+  loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  const listening = vm.runInContext('startProgressListeners({ id: "scan-old" })', h.context);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(snapshots, 1);
+  h.$("network-select").fire("input");
+  pending.resolve({ handle: { id: "scan-old" }, phase: "complete", accounts: [] });
+  await listening;
+  assert.equal(h.state.lastProgress, null);
+  assert.equal(h.$("review-sweep").disabled, true);
 });
 
 test("source setting edits invalidate completed scan authority", () => {
@@ -401,6 +443,29 @@ test("forgetting a loaded wallet revokes its completed scan", () => {
   assert.equal(h.state.lastProgress, null);
   assert.equal(h.state.sweepReview, null);
   assert.equal(h.$("review-sweep").disabled, true);
+});
+
+test("accepting a matched address revokes the previously reviewed ordinary sweep", async () => {
+  const h = flowHarness();
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  h.context.invoke = async (command) => {
+    if (command === "get_address_search") return {
+      network: "testnet", matches: [{ id: "match-new", pool: "transparent",
+        address: "tm-new", path: "m/0", seed_index: 0 }],
+    };
+    throw new Error(`unexpected ${command}`);
+  };
+  loadFlow(h, 'document.addEventListener("address-match-recovery"', '$("network-select").addEventListener("change"');
+  await h.documentEvents.get("address-match-recovery")({
+    detail: { searchId: "search-new", matchId: "match-new" },
+  });
+  assert.equal(h.state.scanHandle, null);
+  assert.equal(h.state.lastProgress, null);
+  assert.equal(h.state.sweepReview, null);
+  assert.equal(h.$("execute-sweep").disabled, true);
+  assert.equal(h.$("review-sweep").disabled, true);
+  assert.equal(h.state.matchedRecovery.matchId, "match-new");
+  assert.equal(h.$("network-select").value, "testnet");
 });
 
 test("wallet drop invalidates the previous scan before opening the new file", async () => {
@@ -563,7 +628,7 @@ test("resume initializes every reviewed field", async () => {
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
   loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
   loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
-  vm.runInContext("let pendingResumeRow = null;", h.context);
+  loadFlow(h, "let pendingResumeRow = null;", "const DISMISSED_SESSIONS_KEY");
   loadFlow(h, "function openResumeModal(", "// ─── Init");
   vm.runInContext('openResumeModal({ workspace_path: "/resumed/ws", network: "testnet", match_coordinates: null })', h.context);
   h.$("resume-seed-input").value = "seed words";
@@ -594,6 +659,83 @@ test("resume initializes every reviewed field", async () => {
   assert.equal(h.$("review-sweep").disabled, true);
 });
 
+for (const outcome of ["resolved", "rejected"]) {
+  test(`cancelled resume ignores its late ${outcome} result`, async () => {
+    const h = flowHarness();
+    const pending = deferred();
+    h.context.invoke = async (command, args) => {
+      h.calls.push({ command, args });
+      if (command === "validate_address") return { destination_ok: true };
+      if (command === "resume_session") return pending.promise;
+      if (command === "cancel_scan") return null;
+      if (command === "get_scan_progress") return null;
+      throw new Error(`unexpected ${command}`);
+    };
+    loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+    loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
+    h.context.startProgressListeners = async () => {};
+    loadFlow(h, "let pendingResumeRow = null;", "const DISMISSED_SESSIONS_KEY");
+    loadFlow(h, "function openResumeModal(", "// ─── Init");
+    vm.runInContext('openResumeModal({ workspace_path: "/old/ws", network: "testnet" })', h.context);
+    h.$("resume-seed-input").value = "seed words";
+    h.$("resume-destination-input").value = "zs-new";
+    h.$("resume-max-fee-zec").value = "0.02";
+    const attempt = h.$("resume-confirm").fire("click");
+    await new Promise((resolve) => setImmediate(resolve));
+    h.$("resume-cancel").fire("click");
+    if (outcome === "resolved") pending.resolve({ handle: { id: "stale-resume" },
+      network: "testnet", data_dir: "/stale", lightwalletd_url: "stale.example" });
+    else pending.reject(new Error("stale failure"));
+    await attempt;
+    assert.equal(h.state.scanHandle.id, "scan-old");
+    assert.equal(h.$("resume-modal").hidden, true);
+    assert.doesNotMatch(h.$("resume-modal-status").textContent, /stale failure/);
+    assert.equal(h.calls.filter((call) => call.command === "cancel_scan").length,
+      outcome === "resolved" ? 1 : 0);
+  });
+}
+
+test("a newer resume keeps its handle when an older resume finishes later", async () => {
+  const h = flowHarness();
+  const older = deferred();
+  const newer = deferred();
+  let attempts = 0;
+  h.context.invoke = async (command, args) => {
+    h.calls.push({ command, args });
+    if (command === "validate_address") return { destination_ok: true };
+    if (command === "resume_session") return ++attempts === 1 ? older.promise : newer.promise;
+    if (command === "cancel_scan" || command === "get_scan_progress") return null;
+    throw new Error(`unexpected ${command}`);
+  };
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
+  h.context.startProgressListeners = async () => {};
+  loadFlow(h, "let pendingResumeRow = null;", "const DISMISSED_SESSIONS_KEY");
+  loadFlow(h, "function openResumeModal(", "// ─── Init");
+  const open = (path) => {
+    vm.runInContext(`openResumeModal({ workspace_path: "${path}", network: "testnet" })`, h.context);
+    h.$("resume-seed-input").value = "seed words";
+    h.$("resume-destination-input").value = "zs-new";
+    h.$("resume-max-fee-zec").value = "0.02";
+  };
+  open("/older/ws");
+  const first = h.$("resume-confirm").fire("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  open("/newer/ws");
+  const second = h.$("resume-confirm").fire("click");
+  await new Promise((resolve) => setImmediate(resolve));
+  newer.resolve({ handle: { id: "newer" }, network: "testnet",
+    data_dir: "/newer", lightwalletd_url: "newer.example" });
+  await second;
+  older.resolve({ handle: { id: "older" }, network: "testnet",
+    data_dir: "/older", lightwalletd_url: "older.example" });
+  await first;
+  assert.equal(h.state.scanHandle.id, "newer");
+  assert.equal(h.state.scanConfig.data_dir, "/newer");
+  assert.deepEqual(h.calls.filter((call) => call.command === "cancel_scan")
+    .map((call) => call.args.handle.id), ["older"]);
+});
+
 test("start over still drops the loaded wallet", () => {
   const h = flowHarness();
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
@@ -607,4 +749,36 @@ test("start over still drops the loaded wallet", () => {
   assert.equal(h.$("donate-rate").value, "10");
   assert.equal(h.$("scan-rows").innerHTML, "");
   assert.equal(h.$("sweep-skipped").innerHTML, "");
+});
+
+test("start over restores every scan source setting to its documented default", () => {
+  const h = flowHarness();
+  h.context.defaultScanLabel = () => "today's scan";
+  Object.assign(h.$("scan-label"), { value: "old label" });
+  Object.assign(h.$("network-select"), { value: "testnet" });
+  Object.assign(h.$("birthday-height"), { value: "123" });
+  Object.assign(h.$("birthday-date"), { value: "2020-01-01" });
+  Object.assign(h.$("accounts-range"), { value: "87" });
+  Object.assign(h.$("auto-gap-limit"), { checked: false });
+  Object.assign(h.$("gap-limit"), { value: "7" });
+  Object.assign(h.$("server-preset"), { value: "custom" });
+  Object.assign(h.$("lightwalletd-url"), { value: "old.example" });
+  Object.assign(h.$("data-dir"), { value: "/old" });
+  Object.assign(h.$("sprout-scan-peers"), { value: "old.example:8233" });
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, "function resetRecoveryFlowState(", "// ─── Donate");
+  h.$("restart-flow").fire("click");
+  assert.equal(h.$("scan-label").value, "today's scan");
+  assert.equal(h.$("network-select").value, "mainnet");
+  assert.equal(h.$("birthday-height").value, "419200");
+  assert.equal(h.$("birthday-date").value, "");
+  assert.equal(h.$("accounts-range").value, "20");
+  assert.equal(h.$("accounts-range-value").textContent, "20");
+  assert.equal(h.$("auto-gap-limit").checked, true);
+  assert.equal(h.$("gap-limit").value, "20");
+  assert.equal(h.$("gap-limit-row").style.display, "none");
+  assert.equal(h.$("server-preset").value, "recommended");
+  assert.equal(h.$("lightwalletd-url").value, "main.example");
+  assert.equal(h.$("data-dir").value, "/platform/default");
+  assert.equal(h.$("sprout-scan-peers").value, "");
 });

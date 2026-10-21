@@ -210,10 +210,7 @@ impl ReviewedIntentStore {
         if scan.released || !matches!(scan.status, SproutScanStatus::Completed) {
             return Err("wait for the Sprout scan to complete".into());
         }
-        let replaces_current = inner.proposals.values().any(
-            |intent| matches!(&intent.source, SproutIntentSource::Scan(source) if source == handle),
-        );
-        if inner.proposals.len() >= MAX_PROPOSALS && !replaces_current {
+        if inner.proposals.len() >= MAX_PROPOSALS {
             return Err("too many Sprout proposals; release an old proposal first".into());
         }
         Ok(())
@@ -350,7 +347,6 @@ impl ReviewedIntentStore {
             .0
             .lock()
             .map_err(|_| "Sprout review store unavailable")?;
-        inner.proposals.retain(|_, old| old.source != intent.source);
         if inner.proposals.len() >= MAX_PROPOSALS {
             return Err("too many Sprout proposals; release an old proposal first".into());
         }
@@ -545,22 +541,26 @@ mod tests {
     }
 
     #[test]
-    fn newer_review_revokes_the_same_source() {
+    fn overlapping_wallet_reviews_remain_until_explicit_release() {
         let store = ReviewedIntentStore::default();
-        let first = proposal(
+        // B finishes first; older A returns later. A must not evict the ID
+        // already displayed for B, and B remains one-shot executable.
+        let b = proposal(
             &store,
             SproutIntentSource::Wallet("wallet-a".into()),
-            "zs-first",
+            "zs-B",
         );
-        let second = proposal(
+        let a = proposal(
             &store,
             SproutIntentSource::Wallet("wallet-a".into()),
-            "zs-second",
+            "zs-A",
         );
-        assert!(store.take_proposal(&first).is_err());
+        assert_eq!(store.take_wallet_proposal(&b).unwrap().destination, "zs-B");
+        assert!(store.take_wallet_proposal(&b).is_err());
+        store.release_proposal(&a).unwrap();
         assert_eq!(
-            store.take_proposal(&second).unwrap().destination,
-            "zs-second"
+            store.take_proposal(&a).err().unwrap(),
+            "unknown or already used Sprout proposal"
         );
     }
 

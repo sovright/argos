@@ -42,6 +42,7 @@ const state = {
   unlistenComplete: null,
   unlistenDiscovered: null,
   scanConfig: null,
+  defaultDataDir: null,
   savedReportPath: null,
   donationEnabled: false,
   matchedRecovery: null,
@@ -832,6 +833,8 @@ function forgetLoadedWalletFile() {
   $("sprout-sweep-plan").textContent = "";
   $("sprout-sweep-pool").textContent = "";
   $("sprout-sweep-params").textContent = "";
+  $("sprout-sweep-spent-status").textContent = "";
+  $("sprout-sweep-status").textContent = "";
   $("wallet-open").disabled = false;
   setStatus("wallet-status", "", "");
 }
@@ -1466,6 +1469,17 @@ for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-di
   $(id)?.addEventListener("input", invalidateWalletSproutReview);
   $(id)?.addEventListener("change", invalidateWalletSproutReview);
 }
+for (const id of ["network-select", "data-dir"]) {
+  for (const event of ["input", "change"]) {
+    $(id)?.addEventListener(event, () => {
+      // Inspection and its spendable balance used these settings. Require a
+      // fresh read before showing any wallet-derived Sprout evidence again.
+      const path = $("wallet-path").value;
+      forgetLoadedWalletFile();
+      $("wallet-path").value = path;
+    });
+  }
+}
 
 const sproutScanListenersReady = (async () => {
   try {
@@ -1611,6 +1625,9 @@ document.addEventListener("address-match-recovery", async (event) => {
     if (!retainedMatch) {
       throw new Error("The selected address match is no longer available.");
     }
+    // Selecting a match changes both source and network without a DOM input
+    // event. Revoke the prior scan and proposal before exposing the match.
+    invalidateScanAuthority();
     state.matchedRecovery = { searchId, matchId, match: retainedMatch, network: snapshot.network };
     state.retainedAddressSearchId = searchId;
     // A matched capability is the sole recovery source. Clear any inputs left
@@ -2088,6 +2105,10 @@ go back and provide one.",
 
 async function startProgressListeners(expectedHandle) {
   const expectedId = expectedHandle.id;
+  const expectedGeneration = state.scanAuthorityGeneration;
+  const isCurrent = () => state.scanAuthorityGeneration === expectedGeneration &&
+    state.scanHandle?.id === expectedId;
+  let terminalEventSeen = false;
   $("scan-phase").textContent = "Starting…";
   $("scan-server").textContent = "Connecting…";
   $("scan-progress-text").textContent = "0 / 0";
@@ -2117,17 +2138,18 @@ async function startProgressListeners(expectedHandle) {
 
   const [unlistenProgress, unlistenComplete, unlistenDiscovered] = await Promise.all([
     listen("scan-progress", (event) => {
-      if (event.payload.handle?.id !== expectedId || state.scanHandle?.id !== expectedId) return;
+      if (event.payload.handle?.id !== expectedId || !isCurrent() || terminalEventSeen) return;
       updateScanUI(event.payload);
     }),
     listen("scan-complete", (event) => {
-      if (event.payload.handle?.id !== expectedId || state.scanHandle?.id !== expectedId) return;
+      if (event.payload.handle?.id !== expectedId || !isCurrent() || terminalEventSeen) return;
+      terminalEventSeen = true;
       updateScanUI(event.payload);
       notifyScanComplete(event.payload);
       cleanupListeners();
     }),
     listen("scan-discovery", (event) => {
-      if (event.payload.handle?.id !== expectedId || state.scanHandle?.id !== expectedId) return;
+      if (event.payload.handle?.id !== expectedId || !isCurrent() || terminalEventSeen) return;
       const d = event.payload.discovery;
       const div = document.createElement("div");
       div.className = "discovery-toast";
@@ -2149,7 +2171,7 @@ async function startProgressListeners(expectedHandle) {
       container.style.display = "";
     }),
   ]);
-  if (state.scanHandle?.id !== expectedId) {
+  if (!isCurrent()) {
     unlistenProgress();
     unlistenComplete();
     unlistenDiscovered();
@@ -2158,6 +2180,25 @@ async function startProgressListeners(expectedHandle) {
   state.unlistenProgress = unlistenProgress;
   state.unlistenComplete = unlistenComplete;
   state.unlistenDiscovered = unlistenDiscovered;
+  if (terminalEventSeen) {
+    cleanupListeners();
+    return;
+  }
+  // A fast scan can finish before the completion subscription exists. Query
+  // the backend after registration and apply only this scan's live snapshot.
+  try {
+    const progress = await invoke("get_scan_progress", { handle: { id: expectedId } });
+    if (!isCurrent() || terminalEventSeen || progress?.handle?.id !== expectedId) return;
+    updateScanUI(progress);
+    if (["complete", "cancelled", "error"].includes(progress.phase)) {
+      notifyScanComplete(progress);
+      cleanupListeners();
+    }
+  } catch (err) {
+    if (isCurrent() && !terminalEventSeen) {
+      setStatus("scan-message", `Could not refresh scan progress: ${err}`, "error");
+    }
+  }
 }
 
 function scanCompletionSummary(progress) {
@@ -3089,6 +3130,9 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   forgetLoadedWalletFile();
   $("sapling-scan-keys").value = "";
   $("sapling-key-addresses").replaceChildren();
+  $("sprout-scan-keys").value = "";
+  $("sprout-scan-peers").value = "";
+  $("sprout-scan-addresses").replaceChildren();
   seedVisibility.checked = false;
   seedInput.classList.add("masked");
   seedNextBtn.disabled = true;
@@ -3097,6 +3141,24 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("destination-input").value = destination;
   $("max-fee-zec").value = maxFeeZec;
   $("sweep-memo").value = memo;
+  $("memo-byte-count").textContent = `${new TextEncoder().encode(memo).length} / 512 bytes`;
+  $("memo-byte-count").style.color = "";
+  $("scan-label").value = defaultScanLabel();
+  $("scan-label").placeholder = defaultScanLabel();
+  $("network-select").value = "mainnet";
+  $("birthday-height").value = "419200";
+  $("birthday-date").value = "";
+  setStatus("birthday-probe-status", "", "");
+  $("accounts-range").value = "20";
+  $("accounts-range-value").textContent = "20";
+  $("accounts-range-value").style.opacity = "0.4";
+  $("auto-gap-limit").checked = true;
+  $("accounts-range").disabled = false;
+  $("gap-limit").value = "20";
+  $("gap-limit-row").style.display = "none";
+  $("server-preset").value = "recommended";
+  $("lightwalletd-url").value = SERVER_PRESETS.mainnet;
+  $("data-dir").value = state.defaultDataDir || "";
   $("transparent-index-start").value = "0";
   $("transparent-index-count").value = "1000";
   $("transparent-include-change").checked = false;
@@ -3313,6 +3375,7 @@ function fmtRelativeTime(epochSeconds) {
 }
 
 let pendingResumeRow = null;
+let resumeGeneration = 0;
 
 const DISMISSED_SESSIONS_KEY = "argos-dismissed-sessions";
 
@@ -3454,7 +3517,9 @@ async function refreshResumePanel() {
 }
 
 function openResumeModal(row) {
+  ++resumeGeneration;
   pendingResumeRow = row;
+  $("resume-confirm").disabled = false;
   $("resume-modal-title").textContent = `Resume "${row.label || "(unlabeled scan)"}"`;
   $("resume-seed-input").value = "";
   $("resume-seed-input").classList.add("masked");
@@ -3471,7 +3536,9 @@ function openResumeModal(row) {
 }
 
 function closeResumeModal() {
+  ++resumeGeneration;
   pendingResumeRow = null;
+  $("resume-confirm").disabled = false;
   $("resume-modal").hidden = true;
   $("resume-seed-input").value = "";
   $("resume-bip39-passphrase").value = "";
@@ -3498,6 +3565,11 @@ $("resume-confirm").addEventListener("click", async () => {
     return;
   }
   if (!pendingResumeRow) return;
+  const row = pendingResumeRow;
+  const generation = resumeGeneration;
+  const scanGeneration = state.scanAuthorityGeneration;
+  const isCurrent = () => generation === resumeGeneration && pendingResumeRow === row &&
+    scanGeneration === state.scanAuthorityGeneration;
   const seed = $("resume-seed-input").value.trim().toLowerCase();
   if (!seed) {
     setStatus("resume-modal-status", "Enter the seed phrase to continue.", "error");
@@ -3515,34 +3587,40 @@ $("resume-confirm").addEventListener("click", async () => {
     return;
   }
   try {
-    const info = await invoke("validate_address", { address: destination, network: pendingResumeRow.network });
+    const info = await invoke("validate_address", { address: destination, network: row.network });
+    if (!isCurrent()) return;
     if (!info.destination_ok) {
       setStatus("resume-modal-status", "Destination must have an Orchard or Sapling receiver.", "error");
       return;
     }
   } catch (err) {
+    if (!isCurrent()) return;
     setStatus("resume-modal-status", `Could not validate destination: ${err}`, "error");
     return;
   }
   const labelOverride = $("resume-label-input").value.trim();
   const passphrase = passphraseForResumedSession(
-    pendingResumeRow,
+    row,
     $("resume-bip39-passphrase").value,
   );
-  const lightwalletdUrl = SERVER_PRESETS[pendingResumeRow.network] ?? SERVER_PRESETS.mainnet;
+  const lightwalletdUrl = SERVER_PRESETS[row.network] ?? SERVER_PRESETS.mainnet;
 
   $("resume-confirm").disabled = true;
   setStatus("resume-modal-status", "Verifying seed and resuming…", "");
   try {
     const resumed = await invoke("resume_session", {
       input: {
-        workspace_path: pendingResumeRow.workspace_path,
+        workspace_path: row.workspace_path,
         seed,
         passphrase,
         lightwalletd_url: lightwalletdUrl,
         label: labelOverride || null,
       },
     });
+    if (!isCurrent()) {
+      await invoke("cancel_scan", { handle: resumed.handle }).catch(() => {});
+      return;
+    }
     resetRecoveryFlowState({ destination, memo, maxFeeZec });
     state.scanConfig = {
       network: resumed.network,
@@ -3552,6 +3630,8 @@ $("resume-confirm").addEventListener("click", async () => {
     $("network-select").value = resumed.network;
     $("data-dir").value = resumed.data_dir;
     $("lightwalletd-url").value = resumed.lightwalletd_url;
+    $("server-preset").value = resumed.lightwalletd_url === SERVER_PRESETS[resumed.network]
+      ? "recommended" : "custom";
     state.scanHandle = resumed.handle;
     closeResumeModal();
     // Skip the seed/config screens — they don't apply to a resumed scan.
@@ -3559,9 +3639,9 @@ $("resume-confirm").addEventListener("click", async () => {
     goTo("scan");
     await startProgressListeners(resumed.handle);
   } catch (err) {
-    setStatus("resume-modal-status", `✗ ${err}`, "error");
+    if (isCurrent()) setStatus("resume-modal-status", `✗ ${err}`, "error");
   } finally {
-    $("resume-confirm").disabled = false;
+    if (isCurrent()) $("resume-confirm").disabled = false;
   }
 });
 
@@ -3576,6 +3656,7 @@ goTo("welcome");
 
 invoke("default_data_dir")
   .then((dir) => {
+    state.defaultDataDir = dir || null;
     if (dir && !$("data-dir").value.trim()) $("data-dir").value = dir;
   })
   .catch(() => {

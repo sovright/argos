@@ -184,6 +184,24 @@ test("wallet source and endpoint edits revoke the reviewed proposal", async () =
   }
 });
 
+test("network and data directory edits hide wallet Sprout evidence until reinspection", async () => {
+  for (const id of ["network-select", "data-dir"]) {
+    const h = harness();
+    await h.open("/fixture/wallet.dat");
+    assert.equal(h.$("wallet-summary").hidden, false);
+    assert.equal(h.$("wallet-sprout-sweep").hidden, false);
+    assert.match(h.$("sprout-sweep-plan").textContent, /note\(s\)/);
+    h.edit(id, "changed");
+    assert.equal(h.peek("walletFile"), null, id);
+    assert.equal(h.$("wallet-summary").hidden, true, id);
+    assert.equal(h.$("wallet-sprout-sweep").hidden, true, id);
+    assert.equal(h.$("wallet-next").disabled, true, id);
+    assert.equal(h.$("sprout-sweep-plan").textContent, "", id);
+    assert.equal(h.$("sprout-sweep-spent-status").textContent, "", id);
+    assert.equal(h.$("wallet-path").value, "/fixture/wallet.dat", id);
+  }
+});
+
 test("first wallet open displays its Sprout preview without a null-path error", async () => {
   const h = harness();
   await h.open("/fixture/first.dat");
