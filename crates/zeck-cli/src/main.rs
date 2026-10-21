@@ -1937,9 +1937,9 @@ async fn main() -> Result<()> {
         (Some(path), key_file) => {
             let mut keys = load_wallet_file(path, network)?;
             if let Some(key_path) = key_file {
-                // Refuses before any scan work starts when the wallet has a
-                // mnemonic: that wallet takes the HD route, which cannot
-                // carry a standalone key. See the helper for why.
+                // A wallet with a mnemonic takes the Combined route, which
+                // registers these keys beside the seed's accounts; a
+                // seedless one scans them as imported accounts.
                 keys_added_from_key_file = argos_core::sapling_key::merge_standalone_sapling_keys(
                     &mut keys,
                     load_sapling_key_file(key_path, network)?,
