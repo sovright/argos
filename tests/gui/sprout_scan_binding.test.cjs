@@ -46,6 +46,7 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
   $("sprout-scan-sweep-run").disabled = true;
   const context = vm.createContext({
     $, document: { createElement: element }, fmt: (n) => String(n),
+    confirmationSourcesFromForm: () => ["backup=https://confirm.example"],
     setTimeout: (callback) => setImmediate(callback),
     setStatus: (id, message) => { $(id).textContent = message; },
     listen: async (name, callback) => {

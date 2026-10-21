@@ -43,6 +43,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   };
   $("network-select").value = "mainnet";
   $("sprout-destination").value = "fixture-destination";
+  $("confirmation-sources").value = "backup=https://confirm.example";
   const previews = [];
   let onProgress;
   let failStatus = false;
@@ -50,6 +51,8 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     listen: async (name, callback) => { assert.equal(name, "sprout-sweep-progress"); onProgress = callback; },
     $, document: { createElement: element },
     fmt: (value) => String(value),
+    confirmationSourcesFromForm: () => $("confirmation-sources").value
+      .split("\n").map((line) => line.trim()).filter(Boolean),
     setStatus: (id, text) => {
       if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
       $(id).textContent = text;
@@ -188,6 +191,38 @@ test("wallet destination edit invalidates the reviewed proposal", async () => {
   assert.equal(h.$("sprout-sweep-run").disabled, true);
 });
 
+test("wallet execution settings invalidate and repreview confirmation authority", async () => {
+  const h = harness();
+  await h.open("/fixture/wallet.dat");
+  assert.equal(h.peek("walletSproutReview?.proposal_id"), "wallet-proposal-1");
+
+  h.edit("confirmation-sources", "other=https://other.example");
+  assert.equal(h.peek("walletSproutReview"), null);
+  h.edit("confirmation-sources", "other=https://other.example", "change");
+  await flush();
+  assert.equal(h.previews.length, 2);
+  assert.deepEqual(
+    h.previews.at(-1).confirmationSources,
+    ["other=https://other.example"],
+  );
+});
+
+test("late wallet preview cannot publish after unannounced config drift", async () => {
+  const pending = deferred();
+  const h = harness((command, _args, fallback) =>
+    command === "propose_wallet_sprout_sweep" ? pending.promise : fallback());
+  const opening = h.open("/fixture/wallet.dat");
+  await flush();
+  h.$("lightwalletd-url").value = "https://changed.example";
+  pending.resolve({
+    proposal_id: "stale-config", notes: 1, gross_zatoshis: 100000,
+    fee_zatoshis: 10000, net_zatoshis: 90000, params_present: true,
+    lands_in_sapling: "Lands in Sapling",
+  });
+  await opening;
+  assert.equal(h.peek("walletSproutReview"), null);
+});
+
 test("wallet Sprout execution sends only proposal id", async () => {
   let executed;
   const h = harness((command, args, fallback) => {
@@ -269,7 +304,8 @@ test("first wallet open displays its Sprout preview without a null-path error", 
   await h.open("/fixture/first.dat");
   assert.deepEqual(h.previews, [{
     path: "/fixture/first.dat", passphrase: null, destination: "fixture-destination",
-    lightwalletdUrl: "", network: "mainnet", dataDir: null,
+    lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
+    network: "mainnet", dataDir: null,
   }]);
   assert.equal(h.$("wallet-sprout-sweep").hidden, false);
   assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
@@ -283,7 +319,8 @@ test("opening another wallet previews the new path and passphrase", async () => 
   await h.open("/fixture/second.dat", "fixture-two");
   assert.deepEqual(h.previews.at(-1), {
     path: "/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
-    lightwalletdUrl: "", network: "mainnet", dataDir: null,
+    lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
+    network: "mainnet", dataDir: null,
   });
   assert.equal(h.$("sprout-sweep-status").textContent, "");
 });

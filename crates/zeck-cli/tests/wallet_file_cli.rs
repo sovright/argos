@@ -13,6 +13,11 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use argos_core::broadcast::{EndpointTxEvidence, TxObservation, TxObservationState};
+use argos_core::{TxLifecycleState, ZeckNetwork};
+use secrecy::ExposeSecret;
+use zcash_primitives::transaction::TxId;
+
 /// zcashd wallet with a Sprout address, a Sapling address, and transparent
 /// keys. Written by a real `zcashd` v6.20.0, so it also holds a 5.x
 /// `mnemonicphrase` HD seed, which Argos verifies but does not scan from. See
@@ -242,6 +247,239 @@ fn argos(args: &[&str]) -> std::process::Output {
         .stdin(Stdio::null())
         .output()
         .expect("argos binary should run")
+}
+
+fn sprout_lifecycle_output(
+    tag: &str,
+    state: TxLifecycleState,
+    mined_height: Option<u32>,
+) -> std::process::Output {
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let bytes = std::fs::read(&wallet).expect("fixture");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("Sprout fixture imports");
+    let spending_keys = keys
+        .sprout
+        .iter()
+        .map(|key| *key.a_sk.expose_secret())
+        .collect::<Vec<_>>();
+    // The writer-produced golden wallet deliberately contains no Sprout
+    // note records (the importer pins that invariant). Use an explicit
+    // orphan row to exercise the source-bound journal status the CLI must
+    // still render and reconcile.
+    let outpoint = argos_core::argos_wallet_import::keys::JsOutPoint {
+        txid: [0x11; 32],
+        js_index: 0,
+        output_index: 0,
+    };
+    let note_txid = outpoint
+        .txid
+        .iter()
+        .rev()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let data_dir = PathBuf::from(scratch_dir(tag));
+    std::fs::create_dir_all(&data_dir).expect("create lifecycle test data dir");
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+        &data_dir,
+        &spending_keys,
+        ZeckNetwork::Mainnet,
+    );
+    let txid = TxId::from_bytes([0x22; 32]);
+    std::fs::write(
+        journal.path(),
+        format!(
+            "{}:{}:{} {}\n",
+            note_txid, outpoint.js_index, outpoint.output_index, txid
+        ),
+    )
+    .expect("write legacy journal");
+    let mut snapshot = journal.load_or_migrate().expect("migrate legacy journal");
+    if state != TxLifecycleState::SubmissionUnknown {
+        let block_hash = vec![0x33; 32];
+        let observation = TxObservation {
+            state: match state {
+                TxLifecycleState::Pending => TxObservationState::PresentUnmined,
+                TxLifecycleState::Mined => TxObservationState::Mined,
+                other => panic!("unsupported test lifecycle state {other}"),
+            },
+            mined_height,
+            expiry_height: None,
+            primary_tip: Some(200),
+            secondary_tip: Some(200),
+            evidence: ["alpha", "beta"]
+                .into_iter()
+                .map(|operator| EndpointTxEvidence {
+                    operator_id: operator.to_owned(),
+                    endpoint: format!("https://{operator}.example"),
+                    tip_height: Some(200),
+                    reported_height: mined_height,
+                    block_hash: mined_height.map(|_| block_hash.clone()),
+                    tx_in_block: mined_height.is_some(),
+                })
+                .collect(),
+        };
+        journal
+            .append_transition(&mut snapshot, txid, state, None, Some(&observation))
+            .expect("append lifecycle transition");
+    }
+    argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("UTF-8 wallet path"),
+        "--data-dir",
+        data_dir.to_str().expect("UTF-8 data dir"),
+        "inspect-wallet",
+    ])
+}
+
+#[test]
+fn pending_and_unknown_cli_results_keep_the_source_warning() {
+    for (tag, state) in [
+        ("lifecycle-pending-warning", TxLifecycleState::Pending),
+        (
+            "lifecycle-unknown-warning",
+            TxLifecycleState::SubmissionUnknown,
+        ),
+    ] {
+        let output = sprout_lifecycle_output(tag, state, None);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(
+                "Keep the original wallet or Sprout key and the scan checkpoint. Broadcast is not confirmation."
+            ),
+            "{state}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn cli_never_calls_pending_value_swept() {
+    let output = sprout_lifecycle_output(
+        "lifecycle-pending-language",
+        TxLifecycleState::Pending,
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("broadcast/pending amount unknown"),
+        "{stdout}"
+    );
+    let lifecycle = stdout
+        .lines()
+        .filter(|line| {
+            line.contains("broadcast/pending")
+                || line.contains("submission status unknown")
+                || line.contains("mined at height")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !lifecycle.to_ascii_lowercase().contains("swept"),
+        "pending lifecycle output claimed finality: {lifecycle}"
+    );
+}
+
+#[test]
+fn cli_prints_mined_height_only_for_mined_evidence() {
+    let pending =
+        sprout_lifecycle_output("lifecycle-pending-height", TxLifecycleState::Pending, None);
+    let pending_stdout = String::from_utf8_lossy(&pending.stdout);
+    assert!(
+        !pending_stdout.contains("mined at height"),
+        "{pending_stdout}"
+    );
+
+    let mined =
+        sprout_lifecycle_output("lifecycle-mined-height", TxLifecycleState::Mined, Some(123));
+    let mined_stdout = String::from_utf8_lossy(&mined.stdout);
+    assert!(
+        mined_stdout.contains("mined at height 123 amount unknown"),
+        "{mined_stdout}"
+    );
+    assert!(
+        mined_stdout.contains(
+            "Keep the original wallet or Sprout key and the scan checkpoint. Broadcast is not confirmation."
+        ),
+        "stored mined evidence is stale until this invocation reobserves it: {mined_stdout}"
+    );
+}
+
+#[test]
+fn v1_journal_is_reported_as_uncertain_not_already_swept() {
+    let output = sprout_lifecycle_output(
+        "lifecycle-v1-unknown",
+        TxLifecycleState::SubmissionUnknown,
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("submission status unknown amount unknown"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("already swept"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("These were recovered from this file alone — no scan needed"),
+        "active-only journal was described as a newly recovered note: {stdout}"
+    );
+    assert!(
+        !stdout.contains("To move them:"),
+        "active-only journal offered a conflicting new sweep: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Nothing is left to sweep"),
+        "orphan uncertain history was hidden by a terminal verdict: {stdout}"
+    );
+}
+
+#[test]
+fn unreadable_journal_keeps_source_warning_and_suppresses_all_clear() {
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let bytes = std::fs::read(&wallet).expect("fixture");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("Sprout fixture imports");
+    let spending_keys = keys
+        .sprout
+        .iter()
+        .map(|key| *key.a_sk.expose_secret())
+        .collect::<Vec<_>>();
+    let data_dir = PathBuf::from(scratch_dir("unreadable-sprout-journal"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+        &data_dir,
+        &spending_keys,
+        ZeckNetwork::Mainnet,
+    );
+    std::fs::write(journal.path(), b"{broken journal\n").unwrap();
+
+    let output = argos(&[
+        "--wallet-file",
+        wallet.to_str().unwrap(),
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "inspect-wallet",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Sweep lifecycle journal could not be read")
+            && stdout.contains(
+                "Keep the original wallet or Sprout key and the scan checkpoint. Broadcast is not confirmation."
+            ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Nothing is left to sweep"), "{stdout}");
 }
 
 fn temporary_wallet(tag: &str, bytes: &[u8]) -> PathBuf {

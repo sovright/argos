@@ -78,6 +78,7 @@ function driveHandler(name, boxText, report) {
     birthdayTouched: false,
     document: { createElement: el },
     fmt: String,
+    confirmationSourcesFromForm: () => ["backup=https://confirm.example"],
     setStatus() {},
     sproutScanPeers: () => [],
     invoke: async (command, args) => {
@@ -140,6 +141,10 @@ test("runSproutScan sends the unfiltered lines so backend line numbers match the
   // Nothing chosen: no floor, skip left to the wallet's own key times.
   assert.equal(starts[0].args.birthdayFloor, null);
   assert.equal(starts[0].args.decryptEveryBlock, false);
+  assert.deepEqual(
+    [...starts[0].args.confirmationSources],
+    ["backup=https://confirm.example"],
+  );
 });
 
 // #271 binds the keys at scan start: the box's raw lines go to

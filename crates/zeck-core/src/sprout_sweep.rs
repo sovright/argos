@@ -42,13 +42,11 @@ use crate::{
     sprout::{self, SproutNotePlaintext},
     sprout_recovery::SpendableSproutNote,
     sprout_spend,
-    sprout_sweep_journal::{
-        note_id, JournalNoteContext, SproutJournalEntry, SproutJournalSnapshot,
-    },
+    sprout_sweep_journal::{note_id, JournalNoteContext},
     sprout_witness,
 };
 
-pub use crate::sprout_sweep_journal::SweepJournal;
+pub use crate::sprout_sweep_journal::{SproutJournalEntry, SproutJournalSnapshot, SweepJournal};
 
 /// ZIP 317 charges 5,000 zatoshi per logical action.
 const ZAT_PER_ACTION: u64 = 5_000;
@@ -630,6 +628,10 @@ pub struct SweepOptions<'a> {
     pub source: NoteSource,
     /// Mandatory durable lifecycle journal.
     pub journal: &'a SweepJournal,
+    /// Independently administered observers used to corroborate mined or
+    /// expired state. The submission endpoint is added separately and can
+    /// never corroborate itself.
+    pub confirmation_sources: &'a [crate::models::ConfirmationEndpoint],
 }
 
 /// What the sweep needs from the network: the tip, and a way to broadcast.
@@ -822,7 +824,7 @@ impl SproutSweepInventory<'_> {
                 .and_then(|observation| observation.mined_height)
                 .expect("mined inventory requires canonical height evidence");
             lines.push(format!(
-                "Sprout transaction {}: canonically confirmed at height {height} ({}).",
+                "Sprout transaction {}: canonically confirmed at height {height} ({}). {KEEP_SOURCE}",
                 entry.txid(),
                 amount(entry)
             ));
@@ -831,13 +833,13 @@ impl SproutSweepInventory<'_> {
             match entry.state {
                 TxLifecycleState::Expired => lines.push(format!(
                     "Sprout transaction {}: the old transaction can no longer mine and the \
-                     note is ready for a new plan.",
+                     note is ready for a new plan. {KEEP_SOURCE}",
                     entry.txid()
                 )),
                 TxLifecycleState::Rejected => lines.push(format!(
                     "Sprout transaction {} was rejected: nothing is counted as moved, note \
                      material is retained, and the existing refusal classification determines \
-                     whether a later run may retry.",
+                     whether a later run may retry. {KEEP_SOURCE}",
                     entry.txid()
                 )),
                 _ => {}
@@ -1307,23 +1309,29 @@ async fn sweep_sprout_notes_guarded(
     let (client, _endpoint, _info) =
         crate::scan::probe_valid_lightwalletd_endpoints(lightwalletd_url, network).await?;
 
-    let proving_key = load_params(params_path)?;
     let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
 
     let mut node = Lightwalletd(client);
-    let mut observer = crate::lightwalletd::LightwalletdTxObserver::new(lightwalletd_url, &[])?;
+    let mut observer = crate::lightwalletd::LightwalletdTxObserver::new(
+        lightwalletd_url,
+        options.confirmation_sources,
+    )?;
+    let mut proving_key = None;
     let mut outcome = run_sweep(
         notes,
         &mut node,
         &mut observer,
         network,
         |note: &SpendableSproutNote, expiry: BlockHeight, branch_id: BranchId| {
+            if proving_key.is_none() {
+                proving_key = Some(load_params(params_path)?);
+            }
             build_sweep_for_note(
                 note,
                 sapling_dest,
                 branch_id,
                 expiry,
-                &proving_key,
+                proving_key.as_ref().expect("proving key initialized"),
                 &sapling_prover,
                 [0u8; 512],
                 rand_core::OsRng,
@@ -1568,14 +1576,19 @@ fn refresh_outcome(
             TxLifecycleState::Expired | TxLifecycleState::Rejected => {}
         }
     }
-    let relevant = notes
-        .iter()
-        .filter_map(|note| snapshot.entry_for_note(&note.outpoint))
-        .collect::<Vec<_>>();
-    outcome.fresh_all_mined = !relevant.is_empty()
-        && relevant.iter().all(|entry| {
+    // Completion is a wallet-journal verdict, not merely a verdict over the
+    // notes recovered by this invocation. An orphaned journal entry still
+    // identifies a transaction whose value may be in flight, so it must be
+    // freshly observed alongside every other transaction before a caller may
+    // tell the operator that the original recovery material is no longer
+    // needed.
+    let journal_entries = snapshot.entries().collect::<Vec<_>>();
+    let no_ready_notes = classify_sprout_notes(notes, snapshot).ready.is_empty();
+    outcome.fresh_all_mined = !journal_entries.is_empty()
+        && journal_entries.iter().all(|entry| {
             entry.state == TxLifecycleState::Mined && freshly_observed_mined.contains(&entry.txid())
         })
+        && no_ready_notes
         && outcome.error.is_none()
         && outcome.skipped.is_empty()
         && outcome.rejected.is_empty();
@@ -1808,6 +1821,7 @@ mod tests {
             SweepOptions {
                 source: NoteSource::WalletFile,
                 journal: &journal,
+                confirmation_sources: &[],
             },
             |_| {},
         )
@@ -1842,6 +1856,7 @@ mod tests {
             SweepOptions {
                 source: NoteSource::WalletFile,
                 journal: &journal,
+                confirmation_sources: &[],
             },
             |_| {},
         )
@@ -2727,6 +2742,53 @@ mod tests {
         assert_eq!(builds, 0);
         assert!(raw.is_empty() && node.sent.is_empty());
         assert!(outcome.fresh_all_mined);
+    }
+
+    #[test]
+    fn orphan_stored_mined_entry_prevents_fresh_all_mined_when_observation_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let recovered_note = lifecycle_note(1_000_000, 60);
+        let orphan_note = lifecycle_note(2_000_000, 61);
+        let recovered_tx = fixture_transaction(600, 140);
+        let orphan_tx = fixture_transaction(601, 140);
+        seed_entry(
+            &journal,
+            &recovered_note,
+            &recovered_tx,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        seed_entry(
+            &journal,
+            &orphan_note,
+            &orphan_tx,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        let mut node = LifecycleNode::accepted(150, 0);
+        let mut observer = LifecycleObserver::new([
+            (recovered_tx.txid, mined(Some(140), 110, 150)),
+            (orphan_tx.txid, unavailable(Some(140), 150)),
+        ]);
+
+        let (outcome, builds, raw) = run_lifecycle(
+            std::slice::from_ref(&recovered_note),
+            &mut node,
+            &mut observer,
+            &journal,
+            602,
+        );
+
+        assert_eq!(builds, 0);
+        assert!(raw.is_empty() && node.sent.is_empty());
+        assert_eq!(outcome.transactions.len(), 2);
+        assert!(outcome
+            .transactions
+            .iter()
+            .any(|transaction| transaction.txid == orphan_tx.txid.to_string()));
+        assert!(
+            !outcome.fresh_all_mined,
+            "an unavailable orphan transaction makes the whole wallet journal nonfinal"
+        );
     }
 
     #[test]

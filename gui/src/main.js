@@ -420,7 +420,21 @@ let sproutPreviewWallet = null;
 let sproutSweepSource = null;
 let walletSproutReview = null;
 let walletSproutReviewDestination = null;
+let walletSproutReviewConfig = null;
 let walletSproutProposalGeneration = 0;
+
+function walletSproutExecutionConfig() {
+  return {
+    network: $("network-select").value,
+    lightwalletdUrl: $("lightwalletd-url").value.trim(),
+    confirmationSources: confirmationSourcesFromForm(),
+    dataDir: $("data-dir").value.trim() || null,
+  };
+}
+
+function walletSproutConfigMatches(left, right = walletSproutExecutionConfig()) {
+  return left !== null && JSON.stringify(left) === JSON.stringify(right);
+}
 
 function invalidateWalletSproutReview() {
   ++walletSproutProposalGeneration;
@@ -429,6 +443,7 @@ function invalidateWalletSproutReview() {
   }
   walletSproutReview = null;
   walletSproutReviewDestination = null;
+  walletSproutReviewConfig = null;
   $("sprout-sweep-confirm").checked = false;
   $("sprout-sweep-confirm").disabled = true;
   $("sprout-sweep-run").disabled = true;
@@ -437,6 +452,7 @@ function invalidateWalletSproutReview() {
 function updateWalletSproutSweepButton() {
   $("sprout-sweep-run").disabled = !walletSproutReview ||
     walletSproutReviewDestination !== $("sprout-destination").value.trim() ||
+    !walletSproutConfigMatches(walletSproutReviewConfig) ||
     sproutPreviewWallet !== walletFile || !$("sprout-sweep-confirm").checked ||
     sproutSweepSource !== null;
 }
@@ -722,22 +738,25 @@ async function showSproutSweep() {
     return;
   }
   const generation = walletSproutProposalGeneration;
+  const previewConfig = walletSproutExecutionConfig();
 
   try {
-    const previewNetwork = $("network-select").value;
+    const previewNetwork = previewConfig.network;
     const preview = await invoke("propose_wallet_sprout_sweep", {
       path: source.path,
       passphrase: source.passphrase,
       destination,
-      lightwalletdUrl: $("lightwalletd-url").value.trim(),
+      lightwalletdUrl: previewConfig.lightwalletdUrl,
+      confirmationSources: previewConfig.confirmationSources,
       network: previewNetwork,
       // Where the scan panel keeps its checkpoint: a scan of these keys
       // settles spends the wallet file cannot see.
-      dataDir: $("data-dir").value.trim() || null,
+      dataDir: previewConfig.dataDir,
     });
 
     if (walletFile !== source || generation !== walletSproutProposalGeneration ||
-        destination !== $("sprout-destination").value.trim()) {
+        destination !== $("sprout-destination").value.trim() ||
+        !walletSproutConfigMatches(previewConfig)) {
       invoke("release_sprout_proposal", { proposalId: preview.proposal_id }).catch(() => {});
       return;
     }
@@ -767,6 +786,7 @@ async function showSproutSweep() {
       sproutPreviewWallet = source;
       walletSproutReview = preview;
       walletSproutReviewDestination = destination;
+      walletSproutReviewConfig = previewConfig;
       $("sprout-sweep-confirm").disabled = false;
       updateWalletSproutSweepButton();
     } else {
@@ -778,7 +798,8 @@ async function showSproutSweep() {
       invoke("release_sprout_proposal", { proposalId: preview.proposal_id }).catch(() => {});
     }
   } catch (err) {
-    if (walletFile !== source || generation !== walletSproutProposalGeneration) return;
+    if (walletFile !== source || generation !== walletSproutProposalGeneration ||
+        !walletSproutConfigMatches(previewConfig)) return;
     $("sprout-sweep-plan").textContent = "";
     setStatus("sprout-sweep-status", `✗ ${err}`, "error");
     $("sprout-sweep-run").disabled = true;
@@ -799,7 +820,8 @@ async function runSproutSweep() {
   }
 
   if (sproutPreviewWallet !== walletFile || !walletSproutReview ||
-      walletSproutReviewDestination !== destination) {
+      walletSproutReviewDestination !== destination ||
+      !walletSproutConfigMatches(walletSproutReviewConfig)) {
     setStatus("sprout-sweep-status", "Wait for this wallet’s Sprout preview before sweeping.", "error");
     return;
   }
@@ -1624,6 +1646,7 @@ async function runSproutScan() {
       // Only to confirm the chain tip independently of the peer; the scan
       // itself reads blocks from the p2p network.
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
+      confirmationSources: confirmationSourcesFromForm(),
       peers,
       birthdayFloor: decrypt.birthdayFloor,
       decryptEveryBlock: decrypt.decryptEveryBlock,
@@ -1805,13 +1828,18 @@ $("sprout-scan-destination").addEventListener("input", invalidateSproutScanRevie
 $("sprout-scan-destination").addEventListener("change", refreshSproutScanReview);
 $("sprout-scan-confirm").addEventListener("change", updateSproutScanSweepButton);
 for (const id of ["sprout-scan-keys", "sprout-scan-peers", "network-select",
-  "data-dir", "lightwalletd-url", "server-preset", "wallet-path", "wallet-passphrase"]) {
+  "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset", "wallet-path", "wallet-passphrase"]) {
   $(id)?.addEventListener("input", invalidateSproutScanSource);
   $(id)?.addEventListener("change", invalidateSproutScanSource);
 }
-for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "server-preset"]) {
+for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset"]) {
   $(id)?.addEventListener("input", invalidateWalletSproutReview);
   $(id)?.addEventListener("change", invalidateWalletSproutReview);
+}
+for (const id of ["lightwalletd-url", "confirmation-sources"]) {
+  $(id)?.addEventListener("change", () => {
+    if (typeof showSproutSweep === "function") void showSproutSweep();
+  });
 }
 for (const id of ["network-select", "data-dir"]) {
   for (const event of ["input", "change"]) {
@@ -2061,6 +2089,7 @@ $("server-preset").addEventListener("change", () => {
   if (preset === "custom") return;
   const key = preset === "recommended" ? $("network-select").value : preset;
   $("lightwalletd-url").value = SERVER_PRESETS[key] ?? SERVER_PRESETS.mainnet;
+  if (walletFile) void showSproutSweep();
 });
 
 $("accounts-range").addEventListener("input", () => {
