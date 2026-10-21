@@ -248,8 +248,12 @@ const STEP_ALIASES = { "wallet-file": "seed" };
 
 function goTo(step) {
   if (step !== "wallet-file") {
+    // Leaving the wallet screen drops reviewed proposals, so a sweep is
+    // re-reviewed on return. A running Sprout scan is not stopped: it can
+    // run for hours, and moving between steps does not change its keys or
+    // settings. Changing those does release it (see the input listeners).
     invalidateWalletSproutReview();
-    invalidateSproutScanSource();
+    invalidateSproutScanReview();
   }
   const leavingMatchedConfig = state.matchedRecovery &&
     document.querySelector('.screen[data-step="config"]')?.classList.contains("active") &&
@@ -743,7 +747,10 @@ async function showSproutSweep() {
 
     $("sprout-sweep-plan").textContent =
       `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
-      `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.`;
+      `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.` +
+      // Keys dropped as forged, in inspect's words: the quote is for the
+      // genuine keys' notes only, and says why the rest are not in it.
+      (preview.warnings ?? []).map((warning) => ` ${warning}`).join("");
 
     // Stated before the user commits. Pasting a unified address reasonably
     // creates the expectation that funds land in its best pool, and for
@@ -1693,7 +1700,19 @@ async function runSproutScanSweep() {
 
   try {
     const report = await invoke("execute_sprout_scan_sweep", { proposalId });
-    if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
+    // The panel may have moved on to another scan source while proving ran.
+    // These funds moved regardless, so the report is always shown, labelled
+    // as the earlier scan's, never dropped.
+    const earlier = generation !== sproutScanGeneration || handle !== sproutScanHandle;
+    const prefix = earlier ? "Earlier Sprout scan: " : "";
+    if (earlier) {
+      $("sprout-scan-sweep").hidden = false;
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent =
+        "This result belongs to the earlier Sprout scan, swept before its keys or settings changed.";
+      list.appendChild(li);
+    }
 
     noteSproutBroadcast(report, true);
     for (const sent of report.sent) {
@@ -1747,12 +1766,12 @@ async function runSproutScanSweep() {
           ? `The ${report.sent.length} transaction(s) above were already broadcast and cannot be undone.`
           : "");
       list.appendChild(li);
-      setStatus("sprout-scan-status", "✗ The sweep did not finish.", "error");
+      setStatus("sprout-scan-status", `${prefix}✗ The sweep did not finish.`, "error");
     } else {
       const refused = (report.rejected ?? []).length;
       setStatus(
         "sprout-scan-status",
-        `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
+        `${prefix}✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
           (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
         "success",
       );
@@ -1762,8 +1781,10 @@ async function runSproutScanSweep() {
       }
     }
   } catch (err) {
-    if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
-    setStatus("sprout-scan-status", `✗ ${err}`, "error");
+    // Execution refuses only when nothing was broadcast; still say so, for
+    // the earlier scan too, rather than leave the click unanswered.
+    const earlier = generation !== sproutScanGeneration || handle !== sproutScanHandle;
+    setStatus("sprout-scan-status", `${earlier ? "Earlier Sprout scan: " : ""}✗ ${err}`, "error");
   } finally {
     sproutScanExecutionPending = false;
     if (generation === sproutScanGeneration && handle === sproutScanHandle &&

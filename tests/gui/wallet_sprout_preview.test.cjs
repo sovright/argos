@@ -1371,3 +1371,24 @@ test("Start over clears the raw Sprout key box and closes the panel", async () =
     assert.match(source.slice(at, at + 300), /forgetSproutScanInputs\(\)/);
   }
 });
+
+// Review finding 6 on #271: a forged Sprout key is dropped from the sweep
+// as inspect drops it, and the review says so, so a user is never quoted a
+// smaller sweep with no reason given. The genuine notes stay sweepable.
+test("a wallet review names a dropped forged Sprout key and stays sweepable", async () => {
+  const forged = "a Sprout key in this file does not control the address it is stored under " +
+    "(stored aa, derived bb). It was skipped: spending with it would build a transaction for " +
+    "someone else's note.";
+  const h = harness(async (command, args, fallback) => {
+    const response = await fallback();
+    if (command === "propose_wallet_sprout_sweep") return { ...response, warnings: [forged] };
+    return response;
+  });
+  await h.open("/fixture/forged.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-plan").textContent, /1 note/);
+  assert.match(h.$("sprout-sweep-plan").textContent, /does not control the address/);
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+});
