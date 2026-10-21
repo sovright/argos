@@ -1,7 +1,32 @@
+//! Reviewed Sprout intent: what the user reviewed is what executes.
+//!
+//! **Key retention.** A scan session keeps its decoded Sprout spending keys,
+//! and a reviewed proposal keeps the notes it will spend (`SpendableSproutNote`
+//! carries the raw `a_sk`), in this process's memory only. Nothing here is
+//! written to disk; the one spend-capable file remains the scan checkpoint,
+//! which `sprout_scan_run` writes at `0600`. Execution used to re-read and
+//! re-decrypt the wallet file, or re-collect the panel's keys, from form
+//! fields at click time. That let execution diverge from the review (a
+//! different file, passphrase, key box, network or server than the one the
+//! user approved) and re-opened the decrypt window on every click. Holding
+//! the reviewed material instead binds execution to the review, at the cost
+//! of keeping keys resident for a bounded time:
+//!
+//! - a proposal lives at most [`PROPOSAL_TTL`], is swept on every store
+//!   access, and is dropped on execute (one-shot) or explicit release;
+//! - a scan session lives until it is released (new scan, source change,
+//!   Start over) or the app exits. A completed one must outlive the TTL: its
+//!   sweep is often reviewed long after an hours-long scan finishes.
+//! - at most [`MAX_SCAN_SESSIONS`] scans and [`MAX_PROPOSALS`] proposals.
+//!
+//! Memory is not zeroized on drop: no zeroizing type is available without a
+//! new dependency, and the wallet-import key types are not zeroizing either.
+
 use std::{
     collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use argos_core::{sprout_recovery::SpendableSproutNote, sprout_sweep::SweepJournal, ZeckNetwork};
@@ -13,6 +38,10 @@ use crate::commands::SproutScanReport;
 pub const MAX_SCAN_SESSIONS: usize = 16;
 pub const MAX_PROPOSALS: usize = 32;
 pub const MAX_IN_FLIGHT_CHECKPOINTS: usize = 16;
+/// How long a reviewed Sprout proposal stays executable. Long enough to read
+/// the review and tick the box; short enough that spending keys held for it
+/// do not linger behind a review the user walked away from.
+pub const PROPOSAL_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -65,11 +94,18 @@ pub struct ReviewedSproutSweep {
     pub params_present: bool,
     pub params_path: String,
     pub lands_in_sapling: String,
+    /// NU7's Sprout spending deadline, shown before the user commits.
+    pub nu7_warning: String,
+    /// Shown with the review, e.g. Sprout keys dropped as forged.
+    pub warnings: Vec<String>,
 }
 
+/// Where a proposal's notes came from. A wallet proposal carries no file
+/// identity: its notes and their spending keys are held in the intent, so
+/// execution never re-reads the file and there is nothing to compare.
 #[derive(PartialEq, Eq)]
 pub enum SproutIntentSource {
-    Wallet(String),
+    Wallet,
     Scan(SproutScanHandle),
 }
 
@@ -80,6 +116,9 @@ pub struct SproutSweepIntent {
     pub network: ZeckNetwork,
     pub lightwalletd_url: String,
     pub journal: Option<SweepJournal>,
+    /// Set when the catch-up scan behind a scan-derived proposal could not
+    /// confirm the chain tip; it leads the sweep report's warnings.
+    pub tip_warning: Option<String>,
 }
 
 pub struct ScanMaterial {
@@ -101,14 +140,56 @@ struct SproutScanSession {
     status: SproutScanStatus,
     report: Option<SproutScanReport>,
     error: Option<String>,
-    released: bool,
+    /// Stops the scan worker. Dropping its future also drops the checkpoint
+    /// reservation it owns, so a released scan frees its checkpoint at once.
+    /// The checkpoint is saved atomically every few hundred blocks, so an
+    /// abort costs at most that much progress, and a later scan of the same
+    /// keys resumes from it.
+    worker: Option<tokio::task::AbortHandle>,
 }
 
-#[derive(Default)]
+struct StoredProposal {
+    intent: SproutSweepIntent,
+    created: Instant,
+}
+
 struct StoreInner {
     scans: HashMap<SproutScanHandle, SproutScanSession>,
-    proposals: HashMap<SproutProposalId, SproutSweepIntent>,
+    proposals: HashMap<SproutProposalId, StoredProposal>,
     in_flight_checkpoints: HashSet<PathBuf>,
+    proposal_ttl: Duration,
+}
+
+impl Default for StoreInner {
+    fn default() -> Self {
+        Self {
+            scans: HashMap::new(),
+            proposals: HashMap::new(),
+            in_flight_checkpoints: HashSet::new(),
+            proposal_ttl: PROPOSAL_TTL,
+        }
+    }
+}
+
+impl StoreInner {
+    /// Drop every proposal past its TTL. Called on each store access, so an
+    /// abandoned review's keys go with the next interaction.
+    fn sweep_expired(&mut self) {
+        let ttl = self.proposal_ttl;
+        let now = Instant::now();
+        self.proposals
+            .retain(|_, stored| now.saturating_duration_since(stored.created) < ttl);
+    }
+
+    fn lock(
+        store: &Arc<Mutex<StoreInner>>,
+    ) -> Result<std::sync::MutexGuard<'_, StoreInner>, String> {
+        let mut inner = store
+            .lock()
+            .map_err(|_| "Sprout review store unavailable".to_owned())?;
+        inner.sweep_expired();
+        Ok(inner)
+    }
 }
 
 /// A scan or catch-up owns this reservation until its future finishes or is
@@ -179,12 +260,22 @@ impl Clone for ReviewedIntentStore {
 }
 
 impl ReviewedIntentStore {
+    #[cfg(test)]
+    pub fn with_proposal_ttl(proposal_ttl: Duration) -> Self {
+        Self(Arc::new(Mutex::new(StoreInner {
+            proposal_ttl,
+            ..StoreInner::default()
+        })))
+    }
+
+    #[cfg(test)]
+    pub fn proposal_count(&self) -> usize {
+        StoreInner::lock(&self.0).map_or(0, |inner| inner.proposals.len())
+    }
+
     pub fn reserve_checkpoint(&self, checkpoint: &Path) -> Result<CheckpointReservation, String> {
         let identity = checkpoint_identity(checkpoint)?;
-        let mut inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let mut inner = StoreInner::lock(&self.0)?;
         if inner.in_flight_checkpoints.contains(&identity) {
             return Err("a Sprout scan or catch-up is already using this checkpoint".into());
         }
@@ -199,15 +290,12 @@ impl ReviewedIntentStore {
     }
 
     pub fn ensure_scan_proposal_capacity(&self, handle: &SproutScanHandle) -> Result<(), String> {
-        let inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let inner = StoreInner::lock(&self.0)?;
         let scan = inner
             .scans
             .get(handle)
             .ok_or("unknown or released Sprout scan")?;
-        if scan.released || !matches!(scan.status, SproutScanStatus::Completed) {
+        if !matches!(scan.status, SproutScanStatus::Completed) {
             return Err("wait for the Sprout scan to complete".into());
         }
         if inner.proposals.len() >= MAX_PROPOSALS {
@@ -225,10 +313,7 @@ impl ReviewedIntentStore {
         lightwalletd_url: String,
         peers: Vec<String>,
     ) -> Result<SproutScanHandle, String> {
-        let mut inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let mut inner = StoreInner::lock(&self.0)?;
         if inner.scans.len() >= MAX_SCAN_SESSIONS {
             return Err("too many Sprout scans; release an old scan first".into());
         }
@@ -245,24 +330,18 @@ impl ReviewedIntentStore {
                 status: SproutScanStatus::Running,
                 report: None,
                 error: None,
-                released: false,
+                worker: None,
             },
         );
         Ok(handle)
     }
 
     pub fn scan_material(&self, handle: &SproutScanHandle) -> Result<ScanMaterial, String> {
-        let inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let inner = StoreInner::lock(&self.0)?;
         let scan = inner
             .scans
             .get(handle)
             .ok_or("unknown or released Sprout scan")?;
-        if scan.released {
-            return Err("unknown or released Sprout scan".into());
-        }
         Ok(ScanMaterial {
             keys: Arc::clone(&scan.keys),
             key_fingerprint: scan.key_fingerprint.clone(),
@@ -274,17 +353,11 @@ impl ReviewedIntentStore {
     }
 
     pub fn snapshot(&self, handle: &SproutScanHandle) -> Result<SproutScanSnapshot, String> {
-        let inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let inner = StoreInner::lock(&self.0)?;
         let scan = inner
             .scans
             .get(handle)
             .ok_or("unknown or released Sprout scan")?;
-        if scan.released {
-            return Err("unknown or released Sprout scan".into());
-        }
         Ok(SproutScanSnapshot {
             handle: handle.clone(),
             status: scan.status.clone(),
@@ -293,13 +366,32 @@ impl ReviewedIntentStore {
         })
     }
 
+    /// Hand the store the scan worker's abort handle. A scan released before
+    /// this lands is already gone, so its worker is stopped here instead.
+    pub fn attach_worker(&self, handle: &SproutScanHandle, worker: tokio::task::AbortHandle) {
+        let orphaned = match StoreInner::lock(&self.0) {
+            Ok(mut inner) => match inner.scans.get_mut(handle) {
+                Some(scan) => {
+                    if matches!(scan.status, SproutScanStatus::Running) {
+                        scan.worker = Some(worker);
+                    }
+                    None
+                }
+                None => Some(worker),
+            },
+            Err(_) => Some(worker),
+        };
+        // Outside the lock: the worker's reservation takes it when dropped.
+        if let Some(worker) = orphaned {
+            worker.abort();
+        }
+    }
+
     pub fn finish_scan(&self, handle: &SproutScanHandle, result: Result<SproutScanReport, String>) {
-        if let Ok(mut inner) = self.0.lock() {
-            if inner.scans.get(handle).is_some_and(|scan| scan.released) {
-                inner.scans.remove(handle);
-                return;
-            }
+        if let Ok(mut inner) = StoreInner::lock(&self.0) {
+            // A released scan was removed; its late result has nowhere to go.
             if let Some(scan) = inner.scans.get_mut(handle) {
+                scan.worker = None;
                 match result {
                     Ok(report) => {
                         scan.status = SproutScanStatus::Completed;
@@ -315,23 +407,22 @@ impl ReviewedIntentStore {
     }
 
     pub fn release_scan(&self, handle: &SproutScanHandle) -> Result<(), String> {
-        let mut inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let mut inner = StoreInner::lock(&self.0)?;
         let scan = inner
             .scans
-            .get_mut(handle)
+            .remove(handle)
             .ok_or("unknown or released Sprout scan")?;
-        if scan.released {
-            return Err("unknown or released Sprout scan".into());
+        inner.proposals.retain(|_, stored| {
+            !matches!(&stored.intent.source, SproutIntentSource::Scan(source) if source == handle)
+        });
+        drop(inner);
+        // Running or not, the session and its keys go now. A running worker
+        // is aborted, which drops its checkpoint reservation with it, so the
+        // same scan can be started again at once rather than after it ends.
+        // Outside the lock, which that reservation's drop takes.
+        if let Some(worker) = scan.worker {
+            worker.abort();
         }
-        if matches!(scan.status, SproutScanStatus::Running) {
-            scan.released = true;
-        } else {
-            inner.scans.remove(handle);
-        }
-        inner.proposals.retain(|_, intent| !matches!(&intent.source, SproutIntentSource::Scan(source) if source == handle));
         Ok(())
     }
 
@@ -343,10 +434,7 @@ impl ReviewedIntentStore {
         let params_path = argos_core::sprout_sweep::default_params_path();
         let params_present = params_path.exists();
         let params_path = params_path.display().to_string();
-        let mut inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let mut inner = StoreInner::lock(&self.0)?;
         if inner.proposals.len() >= MAX_PROPOSALS {
             return Err("too many Sprout proposals; release an old proposal first".into());
         }
@@ -358,30 +446,34 @@ impl ReviewedIntentStore {
             if !matches!(scan.status, SproutScanStatus::Completed) {
                 return Err("Sprout scan has not completed".into());
             }
-            if scan.network != intent.network || scan.lightwalletd_url != intent.lightwalletd_url {
-                return Err("Sprout proposal source changed".into());
-            }
         }
+        let nu7_warning = argos_core::sprout_sweep::nu7_recovery_warning(intent.network);
         let proposal_id = SproutProposalId(Uuid::new_v4().to_string());
-        inner.proposals.insert(proposal_id.clone(), intent);
+        inner.proposals.insert(
+            proposal_id.clone(),
+            StoredProposal {
+                intent,
+                created: Instant::now(),
+            },
+        );
         Ok(ReviewedSproutSweep {
             proposal_id,
             plan,
             params_present,
             params_path,
             lands_in_sapling: argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING.to_owned(),
+            nu7_warning,
+            warnings: Vec::new(),
         })
     }
 
     pub fn take_proposal(&self, id: &SproutProposalId) -> Result<SproutSweepIntent, String> {
-        let mut inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let mut inner = StoreInner::lock(&self.0)?;
         let intent = inner
             .proposals
             .remove(id)
-            .ok_or("unknown or already used Sprout proposal")?;
+            .ok_or("unknown or already used Sprout proposal")?
+            .intent;
         if let SproutIntentSource::Scan(handle) = &intent.source {
             if !inner.scans.contains_key(handle) {
                 return Err("Sprout scan was released".into());
@@ -392,15 +484,12 @@ impl ReviewedIntentStore {
 
     pub fn take_wallet_proposal(&self, id: &SproutProposalId) -> Result<SproutSweepIntent, String> {
         {
-            let inner = self
-                .0
-                .lock()
-                .map_err(|_| "Sprout review store unavailable")?;
+            let inner = StoreInner::lock(&self.0)?;
             let intent = inner
                 .proposals
                 .get(id)
                 .ok_or("unknown or already used Sprout proposal")?;
-            if !matches!(intent.source, SproutIntentSource::Wallet(_)) {
+            if !matches!(intent.intent.source, SproutIntentSource::Wallet) {
                 return Err("proposal belongs to a scan-derived sweep".into());
             }
         }
@@ -409,15 +498,12 @@ impl ReviewedIntentStore {
 
     pub fn take_scan_proposal(&self, id: &SproutProposalId) -> Result<SproutSweepIntent, String> {
         {
-            let inner = self
-                .0
-                .lock()
-                .map_err(|_| "Sprout review store unavailable")?;
+            let inner = StoreInner::lock(&self.0)?;
             let intent = inner
                 .proposals
                 .get(id)
                 .ok_or("unknown or already used Sprout proposal")?;
-            if !matches!(intent.source, SproutIntentSource::Scan(_)) {
+            if !matches!(intent.intent.source, SproutIntentSource::Scan(_)) {
                 return Err("proposal belongs to a wallet-derived sweep".into());
             }
         }
@@ -425,10 +511,7 @@ impl ReviewedIntentStore {
     }
 
     pub fn release_proposal(&self, id: &SproutProposalId) -> Result<(), String> {
-        let mut inner = self
-            .0
-            .lock()
-            .map_err(|_| "Sprout review store unavailable")?;
+        let mut inner = StoreInner::lock(&self.0)?;
         inner
             .proposals
             .remove(id)
@@ -463,6 +546,8 @@ mod tests {
                         spent_notes: 0,
                         total_zatoshis: 100_000,
                         tip_warning: None,
+                        decrypt_from_height: None,
+                        decrypt_line: String::new(),
                     }),
                 );
             })
@@ -478,7 +563,7 @@ mod tests {
             SproutIntentSource::Scan(handle) => {
                 store.scan_material(handle).unwrap().lightwalletd_url
             }
-            SproutIntentSource::Wallet(_) => "https://node-a".to_owned(),
+            SproutIntentSource::Wallet => "https://node-a".to_owned(),
         };
         store
             .insert_proposal(
@@ -489,6 +574,7 @@ mod tests {
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: endpoint,
                     journal: None,
+                    tip_warning: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,
@@ -519,11 +605,7 @@ mod tests {
     #[test]
     fn sprout_intent_is_one_shot() {
         let store = ReviewedIntentStore::default();
-        let id = proposal(
-            &store,
-            SproutIntentSource::Wallet("wallet-a".into()),
-            "zs-reviewed",
-        );
+        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
         assert!(store.take_proposal(&id).is_ok());
         assert!(store.take_proposal(&id).is_err());
     }
@@ -531,11 +613,7 @@ mod tests {
     #[test]
     fn wrong_execution_route_cannot_consume_a_proposal() {
         let store = ReviewedIntentStore::default();
-        let id = proposal(
-            &store,
-            SproutIntentSource::Wallet("wallet-a".into()),
-            "zs-reviewed",
-        );
+        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
         assert!(store.take_scan_proposal(&id).is_err());
         assert!(store.take_wallet_proposal(&id).is_ok());
     }
@@ -545,16 +623,8 @@ mod tests {
         let store = ReviewedIntentStore::default();
         // B finishes first; older A returns later. A must not evict the ID
         // already displayed for B, and B remains one-shot executable.
-        let b = proposal(
-            &store,
-            SproutIntentSource::Wallet("wallet-a".into()),
-            "zs-B",
-        );
-        let a = proposal(
-            &store,
-            SproutIntentSource::Wallet("wallet-a".into()),
-            "zs-A",
-        );
+        let b = proposal(&store, SproutIntentSource::Wallet, "zs-B");
+        let a = proposal(&store, SproutIntentSource::Wallet, "zs-A");
         assert_eq!(store.take_wallet_proposal(&b).unwrap().destination, "zs-B");
         assert!(store.take_wallet_proposal(&b).is_err());
         store.release_proposal(&a).unwrap();
@@ -578,6 +648,7 @@ mod tests {
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: "https://node-a".into(),
                     journal: None,
+                    tip_warning: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,
@@ -620,22 +691,19 @@ mod tests {
                 Vec::new()
             )
             .is_err());
-        for i in 0..MAX_PROPOSALS {
-            proposal(
-                &store,
-                SproutIntentSource::Wallet(format!("wallet-{i}")),
-                "zs-reviewed",
-            );
+        for _ in 0..MAX_PROPOSALS {
+            proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
         }
         assert!(store
             .insert_proposal(
                 SproutSweepIntent {
-                    source: SproutIntentSource::Wallet("overflow".into()),
+                    source: SproutIntentSource::Wallet,
                     notes: Vec::new(),
                     destination: "zs-reviewed".into(),
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: "https://node".into(),
                     journal: None,
+                    tip_warning: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,
@@ -647,10 +715,11 @@ mod tests {
             .is_err());
     }
 
+    /// Finding 10: a released scan is gone, running or not, so it never
+    /// holds a slot that a new scan needs.
     #[test]
-    fn released_running_scans_still_count_until_they_stop() {
+    fn released_running_scans_do_not_count_toward_the_limit() {
         let store = ReviewedIntentStore::default();
-        let mut handles = Vec::new();
         for i in 0..MAX_SCAN_SESSIONS {
             let handle = store
                 .insert_scan(
@@ -664,19 +733,7 @@ mod tests {
                 .unwrap();
             store.release_scan(&handle).unwrap();
             assert!(store.snapshot(&handle).is_err());
-            handles.push(handle);
         }
-        assert!(store
-            .insert_scan(
-                vec![[99; 32]],
-                "overflow".into(),
-                PathBuf::from("/tmp/overflow"),
-                ZeckNetwork::Mainnet,
-                "https://node".into(),
-                Vec::new()
-            )
-            .is_err());
-        store.finish_scan(&handles[0], Err("stopped".into()));
         assert!(store
             .insert_scan(
                 vec![[99; 32]],
@@ -687,6 +744,93 @@ mod tests {
                 Vec::new()
             )
             .is_ok());
+    }
+
+    /// Finding 3: releasing a running scan stops its worker, so the
+    /// checkpoint reservation the worker owns is freed at once and the same
+    /// scan can be started again, instead of failing for hours.
+    #[tokio::test]
+    async fn releasing_a_running_scan_aborts_its_worker_and_frees_its_checkpoint() {
+        let store = ReviewedIntentStore::default();
+        let checkpoint = std::env::temp_dir()
+            .join(format!("argos-abort-{}", Uuid::new_v4()))
+            .join("scan.checkpoint");
+        let handle = store
+            .insert_scan(
+                vec![[3; 32]],
+                "fingerprint-3".into(),
+                checkpoint.clone(),
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        let reservation = store.reserve_checkpoint(&checkpoint).unwrap();
+        let worker = tokio::spawn(async move {
+            let _reservation = reservation;
+            std::future::pending::<()>().await;
+        });
+        store.attach_worker(&handle, worker.abort_handle());
+        store.release_scan(&handle).unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("release stops the worker promptly");
+        assert!(joined.is_err_and(|err| err.is_cancelled()));
+        assert!(store.reserve_checkpoint(&checkpoint).is_ok());
+        assert!(store.snapshot(&handle).is_err());
+    }
+
+    /// A release that lands before the worker is attached still stops it.
+    #[tokio::test]
+    async fn a_worker_attached_after_release_is_aborted() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 4);
+        // `scan` completes the session; make a running one instead.
+        store.release_scan(&handle).unwrap();
+        let handle = store
+            .insert_scan(
+                vec![[5; 32]],
+                "fingerprint-5".into(),
+                PathBuf::from("/tmp/scan-5"),
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+            )
+            .unwrap();
+        store.release_scan(&handle).unwrap();
+        let worker = tokio::spawn(std::future::pending::<()>());
+        store.attach_worker(&handle, worker.abort_handle());
+        let joined = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("a late-attached worker is stopped");
+        assert!(joined.is_err_and(|err| err.is_cancelled()));
+    }
+
+    /// Finding 5: a reviewed proposal holds raw Sprout spending keys in its
+    /// notes, so it does not outlive its review window.
+    #[test]
+    fn sprout_proposals_expire() {
+        let store = ReviewedIntentStore::with_proposal_ttl(std::time::Duration::ZERO);
+        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        assert_eq!(
+            store.take_wallet_proposal(&id).err().unwrap(),
+            "unknown or already used Sprout proposal"
+        );
+        assert_eq!(store.proposal_count(), 0, "expired proposals are dropped");
+
+        let store = ReviewedIntentStore::default();
+        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        assert!(store.take_wallet_proposal(&id).is_ok());
+        assert_eq!(PROPOSAL_TTL, std::time::Duration::from_secs(15 * 60));
+    }
+
+    /// Expired proposals free their slots for new reviews.
+    #[test]
+    fn expired_proposals_do_not_fill_the_store() {
+        let store = ReviewedIntentStore::with_proposal_ttl(std::time::Duration::ZERO);
+        for _ in 0..MAX_PROPOSALS + 1 {
+            proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        }
     }
 
     #[test]
@@ -796,11 +940,7 @@ mod tests {
         store.release_scan(&handle).unwrap();
         assert!(store.snapshot(&handle).is_err());
         assert!(store.take_proposal(&id).is_err());
-        let wallet = proposal(
-            &store,
-            SproutIntentSource::Wallet("wallet-a".into()),
-            "zs-reviewed",
-        );
+        let wallet = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
         store.release_proposal(&wallet).unwrap();
         assert!(store.take_proposal(&wallet).is_err());
     }

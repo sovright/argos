@@ -118,6 +118,7 @@ async fn local_public_transparent_review_binds_live_outpoint_before_submission()
     keys.transparent.push(TransparentKey {
         secret: Secret::new(common::standalone_transparent::STANDALONE_TRANSPARENT_SECRET),
         provenance: Provenance::Standalone,
+        created_at: None,
     });
     let data_dir = tempfile::tempdir().unwrap();
     let service = RecoveryService::new();

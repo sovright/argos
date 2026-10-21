@@ -3661,6 +3661,7 @@ mod tests {
             keys.transparent.push(TransparentKey {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
+                created_at: None,
             });
             assert_eq!(
                 crate::key_source::classify_recovery_route(&keys),
@@ -3999,6 +4000,7 @@ mod tests {
                 keys.sapling.push(SaplingKey {
                     extsk: Secret::new(bytes),
                     provenance: Provenance::Standalone,
+                    created_at: None,
                 });
             }
             let dir = tempfile::tempdir().unwrap();

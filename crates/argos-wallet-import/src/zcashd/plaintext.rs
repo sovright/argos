@@ -9,7 +9,11 @@ use crate::{
         merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
         SaplingKey, SproutKey, TransparentKey,
     },
-    zcashd::records::{compact_size, parse_record_key},
+    zcashd::{
+        metadata::{is_metadata_record, KeyMetadataIndex, MetadataKind},
+        records::{compact_size, parse_record_key},
+        RecoveredKeyIds,
+    },
 };
 
 /// Record types we knowingly ignore: wallet bookkeeping with no key
@@ -24,7 +28,6 @@ const IGNORED: &[&str] = &[
     "bestblock",
     "bestblock_nomerkle",
     "defaultkey",
-    "keymeta",
     "minversion",
     "mnemonichdchain",
     "name",
@@ -32,19 +35,10 @@ const IGNORED: &[&str] = &[
     "orderposnext",
     "pool",
     "purpose",
-    "sapzkeymeta",
     "tx",
     "version",
     "witnesscachesize",
-    "zkeymeta",
 ];
-
-/// Record types that hold the wallet's HD seed: `hdseed`/`chdseed` for
-/// zcashd 1.1-4.x, `mnemonicphrase`/`cmnemonicphrase` for 5.0+. Argos does
-/// not recover a seed from a `wallet.dat`, and must say so — these are not
-/// bookkeeping, and skipping them quietly made a partially recovered wallet
-/// read as a complete one.
-const SEED_BEARING: &[&str] = &["chdseed", "cmnemonicphrase", "hdseed", "mnemonicphrase"];
 
 fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
     let (len, consumed) = compact_size(value)?;
@@ -105,7 +99,13 @@ fn secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
 ///
 /// A record we cannot parse is recorded as a diagnostic and skipped; it
 /// must never prevent a record we *can* parse from being recovered.
-pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
+/// Returns which transparent and Sapling keys were actually recovered.
+pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -> RecoveredKeyIds {
+    let mut recovered = RecoveredKeyIds::default();
+    // Unreadable metadata is reported from here and not from
+    // `collect_encrypted`, which builds the same index: this collector runs
+    // for every zcashd wallet, so each damaged record is reported once.
+    let metadata = KeyMetadataIndex::build(pairs, Some(&mut out.diagnostics));
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             // Do not include any bytes from the record key itself: it can
@@ -140,6 +140,7 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                             address,
                             // zcashd Sprout keys were never HD-derived.
                             provenance: Provenance::Standalone,
+                            created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
                         })
                     }
                     (Some(_), Some(_)) => {
@@ -164,7 +165,9 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                     out.sapling.push(SaplingKey {
                         extsk: Secret::new(extsk.to_vec()),
                         provenance: Provenance::Standalone,
-                    })
+                        created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
+                    });
+                    recovered.sapling.insert(rec.rest);
                 }
                 Some(_) => out
                     .diagnostics
@@ -199,7 +202,10 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
                             out.transparent.push(TransparentKey {
                                 secret: Secret::new(secret),
                                 provenance: Provenance::HdDerived,
-                            })
+                                created_at: metadata
+                                    .created_at(MetadataKind::Transparent, &rec.rest),
+                            });
+                            recovered.transparent.insert(rec.rest);
                         }
                         Ok(_) => out
                             .diagnostics
@@ -222,26 +228,18 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
             // Encrypted variants are handled in Task 10 once the master
             // key is available; skip silently here rather than reporting
             // them as unknown.
-            "ckey" | "czkey" | "csapzkey" | "mkey" | "hdchain" | "sapzaddr" | "zkeymeta" => {}
-            other if SEED_BEARING.contains(&other) => {
-                // An encrypted 5.x wallet carries both `mnemonicphrase` and
-                // `cmnemonicphrase` for one seed; report the seed once.
-                if !out
-                    .diagnostics
-                    .iter()
-                    .any(ImportDiagnostic::is_unrecovered_seed)
-                {
-                    out.diagnostics.push(ImportDiagnostic::UnrecoveredSeed {
-                        record_type: other.to_owned(),
-                    });
-                }
-            }
+            "ckey" | "czkey" | "csapzkey" | "mkey" | "hdchain" | "sapzaddr" => {}
+            // Read into `metadata` above, and by `seed` for coverage.
+            other if is_metadata_record(other) => {}
+            // Assessed as a whole, with the master key in hand, by `seed`.
+            other if super::seed::SEED_RECORDS.contains(&other) => {}
             other if IGNORED.contains(&other) => {}
             other => out.diagnostics.push(ImportDiagnostic::UnknownRecord {
                 record_type: other.to_owned(),
             }),
         }
     }
+    recovered
 }
 
 #[cfg(test)]
@@ -344,6 +342,63 @@ mod tests {
         assert_eq!(k.a_sk.expose_secret(), &value);
     }
 
+    fn metadata(time: i64) -> Vec<u8> {
+        let mut v = 10i32.to_le_bytes().to_vec();
+        v.extend_from_slice(&time.to_le_bytes());
+        v.push(0); // empty HD keypath
+        v.extend_from_slice(&[0u8; 32]);
+        v
+    }
+
+    /// Each key gets the time stored under its own identifier, an imported
+    /// key's "unknown" marker gives no time, and a damaged record gives no
+    /// time plus one diagnostic — while every key is still recovered.
+    #[test]
+    fn creation_times_attach_to_their_own_keys() {
+        // Each address is derived from its key, so the identity check that
+        // refuses a key filed under someone else's address lets all three in.
+        let (known_sk, unknown_sk, damaged_sk) = ([0x01; 32], [0x02; 32], [0x03; 32]);
+        let known = identity::sprout_address_from_spending_key(&known_sk);
+        let unknown = identity::sprout_address_from_spending_key(&unknown_sk);
+        let damaged = identity::sprout_address_from_spending_key(&damaged_sk);
+        let mut truncated = metadata(1_700_000_300);
+        truncated.truncate(10);
+        let pairs = vec![
+            record("zkey", &known, &known_sk),
+            record("zkey", &unknown, &unknown_sk),
+            record("zkey", &damaged, &damaged_sk),
+            record("zkeymeta", &known, &metadata(1_700_000_100)),
+            // What `z_importkey` writes for a key of unknown age.
+            record("zkeymeta", &unknown, &metadata(1)),
+            record("zkeymeta", &damaged, &truncated),
+            // Same bytes, other pool: must not leak onto a Sprout key.
+            record("sapzkeymeta", &[0x02; 32], &metadata(1_700_000_200)),
+        ];
+
+        let mut out = ImportedKeys::default();
+        collect_plaintext(&pairs, &mut out);
+
+        let time_of = |addr: [u8; 64]| {
+            out.sprout
+                .iter()
+                .find(|k| k.address == addr)
+                .map(|k| k.created_at)
+                .unwrap()
+        };
+        assert_eq!(out.sprout.len(), 3, "metadata never costs a key");
+        assert_eq!(time_of(known), Some(1_700_000_100));
+        assert_eq!(time_of(unknown), None);
+        assert_eq!(time_of(damaged), None);
+        assert_eq!(
+            out.diagnostics,
+            vec![ImportDiagnostic::UnreadableKeyMetadata {
+                record_type: "zkeymeta".to_owned(),
+                reason: "value is too short for a creation time".to_owned(),
+            }]
+        );
+        assert_eq!(out.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
     #[test]
     fn a_malformed_record_does_not_silence_a_good_one() {
         // This is the governing principle: partial recovery.
@@ -371,25 +426,6 @@ mod tests {
         collect_plaintext(&pairs, &mut out);
         assert!(out.sprout.is_empty());
         assert_eq!(out.diagnostics.len(), 1);
-    }
-
-    #[test]
-    fn seed_bearing_records_are_reported_as_an_unrecovered_seed() {
-        // zcashd 1.1-4.x kept a raw HD seed in `hdseed`/`chdseed`; 5.0+ a
-        // BIP-39 phrase in `mnemonicphrase`/`cmnemonicphrase`. Every one of
-        // them means keys may exist that this file does not store
-        // individually, so none may be skipped quietly.
-        for kind in ["hdseed", "chdseed", "mnemonicphrase", "cmnemonicphrase"] {
-            let mut out = ImportedKeys::default();
-            collect_plaintext(&[record(kind, &[0x01; 32], &[0x02; 40])], &mut out);
-            assert_eq!(
-                out.diagnostics,
-                vec![ImportDiagnostic::UnrecoveredSeed {
-                    record_type: kind.to_owned()
-                }],
-                "{kind}"
-            );
-        }
     }
 
     #[test]

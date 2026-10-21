@@ -35,6 +35,8 @@ fn top_level_help_matches_behaviour() {
     );
     // Auto-detect branches on a recovered seed, not on the file type.
     assert!(h.contains("whose seed could be decrypted"), "{h}");
+    // ...or a zcashd wallet.dat, dated by its key times (`resolve_birthday`).
+    assert!(h.contains("key creation times"), "{h}");
     // `Mnemonic::from_phrase` takes every BIP-39 length, not only 24.
     assert!(!h.contains("24-word"), "{h}");
     assert!(h.contains("12, 15, 18, 21 or 24 words"), "{h}");
@@ -58,6 +60,12 @@ fn top_level_help_matches_behaviour() {
     );
     // `collect_sprout_scan_keys` is its only reader.
     assert!(h.contains("Read only by `scan-sprout`"), "{h}");
+    // `refuse_unconsumed_birthday_skip` refuses the date and auto-detect
+    // flags on `scan-sprout`, which reads --birthday alone.
+    assert!(h.contains("Refused by `scan-sprout`"), "{h}");
+    // `needs_chain_fallback`: an undated Sapling key rules out the UTXO
+    // fallback, so Sapling is scanned from activation.
+    assert!(h.contains("unless a Sapling key is undated"), "{h}");
 }
 
 #[test]
@@ -81,6 +89,8 @@ fn sweep_help_matches_what_each_route_honours() {
     // donation: `refuse_memo_without_seed` refuses the memo, and testnet
     // turns the donation off even with a seed.
     assert!(h.contains("whose seed could be decrypted"), "{h}");
+    // ...or a zcashd wallet.dat, dated by its key times (`resolve_birthday`).
+    assert!(h.contains("key creation times"), "{h}");
     // `normalized_memo_text` writes RECOVERY_MEMO_DEFAULT when no memo is
     // given, so omitting --memo does not mean "no memo" on the seed route —
     // which matters to anyone sending to an exchange address that must not
@@ -124,7 +134,11 @@ fn scan_sprout_help_does_not_promise_an_exclusive_peer() {
     assert!(h.contains("fallback nodes run by the Argos project"), "{h}");
     // `default_params_path` treats the variable as the file itself.
     assert!(h.contains("the file named by $ARGOS_SPROUT_PARAMS"), "{h}");
-    assert!(h.contains("--birthday does not apply"), "{h}");
+    // `plan_sprout_decrypt`: the walk always starts at 1; a dated wallet
+    // may skip trial decryption, and --birthday can only lower that.
+    assert!(!h.contains("--birthday does not apply"), "{h}");
+    assert!(h.contains("--no-birthday-skip"), "{h}");
+    assert!(h.contains("can only lower"), "{h}");
     // It also takes --wallet-file, and broadcasts through lightwalletd.
     // Pinned to the prose: with top-level flags global (#232), the option
     // list names --wallet-file on every subcommand, so a bare

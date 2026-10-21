@@ -28,7 +28,9 @@ use crate::{
     keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
     zcashd::{
         crypto::MasterKey,
+        metadata::{KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
+        RecoveredKeyIds,
     },
 };
 
@@ -79,7 +81,7 @@ fn sapling_fvfp_iv(fvk: &[u8]) -> [u8; 16] {
 /// caller's to protect — callers wrap it in a `Secret`.
 ///
 /// The IV is not secret: it is derived from a public record identifier.
-fn decrypt(master: &MasterKey, iv: [u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn decrypt(master: &MasterKey, iv: [u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
     let mut buf = ciphertext.to_vec();
     let mut key: [u8; 32] = *master.expose_secret();
     let plain = Aes256CbcDec::new(&key.into(), &iv.into())
@@ -101,7 +103,15 @@ fn read_length_prefixed(value: &[u8]) -> Option<(&[u8], usize)> {
 ///
 /// A record that fails to decrypt is reported and skipped. One corrupt
 /// record must never cost the user the keys beside it.
-pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: &mut ImportedKeys) {
+pub fn collect_encrypted(
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    master: &MasterKey,
+    out: &mut ImportedKeys,
+) -> RecoveredKeyIds {
+    let mut recovered = RecoveredKeyIds::default();
+    // Metadata is stored in plaintext even in an encrypted wallet. Damaged
+    // records are reported by `collect_plaintext`, so not again here.
+    let metadata = KeyMetadataIndex::build(pairs, None);
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             continue;
@@ -150,6 +160,7 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                             a_sk: Secret::new(a_sk),
                             address,
                             provenance: Provenance::Standalone,
+                            created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
                         })
                     }
                     Some(_) => out
@@ -192,7 +203,9 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                         out.transparent.push(TransparentKey {
                             secret: Secret::new(secret),
                             provenance: Provenance::HdDerived,
-                        })
+                            created_at: metadata.created_at(MetadataKind::Transparent, &rec.rest),
+                        });
+                        recovered.transparent.insert(rec.rest);
                     }
                     Some(_) => out
                         .diagnostics
@@ -267,7 +280,9 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
                         out.sapling.push(SaplingKey {
                             extsk: Secret::new(extsk),
                             provenance: Provenance::HdDerived,
-                        })
+                            created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
+                        });
+                        recovered.sapling.insert(rec.rest);
                     }
                     Some(mut wrong_length) if wrong_length.len() == EXTSK_LEN => {
                         let identifier = if !identity::sapling_matches_ivk(&wrong_length, &rec.rest)
@@ -307,6 +322,7 @@ pub fn collect_encrypted(pairs: &[(Vec<u8>, Vec<u8>)], master: &MasterKey, out: 
             _ => {}
         }
     }
+    recovered
 }
 
 #[cfg(test)]

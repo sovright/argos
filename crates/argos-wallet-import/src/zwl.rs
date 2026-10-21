@@ -375,6 +375,8 @@ fn read_zkey(cur: &mut Cursor) -> ZwlReadResult<ZKeyEntry> {
             ZKeyEntry::Recovered(SaplingKey {
                 extsk: Secret::new(bytes.to_vec()),
                 provenance,
+                // ZWL stores no per-key creation time.
+                created_at: None,
             })
         }
         Some(_) => ZKeyEntry::Mismatch,
@@ -415,6 +417,7 @@ fn read_tkey(cur: &mut Cursor) -> ZwlReadResult<TKeyEntry> {
                 TransparentKey {
                     secret: Secret::new(secret),
                     provenance,
+                    created_at: None,
                 },
                 network,
             ),
@@ -516,6 +519,7 @@ fn read_key_vectors(
                     out.transparent.push(TransparentKey {
                         secret,
                         provenance: Provenance::HdDerived,
+                        created_at: None,
                     });
                 } else {
                     out.diagnostics

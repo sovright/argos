@@ -329,6 +329,25 @@ function flowHarness() {
     // exercised by the dedicated wallet and scan VM suites.
     invalidateWalletSproutReview() {},
     invalidateSproutScanSource() {},
+    // Main's raw-key Sprout panel (#273) and scan banner: owned by their own
+    // suites, stubbed here so the ordinary-flow slices load.
+    hasTypedSproutScanText() { return false; },
+    renderSproutScanPanel() {},
+    forgetSproutScanInputs() {
+      for (const id of ["sprout-scan-keys", "sprout-scan-destination"]) $(id).value = "";
+    },
+    showScanWarning() {},
+    scanWarningVariant() { return "shielded"; },
+    birthdayTouched: false,
+    scanBirthdayFromForm(network, rawValue) {
+      const raw = String(rawValue ?? "").trim();
+      if (/^\d+$/.test(raw)) return Number(raw);
+      return network === "testnet" ? 280_000 : 419_200;
+    },
+    syncUntouchedBirthdayToNetwork(network = $("network-select").value) {
+      if (context.birthdayTouched) return;
+      $("birthday-height").value = String(network === "testnet" ? 280_000 : 419_200);
+    },
     updateTransparentScanSummary() {}, clearMatchedRecoveryUi() {},
     goTo() {}, updateScanUI(progress) { state.lastProgress = progress; },
     notifyScanComplete() {},

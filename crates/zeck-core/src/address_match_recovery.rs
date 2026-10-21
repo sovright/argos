@@ -75,6 +75,7 @@ pub fn prepare_match_recovery(
             keys.transparent.push(TransparentKey {
                 secret: Secret::new(secret.secret_bytes()),
                 provenance: Provenance::HdDerived,
+                created_at: None,
             });
             Ok(Arc::new(MatchedImportedKeySource::new(keys, coordinates)))
         }
@@ -105,6 +106,7 @@ pub fn prepare_match_recovery(
             keys.sapling.push(SaplingKey {
                 extsk: Secret::new(extsk.to_bytes().to_vec()),
                 provenance: Provenance::HdDerived,
+                created_at: None,
             });
             Ok(Arc::new(MatchedImportedKeySource::new(keys, coordinates)))
         }
