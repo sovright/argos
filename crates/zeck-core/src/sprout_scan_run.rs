@@ -487,8 +487,9 @@ enum CachedLookup {
 /// Opening a wallet in the GUI asks for the scan twice — inspection, then the
 /// sweep preview — and a completed mainnet scan is a spent set of millions of
 /// nullifiers. The second ask is served from here. Keyed by path and network
-/// and validated by the file's size and modification time, so a resumed scan
-/// rewriting the checkpoint is re-read, and a deleted one is not served.
+/// and validated by the file's size, modification time, and content digest,
+/// so a resumed scan rewriting the checkpoint is re-read, and a deleted one
+/// is not served.
 #[derive(Default)]
 pub struct ChainSpendsCache {
     entries: std::sync::Mutex<Vec<CacheEntry>>,
@@ -501,25 +502,26 @@ struct CacheEntry {
     spends: std::sync::Arc<crate::sprout_recovery::ChainSpends>,
 }
 
-/// What identifies one version of a checkpoint file without parsing it:
-/// its size, its mtime, and its last bytes. The tail is where the cursor
-/// and the completion byte live, so a re-save that changes only those — a
-/// scan finishing, with no new nullifiers and so the same length — is seen
-/// even where mtimes are too coarse to tell two saves apart.
-type Stamp = (u64, Option<std::time::SystemTime>, Vec<u8>);
-
-/// How much of a checkpoint's end goes into its [`Stamp`].
-const STAMP_TAIL: u64 = 64;
+/// Size, mtime and content digest. V3 puts rollback history after the
+/// completion byte, so sampling the tail misses a same-length change from
+/// incomplete to complete on filesystems with coarse mtimes.
+type Stamp = (u64, Option<std::time::SystemTime>, [u8; 32]);
 
 fn stamp_of(path: &Path) -> Option<Stamp> {
-    use std::io::{Read, Seek, SeekFrom};
+    use sha2::Digest;
+    use std::io::Read;
     let meta = std::fs::metadata(path).ok()?;
     let mut file = std::fs::File::open(path).ok()?;
-    file.seek(SeekFrom::Start(meta.len().saturating_sub(STAMP_TAIL)))
-        .ok()?;
-    let mut tail = Vec::new();
-    file.read_to_end(&mut tail).ok()?;
-    Some((meta.len(), meta.modified().ok(), tail))
+    let mut hash = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buf).ok()?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buf[..count]);
+    }
+    Some((meta.len(), meta.modified().ok(), hash.finalize().into()))
 }
 
 /// A few wallets' worth: the GUI works on one at a time.
@@ -865,6 +867,198 @@ pub fn unconfirmed_tip_warning(network: P2pNetwork, reason: &str) -> String {
     )
 }
 
+/// A header-only check of the saved cursor. The seam lets reconciliation be
+/// tested without a socket or fabricated proof of work.
+#[async_trait::async_trait]
+trait CursorVerifier {
+    async fn continuation(&mut self, locators: &[ScanCursor]) -> ZeckResult<CanonicalContinuation>;
+}
+
+enum CanonicalContinuation {
+    Current { chain_has_more: bool },
+    CommonAncestor(ScanCursor),
+}
+
+fn beyond_retained_window(locators: &[ScanCursor], checkpoint_file: &Path) -> ZeckError {
+    let old = locators.first().map_or(0, |c| c.last_height);
+    let oldest = locators.last().map_or(old, |c| c.last_height);
+    ZeckError::ScanNotReady(format!(
+        "the saved Sprout scan at {} ended at height {old}, but the live chain \
+         has no common ancestor among its retained cursors (oldest retained \
+         height {oldest}). Argos will not use its spent-note evidence. \
+         Please keep the original wallet or key and start a safe full rescan.",
+        checkpoint_file.display()
+    ))
+}
+
+/// Persist the verified state before any page can be accepted. A failed
+/// reconciliation leaves the file untouched, including legacy checkpoints
+/// that have no rollback frames.
+async fn reconcile_cursor<V: CursorVerifier>(
+    scanner: &mut SproutScanner,
+    verifier: &mut V,
+    network: P2pNetwork,
+    checkpoint_file: &Path,
+) -> ZeckResult<()> {
+    let locators = scanner.rollback_locators();
+    if locators.is_empty() {
+        return match scanner.cursor() {
+            None => Ok(()),
+            Some(cursor) => Err(ZeckError::ScanNotReady(format!(
+                "the saved Sprout scan at {} ended at height {} without a \
+                 verifiable block-hash cursor. Argos will not use its \
+                 spent-note evidence. Please keep the original wallet or key \
+                 and start a safe full rescan.",
+                checkpoint_file.display(),
+                cursor.last_height
+            ))),
+        };
+    }
+    match verifier.continuation(&locators).await? {
+        CanonicalContinuation::Current {
+            chain_has_more: false,
+        } => Ok(()),
+        CanonicalContinuation::Current {
+            chain_has_more: true,
+        } => {
+            if scanner.is_complete() {
+                scanner.mark_incomplete();
+                save_checkpoint(scanner, network, checkpoint_file)?;
+            }
+            Ok(())
+        }
+        CanonicalContinuation::CommonAncestor(ancestor) => {
+            if !locators.contains(&ancestor) {
+                return Err(beyond_retained_window(&locators, checkpoint_file));
+            }
+            scanner
+                .rewind_to(ancestor.last_block_hash)
+                .map_err(|err| match err {
+                    crate::sprout_scan::RewindError::BeyondRetainedWindow => {
+                        beyond_retained_window(&locators, checkpoint_file)
+                    }
+                    other => ZeckError::TransactionBuild(format!(
+                        "the rollback history in {} is inconsistent ({other}); \
+                         keep the original wallet or key and start a safe full rescan.",
+                        checkpoint_file.display()
+                    )),
+                })?;
+            save_checkpoint(scanner, network, checkpoint_file)
+        }
+    }
+}
+
+/// Owns only the header validation phase; the same peer is handed to the
+/// page fetcher after reconciliation succeeds.
+struct NetworkCursorVerifier<'a> {
+    peer: &'a mut Peer,
+    network: P2pNetwork,
+    peers: &'a [String],
+    floor: u32,
+    tip_anchor: Option<TipAnchor>,
+    checkpoint_file: &'a Path,
+    waits: &'a mut Vec<PeerWait>,
+}
+
+#[async_trait::async_trait]
+impl CursorVerifier for NetworkCursorVerifier<'_> {
+    async fn continuation(&mut self, locators: &[ScanCursor]) -> ZeckResult<CanonicalContinuation> {
+        let hashes: Vec<_> = locators.iter().map(|c| c.last_block_hash).collect();
+        let mut failures = 0u32;
+        let mut silent = Vec::new();
+        loop {
+            let result = self.peer.get_headers(&hashes).await;
+            let failure = match result {
+                Ok(headers) if headers.is_empty() => {
+                    if crate::p2p::wire::empty_reply_is_chain_tip(
+                        locators[0].last_height,
+                        self.floor,
+                        self.peer.peer_height,
+                    ) {
+                        return Ok(CanonicalContinuation::Current {
+                            chain_has_more: false,
+                        });
+                    }
+                    format!(
+                        "peer reported no headers after height {} despite a known tip of {}",
+                        locators[0].last_height,
+                        self.floor.max(self.peer.peer_height)
+                    )
+                }
+                Ok(headers) => {
+                    let valid_work = headers.len() <= crate::p2p::peer::MAX_PAGE_BLOCKS
+                        && headers
+                            .iter()
+                            .all(|h| crate::p2p::wire::verify_header_pow(self.network, h).is_ok());
+                    let valid_links = headers
+                        .windows(2)
+                        .all(|pair| pair[1].prev_hash == pair[0].hash);
+                    if !valid_work || !valid_links {
+                        "peer returned invalid header work or linkage".to_owned()
+                    } else {
+                        // An answer from before every retained hash is a deep
+                        // reorg (or a peer that does not know this branch). No
+                        // height can be assigned to it safely.
+                        let Some(ancestor) = locators
+                            .iter()
+                            .find(|c| c.last_block_hash == headers[0].prev_hash)
+                            .copied()
+                        else {
+                            return Err(beyond_retained_window(locators, self.checkpoint_file));
+                        };
+                        let valid_pins = headers.iter().enumerate().all(|(offset, header)| {
+                            let Some(height) = ancestor
+                                .last_height
+                                .checked_add(1)
+                                .and_then(|h| h.checked_add(offset as u32))
+                            else {
+                                return false;
+                            };
+                            crate::p2p::wire::checkpoint_at(self.network, height)
+                                .is_none_or(|expected| expected == header.hash)
+                                && self
+                                    .tip_anchor
+                                    .filter(|a| a.height == height)
+                                    .is_none_or(|anchor| anchor.hash == header.hash)
+                        });
+                        if valid_pins {
+                            return Ok(if ancestor == locators[0] {
+                                CanonicalContinuation::Current {
+                                    chain_has_more: true,
+                                }
+                            } else {
+                                CanonicalContinuation::CommonAncestor(ancestor)
+                            });
+                        }
+                        "peer returned a header that disagrees with a pinned block".to_owned()
+                    }
+                }
+                Err(err) => {
+                    if matches!(err, crate::p2p::peer::PeerError::Silent { .. }) {
+                        silent.push((
+                            self.peer.dialled_as().to_owned(),
+                            tokio::time::Instant::now() + PEER_RECONNECT_DELAY,
+                        ));
+                    }
+                    err.to_string()
+                }
+            };
+            failures += 1;
+            if failures > MAX_EMPTY_REPLIES {
+                return Err(ZeckError::Broadcast(format!(
+                    "{failures} attempts to verify the saved Sprout cursor failed; \
+                     the most recent: {failure}. The checkpoint was left unchanged."
+                )));
+            }
+            self.peer.close().await;
+            *self.peer = connect_peer(self.network, self.peers, &silent, |wait| {
+                self.waits.push(wait)
+            })
+            .await?;
+        }
+    }
+}
+
 /// Run a Sprout scan to the chain tip, resuming from `checkpoint_file` if
 /// present.
 ///
@@ -906,17 +1100,7 @@ pub async fn run_sprout_scan(
     let mut scanner = load_checkpoint(checkpoint_file, network, spending_keys)?
         .unwrap_or_else(|| SproutScanner::new(spending_keys));
 
-    let cursor = scanner.cursor();
-    // An all-zero locator asks the peer to start from genesis.
-    let locator = cursor.map_or([0u8; 32], |c| c.last_block_hash);
-    // `height` is the height of the *next* block to scan, and the block being
-    // scanned is checkpointed and recorded at this value before it is
-    // incremented. A fresh scan begins at genesis (height 0): the all-zero
-    // locator makes the peer include genesis as `headers[0]`, so the first
-    // block scanned is height 0, not 1. A resumed scan continues one past the
-    // last block it recorded.
-    let mut height = first_scan_height(cursor);
-    let mut since_checkpoint = 0u64;
+    let mut height = first_scan_height(scanner.cursor());
 
     // A wait is reported as a tick at the scan's current position, so the
     // surfaces hear about it through the callback they already have.
@@ -931,10 +1115,26 @@ pub async fn run_sprout_scan(
         }
     };
 
-    let peer = connect_peer(network, extra_peers, &[], |wait| {
+    let mut initial_waits = Vec::new();
+    let mut peer = connect_peer(network, extra_peers, &[], |wait| initial_waits.push(wait)).await?;
+    if scanner.cursor().is_some() {
+        let mut verifier = NetworkCursorVerifier {
+            peer: &mut peer,
+            network,
+            peers: extra_peers,
+            floor,
+            tip_anchor,
+            checkpoint_file,
+            waits: &mut initial_waits,
+        };
+        reconcile_cursor(&mut scanner, &mut verifier, network, checkpoint_file).await?;
+        height = first_scan_height(scanner.cursor());
+    }
+    for wait in initial_waits {
         progress(waiting_tick(&scanner, height, wait));
-    })
-    .await?;
+    }
+    let locator = scanner.cursor().map_or([0u8; 32], |c| c.last_block_hash);
+    let mut since_checkpoint = 0u64;
     // Only for display: the peer's own claim is a better guess at the tip
     // than the floor, and never below where the scan already is.
     let mut target = floor.max(peer.peer_height).max(height);
@@ -1023,6 +1223,7 @@ pub async fn run_sprout_scan(
         // and between checkpoints (every CHECKPOINT_EVERY blocks) that was
         // untrue: a scan stopped by a silent peer at height 1 left no file.
         let Some(page) = page else {
+            scanner.mark_incomplete();
             save_before_stopping(&scanner, network, checkpoint_file);
             return Err(ZeckError::Broadcast(format!(
                 "the block download stopped unexpectedly at height {height}, before \
@@ -1032,6 +1233,7 @@ pub async fn run_sprout_scan(
         let page = match page {
             Ok(page) => page,
             Err(err) => {
+                scanner.mark_incomplete();
                 save_before_stopping(&scanner, network, checkpoint_file);
                 return Err(err);
             }
@@ -1040,48 +1242,15 @@ pub async fn run_sprout_scan(
             break;
         };
 
-        // Already in header order, and already complete: `next_page`
-        // assembles the page in the order the headers came in and treats a
-        // missing block as a hard error, because a short page still looks
-        // well-formed and would land every later commitment at the wrong
-        // position. Re-deriving a hash list and a lookup map here only undid
-        // that work.
-        for (hash, block) in &page {
-            // A pinned block must be the block we were handed. This is what
-            // makes a fabricated chain pointless: cheap forged headers link
-            // to each other fine, but they cannot reproduce a real mainnet
-            // hash at a real height without doing the work. Checked against
-            // this block's own height, before the counter advances — the
-            // checkpoints are keyed by true heights (genesis = 0).
-            let expected = crate::p2p::wire::checkpoint_at(network, height).or(tip_anchor
-                .filter(|anchor| anchor.height == height)
-                .map(|anchor| anchor.hash));
-            if let Some(expected) = expected {
-                if *hash != expected {
-                    return Err(ZeckError::Broadcast(format!(
-                        "the chain this peer served does not match Zcash at height \
-                         {height}. It is serving a different or fabricated chain, so the \
-                         scan stops rather than search it. Re-run to pick another peer, \
-                         or pass --peer with a node you trust."
-                    )));
-                }
+        let consumed = match consume_page(&mut scanner, &page, network, tip_anchor, &mut height) {
+            Ok(count) => count,
+            Err(err) => {
+                scanner.mark_incomplete();
+                save_before_stopping(&scanner, network, checkpoint_file);
+                return Err(err);
             }
-
-            // The branch id is only consulted for pre-v5 transactions, whose
-            // encoding it does not change; v5 carries its own. Sprout
-            // JoinSplits exist only in v2-v4, before and after Canopy alike.
-            let joinsplits = joinsplits_in_block(block, BranchId::Canopy).map_err(|err| {
-                ZeckError::TransactionBuild(format!("block at height {height}: {err}"))
-            })?;
-
-            scanner
-                .scan_block_at(&joinsplits, *hash, height)
-                .map_err(|err| {
-                    ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
-                })?;
-            since_checkpoint += 1;
-            height += 1;
-        }
+        };
+        since_checkpoint += consumed;
 
         if since_checkpoint >= CHECKPOINT_EVERY {
             save_checkpoint(&scanner, network, checkpoint_file)?;
@@ -1114,8 +1283,72 @@ pub async fn run_sprout_scan(
         .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")))
 }
 
-/// One page of blocks, in chain order.
-type Page = Vec<([u8; 32], Vec<u8>)>;
+/// One page of blocks, in chain order, with its first header's parent for
+/// the consumer to compare against the last accepted scanner cursor.
+struct Page {
+    parent: [u8; 32],
+    blocks: Vec<([u8; 32], Vec<u8>)>,
+}
+
+impl Page {
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+/// Reject a branch switch before parsing a single body. On this error the
+/// caller saves only the scanner state from the last consistent page; the
+/// next invocation verifies that cursor against live headers again.
+fn consume_page(
+    scanner: &mut SproutScanner,
+    page: &Page,
+    network: P2pNetwork,
+    tip_anchor: Option<TipAnchor>,
+    height: &mut u32,
+) -> ZeckResult<u64> {
+    if scanner
+        .cursor()
+        .is_some_and(|cursor| page.parent != cursor.last_block_hash)
+    {
+        return Err(ZeckError::ScanNotReady(format!(
+            "a reorg changed the chain before height {height}. The scan is incomplete; \
+             progress is saved and the next run will reconcile its cursor."
+        )));
+    }
+    let mut consumed = 0;
+    for (hash, block) in &page.blocks {
+        if crate::p2p::wire::checkpoint_at(network, *height)
+            .is_some_and(|expected| *hash != expected)
+            || tip_anchor
+                .filter(|anchor| anchor.height == *height)
+                .is_some_and(|anchor| *hash != anchor.hash)
+        {
+            return Err(ZeckError::Broadcast(format!(
+                "the chain this peer served does not match Zcash at height {height}. \
+                 It is serving a different or fabricated chain, so the scan stops \
+                 rather than search it. Re-run to pick another peer, or pass \
+                 --peer with a node you trust."
+            )));
+        }
+        // Sprout JoinSplits exist only in v2-v4. The branch id is only
+        // consulted for pre-v5 transactions, whose encoding it does not change.
+        let joinsplits = joinsplits_in_block(block, BranchId::Canopy).map_err(|err| {
+            ZeckError::TransactionBuild(format!("block at height {height}: {err}"))
+        })?;
+        scanner
+            .scan_block_at(&joinsplits, *hash, *height)
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
+            })?;
+        consumed += 1;
+        *height += 1;
+    }
+    Ok(consumed)
+}
 
 /// The producer half of the scan: everything needed to pull validated pages
 /// from the network, and nothing about what is done with them.
@@ -1278,7 +1511,10 @@ impl PageFetcher {
                     self.floor,
                     self.peer.peer_height,
                 ) {
-                    return Ok(Some(Vec::new()));
+                    return Ok(Some(Page {
+                        parent: self.locator,
+                        blocks: Vec::new(),
+                    }));
                 }
                 let floor = self.floor.max(self.peer.peer_height);
                 return self
@@ -1362,7 +1598,10 @@ impl PageFetcher {
         // hand the consumer a shorter page that still looks well-formed, and
         // every commitment after it would land at the wrong position — the
         // scan would finish clean and the notes would be unspendable.
-        let mut page: Page = Vec::with_capacity(hashes.len());
+        let mut page = Page {
+            parent: headers[0].prev_hash,
+            blocks: Vec::with_capacity(hashes.len()),
+        };
         for (offset, hash) in hashes.iter().enumerate() {
             let Some(block) = blocks.remove(hash) else {
                 return Err(ZeckError::Broadcast(format!(
@@ -1372,7 +1611,7 @@ impl PageFetcher {
                     height + offset as u32
                 )));
             };
-            page.push((*hash, block));
+            page.blocks.push((*hash, block));
         }
 
         self.locator = *hashes.last().expect("non-empty");
@@ -1665,6 +1904,190 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeCursorVerifier {
+        response: Option<CanonicalContinuation>,
+        seen: Vec<ScanCursor>,
+    }
+
+    #[async_trait::async_trait]
+    impl CursorVerifier for FakeCursorVerifier {
+        async fn continuation(
+            &mut self,
+            locators: &[ScanCursor],
+        ) -> ZeckResult<CanonicalContinuation> {
+            self.seen = locators.to_vec();
+            Ok(self.response.take().unwrap())
+        }
+    }
+
+    fn reorg_scanner() -> SproutScanner {
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        for height in 1..=3 {
+            scanner
+                .scan_block_at(
+                    &[joinsplit_revealing([height as u8; 32])],
+                    [height as u8; 32],
+                    height,
+                )
+                .unwrap();
+        }
+        scanner.mark_complete();
+        scanner
+    }
+
+    #[tokio::test]
+    async fn resume_sends_retained_locators_newest_first() {
+        let dir = ScratchDir::new("locator-order");
+        let path = dir.0.join("scan.checkpoint");
+        let mut scanner = reorg_scanner();
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::Current {
+                chain_has_more: false,
+            }),
+            seen: Vec::new(),
+        };
+        reconcile_cursor(&mut scanner, &mut verifier, P2pNetwork::Regtest, &path)
+            .await
+            .unwrap();
+        assert_eq!(
+            verifier.seen,
+            (1..=3)
+                .rev()
+                .map(|height| ScanCursor {
+                    last_block_hash: [height as u8; 32],
+                    last_height: height,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn off_chain_cursor_rewinds_to_the_common_ancestor_before_fetching() {
+        let dir = ScratchDir::new("reorg-rewind");
+        let path = dir.0.join("scan.checkpoint");
+        let mut scanner = reorg_scanner();
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let ancestor = ScanCursor {
+            last_block_hash: [1; 32],
+            last_height: 1,
+        };
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::CommonAncestor(ancestor)),
+            seen: Vec::new(),
+        };
+        reconcile_cursor(&mut scanner, &mut verifier, P2pNetwork::Regtest, &path)
+            .await
+            .unwrap();
+        assert_eq!(scanner.cursor(), Some(ancestor));
+        assert!(!scanner.is_complete());
+        assert!(scanner.spent_nullifiers().contains_key(&[1; 32]));
+        assert!(!scanner.spent_nullifiers().contains_key(&[2; 32]));
+        assert!(!scanner.spent_nullifiers().contains_key(&[3; 32]));
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &[[0x11; 32]])
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.cursor(), Some(ancestor));
+        assert_eq!(saved.spent_nullifiers(), scanner.spent_nullifiers());
+    }
+
+    #[tokio::test]
+    async fn canonical_extension_clears_the_complete_flag() {
+        let dir = ScratchDir::new("reorg-extension");
+        let path = dir.0.join("scan.checkpoint");
+        let mut scanner = reorg_scanner();
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::Current {
+                chain_has_more: true,
+            }),
+            seen: Vec::new(),
+        };
+        reconcile_cursor(&mut scanner, &mut verifier, P2pNetwork::Regtest, &path)
+            .await
+            .unwrap();
+        assert!(!scanner.is_complete());
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &[[0x11; 32]])
+            .unwrap()
+            .unwrap();
+        assert!(!saved.is_complete());
+    }
+
+    #[tokio::test]
+    async fn deep_reorg_preserves_the_checkpoint_and_returns_incomplete() {
+        let dir = ScratchDir::new("reorg-deep");
+        let path = dir.0.join("scan.checkpoint");
+        let mut scanner = reorg_scanner();
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: Some(CanonicalContinuation::CommonAncestor(ScanCursor {
+                last_block_hash: [0xaa; 32],
+                last_height: 0,
+            })),
+            seen: Vec::new(),
+        };
+        let err = reconcile_cursor(&mut scanner, &mut verifier, P2pNetwork::Regtest, &path)
+            .await
+            .expect_err("the rollback window must bound reconciliation");
+        let msg = err.to_string();
+        for phrase in [
+            "height 3",
+            "height 1",
+            "will not use its spent-note evidence",
+            "keep the original wallet or key",
+            "safe full rescan",
+        ] {
+            assert!(msg.contains(phrase), "missing {phrase:?}: {msg}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(scanner.cursor().unwrap().last_height, 3);
+    }
+
+    #[tokio::test]
+    async fn unlocated_legacy_cursor_requires_rescan_without_inventing_ancestry() {
+        let dir = ScratchDir::new("legacy-unlocated");
+        let path = dir.0.join("scan.checkpoint");
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner.scan_block_at(&[], [0; 32], 7).unwrap();
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut verifier = FakeCursorVerifier {
+            response: None,
+            seen: Vec::new(),
+        };
+        let err = reconcile_cursor(&mut scanner, &mut verifier, P2pNetwork::Regtest, &path)
+            .await
+            .expect_err("an unlocated cursor cannot be mapped to a live branch");
+        let msg = err.to_string();
+        assert!(msg.contains("height 7"), "{msg}");
+        assert!(msg.contains("safe full rescan"), "{msg}");
+        assert!(verifier.seen.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn mid_fetch_reorg_stops_without_scanning_or_saving_a_mixed_page() {
+        let dir = ScratchDir::new("reorg-mid-fetch");
+        let path = dir.0.join("scan.checkpoint");
+        let mut scanner = reorg_scanner();
+        scanner.mark_incomplete();
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let page = Page {
+            parent: [0xee; 32],
+            blocks: vec![([4; 32], vec![0xff])],
+        };
+        let mut height = 4;
+        let err = consume_page(&mut scanner, &page, P2pNetwork::Regtest, None, &mut height)
+            .expect_err("a page from the other branch must be refused");
+        assert!(matches!(&err, ZeckError::ScanNotReady(_)));
+        assert!(err.to_string().contains("reorg"), "{err}");
+        save_before_stopping(&scanner, P2pNetwork::Regtest, &path);
+        assert_eq!(scanner.cursor().unwrap().last_height, 3);
+        assert_eq!(height, 4);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
 
     /// A peer that completes the handshake and then answers nothing — what
     /// a zcashd node in initial block download does with `getheaders`. It
