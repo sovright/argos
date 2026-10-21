@@ -1,4 +1,9 @@
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
+    sync::Arc,
+    time::Instant,
+};
 
 use secrecy::SecretString;
 use tokio::{
@@ -44,15 +49,15 @@ use crate::{
     address::validate_destination_address,
     derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
     error::{ZeckError, ZeckResult},
-    key_source::{KeySource, SeedKeySource},
+    key_source::{KeySource, KeySourceFingerprint, SeedKeySource},
     lightwalletd::{
         connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
         validated_lightwalletd_endpoints,
     },
     models::{
-        ProposedTx, ProposedTxKind, RuntimeScanConfig, ScanConfig, ScanHandle, ScanPhase,
-        ScanProgress, SkippedSweepAccount, SweepOutcome, SweepProposal, SweepRequest,
-        TxBroadcastResult,
+        ProposedTx, ProposedTxKind, ReviewedSweepProposal, RuntimeScanConfig, ScanConfig,
+        ScanHandle, ScanPhase, ScanProgress, SkippedSweepAccount, SweepOutcome, SweepProposal,
+        SweepProposalId, SweepRequest, TxBroadcastResult,
     },
     scan::{
         refresh_scan_progress, run_recovery_scan, run_wallet_sync_with_retry, ScanTaskState,
@@ -156,13 +161,138 @@ const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
 /// Balance must decrease after every confirmed step; this is a second bound
 /// against a pathological stream of newly-arriving UTXOs.
 const MAX_TRANSPARENT_SHIELDING_STEPS: u32 = 10_000;
+const MAX_REVIEWED_SWEEPS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepAccountSnapshot {
+    account_index: u32,
+    sapling_zatoshis: u64,
+    orchard_zatoshis: u64,
+    transparent_zatoshis: u64,
+    transparent_utxo_count: u32,
+    total_zatoshis: u64,
+}
+
+/// Only values that change spend authority belong here. Progress text and
+/// timing can change between review and execution without changing balances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepBalanceSnapshot {
+    scan_handle: String,
+    source_fingerprint: KeySourceFingerprint,
+    network: crate::models::ZeckNetwork,
+    workspace_root: std::path::PathBuf,
+    synced_to_height: Option<u64>,
+    accounts: Vec<SweepAccountSnapshot>,
+    total_zatoshis: Option<u64>,
+}
+
+impl SweepBalanceSnapshot {
+    fn capture(session: &ScanSession, progress: &ScanProgress) -> ZeckResult<Self> {
+        let mut accounts: Vec<_> = progress
+            .accounts
+            .iter()
+            .map(|account| SweepAccountSnapshot {
+                account_index: account.account_index,
+                sapling_zatoshis: account.sapling_zatoshis,
+                orchard_zatoshis: account.orchard_zatoshis,
+                transparent_zatoshis: account.transparent_zatoshis,
+                transparent_utxo_count: account.transparent_utxo_count,
+                total_zatoshis: account.total_zatoshis,
+            })
+            .collect();
+        accounts.sort_by_key(|account| account.account_index);
+        Ok(Self {
+            scan_handle: progress.handle.id.clone(),
+            source_fingerprint: session.source_fingerprint,
+            network: session.runtime.network,
+            workspace_root: session.workspace_root.clone(),
+            synced_to_height: progress.synced_to_height,
+            accounts,
+            total_zatoshis: progress
+                .summary
+                .as_ref()
+                .map(|summary| summary.total_zatoshis),
+        })
+    }
+}
+
+struct ReviewedSweepIntent {
+    request: SweepRequest,
+    snapshot: SweepBalanceSnapshot,
+}
+
+impl ReviewedSweepIntent {
+    fn capture(
+        request: SweepRequest,
+        session: &ScanSession,
+        progress: &ScanProgress,
+    ) -> ZeckResult<Self> {
+        Ok(Self {
+            request,
+            snapshot: SweepBalanceSnapshot::capture(session, progress)?,
+        })
+    }
+}
+
+#[derive(Default)]
+struct ReviewedSweepStore {
+    entries: VecDeque<(SweepProposalId, ReviewedSweepIntent)>,
+}
+
+impl ReviewedSweepStore {
+    fn insert(&mut self, id: SweepProposalId, intent: ReviewedSweepIntent) {
+        if self.entries.len() == MAX_REVIEWED_SWEEPS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((id, intent));
+    }
+
+    fn take(&mut self, id: &SweepProposalId) -> ZeckResult<ReviewedSweepIntent> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(stored_id, _)| stored_id == id)
+            .ok_or(ZeckError::UnknownSweepProposal)?;
+        Ok(self
+            .entries
+            .remove(index)
+            .expect("position came from entries")
+            .1)
+    }
+
+    fn validate(
+        &self,
+        intent: &ReviewedSweepIntent,
+        session: &ScanSession,
+        progress: &ScanProgress,
+    ) -> ZeckResult<()> {
+        if progress.phase != ScanPhase::Complete {
+            return Err(ZeckError::StaleSweepProposal(
+                "scan is no longer complete".to_owned(),
+            ));
+        }
+        let now = SweepBalanceSnapshot::capture(session, progress)?;
+        if intent.snapshot != now
+            || now.scan_handle != session.handle_id
+            || session.runtime.key_source.fingerprint()? != session.source_fingerprint
+        {
+            return Err(ZeckError::StaleSweepProposal(
+                "source, scan, workspace, or balance changed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 struct ScanSession {
+    handle_id: String,
+    source_fingerprint: KeySourceFingerprint,
     state: SharedScanTaskState,
     runtime: RuntimeScanConfig,
     started_at: Instant,
     task: Mutex<Option<JoinHandle<()>>>,
     workspace_root: std::path::PathBuf,
+    reviewed_sweeps: Mutex<ReviewedSweepStore>,
 }
 
 type SharedScanSession = Arc<ScanSession>;
@@ -220,6 +350,7 @@ impl RecoveryService {
         };
 
         let workspace_root = RecoveryWorkspace::from_runtime(&runtime)?.root().to_owned();
+        let source_fingerprint = runtime.key_source.fingerprint()?;
 
         // Cancel any existing session targeting the same workspace to prevent
         // concurrent SQLite writers from locking each other out.
@@ -236,11 +367,14 @@ impl RecoveryService {
         }
 
         let session = Arc::new(ScanSession {
+            handle_id: handle.id.clone(),
+            source_fingerprint,
             state: state.clone(),
             runtime: runtime.clone(),
             started_at: Instant::now(),
             task: Mutex::new(None),
             workspace_root,
+            reviewed_sweeps: Mutex::new(ReviewedSweepStore::default()),
         });
 
         self.sessions
@@ -336,7 +470,7 @@ impl RecoveryService {
         &self,
         handle: &ScanHandle,
         request: SweepRequest,
-    ) -> ZeckResult<SweepProposal> {
+    ) -> ZeckResult<ReviewedSweepProposal> {
         let session = self.session(handle).await?;
         let progress = session.state.lock().await.progress.clone();
         if progress.phase != ScanPhase::Complete {
@@ -400,23 +534,39 @@ impl RecoveryService {
         }
 
         refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
-        if session.runtime.key_source.wallet_seed()?.is_none() {
-            return build_seedless_sweep_proposal(&progress, request, session.runtime.network);
-        }
-        build_sweep_proposal(
-            &progress,
-            request,
-            session.runtime.network,
-            crate::donation::DONATION_ADDRESS,
-        )
+        let proposal = if session.runtime.key_source.wallet_seed()?.is_none() {
+            build_seedless_sweep_proposal(&progress, request.clone(), session.runtime.network)?
+        } else {
+            build_sweep_proposal(
+                &progress,
+                request.clone(),
+                session.runtime.network,
+                crate::donation::DONATION_ADDRESS,
+            )?
+        };
+        let intent = ReviewedSweepIntent::capture(request, &session, &progress)?;
+        // Proposal construction may read a wallet and take time. A progress
+        // refresh during that work invalidates the quote before it is issued.
+        let state = session.state.lock().await;
+        ReviewedSweepStore::default().validate(&intent, &session, &state.progress)?;
+        let proposal_id = SweepProposalId(uuid::Uuid::new_v4().to_string());
+        session
+            .reviewed_sweeps
+            .lock()
+            .await
+            .insert(proposal_id.clone(), intent);
+        Ok(ReviewedSweepProposal {
+            proposal_id,
+            proposal,
+        })
     }
 
     pub async fn execute_sweep(
         &self,
         handle: &ScanHandle,
-        request: SweepRequest,
+        proposal_id: &SweepProposalId,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, request, None).await
+        self.execute_sweep_inner(handle, proposal_id, None).await
     }
 
     /// Test-only sweep entrypoint that inserts a fixed pause between
@@ -428,27 +578,26 @@ impl RecoveryService {
     pub async fn execute_sweep_with_test_pause(
         &self,
         handle: &ScanHandle,
-        request: SweepRequest,
+        proposal_id: &SweepProposalId,
         pause_between_broadcasts: std::time::Duration,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, request, Some(pause_between_broadcasts))
+        self.execute_sweep_inner(handle, proposal_id, Some(pause_between_broadcasts))
             .await
     }
 
     async fn execute_sweep_inner(
         &self,
         handle: &ScanHandle,
-        request: SweepRequest,
+        proposal_id: &SweepProposalId,
         pause_between_broadcasts: Option<std::time::Duration>,
     ) -> ZeckResult<SweepOutcome> {
         let session = self.session(handle).await?;
+        // The token is consumed while holding only the in-memory store lock.
+        // No wallet, proving, or network operation runs under this lock.
+        let intent = session.reviewed_sweeps.lock().await.take(proposal_id)?;
         let progress = session.state.lock().await.progress.clone();
-        if progress.phase != ScanPhase::Complete {
-            return Err(ZeckError::ScanNotReady(format!(
-                "current phase is {:?}",
-                progress.phase
-            )));
-        }
+        ReviewedSweepStore::default().validate(&intent, &session, &progress)?;
+        let request = intent.request;
 
         // An imported wallet with no HD seed cannot go through the sweep
         // below, which derives a UnifiedSpendingKey per account. Route it
@@ -2382,7 +2531,8 @@ mod tests {
 
     use super::{
         build_seedless_sweep_proposal, build_sweep_proposal, is_distinct_lightwalletd_endpoint,
-        standalone_transparent_signing_keys,
+        standalone_transparent_signing_keys, ReviewedSweepIntent, ReviewedSweepStore, ScanSession,
+        SweepBalanceSnapshot, MAX_REVIEWED_SWEEPS,
     };
     use crate::{
         derivation::{
@@ -2390,12 +2540,238 @@ mod tests {
         },
         derive_accounts,
         error::ZeckError,
+        key_source::SeedKeySource,
         models::{
-            AccountBalancePreview, AddressScope, ProposedTxKind, ScanHandle, ScanPhase,
-            ScanProgress, SweepRequest, ZeckNetwork,
+            AccountBalancePreview, AddressScope, ProposedTxKind, RuntimeScanConfig, ScanHandle,
+            ScanPhase, ScanProgress, ScanSummary, SweepProposalId, SweepRequest, ZeckNetwork,
         },
-        scan::{TrackedAccount, TrackedTransparentKey},
+        scan::{ScanTaskState, TrackedAccount, TrackedTransparentKey},
     };
+    use std::{path::PathBuf, sync::Arc, time::Instant};
+    use tokio::sync::Mutex;
+
+    fn reviewed_session(handle: ScanHandle, phrase: &str) -> ScanSession {
+        let handle_id = handle.id.clone();
+        let state = Arc::new(Mutex::new(ScanTaskState::new(handle)));
+        let source = Arc::new(SeedKeySource::new(SecretString::new(phrase.to_owned())));
+        let source_fingerprint =
+            crate::key_source::KeySource::fingerprint(source.as_ref()).unwrap();
+        ScanSession {
+            handle_id,
+            source_fingerprint,
+            state,
+            runtime: RuntimeScanConfig {
+                key_source: source,
+                birthday: 1,
+                num_accounts: Some(1),
+                gap_limit: 1,
+                transparent_scan: None,
+                lightwalletd_url: "https://example.invalid".to_owned(),
+                data_dir: PathBuf::from("/tmp/argos-reviewed-intent-test"),
+                network: ZeckNetwork::Mainnet,
+                label: String::new(),
+            },
+            started_at: Instant::now(),
+            task: Mutex::new(None),
+            workspace_root: PathBuf::from("/tmp/argos-reviewed-intent-test/workspace"),
+            reviewed_sweeps: Mutex::new(ReviewedSweepStore::default()),
+        }
+    }
+
+    fn reviewed_progress(handle: ScanHandle) -> ScanProgress {
+        let mut progress = progress_with_account(AccountBalancePreview {
+            account_index: 2,
+            sapling_address: "zs-test".to_owned(),
+            unified_address: "u-test".to_owned(),
+            transparent_receive_address: "t-recv".to_owned(),
+            transparent_change_address: "t-change".to_owned(),
+            transparent_utxo_count: 3,
+            sapling_zatoshis: 40_000,
+            orchard_zatoshis: 30_000,
+            transparent_zatoshis: 20_000,
+            total_zatoshis: 90_000,
+            has_activity: true,
+            status: "ok".to_owned(),
+        });
+        progress.handle = handle;
+        progress.synced_to_height = Some(100);
+        progress.summary = Some(ScanSummary {
+            total_zatoshis: 90_000,
+            authoritative_balances: true,
+            note: String::new(),
+            workspace_dir: String::new(),
+        });
+        progress
+    }
+
+    fn reviewed_request() -> SweepRequest {
+        SweepRequest {
+            destination: "u-reviewed".to_owned(),
+            memo: Some("reviewed memo".to_owned()),
+            max_fee_zatoshis: Some(20_000),
+            donation_rate: Some(0.10),
+            donor_email: Some("reviewed@example.com".to_owned()),
+        }
+    }
+
+    #[test]
+    fn reviewed_intent_preserves_the_exact_request() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let id = SweepProposalId("reviewed".to_owned());
+        let mut store = ReviewedSweepStore::default();
+        store.insert(
+            id.clone(),
+            ReviewedSweepIntent::capture(reviewed_request(), &session, &progress).unwrap(),
+        );
+        let mut changed_live_request = reviewed_request();
+        changed_live_request.destination = "u-other".to_owned();
+        changed_live_request.memo = None;
+        changed_live_request.max_fee_zatoshis = Some(1);
+        changed_live_request.donation_rate = Some(0.99);
+        changed_live_request.donor_email = None;
+        let stored = store.take(&id).unwrap();
+        assert_eq!(stored.request.destination, "u-reviewed");
+        assert_eq!(stored.request.memo.as_deref(), Some("reviewed memo"));
+        assert_eq!(stored.request.max_fee_zatoshis, Some(20_000));
+        assert_eq!(stored.request.donation_rate, Some(0.10));
+        assert_eq!(
+            stored.request.donor_email.as_deref(),
+            Some("reviewed@example.com")
+        );
+        assert_ne!(stored.request.destination, changed_live_request.destination);
+        assert_ne!(
+            stored.request.donation_rate,
+            changed_live_request.donation_rate
+        );
+    }
+
+    #[test]
+    fn reviewed_intent_is_bound_to_its_scan_session() {
+        let handle_a = ScanHandle::new();
+        let session_a = reviewed_session(handle_a.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress_a = reviewed_progress(handle_a);
+        let handle_b = ScanHandle::new();
+        let session_b = reviewed_session(handle_b.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress_b = reviewed_progress(handle_b);
+        let id = SweepProposalId("a".to_owned());
+        let mut store_a = ReviewedSweepStore::default();
+        let mut store_b = ReviewedSweepStore::default();
+        store_a.insert(
+            id.clone(),
+            ReviewedSweepIntent::capture(reviewed_request(), &session_a, &progress_a).unwrap(),
+        );
+        assert!(matches!(
+            store_b.take(&id),
+            Err(ZeckError::UnknownSweepProposal)
+        ));
+        let intent = store_a.take(&id).unwrap();
+        assert!(matches!(
+            store_a.validate(&intent, &session_b, &progress_b),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+    }
+
+    #[test]
+    fn reviewed_intent_is_one_shot() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let id = SweepProposalId("one".to_owned());
+        let mut store = ReviewedSweepStore::default();
+        store.insert(
+            id.clone(),
+            ReviewedSweepIntent::capture(reviewed_request(), &session, &progress).unwrap(),
+        );
+        assert!(store.take(&id).is_ok());
+        assert!(matches!(
+            store.take(&id),
+            Err(ZeckError::UnknownSweepProposal)
+        ));
+    }
+
+    #[test]
+    fn changed_balance_snapshot_requires_a_new_proposal() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let intent = ReviewedSweepIntent::capture(reviewed_request(), &session, &progress).unwrap();
+        let store = ReviewedSweepStore::default();
+        assert!(store.validate(&intent, &session, &progress).is_ok());
+        let mut volatile = progress.clone();
+        volatile.elapsed_seconds = Some(999);
+        volatile.message = Some("later".to_owned());
+        assert!(store.validate(&intent, &session, &volatile).is_ok());
+        for changed in 0..8 {
+            let mut p = progress.clone();
+            match changed {
+                0 => p.synced_to_height = Some(101),
+                1 => p.accounts[0].account_index += 1,
+                2 => p.accounts[0].sapling_zatoshis += 1,
+                3 => p.accounts[0].orchard_zatoshis += 1,
+                4 => p.accounts[0].transparent_zatoshis += 1,
+                5 => p.accounts[0].transparent_utxo_count += 1,
+                6 => p.accounts[0].total_zatoshis += 1,
+                _ => p.summary.as_mut().unwrap().total_zatoshis += 1,
+            }
+            assert!(
+                matches!(
+                    store.validate(&intent, &session, &p),
+                    Err(ZeckError::StaleSweepProposal(_))
+                ),
+                "changed field {changed}"
+            );
+        }
+        let mut other_network = reviewed_session(progress.handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        other_network.runtime.network = ZeckNetwork::Testnet;
+        assert!(matches!(
+            store.validate(&intent, &other_network, &progress),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        other_network.runtime.network = ZeckNetwork::Mainnet;
+        other_network.workspace_root = PathBuf::from("/tmp/other-workspace");
+        assert!(matches!(
+            store.validate(&intent, &other_network, &progress),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        let other_source = reviewed_session(
+            progress.handle.clone(),
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        );
+        assert!(matches!(
+            store.validate(&intent, &other_source, &progress),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        assert_ne!(
+            SweepBalanceSnapshot::capture(&session, &progress).unwrap(),
+            SweepBalanceSnapshot::capture(&other_source, &progress).unwrap()
+        );
+    }
+
+    #[test]
+    fn reviewed_intent_store_is_bounded() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let mut store = ReviewedSweepStore::default();
+        for n in 0..=MAX_REVIEWED_SWEEPS {
+            store.insert(
+                SweepProposalId(n.to_string()),
+                ReviewedSweepIntent::capture(reviewed_request(), &session, &progress).unwrap(),
+            );
+        }
+        assert!(matches!(
+            store.take(&SweepProposalId("0".to_owned())),
+            Err(ZeckError::UnknownSweepProposal)
+        ));
+        for n in 1..=MAX_REVIEWED_SWEEPS {
+            assert!(
+                store.take(&SweepProposalId(n.to_string())).is_ok(),
+                "entry {n}"
+            );
+        }
+    }
 
     #[test]
     fn transparent_range_signer_map_controls_every_coordinate() {
