@@ -1066,6 +1066,66 @@ mod tests {
         assert!(out.diagnostics.is_empty());
     }
 
+    /// Review round 3 on #230, finding 3. zcashd writes `CKeyMetadata`'s
+    /// version as an `int32`. Read as `u32`, a negative version passed the
+    /// "has HD data" gate and its bytes were read as a keypath.
+    #[test]
+    fn a_negative_metadata_version_is_not_read_as_hd_data() {
+        let mut p = pairs("modern-plaintext");
+        let target = keys_at(&p, "keymeta", "/2147483647'/1/")
+            .into_iter()
+            .next()
+            .expect("a change key");
+        for (k, v) in p.iter_mut() {
+            if parse_record_key(k).is_some_and(|r| r.record_type == "keymeta" && r.rest == target) {
+                v[..4].copy_from_slice(&(-1i32).to_le_bytes());
+            }
+        }
+        let out = assess(&p, None);
+        assert!(out.seed_verified);
+        assert!(
+            out.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::MissingDerivedKeys { pool, expected: 101, found: 100 } if pool.contains("change")
+            )),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// zcashd writes one metadata record per key. A second one for the same
+    /// key is not what zcashd wrote, and must not let one recovered key
+    /// stand for two derived positions: here one change key carries its own
+    /// metadata plus a copy naming a lost key's position.
+    #[test]
+    fn duplicate_metadata_for_one_key_is_not_trusted() {
+        let mut p = pairs("modern-plaintext");
+        let change = keys_at(&p, "keymeta", "/2147483647'/1/");
+        let (kept, lost) = (change[0].clone(), change[1].clone());
+        let lost_meta = p
+            .iter()
+            .find_map(|(k, v)| {
+                parse_record_key(k)
+                    .is_some_and(|r| r.record_type == "keymeta" && r.rest == lost)
+                    .then(|| v.clone())
+            })
+            .unwrap();
+        p.retain(|(k, _)| {
+            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && r.rest == lost))
+        });
+        p.push(record("keymeta", &kept, &lost_meta));
+        let out = assess(&p, None);
+        assert!(out.seed_verified);
+        assert!(
+            out.diagnostics.iter().any(|d| matches!(
+                d,
+                ImportDiagnostic::MissingDerivedKeys { pool, expected: 101, found: 99 } if pool.contains("change")
+            )),
+            "neither the lost key nor the doubly-described one counts: {:?}",
+            out.diagnostics
+        );
+    }
+
     /// Review round 3 on #230, finding 2. With no phrase record there is no
     /// seed to have decoded, so an unreadable chain record must not be
     /// reported as "the seed decoded, but…".
