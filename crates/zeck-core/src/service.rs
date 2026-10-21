@@ -1000,7 +1000,9 @@ fn merge_combined_sweep_outcomes(
             imported.skipped_accounts.append(&mut hd.skipped_accounts);
             imported.total_donation_zatoshis = hd.total_donation_zatoshis;
             imported.error = hd.error;
-            imported.donation_note = None;
+            // Only the HD leg can carry a donation, so its note is the
+            // sweep's note.
+            imported.donation_note = hd.donation_note;
             Ok(imported)
         }
         Err(err) if !imported.transactions.is_empty() => {
@@ -4084,6 +4086,35 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.skipped_accounts.len(), 1);
         assert_eq!(outcome.skipped_accounts[0].account_index, 5);
+    }
+
+    /// Review nit on #275: the HD leg's donation note (why a donation was
+    /// or was not placed) used to be dropped when the legs were merged.
+    #[test]
+    fn mixed_outcome_keeps_the_hd_legs_donation_note() {
+        let leg = |txid: &str, note: Option<&str>| crate::models::SweepOutcome {
+            transactions: vec![crate::models::TxBroadcastResult {
+                source_account: 0,
+                txid: Some(txid.into()),
+                status: "broadcast".into(),
+                detail: String::new(),
+                confirmed_height: None,
+            }],
+            skipped_accounts: Vec::new(),
+            total_donation_zatoshis: 0,
+            error: None,
+            donation_note: note.map(str::to_owned),
+        };
+        let merged = super::merge_combined_sweep_outcomes(
+            leg("imported-tx", None),
+            Ok(leg("hd-tx", Some("donation below the floor"))),
+        )
+        .unwrap();
+        assert_eq!(merged.transactions.len(), 2);
+        assert_eq!(
+            merged.donation_note.as_deref(),
+            Some("donation below the floor")
+        );
     }
 
     #[test]
