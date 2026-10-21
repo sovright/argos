@@ -3097,10 +3097,6 @@ mod tests {
         );
     }
 
-    /// Finding 6 on #271: one forged Sprout key used to refuse the whole
-    /// wallet-file sweep while inspect dropped it and warned. The sweep now
-    /// does what inspect does: the genuine keys stay, and the forged one is
-    /// reported in the review rather than silently ignored.
     /// The same rule at the propose path itself, not only its helper: a
     /// forged key is dropped and reported, and the proposal goes on with the
     /// genuine keys. The fixture holds no funded Sprout note (none can be
@@ -3144,6 +3140,10 @@ mod tests {
     }
 
     #[test]
+    /// Finding 6 on #271: one forged Sprout key used to refuse the whole
+    /// wallet-file sweep while inspect dropped it and warned. The sweep now
+    /// does what inspect does: the genuine keys stay, and the forged one is
+    /// reported in the review rather than silently ignored.
     fn a_forged_sprout_key_is_dropped_with_a_warning_and_the_rest_kept() {
         let bytes =
             argos_core::wallet_file::read_wallet_file(fixture("sprout-plaintext.dat")).unwrap();
