@@ -96,6 +96,20 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       }
       return vm.runInContext("runSproutScanSweep()", context);
     },
+    // The whole Sprout scan section, with its real key and peer helpers, for
+    // driving the panel as a user with no wallet file would.
+    loadScanPanel() {
+      const start = source.indexOf("// ─── Sprout scan ─");
+      const end = source.indexOf('$("sprout-scan-sweep-run").addEventListener', start);
+      assert.ok(start > 0 && end > start);
+      // Declared on the settings step, outside every slice: the main birthday
+      // field counts toward the Sprout decrypt bound only once it was set.
+      if (vm.runInContext("typeof birthdayTouched", context) === "undefined") {
+        vm.runInContext("var birthdayTouched = false;", context);
+      }
+      vm.runInContext(source.slice(start, end), context);
+    },
+    scan: () => vm.runInContext("runSproutScan()", context),
     async open(path, passphrase = "") {
       $("wallet-path").value = path;
       $("wallet-passphrase").value = passphrase;
@@ -913,22 +927,258 @@ test("a scan sweep of pasted keys switches the NU7 deadline to the broadcast wor
   assert.match(h.$("wallet-sprout-nu7-warning").textContent, /^testnet NU7: .*confirm it is mined/);
 });
 
-test("the Sprout scan panel is only reachable beneath the NU7 alert", async () => {
+// The panel lives in its own disclosure on the wallet screen, outside
+// #wallet-summary, so a user with only a raw SK…/ST… key backup can reach it.
+// Its first child is its own NU7 alert, and the panel is never shown without
+// that alert's text: these pin the invariant "panel usable ⇒ NU7 visible".
+test("the Sprout scan panel carries its own NU7 alert and is reachable with no wallet file", () => {
   const html = fs.readFileSync("gui/src/index.html", "utf8");
-  const container = html.indexOf('id="wallet-sprout-warning"');
-  const alert = html.indexOf('id="wallet-sprout-nu7-warning"');
+  const depthAt = (from, to) => {
+    const between = html.slice(from, to);
+    return (between.match(/<div\b/g) || []).length - (between.match(/<\/div>/g) || []).length;
+  };
+  const summary = html.indexOf('id="wallet-summary"');
+  const entry = html.indexOf('id="sprout-scan-entry"');
   const panel = html.indexOf('id="sprout-scan-panel"');
-  // If the panel is ever moved out of this container, so that pasted keys can
-  // be scanned with no wallet open, it needs a NU7 warning of its own.
-  assert.ok(container > 0 && container < alert && alert < panel);
-  const between = html.slice(container, panel);
-  const opened = (between.match(/<div\b/g) || []).length;
-  const closed = (between.match(/<\/div>/g) || []).length;
-  assert.ok(opened - closed >= 1, "sprout-scan-panel must stay inside wallet-sprout-warning");
+  const alert = html.indexOf('id="sprout-scan-nu7-warning"');
+  assert.ok(summary > 0 && entry > 0 && panel > entry && alert > panel);
+  // Not nested in the wallet summary, which only a wallet file reveals.
+  assert.ok(depthAt(summary, entry) <= 0, "the scan entry must sit outside #wallet-summary");
+  assert.match(html.slice(entry - 200, entry + 60), /<details[^>]*id="sprout-scan-entry"/);
+  // The alert is the panel's first element, ahead of every control.
+  const firstChild = html.slice(html.indexOf(">", panel) + 1).match(/<([a-z]+)\b[^>]*\bid="([^"]+)"/);
+  assert.equal(firstChild[2], "sprout-scan-nu7-warning");
+  for (const control of ["sprout-scan-keys", "sprout-scan-run", "sprout-scan-sweep-run"]) {
+    const at = html.indexOf(`id="${control}"`);
+    assert.ok(at > alert, `${control} must come after the panel's NU7 alert`);
+    assert.ok(depthAt(html.lastIndexOf("<div", panel), at) >= 1, `${control} must stay inside the panel`);
+  }
+});
 
+function assertPanelUnderDeadline(h, label) {
+  if (h.$("sprout-scan-panel").hidden) return;
+  assert.equal(h.$("sprout-scan-nu7-warning").hidden, false, `${label}: panel usable without NU7 alert`);
+  assert.match(h.$("sprout-scan-nu7-warning").textContent, /NU7/, label);
+}
+
+test("with no wallet file, opening the Sprout disclosure shows the panel under the NU7 deadline", async () => {
+  const h = harness();
+  h.peek("renderSproutScanPanel()");
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+  h.$("sprout-scan-entry").open = true;
+  await h.peek("onSproutScanEntryToggle()");
+  assert.equal(h.peek("walletFile"), null);
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assert.match(h.$("sprout-scan-nu7-warning").textContent, /November 5, 2026/);
+  assertPanelUnderDeadline(h, "opened");
+  assert.doesNotMatch(h.$("sprout-scan-keys").placeholder ?? "", /wallet file/);
+  // The carried-forward banners belong to a wallet file; none is open, so
+  // the panel's alert must not have leaked into their state.
+  assert.equal(h.peek("sproutNu7Warning"), "");
+  assert.equal(h.$("scan-sprout-uncovered").textContent, "");
+  h.$("sprout-scan-entry").open = false;
+  await h.peek("onSproutScanEntryToggle()");
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+});
+
+test("the no-file panel stays hidden until its NU7 text has arrived", async () => {
+  const slow = deferred();
+  const h = harness(async (command, args, fallback) => {
+    if (command === "sprout_nu7_warning") await slow.promise;
+    return fallback();
+  });
+  h.$("sprout-scan-entry").open = true;
+  const pending = h.peek("onSproutScanEntryToggle()");
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+  slow.resolve();
+  await pending;
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assertPanelUnderDeadline(h, "after arrival");
+});
+
+test("if the NU7 text cannot be fetched, the no-file panel still shows a deadline", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "sprout_nu7_warning") throw new Error("ipc down");
+    return fallback();
+  });
+  h.$("sprout-scan-entry").open = true;
+  await h.peek("onSproutScanEntryToggle()");
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assertPanelUnderDeadline(h, "fallback");
+});
+
+test("the no-file panel's NU7 deadline follows the network picker", async () => {
+  const h = harness();
+  h.$("sprout-scan-entry").open = true;
+  await h.peek("onSproutScanEntryToggle()");
+  assert.equal(h.$("sprout-scan-network").value, "mainnet");
+  h.$("network-select").value = "testnet";
+  await h.peek("refreshSproutNu7Warning()");
+  assert.match(h.$("sprout-scan-nu7-warning").textContent, /Testnet NU7: .*4,465,026/);
+  assert.equal(h.$("sprout-scan-network").value, "testnet");
+  assertPanelUnderDeadline(h, "testnet");
+});
+
+test("the panel's network choice drives the one network picker", () => {
+  const source = fs.readFileSync("gui/src/main.js", "utf8");
+  const start = source.indexOf('$("sprout-scan-network")?.addEventListener("change"');
+  assert.ok(start > 0, "the panel's network select must be wired");
+  const handler = source.slice(start, source.indexOf("\n});", start));
+  assert.match(handler, /\$\("network-select"\)\.value = /);
+  assert.match(handler, /dispatchEvent/);
+  const toggle = source.indexOf('$("sprout-scan-entry")?.addEventListener("toggle"');
+  assert.ok(toggle > 0, "opening the disclosure must refresh the panel");
+  assert.match(source.slice(toggle, source.indexOf("\n", toggle)), /onSproutScanEntryToggle/);
+});
+
+test("a no-file scan sends only the pasted lines, with no wallet path or passphrase", async () => {
+  const calls = [];
+  const h = harness(async (command, args, fallback) => {
+    if (command === "start_sprout_scan") {
+      calls.push({ ...args });
+      return { notes_found: 1, total_zatoshis: 7, spent_notes: 0, tip_warning: null };
+    }
+    return fallback();
+  });
+  h.loadScanPanel();
+  h.$("sprout-scan-entry").open = true;
+  await h.peek("onSproutScanEntryToggle()");
+  h.$("sprout-scan-keys").value = "# paper backup\nSKfixture\n";
+  h.$("sprout-scan-peers").value = "";
+  h.$("lightwalletd-url").value = "https://zec.rocks:443";
+  h.$("data-dir").value = "";
+  h.$("birthday-height").value = "419200";
+  await h.scan();
+  assert.equal(calls.length, 1);
+  // The fields that make this a no-file scan; other request fields (the
+  // decrypt bound, for one) are owned by their own tests.
+  const sent = JSON.parse(JSON.stringify(calls[0]));
+  assert.deepEqual(sent.keys, ["# paper backup", "SKfixture", ""]);
+  assert.equal(sent.path, null);
+  assert.equal(sent.passphrase, null);
+  assert.equal(sent.network, "mainnet");
+  assert.equal(sent.dataDir, "");
+  assert.equal(sent.lightwalletdUrl, "https://zec.rocks:443");
+  assert.deepEqual(sent.peers, []);
+  // #260's decrypt request, at its default with no wallet file: no key dates,
+  // so no floor, and the skip left on. The untouched 419200 default in the
+  // main birthday field must not become a floor.
+  assert.equal(sent.birthdayFloor, null);
+  assert.equal(sent.decryptEveryBlock, false);
+  assert.equal(h.$("sprout-scan-sweep").hidden, false);
+});
+
+test("a no-file scan sweep sends the pasted lines and switches the panel to broadcast wording", async () => {
+  const calls = [];
+  const h = harness(async (command, args, fallback) => {
+    if (command === "sweep_sprout_from_scan") {
+      calls.push({ ...args });
+      return { sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected: [], error: null };
+    }
+    return fallback();
+  });
+  h.loadScanPanel();
+  h.$("network-select").value = "testnet";
+  h.$("sprout-scan-entry").open = true;
+  await h.peek("onSproutScanEntryToggle()");
+  h.$("sprout-scan-keys").value = "STfixture";
+  h.$("sprout-scan-peers").value = "";
+  h.$("sprout-scan-destination").value = "fixture-destination";
+  h.$("sprout-scan-confirm").checked = true;
+  await h.peek("runSproutScanSweep()");
+  await flush();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, null);
+  assert.equal(calls[0].passphrase, null);
+  assert.deepEqual([...calls[0].keys], ["STfixture"]);
+  assert.equal(calls[0].network, "testnet");
+  assert.match(h.$("sprout-scan-nu7-warning").textContent, /^testnet NU7: .*confirm it is mined/);
+  // Opening a wallet file afterwards must not drop the broadcast wording.
+  await h.open("/fixture/sprout.dat");
+  await flush();
+  await h.peek("refreshSproutNu7Warning()");
+  assert.match(h.$("sprout-scan-nu7-warning").textContent, /confirm it is mined/);
+  assertPanelUnderDeadline(h, "after a later open");
+});
+
+test("a wallet file needing a scan opens the panel, under its own NU7 alert", async () => {
   const h = keysOnlyHarness();
   await h.open("/fixture/keys-only.dat");
   await flush();
+  assert.equal(h.$("sprout-scan-entry").open, true);
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assertPanelUnderDeadline(h, "file needs scan");
+  assert.match(h.$("sprout-scan-keys").placeholder, /wallet file/);
+  // Forgetting the file closes a panel it opened, if no key was typed.
   h.peek("forgetLoadedWalletFile()");
   assert.equal(h.$("wallet-summary").hidden, true);
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+  assert.doesNotMatch(h.$("sprout-scan-keys").placeholder ?? "", /wallet file/);
+});
+
+test("a failed open of another file drops the previous file's scan offer", async () => {
+  const noNotes = inspected({ sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0 });
+  const h = harness(async (command, args, fallback) => {
+    if (command === "inspect_wallet_file" && args.path === "/fixture/broken.dat") {
+      throw new Error("not a wallet file");
+    }
+    return noNotes(command, args, fallback);
+  });
+  await h.open("/fixture/keys-only.dat");
+  await flush();
+  assert.equal(h.$("sprout-scan-entry").open, true);
+  await h.open("/fixture/broken.dat");
+  assert.equal(h.peek("walletFile"), null);
+  assert.ok(!h.$("sprout-scan-entry").open);
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+  assert.doesNotMatch(h.$("sprout-scan-entry-label").textContent, /this wallet/);
+  assert.doesNotMatch(h.$("sprout-scan-keys").placeholder, /wallet file/);
+});
+
+test("forgetting a wallet file keeps a typed Sprout key and its panel", async () => {
+  const h = keysOnlyHarness();
+  await h.open("/fixture/keys-only.dat");
+  await flush();
+  h.$("sprout-scan-keys").value = "SKfixture";
+  h.peek("forgetLoadedWalletFile()");
+  assert.equal(h.$("sprout-scan-keys").value, "SKfixture");
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assertPanelUnderDeadline(h, "after forget");
+});
+
+test("a wallet whose Sprout notes are cached does not open the scan panel", async () => {
+  const h = harness();
+  await h.open("/fixture/first.dat");
+  await flush();
+  assert.ok(!h.$("sprout-scan-entry").open);
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+});
+
+test("Start over clears the raw Sprout key box and closes the panel", async () => {
+  const h = harness();
+  h.$("sprout-scan-entry").open = true;
+  await h.peek("onSproutScanEntryToggle()");
+  h.$("sprout-scan-keys").value = "SKfixture";
+  h.$("sprout-scan-destination").value = "fixture-destination";
+  h.$("sprout-scan-confirm").checked = true;
+  h.$("sprout-scan-sweep").hidden = false;
+  h.$("sprout-scan-birthday").value = "300000";
+  h.$("sprout-scan-every-block").checked = true;
+  h.peek("forgetSproutScanInputs()");
+  assert.equal(h.$("sprout-scan-birthday").value, "");
+  assert.equal(h.$("sprout-scan-every-block").checked, false);
+  assert.equal(h.$("sprout-scan-keys").value, "");
+  assert.equal(h.$("sprout-scan-destination").value, "");
+  assert.equal(h.$("sprout-scan-confirm").checked, false);
+  assert.equal(h.$("sprout-scan-sweep").hidden, true);
+  assert.ok(!h.$("sprout-scan-entry").open);
+  assert.equal(h.$("sprout-scan-panel").hidden, true);
+
+  // Wired at every site that resets recovery inputs, beside the Sapling box.
+  const source = fs.readFileSync("gui/src/main.js", "utf8");
+  const sites = [...source.matchAll(/\$\("sapling-scan-keys"\)\.value = "";/g)].map((m) => m.index);
+  assert.ok(sites.length >= 2);
+  for (const at of sites) {
+    assert.match(source.slice(at, at + 300), /forgetSproutScanInputs\(\)/);
+  }
 });

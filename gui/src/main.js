@@ -456,7 +456,11 @@ function renderWalletSummary(summary) {
   // Reset every time: reopening a different wallet file must never leave the
   // previous one's sweep panel, plan or results on screen.
   $("wallet-sprout-sweep").hidden = true;
-  $("sprout-scan-panel").hidden = true;
+  // The scan panel lives outside this summary so raw keys can reach it with
+  // no file. A previous file's offer goes; a panel the user opened for a
+  // typed key stays.
+  sproutScanOfferedForFile = false;
+  if (!hasTypedSproutScanText()) $("sprout-scan-entry").open = false;
   $("sprout-scan-sweep").hidden = true;
   $("sprout-scan-sweep-results").innerHTML = "";
   $("sprout-scan-addresses").innerHTML = "";
@@ -490,7 +494,7 @@ function renderWalletSummary(summary) {
         sproutScanCost.appendChild(p);
       }
       sproutScanCost.hidden = sproutScanCost.childElementCount === 0;
-      $("sprout-scan-panel").hidden = false;
+      offerSproutScanForFile(summary);
     } else {
       if (summary.sprout_history_read) {
         // Some note data was read — spent notes, dust — so saying the file
@@ -525,7 +529,7 @@ function renderWalletSummary(summary) {
         sproutScanCost.appendChild(p);
       }
       sproutScanCost.hidden = sproutScanCost.childElementCount === 0;
-      $("sprout-scan-panel").hidden = false;
+      offerSproutScanForFile(summary);
     }
 
     // Rebuilt each time rather than appended to: reopening a wallet file
@@ -558,6 +562,7 @@ function renderWalletSummary(summary) {
   renderList("wallet-diagnostics", "wallet-diagnostics-list", summary.diagnostics);
 
   $("wallet-summary").hidden = false;
+  renderSproutScanPanel();
 }
 
 // ─── Sprout sweep ───────────────────────────────────────────────────────────
@@ -566,6 +571,93 @@ function showSproutNu7Warning(warning) {
   const el = $("wallet-sprout-nu7-warning");
   el.textContent = warning ?? "";
   el.hidden = !warning;
+}
+
+// ─── Sprout scan panel: reachable with or without a wallet file ─────────────
+// The panel sits in its own disclosure on the wallet screen, outside
+// #wallet-summary, so a user with only a raw SK…/ST… key backup can reach it.
+// It carries its own NU7 alert, and is never shown until that alert has text:
+// panel usable ⇒ deadline on screen.
+
+// Set while the open wallet file holds Sprout keys but no spendable note
+// data, the one case where the file itself sends the user to the scan.
+let sproutScanOfferedForFile = false;
+// The panel's own NU7 text, separate from `sproutNu7Warning`: that one is a
+// wallet file's caveat and is carried onto the totals screens, which a raw
+// key with no file never reaches.
+let sproutScanNu7Warning = "";
+// Set once a scan sweep has broadcast. Survives opening another wallet file:
+// the transaction it describes still has to be mined. Start over resets it.
+let sproutScanNu7Broadcast = false;
+// Shown only if the core's text cannot be fetched at all, so the panel never
+// opens with no deadline in view.
+const SPROUT_NU7_FALLBACK =
+  "NU7: Sprout funds become unspendable once NU7 activates. A Sprout recovery " +
+  "transaction must be mined before activation; broadcasting alone is not enough.";
+
+// Any text in the raw key box, comments included: a box the user has
+// written in is theirs, and is not closed under them.
+function hasTypedSproutScanText() {
+  return ($("sprout-scan-keys").value ?? "").trim() !== "";
+}
+
+function offerSproutScanForFile(summary) {
+  sproutScanOfferedForFile = true;
+  $("sprout-scan-entry").open = true;
+  // Immediately, from the same core text as the wallet's own alert; the
+  // broadcast wording of an earlier scan sweep is not overwritten.
+  if (!sproutScanNu7Broadcast && summary.sprout_nu7_warning) {
+    sproutScanNu7Warning = summary.sprout_nu7_warning;
+  }
+}
+
+function renderSproutScanPanel() {
+  const open = !!$("sprout-scan-entry").open;
+  const alert = $("sprout-scan-nu7-warning");
+  alert.textContent = sproutScanNu7Warning;
+  alert.hidden = !sproutScanNu7Warning;
+  $("sprout-scan-panel").hidden = !(open && sproutScanNu7Warning);
+  const fileKeys = (walletFile?.summary?.sprout_keys ?? 0) > 0;
+  $("sprout-scan-entry-label").textContent = sproutScanOfferedForFile
+    ? "Scan the chain for this wallet's Sprout notes"
+    : "I only have a Sprout spending key (SK… or ST…)";
+  $("sprout-scan-keys").placeholder = fileKeys
+    ? "Leave blank to use the Sprout keys already in your wallet file"
+    : "SK… (mainnet) or ST… (testnet), one key per line";
+  // The one network picker lives on the settings step, which a user with no
+  // wallet file cannot reach; this select mirrors it.
+  const network = $("network-select");
+  const mirror = $("sprout-scan-network");
+  mirror.value = network.value;
+  mirror.disabled = !!network.disabled;
+}
+
+// The disclosure was opened or closed by the user (or by a wallet file).
+async function onSproutScanEntryToggle() {
+  renderSproutScanPanel();
+  if ($("sprout-scan-entry").open) await refreshSproutNu7Warning();
+}
+
+// Start over, and a matched address-search recovery: no raw Sprout key, no
+// destination and no result may carry into the next run. The scan itself
+// does not clear the box, because its sweep re-reads the same keys.
+function forgetSproutScanInputs() {
+  $("sprout-scan-keys").value = "";
+  $("sprout-scan-addresses").innerHTML = "";
+  $("sprout-scan-destination").value = "";
+  $("sprout-scan-confirm").checked = false;
+  // The decrypt-bound overrides belong to the run they were set for.
+  $("sprout-scan-birthday").value = "";
+  $("sprout-scan-every-block").checked = false;
+  $("sprout-scan-plan").textContent = "";
+  $("sprout-scan-sweep").hidden = true;
+  $("sprout-scan-sweep-results").innerHTML = "";
+  setStatus("sprout-scan-status", "", "");
+  $("sprout-scan-entry").open = false;
+  sproutScanOfferedForFile = false;
+  sproutScanNu7Warning = "";
+  sproutScanNu7Broadcast = false;
+  renderSproutScanPanel();
 }
 
 // Distinct from the ordinary sweep in every respect: the notes come from the
@@ -771,11 +863,46 @@ let sproutNu7Warning = "";
 // confirm the transaction is mined instead of urging them to start.
 let sproutNu7Broadcast = false;
 
-/// Rebuild the NU7 warning for the network now selected and the current
-/// broadcast state. The wallet screen comes before the network picker, so
-/// the text built at wallet open can name the wrong network. Does nothing
-/// unless a wallet with Sprout keys is open.
+/// Rebuild both NU7 warnings for the network now selected and the current
+/// broadcast state: the open wallet file's, and the Sprout scan panel's,
+/// which is there with or without a wallet file. The wallet screen comes
+/// before the network picker, so text built at wallet open can name the
+/// wrong network. Asks for nothing unless one of them is in use.
 async function refreshSproutNu7Warning() {
+  await Promise.all([refreshWalletSproutNu7Warning(), refreshSproutScanNu7Warning()]);
+}
+
+/// The scan panel's alert, while the panel is open. If the core text cannot
+/// be had, an existing text stays (a deadline for the wrong network is still
+/// better than none), and an empty one takes the fallback so the panel can
+/// open with a deadline in view.
+async function refreshSproutScanNu7Warning() {
+  if (!$("sprout-scan-entry").open) return;
+  const network = $("network-select").value;
+  const broadcast = sproutScanNu7Broadcast;
+  let text;
+  try {
+    text = await invoke("sprout_nu7_warning", { network, broadcast });
+  } catch (err) {
+    globalThis.console?.error("could not refresh the Sprout scan NU7 warning:", err);
+    if (!sproutScanNu7Warning) sproutScanNu7Warning = SPROUT_NU7_FALLBACK;
+    renderSproutScanPanel();
+    return;
+  }
+  if (
+    !text ||
+    $("network-select").value !== network ||
+    sproutScanNu7Broadcast !== broadcast
+  ) {
+    return;
+  }
+  sproutScanNu7Warning = text;
+  renderSproutScanPanel();
+}
+
+/// The open wallet file's alert and the banners it feeds. Does nothing
+/// unless a wallet with Sprout keys is open.
+async function refreshWalletSproutNu7Warning() {
   if (!sproutNu7Warning) return;
   const source = walletFile;
   const network = $("network-select").value;
@@ -804,10 +931,12 @@ async function refreshSproutNu7Warning() {
 }
 
 /// After a Sprout sweep: once anything was broadcast, switch the warning to
-/// "broadcast, but must be mined before activation".
-function noteSproutBroadcast(report) {
+/// "broadcast, but must be mined before activation". A scan sweep also
+/// switches the scan panel's own alert, which outlives the wallet file.
+function noteSproutBroadcast(report, fromScan = false) {
   if ((report.sent ?? []).length === 0) return;
   sproutNu7Broadcast = true;
+  if (fromScan) sproutScanNu7Broadcast = true;
   return refreshSproutNu7Warning();
 }
 
@@ -874,6 +1003,10 @@ function forgetLoadedWalletFile() {
   $("sprout-sweep-params").textContent = "";
   $("wallet-open").disabled = false;
   setStatus("wallet-status", "", "");
+  // A panel the file opened goes with it; one holding a typed key stays.
+  sproutScanOfferedForFile = false;
+  if (!hasTypedSproutScanText()) $("sprout-scan-entry").open = false;
+  renderSproutScanPanel();
 }
 
 function renderSproutUncoveredBanners() {
@@ -918,6 +1051,12 @@ async function openWalletFile() {
   $("sprout-sweep-pool").textContent = "";
   $("sprout-sweep-params").textContent = "";
   showSproutNu7Warning("");
+  // The panel is outside #wallet-summary now, so hiding the summary no longer
+  // takes it along: drop the previous file's offer here, so a failed open
+  // (wrong passphrase, no keys, unreadable) cannot leave it in place.
+  sproutScanOfferedForFile = false;
+  if (!hasTypedSproutScanText()) $("sprout-scan-entry").open = false;
+  renderSproutScanPanel();
   $("wallet-open").disabled = false;
   const path = $("wallet-path").value.trim();
   if (!path) {
@@ -1382,7 +1521,7 @@ async function runSproutScanSweep() {
       peers,
     });
 
-    noteSproutBroadcast(report);
+    noteSproutBroadcast(report, true);
     for (const sent of report.sent) {
       const li = document.createElement("li");
       li.textContent = `${fmt(sent.value_swept)} — ${sent.txid}`;
@@ -1458,6 +1597,7 @@ $("sprout-scan-sweep-run").addEventListener("click", runSproutScanSweep);
 $("sprout-scan-check").addEventListener("click", checkSproutKeys);
 $("sapling-keys-check")?.addEventListener("click", checkSaplingKeys);
 $("sprout-scan-run").addEventListener("click", runSproutScan);
+$("sprout-scan-entry")?.addEventListener("toggle", onSproutScanEntryToggle);
 
 (async () => {
   try {
@@ -1608,8 +1748,11 @@ document.addEventListener("address-match-recovery", async (event) => {
     forgetLoadedWalletFile();
     $("sapling-scan-keys").value = "";
     $("sapling-key-addresses").replaceChildren();
+    forgetSproutScanInputs();
     $("network-select").value = snapshot.network;
     $("network-select").disabled = true;
+    // The Sprout panel's network mirror follows the now-locked picker.
+    renderSproutScanPanel();
     $("server-preset").value = "recommended";
     $("lightwalletd-url").value = SERVER_PRESETS[snapshot.network] ?? SERVER_PRESETS.mainnet;
     $("birthday-autodetect").disabled = true;
@@ -1640,7 +1783,16 @@ $("network-select").addEventListener("change", () => {
   if ($("server-preset").value === "recommended") {
     $("lightwalletd-url").value = SERVER_PRESETS[$("network-select").value] ?? SERVER_PRESETS.mainnet;
   }
+  renderSproutScanPanel();
   refreshSproutNu7Warning();
+});
+
+// The Sprout scan panel's network select is a mirror of the one above, for
+// a user with no wallet file who cannot reach the settings step. It drives
+// that picker, so the endpoint preset and every NU7 warning follow it.
+$("sprout-scan-network")?.addEventListener("change", () => {
+  $("network-select").value = $("sprout-scan-network").value;
+  $("network-select").dispatchEvent(new Event("change"));
 });
 
 $("server-preset").addEventListener("change", () => {
@@ -3002,6 +3154,7 @@ $("restart-flow").addEventListener("click", () => {
   forgetLoadedWalletFile();
   $("sapling-scan-keys").value = "";
   $("sapling-key-addresses").replaceChildren();
+  forgetSproutScanInputs();
   seedVisibility.checked = false;
   seedInput.classList.add("masked");
   seedNextBtn.disabled = true;
@@ -3429,6 +3582,7 @@ $("resume-confirm").addEventListener("click", async () => {
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 $("lightwalletd-url").value = SERVER_PRESETS.mainnet;
+renderSproutScanPanel();
 $("gap-limit-row").style.display = $("auto-gap-limit").checked ? "none" : "block";
 $("accounts-range").disabled = !$("auto-gap-limit").checked;
 $("scan-label").value = defaultScanLabel();
