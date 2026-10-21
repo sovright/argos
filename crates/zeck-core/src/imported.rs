@@ -627,10 +627,12 @@ mod db_tests {
             argos_wallet_import::keys::SaplingKey {
                 extsk: secrecy::Secret::new(first.to_bytes().to_vec()),
                 provenance: keys.sapling[0].provenance,
+                created_at: None,
             },
             argos_wallet_import::keys::SaplingKey {
                 extsk: secrecy::Secret::new(second.to_bytes().to_vec()),
                 provenance: keys.sapling[0].provenance,
+                created_at: None,
             },
         ];
 
@@ -692,6 +694,7 @@ mod db_tests {
             transparent: vec![TransparentKey {
                 secret: Secret::new([0x42; 32]),
                 provenance: Provenance::Standalone,
+                created_at: None,
             }],
             ..Default::default()
         };

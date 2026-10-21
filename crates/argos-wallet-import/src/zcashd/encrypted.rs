@@ -27,6 +27,7 @@ use crate::{
     keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
     zcashd::{
         crypto::MasterKey,
+        metadata::{KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
         RecoveredKeyIds,
     },
@@ -107,6 +108,9 @@ pub fn collect_encrypted(
     out: &mut ImportedKeys,
 ) -> RecoveredKeyIds {
     let mut recovered = RecoveredKeyIds::default();
+    // Metadata is stored in plaintext even in an encrypted wallet. Damaged
+    // records are reported by `collect_plaintext`, so not again here.
+    let metadata = KeyMetadataIndex::build(pairs, None);
     for (raw_key, value) in pairs {
         let Some(rec) = parse_record_key(raw_key) else {
             continue;
@@ -154,6 +158,7 @@ pub fn collect_encrypted(
                         a_sk: Secret::new(a_sk),
                         address,
                         provenance: Provenance::Standalone,
+                        created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
                     }),
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "czkey".to_owned(),
@@ -189,6 +194,7 @@ pub fn collect_encrypted(
                         out.transparent.push(TransparentKey {
                             secret: Secret::new(secret),
                             provenance: Provenance::HdDerived,
+                            created_at: metadata.created_at(MetadataKind::Transparent, &rec.rest),
                         });
                         recovered.transparent.insert(rec.rest);
                     }
@@ -252,6 +258,7 @@ pub fn collect_encrypted(
                         out.sapling.push(SaplingKey {
                             extsk: Secret::new(extsk),
                             provenance: Provenance::HdDerived,
+                            created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
                         });
                         recovered.sapling.insert(rec.rest);
                     }

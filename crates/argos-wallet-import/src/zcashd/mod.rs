@@ -2,6 +2,7 @@
 
 pub mod crypto;
 pub mod encrypted;
+pub mod metadata;
 pub mod plaintext;
 pub mod records;
 pub mod seed;
@@ -9,6 +10,7 @@ pub mod sprout;
 
 pub use crypto::{derive_master_key, find_mkey, MasterKey, MkeyRecord};
 pub use encrypted::collect_encrypted;
+pub use metadata::{KeyMetadataIndex, MetadataKind, UNKNOWN_CREATE_TIME_AT_OR_BEFORE};
 pub use plaintext::collect_plaintext;
 pub use records::{compact_size, parse_record_key, RecordKey};
 pub use sprout::collect_sprout_notes;
