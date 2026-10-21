@@ -155,8 +155,8 @@ pub struct SproutScanner {
     tree: IncrementalMerkleTree,
     pending: Vec<PendingNote>,
     /// Every nullifier seen, to tell a live note from a spent one, with the
-    /// transaction that revealed it. `None` only for nullifiers restored from
-    /// a version-1 checkpoint, which did not record it.
+    /// transaction that revealed it. `None` only in the version-1 layout,
+    /// which did not record it and is no longer resumed.
     spent: HashMap<[u8; 32], Option<[u8; 32]>>,
     progress: SproutScanProgress,
     cursor: ScanCursor,
@@ -166,11 +166,31 @@ pub struct SproutScanner {
     /// cursor is never mistaken for full coverage.
     complete: bool,
     history: VecDeque<BlockUndo>,
-    source_version: u8,
+    /// Blocks below this height are walked but not trial-decrypted. See
+    /// [`SproutScanner::with_decrypt_from`].
+    decrypt_from: Option<u32>,
 }
 
 impl SproutScanner {
     pub fn new(spending_keys: &[[u8; 32]]) -> Self {
+        Self::with_decrypt_from(spending_keys, None)
+    }
+
+    /// A scanner that does not trial-decrypt blocks below `decrypt_from`.
+    ///
+    /// Those blocks are otherwise processed exactly as before: every
+    /// commitment is appended, every nullifier recorded, every pending
+    /// witness advanced. Only the per-key Diffie-Hellman agreement and the
+    /// decryption attempt are skipped — the dominant cost of the walk, and
+    /// the only step that cannot affect the tree. A note paid to these keys
+    /// below the bound is therefore not found, so the bound must come from
+    /// evidence that no such note can exist: the keys' creation times.
+    /// `None` decrypts every block.
+    ///
+    /// The bound is compared with the height passed to
+    /// [`scan_block_at`](Self::scan_block_at); [`scan_block`](Self::scan_block)
+    /// feeds height 0, so with any bound above 0 it decrypts nothing.
+    pub fn with_decrypt_from(spending_keys: &[[u8; 32]], decrypt_from: Option<u32>) -> Self {
         Self {
             keys: spending_keys
                 .iter()
@@ -183,8 +203,22 @@ impl SproutScanner {
             cursor: ScanCursor::default(),
             complete: false,
             history: VecDeque::new(),
-            source_version: CHECKPOINT_VERSION,
+            decrypt_from,
         }
+    }
+
+    /// The height below which this scan does not trial-decrypt, if any.
+    /// Carried through checkpoints, so a resumed scan reports the bound its
+    /// earlier blocks were actually scanned under.
+    pub fn decrypt_from_height(&self) -> Option<u32> {
+        self.decrypt_from
+    }
+
+    /// Replace the bound on a resumed scan. Only for the scan runner, after
+    /// `reconcile_decrypt_from` has established that the blocks already
+    /// walked were scanned the way the new bound would have scanned them.
+    pub(crate) fn set_decrypt_from(&mut self, decrypt_from: Option<u32>) {
+        self.decrypt_from = decrypt_from;
     }
 
     /// Where the walk has reached. `None` before any block is fed.
@@ -229,11 +263,6 @@ impl SproutScanner {
         self.progress
     }
 
-    /// Layout of the checkpoint this scanner was restored from.
-    pub fn checkpoint_version(&self) -> u8 {
-        self.source_version
-    }
-
     /// The commitment tree root after everything appended so far.
     ///
     /// This is the anchor a spend built from this scan will use, so it is
@@ -257,6 +286,7 @@ impl SproutScanner {
         block_hash: [u8; 32],
         height: u32,
     ) -> Result<(), WitnessError> {
+        let decrypt = self.decrypt_from.is_none_or(|bound| height >= bound);
         let located = height > 0 && block_hash != [0; 32];
         let prior = self.cursor();
         let contiguous = located
@@ -291,7 +321,7 @@ impl SproutScanner {
         };
         let complete_before = self.complete;
         for js in joinsplits {
-            if let Err(err) = self.scan_joinsplit(js) {
+            if let Err(err) = self.scan_joinsplit(js, decrypt) {
                 self.restore_block(undo);
                 self.cursor = cursor_before_raw;
                 self.complete = complete_before;
@@ -408,7 +438,7 @@ impl SproutScanner {
         Ok(blocks as u32)
     }
 
-    fn scan_joinsplit(&mut self, js: &SproutJoinSplit) -> Result<(), WitnessError> {
+    fn scan_joinsplit(&mut self, js: &SproutJoinSplit, decrypt: bool) -> Result<(), WitnessError> {
         self.progress.joinsplits_seen += 1;
 
         // A JoinSplit's nullifiers spend earlier notes. Recorded before the
@@ -423,14 +453,21 @@ impl SproutScanner {
         // One Diffie-Hellman per key for this JoinSplit, shared by both of its
         // outputs. Trial decryption is the dominant cost of a full-chain scan,
         // and the agreement is the expensive part of it.
-        let agreements: Vec<[u8; 32]> = self
-            .keys
-            .iter()
-            .map(|k| k.agree(&js.ephemeral_key))
-            .collect();
+        let agreements: Vec<[u8; 32]> = if decrypt {
+            self.keys
+                .iter()
+                .map(|k| k.agree(&js.ephemeral_key))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         for (index, commitment) in js.commitments.iter().enumerate() {
-            let found = self.try_decrypt(js, index, &h_sig, commitment, &agreements);
+            let found = if decrypt {
+                self.try_decrypt(js, index, &h_sig, commitment, &agreements)
+            } else {
+                None
+            };
 
             // Every commitment is appended, decryptable or not. Skipping
             // other people's notes would shift every later position.
@@ -546,6 +583,7 @@ impl SproutScanner {
             spent_notes,
             anchor: self.tree.root(),
             progress: self.progress,
+            decrypt_from_height: self.decrypt_from,
         })
     }
 }
@@ -560,6 +598,10 @@ pub struct SproutScanResult {
     /// The commitment tree root at the end of the scan.
     pub anchor: [u8; 32],
     pub progress: SproutScanProgress,
+    /// The height below which this scan did not trial-decrypt, if any.
+    /// Notes paid to the keys below it were not looked for, so a surface
+    /// reporting the result must say so.
+    pub decrypt_from_height: Option<u32>,
 }
 
 impl SproutScanResult {
@@ -593,19 +635,40 @@ pub struct SproutScanCheckpoint {
 /// misread into a wrong tree — which would produce worthless witnesses with
 /// no visible error.
 ///
-/// Version 3 adds bounded reorg history after the version-2 completion byte.
-/// Version 2 records the revealing txid with each nullifier and completion.
-/// Version 1 is still read — a scan measured in hours must survive an upgrade
-/// mid-way — with no txids and `complete = false`.
-const CHECKPOINT_VERSION: u8 = 3;
+/// Version 2 records the revealing txid with each nullifier and a trailing
+/// completion byte.
+///
+/// Version 3 appends the decrypt-from bound: a flag byte, then the height as
+/// a u64 when set.
+///
+/// Version 4 has exactly the version-3 layout, and records that every block
+/// body was authenticated against its header (transaction Merkle root) before
+/// this state was saved. Versions 1 to 3 predate that check and may contain a
+/// poisoned tree or nullifier set: only their key headers are read (so a
+/// covering file can still be reported), and they are refused for resume and
+/// for spend evidence. A user holding one must start a fresh scan, which also
+/// re-derives any decrypt-from bound.
+///
+/// Version 5 appends bounded reorg history after the version-4 fields. A
+/// version-4 file is authenticated but has no history, and was never
+/// released (it exists only between two unreleased changes); it is refused
+/// like any other older layout rather than resumed without a rollback
+/// window, because a checkpoint at the chain tip with no retained
+/// predecessor cannot prove its cursor against live headers anyway.
+const CHECKPOINT_VERSION: u8 = 5;
 
-/// The oldest layout still read.
+/// The oldest layout whose header is still parsed. Layouts older than
+/// [`CHECKPOINT_VERSION`] are read only far enough to recover their key set
+/// ([`read_spending_keys`]); resume and spend evidence refuse them with
+/// [`CheckpointError::UnauthenticatedLegacy`].
 const OLDEST_READABLE_VERSION: u8 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
     #[error("this checkpoint was written by a different version of Argos and cannot be resumed")]
     WrongVersion,
+    #[error("this checkpoint predates Sprout block-body authentication")]
+    UnauthenticatedLegacy,
     #[error("the checkpoint file is corrupt or truncated")]
     Corrupt,
     #[error(transparent)]
@@ -640,6 +703,9 @@ pub struct ChainEvidence {
     pub cursor: Option<ScanCursor>,
     /// Whether the walk ended at the chain tip.
     pub complete: bool,
+    /// The scan's decrypt-from bound. Does not affect `spent`: nullifiers
+    /// are recorded below the bound too.
+    pub decrypt_from_height: Option<u32>,
 }
 
 /// The key set a checkpoint was made for, read from its header alone.
@@ -669,6 +735,7 @@ pub fn read_chain_evidence(
 ) -> Result<ChainEvidence, CheckpointError> {
     let mut r = codec::Reader::new(checkpoint.as_bytes());
     let version = read_version(&mut r)?;
+    require_authenticated_version(version)?;
     r.bytes().ok_or(CheckpointError::Corrupt)?; // tree
 
     let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
@@ -699,7 +766,8 @@ pub fn read_chain_evidence(
             .map_err(|_| CheckpointError::Corrupt)?,
     };
     let complete = read_complete(&mut r, version)?;
-    if version >= 3 {
+    let decrypt_from_height = read_decrypt_from(&mut r, version)?;
+    if version >= 5 {
         let _ = read_history(&mut r, cursor, false)?;
     }
     if r.pos != r.bytes.len() {
@@ -711,6 +779,7 @@ pub fn read_chain_evidence(
         spent,
         cursor: (blocks_scanned > 0).then_some(cursor),
         complete,
+        decrypt_from_height,
     })
 }
 
@@ -719,6 +788,14 @@ fn read_version(r: &mut codec::Reader<'_>) -> Result<u8, CheckpointError> {
         Some(v) if (OLDEST_READABLE_VERSION..=CHECKPOINT_VERSION).contains(&v) => Ok(v),
         Some(_) => Err(CheckpointError::WrongVersion),
         None => Err(CheckpointError::Corrupt),
+    }
+}
+
+fn require_authenticated_version(version: u8) -> Result<(), CheckpointError> {
+    if version == CHECKPOINT_VERSION {
+        Ok(())
+    } else {
+        Err(CheckpointError::UnauthenticatedLegacy)
     }
 }
 
@@ -884,6 +961,25 @@ fn read_history(
     Ok(history)
 }
 
+fn read_decrypt_from(
+    r: &mut codec::Reader<'_>,
+    version: u8,
+) -> Result<Option<u32>, CheckpointError> {
+    if version < 3 {
+        return Ok(None);
+    }
+    match r.take(1).and_then(|b| b.first().copied()) {
+        Some(0) => Ok(None),
+        Some(1) => {
+            let height = r.u64().ok_or(CheckpointError::Corrupt)?;
+            Ok(Some(
+                u32::try_from(height).map_err(|_| CheckpointError::Corrupt)?,
+            ))
+        }
+        _ => Err(CheckpointError::Corrupt),
+    }
+}
+
 /// Minimal writer/reader for the checkpoint encoding.
 mod codec {
     pub fn put_u64(out: &mut Vec<u8>, v: u64) {
@@ -926,8 +1022,9 @@ impl SproutScanner {
         self.encode(CHECKPOINT_VERSION)
     }
 
-    /// Write the given layout. Only the current one is written outside
-    /// tests; version 1 exists so its reader stays tested.
+    /// Write the given layout. Only [`CHECKPOINT_VERSION`] (4, body-authenticated)
+    /// is written outside tests; older layouts are generated to test that
+    /// they are refused.
     fn encode(&self, version: u8) -> SproutScanCheckpoint {
         use codec::{put_bytes, put_u64};
 
@@ -985,6 +1082,15 @@ impl SproutScanner {
             out.push(u8::from(self.complete));
         }
         if version >= 3 {
+            match self.decrypt_from {
+                Some(height) => {
+                    out.push(1);
+                    put_u64(&mut out, u64::from(height));
+                }
+                None => out.push(0),
+            }
+        }
+        if version >= 5 {
             put_u64(&mut out, self.history.len() as u64);
             for frame in &self.history {
                 write_cursor(&mut out, frame.applied);
@@ -1024,6 +1130,7 @@ impl SproutScanner {
     pub fn resume(checkpoint: &SproutScanCheckpoint) -> Result<Self, CheckpointError> {
         let mut r = codec::Reader::new(checkpoint.as_bytes());
         let version = read_version(&mut r)?;
+        require_authenticated_version(version)?;
 
         let tree = IncrementalMerkleTree::parse(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
 
@@ -1095,8 +1202,9 @@ impl SproutScanner {
         };
 
         let complete = read_complete(&mut r, version)?;
+        let decrypt_from = read_decrypt_from(&mut r, version)?;
 
-        let history = if version >= 3 {
+        let history = if version >= 5 {
             read_history(&mut r, cursor, true)?
         } else {
             VecDeque::new()
@@ -1115,7 +1223,7 @@ impl SproutScanner {
             cursor,
             complete,
             history,
-            source_version: version,
+            decrypt_from,
         })
     }
 }
@@ -1251,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_v3_round_trips_reorg_history() {
+    fn checkpoint_v5_round_trips_reorg_history() {
         let key = [0x42; 32];
         let mut scanner = SproutScanner::new(&[key]);
         for height in 1..=3u32 {
@@ -1263,7 +1371,7 @@ mod tests {
         scanner.mark_complete();
         let checkpoint = scanner.checkpoint();
         let resumed = SproutScanner::resume(&checkpoint).unwrap();
-        assert_eq!(resumed.checkpoint_version(), 3);
+        assert_eq!(checkpoint.as_bytes()[0], CHECKPOINT_VERSION);
         assert_eq!(resumed.history.len(), 3);
         assert_eq!(resumed.checkpoint().as_bytes(), checkpoint.as_bytes());
         assert_eq!(resumed.tree.to_bytes(), scanner.tree.to_bytes());
@@ -1308,9 +1416,9 @@ mod tests {
             .skip(3)
             .all(|f| f.spent_before.is_empty()));
 
-        let v2_bytes = scanner.encode(2).as_bytes().len();
-        let v3 = scanner.checkpoint();
-        let v3_bytes = v3.as_bytes().len();
+        let v4_bytes = scanner.encode(4).as_bytes().len();
+        let v5 = scanner.checkpoint();
+        let v5_bytes = v5.as_bytes().len();
         // A frame contains its own tree/witness snapshots and only the
         // nullifiers changed in that block. Account for every encoded byte:
         // an added copy of the global spent map in any frame fails this.
@@ -1338,20 +1446,20 @@ mod tests {
                     + 40
             })
             .sum();
-        assert_eq!(v3_bytes, v2_bytes + 8 + frames_bytes);
-        assert_eq!(SproutScanner::resume(&v3).unwrap().history.len(), 100);
-        eprintln!("100-frame checkpoint with three pending notes and 64 spent nullifiers: v2-equivalent={v2_bytes} bytes, v3={v3_bytes} bytes");
+        assert_eq!(v5_bytes, v4_bytes + 8 + frames_bytes);
+        assert_eq!(SproutScanner::resume(&v5).unwrap().history.len(), 100);
+        eprintln!("100-frame checkpoint with three pending notes and 64 spent nullifiers: v4-equivalent={v4_bytes} bytes, v5={v5_bytes} bytes");
     }
 
     #[test]
-    fn v3_rejects_oversized_and_noncontiguous_history() {
+    fn v5_rejects_oversized_and_noncontiguous_history() {
         let mut scanner = SproutScanner::new(&[[0x42; 32]]);
         for height in 1..=2u32 {
             scanner
                 .scan_block_at(&[], [height as u8; 32], height)
                 .unwrap();
         }
-        let offset = scanner.encode(2).as_bytes().len();
+        let offset = scanner.encode(4).as_bytes().len();
         let original = scanner.checkpoint().as_bytes().to_vec();
 
         let mut oversized = original.clone();
@@ -1370,16 +1478,23 @@ mod tests {
         ));
     }
 
+    /// Version 4 is authenticated but carries no rollback history. It was
+    /// never released, and is refused like every older layout rather than
+    /// resumed with an empty window.
     #[test]
-    fn v1_and_v2_resume_without_claiming_rollback_history() {
+    fn a_version_4_checkpoint_without_history_is_refused() {
         let mut scanner = SproutScanner::new(&[[0x42; 32]]);
         scanner.scan_block_at(&[], [1; 32], 1).unwrap();
-        for version in [1, 2] {
-            let resumed = SproutScanner::resume(&scanner.encode(version)).unwrap();
-            assert_eq!(resumed.checkpoint_version(), version);
-            assert!(resumed.history.is_empty());
-            assert_eq!(resumed.cursor(), scanner.cursor());
-        }
+        let v4 = scanner.encode(4);
+        assert!(matches!(
+            SproutScanner::resume(&v4),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v4),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert_eq!(read_spending_keys(v4.as_bytes()).unwrap(), vec![[0x42; 32]]);
     }
 
     /// Build a JoinSplit paying `value` to `a_sk` in output `index`, with
@@ -1690,8 +1805,9 @@ mod tests {
         scanner.scan_block(&[js]).expect("scan");
         let anchor = scanner.anchor();
 
-        let resumed =
-            SproutScanner::resume(&scanner.checkpoint()).expect("an empty result must resume");
+        let checkpoint = scanner.checkpoint();
+        assert_eq!(checkpoint.as_bytes()[0], CHECKPOINT_VERSION);
+        let resumed = SproutScanner::resume(&checkpoint).expect("an empty result must resume");
         assert_eq!(resumed.anchor(), anchor);
         assert_eq!(resumed.progress(), scanner.progress());
     }
@@ -1803,10 +1919,10 @@ mod tests {
         assert_eq!(resumed.spent_nullifiers(), scanner.spent_nullifiers());
     }
 
-    /// A real user has a version-1 checkpoint mid-scan. It must still load
-    /// and resume: its nullifiers without txids, and not marked complete.
+    /// Legacy keys remain discoverable for covering-file detection, but
+    /// pre-authentication scan state cannot supply a tree or spend verdict.
     #[test]
-    fn a_version_1_checkpoint_still_resumes() {
+    fn a_version_1_checkpoint_is_not_scan_or_spend_evidence() {
         let a_sk = [0x42u8; 32];
         let (js, _) = joinsplit_paying(&a_sk, 1_000, 0, 70);
         let mut scanner = SproutScanner::new(&[a_sk]);
@@ -1815,19 +1931,32 @@ mod tests {
 
         let v1 = scanner.encode(1);
         assert_eq!(v1.as_bytes()[0], 1);
-        let resumed = SproutScanner::resume(&v1).expect("a v1 checkpoint resumes");
-        assert_eq!(resumed.cursor(), scanner.cursor());
-        assert_eq!(resumed.progress(), scanner.progress());
-        assert!(
-            !resumed.is_complete(),
-            "v1 recorded no completion, so none is claimed"
-        );
-        assert_eq!(resumed.spent_nullifiers().get(&[71u8; 32]), Some(&None));
-        assert_eq!(resumed.spent_nullifiers().len(), 2);
+        assert_eq!(read_spending_keys(v1.as_bytes()).unwrap(), vec![a_sk]);
+        assert!(matches!(
+            SproutScanner::resume(&v1),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v1),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+    }
 
-        let evidence = read_chain_evidence(&v1).expect("v1 reads as evidence");
-        assert!(!evidence.complete);
-        assert_eq!(evidence.spent.get(&[71u8; 32]), Some(&None));
+    #[test]
+    fn a_version_2_checkpoint_is_not_scan_or_spend_evidence() {
+        let a_sk = [0x42u8; 32];
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[], [0xAB; 32], 9).expect("scan");
+        let v2 = scanner.encode(2);
+        assert_eq!(read_spending_keys(v2.as_bytes()).unwrap(), vec![a_sk]);
+        assert!(matches!(
+            SproutScanner::resume(&v2),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v2),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
     }
 
     /// Kristi, #240 #3: a scan that died early left a valid checkpoint
@@ -1889,5 +2018,136 @@ mod tests {
     fn an_empty_scan_yields_the_empty_root() {
         let scanner = SproutScanner::new(&[[0x42u8; 32]]);
         assert_eq!(scanner.anchor(), crate::sprout_witness::empty_tree_root());
+    }
+
+    // ── decrypt-from bound ───────────────────────────────────────────────────
+
+    /// Three blocks paying our key at heights 9, 10 and 11, plus a fourth
+    /// block that spends nothing of ours but reveals nullifiers.
+    fn blocks_paying(a_sk: &[u8; 32]) -> Vec<(u32, SproutJoinSplit)> {
+        [(9u32, 90u8), (10, 100), (11, 110), (12, 120)]
+            .into_iter()
+            .map(|(height, seed)| (height, joinsplit_paying(a_sk, u64::from(height), 0, seed).0))
+            .collect()
+    }
+
+    fn scan_with(a_sk: [u8; 32], decrypt_from: Option<u32>) -> SproutScanner {
+        let mut scanner = SproutScanner::with_decrypt_from(&[a_sk], decrypt_from);
+        for (height, js) in blocks_paying(&a_sk) {
+            scanner
+                .scan_block_at(&[js], [height as u8; 32], height)
+                .expect("scan");
+        }
+        scanner
+    }
+
+    fn found_values(scanner: SproutScanner) -> Vec<u64> {
+        let mut values: Vec<u64> = scanner
+            .finish()
+            .expect("finish")
+            .notes
+            .iter()
+            .map(|n| n.note.value)
+            .collect();
+        values.sort_unstable();
+        values
+    }
+
+    #[test]
+    fn a_note_below_the_bound_is_not_decrypted_and_one_at_it_is() {
+        let a_sk = [0x42u8; 32];
+        // Each note's value is the height it was paid at.
+        assert_eq!(found_values(scan_with(a_sk, Some(10))), vec![10, 11, 12]);
+        assert_eq!(found_values(scan_with(a_sk, Some(12))), vec![12]);
+        assert_eq!(found_values(scan_with(a_sk, None)), vec![9, 10, 11, 12]);
+        // A bound at or below the first block skips nothing.
+        assert_eq!(found_values(scan_with(a_sk, Some(1))), vec![9, 10, 11, 12]);
+    }
+
+    /// Skipping decryption must not touch anything the tree, the witnesses
+    /// or the spent set depend on: a found note's witness must authenticate
+    /// against the same root, and the spent set is evidence the wallet-file
+    /// path relies on whatever the bound.
+    #[test]
+    fn the_bound_changes_nothing_but_decryption() {
+        let a_sk = [0x42u8; 32];
+        let full = scan_with(a_sk, None);
+        let skipping = scan_with(a_sk, Some(11));
+
+        assert_eq!(full.anchor(), skipping.anchor());
+        assert_eq!(full.spent_nullifiers(), skipping.spent_nullifiers());
+        assert_eq!(
+            full.progress().commitments_appended,
+            skipping.progress().commitments_appended
+        );
+        assert_eq!(
+            full.progress().joinsplits_seen,
+            skipping.progress().joinsplits_seen
+        );
+        assert_eq!(full.cursor(), skipping.cursor());
+
+        let anchor = full.anchor();
+        let full = full.finish().unwrap();
+        let skipping = skipping.finish().unwrap();
+        for note in skipping.notes.iter() {
+            assert_eq!(note.anchor, anchor);
+            let same = full
+                .notes
+                .iter()
+                .find(|n| n.commitment == note.commitment)
+                .expect("found by both");
+            assert_eq!(same.witness_path, note.witness_path);
+        }
+    }
+
+    #[test]
+    fn the_bound_survives_a_checkpoint() {
+        let a_sk = [0x42u8; 32];
+        let scanner = scan_with(a_sk, Some(10));
+        let checkpoint = scanner.checkpoint();
+        assert_eq!(checkpoint.as_bytes()[0], CHECKPOINT_VERSION);
+        let resumed = SproutScanner::resume(&checkpoint).expect("resume");
+        assert_eq!(resumed.decrypt_from_height(), Some(10));
+        assert_eq!(resumed.checkpoint().as_bytes(), checkpoint.as_bytes());
+        assert_eq!(
+            read_chain_evidence(&checkpoint)
+                .expect("evidence")
+                .decrypt_from_height,
+            Some(10)
+        );
+
+        let none = scan_with(a_sk, None);
+        let resumed = SproutScanner::resume(&none.checkpoint()).expect("resume");
+        assert_eq!(resumed.decrypt_from_height(), None);
+
+        // Older layouts, the bound-carrying v3 included, predate body
+        // authentication: neither the bound nor anything else in them is
+        // trusted, from either reader. v4 is authenticated but has no
+        // rollback history and was never released; it is refused too.
+        for version in [1, 2, 3, 4] {
+            let old = scanner.encode(version);
+            assert!(
+                matches!(
+                    SproutScanner::resume(&old),
+                    Err(CheckpointError::UnauthenticatedLegacy)
+                ),
+                "v{version}"
+            );
+            assert!(
+                matches!(
+                    read_chain_evidence(&old),
+                    Err(CheckpointError::UnauthenticatedLegacy)
+                ),
+                "v{version}"
+            );
+            assert_eq!(read_spending_keys(old.as_bytes()).unwrap(), vec![a_sk]);
+        }
+
+        // A damaged bound is corruption, not "no bound".
+        // The bound sits at the end of the v4 fields; v5 history follows it.
+        let mut bytes = checkpoint.as_bytes().to_vec();
+        let flag = scanner.encode(4).as_bytes().len() - 9;
+        bytes[flag] = 7;
+        assert!(SproutScanner::resume(&SproutScanCheckpoint::from_bytes(bytes)).is_err());
     }
 }

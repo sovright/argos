@@ -128,4 +128,50 @@ async fn a_scan_finds_a_note_it_was_never_told_about() {
     // ── Resume must not redo the work ─────────────────────────────────────
     assert!(checkpoint.exists(), "the scan must leave a checkpoint");
     eprintln!("[scan] checkpoint at {}", checkpoint.display());
+
+    // ── The decrypt-from bound, against the same real blocks ──────────────
+    //
+    // Kristi's test gap on #260. A bound at the note's own block still finds
+    // it, with the same anchor: commitments below the bound still build the
+    // tree. A bound one past it walks the same chain, sees the same
+    // JoinSplits, and decrypts nothing -- the cost of a bound set too late,
+    // which is why it is only ever derived from dated keys.
+    let shield_height = u32::try_from(shield_height).expect("regtest height fits u32");
+    for (bound, expect_found) in [(shield_height, true), (shield_height + 1, false)] {
+        let dir = std::env::temp_dir().join(format!("argos-scan-e2e-bound-{bound}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let checkpoint = sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let bounded = sprout_scan_run::run_sprout_scan_with_decrypt_from(
+            &[a_sk],
+            P2pNetwork::Regtest,
+            &[NODE_P2P.to_owned()],
+            None,
+            &checkpoint,
+            Some(bound),
+            |_| {},
+        )
+        .await
+        .expect("the bounded scan must complete");
+        assert_eq!(
+            bounded.progress.joinsplits_seen, result.progress.joinsplits_seen,
+            "bound {bound}: the walk must see every JoinSplit"
+        );
+        if expect_found {
+            let note = bounded
+                .notes
+                .iter()
+                .find(|n| n.note.value == shielded)
+                .expect("a bound at the note's block must still find it");
+            assert_eq!(
+                note.anchor, found.anchor,
+                "bound {bound}: the tree below the bound must still be built"
+            );
+        } else {
+            assert!(
+                bounded.notes.is_empty(),
+                "bound {bound}: nothing at or above it pays this key"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

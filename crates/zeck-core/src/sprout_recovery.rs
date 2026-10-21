@@ -855,6 +855,7 @@ mod tests {
             a_sk: Secret::new(a_sk),
             address: address.to_bytes(),
             provenance: Provenance::Standalone,
+            created_at: None,
         });
         keys.sprout_joinsplits.push(SproutJoinSplit {
             txid,
@@ -1407,6 +1408,7 @@ mod tests {
             a_sk: secrecy::Secret::new(other),
             address: SproutPaymentAddress::from_spending_key(&other).to_bytes(),
             provenance: argos_wallet_import::keys::Provenance::Standalone,
+            created_at: None,
         });
         let recovered = recover_spendable_sprout_notes(&keys);
         assert_eq!(recovered.keys_without_notes, 1);
@@ -1434,6 +1436,7 @@ mod tests {
             a_sk: secrecy::Secret::new(other),
             address: SproutPaymentAddress::from_spending_key(&other).to_bytes(),
             provenance: argos_wallet_import::keys::Provenance::Standalone,
+            created_at: None,
         });
         let recovered = recover_spendable_sprout_notes(&keys);
         assert_eq!(recovered.dust.len(), 1);
@@ -1514,6 +1517,7 @@ mod tests {
             a_sk: Secret::new(wrong),
             address: keys.sprout_notes[0].address,
             provenance: Provenance::Standalone,
+            created_at: None,
         };
 
         let recovered = recover_spendable_sprout_notes(&keys);

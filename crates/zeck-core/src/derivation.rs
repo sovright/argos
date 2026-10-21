@@ -303,10 +303,15 @@ fn redact_mnemonic_error(err: &Bip39Error, phrase: &str) -> ZeckError {
     }
 }
 
+/// The BIP-39 phrase lengths. ZecWallet Lite generated 24 words, but other
+/// wallets generate shorter phrases, and `Mnemonic::from_phrase` accepts all
+/// of them.
+const MNEMONIC_WORD_COUNTS: [usize; 5] = [12, 15, 18, 21, 24];
+
 fn normalize_words(words: &[String]) -> ZeckResult<String> {
-    if words.len() != 24 {
+    if !MNEMONIC_WORD_COUNTS.contains(&words.len()) {
         return Err(ZeckError::InvalidMnemonic(format!(
-            "expected 24 words, got {}",
+            "expected 12, 15, 18, 21 or 24 words, got {}",
             words.len()
         )));
     }
@@ -348,11 +353,51 @@ mod tests {
         assert!(validate_mnemonic_words(&words).is_ok());
     }
 
+    // BIP-39 test vectors for 12 and 18 words (128 and 192 bits of zero
+    // entropy).
+    const TEST_SEED_12: &str = "abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon about";
+    const TEST_SEED_18: &str = "abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon agent";
+
+    #[test]
+    fn valid_12_and_18_word_seeds_validate() {
+        for phrase in [TEST_SEED_12, TEST_SEED_18] {
+            let words: Vec<String> = phrase.split_whitespace().map(str::to_owned).collect();
+            assert!(validate_mnemonic_words(&words).is_ok(), "{phrase}");
+        }
+    }
+
+    #[test]
+    fn twelve_word_seed_derives_accounts() {
+        let accounts = derive_accounts(
+            &SecretString::new(TEST_SEED_12.to_owned()),
+            ZeckNetwork::Mainnet,
+            1,
+        )
+        .expect("a 12-word seed derives");
+        let reference = derive_accounts(&test_seed(), ZeckNetwork::Mainnet, 1).unwrap();
+        assert_ne!(
+            accounts[0].sapling_address, reference[0].sapling_address,
+            "a different seed must derive a different address"
+        );
+    }
+
     #[test]
     fn wrong_word_count_rejected() {
         let words: Vec<String> = TEST_SEED
             .split_whitespace()
             .take(23)
+            .map(str::to_owned)
+            .collect();
+        let err = validate_mnemonic_words(&words).unwrap_err();
+        assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
+
+        // 13 words: between two valid lengths.
+        let words: Vec<String> = TEST_SEED_12
+            .split_whitespace()
+            .chain(["abandon"])
             .map(str::to_owned)
             .collect();
         let err = validate_mnemonic_words(&words).unwrap_err();
@@ -433,7 +478,7 @@ mod tests {
 
     #[test]
     fn empty_seed_rejected() {
-        // R-D5: an empty Vec is "zero words", far from the required 24.
+        // R-D5: an empty Vec is "zero words", far from the minimum 12.
         let err = validate_mnemonic_words(&[]).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }

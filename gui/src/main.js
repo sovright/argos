@@ -312,13 +312,39 @@ seedVisibility.addEventListener("change", () => {
   seedInput.classList.toggle("masked", !seedVisibility.checked);
 });
 
+// ZecWallet Lite only generated 24-word phrases, so a shorter one came from
+// another wallet. Argos derives the standard paths (ZIP 32 shielded accounts,
+// BIP-44 account 0 transparent receive addresses), so a wallet that used
+// other paths scans to zero.
+function seedValidMessage(wordCount) {
+  const valid = "✓ Seed phrase is valid.";
+  if (wordCount === 24) return valid;
+  return `${valid} ZecWallet Lite only made 24-word phrases, so this ${wordCount}-word ` +
+    "phrase is from another wallet. Argos checks the standard paths: ZIP 32 shielded " +
+    "accounts and BIP-44 transparent addresses m/44'/133'/0'/0/0–999. If that wallet " +
+    "used a different derivation path, the scan will find no funds.";
+}
+
+// Which scan-screen banner applies. Only a wallet file whose keys are all
+// transparent skips the block sync: pasted Sapling keys move the scan onto
+// the imported-account route, and matched-address recovery ignores the file.
+function scanWarningVariant(walletFile, typedSaplingKeyCount, matchedRecovery) {
+  if (matchedRecovery || typedSaplingKeyCount > 0) return "shielded";
+  return walletFile?.summary?.transparent_only === true ? "transparent-only" : "shielded";
+}
+
+function showScanWarning(variant) {
+  $("scan-warning-shielded").hidden = variant !== "shielded";
+  $("scan-warning-transparent-only").hidden = variant !== "transparent-only";
+}
+
 async function validateSeed() {
   const words = seedInput.value.trim().toLowerCase().split(/\s+/);
   setStatus("seed-status", "Validating…", "");
   seedNextBtn.disabled = true;
   try {
     await invoke("validate_seed", { words });
-    setStatus("seed-status", "✓ Seed phrase is valid.", "success");
+    setStatus("seed-status", seedValidMessage(words.length), "success");
     seedNextBtn.disabled = false;
   } catch (err) {
     setStatus("seed-status", `✗ ${err}`, "error");
@@ -386,7 +412,7 @@ function renderWalletSummary(summary) {
       "Seed phrase",
       summary.has_mnemonic
         ? "recovered — this wallet scans like a typed seed phrase"
-        : "not recovered from this file",
+        : summary.seed_note || "not recovered from this file",
     ],
   ];
   // Graded in argos-core, which the CLI prints verbatim: a lost seed and a
@@ -410,6 +436,7 @@ function renderWalletSummary(summary) {
   const sproutDetail = $("wallet-sprout-detail");
   const sproutScanCost = $("wallet-sprout-scan-cost");
   sproutWarning.hidden = summary.sprout_keys === 0;
+  showSproutNu7Warning(summary.sprout_keys > 0 ? summary.sprout_nu7_warning : "");
   sproutScanCost.hidden = true;
   sproutScanCost.innerHTML = "";
   sproutDetail.innerHTML = "";
@@ -429,7 +456,11 @@ function renderWalletSummary(summary) {
   // Reset every time: reopening a different wallet file must never leave the
   // previous one's sweep panel, plan or results on screen.
   $("wallet-sprout-sweep").hidden = true;
-  $("sprout-scan-panel").hidden = true;
+  // The scan panel lives outside this summary so raw keys can reach it with
+  // no file. A previous file's offer goes; a panel the user opened for a
+  // typed key stays.
+  sproutScanOfferedForFile = false;
+  if (!hasTypedSproutScanText()) $("sprout-scan-entry").open = false;
   $("sprout-scan-sweep").hidden = true;
   $("sprout-scan-sweep-results").innerHTML = "";
   $("sprout-scan-addresses").innerHTML = "";
@@ -463,7 +494,7 @@ function renderWalletSummary(summary) {
         sproutScanCost.appendChild(p);
       }
       sproutScanCost.hidden = sproutScanCost.childElementCount === 0;
-      $("sprout-scan-panel").hidden = false;
+      offerSproutScanForFile(summary);
     } else {
       if (summary.sprout_history_read) {
         // Some note data was read — spent notes, dust — so saying the file
@@ -498,7 +529,7 @@ function renderWalletSummary(summary) {
         sproutScanCost.appendChild(p);
       }
       sproutScanCost.hidden = sproutScanCost.childElementCount === 0;
-      $("sprout-scan-panel").hidden = false;
+      offerSproutScanForFile(summary);
     }
 
     // Rebuilt each time rather than appended to: reopening a wallet file
@@ -514,20 +545,121 @@ function renderWalletSummary(summary) {
     }
   }
 
-  const diagnostics = $("wallet-diagnostics");
-  const diagList = $("wallet-diagnostics-list");
-  diagList.innerHTML = "";
-  diagnostics.hidden = summary.diagnostics.length === 0;
-  for (const entry of summary.diagnostics) {
-    const li = document.createElement("li");
-    li.textContent = entry;
-    diagList.appendChild(li);
-  }
+  // Two blocks, as the CLI prints them: findings about the seed (unified
+  // accounts, keys its chain says are missing) were read fine and are not
+  // "records that could not be read".
+  const renderList = (blockId, listId, entries) => {
+    const list = $(listId);
+    list.innerHTML = "";
+    $(blockId).hidden = entries.length === 0;
+    for (const entry of entries) {
+      const li = document.createElement("li");
+      li.textContent = entry;
+      list.appendChild(li);
+    }
+  };
+  renderList("wallet-seed-diagnostics", "wallet-seed-diagnostics-list", summary.seed_diagnostics || []);
+  renderList("wallet-diagnostics", "wallet-diagnostics-list", summary.diagnostics);
 
   $("wallet-summary").hidden = false;
+  renderSproutScanPanel();
 }
 
 // ─── Sprout sweep ───────────────────────────────────────────────────────────
+
+function showSproutNu7Warning(warning) {
+  const el = $("wallet-sprout-nu7-warning");
+  el.textContent = warning ?? "";
+  el.hidden = !warning;
+}
+
+// ─── Sprout scan panel: reachable with or without a wallet file ─────────────
+// The panel sits in its own disclosure on the wallet screen, outside
+// #wallet-summary, so a user with only a raw SK…/ST… key backup can reach it.
+// It carries its own NU7 alert, and is never shown until that alert has text:
+// panel usable ⇒ deadline on screen.
+
+// Set while the open wallet file holds Sprout keys but no spendable note
+// data, the one case where the file itself sends the user to the scan.
+let sproutScanOfferedForFile = false;
+// The panel's own NU7 text, separate from `sproutNu7Warning`: that one is a
+// wallet file's caveat and is carried onto the totals screens, which a raw
+// key with no file never reaches.
+let sproutScanNu7Warning = "";
+// Set once a scan sweep has broadcast. Survives opening another wallet file:
+// the transaction it describes still has to be mined. Start over resets it.
+let sproutScanNu7Broadcast = false;
+// Shown only if the core's text cannot be fetched at all, so the panel never
+// opens with no deadline in view.
+const SPROUT_NU7_FALLBACK =
+  "NU7: Sprout funds become unspendable once NU7 activates. A Sprout recovery " +
+  "transaction must be mined before activation; broadcasting alone is not enough.";
+
+// Any text in the raw key box, comments included: a box the user has
+// written in is theirs, and is not closed under them.
+function hasTypedSproutScanText() {
+  return ($("sprout-scan-keys").value ?? "").trim() !== "";
+}
+
+function offerSproutScanForFile(summary) {
+  sproutScanOfferedForFile = true;
+  $("sprout-scan-entry").open = true;
+  // Immediately, from the same core text as the wallet's own alert; the
+  // broadcast wording of an earlier scan sweep is not overwritten.
+  if (!sproutScanNu7Broadcast && summary.sprout_nu7_warning) {
+    sproutScanNu7Warning = summary.sprout_nu7_warning;
+  }
+}
+
+function renderSproutScanPanel() {
+  const open = !!$("sprout-scan-entry").open;
+  const alert = $("sprout-scan-nu7-warning");
+  alert.textContent = sproutScanNu7Warning;
+  alert.hidden = !sproutScanNu7Warning;
+  $("sprout-scan-panel").hidden = !(open && sproutScanNu7Warning);
+  const fileKeys = (walletFile?.summary?.sprout_keys ?? 0) > 0;
+  $("sprout-scan-entry-label").textContent = sproutScanOfferedForFile
+    ? "Scan the chain for this wallet's Sprout notes"
+    : "I only have a Sprout spending key (SK… or ST…)";
+  $("sprout-scan-keys").placeholder = fileKeys
+    ? "Leave blank to use the Sprout keys already in your wallet file"
+    : "SK… (mainnet) or ST… (testnet), one key per line";
+  // The one network picker lives on the settings step, which a user with no
+  // wallet file cannot reach; this select mirrors it.
+  const network = $("network-select");
+  const mirror = $("sprout-scan-network");
+  mirror.value = network.value;
+  mirror.disabled = !!network.disabled;
+}
+
+// The disclosure was opened or closed by the user (or by a wallet file).
+async function onSproutScanEntryToggle() {
+  renderSproutScanPanel();
+  if ($("sprout-scan-entry").open) await refreshSproutNu7Warning();
+}
+
+// Start over, and a matched address-search recovery: no raw Sprout key, no
+// destination and no result may carry into the next run. The scan itself
+// does not clear the box, because its sweep re-reads the same keys.
+function forgetSproutScanInputs() {
+  $("sprout-scan-keys").value = "";
+  $("sprout-scan-addresses").innerHTML = "";
+  $("sprout-scan-destination").value = "";
+  $("sprout-scan-confirm").checked = false;
+  // The decrypt-bound overrides belong to the run they were set for.
+  $("sprout-scan-birthday").value = "";
+  $("sprout-scan-every-block").checked = false;
+  $("sprout-scan-plan").textContent = "";
+  $("sprout-scan-sweep").hidden = true;
+  $("sprout-scan-sweep-results").innerHTML = "";
+  setStatus("sprout-scan-status", "", "");
+  $("sprout-scan-entry").open = false;
+  sproutScanOfferedForFile = false;
+  sproutScanNu7Warning = "";
+  sproutScanNu7Broadcast = false;
+  renderSproutScanPanel();
+}
+
 // Distinct from the ordinary sweep in every respect: the notes come from the
 // wallet file rather than a scan, the destination must be Sapling-capable,
 // and proving takes minutes per note against a 725 MB parameter file.
@@ -541,10 +673,11 @@ async function showSproutSweep() {
   panel.hidden = false;
 
   try {
+    const previewNetwork = $("network-select").value;
     const preview = await invoke("preview_sprout_sweep", {
       path: source.path,
       passphrase: source.passphrase,
-      network: $("network-select").value,
+      network: previewNetwork,
       // Where the scan panel keeps its checkpoint: a scan of these keys
       // settles spends the wallet file cannot see.
       dataDir: $("data-dir").value.trim() || null,
@@ -555,6 +688,11 @@ async function showSproutSweep() {
     // Verification runs again for this preview. Show its current verdict
     // beside the plan, even if inspection used an earlier checkpoint view.
     setStatus("sprout-sweep-status", preview.scan_warning || "", "");
+    // A preview for a network the user has since moved off, or one that
+    // lands after a broadcast, would put back the wrong warning.
+    if (preview.nu7_warning && previewNetwork === $("network-select").value && !sproutNu7Broadcast) {
+      showSproutNu7Warning(preview.nu7_warning);
+    }
 
     $("sprout-sweep-plan").textContent =
       `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
@@ -627,6 +765,7 @@ async function runSproutSweep() {
     if (walletFile !== source) return;
 
     const list = $("sprout-sweep-results");
+    const nu7Refresh = noteSproutBroadcast(report);
     for (const sent of report.sent) {
       const li = document.createElement("li");
       li.textContent = `${fmt(sent.value_swept)} — ${sent.txid}`;
@@ -698,6 +837,7 @@ async function runSproutSweep() {
         "To finish moving them to Orchard, shield them from within your own wallet.";
       list.appendChild(li);
     }
+    await nu7Refresh;
   } catch (err) {
     if (walletFile !== source) return;
     setStatus("sprout-sweep-status", `✗ ${err}`, "error");
@@ -719,6 +859,89 @@ async function runSproutSweep() {
 /// total as their entire balance — and then use the Delete workspace button
 /// sitting on that same screen, discarding the only copy of the keys.
 let uncoveredSproutKeys = 0;
+// A broadcast is not mined confirmation. This warning survives clearing the
+// uncovered-key count and is reset only when the wallet source changes.
+let sproutNu7Warning = "";
+// Set once a Sprout sweep has broadcast: the warning then asks the user to
+// confirm the transaction is mined instead of urging them to start.
+let sproutNu7Broadcast = false;
+
+/// Rebuild both NU7 warnings for the network now selected and the current
+/// broadcast state: the open wallet file's, and the Sprout scan panel's,
+/// which is there with or without a wallet file. The wallet screen comes
+/// before the network picker, so text built at wallet open can name the
+/// wrong network. Asks for nothing unless one of them is in use.
+async function refreshSproutNu7Warning() {
+  await Promise.all([refreshWalletSproutNu7Warning(), refreshSproutScanNu7Warning()]);
+}
+
+/// The scan panel's alert, while the panel is open. If the core text cannot
+/// be had, an existing text stays (a deadline for the wrong network is still
+/// better than none), and an empty one takes the fallback so the panel can
+/// open with a deadline in view.
+async function refreshSproutScanNu7Warning() {
+  if (!$("sprout-scan-entry").open) return;
+  const network = $("network-select").value;
+  const broadcast = sproutScanNu7Broadcast;
+  let text;
+  try {
+    text = await invoke("sprout_nu7_warning", { network, broadcast });
+  } catch (err) {
+    globalThis.console?.error("could not refresh the Sprout scan NU7 warning:", err);
+    if (!sproutScanNu7Warning) sproutScanNu7Warning = SPROUT_NU7_FALLBACK;
+    renderSproutScanPanel();
+    return;
+  }
+  if (
+    !text ||
+    $("network-select").value !== network ||
+    sproutScanNu7Broadcast !== broadcast
+  ) {
+    return;
+  }
+  sproutScanNu7Warning = text;
+  renderSproutScanPanel();
+}
+
+/// The open wallet file's alert and the banners it feeds. Does nothing
+/// unless a wallet with Sprout keys is open.
+async function refreshWalletSproutNu7Warning() {
+  if (!sproutNu7Warning) return;
+  const source = walletFile;
+  const network = $("network-select").value;
+  const broadcast = sproutNu7Broadcast;
+  let text;
+  try {
+    text = await invoke("sprout_nu7_warning", { network, broadcast });
+  } catch (err) {
+    // Keep the existing text: a deadline warning for the wrong network is
+    // still better than none.
+    console.error("could not refresh the NU7 warning:", err);
+    return;
+  }
+  if (
+    walletFile !== source ||
+    !sproutNu7Warning ||
+    !text ||
+    $("network-select").value !== network ||
+    sproutNu7Broadcast !== broadcast
+  ) {
+    return;
+  }
+  sproutNu7Warning = text;
+  showSproutNu7Warning(text);
+  renderSproutUncoveredBanners();
+}
+
+/// After a Sprout sweep: once anything was broadcast, switch the warning to
+/// "broadcast, but must be mined before activation". A scan sweep also
+/// switches the scan panel's own alert, which outlives the wallet file.
+function noteSproutBroadcast(report, fromScan = false) {
+  if ((report.sent ?? []).length === 0) return;
+  sproutNu7Broadcast = true;
+  if (fromScan) sproutScanNu7Broadcast = true;
+  return refreshSproutNu7Warning();
+}
 
 /// Whether a Sprout sweep left nothing behind, so the "keep the original
 /// wallet file" caveat may go. Shared by both sweep handlers so they cannot
@@ -739,6 +962,8 @@ function noteUncoveredSproutKeys(summary) {
   // Only counts as uncovered if the file's own notes were not already
   // recovered and swept from the Sprout panel.
   uncoveredSproutKeys = summary.sprout_keys || 0;
+  sproutNu7Warning = summary.sprout_nu7_warning ?? "";
+  sproutNu7Broadcast = false;
   renderSproutUncoveredBanners();
 }
 
@@ -755,8 +980,36 @@ function notePartialImport(summary) {
 
 function forgetWalletCaveats() {
   uncoveredSproutKeys = 0;
+  sproutNu7Warning = "";
+  sproutNu7Broadcast = false;
   partialImportNotice = null;
   renderSproutUncoveredBanners();
+}
+
+// Start over must not carry a wallet file into the next run: the seed step
+// never clears it, so a seed typed afterwards would otherwise be scanned as
+// the old file and its balance shown as the seed's answer.
+function forgetLoadedWalletFile() {
+  ++walletOpenGeneration;
+  walletFile = null;
+  sproutPreviewWallet = null;
+  forgetWalletCaveats();
+  $("wallet-path").value = "";
+  $("wallet-passphrase").value = "";
+  $("wallet-passphrase-field").hidden = true;
+  $("wallet-summary").hidden = true;
+  $("wallet-next").disabled = true;
+  $("wallet-sprout-sweep").hidden = true;
+  $("sprout-sweep-run").disabled = true;
+  $("sprout-sweep-plan").textContent = "";
+  $("sprout-sweep-pool").textContent = "";
+  $("sprout-sweep-params").textContent = "";
+  $("wallet-open").disabled = false;
+  setStatus("wallet-status", "", "");
+  // A panel the file opened goes with it; one holding a typed key stays.
+  sproutScanOfferedForFile = false;
+  if (!hasTypedSproutScanText()) $("sprout-scan-entry").open = false;
+  renderSproutScanPanel();
 }
 
 function renderSproutUncoveredBanners() {
@@ -770,6 +1023,7 @@ function renderSproutUncoveredBanners() {
         tail,
     );
   }
+  if (sproutNu7Warning) parts.push(sproutNu7Warning);
   if (partialImportNotice) {
     parts.push(`This total may not be your whole balance. ${partialImportNotice}`);
   }
@@ -799,6 +1053,13 @@ async function openWalletFile() {
   $("sprout-sweep-plan").textContent = "";
   $("sprout-sweep-pool").textContent = "";
   $("sprout-sweep-params").textContent = "";
+  showSproutNu7Warning("");
+  // The panel is outside #wallet-summary now, so hiding the summary no longer
+  // takes it along: drop the previous file's offer here, so a failed open
+  // (wrong passphrase, no keys, unreadable) cannot leave it in place.
+  sproutScanOfferedForFile = false;
+  if (!hasTypedSproutScanText()) $("sprout-scan-entry").open = false;
+  renderSproutScanPanel();
   $("wallet-open").disabled = false;
   const path = $("wallet-path").value.trim();
   if (!path) {
@@ -881,6 +1142,7 @@ $("wallet-browse")?.addEventListener("click", async () => {
 });
 
 $("wallet-open")?.addEventListener("click", openWalletFile);
+$("wallet-forget")?.addEventListener("click", forgetLoadedWalletFile);
 $("wallet-path")?.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
 });
@@ -1006,8 +1268,25 @@ async function checkSaplingKeys() {
 // The fallback for a wallet whose note data is missing, and the only route
 // for a raw key with no wallet file. Hours, so it checkpoints and resumes.
 
+// The raw lines of the key box, unfiltered. The backend (`collect_scan_keys`)
+// owns the skip rule and numbers a failure by the line the user can see, so
+// dropping blanks here would shift every reported number away from the box.
+function sproutScanKeyLines() {
+  const box = $("sprout-scan-keys");
+  if (!box) return [];
+  return box.value.split("\n");
+}
+
+// Each key paired with the line it sits on. Blank lines and `#` comments are
+// annotation, the same rule as the CLI key file and the Sapling box.
+function sproutScanKeyEntries() {
+  return sproutScanKeyLines()
+    .map((line, i) => ({ key: line.trim(), line: i + 1 }))
+    .filter(({ key }) => key !== "" && !key.startsWith("#"));
+}
+
 function sproutScanKeys() {
-  return $("sprout-scan-keys").value.split("\n").map((k) => k.trim()).filter(Boolean);
+  return sproutScanKeyEntries().map(({ key }) => key);
 }
 
 // Custom P2P peers, for when every public peer's inbound slots are full.
@@ -1045,10 +1324,50 @@ function sproutScanPeers() {
   return peers;
 }
 
+// What the Sprout scan is asked to decrypt. The backend derives any skip
+// from the wallet file's key times; this only carries what the user chose
+// to undo it. The panel's own birthday wins; otherwise the main birthday
+// field counts only once the user has set it, because its 419200 default
+// would otherwise cap every later skip. Either can only lower the skip.
+//
+// The backend takes the bound as a u32, and a larger number fails Tauri's
+// deserialisation with a raw serde error the user cannot act on, so it is
+// refused here in words. Number() of a long digit string is not exact past
+// 2^53, which is why the safe-integer check comes first.
+function sproutDecryptRequest(panelText, everyBlock, mainText, mainTouched) {
+  const MAX_BLOCK_HEIGHT = 4294967295;
+  const tooLarge = (n) => !Number.isSafeInteger(n) || n > MAX_BLOCK_HEIGHT;
+  const tooLargeError = (field) => ({
+    error: `The ${field} is too large: no block number is above ${MAX_BLOCK_HEIGHT.toLocaleString("en-US")}.`,
+  });
+  const panel = String(panelText || "").trim();
+  let birthdayFloor = null;
+  if (panel) {
+    if (!/^\d+$/.test(panel)) {
+      return { error: "The Sprout scan birthday must be a block number." };
+    }
+    birthdayFloor = Number(panel);
+    if (tooLarge(birthdayFloor)) return tooLargeError("Sprout scan birthday");
+  } else if (mainTouched && /^\d+$/.test(String(mainText || "").trim())) {
+    birthdayFloor = Number(String(mainText).trim());
+    if (tooLarge(birthdayFloor)) return tooLargeError("wallet birthday");
+  }
+  return { birthdayFloor, decryptEveryBlock: !!everyBlock };
+}
+
+function currentSproutDecryptRequest() {
+  return sproutDecryptRequest(
+    $("sprout-scan-birthday").value,
+    $("sprout-scan-every-block").checked,
+    $("birthday-height").value,
+    birthdayTouched,
+  );
+}
+
 async function checkSproutKeys() {
   const list = $("sprout-scan-addresses");
   list.innerHTML = "";
-  const keys = sproutScanKeys();
+  const keys = sproutScanKeyEntries();
   if (!keys.length) {
     setStatus(
       "sprout-scan-status",
@@ -1060,14 +1379,14 @@ async function checkSproutKeys() {
     return;
   }
   // Checked before the scan, not six hours into it.
-  for (const [i, key] of keys.entries()) {
+  for (const { key, line } of keys) {
     try {
       const addr = await invoke("check_sprout_key", { key, network: $("network-select").value });
       const li = document.createElement("li");
       li.textContent = addr;
       list.appendChild(li);
     } catch (err) {
-      setStatus("sprout-scan-status", `✗ key ${i + 1}: ${err}`, "error");
+      setStatus("sprout-scan-status", `✗ line ${line}: ${err}`, "error");
       return;
     }
   }
@@ -1093,14 +1412,21 @@ async function runSproutScan() {
     return;
   }
 
+  const decrypt = currentSproutDecryptRequest();
+  if (decrypt.error) {
+    setStatus("sprout-scan-status", `✗ ${decrypt.error}`, "error");
+    return;
+  }
+
   const button = $("sprout-scan-run");
   button.disabled = true;
   $("sprout-scan-bar").hidden = false;
+  $("sprout-scan-plan").textContent = "";
   setStatus("sprout-scan-status", "Connecting to the Zcash network…", "");
 
   try {
     const report = await invoke("start_sprout_scan", {
-      keys,
+      keys: sproutScanKeyLines(),
       // The wallet file's own Sprout keys are merged in by the backend, so
       // leaving the box blank genuinely works now.
       path: walletFile ? walletFile.path : null,
@@ -1111,8 +1437,15 @@ async function runSproutScan() {
       // itself reads blocks from the p2p network.
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       peers,
+      birthdayFloor: decrypt.birthdayFloor,
+      decryptEveryBlock: decrypt.decryptEveryBlock,
     });
     $("sprout-scan-bar").hidden = true;
+    // The bound actually used: after a resume, the saved scan's.
+    $("sprout-scan-plan").textContent =
+      report.decrypt_from_height != null
+        ? `${report.decrypt_line} Trial decryption ran from block ${Number(report.decrypt_from_height).toLocaleString()}.`
+        : report.decrypt_line;
     // The core's own sentence, so the GUI and CLI give the same caveat.
     const caveat = report.tip_warning ? ` ${report.tip_warning}` : "";
     setStatus(
@@ -1162,6 +1495,13 @@ async function runSproutScanSweep() {
     return;
   }
 
+  // No decrypt bound is sent: the backend resumes under the one the saved
+  // scan used, read from its checkpoint. Re-deriving it from the form would
+  // pick up any birthday change made since — auto-detect, an estimate, a
+  // retyped field — and a lower one makes the resume conflict after hours
+  // of scanning. Lowering the bound means starting a new scan, which says
+  // why when it has to refuse.
+
   const button = $("sprout-scan-sweep-run");
   button.disabled = true;
   const list = $("sprout-scan-sweep-results");
@@ -1174,7 +1514,7 @@ async function runSproutScanSweep() {
 
   try {
     const report = await invoke("sweep_sprout_from_scan", {
-      keys: sproutScanKeys(),
+      keys: sproutScanKeyLines(),
       path: walletFile ? walletFile.path : null,
       passphrase: walletFile ? walletFile.passphrase : null,
       destination,
@@ -1184,6 +1524,7 @@ async function runSproutScanSweep() {
       peers,
     });
 
+    noteSproutBroadcast(report, true);
     for (const sent of report.sent) {
       const li = document.createElement("li");
       li.textContent = `${fmt(sent.value_swept)} — ${sent.txid}`;
@@ -1259,9 +1600,14 @@ $("sprout-scan-sweep-run").addEventListener("click", runSproutScanSweep);
 $("sprout-scan-check").addEventListener("click", checkSproutKeys);
 $("sapling-keys-check")?.addEventListener("click", checkSaplingKeys);
 $("sprout-scan-run").addEventListener("click", runSproutScan);
+$("sprout-scan-entry")?.addEventListener("toggle", onSproutScanEntryToggle);
 
 (async () => {
   try {
+    // The backend's sentence on where decryption starts, before the hours.
+    await listen("sprout-scan-plan", (event) => {
+      $("sprout-scan-plan").textContent = event.payload;
+    });
     await listen("sprout-scan-progress", (event) => {
       const p = event.payload;
       const pct = p.target ? (p.height / p.target) * 100 : 0;
@@ -1402,15 +1748,14 @@ document.addEventListener("address-match-recovery", async (event) => {
     // A matched capability is the sole recovery source. Clear any inputs left
     // from an earlier wizard visit so secret provenance cannot be ambiguous.
     seedInput.value = "";
-    ++walletOpenGeneration;
-    sproutPreviewWallet = null;
-    walletFile = null;
-    forgetWalletCaveats();
-    $("wallet-passphrase").value = "";
+    forgetLoadedWalletFile();
     $("sapling-scan-keys").value = "";
     $("sapling-key-addresses").replaceChildren();
+    forgetSproutScanInputs();
     $("network-select").value = snapshot.network;
     $("network-select").disabled = true;
+    // The Sprout panel's network mirror follows the now-locked picker.
+    renderSproutScanPanel();
     $("server-preset").value = "recommended";
     $("lightwalletd-url").value = SERVER_PRESETS[snapshot.network] ?? SERVER_PRESETS.mainnet;
     $("birthday-autodetect").disabled = true;
@@ -1441,6 +1786,16 @@ $("network-select").addEventListener("change", () => {
   if ($("server-preset").value === "recommended") {
     $("lightwalletd-url").value = SERVER_PRESETS[$("network-select").value] ?? SERVER_PRESETS.mainnet;
   }
+  renderSproutScanPanel();
+  refreshSproutNu7Warning();
+});
+
+// The Sprout scan panel's network select is a mirror of the one above, for
+// a user with no wallet file who cannot reach the settings step. It drives
+// that picker, so the endpoint preset and every NU7 warning follow it.
+$("sprout-scan-network")?.addEventListener("change", () => {
+  $("network-select").value = $("sprout-scan-network").value;
+  $("network-select").dispatchEvent(new Event("change"));
 });
 
 $("server-preset").addEventListener("change", () => {
@@ -1473,7 +1828,9 @@ const APPROX_CHAIN_TIP = 2_730_000;
 const BLOCKS_PER_MINUTE = 38_000;
 
 function updateScanEstimate() {
-  const birthday = parseInt($("birthday-height").value, 10) || 419200;
+  // The Sapling scan starts no earlier than activation, so a pre-Sapling
+  // birthday (which only the Sprout scan uses) costs no extra here.
+  const birthday = Math.max(parseInt($("birthday-height").value, 10) || 0, 419200);
   const blocks = Math.max(0, APPROX_CHAIN_TIP - birthday);
   const minutes = Math.round(blocks / BLOCKS_PER_MINUTE);
   const el = $("birthday-scan-estimate");
@@ -1498,8 +1855,13 @@ const BLOSSOM_ACTIVATION_DATE_JS = Date.UTC(2019, 11, 11); // Dec 11 2019
 const PRE_BLOSSOM_BLOCK_SECONDS = 150;
 const POST_BLOSSOM_BLOCK_SECONDS = 75;
 
+// Below Sapling it counts back at the same 150 s, floored at the genesis
+// date: a wallet.dat birthday can be pre-Sapling, and a hint stuck at 2018
+// beside it would misstate the wallet's age.
+const MAINNET_GENESIS_DATE_JS = Date.UTC(2016, 9, 28); // Oct 28 2016
+
 function approxDateFromHeight(height) {
-  if (!Number.isFinite(height) || height <= SAPLING_ACTIVATION_HEIGHT_JS) {
+  if (!Number.isFinite(height)) {
     return new Date(SAPLING_ACTIVATION_DATE_JS);
   }
   let anchorMs, anchorHeight, blockSeconds;
@@ -1512,7 +1874,9 @@ function approxDateFromHeight(height) {
     anchorHeight = BLOSSOM_ACTIVATION_HEIGHT_JS;
     blockSeconds = POST_BLOSSOM_BLOCK_SECONDS;
   }
-  return new Date(anchorMs + (height - anchorHeight) * blockSeconds * 1000);
+  return new Date(
+    Math.max(MAINNET_GENESIS_DATE_JS, anchorMs + (height - anchorHeight) * blockSeconds * 1000),
+  );
 }
 
 function formatApproxMonth(date) {
@@ -1538,49 +1902,114 @@ function updateBirthdayHint() {
   setBirthdayHint(`Block ${height.toLocaleString()} ≈ ${approx}.`, "");
 }
 
+// Whether the birthday field holds a value the user chose (typed, estimated
+// or auto-detected) rather than its 419200 starting value. Only a chosen
+// value may lower where the Sprout scan starts decrypting.
+let birthdayTouched = false;
+
 $("birthday-height").addEventListener("input", () => {
+  birthdayTouched = true;
   updateScanEstimate();
   updateBirthdayHint();
 });
 updateScanEstimate();
 updateBirthdayHint();
 
-$("birthday-autodetect").addEventListener("click", async () => {
-  const seedVal = seedInput.value.trim();
-  if (!seedVal) {
-    setBirthdayHint("Enter your seed phrase on step 2 first.", "error");
+// Which seed auto-detect can use. A loaded wallet file wins over the typed
+// box because the scan will use the file's keys; its mnemonic stays in the
+// backend, so the frontend only chooses the command. A seedless zcashd
+// wallet.dat is dated from its key creation times, so a loaded file always
+// goes to the backend; whether it has a mnemonic, or is a seedless ZecWallet
+// Lite file to refuse, is the backend's call, so its refusal is shown as
+// returned rather than restated here where it could drift.
+function birthdayAutodetectSource(seedText, wallet) {
+  if (wallet) {
+    // The passphrase is dropped once a scan starts (T-S2), so after
+    // back-to-config the backend could not reopen an encrypted file.
+    if (wallet.passphraseCleared && wallet.passphrase == null) {
+      return {
+        kind: "none",
+        message:
+          "This wallet file is encrypted and its passphrase was cleared when the scan started. Re-enter the passphrase on the wallet screen, then try Auto-detect again.",
+      };
+    }
+    return { kind: "wallet" };
+  }
+  if (String(seedText || "").trim()) return { kind: "seed" };
+  return { kind: "none", message: "Enter your seed phrase on step 2 first." };
+}
+
+// The hint for an auto-detected birthday. A seed-path result keeps its short
+// form; a wallet-file result carries the backend's sentence, which names the
+// source and the caveat.
+function birthdayDetectHint(result, approxMonth) {
+  const block = Number(result.birthday).toLocaleString();
+  if (result.method === "wallet_metadata" || result.method === "transparent_utxos") {
+    let text = `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}). ${result.message}`;
+    if (result.method === "transparent_utxos" && !/on-chain unspent outputs/.test(text)) {
+      text += " This comes from on-chain unspent outputs and may be later than the wallet's real age.";
+    }
+    return text;
+  }
+  return `✓ Auto-detected birthday: block ${block} (≈ ${approxMonth}).`;
+}
+
+async function runBirthdayAutodetect() {
+  const source = birthdayAutodetectSource(seedInput.value, walletFile);
+  if (source.kind === "none") {
+    setBirthdayHint(source.message, "error");
     return;
   }
+  const seedVal = seedInput.value.trim();
+  // Phase-2 detection can run for minutes. If the user opens another wallet
+  // or edits the seed meanwhile, the result belongs to the old source.
+  const generation = walletOpenGeneration;
+  const isCurrent = () =>
+    generation === walletOpenGeneration &&
+    (source.kind === "wallet" || seedInput.value.trim() === seedVal);
   $("birthday-autodetect").disabled = true;
   $("birthday-estimate").disabled = true;
   setBirthdayHint("Starting detection…", "");
   setStatus("config-status", "", "");
 
   const unlistenProbe = await listen("birthday-probe-progress", (event) => {
-    setBirthdayHint(event.payload, "");
+    if (isCurrent()) setBirthdayHint(event.payload, "");
   });
 
   try {
-    const result = await invoke("detect_birthday", {
-      seed: seedVal.toLowerCase(),
+    const probe = {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       network: $("network-select").value,
-    });
+    };
+    const result =
+      source.kind === "wallet"
+        ? await invoke("detect_birthday_from_wallet_file", {
+            ...probe,
+            path: walletFile.path,
+            passphrase: walletFile.passphrase,
+            // Scanned with the file, and undated, so they must be counted.
+            saplingKeys: hasSaplingScanKeys() ? saplingScanKeyLines() : [],
+          })
+        : await invoke("detect_birthday", { ...probe, seed: seedVal.toLowerCase() });
+    if (!isCurrent()) {
+      setBirthdayHint("Auto-detect result discarded: the wallet or seed changed while it ran.", "");
+      return;
+    }
     $("birthday-height").value = result.birthday;
+    birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
-    setBirthdayHint(
-      `✓ Auto-detected birthday: block ${Number(result.birthday).toLocaleString()} (≈ ${approx}).`,
-      "success",
-    );
+    setBirthdayHint(birthdayDetectHint(result, approx), "success");
   } catch (err) {
-    setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
+    if (isCurrent()) setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
   } finally {
     $("birthday-autodetect").disabled = false;
     $("birthday-estimate").disabled = false;
     unlistenProbe();
   }
-});
+}
+
+$("birthday-autodetect").addEventListener("click", runBirthdayAutodetect);
 
 $("birthday-estimate").addEventListener("click", async () => {
   const dateVal = $("birthday-date").value;
@@ -1597,6 +2026,7 @@ $("birthday-estimate").addEventListener("click", async () => {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
     });
     $("birthday-height").value = height;
+    birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(height));
     setBirthdayHint(
@@ -1636,6 +2066,28 @@ $("destination-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); validateDestination(); }
 });
 
+// A seed phrase is a different provenance model from a wallet file or a
+// standalone Sapling key, and only one of them can drive a scan. Taking both
+// and quietly preferring one would scan a wallet the user did not ask for and
+// report its balance as the answer. The CLI refuses the same pairs outright
+// (`--wallet-file` and `--sapling-key-file` each conflict with `--seed-file`);
+// refuse them here too rather than letting the two surfaces mean different
+// things. A wallet file and pasted Sapling keys do combine, as in the CLI.
+function scanKeySourceConflict(hasSeed, hasWallet, hasSaplingKeys) {
+  if (hasSeed && hasWallet) {
+    return "A seed phrase and a wallet file cannot be scanned together — \
+they are separate wallets. Run two scans: clear the seed phrase to scan the \
+wallet file, or go back to the wallet screen and press Forget this file to \
+scan the seed phrase.";
+  }
+  if (hasSeed && hasSaplingKeys) {
+    return "A seed phrase and a pasted Sapling spending key cannot be scanned together — \
+they are separate wallets. Run two scans: clear the key box to scan the seed \
+phrase, or clear the seed phrase to scan the pasted key.";
+  }
+  return null;
+}
+
 $("start-scan").addEventListener("click", async () => {
   // Three routes to the same scan: a seed phrase, a wallet file, or a
   // pasted Sapling spending key.
@@ -1650,20 +2102,11 @@ go back and provide one.",
     return;
   }
 
-  // A seed phrase and a standalone Sapling key are different provenance
-  // models, and only one of them can drive a scan. Taking both and quietly
-  // preferring one would scan a wallet the user did not ask for and report
-  // its balance as the answer. The CLI refuses the same pair outright
-  // (`--sapling-key-file` conflicts with `--seed-file`); refuse it here too
-  // rather than letting the two surfaces mean different things.
-  if (seedInput.value.trim() && hasTypedSaplingKeys) {
-    setStatus(
-      "config-status",
-      "A seed phrase and a pasted Sapling spending key cannot be scanned together — \
-they are separate wallets. Run two scans: clear the key box to scan the seed \
-phrase, or clear the seed phrase to scan the pasted key.",
-      "error",
-    );
+  const conflict = scanKeySourceConflict(
+    !!seedInput.value.trim(), !!walletFile, hasTypedSaplingKeys,
+  );
+  if (conflict) {
+    setStatus("config-status", conflict, "error");
     return;
   }
 
@@ -1751,6 +2194,9 @@ phrase, or clear the seed phrase to scan the pasted key.",
     // number the lines the user sees. Empty when the box holds nothing but
     // comments, so a wallet-file-only scan is not handed a key set to reject.
     const typedSaplingKeys = hasTypedSaplingKeys ? saplingScanKeyLines() : [];
+    showScanWarning(
+      scanWarningVariant(walletFile, typedSaplingKeys.length, !!state.matchedRecovery),
+    );
     if (state.matchedRecovery) {
       const matched = state.matchedRecovery;
       const matchedConfig = configForMatchedRecovery(config);
@@ -1779,6 +2225,9 @@ phrase, or clear the seed phrase to scan the pasted key.",
           sapling_keys: typedSaplingKeys,
           // Checked against the key source before the scan starts.
           sweep_memo: state.memo,
+          // Checked before the scan: a seedless sweep's transparent leg
+          // cannot pay an Orchard-only address.
+          destination: state.destination,
         },
       });
     } else {
@@ -1792,7 +2241,10 @@ phrase, or clear the seed phrase to scan the pasted key.",
     // keys (threat model T-S2). Only on success: the passphrase field lives
     // on the wallet screen, so clearing it after a failure would strand a
     // user who retries from the config screen with no way to re-enter it.
-    if (walletFile) walletFile.passphrase = null;
+    if (walletFile) {
+      if (walletFile.passphrase != null) walletFile.passphraseCleared = true;
+      walletFile.passphrase = null;
+    }
     const passphraseInput = $("wallet-passphrase");
     if (passphraseInput) passphraseInput.value = "";
     // The backend holds the decoded keys now; a spending key must not sit
@@ -1875,7 +2327,13 @@ async function startProgressListeners() {
         ? ` (scanned through block ${d.at_block_height.toLocaleString()})`
         : "";
       div.textContent =
-        `Found ${fmt(d.zatoshis)} on account ${d.account_index} — ${d.pool}${heightHint}. Shielded scan still running — Review & Sweep will unlock when complete.`;
+        `Found ${fmt(d.zatoshis)} on account ${d.account_index} — ${d.pool}${heightHint}. `;
+      // Removed by updateScanUI once the scan ends, so a finished scan never
+      // still claims to be running.
+      const pending = document.createElement("span");
+      pending.className = "discovery-pending";
+      pending.textContent = "Shielded scan still running — Review & Sweep will unlock when complete.";
+      div.appendChild(pending);
       const container = $("scan-discoveries");
       container.appendChild(div);
       container.style.display = "";
@@ -1921,47 +2379,80 @@ function cleanupListeners() {
   state.unlistenDiscovered = null;
 }
 
+// What the scan status row shows, as a pure function of the progress payload.
+//
+// The "Connecting…", "0 / 0" and "Calculating…" placeholders are only replaced
+// by a block scan. A transparent-only wallet has no block scan, so it used to
+// finish as "Complete ✓" next to all three, plus an era hint for the chain tip.
+// Once the scan has ended, anything it never reported reads as "—" instead.
+// `server: null` means leave the field as it is.
+function scanStatusFields(progress, etaState, era, primaryEndpoint) {
+  const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
+  const scanned = Number(progress.blocks_scanned);
+  const total = Number(progress.blocks_total);
+
+  let server = null;
+  let serverTitle = "";
+  const endpoint = progress.server?.endpoint;
+  if (endpoint) {
+    const isFallback = endpoint !== primaryEndpoint;
+    server = endpoint + (isFallback ? " (fallback)" : "");
+    if (isFallback) {
+      serverTitle = "Connected to a fallback server — a different operator can see your scan activity";
+    }
+  } else if (terminal) {
+    server = "—";
+  }
+
+  const progressText = total === 0 && terminal
+    ? "—"
+    : `${scanned.toLocaleString()} / ${total.toLocaleString()}`;
+
+  let barPercent = null;
+  if (progress.phase === "complete") {
+    barPercent = 100;
+  } else if (total > 0) {
+    barPercent = Math.min(100, (scanned / total) * 100);
+  }
+
+  let etaText = "";
+  if (!terminal) {
+    if (etaState.kind === "warmup") etaText = "Calculating…";
+    else if (etaState.kind !== "done") etaText = etaState.text;
+    if (era) etaText = etaText ? `${etaText} · scanning ~${era}` : `scanning ~${era}`;
+  }
+
+  return { terminal, server, serverTitle, progressText, barPercent, etaText };
+}
+
 function updateScanUI(progress) {
   state.lastProgress = progress;
 
   $("scan-phase").textContent = phaseLabel(progress.phase);
 
-  if (progress.server?.endpoint) {
-    const primary = $("lightwalletd-url").value.split(",")[0].trim();
-    const isFallback = progress.server.endpoint !== primary;
-    $("scan-server").textContent = progress.server.endpoint + (isFallback ? " (fallback)" : "");
-    $("scan-server").title = isFallback
-      ? "Connected to a fallback server — a different operator can see your scan activity"
-      : "";
-  }
-
   const scanned = Number(progress.blocks_scanned);
   const total = Number(progress.blocks_total);
-  $("scan-progress-text").textContent =
-    `${scanned.toLocaleString()} / ${total.toLocaleString()}`;
-
-  if (total > 0) {
-    $("scan-progress-bar").style.width =
-      `${Math.min(100, (scanned / total) * 100).toFixed(1)}%`;
-  }
-
   eta.observe(scanned, total);
   // eraHint expects an absolute Zcash chain height. blocks_scanned is a
   // delta from effective_birthday — passing it directly mislabels the era
   // for any wallet whose birthday is past Sapling activation. Use
   // synced_to_height (set by the backend) when available.
   const era = progress.synced_to_height ? eraHint(Number(progress.synced_to_height)) : null;
-  const etaState = eta.estimate();
-  let etaText;
-  if (etaState.kind === "warmup") {
-    etaText = "Calculating…";
-  } else if (etaState.kind === "done") {
-    etaText = "";
-  } else {
-    etaText = etaState.text;
+  const primary = $("lightwalletd-url").value.split(",")[0].trim();
+  const fields = scanStatusFields(progress, eta.estimate(), era, primary);
+
+  if (fields.server !== null) {
+    $("scan-server").textContent = fields.server;
+    $("scan-server").title = fields.serverTitle;
   }
-  if (era) etaText = etaText ? `${etaText} · scanning ~${era}` : `scanning ~${era}`;
-  $("scan-eta").textContent = etaText;
+  $("scan-progress-text").textContent = fields.progressText;
+  if (fields.barPercent !== null) {
+    $("scan-progress-bar").style.width = `${fields.barPercent.toFixed(1)}%`;
+  }
+  $("scan-eta").textContent = fields.etaText;
+  if (fields.terminal) {
+    document.querySelectorAll("#scan-discoveries .discovery-pending").forEach((el) => el.remove());
+  }
 
   if (progress.error) {
     setStatus("scan-message", progress.error, "error");
@@ -2365,53 +2856,79 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
+// The seed-phrase route reports "pending" then "confirmed"; the seedless
+// routes (imported wallet file, pasted Sapling key, transparent-only) report
+// "broadcast" and do not poll for confirmation. Both mean the transaction is
+// on the network and cannot be undone, so they must never read as failed: a
+// user told a sent transaction failed may retry and attempt a double spend.
+function txStatusKind(status) {
+  if (status === "confirmed") return "confirmed";
+  if (status === "pending" || status === "broadcast") return "sent";
+  return "failed";
+}
+
+function txStatusLabel(status) {
+  const kind = txStatusKind(status);
+  if (kind === "confirmed") return "Confirmed";
+  if (kind === "sent") return "Broadcast — awaiting confirmation";
+  return "Failed";
+}
+
+function sweepStatusCounts(results) {
+  const counts = { confirmed: 0, pending: 0, failed: 0, broadcast: 0 };
+  for (const r of results) {
+    const kind = txStatusKind(r.status);
+    if (kind === "confirmed") counts.confirmed += 1;
+    else if (kind === "sent") counts.pending += 1;
+    else counts.failed += 1;
+  }
+  counts.broadcast = counts.confirmed + counts.pending;
+  return counts;
+}
+
+function sweepCompleteSummary(results, error) {
+  const { confirmed, failed, broadcast } = sweepStatusCounts(results);
+  if (error) {
+    // The sweep aborted partway. The transactions below were already
+    // broadcast and are irreversible; the remaining accounts were not swept.
+    // Surface this so the user does not assume nothing was sent and retry
+    // (which would double-broadcast) — audit Issue E.
+    return `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
+      `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
+  }
+  if (results.length === 0) {
+    // Nothing was broadcast because every account with a balance was skipped
+    // (below the fee floor, or transparent funds that couldn't be shielded).
+    // The reasons are listed below — this is NOT a broadcast failure.
+    return "No funds were swept — every account with a balance was skipped (reasons below).";
+  }
+  if (failed === results.length) {
+    return "All transactions failed to broadcast. No funds were moved.";
+  }
+  if (confirmed > 0) {
+    return `${confirmed} transaction${confirmed > 1 ? "s" : ""} confirmed on-chain. Your funds are on their way.`;
+  }
+  return `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
+}
+
 function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote) {
   $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
   if (state.retainedAddressSearchId) {
     state.addressMatchRecoveryLocked = false;
     document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
   }
-  const confirmed = results.filter((r) => r.status === "confirmed").length;
-  const pending = results.filter((r) => r.status === "pending").length;
-  const failed = results.filter((r) => r.status === "failed").length;
-  const broadcast = confirmed + pending;
-
-  if (error) {
-    // The sweep aborted partway. The transactions below were already
-    // broadcast and are irreversible; the remaining accounts were not swept.
-    // Surface this so the user does not assume nothing was sent and retry
-    // (which would double-broadcast) — audit Issue E.
-    $("complete-summary").textContent =
-      `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
-      `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
-  } else if (results.length === 0) {
-    // Nothing was broadcast because every account with a balance was skipped
-    // (below the fee floor, or transparent funds that couldn't be shielded).
-    // The reasons are listed below — this is NOT a broadcast failure.
-    $("complete-summary").textContent =
-      "No funds were swept — every account with a balance was skipped (reasons below).";
-  } else if (failed === results.length) {
-    $("complete-summary").textContent = "All transactions failed to broadcast. No funds were moved.";
-  } else if (confirmed > 0) {
-    $("complete-summary").textContent =
-      `${confirmed} transaction${confirmed > 1 ? "s" : ""} confirmed on-chain. Your funds are on their way.`;
-  } else {
-    $("complete-summary").textContent =
-      `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
-  }
+  const { broadcast } = sweepStatusCounts(results);
+  $("complete-summary").textContent = sweepCompleteSummary(results, error);
 
   const container = $("complete-txids");
   container.innerHTML = "";
   results.forEach((r) => {
     const card = document.createElement("div");
-    card.className = "txid-card" + (r.status === "failed" ? " txid-card--failed" : "");
+    card.className = "txid-card" + (txStatusKind(r.status) === "failed" ? " txid-card--failed" : "");
 
     const label = document.createElement("div");
     label.className = "txid-label";
-    const statusTag = r.status === "confirmed" ? "Confirmed" :
-                      r.status === "pending"   ? "Broadcast — awaiting confirmation" :
-                                                 "Failed";
-    label.textContent = `Account ${r.source_account} · ${statusTag}`;
+    label.textContent = `Account ${r.source_account} · ${txStatusLabel(r.status)}`;
     card.appendChild(label);
 
     if (r.txid) {
@@ -2637,6 +3154,10 @@ $("restart-flow").addEventListener("click", () => {
   setStatus("delete-workspace-status", "", "");
 
   seedInput.value = "";
+  forgetLoadedWalletFile();
+  $("sapling-scan-keys").value = "";
+  $("sapling-key-addresses").replaceChildren();
+  forgetSproutScanInputs();
   seedVisibility.checked = false;
   seedInput.classList.add("masked");
   seedNextBtn.disabled = true;
@@ -3037,6 +3558,8 @@ $("resume-confirm").addEventListener("click", async () => {
   $("resume-confirm").disabled = true;
   setStatus("resume-modal-status", "Verifying seed and resuming…", "");
   try {
+    // Resume is seed-only, so it always runs the shielded block sync.
+    showScanWarning("shielded");
     const handle = await invoke("resume_session", {
       input: {
         workspace_path: pendingResumeRow.workspace_path,
@@ -3062,6 +3585,7 @@ $("resume-confirm").addEventListener("click", async () => {
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 $("lightwalletd-url").value = SERVER_PRESETS.mainnet;
+renderSproutScanPanel();
 $("gap-limit-row").style.display = $("auto-gap-limit").checked ? "none" : "block";
 $("accounts-range").disabled = !$("auto-gap-limit").checked;
 $("scan-label").value = defaultScanLabel();

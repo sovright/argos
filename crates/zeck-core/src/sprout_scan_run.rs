@@ -108,7 +108,9 @@ use crate::{
         pool::{connect_to_any_except, PoolError, PEER_RECONNECT_DELAY},
         wire::P2pNetwork,
     },
-    sprout_scan::{ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner},
+    sprout_scan::{
+        CheckpointError, ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner,
+    },
 };
 use zcash_protocol::consensus::BranchId;
 
@@ -303,12 +305,13 @@ fn load_checkpoint(
         _ => (None, bytes),
     };
     let checkpoint = SproutScanCheckpoint::from_bytes(body);
-    let resumed = SproutScanner::resume(&checkpoint).map_err(|err| {
-        ZeckError::TransactionBuild(format!(
+    let resumed = SproutScanner::resume(&checkpoint).map_err(|err| match err {
+        CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(checkpoint_file),
+        _ => ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} could not be read ({err}). Delete it to \
              start a fresh scan, or restore a good copy — it holds hours of work.",
             checkpoint_file.display()
-        ))
+        )),
     })?;
 
     // The checkpoint must be for *these* keys. The default path is
@@ -342,6 +345,132 @@ fn load_checkpoint(
         )));
     }
     Ok(Some(resumed))
+}
+
+fn legacy_checkpoint_error(path: &Path) -> ZeckError {
+    ZeckError::TransactionBuild(format!(
+        "the scan checkpoint at {} predates Sprout block-body authentication and cannot \
+         be trusted for resume or spend evidence. Preserve this file and the original \
+         spending-key source; start a fresh scan in a new data directory or move this \
+         checkpoint aside first.",
+        path.display()
+    ))
+}
+
+/// A resumed scan asked to decrypt blocks its checkpoint walked past
+/// without decrypting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecryptBoundConflict {
+    /// The bound the checkpoint was scanned under.
+    pub stored: u32,
+    /// The bound now asked for; `None` is "decrypt every block".
+    pub requested: Option<u32>,
+    /// The last block the checkpoint walked.
+    pub cursor_height: u32,
+}
+
+impl DecryptBoundConflict {
+    fn into_error(self, checkpoint_file: &Path) -> ZeckError {
+        let asked = match self.requested {
+            Some(height) => format!("decryption from block {height}"),
+            None => "decryption of every block".to_owned(),
+        };
+        ZeckError::TransactionBuild(format!(
+            "the scan checkpoint at {} was saved by a scan that did not try to decrypt \
+             notes below block {stored}, and has already walked to block {cursor}. This \
+             scan asks for {asked}, so resuming would leave the blocks between unchecked \
+             and miss any notes in them. Delete the checkpoint to scan from the start, or \
+             run again with a birthday of block {stored} or later.",
+            checkpoint_file.display(),
+            stored = self.stored,
+            cursor = self.cursor_height,
+        ))
+    }
+}
+
+/// The decrypt-from bound a scan continues under, given the bound its
+/// checkpoint was scanned under, how far that checkpoint walked, and the
+/// bound now requested.
+///
+/// A resumed scan must never silently change which blocks were decrypted.
+/// Nothing walked yet: the request stands. A request at or above the stored
+/// bound: the stored one is kept, since every block it covers was decrypted
+/// anyway and it is the bound that truly applies. A request below it is
+/// accepted only while the walk has not reached the requested bound —
+/// otherwise blocks the request wants decrypted were already passed over.
+pub fn reconcile_decrypt_from(
+    stored: Option<u32>,
+    cursor_height: Option<u32>,
+    requested: Option<u32>,
+) -> Result<Option<u32>, DecryptBoundConflict> {
+    let Some(cursor_height) = cursor_height else {
+        return Ok(requested);
+    };
+    let (stored_floor, requested_floor) = (stored.unwrap_or(0), requested.unwrap_or(0));
+    if requested_floor >= stored_floor {
+        return Ok(stored);
+    }
+    // Blocks 1..=cursor were walked; those in [requested, stored) were not
+    // decrypted but the request needs them to be.
+    if cursor_height < requested_floor.max(1) {
+        return Ok(requested);
+    }
+    Err(DecryptBoundConflict {
+        stored: stored_floor,
+        requested,
+        cursor_height,
+    })
+}
+
+/// The decrypt-from bound a scan may apply, given a height the chain is
+/// known to have reached.
+///
+/// A bound above the tip would decrypt nothing at all, and can only come
+/// from creation times written by a machine whose clock ran ahead. Such a
+/// bound is evidence of nothing, so it is dropped and every block is
+/// decrypted. With no tip to compare against, the bound passes through:
+/// the creation-time check against the current time
+/// (`birthday::sprout_skip_height`) is then the only guard.
+pub fn bound_within_tip(decrypt_from: Option<u32>, tip: Option<u32>) -> Option<u32> {
+    match (decrypt_from, tip) {
+        (Some(bound), Some(tip)) if bound > tip => None,
+        _ => decrypt_from,
+    }
+}
+
+/// What to tell the user when [`bound_within_tip`] drops the requested
+/// skip for the tip the scan was given. The line printed before the scan
+/// promised a skip, and must not be left standing. Asked of the same inputs
+/// rather than inferred from the bound the scan reports, because a resume of
+/// a scan that decrypted every block also reports no bound, for a different
+/// reason.
+pub fn dropped_bound_line(requested: Option<u32>, tip: Option<u32>) -> Option<String> {
+    match (requested, bound_within_tip(requested, tip)) {
+        (Some(bound), None) => Some(format!(
+            "Trial decryption covered every block from 1: the requested start, block \
+             {bound}, is above the chain tip lightwalletd reported, so the wallet file's \
+             creation times cannot be right and were not used."
+        )),
+        _ => None,
+    }
+}
+
+/// The decrypt-from bound the saved scan for `spending_keys` ran under, or
+/// `None` when there is no checkpoint. `Some(None)` is a scan that
+/// decrypted every block.
+///
+/// For a resume that must continue exactly as the scan ran — the sweep
+/// after a scan — rather than re-deriving the bound from inputs that may
+/// have changed since, which [`reconcile_decrypt_from`] would refuse. The
+/// checkpoint is checked as a resume checks it: wrong keys or network is an
+/// error.
+pub fn saved_decrypt_from(
+    checkpoint_file: &Path,
+    network: P2pNetwork,
+    spending_keys: &[[u8; 32]],
+) -> ZeckResult<Option<Option<u32>>> {
+    Ok(load_checkpoint(checkpoint_file, network, spending_keys)?
+        .map(|scanner| scanner.decrypt_from_height()))
 }
 
 /// Read a checkpoint file. `Ok(None)` only when there is no file: any other
@@ -420,18 +549,20 @@ fn lookup_chain_spends(
     let [NETWORK_TAGGED, tag, body @ ..] = bytes.as_slice() else {
         return Err(ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} does not record its network, so its spends \
-             cannot be trusted for this one. It was written by an older Argos; running \
-             the scan again updates it.",
+             cannot be trusted for this one. Preserve the file and the original \
+             spending-key source; start a fresh scan in a new data directory or \
+             move this checkpoint aside first.",
             path.display()
         )));
     };
     let evidence =
         crate::sprout_scan::read_chain_evidence(&SproutScanCheckpoint::from_bytes(body.to_vec()))
-            .map_err(|err| {
-            ZeckError::TransactionBuild(format!(
+            .map_err(|err| match err {
+            CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(&path),
+            _ => ZeckError::TransactionBuild(format!(
                 "the scan checkpoint at {} could not be read ({err}).",
                 path.display()
-            ))
+            )),
         })?;
     if evidence.spending_keys != scan_key_set(spending_keys, &[]) {
         return Err(ZeckError::TransactionBuild(format!(
@@ -739,10 +870,9 @@ async fn verified_checkpoint_lookup_with<V: CursorVerifier>(
             "the scan checkpoint at {} changed while it was being opened; Argos will not use its spent-note evidence.", path.display()
         )));
     }
-    // For v3, bind the parsed state to the bytes stamped before the network
-    // await. Older formats re-encode as v3, so their initial and final file
-    // stamps remain the available identity check.
-    if scanner.checkpoint_version() == 3 {
+    // Bind the parsed state to the bytes stamped before the network await.
+    // Only the current layout resumes, so a re-encode is byte-identical.
+    {
         let parsed = checkpoint_content_fingerprint(&scanner, network);
         if (original_stamp.0, original_stamp.2) != parsed {
             return Err(ZeckError::ScanNotReady(format!(
@@ -1290,6 +1420,40 @@ pub async fn run_sprout_scan(
     extra_peers: &[String],
     tip_anchor: Option<TipAnchor>,
     checkpoint_file: &Path,
+    progress: impl FnMut(ScanTick),
+) -> ZeckResult<SproutScanResult> {
+    run_sprout_scan_with_decrypt_from(
+        spending_keys,
+        network,
+        extra_peers,
+        tip_anchor,
+        checkpoint_file,
+        None,
+        progress,
+    )
+    .await
+}
+
+/// [`run_sprout_scan`], not trial-decrypting blocks below `decrypt_from`.
+///
+/// The walk is unchanged: it still starts at block 1 and appends every
+/// commitment, so the tree, its root and every witness are exactly those of
+/// an unbounded scan — only notes paid below the bound go unfound. The bound
+/// must therefore come from evidence that the keys did not exist before it
+/// (`birthday::sprout_skip_height`), and the bound actually used is returned
+/// in [`SproutScanResult::decrypt_from_height`] for the caller to state.
+///
+/// The bound is saved in the checkpoint. A resume continues under it, or
+/// fails with [`DecryptBoundConflict`]'s explanation when the request would
+/// need blocks already walked to be decrypted — see
+/// [`reconcile_decrypt_from`].
+pub async fn run_sprout_scan_with_decrypt_from(
+    spending_keys: &[[u8; 32]],
+    network: P2pNetwork,
+    extra_peers: &[String],
+    tip_anchor: Option<TipAnchor>,
+    checkpoint_file: &Path,
+    decrypt_from: Option<u32>,
     mut progress: impl FnMut(ScanTick),
 ) -> ZeckResult<SproutScanResult> {
     if spending_keys.is_empty() {
@@ -1304,11 +1468,28 @@ pub async fn run_sprout_scan(
         .map_or(0, |anchor| anchor.height.saturating_add(1))
         .max(network.sprout_scan_minimum_tip());
 
+    // lightwalletd's tip is the one height known to be on the chain before
+    // any peer is reached. A requested bound above it is dropped here, before
+    // the resume check, so a checkpoint that walked under such a bound is
+    // refused rather than continued under it.
+    let decrypt_from = bound_within_tip(decrypt_from, tip_anchor.map(|anchor| anchor.height));
+
     // Resume if we can. A checkpoint that will not load is reported rather
     // than silently discarded: starting a six-hour scan over because a file
     // was quietly ignored is worse than stopping to say so.
-    let mut scanner = load_checkpoint(checkpoint_file, network, spending_keys)?
-        .unwrap_or_else(|| SproutScanner::new(spending_keys));
+    let mut scanner = match load_checkpoint(checkpoint_file, network, spending_keys)? {
+        Some(mut resumed) => {
+            let bound = reconcile_decrypt_from(
+                resumed.decrypt_from_height(),
+                resumed.cursor().map(|c| c.last_height),
+                decrypt_from,
+            )
+            .map_err(|conflict| conflict.into_error(checkpoint_file))?;
+            resumed.set_decrypt_from(bound);
+            resumed
+        }
+        None => SproutScanner::with_decrypt_from(spending_keys, decrypt_from),
+    };
 
     let mut height = first_scan_height(scanner.cursor());
 
@@ -1493,11 +1674,12 @@ pub async fn run_sprout_scan(
         .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")))
 }
 
-/// One page of blocks, in chain order, with its first header's parent for
-/// the consumer to compare against the last accepted scanner cursor.
+/// One page of blocks, in chain order: each block's hash and the JoinSplits
+/// of its authenticated body, with the first header's parent for the
+/// consumer to compare against the last accepted scanner cursor.
 struct Page {
     parent: [u8; 32],
-    blocks: Vec<([u8; 32], Vec<u8>)>,
+    blocks: Vec<([u8; 32], Vec<argos_wallet_import::keys::SproutJoinSplit>)>,
 }
 
 impl Page {
@@ -1530,7 +1712,7 @@ fn consume_page(
         )));
     }
     let mut consumed = 0;
-    for (hash, block) in &page.blocks {
+    for (hash, joinsplits) in &page.blocks {
         if crate::p2p::wire::checkpoint_at(network, *height)
             .is_some_and(|expected| *hash != expected)
             || tip_anchor
@@ -1544,13 +1726,8 @@ fn consume_page(
                  --peer with a node you trust."
             )));
         }
-        // Sprout JoinSplits exist only in v2-v4. The branch id is only
-        // consulted for pre-v5 transactions, whose encoding it does not change.
-        let joinsplits = joinsplits_in_block(block, BranchId::Canopy).map_err(|err| {
-            ZeckError::TransactionBuild(format!("block at height {height}: {err}"))
-        })?;
         scanner
-            .scan_block_at(&joinsplits, *hash, *height)
+            .scan_block_at(joinsplits, *hash, *height)
             .map_err(|err| {
                 ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
             })?;
@@ -1702,7 +1879,10 @@ impl PageFetcher {
     /// again" — the caller loops. An empty page means the chain tip was
     /// reached (see `empty_reply_is_chain_tip`). Every check that decides
     /// whether a page may be scanned at all lives here: proof of work,
-    /// continuity with the locator, and the internal linkage of the page.
+    /// continuity with the locator, the internal linkage of the page, and
+    /// each body's authentication against its header
+    /// ([`Self::authenticate_page`]). A failure of any of them is charged to
+    /// the serving peer and the page refetched from another.
     ///
     /// What deliberately does *not* live here is anything positional —
     /// checkpoint comparison and the tree append stay with the consumer, keyed
@@ -1796,11 +1976,27 @@ impl PageFetcher {
                 .await;
         }
         let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
-        let mut blocks = match self.peer.get_blocks(&hashes).await {
+        let blocks = match self.peer.get_blocks(&hashes).await {
             Ok(b) => b,
             Err(err) => return self.on_request_failure(err, height).await,
         };
+        let parent = headers[0].prev_hash;
+        self.authenticate_page(&hashes, parent, blocks, height)
+            .await
+    }
 
+    /// Turn the bodies fetched for `hashes` into a page, or reject them.
+    ///
+    /// `hashes` come from headers that have already passed proof of work and
+    /// linkage; `blocks` are what the peer sent for them, keyed by the hash
+    /// recomputed from each block's own header bytes.
+    async fn authenticate_page(
+        &mut self,
+        hashes: &[[u8; 32]],
+        parent: [u8; 32],
+        mut blocks: std::collections::HashMap<[u8; 32], Vec<u8>>,
+        height: u32,
+    ) -> ZeckResult<Option<Page>> {
         // Assembled in header order, so the consumer receives the page already
         // in chain order and never has to trust the peer's reply order.
         //
@@ -1809,7 +2005,7 @@ impl PageFetcher {
         // every commitment after it would land at the wrong position — the
         // scan would finish clean and the notes would be unspendable.
         let mut page = Page {
-            parent: headers[0].prev_hash,
+            parent,
             blocks: Vec::with_capacity(hashes.len()),
         };
         for (offset, hash) in hashes.iter().enumerate() {
@@ -1821,7 +2017,35 @@ impl PageFetcher {
                     height + offset as u32
                 )));
             };
-            page.blocks.push((*hash, block));
+            // The body must be the one the authenticated header commits to:
+            // every declared transaction parsed, nothing trailing, and the
+            // txid Merkle root equal to the header's. A body that fails is
+            // the serving peer's fault — the header and so the hash we asked
+            // for are already proven — so it is handled like any other bad
+            // reply: rotate, charge the budget, and fetch this same page
+            // again from the next peer (the locator has not moved). Fail
+            // closed: nothing reaches the consumer unless this returned `Ok`.
+            //
+            // The branch id is only consulted for pre-v5 transactions, whose
+            // encoding it does not change; v5 carries its own. Sprout
+            // JoinSplits exist only in v2-v4, before and after Canopy alike.
+            let joinsplits = match joinsplits_in_block(&block, BranchId::Canopy) {
+                Ok(joinsplits) => joinsplits,
+                Err(err) => {
+                    let at = height + offset as u32;
+                    return self
+                        .rotate(format!(
+                            "{} attempts in a row to fetch blocks from height {height} failed; \
+                             the most recent served a body for the block at height {at} that \
+                             does not match its header ({err}). The scan never uses an \
+                             unauthenticated block, so it stops here. Progress is saved; \
+                             re-run to pick other peers, or pass --peer with a node you trust.",
+                            self.empty_replies + 1
+                        ))
+                        .await;
+                }
+            };
+            page.blocks.push((*hash, joinsplits));
         }
 
         self.locator = *hashes.last().expect("non-empty");
@@ -2608,41 +2832,46 @@ mod tests {
         );
     }
 
+    /// A pre-v5 checkpoint has no rollback history (v4) or no body
+    /// authentication (v1-v3). It is refused before any live verification
+    /// is attempted, and the file is left for the user to preserve.
     #[tokio::test]
-    async fn legacy_checkpoint_on_a_fork_requires_a_safe_rescan() {
-        let dir = ScratchDir::new("evidence-legacy-fork");
-        let keys = [[0x11; 32]];
-        let mut scanner = SproutScanner::new(&keys);
-        scanner
-            .scan_block_at(&[joinsplit_revealing([0xEE; 32])], [0; 32], 7)
-            .unwrap();
-        let mut body = scanner.checkpoint().as_bytes().to_vec();
-        body[0] = 2;
-        body.truncate(body.len() - 8); // v3's empty rollback-history count
-        let cursor_hash = body.len() - 41;
-        body[cursor_hash..cursor_hash + 32].copy_from_slice(&[0xAA; 32]);
-        let path = checkpoint_path(&dir.0, &keys);
-        let mut file = vec![NETWORK_TAGGED, network_tag(P2pNetwork::Regtest)];
-        file.extend_from_slice(&body);
-        std::fs::write(&path, &file).unwrap();
-        let mut verifier = FakeCursorVerifier {
-            response: Some(CanonicalContinuation::CommonAncestor(ScanCursor {
-                last_block_hash: [0xBB; 32],
-                last_height: 6,
-            })),
-            seen: Vec::new(),
-        };
-        let (chain, notice) =
-            wallet_evidence_with_fake(&dir.0, &keys, &mut verifier, &ChainSpendsCache::default())
-                .await;
-        assert!(chain.is_none(), "a legacy fork has no rollback history");
-        let notice = notice.unwrap();
-        assert!(notice.contains("safe full rescan"), "{notice}");
-        assert!(
-            notice.contains("keep the original wallet or key"),
-            "{notice}"
-        );
-        assert_eq!(std::fs::read(path).unwrap(), file);
+    async fn a_legacy_checkpoint_is_refused_before_verification() {
+        for legacy in [2u8, 4] {
+            let dir = ScratchDir::new(&format!("evidence-legacy-v{legacy}"));
+            let keys = [[0x11; 32]];
+            let mut scanner = SproutScanner::new(&keys);
+            scanner
+                .scan_block_at(&[joinsplit_revealing([0xEE; 32])], [0xAA; 32], 7)
+                .unwrap();
+            let mut body = scanner.checkpoint().as_bytes().to_vec();
+            body[0] = legacy;
+            let path = checkpoint_path(&dir.0, &keys);
+            let mut file = vec![NETWORK_TAGGED, network_tag(P2pNetwork::Regtest)];
+            file.extend_from_slice(&body);
+            std::fs::write(&path, &file).unwrap();
+            let mut verifier = FakeCursorVerifier {
+                response: Some(CanonicalContinuation::Current {
+                    chain_has_more: false,
+                }),
+                seen: Vec::new(),
+            };
+            let (chain, notice) = wallet_evidence_with_fake(
+                &dir.0,
+                &keys,
+                &mut verifier,
+                &ChainSpendsCache::default(),
+            )
+            .await;
+            assert!(chain.is_none(), "v{legacy} is never spend evidence");
+            let notice = notice.unwrap();
+            assert!(notice.contains("fresh scan"), "v{legacy}: {notice}");
+            assert!(
+                verifier.seen.is_empty(),
+                "v{legacy}: refused before verification"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), file);
+        }
     }
 
     #[tokio::test]
@@ -2873,7 +3102,7 @@ mod tests {
         let original = std::fs::read(&path).unwrap();
         let page = Page {
             parent: [0xee; 32],
-            blocks: vec![([4; 32], vec![0xff])],
+            blocks: vec![([4; 32], Vec::new())],
         };
         let mut height = 4;
         let err = consume_page(&mut scanner, &page, P2pNetwork::Regtest, None, &mut height)
@@ -3164,6 +3393,148 @@ mod tests {
         );
         assert_eq!(fetcher.empty_replies, 1, "but charged");
         assert!(waits_rx.try_recv().is_err(), "and not announced as silence");
+    }
+
+    /// A peer that completes the handshake on its first connection only, and
+    /// drops every later one before the handshake: once rotated away from,
+    /// it cannot be chosen again, so the test knows which peer comes next.
+    async fn one_connection_only_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(answer_handshake_only(stream));
+            }
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        addr
+    }
+
+    /// An honest block, and the same header over a substituted body: the
+    /// header (and so the block hash the peer was asked for) is unchanged,
+    /// only the transactions differ.
+    fn honest_and_forged_block() -> ([u8; 32], Vec<u8>, Vec<u8>) {
+        use crate::p2p::block::test_support::{legacy_test_transaction, test_block};
+        let honest_tx = legacy_test_transaction(1);
+        let forged_tx = legacy_test_transaction(2);
+        let honest = test_block(std::slice::from_ref(&honest_tx));
+        let mut forged = honest[..honest.len() - honest_tx.len()].to_vec();
+        forged.extend_from_slice(&forged_tx);
+        let hash = crate::p2p::block::block_hash(&honest).unwrap();
+        assert_eq!(crate::p2p::block::block_hash(&forged).unwrap(), hash);
+        (hash, honest, forged)
+    }
+
+    fn fetcher_on(peer: Peer, peers: Vec<String>) -> PageFetcher {
+        let (waits, _rx) = tokio::sync::mpsc::unbounded_channel();
+        PageFetcher {
+            peer,
+            locator: [7; 32],
+            empty_replies: 0,
+            fetched: 10,
+            floor: 0,
+            network: P2pNetwork::Regtest,
+            peers,
+            silent: Vec::new(),
+            silence_exclusion: PEER_RECONNECT_DELAY,
+            waits,
+        }
+    }
+
+    /// Review of #265: a body that fails authentication used to abort the
+    /// whole scan from the consumer, with no other peer tried. It is the
+    /// serving peer's failure: rotate away, charge the budget, and fetch the
+    /// same page again from the next peer — never scanning the forged body.
+    #[tokio::test]
+    async fn a_peer_serving_a_forged_body_is_rotated_away_and_the_page_refetched() {
+        let bad = one_connection_only_peer().await;
+        let good = silent_peer().await;
+        let first = connect_peer(P2pNetwork::Regtest, std::slice::from_ref(&bad), &[], |_| {})
+            .await
+            .unwrap();
+        let mut fetcher = fetcher_on(first, vec![bad.clone(), good.clone()]);
+        let (hash, honest, forged) = honest_and_forged_block();
+
+        let outcome = fetcher
+            .authenticate_page(
+                &[hash],
+                [7; 32],
+                std::collections::HashMap::from([(hash, forged)]),
+                10,
+            )
+            .await
+            .expect("one forged body is within the budget");
+        assert!(outcome.is_none(), "the forged page is not handed on");
+        assert_eq!(fetcher.peer.dialled_as(), good, "rotated to the other peer");
+        assert_eq!(fetcher.empty_replies, 1, "charged against the budget");
+        assert!(fetcher.silent.is_empty(), "a forged body is not silence");
+        assert_eq!(fetcher.locator, [7; 32], "the same page is asked for again");
+
+        let page = fetcher
+            .authenticate_page(
+                &[hash],
+                [7; 32],
+                std::collections::HashMap::from([(hash, honest)]),
+                10,
+            )
+            .await
+            .expect("the honest body authenticates")
+            .expect("and is a page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.parent, [7; 32]);
+        assert_eq!(page.blocks[0].0, hash);
+        assert!(
+            page.blocks[0].1.is_empty(),
+            "a coinbase-only block has no JoinSplits"
+        );
+        assert_eq!(fetcher.locator, hash, "the scan moves on past the page");
+        assert_eq!(
+            fetcher.empty_replies, 0,
+            "a delivered page resets the budget"
+        );
+    }
+
+    /// With no honest peer to be had, the budget still ends the scan, with
+    /// an error saying what to do.
+    #[tokio::test]
+    async fn forged_bodies_from_every_peer_exhaust_the_budget() {
+        let peer = silent_peer().await;
+        let first = connect_peer(
+            P2pNetwork::Regtest,
+            std::slice::from_ref(&peer),
+            &[],
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let mut fetcher = fetcher_on(first, vec![peer]);
+        let (hash, _, forged) = honest_and_forged_block();
+
+        let mut attempts = 0u32;
+        let err = loop {
+            attempts += 1;
+            match fetcher
+                .authenticate_page(
+                    &[hash],
+                    [7; 32],
+                    std::collections::HashMap::from([(hash, forged.clone())]),
+                    10,
+                )
+                .await
+            {
+                Ok(None) => continue,
+                Ok(Some(_)) => panic!("a forged body must never be handed on"),
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(attempts, MAX_EMPTY_REPLIES + 1);
+        let text = err.to_string();
+        assert!(text.contains("height 10"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert!(text.contains("re-run"), "{text}");
+        assert_eq!(fetcher.locator, [7; 32]);
     }
 
     #[test]
@@ -3542,6 +3913,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn a_legacy_covering_scan_is_reported_but_not_used() {
+        for legacy in [2u8, 3, 4] {
+            let dir = ScratchDir::new(&format!("legacy-superset-v{legacy}"));
+            let (a, b) = ([0x31; 32], [0x32; 32]);
+            let path = write_scan(&dir.0, &[a, b], 3_000_000, true);
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
+
+            let (chain, notice) =
+                wallet_evidence_with_current(&dir.0, P2pNetwork::Mainnet, &[a]).await;
+            assert!(chain.is_none(), "v{legacy}");
+            let notice = notice.expect("old covering scan must be reported");
+            assert!(notice.contains("fresh scan"), "{notice}");
+            assert!(notice.contains(&path.display().to_string()), "{notice}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
+    }
+
     /// #240 finding 9, remaining half: opening a wallet asks for the scan
     /// twice (inspection, then preview). The second is served from memory
     /// until the file changes.
@@ -3710,6 +4101,46 @@ mod tests {
         assert!(chain.nullifiers.contains_key(&[0x99; 32]));
         assert!(chain.nullifiers.contains_key(&[0x72; 32]));
         assert_eq!(chain.scanned_to, 2_000_000);
+    }
+
+    #[test]
+    fn a_legacy_checkpoint_cannot_resume_a_scan() {
+        // v3 matters most: it is the decrypt-from layout already on main,
+        // written before bodies were authenticated.
+        for legacy in [2u8, 3] {
+            let dir = ScratchDir::new(&format!("legacy-resume-v{legacy}"));
+            let keys = [[0x11; 32]];
+            let path = checkpoint_path(&dir.0, &keys);
+            save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
+
+            let err = match load_checkpoint(&path, P2pNetwork::Mainnet, &keys) {
+                Err(err) => err,
+                Ok(_) => panic!("v{legacy} state predates body authentication"),
+            };
+            assert!(err.to_string().contains("fresh scan"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
+    }
+
+    #[test]
+    fn a_legacy_checkpoint_cannot_answer_wallet_file_spends() {
+        for legacy in [2u8, 3] {
+            let dir = ScratchDir::new(&format!("legacy-spends-v{legacy}"));
+            let keys = [[0x11; 32]];
+            let path = checkpoint_path(&dir.0, &keys);
+            save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
+
+            let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+                .expect_err("pre-v4 nullifiers predate body authentication");
+            assert!(err.to_string().contains("fresh scan"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
     }
 
     /// Kristi, #240 #10: the revealing txid is carried to the caller, so a
@@ -3975,5 +4406,127 @@ mod tests {
             "the message must say what happened and what to do: {text}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── decrypt-from bound across a resume ───────────────────────────────────
+
+    #[test]
+    fn a_fresh_scan_takes_the_requested_bound() {
+        assert_eq!(
+            reconcile_decrypt_from(Some(50), None, Some(10)),
+            Ok(Some(10))
+        );
+        assert_eq!(reconcile_decrypt_from(Some(50), None, None), Ok(None));
+    }
+
+    /// Asking for a later bound than the checkpoint was scanned under is
+    /// safe — the earlier blocks were decrypted anyway — and keeps the
+    /// checkpoint's, so the reported bound is the one actually used.
+    #[test]
+    fn a_resume_keeps_a_lower_stored_bound() {
+        assert_eq!(
+            reconcile_decrypt_from(Some(10), Some(500), Some(10)),
+            Ok(Some(10))
+        );
+        assert_eq!(
+            reconcile_decrypt_from(Some(10), Some(500), Some(90)),
+            Ok(Some(10))
+        );
+        assert_eq!(reconcile_decrypt_from(None, Some(500), Some(90)), Ok(None));
+    }
+
+    /// Lowering the bound is only possible while the walk has not yet
+    /// reached the new bound: past it, blocks the new bound wants decrypted
+    /// were walked without decryption, and resuming would miss their notes.
+    #[test]
+    fn a_resume_refuses_a_lower_bound_it_has_already_passed() {
+        assert_eq!(
+            reconcile_decrypt_from(Some(100), Some(49), Some(50)),
+            Ok(Some(50))
+        );
+        assert!(reconcile_decrypt_from(Some(100), Some(50), Some(50)).is_err());
+        assert!(reconcile_decrypt_from(Some(100), Some(99), Some(50)).is_err());
+        // Turning the skip off entirely, once any block has been walked.
+        let conflict = reconcile_decrypt_from(Some(100), Some(1), None).unwrap_err();
+        assert_eq!(conflict.stored, 100);
+        assert_eq!(conflict.requested, None);
+    }
+
+    /// A bound above the tip lightwalletd reported would decrypt nothing at
+    /// all. Such a bound can only come from wrong creation times, so it is
+    /// dropped and every block is decrypted. With no tip to compare against
+    /// the bound passes through; the creation-time check already ran.
+    #[test]
+    fn a_bound_above_the_known_tip_is_not_applied() {
+        assert_eq!(bound_within_tip(Some(500), Some(400)), None);
+        assert_eq!(bound_within_tip(Some(400), Some(400)), Some(400));
+        assert_eq!(bound_within_tip(Some(300), Some(400)), Some(300));
+        assert_eq!(bound_within_tip(Some(500), None), Some(500));
+        assert_eq!(bound_within_tip(None, Some(400)), None);
+    }
+
+    #[test]
+    fn a_dropped_skip_is_said_and_a_kept_one_is_not() {
+        let line = dropped_bound_line(Some(500), Some(400)).expect("the skip was dropped");
+        assert!(
+            line.contains("every block") && line.contains("500"),
+            "{line}"
+        );
+        assert_eq!(dropped_bound_line(Some(500), Some(500)), None);
+        assert_eq!(dropped_bound_line(Some(500), None), None);
+        assert_eq!(dropped_bound_line(None, Some(400)), None);
+    }
+
+    /// The sweep resumes under the bound the scan actually used, read from
+    /// the checkpoint, so no later change to the form can make it conflict.
+    #[test]
+    fn the_saved_bound_is_read_back_for_the_same_keys_only() {
+        let keys = [[0x13; 32]];
+        let dir = fresh_dir("saved-decrypt-from");
+
+        let missing = dir.join("missing.checkpoint");
+        assert_eq!(
+            saved_decrypt_from(&missing, P2pNetwork::Regtest, &keys).unwrap(),
+            None
+        );
+
+        for (name, bound) in [("skip", Some(300)), ("every", None)] {
+            let mut scanner = SproutScanner::with_decrypt_from(&keys, bound);
+            scanner
+                .scan_block_at(&[], [0xCF; 32], 400)
+                .expect("an empty block");
+            let path = dir.join(format!("{name}.checkpoint"));
+            save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+            assert_eq!(
+                saved_decrypt_from(&path, P2pNetwork::Regtest, &keys).unwrap(),
+                Some(bound),
+                "{name}"
+            );
+            // Another key set's checkpoint is refused, not read.
+            assert!(saved_decrypt_from(&path, P2pNetwork::Regtest, &[[0x14; 32]]).is_err());
+            discard_checkpoint(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn resuming_a_skipping_scan_without_the_skip_is_refused_before_any_peer() {
+        let keys = [[0x12; 32]];
+        let mut scanner = SproutScanner::with_decrypt_from(&keys, Some(300));
+        scanner
+            .scan_block_at(&[], [0xCE; 32], 400)
+            .expect("an empty block");
+        let dir = fresh_dir("decrypt-bound-resume");
+        let path = dir.join("skip.checkpoint");
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+
+        let err = run_sprout_scan(&keys, P2pNetwork::Regtest, &[], None, &path, |_| {})
+            .await
+            .expect_err("blocks below 300 were never decrypted");
+        let message = err.to_string();
+        assert!(message.contains("300"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        // The file is kept: it is still a valid scan under its own bound.
+        assert!(path.exists());
+        discard_checkpoint(&path);
     }
 }

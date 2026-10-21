@@ -408,7 +408,7 @@ COMMANDS:
   sweep-sprout    Sweep Sprout notes and witnesses already present in wallet.dat
 
 GLOBAL OPTIONS:
-  --seed-file <PATH>           Private file containing the 24-word mnemonic
+  --seed-file <PATH>           Private file containing the 12–24 word mnemonic
   --wallet-file <PATH>         Read-only zcashd or ZecWallet Lite wallet file
   --sapling-key-file <PATH>    One extended Sapling spending key per line
   --sprout-key-file <PATH>     One SK… / ST… Sprout spending key per line
@@ -496,7 +496,7 @@ scan controls before the ordinary flow continues.
 
 **Screen 1 — Welcome**
 - Brief explanation of what ZecWallet Lite was and why recovery is needed
-- "I have my 24-word seed phrase" → proceed
+- "I have my seed phrase" → proceed
 - "I have a wallet file" → open the read-only wallet / standalone-key screen
 - Link to docs / FAQ
 
@@ -504,7 +504,7 @@ scan controls before the ordinary flow continues.
 - 24 text inputs in a 6×4 grid, or one large paste-friendly textarea
 - BIP-39 word validation with autocomplete (word list is static, no network call)
 - Inputs masked by default with "show" toggle (eye icon)
-- Validation: green checkmark when all 24 words are valid BIP-39 and checksum passes
+- Validation: green checkmark when the phrase is 12, 15, 18, 21 or 24 valid BIP-39 words and the checksum passes; a phrase shorter than 24 words also notes that it did not come from ZecWallet Lite
 - Seed phrase is never logged. It crosses the local Tauri IPC boundary once,
   is immediately wrapped in `SecretString`, and is cleared from frontend state
   after the scan starts. This is the accepted local IPC exposure recorded in
