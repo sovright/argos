@@ -3872,22 +3872,24 @@ fn applescript_quote(input: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn powershell_quote(input: &str) -> String {
-    // PowerShell single-quoted string: only single-quotes need escaping (doubled).
-    // Strip control chars to avoid shell injection.
+    // PowerShell single-quoted string. Its tokenizer ends one at ASCII `'`
+    // and also at the typographic quotes U+2018-U+201B, so each of them is
+    // escaped the way PowerShell escapes its own: doubled. Missing the
+    // typographic ones let server-controlled text (it reaches the body through
+    // scan errors) close the string and run code. Control chars are stripped.
     let escaped: String = input
         .chars()
         .filter(|c| !c.is_control())
-        .map(|c| {
-            if c == '\'' {
-                "''".to_string()
-            } else {
-                c.to_string()
-            }
-        })
+        .flat_map(|c| std::iter::once(c).chain(is_powershell_single_quote(c).then_some(c)))
         .collect();
     format!("'{escaped}'")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_powershell_single_quote(c: char) -> bool {
+    matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
 }
 
 #[cfg(test)]
@@ -4979,21 +4981,28 @@ mod tests {
         assert_eq!(format_zec(2_100_000_000_000_000), "21000000 ZEC");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn powershell_quote_simple() {
         assert_eq!(powershell_quote("hello"), "'hello'");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn powershell_quote_single_quote_escaped() {
         assert_eq!(powershell_quote("it's done"), "'it''s done'");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn powershell_quote_strips_control_chars() {
         assert_eq!(powershell_quote("abc\x00def"), "'abcdef'");
+    }
+
+    // PowerShell also ends a single-quoted string at U+2018..U+201B; an
+    // unescaped one would let the rest of the text run as code.
+    #[test]
+    fn powershell_quote_doubles_typographic_single_quotes() {
+        assert_eq!(
+            powershell_quote("x\u{2019}+$(calc)+\u{2018}y\u{201A}\u{201B}"),
+            "'x\u{2019}\u{2019}+$(calc)+\u{2018}\u{2018}y\u{201A}\u{201A}\u{201B}\u{201B}'"
+        );
     }
 }
