@@ -112,9 +112,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $exact -Package argos-core -TestName sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle
           & $exact -Package argos-core -TestName workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader
+          & $exact -Package argos-core -TestName workspace::tests::busy_wallet_rebuild_times_out_without_changing_the_live_database
           & $exact -Package argos-core -TestName workspace::tests::listing_wallet_connection_is_immutable_and_query_only
           & $exact -Package argos-core -TestName workspace::tests::listing_reads_an_initialized_trusted_workspace_without_mutation
           & $exact -Package argos-core -TestName workspace::tests::private_workspace_file_authority_publishes_inside_verified_workspace
+          & $exact -Package argos-core -TestName scan::tests::cancel_resume::gap_extension_rebuilds_a_scanned_wallet_instead_of_importing_into_it
           & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::restart_restores_tombstone_and_a_new_scan_may_delete_it
           & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing
           & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation

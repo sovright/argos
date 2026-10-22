@@ -232,14 +232,14 @@ impl RecoveryWorkspace {
                 self.wallet_db_path.display()
             ))
         })?;
-        set_private_file_permissions(&self.wallet_db_path)?;
+        verify_private_wallet_file(&self.wallet_db_path)?;
         // WAL mode adds `-wal`/`-shm` sidecar files; verify them too.
         for suffix in ["-wal", "-shm"] {
             let mut sidecar = self.wallet_db_path.as_os_str().to_owned();
             sidecar.push(suffix);
             let sidecar = PathBuf::from(sidecar);
             if sidecar.exists() {
-                set_private_file_permissions(&sidecar)?;
+                verify_private_wallet_file(&sidecar)?;
             }
         }
 
@@ -264,13 +264,13 @@ impl RecoveryWorkspace {
                 self.wallet_db_path.display()
             ))
         })?;
-        set_private_file_permissions(&self.wallet_db_path)?;
+        verify_private_wallet_file(&self.wallet_db_path)?;
         for suffix in ["-wal", "-shm"] {
             let mut sidecar = self.wallet_db_path.as_os_str().to_owned();
             sidecar.push(suffix);
             let sidecar = PathBuf::from(sidecar);
             if sidecar.exists() {
-                set_private_file_permissions(&sidecar)?;
+                verify_private_wallet_file(&sidecar)?;
             }
         }
         Ok(())
@@ -666,14 +666,25 @@ fn verify_private_dirs(private_root: &Path, leaf: &Path) -> ZeckResult<()> {
     Ok(())
 }
 
-fn set_private_file_permissions(path: &Path) -> ZeckResult<()> {
-    let file = private_fs::open_private_file(path, PrivateOpenMode::Append).map_err(|err| {
+/// Recheck an initialized SQLite file without demanding an exclusive open.
+/// The wallet open path has already authenticated and retained its exact
+/// lineage; this postcondition verifies the current object and access control
+/// through the same private parent while remaining compatible with live
+/// SQLite handles and Windows' retained no-delete authority.
+fn verify_private_wallet_file(path: &Path) -> ZeckResult<()> {
+    let parent_path = path.parent().ok_or_else(|| {
         ZeckError::Storage(format!(
-            "verifying private permissions on {}: {err}",
+            "private wallet file {} has no parent directory",
             path.display()
         ))
     })?;
-    private_fs::harden_private_file(&file).map_err(|err| {
+    let parent = private_fs::open_private_sqlite_parent(parent_path).map_err(|err| {
+        ZeckError::Storage(format!(
+            "verifying private parent for {}: {err}",
+            path.display()
+        ))
+    })?;
+    private_fs::verify_private_child_file(&parent, path).map_err(|err| {
         ZeckError::Storage(format!(
             "verifying private permissions on {}: {err}",
             path.display()
@@ -2536,7 +2547,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn set_private_file_permissions_rejects_insecure_reuse_without_repair() {
+    fn private_wallet_file_verification_rejects_insecure_reuse_without_repair() {
         // R-W22: reused files must already be `0o600`; chmod cannot revoke a
         // stale descriptor held by another process.
         use std::os::unix::fs::PermissionsExt;
@@ -2545,7 +2556,7 @@ mod tests {
         std::fs::write(&file, b"sensitive").expect("write file");
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
             .expect("seed perms");
-        super::set_private_file_permissions(&file).expect_err("permissive reuse must fail closed");
+        super::verify_private_wallet_file(&file).expect_err("permissive reuse must fail closed");
         let mode = std::fs::metadata(&file)
             .expect("metadata")
             .permissions()
