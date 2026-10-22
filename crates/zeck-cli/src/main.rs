@@ -1770,6 +1770,14 @@ fn print_sprout_transactions(outcome: &argos_core::sprout_sweep::SproutSweepOutc
                     transaction.txid
                 );
             }
+            argos_core::TxLifecycleState::Expired if transaction.superseded => println!(
+                "  expired; superseded by a newer transaction for the same note {amount} — {}",
+                transaction.txid
+            ),
+            argos_core::TxLifecycleState::Rejected if transaction.superseded => println!(
+                "  rejected; superseded by a newer transaction for the same note {amount} — {}",
+                transaction.txid
+            ),
             argos_core::TxLifecycleState::Expired => println!(
                 "  expired; ready for a new plan {amount} — {}",
                 transaction.txid
@@ -3916,6 +3924,7 @@ mod tests {
                 value_zatoshis: Some(7),
                 state: argos_core::TxLifecycleState::Pending,
                 mined_height: None,
+                superseded: false,
             }],
             ..Default::default()
         };

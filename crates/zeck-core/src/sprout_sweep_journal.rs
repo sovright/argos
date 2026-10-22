@@ -223,6 +223,10 @@ pub struct SproutJournalSnapshot {
     by_txid: HashMap<TxId, SproutNoteId>,
     seen_transactions: HashMap<TxId, (SproutNoteId, u64, PreparedTransaction)>,
     order: Vec<SproutNoteId>,
+    /// Expired or rejected transactions a later plan replaced, in the order
+    /// they were replaced. Kept so the old txid stays visible to the user;
+    /// never indexed by txid, so no transition can reach them.
+    superseded: Vec<SproutJournalEntry>,
 }
 
 impl SproutJournalSnapshot {
@@ -240,6 +244,12 @@ impl SproutJournalSnapshot {
 
     pub fn entries_in_journal_order(&self) -> impl Iterator<Item = &SproutJournalEntry> {
         self.entries()
+    }
+
+    /// Transactions replaced by a later plan for the same note. Their state
+    /// is final (Expired or Rejected) and their value is never counted.
+    pub fn superseded_entries(&self) -> impl Iterator<Item = &SproutJournalEntry> {
+        self.superseded.iter()
     }
 
     pub fn ready_for_new_plan(&self, outpoint: &JsOutPoint) -> bool {
@@ -311,8 +321,10 @@ impl SproutJournalSnapshot {
                             "conflicting prepared transaction for active note",
                         ));
                     }
-                    self.by_txid.remove(&existing.txid());
+                    let replaced = existing.clone();
+                    self.by_txid.remove(&replaced.txid());
                     self.order.retain(|existing| *existing != note_id);
+                    self.superseded.push(replaced);
                 }
                 self.seen_transactions
                     .insert(tx.txid, (note_id, value_zatoshis, tx.clone()));

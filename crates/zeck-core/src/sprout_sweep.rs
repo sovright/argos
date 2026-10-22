@@ -381,6 +381,9 @@ pub struct SproutSweepTransaction {
     pub value_zatoshis: Option<u64>,
     pub state: TxLifecycleState,
     pub mined_height: Option<u32>,
+    /// An expired or rejected transaction a later plan for the same note
+    /// replaced. Listed so its txid is not lost; it needs no action.
+    pub superseded: bool,
 }
 
 /// One note the network refused to let the sweep spend.
@@ -965,8 +968,9 @@ pub struct SproutReconciliation {
     pub fresh_safe_to_discard: HashSet<TxId>,
 }
 
-fn transaction_summary(entry: &SproutJournalEntry) -> SproutSweepTransaction {
+fn transaction_summary(entry: &SproutJournalEntry, superseded: bool) -> SproutSweepTransaction {
     SproutSweepTransaction {
+        superseded,
         txid: entry.txid().to_string(),
         value_zatoshis: entry.value_zatoshis,
         state: entry.state,
@@ -983,8 +987,13 @@ fn transaction_summary(entry: &SproutJournalEntry) -> SproutSweepTransaction {
 
 fn transaction_summaries(snapshot: &SproutJournalSnapshot) -> Vec<SproutSweepTransaction> {
     snapshot
-        .entries_in_journal_order()
-        .map(transaction_summary)
+        .superseded_entries()
+        .map(|entry| transaction_summary(entry, true))
+        .chain(
+            snapshot
+                .entries_in_journal_order()
+                .map(|entry| transaction_summary(entry, false)),
+        )
         .collect()
 }
 
@@ -3911,5 +3920,52 @@ mod tests {
         let mut observer = LifecycleObserver::new([(tx.txid, deep)]);
         let (outcome, _, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1082);
         assert!(outcome.fresh_all_mined, "{:?}", outcome.error);
+    }
+
+    #[test]
+    fn a_replanned_note_keeps_its_expired_transaction_visible_as_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 109);
+        let old = fixture_transaction(1090, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &old,
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+        let expired_tip = first_expired_tip(140);
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
+        let mut observer = LifecycleObserver::new([(old.txid, absent(Some(140), expired_tip))]);
+        let (outcome, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &journal, 1091);
+        assert_eq!(builds, 1);
+        assert_eq!(node.sent, raw);
+        assert_eq!(outcome.transactions.len(), 2, "{:?}", outcome.transactions);
+        let old_summary = outcome
+            .transactions
+            .iter()
+            .find(|transaction| transaction.txid == old.txid.to_string())
+            .expect("the expired transaction stays visible");
+        assert_eq!(
+            old_summary.state,
+            crate::broadcast::TxLifecycleState::Expired
+        );
+        assert!(old_summary.superseded);
+        let new_summary = outcome
+            .transactions
+            .iter()
+            .find(|transaction| transaction.txid != old.txid.to_string())
+            .unwrap();
+        assert_eq!(
+            new_summary.state,
+            crate::broadcast::TxLifecycleState::Pending
+        );
+        assert!(!new_summary.superseded);
+        // The superseded value is not counted twice.
+        assert_eq!(outcome.pending_zatoshis, 1_000_000 - SPROUT_SWEEP_FEE);
+        // And it survives a reload.
+        let reloaded = journal.load_or_migrate().unwrap();
+        assert_eq!(transaction_summaries(&reloaded).len(), 2);
     }
 }

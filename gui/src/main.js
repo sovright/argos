@@ -1046,9 +1046,15 @@ function sproutLifecycleRow(transaction) {
         ? `${subject}: mined; the block height was not reported.`
         : `${subject}: mined at block ${Number(transaction.mined_height).toLocaleString()}.`;
     case "expired":
+      if (transaction.superseded === true) {
+        return `${subject}: expired and superseded by a newer transaction for the same note.`;
+      }
       return `${subject}: expired without canonical mined confirmation. ` +
         "Recover or rescan the note before creating a replacement.";
     case "rejected":
+      if (transaction.superseded === true) {
+        return `${subject}: rejected and superseded by a newer transaction for the same note.`;
+      }
       return `${subject}: rejected. Recover or rescan the note before creating a replacement.`;
     case "not_submitted":
       return `${subject}: saved but not submitted. No funds were moved.`;
@@ -1090,7 +1096,10 @@ function renderSproutSweepReport(report, { list, statusId, destination, statusPr
     list.appendChild(li);
   }
 
-  const count = (state) => transactions.filter((transaction) => transaction.state === state).length;
+  // A superseded row is history: a later plan replaced it, so it needs no action.
+  const count = (state) => transactions.filter(
+    (transaction) => transaction.state === state && transaction.superseded !== true,
+  ).length;
   const unknown = count("submission_unknown");
   const pending = count("pending");
   const expired = count("expired");

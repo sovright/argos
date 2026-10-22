@@ -1102,6 +1102,8 @@ pub struct SproutSweepResult {
     pub value_zatoshis: Option<u64>,
     pub state: argos_core::TxLifecycleState,
     pub mined_height: Option<u32>,
+    /// Replaced by a later plan for the same note; listed, needs no action.
+    pub superseded: bool,
 }
 
 #[derive(Serialize)]
@@ -1129,6 +1131,8 @@ fn sprout_result_from_entry(
             .as_ref()
             .filter(|observation| observation.has_canonical_mined_evidence())
             .and_then(|observation| observation.mined_height),
+        // Built from a live journal entry, which a later plan has not replaced.
+        superseded: false,
     }
 }
 
@@ -1959,6 +1963,7 @@ fn sprout_sweep_report(
                 value_zatoshis: transaction.value_zatoshis,
                 state: transaction.state,
                 mined_height: transaction.mined_height,
+                superseded: transaction.superseded,
             })
             .collect(),
         mined_zatoshis: outcome.mined_zatoshis,
@@ -4253,18 +4258,21 @@ mod tests {
                     value_zatoshis: Some(7),
                     state: argos_core::TxLifecycleState::Pending,
                     mined_height: None,
+                    superseded: false,
                 },
                 argos_core::sprout_sweep::SproutSweepTransaction {
                     txid: "unknown".to_owned(),
                     value_zatoshis: None,
                     state: argos_core::TxLifecycleState::SubmissionUnknown,
                     mined_height: None,
+                    superseded: false,
                 },
                 argos_core::sprout_sweep::SproutSweepTransaction {
                     txid: "mined".to_owned(),
                     value_zatoshis: Some(11),
                     state: argos_core::TxLifecycleState::Mined,
                     mined_height: Some(123),
+                    superseded: false,
                 },
             ],
             mined_zatoshis: 11,
@@ -4395,6 +4403,7 @@ mod tests {
                 value_zatoshis: Some(11),
                 state: argos_core::TxLifecycleState::Mined,
                 mined_height: Some(123),
+                superseded: false,
             }],
             mined_zatoshis: 11,
             fresh_all_mined: false,
