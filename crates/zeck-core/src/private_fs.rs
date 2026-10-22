@@ -3597,15 +3597,35 @@ fn ensure_private_workspace_lineage_impl(
                 &publication_parent,
                 published,
             )?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-publish {}: lineage verified",
+                private_root.display()
+            );
             if verified.id != staged_id {
                 return Err(invalid_lineage(
                     "private workspace root changed during staged publication",
                 ));
             }
             let leaf_handle = open_private_sqlite_parent(leaf)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-publish {}: SQLite parent opened",
+                private_root.display()
+            );
             ensure_private_sqlite_lineage(&verified, &leaf_handle, leaf, database)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-publish {}: SQLite lineage matched",
+                private_root.display()
+            );
             if activate_sqlite {
                 ensure_private_sqlite_file(&verified, &leaf_handle, leaf, database)?;
+                #[cfg(all(test, windows))]
+                eprintln!(
+                    "workspace-publish {}: SQLite authority active",
+                    private_root.display()
+                );
             }
             Ok(verified)
         }
@@ -3813,9 +3833,13 @@ pub(crate) fn ensure_private_sqlite_file(
         ));
     }
     root.verify_current()?;
+    #[cfg(all(test, windows))]
+    eprintln!("sqlite-authority {}: root current", path.display());
     let parent_id = private_object_id(parent)?;
     let marker_path = sqlite_lineage_path(path)?;
     let (marker_bytes, marker_id) = read_private_lineage_child_bytes(parent, &marker_path)?;
+    #[cfg(all(test, windows))]
+    eprintln!("sqlite-authority {}: marker read", path.display());
     let record: PrivateSqliteLineageRecord =
         decode_lineage_record(LineageRecordKind::Sqlite, &marker_bytes).map_err(|error| {
             invalid_lineage(format!(
@@ -3825,6 +3849,8 @@ pub(crate) fn ensure_private_sqlite_file(
         })?;
     let database = open_sqlite_file_shared(parent, path)?;
     let database_id = private_object_id(&database)?;
+    #[cfg(all(test, windows))]
+    eprintln!("sqlite-authority {}: database identified", path.display());
     let context = sqlite_lineage_context(root, path)?;
     if record.schema_version != PRIVATE_SQLITE_LINEAGE_SCHEMA_VERSION
         || record.private_root != *root.id()
@@ -3838,6 +3864,8 @@ pub(crate) fn ensure_private_sqlite_file(
             path.display()
         )));
     }
+    #[cfg(all(test, windows))]
+    eprintln!("sqlite-authority {}: record matched", path.display());
     #[cfg(windows)]
     activate_or_verify_windows_sqlite_authority(
         &context,
@@ -3851,11 +3879,15 @@ pub(crate) fn ensure_private_sqlite_file(
             sqlite_marker: marker_id.clone(),
         },
     )?;
+    #[cfg(all(test, windows))]
+    eprintln!("sqlite-authority {}: registry activated", path.display());
     drop(database);
 
     #[cfg(windows)]
     {
         let canonical_path = fs::canonicalize(path)?;
+        #[cfg(test)]
+        eprintln!("sqlite-authority {}: path canonicalized", path.display());
         let identity = TrustedSqliteIdentity {
             canonical_path: canonical_path.clone(),
             publication_parent: root.publication_parent_id.clone(),
@@ -3888,6 +3920,11 @@ pub(crate) fn ensure_private_sqlite_file(
             }
         } else {
             let exclusive = windows_acl::open_child_file_exclusive(parent, path)?;
+            #[cfg(test)]
+            eprintln!(
+                "sqlite-authority {}: exclusive preflight opened",
+                path.display()
+            );
             if private_object_id(&exclusive)? != identity.database {
                 return Err(invalid_lineage(
                     "private SQLite database changed during exclusive preflight",
@@ -3895,19 +3932,27 @@ pub(crate) fn ensure_private_sqlite_file(
             }
             drop(exclusive);
             let retained_root = windows_acl::open_directory_for_authority(&root.path)?;
+            #[cfg(test)]
+            eprintln!("sqlite-authority {}: root retained", path.display());
             if private_object_id(&retained_root)? != identity.private_root {
                 return Err(invalid_lineage(
                     "private workspace root changed before authority retention",
                 ));
             }
             let retained_parent = windows_acl::open_directory_for_cleanup_authority(parent_path)?;
+            #[cfg(test)]
+            eprintln!("sqlite-authority {}: parent retained", path.display());
             if private_object_id(&retained_parent)? != identity.parent {
                 return Err(invalid_lineage(
                     "private SQLite parent changed before authority retention",
                 ));
             }
             let database = windows_acl::open_child_file_for_retained_authority(parent, path)?;
+            #[cfg(test)]
+            eprintln!("sqlite-authority {}: database retained", path.display());
             let marker = windows_acl::open_child_file_for_retained_authority(parent, &marker_path)?;
+            #[cfg(test)]
+            eprintln!("sqlite-authority {}: marker retained", path.display());
             let authority = TrustedSqliteAuthority {
                 identity,
                 _root: retained_root,
@@ -3916,11 +3961,18 @@ pub(crate) fn ensure_private_sqlite_file(
                 marker,
             };
             trusted.authorities.insert(canonical_path, authority);
+            #[cfg(test)]
+            eprintln!(
+                "sqlite-authority {}: process authority stored",
+                path.display()
+            );
         }
     }
     #[cfg(not(windows))]
     let _ = marker_id;
     root.verify_current()?;
+    #[cfg(all(test, windows))]
+    eprintln!("sqlite-authority {}: final root verified", path.display());
     Ok(())
 }
 
