@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     fs::OpenOptions,
-    io::{Cursor, Write},
+    io::{Cursor, Seek, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -1048,12 +1048,7 @@ impl DurableBroadcastLog {
                 )))
             }
         };
-        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-            return Err(ZeckError::Storage(format!(
-                "incomplete broadcast log at {}: final event has no newline",
-                path.display()
-            )));
-        }
+        let bytes = self.repair_unterminated_tail(bytes)?;
         if bytes.is_empty() {
             return Ok(());
         }
@@ -1087,6 +1082,59 @@ impl DurableBroadcastLog {
             self.apply_event(event, true)?;
         }
         Ok(())
+    }
+
+    /// A crash can leave the final event without its newline. Events are
+    /// appended as one buffer and acknowledged only after a sync, so:
+    ///
+    /// - a final fragment that does not parse as an event was never
+    ///   acknowledged; it is truncated away (the earlier synced state stands);
+    /// - a final event that parses was fully written; its newline is added so
+    ///   the next append starts on a clean line.
+    ///
+    /// Any unparseable line before the last still refuses the journal.
+    /// Runs only under the exclusive journal lock held by `open`.
+    fn repair_unterminated_tail(&mut self, mut bytes: Vec<u8>) -> ZeckResult<Vec<u8>> {
+        if bytes.is_empty() || bytes.ends_with(b"\n") {
+            return Ok(bytes);
+        }
+        let tail_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let complete = serde_json::from_slice::<BroadcastLogEvent>(&bytes[tail_start..]).is_ok();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|err| {
+                ZeckError::Storage(format!("opening {} for repair: {err}", self.path.display()))
+            })?;
+        let repaired = if complete {
+            let mut file = file;
+            file.seek(std::io::SeekFrom::End(0))
+                .and_then(|_| file.write_all(b"\n"))
+                .and_then(|_| file.sync_all())
+                .map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "terminating final event in {}: {err}",
+                        self.path.display()
+                    ))
+                })?;
+            bytes.push(b'\n');
+            bytes
+        } else {
+            file.set_len(tail_start as u64)
+                .and_then(|_| file.sync_all())
+                .map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "dropping torn final event in {}: {err}",
+                        self.path.display()
+                    ))
+                })?;
+            bytes.truncate(tail_start);
+            bytes
+        };
+        Ok(repaired)
     }
 
     fn append_event(&mut self, event: BroadcastLogEvent) -> ZeckResult<()> {
@@ -2752,17 +2800,85 @@ mod tests {
         );
         drop(log);
 
+        let synced = fs::read(&path).unwrap();
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(br#"{"schema_version":1,"kind":"state_changed""#)
             .unwrap();
         file.sync_all().unwrap();
-        let before = fs::read(&path).unwrap();
 
-        assert!(matches!(
-            DurableBroadcastLog::open(&path),
-            Err(crate::ZeckError::Storage(_))
-        ));
-        assert_eq!(fs::read(&path).unwrap(), before);
+        // A torn, unparseable final fragment was never acknowledged: it is
+        // dropped instead of refusing the journal forever, and it cannot
+        // upgrade the last synced state.
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(
+            log.latest(txid).unwrap().state,
+            TxLifecycleState::NotSubmitted
+        );
+        assert_eq!(fs::read(&path).unwrap(), synced);
+        // Later appends land on a clean line boundary.
+        log.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        drop(log);
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .latest(txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[test]
+    fn complete_final_event_without_newline_is_kept_and_terminated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        drop(log);
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, &bytes).unwrap();
+
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(
+            log.latest(tx.txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+        log.transition(
+            tx.txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+        drop(log);
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .latest(tx.txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::Pending
+        );
+    }
+
+    #[test]
+    fn corrupt_middle_line_still_refuses_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        drop(log);
+        let mut bytes = b"{not json}\n".to_vec();
+        bytes.extend(fs::read(&path).unwrap());
+        fs::write(&path, &bytes).unwrap();
+        assert!(DurableBroadcastLog::open(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
