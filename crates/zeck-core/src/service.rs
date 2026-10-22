@@ -740,12 +740,7 @@ impl ReviewedSweepIntent {
     /// while the split moves, and the split decides who signs what.
     fn validate_scan_state(&self, session: &ScanSession, state: &ScanTaskState) -> ZeckResult<()> {
         self.validate_state(session, &state.progress)?;
-        if self.authority.as_ref() != Some(&SweepAuthoritySnapshot::capture(state)) {
-            return Err(ZeckError::StaleSweepProposal(
-                "scan spend authority or standalone balance changed".to_owned(),
-            ));
-        }
-        Ok(())
+        self.require_current_authority(state)
     }
 }
 
