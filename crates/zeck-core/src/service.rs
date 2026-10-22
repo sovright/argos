@@ -890,7 +890,7 @@ fn create_cleanup_marker(
     root: &std::path::Path,
     tombstone: &std::path::Path,
     broadcast_log: &DurableBroadcastLog,
-    outcome: &SweepOutcome,
+    outcome: Option<&SweepOutcome>,
     local_journal_exists: bool,
 ) -> ZeckResult<()> {
     use sha2::{Digest, Sha256};
@@ -898,7 +898,8 @@ fn create_cleanup_marker(
 
     let records = broadcast_log.records();
     let mut receipts = Vec::new();
-    for transaction in &outcome.transactions {
+    // A workspace deleted without a sweep has no receipts to bind.
+    for transaction in outcome.map_or(&[][..], |outcome| &outcome.transactions[..]) {
         let txid = transaction.txid.as_deref().ok_or_else(|| {
             ZeckError::Storage("cannot mark cleanup without a durable transaction ID".to_owned())
         })?;
@@ -911,12 +912,6 @@ fn create_cleanup_marker(
             "raw_sha256": format!("{:x}", Sha256::digest(&record.prepared.raw_tx)),
         }));
     }
-    if receipts.is_empty() {
-        return Err(ZeckError::Storage(
-            "cannot mark cleanup without durable receipts".to_owned(),
-        ));
-    }
-
     let path = cleanup_marker_path(root)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1002,7 +997,6 @@ fn recover_interrupted_cleanup(
     let receipts = payload
         .get("receipts")
         .and_then(|value| value.as_array())
-        .filter(|receipts| !receipts.is_empty())
         .ok_or_else(|| manual("missing durable receipt list"))?;
     let local_journal_exists = payload
         .get("local_journal_exists")
@@ -1310,75 +1304,6 @@ fn discover_legacy_broadcast_logs(
     }
     journals.sort();
     Ok(journals)
-}
-
-async fn require_independent_transparent_zero(
-    runtime: &RuntimeScanConfig,
-    keys: &[crate::imported::ImportedTransparentKey],
-) -> ZeckResult<()> {
-    use std::collections::HashSet;
-
-    let sources = crate::lightwalletd::confirmation_endpoints(
-        &runtime.lightwalletd_url,
-        &runtime.confirmation_sources,
-    )?;
-    let labelled = sources
-        .into_iter()
-        .filter(|source| !source.operator_id.trim().is_empty())
-        .collect::<Vec<_>>();
-    if labelled
-        .iter()
-        .map(|source| source.operator_id.as_str())
-        .collect::<HashSet<_>>()
-        .len()
-        < 2
-    {
-        return Err(ZeckError::ScanNotReady(
-            "cannot delete workspace without two independent transparent balance authorities"
-                .to_owned(),
-        ));
-    }
-    for source in labelled {
-        let mut client = tokio::time::timeout(
-            Duration::from_secs(5),
-            CompactTxStreamerClient::connect(source.endpoint.clone()),
-        )
-        .await
-        .map_err(|_| {
-            ZeckError::Lightwalletd(format!("connecting to {} timed out", source.endpoint))
-        })?
-        .map_err(|err| {
-            ZeckError::Lightwalletd(format!("connecting to {}: {err}", source.endpoint))
-        })?;
-        let info = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.get_lightd_info(zcash_client_backend::proto::service::Empty {}),
-        )
-        .await
-        .map_err(|_| ZeckError::Lightwalletd(format!("probing {} timed out", source.endpoint)))?
-        .map_err(|err| ZeckError::Lightwalletd(format!("probing {}: {err}", source.endpoint)))?
-        .into_inner();
-        validate_lightwalletd_network(runtime.network, &info)?;
-        let utxos = tokio::time::timeout(
-            Duration::from_secs(30),
-            crate::transparent_recovery::fetch_transparent_utxos(
-                &mut client,
-                keys,
-                runtime.network,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            ZeckError::Lightwalletd(format!("querying {} timed out", source.endpoint))
-        })??;
-        if !utxos.is_empty() {
-            return Err(ZeckError::ScanNotReady(format!(
-                "cannot delete workspace while {} reports standalone transparent funds",
-                source.endpoint
-            )));
-        }
-    }
-    Ok(())
 }
 
 impl RecoveryService {
@@ -2319,41 +2244,59 @@ impl RecoveryService {
 
         // Refuse mid-scan to avoid tearing the SQLite write-ahead state out
         // from under the running task. Callers can cancel first if they really
-        // mean it.
+        // mean it. A finished scan -- complete, cancelled or failed -- may be
+        // deleted with or without a sweep: spend authority lives in the
+        // source keys, not in this workspace.
         {
             let state = session.state.lock().await;
             let phase = state.progress.phase;
-            if phase != ScanPhase::Complete {
+            if !matches!(
+                phase,
+                ScanPhase::Complete | ScanPhase::Cancelled | ScanPhase::Error
+            ) {
                 return Err(ZeckError::ScanNotReady(format!(
-                    "cannot delete workspace while scan is {phase:?}",
+                    "cannot delete workspace while scan is {phase:?}; cancel first",
                 )));
             }
         }
 
         let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
         // Import and inspect the surviving workspace journal after a retry
-        // restored its actual path. The network registry is authoritative for
-        // all aliases; the local journal is also checked so a changed source
+        // restored its actual path. The network registry (outside the
+        // workspace, so it survives deletion) is authoritative for all
+        // aliases; the local journal is also checked so a changed source
         // cannot be silently ignored.
         let local_path = workspace.broadcast_log_path();
         let local_journal_exists = local_path.exists();
         let mut broadcast_log = _operation_lock.open_broadcast_log_for(&local_path)?;
-        // The returned registry retains the exact legacy lock even if its
-        // JSONL has not been written yet, as well as all discovered aliases.
-        // A legacy local journal is an immutable migration source. Its
-        // historical Pending prefix may have been reconciled to Mined in the
-        // global registry. `open_broadcast_log` checks the exact source
-        // event prefix and rejects any mutation or newly appended Unknown;
-        // the registry holds the current lifecycle state.
-        if let Some(txid) = broadcast_log.blocking_submission() {
-            return Err(ZeckError::Broadcast(format!(
-                "cannot delete workspace: transaction {txid} needs exact-byte reconciliation"
-            )));
+        // The only refusal: a broadcast whose outcome is not yet resolved.
+        // Observe each once first, so a transaction that has since mined (by
+        // any operator), expired, or been rejected does not block. An
+        // observation failure leaves the record as it was. The registry is
+        // network-wide, so this conservatively includes broadcasts from
+        // other workspaces on the same network.
+        for record in broadcast_log.records() {
+            if record.state.is_resolved() {
+                continue;
+            }
+            let txid = record.prepared.txid;
+            let observed = observer
+                .observe(session.runtime.network, txid, record.prepared.expiry_height)
+                .await
+                .unwrap_or_else(|_| {
+                    crate::broadcast::observe_transaction(Vec::new(), record.prepared.expiry_height)
+                });
+            crate::reconciliation::record_observation(&mut broadcast_log, txid, &observed)?;
         }
-        if broadcast_log.has_unresolved_history() {
-            return Err(ZeckError::Broadcast(
-                "cannot delete workspace with unresolved prepared transaction history".to_owned(),
-            ));
+        if let Some(record) = broadcast_log
+            .records()
+            .into_iter()
+            .find(|record| !record.state.is_resolved())
+        {
+            return Err(ZeckError::Broadcast(format!(
+                "cannot delete workspace: transaction {} is {}; reconcile it first",
+                record.prepared.txid, record.state
+            )));
         }
         let outcome = self
             .last_sweep_outcomes
@@ -2361,61 +2304,6 @@ impl RecoveryService {
             .await
             .get(&handle.id)
             .cloned();
-        let eligible = outcome.as_ref().is_some_and(|outcome| {
-            outcome.error.is_none()
-                && !outcome.follow_up_review_required
-                && outcome.skipped_accounts.is_empty()
-                && !outcome.transactions.is_empty()
-                && outcome.transactions.iter().all(|tx| {
-                    tx.status == TxLifecycleState::Mined
-                        && tx
-                            .txid
-                            .as_deref()
-                            .is_some_and(|txid| broadcast_log.contains_mined_txid(txid))
-                })
-        });
-        if !eligible {
-            return Err(ZeckError::ScanNotReady(
-                "cannot delete workspace before every recovery leg is canonically mined with no skipped balance or follow-up".to_owned(),
-            ));
-        }
-
-        // A durable Mined result may have been reorged since the last GUI
-        // poll. Re-observe every durable Mined transaction, including one
-        // omitted from the GUI outcome, before using any zero-balance claim
-        // to destroy the only wallet capable of reconciliation.
-        for record in broadcast_log.mined_records() {
-            let txid = record.prepared.txid;
-            let observation = observer
-                .observe(session.runtime.network, txid, record.prepared.expiry_height)
-                .await?;
-            crate::reconciliation::record_observation(&mut broadcast_log, txid, &observation)?;
-            if !observation.has_canonical_mined_evidence() {
-                return Err(ZeckError::Broadcast(format!(
-                    "cannot delete workspace: transaction {txid} lacks fresh canonical mining evidence"
-                )));
-            }
-        }
-
-        // Reconcile the current balances before discarding keys and witnesses.
-        // A completed GUI result describes one execution, not all funds that
-        // may still be controlled by this workspace.
-        let tracked_accounts = session.state.lock().await.tracked_accounts.clone();
-        let transparent_keys = session
-            .runtime
-            .key_source
-            .imported_keys()
-            .map(crate::imported::imported_transparent_keys)
-            .transpose()?
-            .unwrap_or_default();
-        if !tracked_accounts.is_empty() {
-            return Err(ZeckError::ScanNotReady(
-                "cannot delete shielded workspace without independent full rescans that agree on zero balance".to_owned(),
-            ));
-        }
-        if !transparent_keys.is_empty() {
-            require_independent_transparent_zero(&session.runtime, &transparent_keys).await?;
-        }
 
         // Drop any lingering task handle so the SQLite files aren't held open.
         if let Some(task) = session.task.lock().await.take() {
@@ -2438,7 +2326,7 @@ impl RecoveryService {
                     &workspace_root,
                     &tombstone,
                     &broadcast_log,
-                    outcome.as_ref().expect("eligible outcome"),
+                    outcome.as_ref(),
                     local_journal_exists,
                 )?;
             }
@@ -7651,7 +7539,9 @@ mod deletion_fake_lightwalletd;
 #[cfg(test)]
 mod propose_workspace_guard_tests {
     use super::*;
-    use crate::broadcast::{SubmissionDisposition, TxObservation};
+    use crate::broadcast::{
+        observe_transaction, EndpointTxEvidence, SubmissionDisposition, TxObservation,
+    };
     use crate::key_source::{ImportedKeySource, SeedKeySource};
     use crate::models::{AccountBalancePreview, ZeckNetwork};
     use crate::scan::ScanTaskState;
@@ -8393,6 +8283,101 @@ mod propose_workspace_guard_tests {
         )
     }
 
+    fn seed_source() -> Arc<dyn KeySource> {
+        Arc::new(SeedKeySource::new(SecretString::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
+        )))
+    }
+
+    /// Pre-registry eligibility: a Complete, Cancelled or Error scan may be
+    /// deleted with or without a sweep outcome, and with tracked shielded
+    /// accounts -- the source keys, not the workspace, hold spend authority.
+    #[tokio::test]
+    async fn finished_scans_delete_without_a_sweep_outcome() {
+        for phase in [ScanPhase::Complete, ScanPhase::Cancelled, ScanPhase::Error] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let (service, handle) =
+                completed_session(tempdir.path(), seed_source(), transparent_account(5_000)).await;
+            let session = service.session(&handle).await.unwrap();
+            session.state.lock().await.progress.phase = phase;
+            let root = session.workspace_root.clone();
+            drop(session);
+            let deleted = service
+                .delete_workspace_with_observer(
+                    &handle,
+                    &mut FixedDeletionObserver(observe_transaction(vec![], None)),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{phase:?}: {err}"));
+            assert_eq!(deleted, root);
+            assert!(!root.exists(), "{phase:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_broadcast_blocks_deletion_until_observed_resolved() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (service, handle) =
+            completed_session(tempdir.path(), seed_source(), transparent_account(0)).await;
+        let root = service
+            .session(&handle)
+            .await
+            .unwrap()
+            .workspace_root
+            .clone();
+        let txid = TxId::from_bytes([91; 32]);
+        let registry_path = {
+            let guard =
+                NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+            let path = guard.broadcast_log_path().unwrap();
+            let mut log = guard.open_broadcast_log().unwrap();
+            log.persist_prepared(&PreparedTransaction {
+                txid,
+                raw_tx: vec![91],
+                fee_zatoshis: 10_000,
+                expiry_height: Some(130),
+            })
+            .unwrap();
+            log.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
+                .unwrap();
+            path
+        };
+        // Still unresolved after a fresh observation: refused.
+        let err = service
+            .delete_workspace_with_observer(
+                &handle,
+                &mut FixedDeletionObserver(observe_transaction(vec![], Some(130))),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&txid.to_string()), "{err}");
+        assert!(root.exists());
+        // One operator reports it mined: resolved, so deletion proceeds.
+        let single = observe_transaction(
+            vec![EndpointTxEvidence {
+                operator_id: "zec.rocks".to_owned(),
+                endpoint: "https://zec.rocks:443".to_owned(),
+                tip_height: Some(125),
+                reported_height: Some(120),
+                block_hash: Some(vec![1; 32]),
+                tx_in_block: true,
+            }],
+            Some(130),
+        );
+        service
+            .delete_workspace_with_observer(&handle, &mut FixedDeletionObserver(single))
+            .await
+            .unwrap();
+        assert!(!root.exists());
+        // The network registry outlives the workspace.
+        assert!(registry_path.is_file());
+        let reopened = DurableBroadcastLog::open(&registry_path).unwrap();
+        assert_eq!(
+            reopened.latest(txid).unwrap().state,
+            TxLifecycleState::MinedSingleSource
+        );
+    }
+
     async fn completed_mined_session(
         data_dir: &std::path::Path,
     ) -> (RecoveryService, ScanHandle, std::path::PathBuf, TxId) {
@@ -8573,7 +8558,7 @@ mod propose_workspace_guard_tests {
     }
 
     #[tokio::test]
-    async fn restart_restores_tombstone_and_requires_new_scan_before_deletion() {
+    async fn restart_restores_tombstone_and_a_new_scan_may_delete_it() {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -8644,18 +8629,20 @@ mod propose_workspace_guard_tests {
             .await
             .progress
             .phase = ScanPhase::Complete;
-        let error = restarted
+        // The fresh scan carries no old outcome; with every broadcast
+        // resolved, it may be deleted, and the registry receipt survives.
+        restarted
             .delete_workspace_with_observer(
                 &started,
                 &mut FixedDeletionObserver(mined_deletion_observation()),
             )
             .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("before every recovery leg"),
-            "{error}"
-        );
-        assert!(root.exists());
+            .unwrap();
+        assert!(!root.exists());
+        let guard =
+            super::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network).unwrap();
+        let log = guard.open_broadcast_log().unwrap();
+        assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
     }
 
     #[tokio::test]
@@ -8966,54 +8953,29 @@ mod propose_workspace_guard_tests {
     }
 
     #[tokio::test]
-    async fn deletion_refuses_old_mined_receipt_when_fresh_sources_are_unavailable() {
+    async fn resolved_mined_receipt_deletes_without_a_fresh_observation() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
-        let result = service.delete_workspace(&handle).await;
-        assert!(
-            result.is_err(),
-            "stored mining evidence is not a fresh finality check"
-        );
-        assert!(root.exists());
-        let log = DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-            .unwrap();
-        assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
-    }
-
-    #[tokio::test]
-    async fn deletion_records_fresh_unmined_observation_and_preserves_workspace() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
-        let unmined = crate::broadcast::observe_transaction(
-            vec![crate::broadcast::EndpointTxEvidence {
-                operator_id: "one".to_owned(),
-                endpoint: "https://one.example".to_owned(),
-                tip_height: Some(121),
-                reported_height: Some(0),
-                block_hash: None,
-                tx_in_block: false,
-            }],
-            Some(130),
-        );
-        assert_eq!(unmined.state, TxObservationState::PresentUnmined);
-        let result = service
-            .delete_workspace_with_observer(&handle, &mut FixedDeletionObserver(unmined.clone()))
-            .await;
-        assert!(result.is_err());
-        assert!(root.exists());
+        // The session's lightwalletd is unroutable: a resolved receipt must
+        // not need it.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.delete_workspace(&handle),
+        )
+        .await
+        .expect("no network call for a resolved receipt")
+        .unwrap();
+        assert!(!root.exists());
         let registry_path =
             super::network_broadcast_log_path(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
         let log = DurableBroadcastLog::open(registry_path).unwrap();
-        let record = log.latest(txid).unwrap();
-        assert_eq!(record.prepared.raw_tx, vec![84, 85]);
-        assert_eq!(record.state, TxLifecycleState::Pending);
-        assert_eq!(record.observation, Some(unmined));
+        assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
+        assert_eq!(log.latest(txid).unwrap().state, TxLifecycleState::Mined);
     }
 
     #[tokio::test]
-    async fn deletion_reobserves_mined_receipts_omitted_from_gui_outcome() {
+    async fn deletion_observes_unresolved_receipts_omitted_from_gui_outcome() {
         struct PerTransactionObserver {
-            extra: TxId,
             seen: Vec<TxId>,
         }
         #[async_trait::async_trait]
@@ -9025,21 +8987,17 @@ mod propose_workspace_guard_tests {
                 _expiry_height: Option<u32>,
             ) -> ZeckResult<TxObservation> {
                 self.seen.push(txid);
-                if txid == self.extra {
-                    Ok(crate::broadcast::observe_transaction(
-                        vec![crate::broadcast::EndpointTxEvidence {
-                            operator_id: "one".to_owned(),
-                            endpoint: "https://one.example".to_owned(),
-                            tip_height: Some(121),
-                            reported_height: Some(0),
-                            block_hash: None,
-                            tx_in_block: false,
-                        }],
-                        Some(130),
-                    ))
-                } else {
-                    Ok(mined_deletion_observation())
-                }
+                Ok(crate::broadcast::observe_transaction(
+                    vec![crate::broadcast::EndpointTxEvidence {
+                        operator_id: "one".to_owned(),
+                        endpoint: "https://one.example".to_owned(),
+                        tip_height: Some(121),
+                        reported_height: Some(0),
+                        block_hash: None,
+                        tx_in_block: false,
+                    }],
+                    Some(130),
+                ))
             }
         }
 
@@ -9064,35 +9022,23 @@ mod propose_workspace_guard_tests {
             None,
         )
         .unwrap();
-        log.transition(
-            extra,
-            TxLifecycleState::Mined,
-            None,
-            Some(&mined_deletion_observation()),
-        )
-        .unwrap();
         drop(log);
 
-        let mut observer = PerTransactionObserver {
-            extra,
-            seen: Vec::new(),
-        };
-        assert!(service
+        let mut observer = PerTransactionObserver { seen: Vec::new() };
+        let err = service
             .delete_workspace_with_observer(&handle, &mut observer)
             .await
-            .is_err());
-        assert!(observer.seen.contains(&extra));
+            .unwrap_err();
+        assert!(err.to_string().contains(&extra.to_string()), "{err}");
+        // Only the unresolved receipt is observed; the mined one is resolved.
+        assert_eq!(observer.seen, vec![extra]);
         assert!(root.exists());
         let registry_path =
             super::network_broadcast_log_path(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
         let registry = DurableBroadcastLog::open(registry_path).unwrap();
         assert_eq!(
-            registry.latest(original).unwrap().prepared.raw_tx,
-            vec![84, 85]
-        );
-        assert_eq!(
-            registry.latest(extra).unwrap().prepared.raw_tx,
-            vec![97, 98]
+            registry.latest(original).unwrap().state,
+            TxLifecycleState::Mined
         );
         assert_eq!(
             registry.latest(extra).unwrap().state,
@@ -9359,7 +9305,7 @@ mod propose_workspace_guard_tests {
     }
 
     #[tokio::test]
-    async fn deletion_requires_canonical_history_and_no_skipped_funds() {
+    async fn deletion_requires_resolved_history_not_a_clean_outcome() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
             tempdir.path(),
@@ -9436,15 +9382,8 @@ mod propose_workspace_guard_tests {
                 gross_zatoshis: 1,
                 reason: "remaining".to_owned(),
             });
-        assert!(service.delete_workspace(&handle).await.is_err());
-        service
-            .last_sweep_outcomes
-            .lock()
-            .await
-            .get_mut(&handle.id)
-            .unwrap()
-            .skipped_accounts
-            .clear();
+        // A skipped balance stays spendable from the source keys; it does not
+        // pin the workspace once every broadcast is resolved.
         let deleted = service
             .delete_workspace_with_observer(
                 &handle,
