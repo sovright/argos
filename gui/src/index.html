@@ -222,7 +222,7 @@
                 <li><strong>Are my recovery secrets transmitted?</strong> No. Seeds, wallet passphrases, and spending keys stay local. Ordinary scans download compact blocks from lightwalletd; Sprout scans download public full blocks from Zcash P2P peers.</li>
                 <li><strong>Can I use a transparent or Sapling address as my destination?</strong> Ordinary recovery requires a Unified Address with an Orchard or Sapling receiver. The separate Sprout sweep also accepts a bare Sapling address because Sprout can only land in Sapling.</li>
                 <li><strong>What if I had more than one ZecWallet Lite account?</strong> Argos scans up to 500 accounts automatically. If you enabled the gap-limit scan mode, it stops after 20 consecutive empty accounts by default — enough for almost all wallets.</li>
-                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume; Argos removes it after a successful sweep. Delete remaining recovery state only after confirming the funds arrived.</li>
+                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume; Argos does not remove it, even after a sweep. Delete it and any remaining recovery state yourself, only after Argos reports fresh canonical mined evidence for every Sprout transaction.</li>
                 <li><strong>Can I run Argos offline?</strong> Source validation and key derivation are offline, but scanning requires a network connection: lightwalletd for ordinary recovery or Zcash P2P peers for Sprout.</li>
               </ul>
             </div>
@@ -347,8 +347,10 @@
                 <hr />
                 <p><strong>Move these funds now</strong></p>
                 <p class="muted">
-                  No scan is needed — the note data is in this file. The destination must
-                  have a Sapling receiver.
+                  Argos checks any saved transaction before creating a new one. Keep the
+                  original wallet file and private scan checkpoint until every transaction
+                  is freshly confirmed mined. New transactions require recovered note data,
+                  and the destination must have a Sapling receiver.
                 </p>
                 <label for="sprout-destination">Destination address</label>
                 <input
@@ -362,6 +364,10 @@
                 <p id="sprout-sweep-pool" class="muted"></p>
                 <p id="sprout-sweep-params" class="muted"></p>
                 <p id="sprout-sweep-spent-status" class="muted"></p>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="sprout-sweep-confirm" disabled />
+                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
+                </label>
                 <button id="sprout-sweep-run" type="button" disabled>
                   Sweep Sprout funds
                 </button>
@@ -481,11 +487,12 @@
                   spellcheck="false"
                   placeholder="zs1… or a Unified Address with a Sapling receiver"
                 />
+                <p id="sprout-scan-sweep-plan" class="muted"></p>
                 <label class="checkbox-row">
-                  <input type="checkbox" id="sprout-scan-confirm" />
-                  I understand this moves funds and cannot be undone.
+                  <input type="checkbox" id="sprout-scan-confirm" disabled />
+                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
                 </label>
-                <button id="sprout-scan-sweep-run" type="button">Sweep found funds</button>
+                <button id="sprout-scan-sweep-run" type="button" disabled>Sweep found funds</button>
                 <ul id="sprout-scan-sweep-results" class="session-list"></ul>
               </div>
             </div>
@@ -578,10 +585,10 @@
             <p class="form-section-heading span-two" id="accounts-heading">Accounts to scan</p>
 
             <label class="field" id="accounts-range-field">
-              <span>Starting number of accounts</span>
+              <span>Number of accounts</span>
               <input id="accounts-range" type="range" min="1" max="500" value="20" />
               <strong id="accounts-range-value">20</strong>
-              <small>Most users only ever had 1 account. Leave at 20 to be safe. With gap scanning enabled, Argos may check additional accounts beyond this number.</small>
+              <small>Used when "Keep scanning until no more funds are found" is off: Argos checks exactly this many accounts. Most users only ever had 1 account.</small>
             </label>
             <label class="checkline field" id="auto-gap-limit-field">
               <input id="auto-gap-limit" type="checkbox" checked />
@@ -631,6 +638,11 @@
               <small>The server Argos connects to for blockchain data. Auto-filled by the preset above. You can add backup servers separated by commas.</small>
             </label>
             <label class="field span-two">
+              <span>Independent confirmation servers</span>
+              <textarea id="confirmation-sources" rows="2" spellcheck="false" placeholder="operator-id=https://independent.example:443"></textarea>
+              <small>Optional. One operator-id=https://lightwalletd-url per line. Without one, confirmation rests on a single operator (the recommended servers are both run by zec.rocks and count as one): the recovery completes, but keep your source until an independent source confirms.</small>
+            </label>
+            <label class="field span-two">
               <span>Where to save scan data on this computer</span>
               <input id="data-dir" type="text" placeholder="platform default populated on load" />
               <small>Argos saves its progress here so a scan can be resumed if interrupted. Change this to a permanent folder if you want to keep the data after a reboot.</small>
@@ -649,9 +661,9 @@
               <small>A short note attached to the recovery transaction. Visible only to the sender and recipient. <span id="memo-byte-count"></span></small>
             </label>
             <label class="field">
-              <span>Max transaction fee in ZEC (optional)</span>
+              <span>Maximum total sweep fee in ZEC (optional)</span>
               <input id="max-fee-zec" type="text" inputmode="decimal" placeholder="0.0002" />
-              <small>Leave blank to use the standard fee (~0.0002 ZEC). Only change this if you know what you're doing.</small>
+              <small>Leave blank to use the exact total fee shown in your reviewed proposal.</small>
             </label>
           </div>
           <div class="inline-actions">
@@ -758,6 +770,7 @@
             <button class="secondary" id="cancel-scan">Cancel</button>
             <button class="ghost" id="back-to-config" style="display:none">← Back to config</button>
             <button class="ghost" id="scan-return-address-matches" type="button" hidden>← Back to address matches</button>
+            <button class="secondary" id="scan-saved-transactions" type="button" disabled>Saved transaction status</button>
             <button class="primary" id="review-sweep" disabled>Review & Sweep</button>
           </div>
         </section>
@@ -839,8 +852,8 @@
 
         <section class="screen" data-step="complete">
           <p class="eyebrow">Step 6</p>
-          <h2>Recovery complete</h2>
-          <p class="lead" id="complete-summary">Transactions broadcast successfully.</p>
+          <h2 id="complete-heading">Sweep status</h2>
+          <p class="lead" id="complete-summary"></p>
           <!-- Repeated here deliberately: this screen is where the "Delete
                workspace" button lives, and the wallet file is the only copy
                of any Sprout key it holds. -->
@@ -848,11 +861,13 @@
           <div id="complete-txids" class="complete-txids"></div>
           <p id="complete-donation" hidden></p>
           <div class="report-card" id="complete-skipped"></div>
-          <!-- Audit Issue B: confirmation is attested by the single connected
-               lightwalletd server, so this advises independent verification. -->
           <p class="status-line" id="complete-confirmation-note">
-            Confirmation status is reported by the lightwalletd server you connected to. Before treating your recovery as final, verify each transaction ID on an independent Zcash block explorer or a second node.
+            Keep the source wallet and recovery workspace until submitted transactions are independently verified as mined.
           </p>
+          <div class="inline-actions">
+            <button class="secondary" id="complete-check-status" type="button">Check transaction status</button>
+            <p id="complete-reconciliation-status" class="status-line"></p>
+          </div>
           <div class="report-card" id="complete-report" style="display:none"></div>
           <div class="donate-card report-card">
             <h3>Help us keep doing this</h3>
@@ -923,9 +938,26 @@
           <small>This must match the passphrase used when the address was found. It is not your wallet encryption password.</small>
         </label>
         <label class="field">
+          <span>Independent confirmation servers</span>
+          <textarea id="resume-confirmation-sources" rows="2" spellcheck="false" placeholder="operator-id=https://independent.example:443"></textarea>
+          <small>Optional. Use the same independent operator labels you configured for the scan.</small>
+        </label>
+        <label class="field">
           <span>Label (optional rename)</span>
           <input id="resume-label-input" type="text" maxlength="120" />
           <small>Leave blank to keep the existing label.</small>
+        </label>
+        <label class="field">
+          <span>Destination Unified Address</span>
+          <input id="resume-destination-input" type="text" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>Memo (optional)</span>
+          <input id="resume-memo-input" type="text" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>Maximum fee (ZEC)</span>
+          <input id="resume-max-fee-zec" type="text" inputmode="decimal" placeholder="0.01" autocomplete="off" />
         </label>
         <p id="resume-modal-status" class="status-line"></p>
         <div class="actions split">

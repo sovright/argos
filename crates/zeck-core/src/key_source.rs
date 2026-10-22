@@ -21,7 +21,7 @@ const FINGERPRINT_DOMAIN: &[u8] = b"argos-key-source-fingerprint-v1";
 /// Identifies a key set for workspace keying. Changing the keys must
 /// change this, so a resume never reuses a workspace built from different
 /// keys — the same invariant the seed fingerprint provided before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeySourceFingerprint([u8; 32]);
 
 impl KeySourceFingerprint {
@@ -253,6 +253,9 @@ pub enum RecoveryRoute {
     /// including a decrypted ZecWallet Lite wallet, which re-enters the
     /// normal pipeline exactly like a typed seed phrase.
     Hd,
+    /// A recovered mnemonic and independently imported spending keys share
+    /// one wallet workspace and must both be registered before completion.
+    Combined,
     /// Seedless with Sapling keys: one imported account per key, with the
     /// transparent keys attached to the first as standalone receivers, so a
     /// single sync covers both pools.
@@ -267,11 +270,22 @@ pub enum RecoveryRoute {
     Nothing,
 }
 
-/// Classify a key set. Order matters: the mnemonic wins, because a wallet
-/// that has one can derive everything else.
+/// Classify a key set by the authority each recovered key needs.
 pub fn classify_recovery_route(keys: &ImportedKeys) -> RecoveryRoute {
     if keys.mnemonic.is_some() {
-        RecoveryRoute::Hd
+        if keys
+            .sapling
+            .iter()
+            .any(|key| key.provenance == argos_wallet_import::Provenance::Standalone)
+            || keys
+                .transparent
+                .iter()
+                .any(|key| key.provenance == argos_wallet_import::Provenance::Standalone)
+        {
+            RecoveryRoute::Combined
+        } else {
+            RecoveryRoute::Hd
+        }
     } else if !keys.sapling.is_empty() {
         RecoveryRoute::ImportedAccounts
     } else if !keys.transparent.is_empty() {
@@ -415,6 +429,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plaintext_zwl_seed_derives_orchard_account_zero() {
+        use bip0039::{English, Mnemonic};
+        use zcash_address::unified::{Address, Container, Encoding, Receiver};
+
+        let entropy = [0x11u8; 32];
+        let phrase = Mnemonic::<English>::from_entropy(entropy.to_vec())
+            .unwrap()
+            .into_phrase();
+        let mut bytes = 25u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&22u64.to_le_bytes());
+        bytes.push(0); // plaintext
+        bytes.extend_from_slice(&[0u8; 48]);
+        bytes.push(0); // empty nonce
+        bytes.extend_from_slice(&entropy);
+        bytes.extend_from_slice(&[0, 0, 0]); // empty okey, zkey, tkey vectors
+        let imported = argos_wallet_import::zwl::import_zwl(&bytes, None).unwrap();
+        let source = ImportedKeySource::new(imported);
+        let seed = source.wallet_seed().unwrap().expect("plaintext ZWL seed");
+        let actual = crate::derivation::derive_accounts_from_seed(
+            &seed,
+            crate::models::ZeckNetwork::Mainnet,
+            1,
+        )
+        .unwrap();
+        let expected = crate::derivation::derive_accounts(
+            &SecretString::new(phrase),
+            crate::models::ZeckNetwork::Mainnet,
+            1,
+        )
+        .unwrap();
+        let orchard = |ua: &str| {
+            let (_, address) = Address::decode(ua).unwrap();
+            address
+                .items()
+                .into_iter()
+                .find_map(|item| match item {
+                    Receiver::Orchard(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            orchard(&actual[0].unified_address),
+            orchard(&expected[0].unified_address)
+        );
+    }
+
     /// The whole reason a decrypted ZecWallet Lite wallet is scannable is
     /// that its recovered mnemonic re-enters the ordinary HD pipeline. If
     /// the seed it yields ever diverged from what the same phrase typed by
@@ -464,5 +526,25 @@ mod tests {
         let source = ImportedKeySource::new(keys);
 
         assert!(source.wallet_seed().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_seed_and_standalone_key_use_the_combined_route() {
+        use argos_wallet_import::keys::{Provenance, TransparentKey};
+        use secrecy::Secret;
+
+        let mut keys = argos_wallet_import::ImportedKeys {
+            mnemonic: Some(SecretString::new(SEED.to_owned())),
+            ..Default::default()
+        };
+        keys.transparent.push(TransparentKey {
+            secret: Secret::new([0x42; 32]),
+            provenance: Provenance::Standalone,
+            created_at: None,
+        });
+        assert_ne!(classify_recovery_route(&keys), RecoveryRoute::Hd);
+
+        keys.transparent[0].provenance = Provenance::HdDerived;
+        assert_eq!(classify_recovery_route(&keys), RecoveryRoute::Hd);
     }
 }

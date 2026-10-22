@@ -3,6 +3,7 @@ pub mod address_match_recovery;
 pub mod address_search;
 pub mod address_search_shielded;
 pub mod birthday;
+pub mod broadcast;
 pub mod derivation;
 pub mod donation;
 pub mod error;
@@ -12,6 +13,7 @@ pub mod key_source;
 pub mod lightwalletd;
 pub mod models;
 pub mod wallet_file;
+pub mod wallet_file_import;
 // Transfer-based funding for the regtest harness. Test-only: a released
 // binary must contain no code that spends from a hardcoded seed.
 #[cfg(feature = "argos-network")]
@@ -41,18 +43,24 @@ pub mod sprout_scan;
 // Moves recovered Sprout notes out, via vpub_new into a Sapling output in
 // the same transaction -- Sprout cannot pay Sapling directly.
 pub mod sprout_sweep;
+pub mod sprout_sweep_journal;
 // Direct p2p access. Sprout notes are invisible to lightwalletd -- compact
 // blocks carry no JoinSplits -- so finding one needs full blocks.
 pub mod p2p;
+pub mod reconciliation;
 // What a Sprout scan costs in time, bandwidth and disk, and the wording
 // that tells the user -- shared so the CLI and GUI cannot drift apart.
 pub mod sprout_scan_cost;
 // Drives a scan: connects, walks the chain, checkpoints. SproutScanner
 // itself is a passive consumer and knows nothing about the network.
 pub mod sprout_scan_run;
+pub mod sweep_guidance;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
+
+#[cfg(test)]
+mod test_support;
 
 pub use address::validate_destination_address;
 pub use birthday::{
@@ -69,6 +77,7 @@ pub use donation::{
 };
 pub use error::{ZeckError, ZeckResult};
 pub use key_source::{ImportedKeySource, KeySource, KeySourceFingerprint, SeedKeySource};
+pub use wallet_file_import::import_wallet_file_for_network;
 
 /// Re-exported so front-ends can read a wallet file without taking a
 /// direct dependency on the parser crate.

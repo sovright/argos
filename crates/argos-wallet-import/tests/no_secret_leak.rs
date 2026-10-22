@@ -104,7 +104,9 @@ fn master_key_debug_is_redacted() {
     // the test would pass while proving nothing at all.
     let bytes = std::fs::read("tests/fixtures/modern-encrypted.dat")
         .expect("modern-encrypted.dat fixture must exist");
-    let records = argos_wallet_import::bdb::walk(&bytes).expect("fixture must walk");
+    let records = argos_wallet_import::bdb::walk(&bytes)
+        .expect("fixture must walk")
+        .records;
     let mkey: MkeyRecord = argos_wallet_import::zcashd::find_mkey(&records)
         .expect("encrypted wallet must have an mkey");
 
@@ -305,6 +307,7 @@ fn a_seed_whose_chain_fails_does_not_leak_through_its_diagnostic() {
     let mut bytes = std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap();
     let chain = argos_wallet_import::bdb::walk(&bytes)
         .unwrap()
+        .records
         .into_iter()
         .find(|(k, _)| {
             argos_wallet_import::zcashd::parse_record_key(k)

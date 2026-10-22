@@ -17,6 +17,58 @@ pub enum Provenance {
     Standalone,
 }
 
+/// Network identity found in a wallet's own metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedNetwork {
+    Mainnet,
+    Testnet,
+    Regtest,
+}
+
+impl std::fmt::Display for EmbeddedNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
+            Self::Regtest => "regtest",
+        })
+    }
+}
+
+pub(crate) fn merge_embedded_network(out: &mut ImportedKeys, network: EmbeddedNetwork) {
+    if out.diagnostics.iter().any(|d| {
+        matches!(
+            d,
+            ImportDiagnostic::ConflictingNetworkMetadata { .. }
+                | ImportDiagnostic::UnrecognizedNetworkMetadata { .. }
+        )
+    }) {
+        return;
+    }
+    match out.embedded_network {
+        Some(first) if first != network => {
+            out.embedded_network = None;
+            out.diagnostics
+                .push(ImportDiagnostic::ConflictingNetworkMetadata {
+                    first,
+                    second: network,
+                });
+        }
+        None => out.embedded_network = Some(network),
+        _ => {}
+    }
+}
+
+pub(crate) fn unrecognized_network(
+    out: &mut ImportedKeys,
+    format: &'static str,
+    reason: &'static str,
+) {
+    out.embedded_network = None;
+    out.diagnostics
+        .push(ImportDiagnostic::UnrecognizedNetworkMetadata { format, reason });
+}
+
 /// Deliberately no `#[derive(Debug, Clone)]` on any struct below that holds
 /// a `Secret`. A derived `Debug` on a key-bearing struct is a standing risk
 /// that a spending key ends up in a log line or a panic message, and this
@@ -186,6 +238,8 @@ pub struct ImportedKeys {
     /// individually. Deriving keys from it is `argos-core`'s job, not this
     /// crate's: see the module docs on `zwl` for why.
     pub mnemonic: Option<SecretString>,
+    /// Network asserted by the wallet file, if its format stores one.
+    pub embedded_network: Option<EmbeddedNetwork>,
     /// True when a zcashd 5.x seed decoded, matched the fingerprint zcashd
     /// stored it under, and matched the wallet's `mnemonichdchain`. It is
     /// *not* placed in `mnemonic`: zcashd stores its keys under the legacy
@@ -193,6 +247,20 @@ pub struct ImportedKeys {
     /// the wallet down the HD path would drop them. Verification is what
     /// lets the import say whether the stored keys are the whole story.
     pub seed_verified: bool,
+    /// The block height the wallet file records as its birthday, when its
+    /// format stores one: ZecWallet Lite's wallet tail. ZWL lowers it to the
+    /// birthday given for any Sapling key imported into the wallet
+    /// (`adjust_wallet_birthday` in `add_imported_sk`), so it bounds the
+    /// file's standalone Sapling keys as well as its seed. `None` when the
+    /// format stores no birthday or the file records zero ("not recorded").
+    /// A block height, not a time: unrelated to the keys' `created_at`.
+    pub birthday_height: Option<u32>,
+    /// The largest HD index (`hdkey_num`) the file says it derived a key
+    /// at, for formats that number their HD keys: ZecWallet Lite derives a
+    /// new account per address, so a key at index 37 means accounts 0..=37
+    /// exist whatever the scan's gap limit would find. `None` when the file
+    /// records no HD index.
+    pub highest_hd_index: Option<u32>,
     /// Everything we could not read. Never empty silently — always shown
     /// to the user with counts.
     pub diagnostics: Vec<ImportDiagnostic>,
@@ -265,6 +333,17 @@ impl ImportedKeys {
                 ImportCoverage::SproutNoteDataUnread if self.sprout.is_empty() => {
                     ImportCoverage::Complete
                 }
+                ImportCoverage::SeedNotRecovered
+                    if matches!(
+                        d,
+                        ImportDiagnostic::LockedKey {
+                            provenance: Provenance::HdDerived,
+                            ..
+                        }
+                    ) && self.mnemonic.is_some() =>
+                {
+                    ImportCoverage::Complete
+                }
                 grade => grade,
             })
     }
@@ -320,12 +399,18 @@ pub enum ImportCoverage {
     /// recovered from it — absent, or present only as a record that could
     /// not be read or decrypted. A truncated or damaged wallet.
     DerivedKeysMissing,
+    /// The file records an HD key at an account index past the most HD
+    /// accounts the scan walks, so those accounts are not scanned.
+    HdAccountsBeyondScanLimit,
     /// The seed is verified, but unified accounts derived from it hold
     /// keys the file does not store, so they are not scanned.
     SeedAccountsNotScanned,
     /// The wallet's HD seed could not be verified, so a whole key tree may
     /// be missing.
     SeedNotRecovered,
+    /// The wallet was recognized, but the needed spending authority is absent
+    /// or could not be recovered from this file.
+    KeyMaterialMissing,
 }
 
 impl ImportCoverage {
@@ -333,15 +418,31 @@ impl ImportCoverage {
     pub fn of(diagnostic: &ImportDiagnostic) -> Self {
         match diagnostic {
             ImportDiagnostic::UnrecoveredSeed { .. } => Self::SeedNotRecovered,
+            ImportDiagnostic::LockedKey {
+                provenance: Provenance::HdDerived,
+                ..
+            } => Self::SeedNotRecovered,
+            ImportDiagnostic::LockedKey {
+                provenance: Provenance::Standalone,
+                ..
+            }
+            | ImportDiagnostic::UnsupportedWalletVersion { .. }
+            | ImportDiagnostic::UnrecoveredStandaloneKey { .. }
+            | ImportDiagnostic::MissingSpendAuthority { .. } => Self::KeyMaterialMissing,
             // A transaction holds note data, never keys: every key was
             // still read, and the full-block scan recovers the notes.
             ImportDiagnostic::UnparseableRecord { record_type, .. } if record_type == "tx" => {
                 Self::SproutNoteDataUnread
             }
             ImportDiagnostic::UnparseableRecord { .. }
-            | ImportDiagnostic::DecryptionFailed { .. } => Self::KeysUnread,
-            ImportDiagnostic::UnknownRecord { .. } => Self::UnknownRecordsSkipped,
+            | ImportDiagnostic::DecryptionFailed { .. }
+            | ImportDiagnostic::ContainerDamage { .. }
+            | ImportDiagnostic::PublicIdentifierMismatch { .. } => Self::KeysUnread,
+            ImportDiagnostic::UnknownRecord { .. }
+            | ImportDiagnostic::ConflictingNetworkMetadata { .. }
+            | ImportDiagnostic::UnrecognizedNetworkMetadata { .. } => Self::UnknownRecordsSkipped,
             ImportDiagnostic::UnscannedSeedAccounts { .. } => Self::SeedAccountsNotScanned,
+            ImportDiagnostic::HdAccountsBeyondScanLimit { .. } => Self::HdAccountsBeyondScanLimit,
             ImportDiagnostic::MissingDerivedKeys { .. } => Self::DerivedKeysMissing,
             ImportDiagnostic::UncheckedLegacySeed { .. } => Self::LegacySeedUnchecked,
             // A key without a creation time is still a key, and is scanned
@@ -384,6 +485,11 @@ impl ImportCoverage {
                 "Incomplete — this wallet's own records say its seed derived keys that \
                  were not read from this file, so balances may be missing funds.",
             ),
+            Self::HdAccountsBeyondScanLimit => Some(
+                "Incomplete — this wallet records HD keys at more accounts than Argos \
+                 scans. Accounts past the scan's limit are not scanned, so balances may \
+                 be missing funds.",
+            ),
             Self::SeedAccountsNotScanned => Some(
                 "Incomplete — this wallet created unified accounts from its seed \
                  (z_getnewaccount). Their keys are not stored in the file and Argos \
@@ -393,6 +499,10 @@ impl ImportCoverage {
                 "Incomplete — this file holds an HD seed that Argos could not verify. \
                  Keys derived from it are only covered if the file also stores them \
                  individually, so balances may be missing funds.",
+            ),
+            Self::KeyMaterialMissing => Some(
+                "Incomplete — spending authority is missing from this recognized wallet. \
+                 Recovered keys and balances may be missing funds.",
             ),
         }
     }
@@ -426,6 +536,8 @@ impl std::fmt::Debug for ImportedKeys {
                     "None"
                 },
             )
+            .field("birthday_height", &self.birthday_height)
+            .field("highest_hd_index", &self.highest_hd_index)
             .field("diagnostics", &self.diagnostics)
             .finish()
     }
@@ -434,6 +546,7 @@ impl std::fmt::Debug for ImportedKeys {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+    use crate::error::ImportError;
 
     fn with(diagnostics: Vec<ImportDiagnostic>) -> ImportedKeys {
         ImportedKeys {
@@ -688,5 +801,76 @@ mod coverage_tests {
         let seed = ImportCoverage::SeedNotRecovered.notice().unwrap();
         assert!(seed.contains("HD seed"));
         assert_ne!(Some(seed), ImportCoverage::KeysUnread.notice());
+    }
+
+    #[test]
+    fn container_damage_is_never_complete() {
+        let keys = with(vec![ImportDiagnostic::ContainerDamage {
+            format: "Berkeley DB",
+            location: "page 4 slot 3".to_owned(),
+            reason: "entry extends past the page".to_owned(),
+        }]);
+        assert_eq!(keys.coverage(), ImportCoverage::KeysUnread);
+        assert!(keys.coverage().may_hide_funds());
+    }
+
+    #[test]
+    fn recognized_empty_wallet_is_key_material_missing() {
+        let keys = with(vec![ImportDiagnostic::MissingSpendAuthority {
+            format: "ZecWallet Lite",
+        }]);
+        assert_eq!(keys.coverage(), ImportCoverage::KeyMaterialMissing);
+        assert!(keys
+            .coverage_notice()
+            .unwrap()
+            .contains("original wallet file"));
+    }
+
+    #[test]
+    fn locked_key_coverage_depends_on_provenance_and_seed() {
+        let standalone = ImportDiagnostic::LockedKey {
+            record_type: "zkey".to_owned(),
+            provenance: Provenance::Standalone,
+        };
+        assert_eq!(
+            with(vec![standalone]).coverage(),
+            ImportCoverage::KeyMaterialMissing
+        );
+
+        let hd = ImportDiagnostic::LockedKey {
+            record_type: "zkey".to_owned(),
+            provenance: Provenance::HdDerived,
+        };
+        assert_eq!(
+            with(vec![hd.clone()]).coverage(),
+            ImportCoverage::SeedNotRecovered
+        );
+        let mut with_seed = with(vec![hd]);
+        with_seed.mnemonic = Some(SecretString::new("test mnemonic".into()));
+        assert_eq!(with_seed.coverage(), ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn public_identifier_mismatch_redacts_identifier_bytes() {
+        let diagnostic = ImportDiagnostic::PublicIdentifierMismatch {
+            record_type: "marker-record-8a721".to_owned(),
+            identifier: "marker-identifier-754c",
+        };
+        let message = diagnostic.to_string();
+        assert!(!message.contains("marker-record-8a721"), "{message}");
+        assert!(!message.contains("marker-identifier-754c"), "{message}");
+        let debug = format!("{diagnostic:?}");
+        assert!(!debug.contains("marker-record-8a721"), "{debug}");
+        assert!(!debug.contains("marker-identifier-754c"), "{debug}");
+    }
+
+    #[test]
+    fn damaged_encryption_metadata_redacts_record_bytes() {
+        let error = ImportError::DamagedEncryptionMetadata("marker-mkey-3e920".to_owned());
+        let message = error.to_string();
+        assert!(!message.contains("marker-mkey-3e920"), "{message}");
+        assert!(message.contains("original wallet file"), "{message}");
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("marker-mkey-3e920"), "{debug}");
     }
 }

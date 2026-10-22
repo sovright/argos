@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn parsing_the_golden_wallet_fabricates_no_notes() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mut out = ImportedKeys::default();
         collect_sprout_notes(&pairs, &mut out);
         // zcashd files no Sprout note records at all — it does not detect
@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn walks_every_real_tx_record_in_the_encrypted_golden_wallet_without_failing() {
         let bytes = std::fs::read("tests/fixtures/sprout-encrypted.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mut tx_count = 0;
         let mut out = ImportedKeys::default();
         for (raw_key, value) in &pairs {
@@ -980,7 +980,7 @@ mod tests {
             "modern-encrypted.dat",
         ] {
             let bytes = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
-            let pairs = crate::bdb::walk(&bytes).unwrap();
+            let pairs = crate::bdb::walk(&bytes).unwrap().records;
             let mut out = ImportedKeys::default();
             collect_sprout_notes(&pairs, &mut out);
             assert!(out.diagnostics.is_empty(), "{name}: {:?}", out.diagnostics);

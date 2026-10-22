@@ -45,12 +45,16 @@
 //! (`src/wallet/walletdb.cpp`) — and `ivk = CRH^ivk(ak, nk)` is derived from
 //! the same viewing key. So the record key is the oracle there.
 //!
-//! The re-derivation uses `sapling-crypto`, a crate this parser does not
-//! depend on and never calls, so the comparison is against an independent
-//! implementation rather than a restatement of the code under test — the
-//! same arrangement `transparent_key_is_genuine.rs` has with `secp256k1`.
+//! The fixture bytes came from zcashd independently of this parser. Both
+//! this test and the parser now use `sapling-crypto` to derive viewing keys,
+//! so the golden bytes, not a separate crypto implementation, are the
+//! external oracle. The mutation tests still prove mismatches are rejected.
 
-use argos_wallet_import::{bdb, keys::ImportedKeys, zcashd};
+use argos_wallet_import::{
+    bdb,
+    keys::{ImportCoverage, ImportedKeys},
+    zcashd, ImportDiagnostic,
+};
 use sapling_crypto::zip32::ExtendedSpendingKey;
 use secrecy::{ExposeSecret, SecretString};
 
@@ -70,7 +74,9 @@ const FVK_LEN: usize = 96;
 fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
-    bdb::walk(&bytes).unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+    bdb::walk(&bytes)
+        .unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+        .records
 }
 
 /// Parse a recovered 169-byte extended spending key and return the
@@ -318,4 +324,72 @@ fn the_derivation_rejects_a_wrong_key() {
         viewing_key_from(&good).0,
         "flipping one bit of ask must change the derived full viewing key"
     );
+}
+
+fn assert_one_sapling_rejected(
+    before: &ImportedKeys,
+    after: &ImportedKeys,
+    kind: &str,
+    identifier: &str,
+) {
+    assert_eq!(after.sapling.len() + 1, before.sapling.len());
+    for (actual, expected) in after.sapling.iter().zip(before.sapling.iter().skip(1)) {
+        assert_eq!(actual.extsk.expose_secret(), expected.extsk.expose_secret());
+    }
+    assert_ne!(after.coverage(), ImportCoverage::Complete);
+    let mismatches: Vec<_> = after
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d,
+        ImportDiagnostic::PublicIdentifierMismatch { record_type, identifier: found }
+        if record_type == kind && *found == identifier)
+        })
+        .collect();
+    assert_eq!(mismatches.len(), 1);
+    let message = mismatches[0].to_string();
+    assert!(message.contains("stored public identifier"));
+    assert!(!message.contains(&format!("{:02x?}", before.sapling[0].extsk.expose_secret())));
+}
+
+#[test]
+fn mutated_sapzkey_ivk_rejects_extsk() {
+    let mut pairs = load("modern-plaintext");
+    let mut before = ImportedKeys::default();
+    zcashd::collect_plaintext(&pairs, &mut before);
+    let (raw_key, _) = pairs
+        .iter_mut()
+        .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == "sapzkey"))
+        .unwrap();
+    raw_key[1 + "sapzkey".len()] ^= 1;
+    let mut after = ImportedKeys::default();
+    zcashd::collect_plaintext(&pairs, &mut after);
+    assert_one_sapling_rejected(&before, &after, "sapzkey", "incoming viewing key");
+}
+
+#[test]
+fn mutated_csapzkey_identifiers_reject_extsk() {
+    let pairs = load("modern-encrypted");
+    let mkey = zcashd::find_mkey(&pairs).unwrap();
+    let master =
+        zcashd::derive_master_key(&SecretString::new(FIXTURE_PASSPHRASE.to_owned()), &mkey)
+            .unwrap();
+    let mut before = ImportedKeys::default();
+    zcashd::collect_encrypted(&pairs, &master, &mut before);
+    for identifier in ["incoming viewing key", "extended full viewing key"] {
+        let mut altered = pairs.clone();
+        let (raw_key, value) = altered
+            .iter_mut()
+            .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == "csapzkey"))
+            .unwrap();
+        if identifier == "incoming viewing key" {
+            raw_key[1 + "csapzkey".len()] ^= 1;
+        } else {
+            // Mutate the extfvk's depth metadata. IV uses its FVK body, so ciphertext remains genuine.
+            value[0] ^= 1;
+        }
+        let mut after = ImportedKeys::default();
+        zcashd::collect_encrypted(&altered, &master, &mut after);
+        assert_one_sapling_rejected(&before, &after, "csapzkey", identifier);
+    }
 }

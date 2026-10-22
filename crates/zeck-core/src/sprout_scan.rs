@@ -35,7 +35,7 @@
 //! matched at the end. Missing that check would mean offering the user a
 //! balance they cannot move.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use argos_wallet_import::keys::{JsOutPoint, SproutJoinSplit};
 
@@ -124,14 +124,39 @@ pub struct ScanCursor {
     pub last_height: u32,
 }
 
+pub const SPROUT_REORG_WINDOW: usize = 100;
+
+struct BlockUndo {
+    applied: ScanCursor,
+    cursor_before: Option<ScanCursor>,
+    tree_before: IncrementalMerkleTree,
+    pending_len_before: usize,
+    witnesses_before: Vec<IncrementalWitness>,
+    spent_before: Vec<NullifierUndo>,
+    progress_before: SproutScanProgress,
+}
+
+struct NullifierUndo {
+    nullifier: [u8; 32],
+    previous: Option<Option<[u8; 32]>>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RewindError {
+    #[error("the common ancestor is older than this checkpoint's retained rollback window")]
+    BeyondRetainedWindow,
+    #[error("the checkpoint rollback history is internally inconsistent")]
+    CorruptHistory,
+}
+
 /// Scans blocks for notes belonging to a set of Sprout spending keys.
 pub struct SproutScanner {
     keys: Vec<ScanKey>,
     tree: IncrementalMerkleTree,
     pending: Vec<PendingNote>,
     /// Every nullifier seen, to tell a live note from a spent one, with the
-    /// transaction that revealed it. `None` only for nullifiers restored from
-    /// a version-1 checkpoint, which did not record it.
+    /// transaction that revealed it. `None` only in the version-1 layout,
+    /// which did not record it and is no longer resumed.
     spent: HashMap<[u8; 32], Option<[u8; 32]>>,
     progress: SproutScanProgress,
     cursor: ScanCursor,
@@ -140,6 +165,7 @@ pub struct SproutScanner {
     /// checkpoint left by a scan that stopped early reads `false`, so its
     /// cursor is never mistaken for full coverage.
     complete: bool,
+    history: VecDeque<BlockUndo>,
     /// Blocks below this height are walked but not trial-decrypted. See
     /// [`SproutScanner::with_decrypt_from`].
     decrypt_from: Option<u32>,
@@ -176,6 +202,7 @@ impl SproutScanner {
             progress: SproutScanProgress::default(),
             cursor: ScanCursor::default(),
             complete: false,
+            history: VecDeque::new(),
             decrypt_from,
         }
     }
@@ -206,9 +233,20 @@ impl SproutScanner {
         &self.spent
     }
 
+    /// [`Self::spent_nullifiers`], taken by value so a caller done with the
+    /// scanner does not copy a set that can run to millions of entries.
+    pub fn into_spent_nullifiers(self) -> HashMap<[u8; 32], Option<[u8; 32]>> {
+        self.spent
+    }
+
     /// Record that the walk reached the chain tip at the current cursor.
     pub fn mark_complete(&mut self) {
         self.complete = true;
+    }
+
+    /// A scan stopped before the chain tip cannot supply complete evidence.
+    pub fn mark_incomplete(&mut self) {
+        self.complete = false;
     }
 
     /// Whether the walk ended at the chain tip rather than stopping early.
@@ -255,18 +293,155 @@ impl SproutScanner {
         height: u32,
     ) -> Result<(), WitnessError> {
         let decrypt = self.decrypt_from.is_none_or(|bound| height >= bound);
+        let located = height > 0 && block_hash != [0; 32];
+        let prior = self.cursor();
+        let contiguous = located
+            && prior.is_some_and(|cursor| {
+                cursor.last_height > 0
+                    && cursor.last_block_hash != [0; 32]
+                    && cursor.last_height.checked_add(1) == Some(height)
+            });
+        let applied = ScanCursor {
+            last_block_hash: block_hash,
+            last_height: height,
+        };
+        let mut seen_nullifiers = HashSet::new();
+        let spent_before = joinsplits
+            .iter()
+            .flat_map(|js| js.nullifiers)
+            .filter(|nf| seen_nullifiers.insert(*nf))
+            .map(|nullifier| NullifierUndo {
+                nullifier,
+                previous: self.spent.get(&nullifier).copied(),
+            })
+            .collect();
+        let cursor_before_raw = self.cursor;
+        let undo = BlockUndo {
+            applied,
+            cursor_before: if contiguous { prior } else { None },
+            tree_before: self.tree.clone(),
+            pending_len_before: self.pending.len(),
+            witnesses_before: self.pending.iter().map(|p| p.witness.clone()).collect(),
+            spent_before,
+            progress_before: self.progress,
+        };
+        let complete_before = self.complete;
         for js in joinsplits {
-            self.scan_joinsplit(js, decrypt)?;
+            if let Err(err) = self.scan_joinsplit(js, decrypt) {
+                self.restore_block(undo);
+                self.cursor = cursor_before_raw;
+                self.complete = complete_before;
+                return Err(err);
+            }
         }
         self.progress.blocks_scanned += 1;
         self.progress.last_height = height;
         // The tip has moved past wherever a previous run ended.
         self.complete = false;
-        self.cursor = ScanCursor {
-            last_block_hash: block_hash,
-            last_height: height,
-        };
+        self.cursor = applied;
+        if located {
+            if !contiguous {
+                self.history.clear();
+            }
+            self.history.push_back(undo);
+            if self.history.len() > SPROUT_REORG_WINDOW {
+                self.history.pop_front();
+            }
+        } else {
+            // An unlocated helper call changes state but proves no chain
+            // ancestry, so no earlier rollback frames can cross it.
+            self.history.clear();
+        }
         Ok(())
+    }
+
+    fn restore_block(&mut self, undo: BlockUndo) {
+        self.tree = undo.tree_before;
+        self.pending.truncate(undo.pending_len_before);
+        for (pending, witness) in self.pending.iter_mut().zip(undo.witnesses_before) {
+            pending.witness = witness;
+        }
+        for entry in undo.spent_before {
+            match entry.previous {
+                Some(previous) => {
+                    self.spent.insert(entry.nullifier, previous);
+                }
+                None => {
+                    self.spent.remove(&entry.nullifier);
+                }
+            }
+        }
+        self.progress = undo.progress_before;
+        self.cursor = undo.cursor_before.unwrap_or_default();
+    }
+
+    /// Candidate ancestors in newest-first order, limited to actual block
+    /// hashes. The oldest candidate is the cursor before the oldest undo.
+    pub fn rollback_locators(&self) -> Vec<ScanCursor> {
+        let Some(current) = self
+            .cursor()
+            .filter(|cursor| cursor.last_height > 0 && cursor.last_block_hash != [0; 32])
+        else {
+            return Vec::new();
+        };
+        let mut locators = vec![current];
+        let mut expected = current;
+        for frame in self.history.iter().rev() {
+            if frame.applied != expected {
+                break;
+            }
+            let Some(previous) = frame.cursor_before else {
+                break;
+            };
+            locators.push(previous);
+            expected = previous;
+        }
+        locators
+    }
+
+    /// Restore all state after a retained ancestor. Validate the whole
+    /// suffix first so a corrupt in-memory history cannot partially rewind.
+    pub fn rewind_to(&mut self, ancestor_hash: [u8; 32]) -> Result<u32, RewindError> {
+        let current = self
+            .cursor()
+            .filter(|cursor| cursor.last_height > 0 && cursor.last_block_hash != [0; 32]);
+        let Some(current) = current else {
+            return Err(RewindError::BeyondRetainedWindow);
+        };
+        let mut expected = current;
+        let mut pending_len = self.pending.len();
+        let mut blocks = 0usize;
+        if expected.last_block_hash != ancestor_hash {
+            for frame in self.history.iter().rev() {
+                if frame.applied != expected
+                    || frame.witnesses_before.len() != frame.pending_len_before
+                    || frame.pending_len_before > pending_len
+                    || frame.cursor_before.is_some_and(|previous| {
+                        previous.last_height.checked_add(1) != Some(frame.applied.last_height)
+                    })
+                {
+                    return Err(RewindError::CorruptHistory);
+                }
+                pending_len = frame.pending_len_before;
+                blocks += 1;
+                let Some(previous) = frame.cursor_before else {
+                    break;
+                };
+                expected = previous;
+                if expected.last_block_hash == ancestor_hash {
+                    break;
+                }
+            }
+            if expected.last_block_hash != ancestor_hash {
+                return Err(RewindError::BeyondRetainedWindow);
+            }
+        }
+        for _ in 0..blocks {
+            let frame = self.history.pop_back().expect("validated undo frame");
+            self.restore_block(frame);
+        }
+        self.complete = false;
+        Ok(blocks as u32)
     }
 
     fn scan_joinsplit(&mut self, js: &SproutJoinSplit, decrypt: bool) -> Result<(), WitnessError> {
@@ -467,21 +642,39 @@ pub struct SproutScanCheckpoint {
 /// no visible error.
 ///
 /// Version 2 records the revealing txid with each nullifier and a trailing
-/// completion byte. Version 1 is still read — a scan measured in hours must
-/// survive an upgrade mid-way — with no txids and `complete = false`.
+/// completion byte.
 ///
 /// Version 3 appends the decrypt-from bound: a flag byte, then the height as
-/// a u64 when set. Versions 1 and 2 read as no bound, which is what they
-/// were scanned under.
-const CHECKPOINT_VERSION: u8 = 3;
+/// a u64 when set.
+///
+/// Version 4 has exactly the version-3 layout, and records that every block
+/// body was authenticated against its header (transaction Merkle root) before
+/// this state was saved. Versions 1 to 3 predate that check and may contain a
+/// poisoned tree or nullifier set: only their key headers are read (so a
+/// covering file can still be reported), and they are refused for resume and
+/// for spend evidence. A user holding one must start a fresh scan, which also
+/// re-derives any decrypt-from bound.
+///
+/// Version 5 appends bounded reorg history after the version-4 fields. A
+/// version-4 file is authenticated but has no history, and was never
+/// released (it exists only between two unreleased changes); it is refused
+/// like any other older layout rather than resumed without a rollback
+/// window, because a checkpoint at the chain tip with no retained
+/// predecessor cannot prove its cursor against live headers anyway.
+const CHECKPOINT_VERSION: u8 = 5;
 
-/// The oldest layout still read.
+/// The oldest layout whose header is still parsed. Layouts older than
+/// [`CHECKPOINT_VERSION`] are read only far enough to recover their key set
+/// ([`read_spending_keys`]); resume and spend evidence refuse them with
+/// [`CheckpointError::UnauthenticatedLegacy`].
 const OLDEST_READABLE_VERSION: u8 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
     #[error("this checkpoint was written by a different version of Argos and cannot be resumed")]
     WrongVersion,
+    #[error("this checkpoint predates Sprout block-body authentication")]
+    UnauthenticatedLegacy,
     #[error("the checkpoint file is corrupt or truncated")]
     Corrupt,
     #[error(transparent)]
@@ -548,6 +741,7 @@ pub fn read_chain_evidence(
 ) -> Result<ChainEvidence, CheckpointError> {
     let mut r = codec::Reader::new(checkpoint.as_bytes());
     let version = read_version(&mut r)?;
+    require_authenticated_version(version)?;
     r.bytes().ok_or(CheckpointError::Corrupt)?; // tree
 
     let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
@@ -579,6 +773,9 @@ pub fn read_chain_evidence(
     };
     let complete = read_complete(&mut r, version)?;
     let decrypt_from_height = read_decrypt_from(&mut r, version)?;
+    if version >= 5 {
+        let _ = read_history(&mut r, cursor, false)?;
+    }
     if r.pos != r.bytes.len() {
         return Err(CheckpointError::Corrupt);
     }
@@ -597,6 +794,14 @@ fn read_version(r: &mut codec::Reader<'_>) -> Result<u8, CheckpointError> {
         Some(v) if (OLDEST_READABLE_VERSION..=CHECKPOINT_VERSION).contains(&v) => Ok(v),
         Some(_) => Err(CheckpointError::WrongVersion),
         None => Err(CheckpointError::Corrupt),
+    }
+}
+
+fn require_authenticated_version(version: u8) -> Result<(), CheckpointError> {
+    if version == CHECKPOINT_VERSION {
+        Ok(())
+    } else {
+        Err(CheckpointError::UnauthenticatedLegacy)
     }
 }
 
@@ -631,6 +836,135 @@ fn read_complete(r: &mut codec::Reader<'_>, version: u8) -> Result<bool, Checkpo
         Some(1) => Ok(true),
         _ => Err(CheckpointError::Corrupt),
     }
+}
+
+fn write_cursor(out: &mut Vec<u8>, cursor: ScanCursor) {
+    out.extend_from_slice(&cursor.last_block_hash);
+    codec::put_u64(out, u64::from(cursor.last_height));
+}
+
+fn read_cursor(r: &mut codec::Reader<'_>) -> Result<ScanCursor, CheckpointError> {
+    Ok(ScanCursor {
+        last_block_hash: r.array32().ok_or(CheckpointError::Corrupt)?,
+        last_height: u32::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?,
+    })
+}
+
+fn write_progress(out: &mut Vec<u8>, progress: SproutScanProgress) {
+    for value in [
+        progress.blocks_scanned,
+        progress.joinsplits_seen,
+        progress.commitments_appended,
+        progress.notes_found as u64,
+        u64::from(progress.last_height),
+    ] {
+        codec::put_u64(out, value);
+    }
+}
+
+fn read_progress(r: &mut codec::Reader<'_>) -> Result<SproutScanProgress, CheckpointError> {
+    Ok(SproutScanProgress {
+        blocks_scanned: r.u64().ok_or(CheckpointError::Corrupt)?,
+        joinsplits_seen: r.u64().ok_or(CheckpointError::Corrupt)?,
+        commitments_appended: r.u64().ok_or(CheckpointError::Corrupt)?,
+        notes_found: usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?,
+        last_height: u32::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?,
+    })
+}
+
+fn read_history(
+    r: &mut codec::Reader<'_>,
+    cursor: ScanCursor,
+    parse_state: bool,
+) -> Result<VecDeque<BlockUndo>, CheckpointError> {
+    let count = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+        .map_err(|_| CheckpointError::Corrupt)?;
+    // Check before allocation or iteration. Every frame needs at least a
+    // cursor, prior-cursor tag, tree length, three counts and five counters.
+    if count > SPROUT_REORG_WINDOW || count > (r.bytes.len() - r.pos) / 113 {
+        return Err(CheckpointError::Corrupt);
+    }
+    let mut history: VecDeque<BlockUndo> = VecDeque::new();
+    for _ in 0..count {
+        let applied = read_cursor(r)?;
+        let cursor_before = match r.take(1).and_then(|b| b.first().copied()) {
+            Some(0) => None,
+            Some(1) => Some(read_cursor(r)?),
+            _ => return Err(CheckpointError::Corrupt),
+        };
+        if let Some(previous) = cursor_before {
+            if previous.last_height.checked_add(1) != Some(applied.last_height) {
+                return Err(CheckpointError::Corrupt);
+            }
+        }
+        if let Some(previous_frame) = history.back() {
+            if cursor_before != Some(previous_frame.applied) {
+                return Err(CheckpointError::Corrupt);
+            }
+        }
+        let tree_bytes = r.bytes().ok_or(CheckpointError::Corrupt)?;
+        let tree_before = if parse_state {
+            IncrementalMerkleTree::parse(tree_bytes)?
+        } else {
+            IncrementalMerkleTree::default()
+        };
+        let pending_len_before = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?;
+        let witness_count = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?;
+        if witness_count != pending_len_before || witness_count > (r.bytes.len() - r.pos) / 8 {
+            return Err(CheckpointError::Corrupt);
+        }
+        let mut witnesses_before = Vec::new();
+        for _ in 0..witness_count {
+            let bytes = r.bytes().ok_or(CheckpointError::Corrupt)?;
+            if parse_state {
+                witnesses_before.push(IncrementalWitness::parse_one(bytes)?);
+            }
+        }
+        let spent_count = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?;
+        if spent_count > (r.bytes.len() - r.pos) / 33 {
+            return Err(CheckpointError::Corrupt);
+        }
+        let mut spent_before = Vec::new();
+        let mut seen = HashSet::new();
+        for _ in 0..spent_count {
+            let nullifier = r.array32().ok_or(CheckpointError::Corrupt)?;
+            if !seen.insert(nullifier) {
+                return Err(CheckpointError::Corrupt);
+            }
+            let previous = match r.take(1).and_then(|b| b.first().copied()) {
+                Some(0) => None,
+                Some(1) => Some(None),
+                Some(2) => Some(Some(r.array32().ok_or(CheckpointError::Corrupt)?)),
+                _ => return Err(CheckpointError::Corrupt),
+            };
+            if parse_state {
+                spent_before.push(NullifierUndo {
+                    nullifier,
+                    previous,
+                });
+            }
+        }
+        let progress_before = read_progress(r)?;
+        history.push_back(BlockUndo {
+            applied,
+            cursor_before,
+            tree_before,
+            pending_len_before,
+            witnesses_before,
+            spent_before,
+            progress_before,
+        });
+    }
+    if history.back().is_some_and(|frame| frame.applied != cursor) {
+        return Err(CheckpointError::Corrupt);
+    }
+    Ok(history)
 }
 
 fn read_decrypt_from(
@@ -694,8 +1028,9 @@ impl SproutScanner {
         self.encode(CHECKPOINT_VERSION)
     }
 
-    /// Write the given layout. Only the current one is written outside
-    /// tests; version 1 exists so its reader stays tested.
+    /// Write the given layout. Only [`CHECKPOINT_VERSION`] (5:
+    /// body-authenticated, with rollback history) is written outside tests;
+    /// older layouts are generated to test that they are refused.
     fn encode(&self, version: u8) -> SproutScanCheckpoint {
         use codec::{put_bytes, put_u64};
 
@@ -761,6 +1096,38 @@ impl SproutScanner {
                 None => out.push(0),
             }
         }
+        if version >= 5 {
+            put_u64(&mut out, self.history.len() as u64);
+            for frame in &self.history {
+                write_cursor(&mut out, frame.applied);
+                match frame.cursor_before {
+                    Some(cursor) => {
+                        out.push(1);
+                        write_cursor(&mut out, cursor);
+                    }
+                    None => out.push(0),
+                }
+                put_bytes(&mut out, &frame.tree_before.to_bytes());
+                put_u64(&mut out, frame.pending_len_before as u64);
+                put_u64(&mut out, frame.witnesses_before.len() as u64);
+                for witness in &frame.witnesses_before {
+                    put_bytes(&mut out, &witness.to_bytes());
+                }
+                put_u64(&mut out, frame.spent_before.len() as u64);
+                for undo in &frame.spent_before {
+                    out.extend_from_slice(&undo.nullifier);
+                    match undo.previous {
+                        None => out.push(0),
+                        Some(None) => out.push(1),
+                        Some(Some(txid)) => {
+                            out.push(2);
+                            out.extend_from_slice(&txid);
+                        }
+                    }
+                }
+                write_progress(&mut out, frame.progress_before);
+            }
+        }
 
         SproutScanCheckpoint { bytes: out }
     }
@@ -769,6 +1136,7 @@ impl SproutScanner {
     pub fn resume(checkpoint: &SproutScanCheckpoint) -> Result<Self, CheckpointError> {
         let mut r = codec::Reader::new(checkpoint.as_bytes());
         let version = read_version(&mut r)?;
+        require_authenticated_version(version)?;
 
         let tree = IncrementalMerkleTree::parse(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
 
@@ -842,6 +1210,12 @@ impl SproutScanner {
         let complete = read_complete(&mut r, version)?;
         let decrypt_from = read_decrypt_from(&mut r, version)?;
 
+        let history = if version >= 5 {
+            read_history(&mut r, cursor, true)?
+        } else {
+            VecDeque::new()
+        };
+
         if r.pos != r.bytes.len() {
             return Err(CheckpointError::Corrupt);
         }
@@ -854,6 +1228,7 @@ impl SproutScanner {
             progress,
             cursor,
             complete,
+            history,
             decrypt_from,
         })
     }
@@ -874,6 +1249,259 @@ pub fn joinsplits_by_transaction(joinsplits: &[SproutJoinSplit]) -> HashMap<[u8;
 mod tests {
     use super::*;
     use crate::sprout::SproutNotePlaintext;
+
+    #[test]
+    fn orphaned_nullifier_is_removed_and_the_note_is_live_again() {
+        let key = [0x42; 32];
+        let (receipt, nullifier) = joinsplit_paying(&key, 1234, 0, 11);
+        let (mut spend, _) = joinsplit_paying(&[0x77; 32], 1, 0, 12);
+        spend.nullifiers[0] = nullifier;
+        let mut scanner = SproutScanner::new(&[key]);
+        scanner.scan_block_at(&[receipt], [1; 32], 1).unwrap();
+        scanner.scan_block_at(&[spend], [2; 32], 2).unwrap();
+        assert!(scanner.spent.contains_key(&nullifier));
+
+        assert_eq!(scanner.rewind_to([1; 32]), Ok(1));
+        assert!(!scanner.spent.contains_key(&nullifier));
+        let result = scanner.finish().unwrap();
+        assert_eq!(result.spent_notes, 0);
+        assert_eq!(result.total_value(), 1234);
+    }
+
+    #[test]
+    fn orphaned_received_note_is_removed_and_the_previous_anchor_is_restored() {
+        let key = [0x42; 32];
+        let mut scanner = SproutScanner::new(&[key]);
+        scanner.scan_block_at(&[], [1; 32], 1).unwrap();
+        let anchor_before = scanner.anchor();
+        let (receipt, _) = joinsplit_paying(&key, 1234, 0, 13);
+        scanner.scan_block_at(&[receipt], [2; 32], 2).unwrap();
+        assert_ne!(scanner.anchor(), anchor_before);
+
+        assert_eq!(scanner.rewind_to([1; 32]), Ok(1));
+        assert_eq!(scanner.anchor(), anchor_before);
+        assert!(scanner.finish().unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn rewind_removes_a_received_and_spent_orphan_note_atomically() {
+        let key = [0x42; 32];
+        let mut scanner = SproutScanner::new(&[key]);
+        let (original, _) = joinsplit_paying(&key, 42, 0, 14);
+        scanner.scan_block_at(&[original], [1; 32], 1).unwrap();
+        let expected = scanner.checkpoint().as_bytes().to_vec();
+        let (receipt, nullifier) = joinsplit_paying(&key, 1234, 0, 15);
+        let (mut spend, _) = joinsplit_paying(&[0x77; 32], 1, 0, 16);
+        spend.nullifiers[0] = nullifier;
+        scanner.scan_block_at(&[receipt], [2; 32], 2).unwrap();
+        scanner.scan_block_at(&[spend], [3; 32], 3).unwrap();
+        scanner.mark_complete();
+
+        assert_eq!(scanner.rewind_to([1; 32]), Ok(2));
+        assert_eq!(scanner.cursor().unwrap().last_block_hash, [1; 32]);
+        assert!(!scanner.is_complete());
+        // Completion is intentionally cleared by rewind; all other state is exact.
+        assert_eq!(scanner.checkpoint().as_bytes(), expected);
+        let result = scanner.finish().unwrap();
+        assert_eq!(result.total_value(), 42);
+        assert_eq!(result.spent_notes, 0);
+    }
+
+    #[test]
+    fn failed_block_scan_is_atomic() {
+        // A tree with one available leaf lets the first commitment through,
+        // then the second fails after nullifiers and progress have changed.
+        let mut almost_full = vec![1];
+        almost_full.extend_from_slice(&[1; 32]);
+        almost_full.push(0);
+        almost_full.push((crate::sprout_witness::TREE_DEPTH - 1) as u8);
+        for _ in 0..crate::sprout_witness::TREE_DEPTH - 1 {
+            almost_full.push(1);
+            almost_full.extend_from_slice(&[2; 32]);
+        }
+        let mut scanner = SproutScanner::new(&[[0x42; 32]]);
+        scanner.scan_block_at(&[], [1; 32], 1).unwrap();
+        scanner.tree = IncrementalMerkleTree::parse(&almost_full).unwrap();
+        scanner.mark_complete();
+        let before = scanner.checkpoint().as_bytes().to_vec();
+        let (js, _) = joinsplit_paying(&[0x77; 32], 1, 0, 17);
+
+        assert_eq!(
+            scanner.scan_block_at(&[js], [2; 32], 2),
+            Err(WitnessError::TreeFull)
+        );
+        assert_eq!(scanner.checkpoint().as_bytes(), before);
+    }
+
+    #[test]
+    fn rollback_history_keeps_exactly_one_hundred_blocks() {
+        let mut scanner = SproutScanner::new(&[]);
+        for height in 1..=101u32 {
+            scanner
+                .scan_block_at(&[], [height as u8; 32], height)
+                .unwrap();
+        }
+        assert_eq!(scanner.history.len(), SPROUT_REORG_WINDOW);
+        let locators = scanner.rollback_locators();
+        assert_eq!(locators.len(), 101);
+        assert_eq!(locators[0].last_height, 101);
+        assert_eq!(locators[100].last_height, 1);
+    }
+
+    #[test]
+    fn ancestor_older_than_the_window_is_refused_without_mutation() {
+        let mut scanner = SproutScanner::new(&[]);
+        for height in 1..=102u32 {
+            scanner
+                .scan_block_at(&[], [height as u8; 32], height)
+                .unwrap();
+        }
+        let before = scanner.checkpoint().as_bytes().to_vec();
+        assert_eq!(
+            scanner.rewind_to([1; 32]),
+            Err(RewindError::BeyondRetainedWindow)
+        );
+        assert_eq!(scanner.checkpoint().as_bytes(), before);
+    }
+
+    #[test]
+    fn checkpoint_v5_round_trips_reorg_history() {
+        let key = [0x42; 32];
+        let mut scanner = SproutScanner::new(&[key]);
+        for height in 1..=3u32 {
+            let (js, _) = joinsplit_paying(&key, 100 * u64::from(height), 0, height as u8);
+            scanner
+                .scan_block_at(&[js], [height as u8; 32], height)
+                .unwrap();
+        }
+        scanner.mark_complete();
+        let checkpoint = scanner.checkpoint();
+        let resumed = SproutScanner::resume(&checkpoint).unwrap();
+        assert_eq!(checkpoint.as_bytes()[0], CHECKPOINT_VERSION);
+        assert_eq!(resumed.history.len(), 3);
+        assert_eq!(resumed.checkpoint().as_bytes(), checkpoint.as_bytes());
+        assert_eq!(resumed.tree.to_bytes(), scanner.tree.to_bytes());
+        assert_eq!(resumed.pending.len(), scanner.pending.len());
+        for (actual, expected) in resumed.pending.iter().zip(&scanner.pending) {
+            assert_eq!(actual.witness.to_bytes(), expected.witness.to_bytes());
+        }
+        assert_eq!(resumed.spent, scanner.spent);
+        assert_eq!(resumed.progress(), scanner.progress());
+        assert_eq!(resumed.cursor(), scanner.cursor());
+        assert_eq!(resumed.is_complete(), scanner.is_complete());
+    }
+
+    #[test]
+    fn hundred_frame_checkpoint_records_only_per_block_spent_undo() {
+        let key = [0x42; 32];
+        let mut scanner = SproutScanner::new(&[key]);
+        let mut first_block = Vec::new();
+        for seed in (10..100u8).step_by(3) {
+            let recipient = if seed == 10 { key } else { [0x77; 32] };
+            first_block.push(joinsplit_paying(&recipient, 100, 0, seed).0);
+        }
+        scanner.scan_block_at(&first_block, [1; 32], 1).unwrap();
+        for height in 2..=100u32 {
+            let joinsplits = match height {
+                2 | 3 => vec![joinsplit_paying(&key, 100, 0, 100 + 3 * height as u8).0],
+                _ => Vec::new(),
+            };
+            scanner
+                .scan_block_at(&joinsplits, [height as u8; 32], height)
+                .unwrap();
+        }
+        assert_eq!(scanner.history.len(), SPROUT_REORG_WINDOW);
+        assert_eq!(scanner.pending.len(), 3);
+        assert_eq!(scanner.spent.len(), 64);
+        assert_eq!(scanner.history[0].spent_before.len(), 60);
+        assert_eq!(scanner.history[1].spent_before.len(), 2);
+        assert_eq!(scanner.history[2].spent_before.len(), 2);
+        assert!(scanner
+            .history
+            .iter()
+            .skip(3)
+            .all(|f| f.spent_before.is_empty()));
+
+        let v4_bytes = scanner.encode(4).as_bytes().len();
+        let v5 = scanner.checkpoint();
+        let v5_bytes = v5.as_bytes().len();
+        // A frame contains its own tree/witness snapshots and only the
+        // nullifiers changed in that block. Account for every encoded byte:
+        // an added copy of the global spent map in any frame fails this.
+        let frames_bytes: usize = scanner
+            .history
+            .iter()
+            .map(|frame| {
+                40 + 1
+                    + usize::from(frame.cursor_before.is_some()) * 40
+                    + 8
+                    + frame.tree_before.to_bytes().len()
+                    + 8
+                    + 8
+                    + frame
+                        .witnesses_before
+                        .iter()
+                        .map(|w| 8 + w.to_bytes().len())
+                        .sum::<usize>()
+                    + 8
+                    + frame
+                        .spent_before
+                        .iter()
+                        .map(|undo| 33 + usize::from(matches!(undo.previous, Some(Some(_)))) * 32)
+                        .sum::<usize>()
+                    + 40
+            })
+            .sum();
+        assert_eq!(v5_bytes, v4_bytes + 8 + frames_bytes);
+        assert_eq!(SproutScanner::resume(&v5).unwrap().history.len(), 100);
+        eprintln!("100-frame checkpoint with three pending notes and 64 spent nullifiers: v4-equivalent={v4_bytes} bytes, v5={v5_bytes} bytes");
+    }
+
+    #[test]
+    fn v5_rejects_oversized_and_noncontiguous_history() {
+        let mut scanner = SproutScanner::new(&[[0x42; 32]]);
+        for height in 1..=2u32 {
+            scanner
+                .scan_block_at(&[], [height as u8; 32], height)
+                .unwrap();
+        }
+        let offset = scanner.encode(4).as_bytes().len();
+        let original = scanner.checkpoint().as_bytes().to_vec();
+
+        let mut oversized = original.clone();
+        oversized[offset..offset + 8].copy_from_slice(&101u64.to_le_bytes());
+        assert!(matches!(
+            SproutScanner::resume(&SproutScanCheckpoint::from_bytes(oversized)),
+            Err(CheckpointError::Corrupt)
+        ));
+
+        // The first applied cursor no longer joins the second frame's prior cursor.
+        let mut noncontiguous = original;
+        noncontiguous[offset + 8 + 32..offset + 8 + 32 + 8].copy_from_slice(&3u64.to_le_bytes());
+        assert!(matches!(
+            SproutScanner::resume(&SproutScanCheckpoint::from_bytes(noncontiguous)),
+            Err(CheckpointError::Corrupt)
+        ));
+    }
+
+    /// Version 4 is authenticated but carries no rollback history. It was
+    /// never released, and is refused like every older layout rather than
+    /// resumed with an empty window.
+    #[test]
+    fn a_version_4_checkpoint_without_history_is_refused() {
+        let mut scanner = SproutScanner::new(&[[0x42; 32]]);
+        scanner.scan_block_at(&[], [1; 32], 1).unwrap();
+        let v4 = scanner.encode(4);
+        assert!(matches!(
+            SproutScanner::resume(&v4),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v4),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert_eq!(read_spending_keys(v4.as_bytes()).unwrap(), vec![[0x42; 32]]);
+    }
 
     /// Build a JoinSplit paying `value` to `a_sk` in output `index`, with
     /// the other output a real note to a stranger. Produced through the
@@ -1183,8 +1811,9 @@ mod tests {
         scanner.scan_block(&[js]).expect("scan");
         let anchor = scanner.anchor();
 
-        let resumed =
-            SproutScanner::resume(&scanner.checkpoint()).expect("an empty result must resume");
+        let checkpoint = scanner.checkpoint();
+        assert_eq!(checkpoint.as_bytes()[0], CHECKPOINT_VERSION);
+        let resumed = SproutScanner::resume(&checkpoint).expect("an empty result must resume");
         assert_eq!(resumed.anchor(), anchor);
         assert_eq!(resumed.progress(), scanner.progress());
     }
@@ -1296,10 +1925,10 @@ mod tests {
         assert_eq!(resumed.spent_nullifiers(), scanner.spent_nullifiers());
     }
 
-    /// A real user has a version-1 checkpoint mid-scan. It must still load
-    /// and resume: its nullifiers without txids, and not marked complete.
+    /// Legacy keys remain discoverable for covering-file detection, but
+    /// pre-authentication scan state cannot supply a tree or spend verdict.
     #[test]
-    fn a_version_1_checkpoint_still_resumes() {
+    fn a_version_1_checkpoint_is_not_scan_or_spend_evidence() {
         let a_sk = [0x42u8; 32];
         let (js, _) = joinsplit_paying(&a_sk, 1_000, 0, 70);
         let mut scanner = SproutScanner::new(&[a_sk]);
@@ -1308,19 +1937,32 @@ mod tests {
 
         let v1 = scanner.encode(1);
         assert_eq!(v1.as_bytes()[0], 1);
-        let resumed = SproutScanner::resume(&v1).expect("a v1 checkpoint resumes");
-        assert_eq!(resumed.cursor(), scanner.cursor());
-        assert_eq!(resumed.progress(), scanner.progress());
-        assert!(
-            !resumed.is_complete(),
-            "v1 recorded no completion, so none is claimed"
-        );
-        assert_eq!(resumed.spent_nullifiers().get(&[71u8; 32]), Some(&None));
-        assert_eq!(resumed.spent_nullifiers().len(), 2);
+        assert_eq!(read_spending_keys(v1.as_bytes()).unwrap(), vec![a_sk]);
+        assert!(matches!(
+            SproutScanner::resume(&v1),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v1),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+    }
 
-        let evidence = read_chain_evidence(&v1).expect("v1 reads as evidence");
-        assert!(!evidence.complete);
-        assert_eq!(evidence.spent.get(&[71u8; 32]), Some(&None));
+    #[test]
+    fn a_version_2_checkpoint_is_not_scan_or_spend_evidence() {
+        let a_sk = [0x42u8; 32];
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[], [0xAB; 32], 9).expect("scan");
+        let v2 = scanner.encode(2);
+        assert_eq!(read_spending_keys(v2.as_bytes()).unwrap(), vec![a_sk]);
+        assert!(matches!(
+            SproutScanner::resume(&v2),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v2),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
     }
 
     /// Kristi, #240 #3: a scan that died early left a valid checkpoint
@@ -1484,17 +2126,33 @@ mod tests {
         let resumed = SproutScanner::resume(&none.checkpoint()).expect("resume");
         assert_eq!(resumed.decrypt_from_height(), None);
 
-        // Older layouts never skipped anything.
-        for version in [1, 2] {
+        // Older layouts, the bound-carrying v3 included, predate body
+        // authentication: neither the bound nor anything else in them is
+        // trusted, from either reader. v4 is authenticated but has no
+        // rollback history and was never released; it is refused too.
+        for version in [1, 2, 3, 4] {
             let old = scanner.encode(version);
-            let resumed = SproutScanner::resume(&old).expect("an old checkpoint resumes");
-            assert_eq!(resumed.decrypt_from_height(), None, "v{version}");
-            assert_eq!(read_chain_evidence(&old).unwrap().decrypt_from_height, None);
+            assert!(
+                matches!(
+                    SproutScanner::resume(&old),
+                    Err(CheckpointError::UnauthenticatedLegacy)
+                ),
+                "v{version}"
+            );
+            assert!(
+                matches!(
+                    read_chain_evidence(&old),
+                    Err(CheckpointError::UnauthenticatedLegacy)
+                ),
+                "v{version}"
+            );
+            assert_eq!(read_spending_keys(old.as_bytes()).unwrap(), vec![a_sk]);
         }
 
         // A damaged bound is corruption, not "no bound".
+        // The bound sits at the end of the v4 fields; v5 history follows it.
         let mut bytes = checkpoint.as_bytes().to_vec();
-        let flag = bytes.len() - 9;
+        let flag = scanner.encode(4).as_bytes().len() - 9;
         bytes[flag] = 7;
         assert!(SproutScanner::resume(&SproutScanCheckpoint::from_bytes(bytes)).is_err());
     }

@@ -177,7 +177,7 @@ enum HelperEvent<'a> {
     Broadcast {
         source_account: u32,
         txid: Option<&'a str>,
-        status: &'a str,
+        status: &'a argos_core::models::TxLifecycleState,
         detail: &'a str,
         confirmed_height: Option<u32>,
     },
@@ -236,6 +236,7 @@ async fn main() {
         gap_limit: args.gap_limit,
         transparent_scan: None,
         lightwalletd_url: args.lightwalletd_url,
+        confirmation_sources: Vec::new(),
         data_dir: args.data_dir,
         network: ZeckNetwork::Testnet,
         label: args.label,
@@ -344,6 +345,10 @@ async fn main() {
         donation_rate: None,
         donor_email: None,
     };
+    let reviewed = service
+        .propose_sweep(&handle, sweep_request)
+        .await
+        .expect("review sweep before test-only execution");
 
     // NB: the helper's broadcast event is emitted only *after* the per-account
     // broadcast lands in the result list. The library's pause happens after
@@ -364,7 +369,7 @@ async fn main() {
     // is an `Err`. Emit the broadcast records in either case.
     let pause = Duration::from_millis(args.pause_millis_between_broadcasts);
     let outcome = match service
-        .execute_sweep_with_test_pause(&handle, sweep_request, pause)
+        .execute_sweep_with_test_pause(&handle, &reviewed.proposal_id, pause)
         .await
     {
         Ok(outcome) => outcome,

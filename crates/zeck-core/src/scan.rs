@@ -6,6 +6,7 @@ use std::sync::{
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use rustls::crypto::ring::default_provider;
+use secrecy::ExposeSecret;
 use secrecy::SecretVec;
 use tokio::sync::Mutex;
 use tonic::{
@@ -19,8 +20,8 @@ use zcash_client_backend::{
         chain::{error::Error as ChainError, BlockCache, BlockSource},
         scanning::ScanRange,
         wallet::{input_selection::LockFilter, ConfirmationsPolicy},
-        Account as _, AccountBirthday, CoinbaseFilter, InputSource, WalletRead, WalletWrite,
-        Zip32Derivation,
+        Account as _, AccountBirthday, AccountPurpose, CoinbaseFilter, InputSource, WalletRead,
+        WalletWrite, Zip32Derivation,
     },
     proto::{
         compact_formats::CompactBlock,
@@ -69,7 +70,8 @@ fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-const MAX_ACCOUNT_SCAN_COUNT: u32 = 500;
+use crate::wallet_file_import::MAX_ACCOUNT_SCAN_COUNT;
+
 /// Blocks downloaded and scanned per batch unless the caller chose otherwise.
 /// The in-memory block cache holds one batch, so this bounds its size.
 const SYNC_BATCH_SIZE: u32 = 1_000;
@@ -272,7 +274,28 @@ pub struct TrackedAccount {
     pub wallet_account_id: AccountUuid,
     pub derived: DerivedAccount,
     pub transparent_receivers: Vec<TransparentAddress>,
+    pub spend_authority: TrackedSpendAuthority,
+    /// The subset controlled by imported private keys, even when those
+    /// receivers share an HD account's wallet-database balance row.
+    pub standalone_transparent_receivers: Vec<TransparentAddress>,
     pub(crate) transparent_key_coordinates: Vec<TrackedTransparentKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedSpendAuthority {
+    Hd {
+        zip32_index: u32,
+    },
+    ImportedSapling {
+        key_index: usize,
+        wallet_account_id: AccountUuid,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StandaloneTransparentBalance {
+    pub zatoshis: u64,
+    pub utxo_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +320,11 @@ pub struct ScanTaskState {
     pub cancelled: Arc<AtomicBool>,
     pub workspace: Option<RecoveryWorkspace>,
     pub tracked_accounts: Vec<TrackedAccount>,
+    /// Original import positions that survived overlap and duplicate checks.
+    pub standalone_sapling_indices: Vec<usize>,
+    pub standalone_transparent_indices: Vec<usize>,
+    pub standalone_transparent_balances:
+        std::collections::HashMap<u32, StandaloneTransparentBalance>,
 }
 
 impl ScanTaskState {
@@ -323,6 +351,9 @@ impl ScanTaskState {
             cancelled: Arc::new(AtomicBool::new(false)),
             workspace: None,
             tracked_accounts: vec![],
+            standalone_sapling_indices: vec![],
+            standalone_transparent_indices: vec![],
+            standalone_transparent_balances: std::collections::HashMap::new(),
         }
     }
 }
@@ -558,9 +589,9 @@ async fn run_recovery_scan_inner(
         guard.workspace = Some(workspace.clone());
     }
 
-    let max_accounts = resolve_max_account_count(&config)?;
+    let (max_accounts, mut target_accounts) =
+        hd_scan_bounds(&config, config.key_source.imported_keys())?;
     let mut imported_accounts = 0u32;
-    let mut target_accounts = initial_batch_size(&config, max_accounts);
     let mut gap_extension_pass = 0u32;
     let network = consensus_network(config.network);
     let initial_accounts = derive_scan_accounts(
@@ -827,7 +858,376 @@ async fn run_recovery_scan_inner(
         target_accounts = new_target;
     }
 
-    finish_scan(&state, &workspace).await
+    finish_seeded_scan(
+        StandaloneLeg {
+            state: &state,
+            workspace: &workspace,
+            config: &config,
+            seed: &seed,
+            hd_birthday: &account_birthday,
+            hd_start: effective_birthday,
+            sapling_floor,
+            hd_accounts: imported_accounts,
+        },
+        &mut LightwalletdChain {
+            client: &mut client,
+            chain_tip_height,
+            workspace: &workspace,
+            network: &network,
+            config: &config,
+            state: &state,
+        },
+    )
+    .await
+}
+
+/// The tail of a seeded scan, once the HD gap is resolved: run the
+/// standalone-key leg (a no-op unless the source is Combined), then mark the
+/// scan complete. One function so a test can drive the exact path
+/// `run_recovery_scan_inner` takes with the chain replaced by a recorder:
+/// a Combined scan that completed without syncing its standalone keys would
+/// report their funds as absent.
+async fn finish_seeded_scan(
+    leg: StandaloneLeg<'_>,
+    chain: &mut impl StandaloneChain,
+) -> ZeckResult<()> {
+    let (state, workspace) = (leg.state, leg.workspace);
+    run_standalone_leg(leg, chain).await?;
+    finish_scan(state, workspace).await
+}
+
+/// The account range the HD scan walks: `(max_accounts, first batch)`.
+///
+/// A wallet file that numbers its HD keys (ZecWallet Lite derives a new
+/// account per address) says how many accounts exist. The first batch
+/// covers the highest index it records, so an account past the gap limit
+/// is scanned rather than lost; an explicit account count is widened to
+/// it, never narrowed. Capped at the scan's own ceiling, so a hostile
+/// index cannot make the scan unbounded.
+fn hd_scan_bounds(
+    config: &RuntimeScanConfig,
+    keys: Option<&argos_wallet_import::ImportedKeys>,
+) -> ZeckResult<(u32, u32)> {
+    let configured = resolve_max_account_count(config)?;
+    let floor = keys
+        .and_then(|keys| keys.highest_hd_index)
+        .map_or(0, |index| {
+            if index >= MAX_ACCOUNT_SCAN_COUNT {
+                // The import grades this as a coverage gap
+                // (`note_hd_scan_limit`); say so in the scan log as well.
+                warn!(
+                    "wallet file records an HD key at account {index}; scanning only the \
+                     first {MAX_ACCOUNT_SCAN_COUNT} accounts"
+                );
+            }
+            index.saturating_add(1).min(MAX_ACCOUNT_SCAN_COUNT)
+        });
+    let max_accounts = configured.max(floor);
+    let first_batch = initial_batch_size(config, max_accounts)
+        .max(floor)
+        .min(max_accounts);
+    Ok((max_accounts, first_batch))
+}
+
+/// Where a Combined scan starts syncing its standalone keys.
+///
+/// A standalone Sapling key exists in no seed, so the seed's birthday says
+/// nothing about it. ZecWallet Lite lowers its wallet-tail birthday to that
+/// of every Sapling key imported into it, so the earlier of that and the
+/// seed's start covers them; with no birthday on file the key is undated and
+/// starts at Sapling activation, as #274 does for an undated imported key.
+/// Standalone transparent keys need no lower start: `GetAddressUtxos`
+/// reports their outputs at any height.
+fn standalone_scan_start(
+    keys: &argos_wallet_import::ImportedKeys,
+    hd_start: u32,
+    sapling_floor: u32,
+) -> u32 {
+    let has_standalone_sapling = keys
+        .sapling
+        .iter()
+        .any(|key| key.provenance == argos_wallet_import::Provenance::Standalone);
+    if !has_standalone_sapling {
+        return hd_start;
+    }
+    match keys.birthday_height {
+        Some(height) => height.max(sapling_floor).min(hd_start),
+        None => sapling_floor.min(hd_start),
+    }
+}
+
+/// What the standalone leg needs from the chain. The scan drives it with
+/// lightwalletd; tests drive the same leg with a recorder.
+trait StandaloneChain {
+    /// The account birthday for an account first scanned from `height`.
+    async fn birthday_at(&mut self, height: u32) -> ZeckResult<AccountBirthday>;
+    /// Sync the wallet database, reporting progress from `start`.
+    async fn sync_from(&mut self, start: u32) -> ZeckResult<()>;
+}
+
+struct LightwalletdChain<'a> {
+    client: &'a mut CompactTxStreamerClient<tonic::transport::Channel>,
+    chain_tip_height: u32,
+    workspace: &'a RecoveryWorkspace,
+    network: &'a crate::workspace::ArgosParams,
+    config: &'a RuntimeScanConfig,
+    state: &'a SharedScanTaskState,
+}
+
+impl StandaloneChain for LightwalletdChain<'_> {
+    async fn birthday_at(&mut self, height: u32) -> ZeckResult<AccountBirthday> {
+        let treestate = self
+            .client
+            .get_tree_state(BlockId {
+                height: u64::from(height.saturating_sub(1)),
+                hash: vec![],
+            })
+            .await
+            .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+            .into_inner();
+        AccountBirthday::from_treestate(
+            treestate,
+            Some(BlockHeight::from_u32(self.chain_tip_height)),
+        )
+        .map_err(|_| ZeckError::Wallet("constructing account birthday from treestate".to_owned()))
+    }
+
+    async fn sync_from(&mut self, start: u32) -> ZeckResult<()> {
+        self.state.lock().await.progress.blocks_total = block_delta(self.chain_tip_height, start);
+        let poller = ProgressPoller::start(
+            self.workspace.clone(),
+            self.config.network,
+            self.state.clone(),
+            start,
+        );
+        let result = run_wallet_sync_with_retry(
+            self.workspace,
+            self.network,
+            self.config.network,
+            self.client,
+            &self.config.lightwalletd_url,
+            self.state,
+        )
+        .await;
+        poller.stop().await;
+        result?;
+        refresh_scan_progress(self.state, self.workspace, self.config.network, start).await
+    }
+}
+
+/// The standalone-key leg of a scan, run after the HD gap is resolved.
+struct StandaloneLeg<'a> {
+    state: &'a SharedScanTaskState,
+    workspace: &'a RecoveryWorkspace,
+    config: &'a RuntimeScanConfig,
+    seed: &'a [u8; 64],
+    /// The birthday the HD accounts were registered with.
+    hd_birthday: &'a AccountBirthday,
+    /// The height the HD accounts were scanned from.
+    hd_start: u32,
+    sapling_floor: u32,
+    hd_accounts: u32,
+}
+
+/// For a Combined source (a seed plus standalone keys), register the
+/// standalone keys beside the HD accounts and sync once more so both are in
+/// one wallet database. Standalone Sapling keys are registered from
+/// [`standalone_scan_start`], which may be below the HD birthday. Returns
+/// whether there was a leg to run.
+async fn run_standalone_leg(
+    leg: StandaloneLeg<'_>,
+    chain: &mut impl StandaloneChain,
+) -> ZeckResult<bool> {
+    let Some(keys) = leg.config.key_source.imported_keys() else {
+        return Ok(false);
+    };
+    if crate::key_source::classify_recovery_route(keys)
+        != crate::key_source::RecoveryRoute::Combined
+    {
+        return Ok(false);
+    }
+    let start = standalone_scan_start(keys, leg.hd_start, leg.sapling_floor);
+    let lowered;
+    let birthday = if start < leg.hd_start {
+        lowered = chain.birthday_at(start).await?;
+        &lowered
+    } else {
+        leg.hd_birthday
+    };
+    if !register_mixed_keys(
+        leg.state,
+        leg.workspace,
+        keys,
+        leg.seed,
+        birthday,
+        leg.config.network,
+        leg.hd_accounts,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    {
+        let mut guard = leg.state.lock().await;
+        guard.progress.phase = ScanPhase::ScanningShielded;
+        guard.progress.message =
+            Some("Syncing standalone keys alongside the recovered HD accounts.".to_owned());
+    }
+    chain.sync_from(start).await?;
+    Ok(true)
+}
+
+/// Register independently imported keys after the HD gap has been resolved.
+/// This keeps the HD search boundary independent of funds in standalone keys
+/// while giving both authorities one wallet database and one final sync.
+async fn register_mixed_keys(
+    state: &SharedScanTaskState,
+    workspace: &RecoveryWorkspace,
+    keys: &argos_wallet_import::ImportedKeys,
+    seed: &[u8; 64],
+    birthday: &AccountBirthday,
+    network: crate::models::ZeckNetwork,
+    hd_count: u32,
+) -> ZeckResult<bool> {
+    use crate::imported::{
+        imported_account_display, imported_transparent_keys, parse_sapling_extsk, sapling_ufvk,
+    };
+    use argos_wallet_import::Provenance;
+
+    let hd_rows = state.lock().await.tracked_accounts.clone();
+    let mut sapling_seen = std::collections::HashSet::new();
+    for row in &hd_rows {
+        if let TrackedSpendAuthority::Hd { zip32_index } = row.spend_authority {
+            let index = AccountId::try_from(zip32_index).map_err(|_| {
+                ZeckError::InvalidConfig(format!("account index {zip32_index} is out of range"))
+            })?;
+            let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), index);
+            sapling_seen.insert(extsk.to_diversifiable_full_viewing_key().to_bytes());
+        }
+    }
+    let mut transparent_seen: std::collections::HashSet<TransparentAddress> = hd_rows
+        .iter()
+        .flat_map(|row| {
+            row.transparent_receivers
+                .iter()
+                .chain(&row.standalone_transparent_receivers)
+                .copied()
+        })
+        .collect();
+    let mut selected_sapling = Vec::new();
+    for (key_index, key) in keys.sapling.iter().enumerate() {
+        if key.provenance != Provenance::Standalone {
+            continue;
+        }
+        let extsk = parse_sapling_extsk(key.extsk.expose_secret())?;
+        let identity = extsk.to_diversifiable_full_viewing_key().to_bytes();
+        if sapling_seen.insert(identity) {
+            selected_sapling.push((key_index, extsk));
+        }
+    }
+
+    let resolved = imported_transparent_keys(keys)?;
+    let mut selected_transparent = Vec::new();
+    for (key_index, key) in keys.transparent.iter().enumerate() {
+        if key.provenance == Provenance::Standalone
+            && transparent_seen.insert(resolved[key_index].address)
+        {
+            selected_transparent.push(key_index);
+        }
+    }
+
+    if selected_sapling.is_empty() && selected_transparent.is_empty() {
+        return Ok(false);
+    }
+    let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), consensus_network(network))?;
+    let mut imported_rows = Vec::new();
+    for (ordinal, (key_index, extsk)) in selected_sapling.iter().enumerate() {
+        let ufvk = sapling_ufvk(extsk)?;
+        let wallet_account_id = if let Some(existing) = wallet_db
+            .get_account_for_ufvk(&ufvk)
+            .map_err(|err| ZeckError::Wallet(format!("looking up mixed imported account: {err}")))?
+        {
+            existing.id()
+        } else {
+            wallet_db
+                .import_account_ufvk(
+                    &format!("mixed_sapling_{key_index}"),
+                    &ufvk,
+                    birthday,
+                    AccountPurpose::Spending { derivation: None },
+                    Some("Argos mixed wallet import"),
+                )
+                .map_err(|err| {
+                    ZeckError::Wallet(format!("importing mixed Sapling account: {err}"))
+                })?
+                .id()
+        };
+        let display_index =
+            hd_count
+                .checked_add(u32::try_from(ordinal).map_err(|_| {
+                    ZeckError::Internal("mixed account index overflowed".to_owned())
+                })?)
+                .ok_or_else(|| ZeckError::Internal("mixed account index overflowed".to_owned()))?;
+        let display = imported_account_display(display_index, extsk, None, network)?;
+        imported_rows.push(TrackedAccount {
+            wallet_account_id,
+            derived: display,
+            transparent_receivers: Vec::new(),
+            spend_authority: TrackedSpendAuthority::ImportedSapling {
+                key_index: *key_index,
+                wallet_account_id,
+            },
+            standalone_transparent_receivers: Vec::new(),
+            transparent_key_coordinates: Vec::new(),
+        });
+    }
+
+    let anchor_id = imported_rows
+        .first()
+        .or_else(|| hd_rows.first())
+        .ok_or_else(|| {
+            ZeckError::Internal("mixed wallet has no account to watch transparent keys".to_owned())
+        })?
+        .wallet_account_id;
+    let secp = secp256k1::Secp256k1::signing_only();
+    let existing = wallet_db
+        .get_transparent_receivers(anchor_id, true, true)
+        .map_err(|err| ZeckError::Wallet(format!("loading mixed transparent receivers: {err}")))?;
+    let mut added_addresses = Vec::new();
+    for &key_index in &selected_transparent {
+        let key = &resolved[key_index];
+        if !existing.contains_key(&key.address) {
+            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &key.secret);
+            wallet_db
+                .import_standalone_transparent_pubkey(anchor_id, pubkey)
+                .map_err(|err| {
+                    ZeckError::Wallet(format!("importing mixed transparent receiver: {err}"))
+                })?;
+        }
+        added_addresses.push(key.address);
+    }
+    drop(wallet_db);
+
+    let mut guard = state.lock().await;
+    guard.standalone_sapling_indices = selected_sapling.iter().map(|(index, _)| *index).collect();
+    guard.standalone_transparent_indices = selected_transparent;
+    if let Some(anchor) = imported_rows.first_mut() {
+        anchor
+            .standalone_transparent_receivers
+            .extend(added_addresses);
+    } else if let Some(anchor) = guard.tracked_accounts.first_mut() {
+        anchor
+            .standalone_transparent_receivers
+            .extend(added_addresses);
+    }
+    for row in &imported_rows {
+        guard
+            .progress
+            .accounts
+            .push(build_account_preview(&row.derived));
+    }
+    guard.tracked_accounts.extend(imported_rows);
+    Ok(true)
 }
 
 /// Publish the terminal state of a completed scan.
@@ -1169,8 +1569,12 @@ async fn run_imported_scan(
 
     let mut displays = Vec::with_capacity(registered.len());
     let mut tracked = Vec::with_capacity(registered.len());
+    let mut seen_imported_accounts = std::collections::HashSet::new();
     for (position, account) in registered.iter().enumerate() {
-        let index = u32::try_from(position)
+        if !seen_imported_accounts.insert(account.wallet_account_id) {
+            continue;
+        }
+        let index = u32::try_from(displays.len())
             .map_err(|_| ZeckError::Internal("imported account index overflowed u32".to_owned()))?;
         let Some(extsk) = account.sapling_extsk.as_ref() else {
             continue;
@@ -1186,6 +1590,11 @@ async fn run_imported_scan(
             wallet_account_id: account.wallet_account_id,
             derived: display,
             transparent_receivers: account.transparent_addresses.clone(),
+            spend_authority: TrackedSpendAuthority::ImportedSapling {
+                key_index: position,
+                wallet_account_id: account.wallet_account_id,
+            },
+            standalone_transparent_receivers: account.transparent_addresses.clone(),
             transparent_key_coordinates: Vec::new(),
         });
     }
@@ -1665,7 +2074,8 @@ async fn import_accounts_into(
                                 account.index
                             ))
                         })?
-                        .into_keys()
+                        .into_iter()
+                        .filter_map(|(address, metadata)| metadata.scope().map(|_| address))
                         .collect(),
                     Vec::new(),
                 )
@@ -1682,7 +2092,10 @@ async fn import_accounts_into(
                             account.index
                         ))
                     })?;
-                let mut receivers: Vec<_> = existing_receivers.keys().copied().collect();
+                let mut receivers: Vec<_> = existing_receivers
+                    .iter()
+                    .filter_map(|(address, metadata)| metadata.scope().map(|_| *address))
+                    .collect();
                 let mut coordinates = Vec::new();
                 let scopes: &[AddressScope] = if config.include_change {
                     &[AddressScope::External, AddressScope::Internal]
@@ -1731,7 +2144,8 @@ async fn import_accounts_into(
                             account.index
                         ))
                     })?
-                    .into_keys()
+                    .into_iter()
+                    .filter_map(|(address, metadata)| metadata.scope().map(|_| address))
                     .collect(),
                 Vec::new(),
             ),
@@ -1741,6 +2155,10 @@ async fn import_accounts_into(
             wallet_account_id,
             derived: account.clone(),
             transparent_receivers,
+            spend_authority: TrackedSpendAuthority::Hd {
+                zip32_index: account.index,
+            },
+            standalone_transparent_receivers: Vec::new(),
             transparent_key_coordinates,
         });
     }
@@ -2108,12 +2526,27 @@ pub(crate) async fn refresh_scan_progress(
         .map_err(|err| {
             ZeckError::Storage(format!("setting busy_timeout on wallet database: {err}"))
         })?;
+    if duplicate_wallet_output_ownership(&raw_conn)
+        .map_err(|err| ZeckError::Storage(format!("checking wallet output identities: {err}")))?
+    {
+        return Err(ZeckError::Wallet(
+            "one wallet output is assigned to multiple wallet accounts".to_owned(),
+        ));
+    }
 
     let target_height = (summary.chain_tip_height() + 1).into();
     let mut account_rows = Vec::with_capacity(tracked_accounts.len());
     let mut total_zatoshis = 0u64;
+    let mut seen_accounts = std::collections::HashSet::new();
+    let mut seen_outpoints = std::collections::HashMap::new();
+    let mut standalone_balances = std::collections::HashMap::new();
 
     for tracked in tracked_accounts {
+        if !seen_accounts.insert(tracked.wallet_account_id) {
+            return Err(ZeckError::Wallet(
+                "one wallet account is tracked more than once".to_owned(),
+            ));
+        }
         let balance = summary.account_balances().get(&tracked.wallet_account_id);
         let sapling_zatoshis = balance
             .map(|value| u64::from(value.sapling_balance().total()))
@@ -2131,37 +2564,86 @@ pub(crate) async fn refresh_scan_progress(
                 ZeckError::Internal("recovery total overflowed the supported range".to_owned())
             })?;
 
-        let transparent_utxo_count =
-            tracked
-                .transparent_receivers
-                .iter()
-                .try_fold(0usize, |sum, address| {
-                    let outputs = wallet_db
-                        .get_spendable_transparent_outputs(
-                            address,
-                            target_height,
-                            ConfirmationsPolicy::MIN,
-                            CoinbaseFilter::AllTransparentOutputs,
-                            // Reporting path, not a selection path: this count feeds the
-                            // recovery total shown to the user, so it must reflect
-                            // everything the wallet holds. Argos never takes output locks,
-                            // but `Unfiltered` is the upstream-sanctioned choice for
-                            // retrieval and keeps the total from silently under-reporting
-                            // if a lock ever appears.
-                            LockFilter::Unfiltered,
-                        )
-                        .map_err(|err| {
-                            ZeckError::Wallet(format!(
-                                "loading transparent outputs for account {}: {err}",
-                                tracked.derived.index
-                            ))
-                        })?;
-                    sum.checked_add(outputs.len()).ok_or_else(|| {
-                        ZeckError::Internal(
-                            "transparent UTXO count overflowed the supported range".to_owned(),
-                        )
-                    })
+        let mut transparent_utxo_count = 0usize;
+        let mut standalone_balance = StandaloneTransparentBalance::default();
+        for (address, standalone) in tracked
+            .transparent_receivers
+            .iter()
+            .map(|address| (address, false))
+            .chain(
+                tracked
+                    .standalone_transparent_receivers
+                    .iter()
+                    .map(|address| (address, true)),
+            )
+        {
+            let outputs = wallet_db
+                .get_spendable_transparent_outputs(
+                    address,
+                    target_height,
+                    ConfirmationsPolicy::MIN,
+                    CoinbaseFilter::AllTransparentOutputs,
+                    // Reporting path, not a selection path: this count feeds the
+                    // recovery total shown to the user, so it must reflect
+                    // everything the wallet holds. Argos never takes output locks,
+                    // but `Unfiltered` is the upstream-sanctioned choice for
+                    // retrieval and keeps the total from silently under-reporting
+                    // if a lock ever appears.
+                    LockFilter::Unfiltered,
+                )
+                .map_err(|err| {
+                    ZeckError::Wallet(format!(
+                        "loading transparent outputs for account {}: {err}",
+                        tracked.derived.index
+                    ))
                 })?;
+            for output in outputs {
+                let outpoint = output.outpoint().clone();
+                let value = u64::from(output.txout().value());
+                if output.txout().script_pubkey() != &address.script().into() {
+                    return Err(ZeckError::Wallet(
+                        "one transparent output has a script conflicting with its receiver"
+                            .to_owned(),
+                    ));
+                }
+                if let Some((prior_address, prior_value)) =
+                    seen_outpoints.insert(outpoint, (*address, value))
+                {
+                    if prior_address != *address || prior_value != value {
+                        return Err(ZeckError::Wallet(
+                            "one transparent outpoint has conflicting wallet owners or values"
+                                .to_owned(),
+                        ));
+                    }
+                    continue;
+                }
+                transparent_utxo_count =
+                    transparent_utxo_count.checked_add(1).ok_or_else(|| {
+                        ZeckError::Internal("transparent UTXO count overflowed".to_owned())
+                    })?;
+                if standalone {
+                    standalone_balance.zatoshis = standalone_balance
+                        .zatoshis
+                        .checked_add(value)
+                        .ok_or_else(|| {
+                            ZeckError::Internal(
+                                "standalone transparent balance overflowed".to_owned(),
+                            )
+                        })?;
+                    standalone_balance.utxo_count = standalone_balance
+                        .utxo_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            ZeckError::Internal(
+                                "standalone transparent UTXO count overflowed".to_owned(),
+                            )
+                        })?;
+                }
+            }
+        }
+        if !tracked.standalone_transparent_receivers.is_empty() {
+            standalone_balances.insert(tracked.derived.index, standalone_balance);
+        }
 
         let has_activity = account_has_note_activity(&raw_conn, &tracked.wallet_account_id)
             .map_err(|err| {
@@ -2203,6 +2685,7 @@ pub(crate) async fn refresh_scan_progress(
         scanned_height,
     );
     guard.progress.accounts = account_rows;
+    guard.standalone_transparent_balances = standalone_balances;
     guard.progress.blocks_total =
         block_delta(summary.chain_tip_height().into(), effective_birthday);
     guard.progress.blocks_scanned =
@@ -2676,6 +3159,79 @@ fn account_has_note_activity(
     )
 }
 
+/// The upstream schema has unique output identities; retain this explicit guard
+/// so a corrupted or migrated database cannot produce a complete aggregate.
+fn duplicate_wallet_output_ownership(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sapling_received_notes
+             GROUP BY transaction_id, output_index
+             HAVING COUNT(*) > 1
+         ) OR EXISTS(
+             SELECT 1 FROM orchard_received_notes
+             GROUP BY transaction_id, action_index
+             HAVING COUNT(*) > 1
+         ) OR EXISTS(
+             SELECT 1 FROM transparent_received_outputs
+             GROUP BY transaction_id, output_index
+             HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Recheck persisted ownership immediately before quoting and executing a
+/// combined sweep, including after a completed scan has been resumed.
+pub(crate) fn validate_wallet_output_identities(workspace: &RecoveryWorkspace) -> ZeckResult<()> {
+    let conn = Connection::open_with_flags(
+        workspace.wallet_db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| {
+        ZeckError::Storage(format!("opening wallet database for identity check: {err}"))
+    })?;
+    if duplicate_wallet_output_ownership(&conn)
+        .map_err(|err| ZeckError::Storage(format!("checking wallet output identities: {err}")))?
+    {
+        return Err(ZeckError::Wallet(
+            "one wallet output is assigned to multiple wallet accounts".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn duplicate_wallet_output_identity_is_rejected() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sapling_received_notes (transaction_id INTEGER, output_index INTEGER, account_id INTEGER);
+         CREATE TABLE orchard_received_notes (transaction_id INTEGER, action_index INTEGER, account_id INTEGER);
+         CREATE TABLE transparent_received_outputs (transaction_id INTEGER, output_index INTEGER, account_id INTEGER);
+         INSERT INTO sapling_received_notes VALUES (1, 2, 11), (1, 2, 12);",
+    ).unwrap();
+    assert!(duplicate_wallet_output_ownership(&conn).unwrap());
+    conn.execute_batch(
+        "DELETE FROM sapling_received_notes;
+                        INSERT INTO orchard_received_notes VALUES (3, 4, 11), (3, 4, 12);",
+    )
+    .unwrap();
+    assert!(duplicate_wallet_output_ownership(&conn).unwrap());
+    conn.execute_batch(
+        "DELETE FROM orchard_received_notes;
+                        INSERT INTO transparent_received_outputs VALUES (5, 6, 11), (5, 6, 12);",
+    )
+    .unwrap();
+    assert!(duplicate_wallet_output_ownership(&conn).unwrap());
+    conn.execute_batch(
+        "DELETE FROM transparent_received_outputs;
+                        INSERT INTO sapling_received_notes VALUES (1, 2, 11), (1, 2, 11);",
+    )
+    .unwrap();
+    assert!(duplicate_wallet_output_ownership(&conn).unwrap());
+}
+
 /// Imports account-0 into a probe workspace without requiring a `SharedScanTaskState`.
 /// Used by `birthday::probe_shielded_window` to set up a fresh temporary workspace
 /// before running a time-limited sync to detect shielded activity.
@@ -2841,6 +3397,7 @@ mod tests {
             gap_limit: 20,
             transparent_scan: None,
             lightwalletd_url: "https://example.com".to_owned(),
+            confirmation_sources: Vec::new(),
             data_dir: std::path::PathBuf::from("zeck_data"),
             network: ZeckNetwork::Mainnet,
             label: String::new(),
@@ -3347,14 +3904,18 @@ mod tests {
         use zcash_protocol::consensus::BlockHeight;
 
         use super::super::{
-            import_accounts, import_accounts_scoped, prepare_scan_accounts, AccountPreparation,
-            MemoryBlockCache, ScanTaskState, TransparentImportMode,
+            import_accounts, import_accounts_scoped, prepare_scan_accounts, register_mixed_keys,
+            AccountPreparation, MemoryBlockCache, ScanTaskState, TrackedSpendAuthority,
+            TransparentImportMode,
         };
         use crate::{
-            derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
+            derivation::{
+                derive_accounts, derive_accounts_from_seed, legacy_transparent_account_key,
+                legacy_transparent_account_key_from_seed, mnemonic_seed,
+            },
             key_source::SeedKeySource,
             models::{RuntimeScanConfig, ScanHandle, ZeckNetwork},
-            workspace::{consensus_network, RecoveryWorkspace},
+            workspace::{consensus_network, open_wallet_db, RecoveryWorkspace},
         };
 
         const TEST_SEED: &str = "abandon abandon abandon abandon abandon abandon \
@@ -3499,6 +4060,7 @@ mod tests {
                 gap_limit: 5,
                 transparent_scan: None,
                 lightwalletd_url: "https://example.invalid:443".to_owned(),
+                confirmation_sources: Vec::new(),
                 data_dir,
                 network: ZeckNetwork::Mainnet,
                 label: String::new(),
@@ -3513,6 +4075,577 @@ mod tests {
                 ChainState::empty(BlockHeight::from_u32(419_199), BlockHash([0u8; 32])),
                 None,
             )
+        }
+
+        /// A chain double for the standalone leg: hands out an empty-tree
+        /// birthday at whatever height is asked, and records what the leg
+        /// asked for and synced from. No network.
+        #[derive(Default)]
+        struct RecordingChain {
+            birthdays_at: Vec<u32>,
+            synced_from: Vec<u32>,
+        }
+
+        impl super::super::StandaloneChain for RecordingChain {
+            async fn birthday_at(
+                &mut self,
+                height: u32,
+            ) -> crate::error::ZeckResult<AccountBirthday> {
+                self.birthdays_at.push(height);
+                Ok(AccountBirthday::from_parts(
+                    ChainState::empty(BlockHeight::from_u32(height - 1), BlockHash([0u8; 32])),
+                    None,
+                ))
+            }
+
+            async fn sync_from(&mut self, start: u32) -> crate::error::ZeckResult<()> {
+                self.synced_from.push(start);
+                Ok(())
+            }
+        }
+
+        fn standalone_sapling(seed: u8) -> argos_wallet_import::SaplingKey {
+            argos_wallet_import::SaplingKey {
+                extsk: secrecy::Secret::new(
+                    sapling_crypto::zip32::ExtendedSpendingKey::master(&[seed; 32])
+                        .to_bytes()
+                        .to_vec(),
+                ),
+                provenance: argos_wallet_import::Provenance::Standalone,
+                created_at: None,
+            }
+        }
+
+        /// A ZecWallet Lite shape: the seed plus one imported Sapling key,
+        /// with the wallet-tail birthday the file recorded.
+        fn mixed_keys(birthday_height: Option<u32>) -> argos_wallet_import::ImportedKeys {
+            argos_wallet_import::ImportedKeys {
+                mnemonic: Some(test_seed_phrase()),
+                sapling: vec![standalone_sapling(0x61)],
+                birthday_height,
+                ..Default::default()
+            }
+        }
+
+        /// Review finding 3 on #275: the Combined branch of
+        /// `run_recovery_scan_inner` must register the standalone keys and
+        /// sync them. Driven through the leg the scan itself runs, with the
+        /// chain replaced by a recorder.
+        #[tokio::test]
+        async fn a_combined_scan_registers_and_syncs_its_standalone_keys() {
+            use crate::key_source::ImportedKeySource;
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.birthday = 1_000_000;
+            config.key_source = Arc::new(ImportedKeySource::new(mixed_keys(Some(600_000))));
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize_from_source(config.network, config.key_source.as_ref())
+                .unwrap();
+            let hd = derive_accounts_from_seed(&seed, config.network, 1).unwrap();
+            let t_account =
+                legacy_transparent_account_key_from_seed(config.network, &seed).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts(
+                &workspace,
+                config.network,
+                &seed,
+                &test_birthday(),
+                &t_account,
+                &hd,
+                &state,
+            )
+            .await
+            .unwrap();
+
+            let mut chain = RecordingChain::default();
+            let ran = super::super::run_standalone_leg(
+                super::super::StandaloneLeg {
+                    state: &state,
+                    workspace: &workspace,
+                    config: &config,
+                    seed: &seed,
+                    hd_birthday: &test_birthday(),
+                    hd_start: 1_000_000,
+                    sapling_floor: 419_201,
+                    hd_accounts: 1,
+                },
+                &mut chain,
+            )
+            .await
+            .unwrap();
+
+            assert!(ran, "a Combined source has a standalone leg");
+            let guard = state.lock().await;
+            assert_eq!(guard.standalone_sapling_indices, vec![0]);
+            let imported: Vec<_> = guard
+                .tracked_accounts
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.spend_authority,
+                        TrackedSpendAuthority::ImportedSapling { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(imported.len(), 1, "the standalone key is tracked");
+            assert_eq!(chain.synced_from, vec![600_000], "and synced, once");
+
+            // Review finding 1: registered from the file's birthday, below
+            // the seed's, not from the HD birthday.
+            assert_eq!(chain.birthdays_at, vec![600_000]);
+            let db = open_wallet_db(
+                workspace.wallet_db_path(),
+                consensus_network(config.network),
+            )
+            .unwrap();
+            assert_eq!(
+                db.get_account_birthday(imported[0].wallet_account_id)
+                    .unwrap(),
+                BlockHeight::from_u32(600_000)
+            );
+        }
+
+        /// Round-2 item A on #275: the scan's tail reaches the standalone
+        /// leg for a Combined source before it reports Complete. Driven
+        /// through `finish_seeded_scan`, the function
+        /// `run_recovery_scan_inner` calls once the HD gap is resolved.
+        #[tokio::test]
+        async fn a_combined_scan_syncs_its_standalone_keys_before_completing() {
+            use crate::key_source::ImportedKeySource;
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.birthday = 1_000_000;
+            config.key_source = Arc::new(ImportedKeySource::new(mixed_keys(Some(600_000))));
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize_from_source(config.network, config.key_source.as_ref())
+                .unwrap();
+            let hd = derive_accounts_from_seed(&seed, config.network, 1).unwrap();
+            let t_account =
+                legacy_transparent_account_key_from_seed(config.network, &seed).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts(
+                &workspace,
+                config.network,
+                &seed,
+                &test_birthday(),
+                &t_account,
+                &hd,
+                &state,
+            )
+            .await
+            .unwrap();
+            state.lock().await.workspace = Some(workspace.clone());
+
+            let mut chain = RecordingChain::default();
+            super::super::finish_seeded_scan(
+                super::super::StandaloneLeg {
+                    state: &state,
+                    workspace: &workspace,
+                    config: &config,
+                    seed: &seed,
+                    hd_birthday: &test_birthday(),
+                    hd_start: 1_000_000,
+                    sapling_floor: 419_201,
+                    hd_accounts: 1,
+                },
+                &mut chain,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(chain.synced_from, vec![600_000], "the standalone leg ran");
+            let guard = state.lock().await;
+            assert_eq!(guard.standalone_sapling_indices, vec![0]);
+            assert!(matches!(guard.progress.phase, crate::ScanPhase::Complete));
+        }
+
+        #[tokio::test]
+        async fn an_hd_only_source_has_no_standalone_leg() {
+            let tempdir = tempfile::tempdir().unwrap();
+            let config = test_config(tempdir.path().to_owned());
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let mut chain = RecordingChain::default();
+            let ran = super::super::run_standalone_leg(
+                super::super::StandaloneLeg {
+                    state: &state,
+                    workspace: &workspace,
+                    config: &config,
+                    seed: &seed,
+                    hd_birthday: &test_birthday(),
+                    hd_start: 1_000_000,
+                    sapling_floor: 419_201,
+                    hd_accounts: 2,
+                },
+                &mut chain,
+            )
+            .await
+            .unwrap();
+            assert!(!ran);
+            assert!(chain.synced_from.is_empty() && chain.birthdays_at.is_empty());
+        }
+
+        #[test]
+        fn standalone_keys_start_from_the_earlier_of_the_file_and_seed_birthdays() {
+            use super::super::standalone_scan_start;
+            let floor = 419_201;
+            // The file's birthday below the seed's wins.
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(Some(600_000)), 1_000_000, floor),
+                600_000
+            );
+            // A file birthday above the seed's never raises the start.
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(Some(1_200_000)), 1_000_000, floor),
+                1_000_000
+            );
+            // Below Sapling activation is clamped to it (writers store 1).
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(Some(1)), 1_000_000, floor),
+                floor
+            );
+            // No birthday: the key is undated and scanned from activation.
+            assert_eq!(
+                standalone_scan_start(&mixed_keys(None), 1_000_000, floor),
+                floor
+            );
+            // Standalone transparent keys only: GetAddressUtxos finds them at
+            // any height, so the seed's start stands.
+            let mut transparent_only = mixed_keys(None);
+            transparent_only.sapling.clear();
+            assert_eq!(
+                standalone_scan_start(&transparent_only, 1_000_000, floor),
+                1_000_000
+            );
+        }
+
+        /// Review finding 8 on #275: ZecWallet Lite derives an account per
+        /// address, so an HD key the file records at index 12 must be inside
+        /// the scanned range even with a gap limit of 5.
+        #[test]
+        fn the_scan_covers_the_highest_hd_index_the_file_records() {
+            use super::super::hd_scan_bounds;
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.num_accounts = None;
+            config.gap_limit = 5;
+            let mut keys = mixed_keys(None);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (500, 5));
+            keys.highest_hd_index = Some(12);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (500, 13));
+            // An explicit account count is widened, never narrowed.
+            config.num_accounts = Some(3);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (13, 13));
+            config.num_accounts = Some(20);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (20, 20));
+            // A hostile index cannot push past the scan's own ceiling.
+            config.num_accounts = None;
+            keys.highest_hd_index = Some(u32::MAX);
+            assert_eq!(hd_scan_bounds(&config, Some(&keys)).unwrap(), (500, 500));
+            assert_eq!(hd_scan_bounds(&config, None).unwrap(), (500, 5));
+        }
+
+        #[tokio::test]
+        async fn mixed_writer_standalone_tkey_is_registered_with_hd_account() {
+            use crate::key_source::ImportedKeySource;
+            let mut bytes =
+                include_bytes!("../../argos-wallet-import/tests/fixtures/zwl-mainnet-empty.dat")
+                    .to_vec();
+            assert_eq!(&bytes[102..106], &0u32.to_le_bytes());
+            bytes[102..106].copy_from_slice(&1u32.to_le_bytes());
+            // Replace the writer's HD secret/address pair with a distinct
+            // public no-funds standalone key, retaining writer field layout.
+            let secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
+            let pubkey =
+                secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+            let address = crate::imported::encode_transparent_address(
+                &zcash_transparent::address::TransparentAddress::from_pubkey(&pubkey),
+                ZeckNetwork::Mainnet,
+            );
+            assert_eq!(address.len(), 35);
+            bytes[108..140].copy_from_slice(&[0x42; 32]);
+            bytes[148..183].copy_from_slice(address.as_bytes());
+            let keys = argos_wallet_import::zwl::import_zwl(&bytes, None).unwrap();
+            assert_eq!(keys.transparent.len(), 1);
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.key_source = Arc::new(ImportedKeySource::new(keys));
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize_from_source(config.network, config.key_source.as_ref())
+                .unwrap();
+            let hd = derive_accounts_from_seed(&seed, config.network, 1).unwrap();
+            let t_account =
+                legacy_transparent_account_key_from_seed(config.network, &seed).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts(
+                &workspace,
+                config.network,
+                &seed,
+                &test_birthday(),
+                &t_account,
+                &hd,
+                &state,
+            )
+            .await
+            .unwrap();
+            register_mixed_keys(
+                &state,
+                &workspace,
+                config.key_source.imported_keys().unwrap(),
+                &seed,
+                &test_birthday(),
+                config.network,
+                1,
+            )
+            .await
+            .unwrap();
+            let guard = state.lock().await;
+            assert_eq!(guard.standalone_transparent_indices, vec![0]);
+            assert_eq!(guard.tracked_accounts.len(), 1);
+            assert_eq!(
+                guard.tracked_accounts[0]
+                    .standalone_transparent_receivers
+                    .len(),
+                1
+            );
+            let db = open_wallet_db(
+                workspace.wallet_db_path(),
+                consensus_network(config.network),
+            )
+            .unwrap();
+            let registered = db
+                .get_transparent_receivers(guard.tracked_accounts[0].wallet_account_id, true, true)
+                .unwrap();
+            assert!(registered
+                .contains_key(&guard.tracked_accounts[0].standalone_transparent_receivers[0]));
+            let address = guard.tracked_accounts[0].standalone_transparent_receivers[0];
+            let account_id = guard.tracked_accounts[0].wallet_account_id;
+            drop(guard);
+            drop(db);
+
+            use zcash_client_backend::wallet::WalletTransparentOutput;
+            use zcash_protocol::value::Zatoshis;
+            use zcash_transparent::bundle::{OutPoint, TxOut};
+            let mut db = open_wallet_db(
+                workspace.wallet_db_path(),
+                consensus_network(config.network),
+            )
+            .unwrap();
+            let utxo = WalletTransparentOutput::from_parts(
+                OutPoint::new([0x55; 32], 0),
+                TxOut::new(Zatoshis::const_from_u64(42_000), address.script().into()),
+                Some(BlockHeight::from_u32(419_200)),
+                Some(account_id),
+                None,
+                None,
+            )
+            .unwrap();
+            db.put_sapling_subtree_roots(0, &[]).unwrap();
+            db.put_orchard_subtree_roots(0, &[]).unwrap();
+            db.update_chain_tip(BlockHeight::from_u32(419_200)).unwrap();
+            let cache = MemoryBlockCache::new();
+            let block = empty_compact_block(419_200, [0u8; 32], 0, 0);
+            <MemoryBlockCache as super::super::BlockCache>::insert(&cache, vec![block])
+                .await
+                .unwrap();
+            scan_cached_blocks(
+                &consensus_network(config.network),
+                &cache,
+                &mut db,
+                BlockHeight::from_u32(419_200),
+                &ChainState::empty(BlockHeight::from_u32(419_199), BlockHash([0u8; 32])),
+                1,
+            )
+            .unwrap();
+            db.put_received_transparent_utxo(&utxo).unwrap();
+            drop(db);
+            super::super::refresh_scan_progress(&state, &workspace, config.network, 419_200)
+                .await
+                .unwrap();
+            let guard = state.lock().await;
+            assert_eq!(
+                guard
+                    .standalone_transparent_balances
+                    .get(&0)
+                    .unwrap()
+                    .zatoshis,
+                42_000
+            );
+            assert_eq!(guard.progress.accounts[0].transparent_zatoshis, 42_000);
+            assert_eq!(guard.progress.accounts[0].total_zatoshis, 42_000);
+            drop(guard);
+
+            // A resumed range scan must not mistake the imported receiver
+            // already stored in the DB for an HD-derived receiver.
+            let resumed = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let range = crate::models::TransparentScanConfig {
+                index_start: 0,
+                index_count: 1,
+                include_change: true,
+            };
+            import_accounts_scoped(
+                &workspace,
+                config.network,
+                &seed,
+                &test_birthday(),
+                TransparentImportMode::Range {
+                    account: &t_account,
+                    config: &range,
+                },
+                &hd,
+                &resumed,
+            )
+            .await
+            .unwrap();
+            assert!(!resumed.lock().await.tracked_accounts[0]
+                .transparent_receivers
+                .contains(&address));
+            register_mixed_keys(
+                &resumed,
+                &workspace,
+                config.key_source.imported_keys().unwrap(),
+                &seed,
+                &test_birthday(),
+                config.network,
+                1,
+            )
+            .await
+            .unwrap();
+            super::super::refresh_scan_progress(&resumed, &workspace, config.network, 419_200)
+                .await
+                .unwrap();
+            let resumed_guard = resumed.lock().await;
+            assert_eq!(resumed_guard.standalone_transparent_indices, vec![0]);
+            assert_eq!(
+                resumed_guard
+                    .standalone_transparent_balances
+                    .get(&0)
+                    .unwrap()
+                    .zatoshis,
+                42_000
+            );
+            assert_eq!(resumed_guard.progress.accounts[0].total_zatoshis, 42_000);
+            drop(resumed_guard);
+
+            let standard_resume = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts_scoped(
+                &workspace,
+                config.network,
+                &seed,
+                &test_birthday(),
+                TransparentImportMode::Standard,
+                &hd,
+                &standard_resume,
+            )
+            .await
+            .unwrap();
+            assert!(!standard_resume.lock().await.tracked_accounts[0]
+                .transparent_receivers
+                .contains(&address));
+            register_mixed_keys(
+                &standard_resume,
+                &workspace,
+                config.key_source.imported_keys().unwrap(),
+                &seed,
+                &test_birthday(),
+                config.network,
+                1,
+            )
+            .await
+            .unwrap();
+            super::super::refresh_scan_progress(
+                &standard_resume,
+                &workspace,
+                config.network,
+                419_200,
+            )
+            .await
+            .unwrap();
+            let standard_guard = standard_resume.lock().await;
+            assert_eq!(standard_guard.standalone_transparent_indices, vec![0]);
+            assert_eq!(standard_guard.progress.accounts[0].total_zatoshis, 42_000);
+        }
+
+        #[tokio::test]
+        async fn mixed_sapling_identity_overlaps_are_registered_once() {
+            use crate::key_source::ImportedKeySource;
+            use argos_wallet_import::{ImportedKeys, Provenance, SaplingKey};
+            use secrecy::Secret;
+            use zcash_keys::keys::sapling;
+            use zip32::AccountId;
+
+            let mut keys = ImportedKeys {
+                mnemonic: Some(test_seed_phrase()),
+                ..Default::default()
+            };
+            let seed = mnemonic_seed(&test_seed_phrase()).unwrap();
+            let hd_key = sapling::spending_key(
+                seed.expose_secret(),
+                ZeckNetwork::Mainnet.coin_type(),
+                AccountId::try_from(0).unwrap(),
+            );
+            let separate = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x71; 32]);
+            for bytes in [
+                hd_key.to_bytes().to_vec(),
+                hd_key.to_bytes().to_vec(),
+                separate.to_bytes().to_vec(),
+                separate.to_bytes().to_vec(),
+            ] {
+                keys.sapling.push(SaplingKey {
+                    extsk: Secret::new(bytes),
+                    provenance: Provenance::Standalone,
+                    created_at: None,
+                });
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path().to_owned());
+            config.key_source = Arc::new(ImportedKeySource::new(keys));
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize_from_source(config.network, config.key_source.as_ref())
+                .unwrap();
+            let hd = derive_accounts_from_seed(seed.expose_secret(), config.network, 1).unwrap();
+            let t_account =
+                legacy_transparent_account_key_from_seed(config.network, seed.expose_secret())
+                    .unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            import_accounts(
+                &workspace,
+                config.network,
+                seed.expose_secret(),
+                &test_birthday(),
+                &t_account,
+                &hd,
+                &state,
+            )
+            .await
+            .unwrap();
+            register_mixed_keys(
+                &state,
+                &workspace,
+                config.key_source.imported_keys().unwrap(),
+                seed.expose_secret(),
+                &test_birthday(),
+                config.network,
+                1,
+            )
+            .await
+            .unwrap();
+            let guard = state.lock().await;
+            assert_eq!(guard.standalone_sapling_indices, vec![2]);
+            assert_eq!(guard.tracked_accounts.len(), 2);
+            assert_eq!(guard.tracked_accounts[1].derived.index, 1);
+            assert_ne!(
+                guard.tracked_accounts[0].wallet_account_id,
+                guard.tracked_accounts[1].wallet_account_id
+            );
         }
 
         #[tokio::test]

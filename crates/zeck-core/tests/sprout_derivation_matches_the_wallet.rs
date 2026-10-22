@@ -28,7 +28,9 @@ fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
         env!("CARGO_MANIFEST_DIR")
     );
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"));
-    bdb::walk(&bytes).unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+    bdb::walk(&bytes)
+        .unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+        .records
 }
 
 fn assert_derivation_matches(keys: &ImportedKeys, what: &str) {

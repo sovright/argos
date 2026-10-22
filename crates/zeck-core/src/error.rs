@@ -57,6 +57,12 @@ pub enum ZeckError {
     #[error("scan session not found")]
     UnknownScanHandle,
 
+    #[error("reviewed sweep proposal not found or already used")]
+    UnknownSweepProposal,
+
+    #[error("reviewed sweep proposal is stale: {0}")]
+    StaleSweepProposal(String),
+
     #[error("scan was cancelled")]
     Cancelled,
 
@@ -65,6 +71,9 @@ pub enum ZeckError {
 
     #[error("estimated sweep fees exceed the configured maximum: {0}")]
     MaxFeeExceeded(String),
+
+    #[error("sweep fee quote changed: reviewed {reviewed} zats, current {current} zats; review a new proposal before submission")]
+    FeeQuoteChanged { reviewed: u64, current: u64 },
 
     #[error("invalid memo: {0}")]
     InvalidMemo(String),
@@ -99,4 +108,10 @@ pub enum ZeckError {
 
     #[error("wallet import failed: {0}")]
     Import(String),
+
+    /// The wallet-file parser's own error, kept typed so a caller can tell
+    /// a locked wallet (`ImportError::WrongPassphrase`) from damage or a
+    /// network mismatch without comparing message text.
+    #[error("wallet import failed: {0}")]
+    WalletFile(argos_wallet_import::ImportError),
 }

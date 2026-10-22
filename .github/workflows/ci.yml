@@ -99,10 +99,16 @@ jobs:
             libdbus-1-dev \
             libappindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            protobuf-compiler
 
       - name: cargo test
         run: cargo test --workspace
+
+      # Runs the local fake-lightwalletd tests. Real-node cases remain ignored
+      # unless a provisioned regtest harness is explicitly supplied.
+      - name: cargo test (local argos-network integration)
+        run: cargo test -p argos-core --features argos-network --test regtest_integration
 
       - name: Install Node for GUI interaction tests
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -137,11 +143,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # The spend tests below build `--features argos-network`, and that is the
-      # only configuration in which `crates/zeck-core/build.rs` compiles the
-      # vendored lightwalletd protos -- which needs `protoc`. No other job
-      # enables the feature, so nothing needed this until the spend tests were
-      # added and the build died before a single test ran.
+      # The spend tests build `--features argos-network`, which compiles
+      # vendored lightwalletd protos and needs `protoc`. The normal test job
+      # installs it too for its local argos-network integration tests.
       - name: Install protoc
         run: |
           sudo apt-get update
@@ -204,6 +208,15 @@ jobs:
             --test sprout_scan_matches_the_node \
             --test sprout_scan_finds_a_real_note \
             -- --ignored --nocapture
+
+      - name: Sprout checkpoint reorg test
+        run: |
+          set -o pipefail
+          cargo test -p argos-core --test sprout_scan_reorg \
+            -- --ignored --nocapture 2>&1 | tee reorg-test.log
+          passed=$(grep -cE '^test .* \.\.\. ok$' reorg-test.log || true)
+          echo "reorg tests passed: $passed"
+          test "$passed" -ge 1
 
       # The spend half, and the reason it is no longer optional: `rcm` is now
       # sampled per §4.7.1 rather than derived, which changes *every*

@@ -522,7 +522,9 @@ mod tests {
     use secrecy::SecretString;
 
     fn pairs(name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-        bdb::walk(&std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap()).unwrap()
+        bdb::walk(&std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap())
+            .unwrap()
+            .records
     }
 
     fn master(pairs: &[(Vec<u8>, Vec<u8>)]) -> MasterKey {

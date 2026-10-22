@@ -134,9 +134,11 @@ dependencies = [
  "dialoguer",
  "indicatif",
  "secrecy",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zcash_primitives",
 ]
 
 [[package]]
@@ -187,6 +189,7 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
+ "zeroize",
  "zip32",
 ]
 
@@ -205,6 +208,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -223,6 +228,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "x25519-dalek",
+ "zcash_address",
+ "zcash_protocol",
+ "zcash_transparent",
 ]
 
 [[package]]

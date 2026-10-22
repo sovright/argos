@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::ImportDiagnostic,
+    identity,
     keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
     zcashd::{
         crypto::MasterKey,
@@ -154,12 +155,20 @@ pub fn collect_encrypted(
                     let s: [u8; 32] = p.get(..32)?.try_into().ok()?;
                     Some(s)
                 }) {
-                    Some(a_sk) => out.sprout.push(SproutKey {
-                        a_sk: Secret::new(a_sk),
-                        address,
-                        provenance: Provenance::Standalone,
-                        created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
-                    }),
+                    Some(a_sk) if identity::sprout_address_from_spending_key(&a_sk) == address => {
+                        out.sprout.push(SproutKey {
+                            a_sk: Secret::new(a_sk),
+                            address,
+                            provenance: Provenance::Standalone,
+                            created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
+                        })
+                    }
+                    Some(_) => out
+                        .diagnostics
+                        .push(ImportDiagnostic::PublicIdentifierMismatch {
+                            record_type: "czkey".to_owned(),
+                            identifier: "payment address",
+                        }),
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "czkey".to_owned(),
                         reason: "ciphertext did not decrypt to a 32-byte key".to_owned(),
@@ -190,7 +199,7 @@ pub fn collect_encrypted(
                         let s: [u8; 32] = p.get(..32)?.try_into().ok()?;
                         Some(s)
                     }) {
-                    Some(secret) => {
+                    Some(secret) if identity::transparent_matches_pubkey(&secret, pubkey) => {
                         out.transparent.push(TransparentKey {
                             secret: Secret::new(secret),
                             provenance: Provenance::HdDerived,
@@ -198,6 +207,12 @@ pub fn collect_encrypted(
                         });
                         recovered.transparent.insert(rec.rest);
                     }
+                    Some(_) => out
+                        .diagnostics
+                        .push(ImportDiagnostic::PublicIdentifierMismatch {
+                            record_type: "ckey".to_owned(),
+                            identifier: "public key",
+                        }),
                     None => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
                         record_type: "ckey".to_owned(),
                         reason: "ciphertext did not decrypt to a 32-byte key".to_owned(),
@@ -229,12 +244,15 @@ pub fn collect_encrypted(
                 // chaincode(32) + expsk(ask+nsk+ovk, 96) + dk(32).
                 const EXTSK_LEN: usize = 169;
 
-                let fvk = value.get(FVK_OFFSET..FVK_OFFSET + FVK_LEN);
-                let Some(fvk) = fvk else {
+                let extfvk = value.get(..EXTFVK_LEN);
+                let Some(extfvk) = extfvk else {
                     out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                         record_type: "csapzkey".to_owned(),
                         reason: "extfvk is truncated".to_owned(),
                     });
+                    continue;
+                };
+                let Some(fvk) = extfvk.get(FVK_OFFSET..FVK_OFFSET + FVK_LEN) else {
                     continue;
                 };
                 let iv = sapling_fvfp_iv(fvk);
@@ -254,13 +272,31 @@ pub fn collect_encrypted(
                     .and_then(read_length_prefixed)
                     .and_then(|(ct, _)| decrypt(master, iv, ct))
                 {
-                    Some(extsk) if extsk.len() == EXTSK_LEN => {
+                    Some(extsk)
+                        if extsk.len() == EXTSK_LEN
+                            && identity::sapling_matches_ivk(&extsk, &rec.rest)
+                            && identity::sapling_matches_extfvk(&extsk, extfvk) =>
+                    {
                         out.sapling.push(SaplingKey {
                             extsk: Secret::new(extsk),
                             provenance: Provenance::HdDerived,
                             created_at: metadata.created_at(MetadataKind::Sapling, &rec.rest),
                         });
                         recovered.sapling.insert(rec.rest);
+                    }
+                    Some(mut wrong_length) if wrong_length.len() == EXTSK_LEN => {
+                        let identifier = if !identity::sapling_matches_ivk(&wrong_length, &rec.rest)
+                        {
+                            "incoming viewing key"
+                        } else {
+                            "extended full viewing key"
+                        };
+                        wrong_length.zeroize();
+                        out.diagnostics
+                            .push(ImportDiagnostic::PublicIdentifierMismatch {
+                                record_type: "csapzkey".to_owned(),
+                                identifier,
+                            });
                     }
                     Some(mut wrong_length) => {
                         let got = wrong_length.len();
@@ -297,7 +333,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn unlock(fixture: &str) -> (Vec<(Vec<u8>, Vec<u8>)>, MasterKey) {
         let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat")).unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mkey = crate::zcashd::find_mkey(&pairs).expect("no mkey");
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         let master = crate::zcashd::derive_master_key(&pass, &mkey).unwrap();

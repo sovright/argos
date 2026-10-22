@@ -16,6 +16,37 @@ function nu7Text({ network, broadcast }) {
       "must be mined before activation; broadcast alone is not enough.";
 }
 
+function sproutTransaction(state, overrides = {}) {
+  return {
+    txid: `${state}-tx`,
+    value_zatoshis: 5,
+    state,
+    mined_height: state === "mined" ? 321 : null,
+    ...overrides,
+  };
+}
+
+function sproutLifecycleReport(transactions, overrides = {}) {
+  return {
+    transactions,
+    mined_zatoshis: transactions
+      .filter((transaction) => transaction.state === "mined")
+      .reduce((sum, transaction) => sum + (transaction.value_zatoshis ?? 0), 0),
+    pending_zatoshis: transactions
+      .filter((transaction) => transaction.state === "pending")
+      .reduce((sum, transaction) => sum + (transaction.value_zatoshis ?? 0), 0),
+    unknown_zatoshis: transactions
+      .filter((transaction) => transaction.state === "submission_unknown")
+      .reduce((sum, transaction) => sum + (transaction.value_zatoshis ?? 0), 0),
+    skipped: [],
+    rejected: [],
+    warnings: [],
+    error: null,
+    fresh_all_mined: false,
+    ...overrides,
+  };
+}
+
 // Exercise wallet opening, summary rendering and preview together. Only the
 // desktop IPC boundary and DOM are stand-ins; no wallet secrets or funds are used.
 function harness(intercept = (_, __, fallback) => fallback()) {
@@ -24,6 +55,10 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   function element() {
     return {
       value: "", textContent: "",
+      checked: false,
+      listeners: {},
+      addEventListener(name, callback) { (this.listeners[name] ??= []).push(callback); },
+      dispatch(name) { for (const callback of this.listeners[name] ?? []) callback({ target: this }); },
       get innerHTML() { return ""; },
       set innerHTML(value) { assert.equal(value, ""); this.children = []; },
       hidden: false, disabled: false,
@@ -38,6 +73,8 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     return elements.get(id);
   };
   $("network-select").value = "mainnet";
+  $("sprout-destination").value = "fixture-destination";
+  $("confirmation-sources").value = "backup=https://confirm.example";
   const previews = [];
   let onProgress;
   let failStatus = false;
@@ -45,26 +82,50 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     listen: async (name, callback) => { assert.equal(name, "sprout-sweep-progress"); onProgress = callback; },
     $, document: { createElement: element },
     fmt: (value) => String(value),
+    confirmationSourcesFromForm: () => $("confirmation-sources").value
+      .split("\n").map((line) => line.trim()).filter(Boolean),
+    // The scan panel's peer field; replaced by the real helper when a test
+    // loads the scan panel.
+    sproutScanPeers: () => ["192.0.2.7:8233"],
     setStatus: (id, text) => {
       if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
       $(id).textContent = text;
     },
+    invalidateSproutScanSource() {},
     invoke: (command, args) => intercept(command, args, async () => {
       if (command === "inspect_wallet_file") return {
         needs_passphrase: false, transparent_keys: 0, sapling_keys: 0,
         sprout_keys: 1, has_mnemonic: false, sprout_spendable_notes: 1,
         sprout_spendable_zatoshis: 100000, sprout_addresses: [], diagnostics: [],
+        sprout_has_lifecycle_status: false,
         sprout_nu7_warning: "NU7: Sprout recovery must be mined before activation; broadcasting alone is not enough. Check the current mainnet activation schedule.",
         coverage_notice: null, coverage_may_hide_funds: false, seed_note: null,
       };
       if (command === "sprout_nu7_warning") return nu7Text(args);
-      if (command === "preview_sprout_sweep") {
+      if (command === "propose_wallet_sprout_sweep") {
         previews.push({ ...args });
         return {
+          proposal_id: `wallet-proposal-${previews.length}`,
           notes: 1, gross_zatoshis: 100000, fee_zatoshis: 10000,
           net_zatoshis: 90000, lands_in_sapling: "Lands in Sapling",
           params_present: true, params_path: "/fixture/sprout.params",
+          active: [], mined: [],
           nu7_warning: "NU7: Sprout recovery must be mined before activation; broadcasting alone is not enough. Check the current mainnet activation schedule.",
+        };
+      }
+      if (command === "release_sprout_proposal" || command === "release_sprout_scan") return null;
+      // #271's scan API: a scan returns a backend handle, its result is a
+      // snapshot, and a sweep is a reviewed proposal executed by id.
+      if (command === "start_sprout_scan") return "scan-1";
+      if (command === "get_sprout_scan") return { handle: args.handle, status: "running", report: null, error: null };
+      if (command === "propose_sprout_scan_sweep") {
+        return {
+          proposal_id: `scan-proposal-${args.scanHandle}`,
+          notes: 1, gross_zatoshis: 100000, fee_zatoshis: 10000,
+          net_zatoshis: 90000, lands_in_sapling: "Lands in Sapling",
+          params_present: true, params_path: "/fixture/sprout.params",
+          active: [], mined: [],
+          nu7_warning: "NU7: Sprout recovery must be mined before activation.",
         };
       }
       throw new Error(`Unexpected IPC command: ${command}`);
@@ -77,28 +138,36 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   ), context);
   const progressStart = source.indexOf("(async () => {", source.indexOf("// Proving runs for minutes"));
   vm.runInContext(source.slice(progressStart, source.indexOf("// ─── Typed Sapling keys", progressStart)), context);
+  vm.runInContext(source.slice(source.indexOf('for (const id of ["sprout-scan-keys"'),
+    source.indexOf("const sproutScanListenersReady", source.indexOf('for (const id of ["sprout-scan-keys"'))), context);
   return {
     $, previews,
+    edit(id, value, event = "input") { $(id).value = value; $(id).dispatch(event); },
     failNextStatus: () => { failStatus = true; },
     progress: (payload) => onProgress({ payload }),
     sweep: () => vm.runInContext("runSproutSweep()", context),
+    sweepConfirmed() { $("sprout-sweep-confirm").checked = true; $("sprout-sweep-confirm").dispatch("change"); return vm.runInContext("runSproutSweep()", context); },
     peek: (expr) => vm.runInContext(expr, context),
-    // The scan-sweep handler lives outside the slices above; load it on its
-    // own, with its input helpers stubbed only if not already present.
-    scanSweep() {
-      const start = source.indexOf("async function runSproutScanSweep()");
-      const end = source.indexOf("\n}\n", start) + 3;
-      vm.runInContext(source.slice(start, end), context);
-      for (const helper of ["sproutScanPeers", "sproutScanKeyLines", "sproutScanKeyEntries", "sproutScanKeys"]) {
-        if (vm.runInContext(`typeof ${helper}`, context) !== "function") {
-          vm.runInContext(`function ${helper}() { return []; }`, context);
-        }
-      }
+    // Executes a scan-derived sweep the way a user reaches it under #271: a
+    // completed scan (its backend handle and report), a destination reviewed
+    // through `propose_sprout_scan_sweep`, the box ticked, then the button.
+    async scanSweep() {
+      this.loadScanPanel();
+      vm.runInContext(
+        'sproutScanHandle = "scan-1"; sproutScanResult = { notes_found: 1, total_zatoshis: 5, spent_notes: 0 };',
+        context,
+      );
+      if (!$("sprout-scan-destination").value) $("sprout-scan-destination").value = "fixture-destination";
+      await vm.runInContext("refreshSproutScanReview()", context);
+      $("sprout-scan-confirm").checked = true;
       return vm.runInContext("runSproutScanSweep()", context);
     },
     // The whole Sprout scan section, with its real key and peer helpers, for
-    // driving the panel as a user with no wallet file would.
+    // driving the panel as a user with no wallet file would. Loaded once:
+    // its `let` state cannot be declared twice in one context.
     loadScanPanel() {
+      if (vm.runInContext("typeof runSproutScanSweep", context) === "function" &&
+          vm.runInContext("typeof refreshSproutScanReview", context) === "function") return;
       const start = source.indexOf("// ─── Sprout scan ─");
       const end = source.indexOf('$("sprout-scan-sweep-run").addEventListener', start);
       assert.ok(start > 0 && end > start);
@@ -107,6 +176,8 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       if (vm.runInContext("typeof birthdayTouched", context) === "undefined") {
         vm.runInContext("var birthdayTouched = false;", context);
       }
+      // Declared after the scan section; its listeners are not exercised here.
+      vm.runInContext("var sproutScanListenersReady = Promise.resolve(true);", context);
       vm.runInContext(source.slice(start, end), context);
     },
     scan: () => vm.runInContext("runSproutScan()", context),
@@ -114,20 +185,189 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       $("wallet-path").value = path;
       $("wallet-passphrase").value = passphrase;
       await vm.runInContext("openWalletFile()", context);
+      await flush();
     },
   };
 }
+
+test("wallet Sprout sweep requires explicit irreversible confirmation", async () => {
+  const executions = [];
+  const h = harness((command, args, fallback) => {
+    if (command === "execute_wallet_sprout_sweep") { executions.push(args); return sproutLifecycleReport([]); }
+    return fallback();
+  });
+  h.$("sprout-destination").value = "zs-wallet";
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+  await h.sweep();
+  assert.deepEqual(executions, []);
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+});
+
+test("wallet destination edit invalidates the reviewed proposal", async () => {
+  const pending = deferred();
+  const h = harness((command, args, fallback) =>
+    command === "propose_wallet_sprout_sweep" && args.destination === "zs-new"
+      ? pending.promise : fallback());
+  h.$("sprout-destination").value = "zs-old";
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  h.edit("sprout-destination", "zs-new");
+  assert.equal(h.$("sprout-sweep-confirm").checked, false);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+  pending.resolve({ proposal_id: "new-proposal", notes: 1, gross_zatoshis: 100000,
+    fee_zatoshis: 10000, net_zatoshis: 90000, params_present: true,
+    lands_in_sapling: "Lands in Sapling" });
+  h.$("sprout-destination").dispatch("change");
+  await flush();
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+});
+
+test("wallet execution settings invalidate and repreview confirmation authority", async () => {
+  const h = harness();
+  await h.open("/fixture/wallet.dat");
+  assert.equal(h.peek("walletSproutReview?.proposal_id"), "wallet-proposal-1");
+
+  h.edit("confirmation-sources", "other=https://other.example");
+  assert.equal(h.peek("walletSproutReview"), null);
+  h.edit("confirmation-sources", "other=https://other.example", "change");
+  await flush();
+  assert.equal(h.previews.length, 2);
+  assert.deepEqual(
+    h.previews.at(-1).confirmationSources,
+    ["other=https://other.example"],
+  );
+});
+
+test("late wallet preview cannot publish after unannounced config drift", async () => {
+  const pending = deferred();
+  const h = harness((command, _args, fallback) =>
+    command === "propose_wallet_sprout_sweep" ? pending.promise : fallback());
+  const opening = h.open("/fixture/wallet.dat");
+  await flush();
+  h.$("lightwalletd-url").value = "https://changed.example";
+  pending.resolve({
+    proposal_id: "stale-config", notes: 1, gross_zatoshis: 100000,
+    fee_zatoshis: 10000, net_zatoshis: 90000, params_present: true,
+    lands_in_sapling: "Lands in Sapling",
+  });
+  await opening;
+  assert.equal(h.peek("walletSproutReview"), null);
+});
+
+test("wallet Sprout execution sends only proposal id", async () => {
+  let executed;
+  const h = harness((command, args, fallback) => {
+    if (command === "execute_wallet_sprout_sweep") { executed = args; return sproutLifecycleReport([]); }
+    return fallback();
+  });
+  h.$("sprout-destination").value = "zs-destination";
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  await h.sweep();
+  assert.deepEqual(JSON.parse(JSON.stringify(executed)), { proposalId: "wallet-proposal-1" });
+});
+
+test("older wallet Sprout proposal cannot replace the current one", async () => {
+  const old = deferred();
+  const h = harness((command, args, fallback) =>
+    command === "propose_wallet_sprout_sweep" && args.destination === "zs-old"
+      ? old.promise : fallback());
+  h.$("sprout-destination").value = "zs-old";
+  await h.open("/fixture/wallet.dat");
+  h.edit("sprout-destination", "zs-new", "change");
+  await flush();
+  const plan = h.$("sprout-sweep-plan").textContent;
+  old.resolve({ proposal_id: "old-proposal", notes: 99, gross_zatoshis: 999,
+    fee_zatoshis: 1, net_zatoshis: 998, params_present: true,
+    lands_in_sapling: "Old pool" });
+  await flush();
+  assert.equal(h.$("sprout-sweep-plan").textContent, plan);
+  assert.notEqual(h.peek("walletSproutReview?.proposal_id"), "old-proposal");
+});
+
+test("changing wallet invalidates its Sprout proposal", async () => {
+  const h = harness();
+  h.$("sprout-destination").value = "zs-destination";
+  await h.open("/fixture/first.dat");
+  await flush();
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  await h.open("/fixture/second.dat");
+  assert.equal(h.$("sprout-sweep-confirm").checked, false);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+});
+
+test("wallet source and endpoint edits revoke the reviewed proposal", async () => {
+  for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url"]) {
+    const h = harness();
+    await h.open("/fixture/wallet.dat");
+    h.$("sprout-sweep-confirm").checked = true;
+    h.$("sprout-sweep-confirm").dispatch("change");
+    assert.equal(h.$("sprout-sweep-run").disabled, false);
+    h.edit(id, "changed");
+    assert.equal(h.$("sprout-sweep-confirm").checked, false, id);
+    assert.equal(h.$("sprout-sweep-run").disabled, true, id);
+  }
+});
+
+test("network and data directory edits hide wallet Sprout evidence until reinspection", async () => {
+  for (const id of ["network-select", "data-dir"]) {
+    const h = harness();
+    await h.open("/fixture/wallet.dat");
+    assert.equal(h.$("wallet-summary").hidden, false);
+    assert.equal(h.$("wallet-sprout-sweep").hidden, false);
+    assert.match(h.$("sprout-sweep-plan").textContent, /note\(s\)/);
+    h.edit(id, "changed");
+    assert.equal(h.peek("walletFile"), null, id);
+    assert.equal(h.$("wallet-summary").hidden, true, id);
+    assert.equal(h.$("wallet-sprout-sweep").hidden, true, id);
+    assert.equal(h.$("wallet-next").disabled, true, id);
+    assert.equal(h.$("sprout-sweep-plan").textContent, "", id);
+    assert.equal(h.$("sprout-sweep-spent-status").textContent, "", id);
+    assert.equal(h.$("wallet-path").value, "/fixture/wallet.dat", id);
+  }
+});
 
 test("first wallet open displays its Sprout preview without a null-path error", async () => {
   const h = harness();
   await h.open("/fixture/first.dat");
   assert.deepEqual(h.previews, [{
-    path: "/fixture/first.dat", passphrase: null, network: "mainnet", dataDir: null,
+    path: "/fixture/first.dat", passphrase: null, destination: "fixture-destination",
+    lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
+    network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
   }]);
   assert.equal(h.$("wallet-sprout-sweep").hidden, false);
   assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
   assert.equal(h.$("sprout-sweep-status").textContent, "");
-  assert.equal(h.$("sprout-sweep-run").disabled, false);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+});
+
+test("inspection carries no peers; the review verifies through the scan panel's", async () => {
+  const seen = {};
+  const h = harness(async (command, args, fallback) => {
+    seen[command] = { ...args };
+    if (command === "execute_wallet_sprout_sweep") return {
+      sent: [], total_swept: 0, skipped: [], rejected: [], warnings: [], error: null,
+    };
+    return fallback();
+  });
+  await h.open("/fixture/peers.dat");
+  await flush();
+  assert.equal("peers" in seen.inspect_wallet_file, false, "opening a wallet never dials");
+  assert.deepEqual(seen.propose_wallet_sprout_sweep.peers, ["192.0.2.7:8233"]);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  // Under #271 the reviewed proposal carries the verified notes; execute
+  // takes only its ID and no peers or other authority.
+  assert.deepEqual(Object.keys(seen.execute_wallet_sprout_sweep), ["proposalId"]);
 });
 
 test("opening another wallet previews the new path and passphrase", async () => {
@@ -135,7 +375,9 @@ test("opening another wallet previews the new path and passphrase", async () => 
   await h.open("/fixture/first.dat", "fixture-one");
   await h.open("/fixture/second.dat", "fixture-two");
   assert.deepEqual(h.previews.at(-1), {
-    path: "/fixture/second.dat", passphrase: "fixture-two", network: "mainnet", dataDir: null,
+    path: "/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
+    lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
+    network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
   });
   assert.equal(h.$("sprout-sweep-status").textContent, "");
 });
@@ -143,7 +385,7 @@ test("opening another wallet previews the new path and passphrase", async () => 
 test("the NU7 deadline is visible as soon as Sprout keys are detected, before preview finishes", async () => {
   const preview = deferred();
   const h = harness(async (command, args, fallback) => {
-    if (command === "preview_sprout_sweep") await preview.promise;
+    if (command === "propose_wallet_sprout_sweep") await preview.promise;
     return fallback();
   });
   await h.open("/fixture/sprout.dat");
@@ -185,15 +427,14 @@ test("opening a wallet without Sprout clears an earlier NU7 warning", async () =
 
 test("testnet preview refreshes the warning without urging post-activation recovery", async () => {
   const h = harness(async (command, args, fallback) => {
-    if (command === "execute_sprout_sweep") return {
-      sent: [{ value_swept: 5, txid: "fixture-tx" }], total_swept: 5,
-      skipped: [], rejected: [], warnings: [], error: null,
-    };
+    if (command === "execute_wallet_sprout_sweep") {
+      return sproutLifecycleReport([sproutTransaction("pending", { txid: "fixture-tx" })]);
+    }
     const response = await fallback();
     if (command === "inspect_wallet_file") return {
       ...response, sprout_nu7_warning: "Testnet NU7: see the activation warning before spending.",
     };
-    if (command === "preview_sprout_sweep") return {
+    if (command === "propose_wallet_sprout_sweep") return {
       ...response, nu7_warning: "Testnet NU7: Sprout spending is unavailable at or after block 4,465,026.",
     };
     return response;
@@ -203,23 +444,22 @@ test("testnet preview refreshes the warning without urging post-activation recov
   await flush();
   assert.match(h.$("wallet-sprout-nu7-warning").textContent, /Testnet.*4,465,026/);
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   assert.equal(h.$("wallet-sprout-nu7-warning").hidden, false);
   assert.match(h.$("wallet-sprout-nu7-warning").textContent, /NU7/);
 });
 
 test("an accepted mainnet broadcast switches the warning to confirming it is mined", async () => {
   const h = harness(async (command, args, fallback) => {
-    if (command === "execute_sprout_sweep") return {
-      sent: [{ value_swept: 5, txid: "fixture-tx" }], total_swept: 5,
-      skipped: [], rejected: [], warnings: [], error: null,
-    };
+    if (command === "execute_wallet_sprout_sweep") {
+      return sproutLifecycleReport([sproutTransaction("pending", { txid: "fixture-tx" })]);
+    }
     return fallback();
   });
   await h.open("/fixture/mainnet.dat");
   await flush();
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   await flush();
   const warning = h.$("wallet-sprout-nu7-warning");
   assert.equal(warning.hidden, false);
@@ -236,15 +476,15 @@ test("a sweep that broadcast nothing keeps the start-recovery wording", async ()
   const requested = [];
   const h = harness(async (command, args, fallback) => {
     if (command === "sprout_nu7_warning") requested.push({ ...args });
-    if (command === "execute_sprout_sweep") return {
-      sent: [], total_swept: 0, skipped: [], rejected: ["refused"], warnings: [], error: null,
-    };
+    if (command === "execute_wallet_sprout_sweep") {
+      return sproutLifecycleReport([], { rejected: ["refused"] });
+    }
     return fallback();
   });
   await h.open("/fixture/mainnet.dat");
   await flush();
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   await flush();
   assert.equal(requested.filter((r) => r.broadcast).length, 0);
   assert.match(h.$("wallet-sprout-nu7-warning").textContent, /mined before activation/);
@@ -268,16 +508,15 @@ test("changing the network after opening a Sprout wallet rebuilds the warning fo
 
 test("a network change keeps the post-broadcast wording, for the new network", async () => {
   const h = harness(async (command, args, fallback) => {
-    if (command === "execute_sprout_sweep") return {
-      sent: [{ value_swept: 5, txid: "fixture-tx" }], total_swept: 5,
-      skipped: [], rejected: [], warnings: [], error: null,
-    };
+    if (command === "execute_wallet_sprout_sweep") {
+      return sproutLifecycleReport([sproutTransaction("pending", { txid: "fixture-tx" })]);
+    }
     return fallback();
   });
   await h.open("/fixture/sprout.dat");
   await flush();
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   h.$("network-select").value = "testnet";
   await h.peek("refreshSproutNu7Warning()");
   assert.match(h.$("wallet-sprout-nu7-warning").textContent, /^testnet NU7: .*confirm it is mined/);
@@ -339,9 +578,9 @@ for (const fails of [false, true]) {
     const executions = [];
     const h = harness(async (command, args, fallback) => {
       if (command === "inspect_wallet_file" && args.path === "/fixture/old.dat") await old.promise;
-      if (command === "execute_sprout_sweep") {
-        executions.push(args.path);
-        return { sent: [], skipped: [], error: null };
+      if (command === "execute_wallet_sprout_sweep") {
+        executions.push(args.proposalId);
+        return sproutLifecycleReport([]);
       }
       return fallback();
     });
@@ -351,8 +590,8 @@ for (const fails of [false, true]) {
     await first;
     await flush();
     h.$("sprout-destination").value = "fixture-destination";
-    await h.sweep();
-    assert.deepEqual(executions, ["/fixture/new.dat"]);
+    await h.sweepConfirmed();
+    assert.deepEqual(executions, ["wallet-proposal-1"]);
     assert.equal(h.$("wallet-next").disabled, false);
     assert.equal(h.$("wallet-summary").hidden, false);
   });
@@ -360,9 +599,10 @@ for (const fails of [false, true]) {
   test(`older preview ${fails ? "failure" : "success"} cannot overwrite the current preview`, async () => {
     const old = deferred();
     const h = harness(async (command, args, fallback) => {
-      if (command === "preview_sprout_sweep" && args.path === "/fixture/old.dat") {
+      if (command === "propose_wallet_sprout_sweep" && args.path === "/fixture/old.dat") {
         await old.promise;
-        return { notes: 99, gross_zatoshis: 999, fee_zatoshis: 1, net_zatoshis: 998, params_present: true };
+        return { proposal_id: "old-proposal", notes: 99, gross_zatoshis: 999,
+          fee_zatoshis: 1, net_zatoshis: 998, params_present: true };
       }
       return fallback();
     });
@@ -374,7 +614,7 @@ for (const fails of [false, true]) {
     await flush();
     assert.equal(h.$("sprout-sweep-plan").textContent, plan);
     assert.equal(h.$("sprout-sweep-status").textContent, "");
-    assert.equal(h.$("sprout-sweep-run").disabled, false);
+    assert.equal(h.$("sprout-sweep-run").disabled, true);
   });
 }
 
@@ -384,11 +624,11 @@ test("a new import blocks spending until its own preview is ready", async () => 
   const h = harness(async (command, args, fallback) => {
     if (args.path === "/fixture/new.dat") {
       if (command === "inspect_wallet_file") await inspection.promise;
-      if (command === "preview_sprout_sweep") await preview.promise;
+      if (command === "propose_wallet_sprout_sweep") await preview.promise;
     }
-    if (command === "execute_sprout_sweep") {
-      executions.push(args.path);
-      return { sent: [], skipped: [], error: null };
+    if (command === "execute_wallet_sprout_sweep") {
+      executions.push(args.proposalId);
+      return sproutLifecycleReport([]);
     }
     return fallback();
   });
@@ -398,36 +638,38 @@ test("a new import blocks spending until its own preview is ready", async () => 
   const opening = h.open("/fixture/new.dat");
   assert.equal(h.$("sprout-sweep-run").disabled, true);
   assert.equal(h.$("wallet-next").disabled, true);
-  await h.sweep();
+  await h.sweepConfirmed();
   assert.deepEqual(executions, []);
   inspection.resolve();
   await opening;
   assert.equal(h.$("sprout-sweep-run").disabled, true);
-  await h.sweep();
+  await h.sweepConfirmed();
   assert.deepEqual(executions, []);
   preview.resolve();
   await flush();
-  await h.sweep();
-  assert.deepEqual(executions, ["/fixture/new.dat"]);
+  await h.sweepConfirmed();
+  assert.deepEqual(executions, ["wallet-proposal-2"]);
 });
 
 for (const fails of [false, true]) {
   test(`stale sweep ${fails ? "failure" : "success"} leaves the new wallet's results and warnings intact`, async () => {
     const pending = deferred();
-    const h = harness((command, args, fallback) => command === "execute_sprout_sweep" ? pending.promise : fallback());
+    const h = harness((command, args, fallback) => command === "execute_wallet_sprout_sweep" ? pending.promise : fallback());
     await h.open("/fixture/old.dat");
     h.$("sprout-destination").value = "fixture-destination";
-    const sweep = h.sweep();
+    const sweep = h.sweepConfirmed();
     await h.open("/fixture/new.dat");
     const warning = h.$("delete-sprout-uncovered").textContent;
     if (fails) pending.reject(new Error("old sweep failed"));
-    else pending.resolve({ sent: [{ txid: "old-tx", value_swept: 90000 }], skipped: [], total_swept: 90000, error: null });
+    else pending.resolve(sproutLifecycleReport([
+      sproutTransaction("pending", { txid: "old-tx", value_zatoshis: 90000 }),
+    ]));
     await sweep;
     assert.equal(h.$("sprout-sweep-status").textContent, "");
     assert.equal(h.$("sprout-sweep-results").children.length, 0);
     assert.equal(h.$("delete-sprout-uncovered").hidden, false);
     assert.equal(h.$("delete-sprout-uncovered").textContent, warning);
-    assert.equal(h.$("sprout-sweep-run").disabled, false);
+    assert.equal(h.$("sprout-sweep-run").disabled, true);
   });
 }
 
@@ -435,51 +677,54 @@ test("reopening a wallet cannot start a concurrent sweep, and failure releases t
   const pending = deferred();
   let executions = 0;
   const h = harness((command, args, fallback) => {
-    if (command !== "execute_sprout_sweep") return fallback();
+    if (command !== "execute_wallet_sprout_sweep") return fallback();
     executions++;
     return pending.promise;
   });
   await h.open("/fixture/wallet.dat");
   h.$("sprout-destination").value = "fixture-destination";
-  const sweep = h.sweep();
+  const sweep = h.sweepConfirmed();
   await h.open("/fixture/wallet.dat");
   assert.equal(h.$("sprout-sweep-run").disabled, true);
   // Invoke the handler even when disabled: the lock must guard execution itself.
-  const second = h.sweep();
+  const second = h.sweepConfirmed();
   assert.equal(executions, 1);
   pending.reject(new Error("fixture failure"));
   await Promise.all([sweep, second]);
   assert.equal(h.$("sprout-sweep-run").disabled, false);
-  await h.sweep();
+  await h.sweepConfirmed();
   assert.equal(executions, 2);
 });
 
 test("sweep progress and completion belong only to the active source", async () => {
   const pending = deferred();
-  const h = harness((command, args, fallback) => command === "execute_sprout_sweep" ? pending.promise : fallback());
+  const h = harness((command, args, fallback) => command === "execute_wallet_sprout_sweep" ? pending.promise : fallback());
   await h.open("/fixture/old.dat");
   h.$("sprout-destination").value = "fixture-destination";
-  const sweep = h.sweep();
+  const sweep = h.sweepConfirmed();
   h.progress("Proving note 1");
   assert.match(h.$("sprout-sweep-status").textContent, /Proving note 1/);
   await h.open("/fixture/new.dat");
   h.progress("Proving old note 2");
   assert.equal(h.$("sprout-sweep-status").textContent, "");
-  pending.resolve({ sent: [], skipped: [], total_swept: 90000, error: null });
+  pending.resolve(sproutLifecycleReport([]));
   await sweep;
   h.progress("Late old event");
   assert.equal(h.$("sprout-sweep-status").textContent, "");
 });
 
-test("current wallet sweep shows its transaction and clears the uncovered-key notice", async () => {
-  const h = harness((command, args, fallback) => command === "execute_sprout_sweep"
-    ? Promise.resolve({ sent: [{ txid: "fixture-tx", value_swept: 90000 }], skipped: [], total_swept: 90000, error: null })
+test("current wallet sweep shows its mined transaction and clears its own warning", async () => {
+  const h = harness((command, args, fallback) => command === "execute_wallet_sprout_sweep"
+    ? Promise.resolve(sproutLifecycleReport([
+      sproutTransaction("mined", { txid: "fixture-tx", value_zatoshis: 90000, mined_height: 444 }),
+    ], { mined_zatoshis: 90000, fresh_all_mined: true }))
     : fallback());
   await h.open("/fixture/wallet.dat");
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   assert.match(h.$("sprout-sweep-results").children[0].textContent, /fixture-tx/);
-  assert.match(h.$("sprout-sweep-status").textContent, /Swept 90000/);
+  assert.match(h.$("sprout-sweep-status").textContent, /Mined 90000/);
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /Swept/);
   assert.doesNotMatch(h.$("delete-sprout-uncovered").textContent, /does not include Sprout/);
   // The deadline survives the sweep, reworded: broadcast is not mined.
   assert.match(h.$("delete-sprout-uncovered").textContent, /must be mined before NU7 activation; confirm it is mined/);
@@ -488,21 +733,233 @@ test("current wallet sweep shows its transaction and clears the uncovered-key no
   assert.equal(h.$("sprout-sweep-results").children.length, 0);
 });
 
+test("historical lifecycle reports never claim the current unified destination", async () => {
+  const report = sproutLifecycleReport([
+    sproutTransaction("pending", { txid: "historical-tx" }),
+  ]);
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? report : fallback());
+  h.$("sprout-destination").value = "u1-new-destination";
+  await h.open("/fixture/historical.dat");
+  await h.sweepConfirmed();
+  const rendered = texts(h.$("sprout-sweep-results")).join("\n") +
+    h.$("sprout-sweep-status").textContent;
+  assert.match(rendered, /historical-tx/);
+  assert.doesNotMatch(rendered, /that unified address|these funds land|funds are in/i);
+});
+
+test("accepted_transaction_renders_broadcast_pending_without_a_green_check", async () => {
+  const pending = sproutLifecycleReport([sproutTransaction("pending")]);
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? pending : fallback());
+  await h.open("/fixture/pending.dat");
+  await h.sweepConfirmed();
+  const rows = texts(h.$("sprout-sweep-results"));
+  assert.ok(rows.some((row) => /pending/i.test(row) && /pending-tx/.test(row)), rows.join("\n"));
+  assert.match(h.$("sprout-sweep-status").textContent, /pending/i);
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /✓|Swept/i);
+  assert.ok(h.peek("uncoveredSproutKeys") > 0);
+});
+
+test("submission_unknown_says_later_notes_were_not_attempted", async () => {
+  const unknown = sproutLifecycleReport([sproutTransaction("submission_unknown")]);
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? unknown : fallback());
+  await h.open("/fixture/unknown.dat");
+  await h.sweepConfirmed();
+  const rendered = texts(h.$("sprout-sweep-results")).join("\n");
+  assert.match(rendered, /submission (status )?unknown/i);
+  assert.match(rendered, /later notes were not attempted/i);
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /✓|Swept/i);
+});
+
+test("only_fresh_all_mined_results_clear_the_gui_caveat", () => {
+  const h = harness();
+  const mined = sproutTransaction("mined");
+  const clean = sproutLifecycleReport([mined], { fresh_all_mined: true });
+  const cases = [
+    [clean, true],
+    [{ ...clean, fresh_all_mined: false }, false],
+    [{ ...clean, transactions: [] }, false],
+    [{ ...clean, transactions: [sproutTransaction("pending")] }, false],
+    [{ ...clean, transactions: [sproutTransaction("submission_unknown")] }, false],
+    [{ ...clean, transactions: [sproutTransaction("expired")] }, false],
+    [{ ...clean, transactions: [sproutTransaction("rejected")] }, false],
+    [{ ...clean, transactions: [sproutTransaction("mined", { mined_height: null })] }, false],
+    [{ ...clean, error: "stopped" }, false],
+    [{ ...clean, rejected: ["refused"] }, false],
+    [{ ...clean, skipped: ["dust"] }, false],
+    [{ ...clean, ready: [{ note: "unbuilt" }] }, false],
+  ];
+  for (const [report, expected] of cases) {
+    assert.equal(
+      h.peek(`sproutSourceWarningMayClear(${JSON.stringify(report)})`),
+      expected,
+      JSON.stringify(report),
+    );
+  }
+});
+
+test("pending_and_contested_results_keep_the_original_wallet_and_checkpoint_warning", async () => {
+  const report = sproutLifecycleReport([sproutTransaction("pending")], {
+    warnings: ["Confirmation sources disagreed; canonical status is contested."],
+  });
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? report : fallback());
+  await h.open("/fixture/contested.dat");
+  await h.sweepConfirmed();
+  assert.ok(h.peek("uncoveredSproutKeys") > 0);
+  const rendered = texts(h.$("sprout-sweep-results")).join("\n");
+  assert.match(rendered, /contested/i);
+  assert.match(h.$("delete-sprout-uncovered").textContent, /original wallet|Sprout key/i);
+});
+
+test("pending_only_preview_enables_check_status_without_sprout_parameters", async () => {
+  let executions = 0;
+  const h = harness(async (command, args, fallback) => {
+    if (command === "inspect_wallet_file") {
+      return {
+        ...(await fallback()),
+        sprout_spendable_notes: 0,
+        sprout_spendable_zatoshis: 0,
+        sprout_has_lifecycle_status: true,
+        sprout_nothing_left: false,
+      };
+    }
+    if (command === "propose_wallet_sprout_sweep") {
+      return {
+        proposal_id: "status-only",
+        notes: 0,
+        gross_zatoshis: 0,
+        fee_zatoshis: 0,
+        net_zatoshis: 0,
+        active: [sproutTransaction("pending", { value_zatoshis: null })],
+        mined: [],
+        lands_in_sapling: "Lands in Sapling",
+        params_present: false,
+        params_path: "/missing/sprout.params",
+        warnings: [],
+      };
+    }
+    if (command === "execute_wallet_sprout_sweep") {
+      executions++;
+      return sproutLifecycleReport([sproutTransaction("pending", { value_zatoshis: null })]);
+    }
+    return fallback();
+  });
+  await h.open("/fixture/status-only.dat");
+  assert.equal(h.$("wallet-sprout-sweep").hidden, false);
+  assert.match(h.$("wallet-sprout-headline").textContent, /transaction status/i);
+  assert.equal(h.$("sprout-sweep-run").textContent, "Check status and continue");
+  assert.equal(h.$("sprout-sweep-confirm").disabled, false);
+  assert.doesNotMatch(h.$("sprout-sweep-params").textContent, /before (sweeping|continuing)/i);
+  await h.sweepConfirmed();
+  assert.equal(executions, 1);
+});
+
+test("legacy_unknown_entry_keeps_the_source_warning_and_omits_unknown_amount", async () => {
+  const legacy = sproutLifecycleReport([
+    sproutTransaction("submission_unknown", { txid: "legacy-tx", value_zatoshis: null }),
+  ]);
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? legacy : fallback());
+  await h.open("/fixture/legacy.dat");
+  await h.sweepConfirmed();
+  const rendered = texts(h.$("sprout-sweep-results")).join("\n");
+  assert.match(rendered, /legacy-tx/);
+  assert.match(rendered, /amount unknown/i);
+  assert.doesNotMatch(rendered, /undefined|\b0\b/);
+  assert.ok(h.peek("uncoveredSproutKeys") > 0);
+});
+
+test("legacy mined entry clears the source warning without inventing a zero amount", async () => {
+  const legacy = sproutLifecycleReport([
+    sproutTransaction("mined", {
+      txid: "legacy-mined-tx",
+      value_zatoshis: null,
+      mined_height: 654,
+    }),
+  ], { mined_zatoshis: 0, fresh_all_mined: true });
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? legacy : fallback());
+  await h.open("/fixture/legacy-mined.dat");
+  await h.sweepConfirmed();
+  const rendered = [
+    ...texts(h.$("sprout-sweep-results")),
+    h.$("sprout-sweep-status").textContent,
+  ].join("\n");
+  assert.match(rendered, /legacy-mined-tx/);
+  assert.match(rendered, /amount unknown/i);
+  assert.doesNotMatch(rendered, /undefined|\b0\b/);
+  assert.equal(h.peek("uncoveredSproutKeys"), 0);
+});
+
+test("expired and rejected lifecycle rows require recoverable follow-up", async () => {
+  const report = sproutLifecycleReport([
+    sproutTransaction("expired"),
+    sproutTransaction("rejected"),
+  ]);
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" ? report : fallback());
+  await h.open("/fixture/terminal.dat");
+  await h.sweepConfirmed();
+  const rendered = texts(h.$("sprout-sweep-results")).join("\n");
+  assert.match(rendered, /expired.*recover|recover.*expired/i);
+  assert.match(rendered, /rejected.*recover|recover.*rejected/i);
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /✓|Swept/i);
+});
+
+test("wallet_and_scan_sweep_handlers_render_identical_lifecycle_rows", async () => {
+  const report = sproutLifecycleReport([
+    sproutTransaction("pending"),
+    sproutTransaction("submission_unknown", { value_zatoshis: null }),
+    sproutTransaction("mined"),
+    sproutTransaction("expired"),
+    sproutTransaction("rejected"),
+  ]);
+  const h = harness((command, args, fallback) =>
+    command === "execute_wallet_sprout_sweep" || command === "execute_sprout_scan_sweep"
+      ? report : fallback());
+  await h.open("/fixture/shared-renderer.dat");
+  await h.sweepConfirmed();
+  const walletRows = texts(h.$("sprout-sweep-results"));
+  h.$("sprout-scan-destination").value = "fixture-destination";
+  await h.scanSweep();
+  const scanRows = texts(h.$("sprout-scan-sweep-results"));
+  assert.equal(walletRows.length, 5);
+  assert.deepEqual(scanRows, walletRows);
+});
+
+test("lifecycle action label resets for a ready-only preview", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command !== "propose_wallet_sprout_sweep") return fallback();
+    const review = await fallback();
+    return args.path.endsWith("status.dat")
+      ? { ...review, notes: 0, gross_zatoshis: 0, fee_zatoshis: 0, net_zatoshis: 0,
+        active: [sproutTransaction("pending")], params_present: false }
+      : { ...review, active: [], mined: [], params_present: true };
+  });
+  await h.open("/fixture/status.dat");
+  assert.equal(h.$("sprout-sweep-run").textContent, "Check status and continue");
+  await h.open("/fixture/ready.dat");
+  assert.equal(h.$("sprout-sweep-run").textContent, "Sweep Sprout funds");
+});
+
 test("synchronous status failure before proving cannot strand the sweep lock", async () => {
   let executions = 0;
   const h = harness((command, args, fallback) => {
-    if (command !== "execute_sprout_sweep") return fallback();
+    if (command !== "execute_wallet_sprout_sweep") return fallback();
     executions++;
-    return Promise.resolve({ sent: [], skipped: [], total_swept: 0, error: null });
+    return Promise.resolve(sproutLifecycleReport([]));
   });
   await h.open("/fixture/wallet.dat");
   h.$("sprout-destination").value = "fixture-destination";
   h.failNextStatus();
-  await h.sweep().catch(() => {});
+  await h.sweepConfirmed().catch(() => {});
   assert.equal(executions, 0);
   await h.open("/fixture/wallet.dat");
-  assert.equal(h.$("sprout-sweep-run").disabled, false);
-  await h.sweep();
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+  await h.sweepConfirmed();
   assert.equal(executions, 1);
 });
 
@@ -535,15 +992,17 @@ test("an unrecovered seed is shown at import and carried to the totals and delet
 });
 
 test("sweeping the file's Sprout notes does not clear the partial-import warning", async () => {
-  const h = harness(async (command, args, fallback) => command === "execute_sprout_sweep"
-    ? { sent: [{ txid: "fixture-tx", value_swept: 90000 }], skipped: [], total_swept: 90000, error: null }
+  const h = harness(async (command, args, fallback) => command === "execute_wallet_sprout_sweep"
+    ? sproutLifecycleReport([
+      sproutTransaction("mined", { txid: "fixture-tx", value_zatoshis: 90000 }),
+    ], { mined_zatoshis: 90000, fresh_all_mined: true })
     : withCoverage(SEED_NOTICE, true)(command, args, fallback));
   await h.open("/fixture/zcashd5.dat");
   // The preview is requested without being awaited; let it land.
   await new Promise(setImmediate);
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
-  assert.match(h.$("sprout-sweep-status").textContent, /Swept 90000/);
+  await h.sweepConfirmed();
+  assert.match(h.$("sprout-sweep-status").textContent, /Mined 90000/);
   for (const id of LATER_SCREENS) {
     assert.equal(h.$(id).hidden, false, id);
     assert.doesNotMatch(h.$(id).textContent, /Sprout key\(s\)/, id);
@@ -632,6 +1091,90 @@ function inspected(overrides) {
 }
 const texts = (el) => el.children.map((c) => c.textContent);
 
+test("unverified checkpoint notice stays visible while wallet-file preview remains available", async () => {
+  const checkpoint = "/fixture/workspace/sprout-scan-123.checkpoint";
+  const notice = `Not using the full-block scan checkpoint at ${checkpoint}. Spent status is the wallet file's own record.`;
+  const h = harness(inspected({
+    sprout_spendable_notes: 1,
+    sprout_spendable_zatoshis: 100000,
+    sprout_accounting: [notice],
+    sprout_spent_status: "Spent status comes from this wallet file's own history.",
+  }));
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), [notice]);
+  assert.match(h.$("sprout-sweep-spent-status").textContent, /wallet file's own history/);
+  // Under #271 the review is sweepable once the irreversible box is ticked.
+  assert.equal(h.$("sprout-sweep-confirm").disabled, false);
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+  assert.deepEqual(h.previews.at(-1), {
+    path: "/fixture/wallet.dat", passphrase: null, destination: "fixture-destination",
+    lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
+    network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
+  });
+});
+
+test("deep reorg notice names the preserved checkpoint and source wallet", async () => {
+  const checkpoint = "/fixture/workspace/sprout-scan-456.checkpoint";
+  const notice = `The scan checkpoint at ${checkpoint} could not be reconciled. Keep the original wallet or key for a safe full rescan.`;
+  const h = harness(inspected({
+    sprout_spendable_notes: 0,
+    sprout_spendable_zatoshis: 0,
+    sprout_nothing_left: false,
+    sprout_accounting: [notice],
+  }));
+  await h.open("/fixture/wallet.dat");
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), [notice]);
+  assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /keep the original wallet or key/i);
+  assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /sprout-scan-456\.checkpoint/);
+});
+
+test("preview shows its fresh verification warning and execute shows a newer one", async () => {
+  const previewNotice = "Preview: checkpoint verification is unavailable; use wallet-file evidence.";
+  const executeNotice = "Execute: checkpoint changed after preview; use wallet-file evidence.";
+  const calls = [];
+  const h = harness(async (command, args, fallback) => {
+    if (command === "propose_wallet_sprout_sweep") {
+      calls.push(command);
+      return { ...(await fallback()), scan_warning: previewNotice };
+    }
+    if (command === "execute_wallet_sprout_sweep") {
+      calls.push(command);
+      return {
+        sent: [], total_swept: 0, skipped: [], rejected: [],
+        warnings: [executeNotice], error: null,
+      };
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-status").textContent, /Preview: checkpoint verification/);
+  assert.equal(h.$("sprout-sweep-confirm").disabled, false);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  assert.deepEqual(calls, ["propose_wallet_sprout_sweep", "execute_wallet_sprout_sweep"]);
+  assert.ok(texts(h.$("sprout-sweep-results")).includes(executeNotice));
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /Preview: checkpoint/);
+});
+
+test("execute displays a changed spent verdict after a spendable preview", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "execute_wallet_sprout_sweep") {
+      throw new Error("nothing is left to sweep; fresh checkpoint verification found this note spent");
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-plan").textContent, /1 note\(s\)/);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  assert.match(h.$("sprout-sweep-status").textContent, /fresh checkpoint verification found this note spent/);
+});
+
 test("a wallet that spent every Sprout note says so instead of asking for note data", async () => {
   const h = harness(inspected({
     sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
@@ -660,56 +1203,64 @@ test("a recoverable wallet shows why its total is what it is, and the file's lim
 
 test("notes the network refused are listed after a sweep", async () => {
   const h = harness(async (command, args, fallback) => {
-    if (command === "execute_sprout_sweep") return {
-      sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [],
-      rejected: ["note bb:0:1 was refused by the network: spent"], error: null,
-    };
+    if (command === "execute_wallet_sprout_sweep") {
+      return sproutLifecycleReport([sproutTransaction("pending", { txid: "aa" })], {
+        rejected: ["note bb:0:1 was refused by the network: spent"],
+      });
+    }
     return fallback();
   });
   await h.open("/fixture/first.dat");
   await flush();
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   const lines = texts(h.$("sprout-sweep-results"));
   assert.ok(lines.some((l) => /refused by the network/.test(l)), lines.join("\n"));
-  assert.match(h.$("sprout-sweep-status").textContent, /1 note\(s\) refused/);
+  assert.match(h.$("sprout-sweep-status").textContent, /pending/i);
 });
 
 // The wallet-file path asks a full-block scan of the same keys to settle
 // spends the file cannot see. It must look where the scan panel writes.
 test("the Sprout preview, inspection and sweep look in the scan's data directory", async () => {
   const seen = {};
+  const executions = [];
   const h = harness(async (command, args, fallback) => {
-    seen[command] = args.dataDir;
-    if (command === "execute_sprout_sweep") return { sent: [], skipped: [], rejected: [], error: null };
+    if (command === "inspect_wallet_file" || command === "propose_wallet_sprout_sweep") {
+      seen[command] = args.dataDir;
+    }
+    if (command === "execute_wallet_sprout_sweep") {
+      executions.push(JSON.parse(JSON.stringify(args)));
+      return sproutLifecycleReport([]);
+    }
     return fallback();
   });
   h.$("data-dir").value = "/fixture/workspace";
   await h.open("/fixture/first.dat");
   await flush();
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   assert.deepEqual(seen, {
     inspect_wallet_file: "/fixture/workspace",
-    preview_sprout_sweep: "/fixture/workspace",
-    execute_sprout_sweep: "/fixture/workspace",
+    propose_wallet_sprout_sweep: "/fixture/workspace",
   });
+  assert.deepEqual(executions, [{ proposalId: "wallet-proposal-1" }]);
 });
 
 // A broadcast that could not be written to the sweep journal is worth
 // saying: a re-run would prove that one note again and see it refused.
 test("a sweep journal warning is shown after the sweep", async () => {
   const h = harness(async (command, args, fallback) => {
-    if (command === "execute_sprout_sweep") return {
-      sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected: [],
-      warnings: ["aa was broadcast, but writing the sweep journal failed"], error: null,
-    };
+    if (command === "execute_wallet_sprout_sweep") {
+      return sproutLifecycleReport([sproutTransaction("pending", { txid: "aa" })], {
+        warnings: ["aa was broadcast, but writing the sweep journal failed"],
+      });
+    }
     return fallback();
   });
   await h.open("/fixture/first.dat");
   await flush();
   h.$("sprout-destination").value = "fixture-destination";
-  await h.sweep();
+  await h.sweepConfirmed();
   const lines = texts(h.$("sprout-sweep-results"));
   assert.ok(lines.some((l) => /sweep journal/.test(l)), lines.join("\n"));
 });
@@ -748,16 +1299,18 @@ test("some notes spent and one unusable does not claim the note data is missing"
 test("the Sprout caveat survives a sweep in which any note was refused", async () => {
   for (const [rejected, kept] of [[[], false], [["note bb:0:1 was refused"], true]]) {
     const h = harness(async (command, args, fallback) => {
-      if (command === "execute_sprout_sweep") return {
-        sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected, error: null,
-      };
+      if (command === "execute_wallet_sprout_sweep") {
+        return sproutLifecycleReport([
+          sproutTransaction("mined", { txid: "aa" }),
+        ], { rejected, fresh_all_mined: true });
+      }
       return fallback();
     });
     await h.open("/fixture/first.dat");
     await flush();
     h.peek("uncoveredSproutKeys = 1");
     h.$("sprout-destination").value = "fixture-destination";
-    await h.sweep();
+    await h.sweepConfirmed();
     assert.equal(h.peek("uncoveredSproutKeys") > 0, kept, `rejected=${rejected.length}`);
   }
 });
@@ -767,16 +1320,18 @@ test("the Sprout caveat survives a sweep in which any note was refused", async (
 // that skipped any note.
 test("a sweep that stopped or skipped a note says so and keeps the caveat", async () => {
   for (const [report, stopped] of [
-    [{ sent: [], total_swept: 0, skipped: [], rejected: [], error: "note 1 of 3 could not be built: bad bundle" }, true],
-    [{ sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: ["note 2 of 2: below the fee"], rejected: [], error: null }, false],
+    [sproutLifecycleReport([], { error: "note 1 of 3 could not be built: bad bundle" }), true],
+    [sproutLifecycleReport([sproutTransaction("pending", { txid: "aa" })], {
+      skipped: ["note 2 of 2: below the fee"],
+    }), false],
   ]) {
     const h = harness(async (command, args, fallback) =>
-      command === "execute_sprout_sweep" ? report : fallback());
+      command === "execute_wallet_sprout_sweep" ? report : fallback());
     await h.open("/fixture/first.dat");
     await flush();
     h.peek("uncoveredSproutKeys = 1");
     h.$("sprout-destination").value = "fixture-destination";
-    await h.sweep();
+    await h.sweepConfirmed();
     const status = h.$("sprout-sweep-status").textContent;
     if (stopped) {
       assert.match(status, /did not finish: note 1 of 3 could not be built/);
@@ -786,23 +1341,23 @@ test("a sweep that stopped or skipped a note says so and keeps the caveat", asyn
   }
 });
 
-// Round-5 findings 3 and 4: one rule for both sweep handlers. The caveat
-// goes only when something was sent and nothing stopped, was refused, or
-// was skipped.
-test("the caveat is cleared only by a sweep that left nothing behind", () => {
+// A backend aggregate is necessary but not sufficient: the frontend also
+// checks every rendered transaction and every nonfinal outcome field.
+test("the caveat is cleared only by a fresh canonically mined report", () => {
   const h = harness();
-  const clean = { sent: [{ txid: "a" }], error: null, rejected: [], skipped: [] };
+  const clean = sproutLifecycleReport([sproutTransaction("mined", { txid: "a" })], {
+    fresh_all_mined: true,
+  });
   const cases = [
     [clean, true],
-    [{ ...clean, sent: [] }, false],
+    [{ ...clean, transactions: [] }, false],
     [{ ...clean, error: "stopped" }, false],
     [{ ...clean, rejected: ["r"] }, false],
     [{ ...clean, skipped: ["s"] }, false],
-    // Round 6: held by the node but not mined is not "left nothing behind".
-    [{ ...clean, already_held: [{ txid: "h", value_swept: 1 }] }, false],
+    [{ ...clean, transactions: [sproutTransaction("pending", { txid: "h" })] }, false],
   ];
   for (const [report, expected] of cases) {
-    assert.equal(h.peek(`sweepLeftNothingBehind(${JSON.stringify(report)})`), expected, JSON.stringify(report));
+    assert.equal(h.peek(`sproutSourceWarningMayClear(${JSON.stringify(report)})`), expected, JSON.stringify(report));
   }
 });
 
@@ -825,15 +1380,17 @@ test("a fully spent wallet quotes the scan's cost beside the offer", async () =>
 test("the scan sweep keeps the caveat when a note was refused", async () => {
   for (const [rejected, kept] of [[[], false], [["note bb:0:1 was refused"], true]]) {
     const h = harness(async (command, args, fallback) =>
-      command === "sweep_sprout_from_scan"
-        ? { sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected, error: null }
+      command === "execute_sprout_scan_sweep"
+        ? sproutLifecycleReport([
+          sproutTransaction("mined", { txid: "aa" }),
+        ], { rejected, fresh_all_mined: true })
         : fallback());
     h.peek("uncoveredSproutKeys = 1");
     h.$("sprout-scan-destination").value = "fixture-destination";
     h.$("sprout-scan-confirm").checked = true;
     await h.scanSweep();
     assert.equal(h.peek("uncoveredSproutKeys") > 0, kept, `rejected=${rejected.length}`);
-    if (kept) assert.match(h.$("sprout-scan-status").textContent, /1 note\(s\) refused/);
+    if (kept) assert.match(h.$("sprout-scan-status").textContent, /recovery|rescan/i);
   }
 });
 
@@ -848,28 +1405,34 @@ test("the scan sweep sends no decrypt bound, whatever the form says now", async 
     "{ birthdayFloor: 1000, decryptEveryBlock: true }",
     "{ error: 'The Sprout scan birthday must be a block number.' }",
   ]) {
+    const proposed = [];
     const sent = [];
     const h = harness((command, args, fallback) => {
-      if (command === "sweep_sprout_from_scan") {
+      if (command === "propose_sprout_scan_sweep") proposed.push({ ...args });
+      if (command === "execute_sprout_scan_sweep") {
         sent.push({ ...args });
-        return { sent: [], total_swept: 0, skipped: [], rejected: [], error: null };
+        return sproutLifecycleReport([]);
       }
       return fallback();
     });
+    h.loadScanPanel();
     h.peek(`function currentSproutDecryptRequest() { return ${formNow}; }`);
     h.$("sprout-scan-destination").value = "fixture-destination";
-    h.$("sprout-scan-confirm").checked = true;
     await h.scanSweep();
+    // #271: the review names only the backend scan handle and destination;
+    // the backend resumes under the bound saved in that scan's checkpoint.
+    assert.equal(proposed.length, 1, formNow);
+    assert.deepEqual(Object.keys(proposed[0]).sort(), ["destination", "scanHandle"], JSON.stringify(proposed[0]));
+    // Execution carries the reviewed proposal and nothing from the form.
     assert.equal(sent.length, 1, formNow);
-    assert.equal("birthdayFloor" in sent[0], false, JSON.stringify(sent[0]));
-    assert.equal("decryptEveryBlock" in sent[0], false, JSON.stringify(sent[0]));
+    assert.deepEqual(JSON.parse(JSON.stringify(sent[0])), { proposalId: "scan-proposal-scan-1" });
   }
 });
 
 test("a scan sweep that broadcast switches the NU7 warning to confirming it is mined", async () => {
   const h = harness(async (command, args, fallback) =>
-    command === "sweep_sprout_from_scan"
-      ? { sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected: [], error: null }
+    command === "execute_sprout_scan_sweep"
+      ? sproutLifecycleReport([sproutTransaction("pending", { txid: "aa" })])
       : fallback());
   await h.open("/fixture/sprout.dat");
   await flush();
@@ -890,8 +1453,8 @@ test("a scan sweep that broadcast switches the NU7 warning to confirming it is m
 function keysOnlyHarness() {
   const noNotes = inspected({ sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0 });
   return harness(async (command, args, fallback) => {
-    if (command === "sweep_sprout_from_scan") {
-      return { sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected: [], error: null };
+    if (command === "execute_sprout_scan_sweep") {
+      return sproutLifecycleReport([sproutTransaction("pending", { txid: "aa" })]);
     }
     return noNotes(command, args, fallback);
   });
@@ -1036,7 +1599,14 @@ test("a no-file scan sends only the pasted lines, with no wallet path or passphr
   const h = harness(async (command, args, fallback) => {
     if (command === "start_sprout_scan") {
       calls.push({ ...args });
-      return { notes_found: 1, total_zatoshis: 7, spent_notes: 0, tip_warning: null };
+      return "scan-1";
+    }
+    if (command === "get_sprout_scan") {
+      return {
+        handle: args.handle, status: "completed", error: null,
+        report: { notes_found: 1, total_zatoshis: 7, spent_notes: 0, tip_warning: null,
+          decrypt_from_height: null, decrypt_line: "Every block is decrypted." },
+      };
     }
     return fallback();
   });
@@ -1065,15 +1635,30 @@ test("a no-file scan sends only the pasted lines, with no wallet path or passphr
   // main birthday field must not become a floor.
   assert.equal(sent.birthdayFloor, null);
   assert.equal(sent.decryptEveryBlock, false);
+  // The completed snapshot reveals the sweep, and the backend's line on
+  // where decryption started is shown (#274).
   assert.equal(h.$("sprout-scan-sweep").hidden, false);
+  assert.equal(h.$("sprout-scan-plan").textContent, "Every block is decrypted.");
 });
 
 test("a no-file scan sweep sends the pasted lines and switches the panel to broadcast wording", async () => {
-  const calls = [];
+  const starts = [];
+  const executions = [];
   const h = harness(async (command, args, fallback) => {
-    if (command === "sweep_sprout_from_scan") {
-      calls.push({ ...args });
-      return { sent: [{ value_swept: 5, txid: "aa" }], total_swept: 5, skipped: [], rejected: [], error: null };
+    if (command === "start_sprout_scan") {
+      starts.push({ ...args });
+      return "scan-1";
+    }
+    if (command === "get_sprout_scan") {
+      return {
+        handle: args.handle, status: "completed", error: null,
+        report: { notes_found: 1, total_zatoshis: 5, spent_notes: 0, tip_warning: null,
+          decrypt_from_height: null, decrypt_line: "" },
+      };
+    }
+    if (command === "execute_sprout_scan_sweep") {
+      executions.push({ ...args });
+      return sproutLifecycleReport([sproutTransaction("pending", { txid: "aa" })]);
     }
     return fallback();
   });
@@ -1083,15 +1668,21 @@ test("a no-file scan sweep sends the pasted lines and switches the panel to broa
   await h.peek("onSproutScanEntryToggle()");
   h.$("sprout-scan-keys").value = "STfixture";
   h.$("sprout-scan-peers").value = "";
+  await h.scan();
+  // #271 binds the pasted lines when the scan starts, with no wallet file.
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].path, null);
+  assert.equal(starts[0].passphrase, null);
+  assert.deepEqual([...starts[0].keys], ["STfixture"]);
+  assert.equal(starts[0].network, "testnet");
   h.$("sprout-scan-destination").value = "fixture-destination";
+  await h.peek("refreshSproutScanReview()");
   h.$("sprout-scan-confirm").checked = true;
   await h.peek("runSproutScanSweep()");
   await flush();
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].path, null);
-  assert.equal(calls[0].passphrase, null);
-  assert.deepEqual([...calls[0].keys], ["STfixture"]);
-  assert.equal(calls[0].network, "testnet");
+  // The sweep executes the reviewed proposal only; no line is re-sent.
+  assert.equal(executions.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(executions[0])), { proposalId: "scan-proposal-scan-1" });
   assert.match(h.$("sprout-scan-nu7-warning").textContent, /^testnet NU7: .*confirm it is mined/);
   // Opening a wallet file afterwards must not drop the broadcast wording.
   await h.open("/fixture/sprout.dat");
@@ -1181,4 +1772,54 @@ test("Start over clears the raw Sprout key box and closes the panel", async () =
   for (const at of sites) {
     assert.match(source.slice(at, at + 300), /forgetSproutScanInputs\(\)/);
   }
+});
+
+// Review finding 6 on #271: a forged Sprout key is dropped from the sweep
+// as inspect drops it, and the review says so, so a user is never quoted a
+// smaller sweep with no reason given. The genuine notes stay sweepable.
+test("a wallet review names a dropped forged Sprout key and stays sweepable", async () => {
+  const forged = "a Sprout key in this file does not control the address it is stored under " +
+    "(stored aa, derived bb). It was skipped: spending with it would build a transaction for " +
+    "someone else's note.";
+  const h = harness(async (command, args, fallback) => {
+    const response = await fallback();
+    if (command === "propose_wallet_sprout_sweep") return { ...response, warnings: [forged] };
+    return response;
+  });
+  await h.open("/fixture/forged.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-plan").textContent, /1 note/);
+  assert.match(h.$("sprout-sweep-plan").textContent, /does not control the address/);
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+});
+
+test("a malformed scan peer does not fail the preview; the backend warns and the sweep still refuses", async () => {
+  const seen = {};
+  const h = harness(async (command, args, fallback) => {
+    seen[command] = { ...args };
+    if (command === "propose_wallet_sprout_sweep") {
+      const response = await fallback();
+      return {
+        ...response,
+        scan_warning: "The scan panel's peers were not used: custom peer \"no-port-here\" is not valid.",
+      };
+    }
+    return fallback();
+  });
+  h.loadScanPanel();
+  h.$("sprout-scan-peers").value = "192.0.2.7:8233, no-port-here";
+  await h.open("/fixture/bad-peer.dat");
+  await flush();
+  // The raw entries reach the backend, which decides how to degrade.
+  assert.deepEqual([...seen.propose_wallet_sprout_sweep.peers], ["192.0.2.7:8233", "no-port-here"]);
+  assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
+  assert.match(h.$("sprout-sweep-status").textContent, /peers were not used/);
+  // Sweeping with the same field refuses before anything is sent.
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  await flush();
+  assert.equal("execute_wallet_sprout_sweep" in seen, false);
+  assert.match(h.$("sprout-sweep-status").textContent, /no-port-here.*host:port/);
 });

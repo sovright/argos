@@ -82,6 +82,918 @@ use secrecy::SecretString;
 /// watchdog accounts for in-flight batch progress.
 const LATENCY_WINDOW_BLOCKS: u64 = 100;
 
+#[tokio::test]
+async fn local_public_transparent_review_binds_live_outpoint_before_submission() {
+    use argos_core::key_source::ImportedKeySource;
+    use argos_core::{
+        argos_wallet_import::keys::{Provenance, TransparentKey},
+        derive_accounts,
+    };
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use secrecy::Secret;
+    use std::sync::Arc;
+    use zcash_client_backend::proto::service::GetAddressUtxosReply;
+
+    let key = common::standalone_transparent::standalone_transparent_key();
+    let address =
+        argos_core::imported::encode_transparent_address(&key.address, ZeckNetwork::Testnet);
+    let mut utxo = GetAddressUtxosReply {
+        address,
+        txid: vec![0x51; 32],
+        index: 0,
+        script: Vec::new(),
+        value_zat: 250_000,
+        height: 3_500_000,
+    };
+    let fake = FakeLightwalletd::builder()
+        .chain_name("test")
+        .sapling_activation_height(280_000)
+        .block_height(3_500_000)
+        .scripted_address_utxos(vec![utxo.clone()])
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+    keys.transparent.push(TransparentKey {
+        secret: Secret::new(common::standalone_transparent::STANDALONE_TRANSPARENT_SECRET),
+        provenance: Provenance::Standalone,
+        created_at: None,
+    });
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: 1_000_000,
+                num_accounts: None,
+                gap_limit: 20,
+                transparent_scan: None,
+                lightwalletd_url: fake.url.clone(),
+                confirmation_sources: Vec::new(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "local direct quote binding".to_owned(),
+            },
+            Arc::new(ImportedKeySource::new(keys)),
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            if progress.phase.is_terminal() {
+                break progress;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(progress.phase, ScanPhase::Complete, "{:?}", progress.error);
+    assert_eq!(progress.accounts[0].transparent_zatoshis, 250_000);
+
+    let destination = derive_accounts(&SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned()), ZeckNetwork::Testnet, 1).unwrap()[0].unified_address.clone();
+    let reviewed = service
+        .propose_sweep(
+            &handle,
+            SweepRequest {
+                destination,
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reviewed.proposal.transactions.len(), 1);
+    let quoted = &reviewed.proposal.transactions[0];
+    let fee =
+        argos_core::transparent_recovery::transparent_sweep_fee(ZeckNetwork::Testnet, 1).unwrap();
+    assert_eq!(quoted.gross_zatoshis, 250_000);
+    assert_eq!(quoted.fee_zatoshis, fee);
+    assert_eq!(quoted.net_zatoshis, 250_000 - fee);
+
+    utxo.txid = vec![0x52; 32];
+    fake.set_scripted_address_utxos(vec![utxo]);
+    let error = service
+        .execute_sweep(&handle, &reviewed.proposal_id)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("selected sweep inputs changed"),
+        "{error}"
+    );
+    assert!(fake.captured_submissions().lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn standalone_transparent_quote_refuses_same_fee_outpoint_swap_before_signing() {
+    use argos_core::transparent_recovery::{
+        quote_transparent_only, sweep_transparent_only_from_quote,
+    };
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use zcash_client_backend::proto::service::GetAddressUtxosReply;
+
+    let key = common::standalone_transparent::standalone_transparent_key();
+    let mut utxo = GetAddressUtxosReply {
+        address: argos_core::imported::encode_transparent_address(
+            &key.address,
+            ZeckNetwork::Testnet,
+        ),
+        txid: vec![0x61; 32],
+        index: 0,
+        script: Vec::new(),
+        value_zat: 250_000,
+        height: 3_500_000,
+    };
+    let fake = FakeLightwalletd::builder()
+        .chain_name("test")
+        .sapling_activation_height(280_000)
+        .block_height(3_500_000)
+        .scripted_address_utxos(vec![utxo.clone()])
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let keys = [key];
+    let quote = quote_transparent_only(&keys, ZeckNetwork::Testnet, &fake.url)
+        .await
+        .unwrap();
+    let plan = quote.plan().unwrap();
+    assert_eq!(plan.total_input_zatoshis, 250_000);
+    assert_eq!(plan.fee_zatoshis, 15_000);
+    assert_eq!(plan.output_zatoshis, 235_000);
+
+    utxo.txid = vec![0x62; 32];
+    fake.set_scripted_address_utxos(vec![utxo]);
+    let data_dir = tempfile::tempdir().unwrap();
+    let registry =
+        argos_core::service::NetworkOperationGuard::acquire(data_dir.path(), ZeckNetwork::Testnet)
+            .unwrap();
+    let mut log = registry.open_broadcast_log().unwrap();
+    let destination = argos_core::derive_accounts(
+        &SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned()),
+        ZeckNetwork::Testnet,
+        1,
+    )
+    .unwrap()[0]
+        .unified_address
+        .clone();
+    let error = sweep_transparent_only_from_quote(
+        &mut log,
+        &keys,
+        ZeckNetwork::Testnet,
+        &fake.url,
+        &destination,
+        Some(15_000),
+        &quote,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("selected sweep inputs changed"),
+        "{error}"
+    );
+    assert!(fake.captured_submissions().lock().unwrap().is_empty());
+}
+
+// This local RPC test runs without the external regtest node. A missing
+// capture or a response dropped before upstream acceptance breaks it.
+#[tokio::test]
+async fn fake_lightwalletd_drops_only_first_successful_upstream_reply() {
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction,
+    };
+
+    let upstream = FakeLightwalletd::builder()
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let proxy = FakeLightwalletd::builder()
+        .upstream(upstream.url.clone())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .unwrap();
+    let captured = proxy.captured_submissions();
+    let mut client = CompactTxStreamerClient::connect(proxy.url.clone())
+        .await
+        .unwrap();
+    let first = client
+        .send_transaction(RawTransaction {
+            data: vec![1, 2, 3],
+            height: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(first.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        *upstream.captured_submissions().lock().unwrap(),
+        vec![vec![1, 2, 3]]
+    );
+    assert_eq!(*captured.lock().unwrap(), vec![vec![1, 2, 3]]);
+
+    let second = client
+        .send_transaction(RawTransaction {
+            data: vec![4, 5, 6],
+            height: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.error_code, 0);
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![vec![1, 2, 3], vec![4, 5, 6]]
+    );
+}
+
+#[tokio::test]
+async fn fake_lightwalletd_does_not_drop_a_node_rejection() {
+    use common::fake_lightwalletd::FakeLightwalletd;
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction,
+    };
+
+    let upstream = FakeLightwalletd::builder()
+        .reject_submissions_for_test(-26)
+        .build()
+        .await
+        .unwrap();
+    let proxy = FakeLightwalletd::builder()
+        .upstream(upstream.url.clone())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .unwrap();
+    let mut client = CompactTxStreamerClient::connect(proxy.url).await.unwrap();
+    for raw in [vec![1], vec![2]] {
+        let response = client
+            .send_transaction(RawTransaction {
+                data: raw,
+                height: 0,
+            })
+            .await
+            .expect("node rejection is a delivered response")
+            .into_inner();
+        assert_eq!(response.error_code, -26);
+    }
+    assert_eq!(upstream.captured_submissions().lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn local_proxy_lost_reply_keeps_unknown_and_restarts_with_exact_bytes() {
+    use argos_core::broadcast::{
+        resubmit_prepared_transaction, submit_prepared_transaction, BroadcastStore,
+        DurableBroadcastLog, LightwalletdSubmitter, PreparedTransaction, SubmissionDisposition,
+    };
+    use argos_core::models::TxLifecycleState;
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, TxFilter,
+    };
+    let (txid, raw) = test_v5_transaction();
+    let prepared = PreparedTransaction {
+        txid,
+        raw_tx: raw.clone(),
+        fee_zatoshis: 12_345,
+        expiry_height: Some(200),
+    };
+    let upstream = FakeLightwalletd::builder()
+        .accept_submissions_for_test()
+        .build()
+        .await
+        .unwrap();
+    let proxy = FakeLightwalletd::builder()
+        .upstream(upstream.url.clone())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broadcasts-v1.jsonl");
+    let mut log = DurableBroadcastLog::open(&path).unwrap();
+    let mut client = CompactTxStreamerClient::connect(proxy.url.clone())
+        .await
+        .unwrap();
+    let first = submit_prepared_transaction(
+        &mut log,
+        &mut LightwalletdSubmitter {
+            client: &mut client,
+        },
+        prepared.clone(),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.state, TxLifecycleState::SubmissionUnknown);
+    assert_eq!(first.disposition, SubmissionDisposition::AmbiguousTransport);
+    assert_eq!(first.txid, prepared.txid);
+    assert_eq!(first.fee_zatoshis, 12_345);
+    assert_eq!(
+        *upstream.captured_submissions().lock().unwrap(),
+        vec![raw.clone()]
+    );
+    proxy.set_scripted_transaction_evidence(ScriptedTxEvidence {
+        transaction: ScriptedTransaction::Fixed {
+            txid: prepared.txid.as_ref().to_vec(),
+            raw_tx: raw.clone(),
+        },
+        reported_height: 123,
+        tip_height: 124,
+        block_hash: vec![8; 32],
+        block_txids: Vec::new(),
+        include_transaction_in_block: false,
+    });
+    let tip = client.get_lightd_info(Empty {}).await.unwrap().into_inner();
+    assert_eq!(tip.block_height, 124);
+    let reported = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: prepared.txid.as_ref().to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reported.data, raw);
+    assert_eq!(reported.height, 123);
+    let block = client
+        .get_block(BlockId {
+            height: 123,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(block.height, 123);
+    assert_eq!(block.hash, vec![8; 32]);
+    assert!(!block.vtx.iter().any(|tx| tx.txid == prepared.txid.as_ref()));
+    drop(log);
+
+    let mut reopened = DurableBroadcastLog::open(&path).unwrap();
+    let stored = reopened.latest(prepared.txid).unwrap();
+    assert_eq!(stored.prepared, prepared);
+    let second = resubmit_prepared_transaction(
+        &mut reopened,
+        &mut LightwalletdSubmitter {
+            client: &mut client,
+        },
+        &stored.prepared,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.txid, first.txid);
+    assert_eq!(
+        *proxy.captured_submissions().lock().unwrap(),
+        vec![raw.clone(), raw]
+    );
+}
+
+#[tokio::test]
+async fn fake_lightwalletd_binds_next_accepted_transaction_to_including_block() {
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, RawTransaction, TxFilter,
+    };
+
+    let (txid, raw_tx) = test_v5_transaction();
+    let fake = FakeLightwalletd::builder()
+        .accept_submissions_for_test()
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            transaction: ScriptedTransaction::NextAcceptedSubmission,
+            reported_height: 123,
+            tip_height: 124,
+            block_hash: vec![8; 32],
+            block_txids: Vec::new(),
+            include_transaction_in_block: true,
+        })
+        .build()
+        .await
+        .unwrap();
+    let mut client = CompactTxStreamerClient::connect(fake.url).await.unwrap();
+    let early = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(early.code(), tonic::Code::NotFound);
+    let response = client
+        .send_transaction(RawTransaction {
+            data: raw_tx.clone(),
+            height: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.error_code, 0);
+    let reported = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reported.data, raw_tx);
+    assert_eq!(submitted_txid(&reported.data), txid);
+    let block = client
+        .get_block(BlockId {
+            height: 123,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(block.vtx.iter().any(|tx| tx.txid == txid.as_ref()));
+}
+
+#[tokio::test]
+async fn fake_lightwalletd_scripts_consistent_transaction_tip_and_block_evidence() {
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+    use zcash_client_backend::proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, TxFilter,
+    };
+
+    let (txid, raw_tx) = test_v5_transaction();
+    let fake = FakeLightwalletd::builder()
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            transaction: ScriptedTransaction::Fixed {
+                txid: txid.as_ref().to_vec(),
+                raw_tx: raw_tx.clone(),
+            },
+            reported_height: 123,
+            tip_height: 124,
+            block_hash: vec![8; 32],
+            block_txids: Vec::new(),
+            include_transaction_in_block: false,
+        })
+        .build()
+        .await
+        .unwrap();
+    let mut client = CompactTxStreamerClient::connect(fake.url).await.unwrap();
+    let info = client.get_lightd_info(Empty {}).await.unwrap().into_inner();
+    assert_eq!(info.block_height, 124);
+    let parsed = zcash_primitives::transaction::Transaction::read(
+        &mut std::io::Cursor::new(raw_tx.as_slice()),
+        zcash_protocol::consensus::BranchId::Nu5,
+    )
+    .unwrap();
+    assert!(
+        u64::from(u32::from(parsed.expiry_height())) > info.block_height,
+        "scripted transaction must remain valid at the claimed tip"
+    );
+    let raw = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(raw.data, raw_tx);
+    assert_eq!(submitted_txid(&raw.data), txid);
+    assert_eq!(raw.height, 123);
+    let block = client
+        .get_block(BlockId {
+            height: 123,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(block.height, 123);
+    assert_eq!(block.hash, vec![8; 32]);
+    assert!(block.vtx.is_empty());
+    let missing = client
+        .get_block(BlockId {
+            height: 122,
+            hash: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+#[test]
+#[should_panic(expected = "scripted transaction ID does not match raw bytes")]
+fn fake_lightwalletd_rejects_incoherent_fixed_script() {
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+    let (_, raw_tx) = test_v5_transaction();
+    let _ = FakeLightwalletd::builder().scripted_transaction_evidence(ScriptedTxEvidence {
+        transaction: ScriptedTransaction::Fixed {
+            txid: vec![7; 32],
+            raw_tx,
+        },
+        reported_height: 123,
+        tip_height: 124,
+        block_hash: vec![8; 32],
+        block_txids: Vec::new(),
+        include_transaction_in_block: false,
+    });
+}
+
+#[tokio::test]
+async fn local_observer_contests_included_primary_when_secondary_disagrees() {
+    use argos_core::{
+        broadcast::{TxObservationState, TxObserver},
+        lightwalletd::LightwalletdTxObserver,
+        models::ConfirmationEndpoint,
+    };
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+
+    let (txid, raw_tx) = test_v5_transaction();
+    let primary = FakeLightwalletd::builder()
+        .chain_name("testnet")
+        .sapling_activation_height(280_000)
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            transaction: ScriptedTransaction::Fixed {
+                txid: txid.as_ref().to_vec(),
+                raw_tx: raw_tx.clone(),
+            },
+            reported_height: 123,
+            tip_height: 124,
+            block_hash: vec![8; 32],
+            block_txids: Vec::new(),
+            include_transaction_in_block: true,
+        })
+        .build()
+        .await
+        .unwrap();
+    let secondary = FakeLightwalletd::builder()
+        .chain_name("testnet")
+        .sapling_activation_height(280_000)
+        .scripted_transaction_evidence(ScriptedTxEvidence {
+            transaction: ScriptedTransaction::Fixed {
+                txid: txid.as_ref().to_vec(),
+                raw_tx,
+            },
+            reported_height: 122,
+            tip_height: 124,
+            block_hash: vec![9; 32],
+            block_txids: Vec::new(),
+            include_transaction_in_block: true,
+        })
+        .build()
+        .await
+        .unwrap();
+    let mut observer = LightwalletdTxObserver::new(
+        &primary.url,
+        &[
+            ConfirmationEndpoint {
+                operator_id: "primary-operator".to_owned(),
+                endpoint: primary.url.clone(),
+            },
+            ConfirmationEndpoint {
+                operator_id: "secondary-operator".to_owned(),
+                endpoint: secondary.url.clone(),
+            },
+        ],
+    )
+    .unwrap();
+    let result = observer
+        .observe(ZeckNetwork::Testnet, txid, None)
+        .await
+        .unwrap();
+    assert_eq!(result.state, TxObservationState::Contested, "{result:?}");
+    assert_eq!(result.mined_height, None);
+    assert_eq!(result.evidence.len(), 2);
+    assert!(result.evidence[0].tx_in_block);
+    assert!(result.evidence[1].tx_in_block);
+    assert_eq!(result.evidence[0].reported_height, Some(123));
+    assert_eq!(result.evidence[1].reported_height, Some(122));
+}
+
+fn test_v5_transaction() -> (zcash_primitives::transaction::TxId, Vec<u8>) {
+    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+    let tx = TransactionData::<Authorized>::from_parts(
+        TxVersion::V5,
+        BranchId::Nu5,
+        0,
+        BlockHeight::from_u32(200),
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+    let mut raw = Vec::new();
+    tx.write(&mut raw).unwrap();
+    (tx.txid(), raw)
+}
+
+fn submitted_txid(raw: &[u8]) -> zcash_primitives::transaction::TxId {
+    let mut cursor = std::io::Cursor::new(raw);
+    let tx = zcash_primitives::transaction::Transaction::read(
+        &mut cursor,
+        zcash_protocol::consensus::BranchId::Nu5,
+    )
+    .expect("captured bytes are a serialized Zcash transaction");
+    assert_eq!(cursor.position(), raw.len() as u64);
+    tx.txid()
+}
+
+struct DroppedSweep {
+    _data_dir: tempfile::TempDir,
+    fixture: ScannedFixture,
+    fake: common::fake_lightwalletd::FakeLightwalletd,
+    reviewed: argos_core::models::ReviewedSweepProposal,
+    outcome: argos_core::models::SweepOutcome,
+}
+
+async fn dropped_response_sweep(
+    harness: &RegtestHarness,
+    fund_second_account: bool,
+) -> DroppedSweep {
+    common::regtest_harness::fund_test_account(0, 1_000_000).await;
+    if fund_second_account {
+        common::regtest_harness::fund_test_account(1, 1_000_000).await;
+    }
+    let fake = common::fake_lightwalletd::FakeLightwalletd::builder()
+        .upstream(harness.lightwalletd_url())
+        .drop_send_response_after_forward_once()
+        .build()
+        .await
+        .expect("bind forwarding lightwalletd");
+    let data_dir = tempfile::tempdir().expect("wallet data dir");
+    let fixture = complete_scan_against_test_seed_at(
+        harness,
+        &data_dir,
+        "dropped-submission-response",
+        &fake.url,
+        Vec::new(),
+    )
+    .await;
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua.clone(),
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("review sweep with funded account");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        fixture
+            .service
+            .execute_sweep(&fixture.handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("dropped-reply sweep timed out")
+    .expect("sweep should return its partial outcome");
+    DroppedSweep {
+        _data_dir: data_dir,
+        fixture,
+        fake,
+        reviewed,
+        outcome,
+    }
+}
+
+/// Real-node acceptance followed by a lost gRPC response must retain the
+/// transaction identity and fee and stop before another reviewed leg.
+#[tokio::test]
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+async fn accepted_transaction_with_dropped_response_is_unknown_and_stops_followup() {
+    let harness = RegtestHarness::require();
+    let run = dropped_response_sweep(&harness, true).await;
+    assert!(
+        run.reviewed.proposal.transactions.len() >= 2,
+        "both funded accounts must produce follow-up legs"
+    );
+    assert!(
+        run.reviewed.proposal.transactions.iter().any(|tx| {
+            tx.source_account != run.reviewed.proposal.transactions[0].source_account
+        }),
+        "the quote must include a later funded account"
+    );
+    assert_eq!(
+        run.outcome.transactions.len(),
+        1,
+        "must stop after first ambiguous submission"
+    );
+    let record = &run.outcome.transactions[0];
+    let captured = run.fake.captured_submissions();
+    let captured = captured.lock().unwrap().clone();
+    assert_eq!(
+        captured.len(),
+        1,
+        "no later account or transparent leg was submitted"
+    );
+    let computed_txid = submitted_txid(&captured[0]).to_string();
+    assert_eq!(record.txid.as_deref(), Some(computed_txid.as_str()));
+    assert_eq!(
+        record.status,
+        argos_core::models::TxLifecycleState::SubmissionUnknown
+    );
+    assert_eq!(
+        record.fee_zatoshis,
+        run.reviewed.proposal.transactions[0].fee_zatoshis
+    );
+    assert!(record.fee_zatoshis > 0);
+    assert_eq!(
+        run.outcome
+            .transactions
+            .iter()
+            .filter(|tx| tx.status.fee_is_at_risk())
+            .map(|tx| tx.fee_zatoshis)
+            .sum::<u64>(),
+        record.fee_zatoshis,
+        "the entire unknown fee must remain in the outcome's at-risk total"
+    );
+    assert!(run
+        .outcome
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains(&computed_txid));
+    let mempool = common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+    assert!(
+        mempool
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&computed_txid))),
+        "accepted raw transaction must be present in the real node mempool: {computed_txid}"
+    );
+}
+
+/// The journal's prepared bytes survive reopening and are the only bytes
+/// sent on the second attempt, even though the first reply was lost.
+#[tokio::test]
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+async fn restarting_resubmits_identical_raw_transaction() {
+    use argos_core::broadcast::{
+        resubmit_prepared_transaction, BroadcastStore, DurableBroadcastLog, LightwalletdSubmitter,
+    };
+    use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
+
+    let harness = RegtestHarness::require();
+    let run = dropped_response_sweep(&harness, false).await;
+    assert_eq!(run.outcome.transactions.len(), 1);
+    assert_eq!(
+        run.outcome.transactions[0].status,
+        argos_core::models::TxLifecycleState::SubmissionUnknown
+    );
+    let first_raw = run.fake.captured_submissions().lock().unwrap()[0].clone();
+    let txid = submitted_txid(&first_raw);
+    assert_eq!(
+        run.outcome.transactions[0].txid.as_deref(),
+        Some(txid.to_string().as_str())
+    );
+
+    let path = run.fixture.workspace_root.join("broadcasts-v1.jsonl");
+    let mut reopened = DurableBroadcastLog::open(&path).expect("reopen durable log after sweep");
+    let persisted = reopened
+        .latest(txid)
+        .expect("prepared transaction survives restart");
+    assert_eq!(persisted.prepared.raw_tx, first_raw);
+    let mut client = CompactTxStreamerClient::connect(run.fake.url.clone())
+        .await
+        .unwrap();
+    let second = resubmit_prepared_transaction(
+        &mut reopened,
+        &mut LightwalletdSubmitter {
+            client: &mut client,
+        },
+        &persisted.prepared,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("resubmit stored bytes");
+    let captured = run.fake.captured_submissions();
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        captured[0], captured[1],
+        "restart must resend exact raw bytes"
+    );
+    assert_eq!(second.txid, txid);
+    assert_eq!(
+        submitted_txid(&captured[1]),
+        txid,
+        "both sends have one txid"
+    );
+}
+
+/// One fabricated primary height and block cannot finalize a transaction
+/// when an independent server disagrees about its inclusion.
+#[tokio::test]
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported)"]
+async fn hostile_primary_height_with_secondary_disagreement_is_not_mined() {
+    use argos_core::{
+        broadcast::{BroadcastStore, DurableBroadcastLog, TxObservationState},
+        models::{ConfirmationEndpoint, TxLifecycleState},
+    };
+    use common::fake_lightwalletd::{FakeLightwalletd, ScriptedTransaction, ScriptedTxEvidence};
+
+    let harness = RegtestHarness::require();
+    common::regtest_harness::fund_test_account(0, 1_000_000).await;
+    let fake = FakeLightwalletd::builder()
+        .upstream(harness.lightwalletd_url())
+        .build()
+        .await
+        .expect("bind hostile primary");
+    let confirmation_sources = vec![
+        ConfirmationEndpoint {
+            operator_id: "hostile-primary".to_owned(),
+            endpoint: fake.url.clone(),
+        },
+        ConfirmationEndpoint {
+            operator_id: "independent-secondary".to_owned(),
+            endpoint: harness.lightwalletd_url().to_owned(),
+        },
+    ];
+    let data_dir = tempfile::tempdir().unwrap();
+    let fixture = complete_scan_against_test_seed_at(
+        &harness,
+        &data_dir,
+        "contested-confirmation",
+        &fake.url,
+        confirmation_sources,
+    )
+    .await;
+    let tip = common::regtest_harness::zebra_rpc("getblockcount", serde_json::json!([]))
+        .await
+        .as_u64()
+        .expect("regtest tip height");
+    fake.set_scripted_transaction_evidence(ScriptedTxEvidence {
+        transaction: ScriptedTransaction::NextAcceptedSubmission,
+        reported_height: tip,
+        tip_height: tip,
+        block_hash: vec![9; 32],
+        block_txids: Vec::new(),
+        include_transaction_in_block: true,
+    });
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua.clone(),
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        fixture
+            .service
+            .execute_sweep(&fixture.handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("confirmation poll timed out")
+    .expect("sweep should return pending outcome");
+    assert_eq!(outcome.transactions.len(), 1);
+    let record = &outcome.transactions[0];
+    assert_eq!(record.status, TxLifecycleState::Pending);
+    assert!(record.detail.contains("Contested"), "{:?}", record.detail);
+    assert_eq!(record.confirmed_height, None);
+    let txid = submitted_txid(&fake.captured_submissions().lock().unwrap()[0]);
+    assert_eq!(record.txid.as_deref(), Some(txid.to_string().as_str()));
+    let path = fixture.workspace_root.join("broadcasts-v1.jsonl");
+    let log = DurableBroadcastLog::open(&path).unwrap();
+    let persisted = log.latest(txid).unwrap();
+    assert_eq!(persisted.state, TxLifecycleState::Pending);
+    let observation = persisted.observation.unwrap();
+    assert_eq!(observation.state, TxObservationState::Contested);
+    assert_eq!(observation.evidence.len(), 2);
+    assert_eq!(observation.evidence[0].reported_height, Some(tip as u32));
+    assert!(observation.evidence[0].block_hash.is_some());
+    assert!(observation.evidence[0].tx_in_block);
+    assert!(observation.evidence[1].tip_height.is_some());
+    assert_ne!(observation.evidence[1].reported_height, Some(tip as u32));
+    assert!(
+        fixture.workspace_root.exists(),
+        "contested outcome cannot clean up the wallet"
+    );
+    let events = std::fs::read_to_string(path).unwrap();
+    assert!(
+        !events.contains("\"state\":\"mined\""),
+        "no mined event may be journaled"
+    );
+}
+
 // ─── Shared setup helper ─────────────────────────────────────────────────────
 
 /// Boot a scan against the Argos network harness with the canonical test
@@ -95,6 +1007,23 @@ async fn complete_scan_against_test_seed(
     harness: &RegtestHarness,
     temp_data_dir: &tempfile::TempDir,
     label: &str,
+) -> ScannedFixture {
+    complete_scan_against_test_seed_at(
+        harness,
+        temp_data_dir,
+        label,
+        harness.lightwalletd_url(),
+        Vec::new(),
+    )
+    .await
+}
+
+async fn complete_scan_against_test_seed_at(
+    harness: &RegtestHarness,
+    temp_data_dir: &tempfile::TempDir,
+    label: &str,
+    lightwalletd_url: &str,
+    confirmation_sources: Vec<argos_core::models::ConfirmationEndpoint>,
 ) -> ScannedFixture {
     // Build the runtime config first so we can compute the workspace path
     // deterministically without involving the service. RecoveryWorkspace's
@@ -115,7 +1044,8 @@ async fn complete_scan_against_test_seed(
         num_accounts: Some(2),
         gap_limit: 5,
         transparent_scan: None,
-        lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        lightwalletd_url: lightwalletd_url.to_owned(),
+        confirmation_sources: confirmation_sources.clone(),
         data_dir: temp_data_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: label.to_owned(),
@@ -136,6 +1066,7 @@ async fn complete_scan_against_test_seed(
         num_accounts: runtime.num_accounts,
         gap_limit: runtime.gap_limit,
         lightwalletd_url: runtime.lightwalletd_url.clone(),
+        confirmation_sources,
         data_dir: runtime.data_dir.clone(),
         network: runtime.network,
         label: runtime.label.clone(),
@@ -274,6 +1205,7 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
         gap_limit: 5,
         transparent_scan: None,
         lightwalletd_url: fake.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: fixture_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn8-faulted".to_owned(),
@@ -283,6 +1215,7 @@ async fn goaway_mid_scan_reconnects_without_duplicate_emissions() {
         num_accounts: runtime.num_accounts,
         gap_limit: runtime.gap_limit,
         lightwalletd_url: runtime.lightwalletd_url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: runtime.data_dir.clone(),
         network: runtime.network,
         label: runtime.label.clone(),
@@ -424,6 +1357,7 @@ async fn hostile_compact_block_rejected_cleanly() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: faulted_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn9-faulted".to_owned(),
@@ -576,6 +1510,7 @@ async fn sustained_high_latency_scan_completes() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn13-latency".to_owned(),
@@ -666,6 +1601,7 @@ async fn bandwidth_throttled_scan_does_not_flag_false_stall() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn14-throttle".to_owned(),
@@ -757,6 +1693,7 @@ async fn hung_stream_surfaces_err_within_bounded_time() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: fake.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn15-hang".to_owned(),
@@ -891,6 +1828,7 @@ async fn dns_drift_retry_succeeds_against_replacement_backend() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: proxy.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn16-drift".to_owned(),
@@ -964,6 +1902,7 @@ async fn captive_portal_shim_surfaces_clean_error() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: shim.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: tempfile::tempdir().expect("temp data dir").keep(),
         network: ZeckNetwork::Testnet,
         label: "rn17-captive".to_owned(),
@@ -1109,6 +2048,7 @@ async fn asymmetric_loss_recovers_via_watchdog_and_retry() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: proxy.url.clone(),
+        confirmation_sources: Vec::new(),
         data_dir: dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "rn18-asymmetric".to_owned(),
@@ -1470,6 +2410,7 @@ async fn reorg_during_scan_invalidates_and_rescans_affected_range() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        confirmation_sources: Vec::new(),
         data_dir: temp_data_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         label: "argos-rs26-post".to_owned(),
@@ -1691,8 +2632,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     );
 
     eprintln!(
-        "[regtest] R-S27 ok: SIGKILL at block {kill_block}, resume reached {} zatoshis (matches baseline)",
-        resume_total
+        "[regtest] R-S27 ok: SIGKILL at block {kill_block}, resume reached {resume_total} zatoshis (matches baseline)"
     );
 }
 
@@ -1944,6 +2884,7 @@ async fn two_instances_same_workspace_cancels_first() {
         num_accounts: Some(2),
         gap_limit: 5,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        confirmation_sources: Vec::new(),
         data_dir: temp_data_dir.path().to_path_buf(),
         network: ZeckNetwork::Testnet,
         // Labels go into session.json — the workspace path itself is
@@ -2259,9 +3200,14 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         donation_rate: Some(0.10),
         donor_email: None,
     };
+    let reviewed = fixture
+        .service
+        .propose_sweep(&fixture.handle, request)
+        .await
+        .expect("review the 10% donation sweep");
     let outcome = fixture
         .service
-        .execute_sweep(&fixture.handle, request)
+        .execute_sweep(&fixture.handle, &reviewed.proposal_id)
         .await;
 
     // Always clear the override, even on assertion failure below.
@@ -2284,6 +3230,57 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         "[regtest] donation sweep placed {} zats across {} tx(s)",
         outcome.total_donation_zatoshis,
         outcome.transactions.len()
+    );
+}
+
+#[ignore = "requires the Argos network harness (tests/regtest/ booted, ARGOS_REGTEST_LIGHTWALLETD_URL exported) and --features argos-network"]
+#[tokio::test]
+async fn reviewed_proposal_cannot_be_replayed_after_execution() {
+    let harness = RegtestHarness::require();
+    common::regtest_harness::fund_test_account(0, 1_250_000_000).await;
+
+    let temp_data_dir = tempfile::tempdir().expect("tempdir for one-shot sweep");
+    let fixture = complete_scan_against_test_seed(&harness, &temp_data_dir, "argos-one-shot").await;
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua.clone(),
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("review funded sweep");
+
+    let outcome = fixture
+        .service
+        .execute_sweep(&fixture.handle, &reviewed.proposal_id)
+        .await
+        .expect("first execution succeeds");
+    assert!(
+        !outcome.transactions.is_empty(),
+        "first execution must broadcast a transaction"
+    );
+
+    let mempool_before_replay =
+        common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+    let replay = fixture
+        .service
+        .execute_sweep(&fixture.handle, &reviewed.proposal_id)
+        .await;
+    assert!(
+        matches!(&replay, Err(argos_core::ZeckError::UnknownSweepProposal)),
+        "a consumed proposal ID must fail before another broadcast: {replay:?}"
+    );
+    let mempool_after_replay =
+        common::regtest_harness::zebra_rpc("getrawmempool", serde_json::json!([])).await;
+    assert_eq!(
+        mempool_after_replay, mempool_before_replay,
+        "replaying a reviewed ID must not broadcast another transaction"
     );
 }
 
@@ -2577,6 +3574,7 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                confirmation_sources: Vec::new(),
                 data_dir: data_dir.path().to_path_buf(),
                 network: ZeckNetwork::Testnet,
                 label: "post-ironwood-sweep".to_owned(),
@@ -2632,8 +3630,8 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
         }
     });
 
-    let outcome = service
-        .execute_sweep(
+    let reviewed = service
+        .propose_sweep(
             &handle,
             SweepRequest {
                 destination,
@@ -2643,6 +3641,10 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
                 donor_email: None,
             },
         )
+        .await
+        .expect("review sweep before execution");
+    let outcome = service
+        .execute_sweep(&handle, &reviewed.proposal_id)
         .await
         .expect("sweep must not error");
     mining.abort();
@@ -2665,8 +3667,12 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
     // here at all.
     for tx in &outcome.transactions {
         assert!(
-            matches!(tx.status.as_str(), "confirmed" | "broadcast"),
-            "post-Ironwood sweep was not accepted by the node: {} — {}",
+            matches!(
+                tx.status,
+                argos_core::models::TxLifecycleState::Mined
+                    | argos_core::models::TxLifecycleState::Pending
+            ),
+            "post-Ironwood sweep was not accepted by the node: {:?} — {}",
             tx.status,
             tx.detail
         );
@@ -2862,8 +3868,7 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
     });
     assert_eq!(
         after_total, 0,
-        "every UTXO must have been swept; {} zatoshis remain",
-        after_total
+        "every UTXO must have been swept; {after_total} zatoshis remain"
     );
 }
 
@@ -2914,6 +3919,7 @@ async fn an_imported_zcashd_wallet_scans_as_wallet_accounts() {
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                confirmation_sources: Vec::new(),
                 data_dir: data_dir.path().to_owned(),
                 network: ZeckNetwork::Testnet,
                 label: String::new(),
@@ -3012,6 +4018,7 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
         num_accounts: Some(1),
         gap_limit: 1,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        confirmation_sources: Vec::new(),
         data_dir: data_dir.path().to_owned(),
         network: ZeckNetwork::Testnet,
         label: String::new(),
@@ -3056,8 +4063,8 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
     // path, which is the part a front-end depends on and which calling the
     // builder directly would leave untested.
     let destination = regtest_encoded_unified_address(harness.test_seed());
-    let outcome = service
-        .execute_sweep(
+    let reviewed = service
+        .propose_sweep(
             &handle,
             SweepRequest {
                 destination: destination.clone(),
@@ -3067,6 +4074,10 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
                 max_fee_zatoshis: None,
             },
         )
+        .await
+        .expect("review the imported sweep");
+    let outcome = service
+        .execute_sweep(&handle, &reviewed.proposal_id)
         .await
         .expect("the imported sweep must succeed");
 
@@ -3200,6 +4211,7 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                confirmation_sources: Vec::new(),
                 data_dir: data_dir.path().to_owned(),
                 network: ZeckNetwork::Testnet,
                 label: "matched transparent index 997".into(),
@@ -3236,8 +4248,8 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
         donation_rate: None,
         donor_email: None,
     };
-    service
-        .propose_sweep(&handle, request.clone())
+    let reviewed = service
+        .propose_sweep(&handle, request)
         .await
         .expect("matched sweep proposal");
     let mining = tokio::spawn(async {
@@ -3250,7 +4262,7 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
     });
     let outcome = tokio::time::timeout(
         Duration::from_secs(600),
-        service.execute_sweep(&handle, request),
+        service.execute_sweep(&handle, &reviewed.proposal_id),
     )
     .await;
     mining.abort();
@@ -3272,8 +4284,12 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
         .collect();
     for tx in &outcome.transactions {
         assert!(
-            matches!(tx.status.as_str(), "confirmed" | "broadcast"),
-            "{}: {}",
+            matches!(
+                tx.status,
+                argos_core::models::TxLifecycleState::Mined
+                    | argos_core::models::TxLifecycleState::Pending
+            ),
+            "{:?}: {}",
             tx.status,
             tx.detail
         );
@@ -3391,6 +4407,7 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                confirmation_sources: Vec::new(),
                 data_dir: data_dir.path().to_owned(),
                 network: ZeckNetwork::Testnet,
                 label: "matched internal Sapling receiver".into(),
@@ -3427,10 +4444,7 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
         donation_rate: None,
         donor_email: None,
     };
-    service
-        .propose_sweep(&handle, request.clone())
-        .await
-        .unwrap();
+    let reviewed = service.propose_sweep(&handle, request).await.unwrap();
     let mining = tokio::spawn(async {
         let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
@@ -3441,7 +4455,7 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
     });
     let outcome = tokio::time::timeout(
         Duration::from_secs(600),
-        service.execute_sweep(&handle, request),
+        service.execute_sweep(&handle, &reviewed.proposal_id),
     )
     .await
     .expect("internal Sapling sweep timed out")
@@ -3463,6 +4477,277 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
             .is_some(),
         "internal Sapling sweep must be mined, got: {mined}"
     );
+}
+
+/// Four mined notes force a ZIP-317 fee above the two-action floor. This
+/// exercises the wallet-backed imported Sapling proposal used for review and
+/// compares it with the fee of the transaction actually built and submitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn imported_multi_action_quote_matches_built_transaction_fee() {
+    use argos_core::address_search::candidate_seed;
+    use argos_core::{prepare_match_recovery, AddressScope, DiscoveryPool, MatchCoordinates};
+    use secrecy::ExposeSecret;
+    use zcash_keys::encoding::AddressCodec;
+
+    let harness = RegtestHarness::require();
+    let phrase = SecretString::new(harness.test_seed().to_owned());
+    let seed = candidate_seed(&phrase, &SecretString::new(String::new())).unwrap();
+    let account_index = 4u32;
+    let account = zip32::AccountId::try_from(account_index).unwrap();
+    let extsk = zcash_keys::keys::sapling::spending_key(seed.expose_secret(), 1, account);
+    let internal_dfvk = extsk.derive_internal().to_diversifiable_full_viewing_key();
+    let (address_index, internal_address) = (1u32..100)
+        .find_map(|index| {
+            internal_dfvk
+                .address(index.into())
+                .map(|address| (index, address))
+        })
+        .expect("valid internal diversifier");
+    let encoded = internal_address.encode(&zcash_protocol::consensus::TEST_NETWORK);
+    for _ in 0..4 {
+        common::regtest_harness::fund_address(&encoded, 100_000_000).await;
+    }
+    let source = prepare_match_recovery(
+        seed.expose_secret(),
+        ZeckNetwork::Testnet,
+        MatchCoordinates {
+            pool: DiscoveryPool::Sapling,
+            account: account_index,
+            scope: AddressScope::Internal,
+            index: address_index,
+            network: ZeckNetwork::Testnet,
+            address: encoded,
+            path: String::new(),
+        },
+    )
+    .unwrap();
+    drop(seed);
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan_from_key_source(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some(1),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                confirmation_sources: Vec::new(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "four imported Sapling notes".into(),
+                transparent_scan: None,
+            },
+            source,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => break,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("multi-note scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("multi-note scan timed out");
+
+    let reviewed = service
+        .propose_sweep(
+            &handle,
+            SweepRequest {
+                destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reviewed.proposal.transactions.len(), 1);
+    let quoted_fee = reviewed.proposal.total_fee_zatoshis;
+    assert!(
+        quoted_fee > 10_000,
+        "four spends need more than the fee floor: {quoted_fee}"
+    );
+    assert_eq!(reviewed.proposal.transactions[0].fee_zatoshis, quoted_fee);
+
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        service.execute_sweep(&handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("multi-note sweep timed out")
+    .expect("multi-note sweep failed");
+    mining.abort();
+    assert_eq!(outcome.transactions.len(), 1);
+    assert_eq!(outcome.transactions[0].fee_zatoshis, quoted_fee);
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+}
+
+/// Wallet-backed HD quote: several separately mined notes make the actual
+/// send-max proposal cost more than the ZIP-317 floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn multi_note_shielded_quote_uses_real_zip317_fee() {
+    let harness = RegtestHarness::require();
+    let receive = regtest_encoded_unified_address(harness.test_seed());
+    for _ in 0..4 {
+        common::regtest_harness::fund_address(&receive, 100_000_000).await;
+    }
+    let temp_data_dir = tempfile::tempdir().unwrap();
+    let fixture =
+        complete_scan_against_test_seed(&harness, &temp_data_dir, "multi-note exact fee").await;
+    let reviewed = fixture
+        .service
+        .propose_sweep(
+            &fixture.handle,
+            SweepRequest {
+                destination: fixture.destination_ua,
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("real send-max quote");
+    let steps = reviewed
+        .proposal
+        .transactions
+        .iter()
+        .filter(|tx| tx.kind == argos_core::models::ProposedTxKind::SweepShielded)
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), 1, "fixture must quote one HD send-max step");
+    assert!(
+        steps[0].fee_zatoshis > 10_000,
+        "multi-note fee must exceed the two-action floor: {:?}",
+        steps[0]
+    );
+    assert_eq!(
+        reviewed.proposal.total_fee_zatoshis,
+        steps.iter().map(|step| step.fee_zatoshis).sum::<u64>()
+    );
+    assert!(!reviewed.proposal.follow_up_review_required);
+
+    let mining = tokio::spawn(async {
+        let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = zebra_generate(&url, 1).await;
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        fixture
+            .service
+            .execute_sweep(&fixture.handle, &reviewed.proposal_id),
+    )
+    .await
+    .expect("multi-note HD sweep timed out")
+    .expect("multi-note HD sweep failed");
+    mining.abort();
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(outcome.transactions.len(), steps.len());
+    assert_eq!(
+        outcome
+            .transactions
+            .iter()
+            .map(|tx| tx.fee_zatoshis)
+            .collect::<Vec<_>>(),
+        steps.iter().map(|tx| tx.fee_zatoshis).collect::<Vec<_>>()
+    );
+}
+
+/// Post-NU6.3, the account summary includes Ironwood value in `total` but
+/// the public preview has no separate Ironwood field. A fresh account funded
+/// through its Orchard/Ironwood receiver must still reach the HD send builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
+async fn ironwood_only_hd_account_quotes_real_send_max() {
+    let harness = RegtestHarness::require();
+    let account_index = 5usize;
+    common::regtest_harness::fund_test_account(account_index as u32, 200_000_000).await;
+    let data_dir = tempfile::tempdir().unwrap();
+    let service = RecoveryService::new();
+    let handle = service
+        .start_scan(
+            ScanConfig {
+                birthday: common::regtest_harness::funding_birthday(),
+                num_accounts: Some((account_index + 1) as u32),
+                gap_limit: 1,
+                lightwalletd_url: harness.lightwalletd_url().to_owned(),
+                confirmation_sources: Vec::new(),
+                data_dir: data_dir.path().to_owned(),
+                network: ZeckNetwork::Testnet,
+                label: "Ironwood-only HD quote".into(),
+                transparent_scan: None,
+            },
+            SecretString::new(harness.test_seed().to_owned()),
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let progress = service.get_scan_progress(&handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => break progress,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("Ironwood scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("Ironwood scan timed out");
+    let row = progress
+        .accounts
+        .iter()
+        .find(|row| row.account_index == account_index as u32)
+        .expect("funded account in scan");
+    assert!(row.total_zatoshis >= 200_000_000);
+    assert_eq!(row.sapling_zatoshis, 0);
+    assert_eq!(row.orchard_zatoshis, 0);
+    assert_eq!(row.transparent_zatoshis, 0);
+
+    let reviewed = service
+        .propose_sweep(
+            &handle,
+            SweepRequest {
+                destination: regtest_encoded_unified_address_at(harness.test_seed(), 6),
+                memo: None,
+                max_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("Ironwood balance must reach real send-max proposal");
+    let step = reviewed
+        .proposal
+        .transactions
+        .iter()
+        .find(|step| step.source_account == account_index as u32)
+        .expect("Ironwood send-max step");
+    assert_eq!(step.kind, argos_core::models::ProposedTxKind::SweepShielded);
+    assert_eq!(step.fee_zatoshis, reviewed.proposal.total_fee_zatoshis);
 }
 
 /// Regression for automatic transparent range discovery: both a low and a
@@ -3542,6 +4827,7 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
         num_accounts: Some(1),
         gap_limit: 1,
         lightwalletd_url: harness.lightwalletd_url().to_owned(),
+        confirmation_sources: Vec::new(),
         data_dir: data_dir.path().to_owned(),
         network: ZeckNetwork::Testnet,
         label: "automatic transparent range".into(),
@@ -3589,7 +4875,10 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     };
     let resumed = RecoveryService::new();
     let resumed_handle = resumed
-        .start_scan(config, SecretString::new(harness.test_seed().to_owned()))
+        .start_scan(
+            config.clone(),
+            SecretString::new(harness.test_seed().to_owned()),
+        )
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(180), async {
@@ -3613,10 +4902,16 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
         donation_rate: None,
         donor_email: None,
     };
-    resumed
-        .propose_sweep(&resumed_handle, request.clone())
+    let reviewed = resumed
+        .propose_sweep(&resumed_handle, request)
         .await
         .unwrap();
+    assert!(reviewed.proposal.follow_up_review_required);
+    assert_eq!(reviewed.proposal.transactions.len(), 1);
+    assert_eq!(
+        reviewed.proposal.transactions[0].kind,
+        argos_core::models::ProposedTxKind::ShieldTransparent
+    );
     let mining = tokio::spawn(async {
         let url = std::env::var("ARGOS_REGTEST_ZEBRA_RPC_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:18232".into());
@@ -3627,30 +4922,28 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     });
     let outcome = tokio::time::timeout(
         Duration::from_secs(600),
-        resumed.execute_sweep(&resumed_handle, request),
+        resumed.execute_sweep(&resumed_handle, &reviewed.proposal_id),
     )
     .await;
     mining.abort();
     let outcome = outcome.expect("range sweep timed out").unwrap();
     assert!(
         outcome.error.is_none(),
-        "sweep must fully finish: {:?}",
+        "shielding stage must finish: {:?}",
         outcome.error
     );
+    assert!(outcome.follow_up_review_required);
     assert!(
         outcome.skipped_accounts.is_empty(),
         "funded range must not be skipped"
     );
-    assert!(
-        outcome
-            .transactions
-            .iter()
-            .any(|tx| tx.detail.starts_with("sweep transaction") && tx.txid.is_some()),
-        "consuming transparent inputs through shielding alone is not a completed recovery"
-    );
-    assert!(
-        !outcome.transactions.is_empty(),
-        "range sweep must broadcast"
+    assert_eq!(outcome.transactions.len(), 1);
+    assert!(outcome.transactions[0]
+        .detail
+        .starts_with("shielding submission"));
+    assert_eq!(
+        outcome.transactions[0].fee_zatoshis,
+        reviewed.proposal.total_fee_zatoshis
     );
     let txids: Vec<_> = outcome
         .transactions
@@ -3674,5 +4967,45 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     assert!(
         after.is_empty(),
         "the sweep must spend both index 7 and index 997 UTXOs"
+    );
+
+    // Mining and scanning create a new, independently reviewed send stage.
+    let next_handle = resumed
+        .start_scan(config, SecretString::new(harness.test_seed().to_owned()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let progress = resumed.get_scan_progress(&next_handle).await.unwrap();
+            match progress.phase {
+                ScanPhase::Complete => break,
+                ScanPhase::Error | ScanPhase::Cancelled => {
+                    panic!("post-shield scan failed: {:?}", progress.error)
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("post-shield scan timed out");
+    let next = resumed
+        .propose_sweep(
+            &next_handle,
+            SweepRequest {
+                destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
+                memo: None,
+                max_fee_zatoshis: Some(100_000),
+                donation_rate: None,
+                donor_email: None,
+            },
+        )
+        .await
+        .expect("review mined shielded send stage");
+    assert_ne!(next.proposal_id, reviewed.proposal_id);
+    assert!(!next.proposal.follow_up_review_required);
+    assert_eq!(next.proposal.transactions.len(), 1);
+    assert_eq!(
+        next.proposal.transactions[0].kind,
+        argos_core::models::ProposedTxKind::SweepShielded
     );
 }

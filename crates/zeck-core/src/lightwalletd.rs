@@ -1,12 +1,20 @@
-use tonic::transport::Channel;
+use std::{collections::HashSet, time::Duration};
+
+use async_trait::async_trait;
+use tonic::{transport::Channel, Code};
 use url::Url;
 use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, Empty, LightdInfo,
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, LightdInfo, TxFilter,
 };
+use zcash_primitives::transaction::TxId;
 
 use crate::{
+    broadcast::{observe_transaction, EndpointTxEvidence, TxObservation, TxObserver},
     error::{ZeckError, ZeckResult},
-    models::{LightwalletdProbe, ZeckNetwork},
+    models::{
+        canonical_confirmation_operator_id, known_confirmation_operator,
+        normalized_confirmation_authority, ConfirmationEndpoint, LightwalletdProbe, ZeckNetwork,
+    },
 };
 
 const MAINNET_SAPLING_ACTIVATION: u64 = 419_200;
@@ -60,6 +68,225 @@ pub const DEFAULT_MAINNET_LIGHTWALLETD: &str = "https://zec.rocks:443,https://na
 
 /// Default testnet lightwalletd endpoint.
 pub const DEFAULT_TESTNET_LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
+
+const CONFIRMATION_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn normalized_endpoint_authority(endpoint: &str) -> ZeckResult<String> {
+    normalized_confirmation_authority(endpoint).ok_or_else(|| {
+        ZeckError::InvalidConfig(format!("invalid confirmation endpoint '{endpoint}'"))
+    })
+}
+
+pub fn parse_confirmation_sources(raw: &[&str]) -> ZeckResult<Vec<ConfirmationEndpoint>> {
+    let mut sources = Vec::with_capacity(raw.len());
+    let mut authorities = HashSet::new();
+    for item in raw {
+        let (operator_id, endpoint) = item.split_once('=').ok_or_else(|| {
+            ZeckError::InvalidConfig(format!(
+                "confirmation source '{item}' must be <operator-id>=<url>"
+            ))
+        })?;
+        let operator_id = operator_id.trim();
+        if operator_id.is_empty() {
+            return Err(ZeckError::InvalidConfig(
+                "confirmation source operator ID must not be empty".to_owned(),
+            ));
+        }
+        let endpoint = validate_lightwalletd_endpoint(endpoint.trim())?;
+        let authority = normalized_endpoint_authority(&endpoint)?;
+        if !authorities.insert(authority.clone()) {
+            return Err(ZeckError::InvalidConfig(format!(
+                "duplicate confirmation source authority {authority}"
+            )));
+        }
+        sources.push(ConfirmationEndpoint {
+            operator_id: canonical_confirmation_operator_id(operator_id, &endpoint),
+            endpoint,
+        });
+    }
+    Ok(sources)
+}
+
+pub fn confirmation_endpoints(
+    scan_urls: &str,
+    explicit: &[ConfirmationEndpoint],
+) -> ZeckResult<Vec<ConfirmationEndpoint>> {
+    let mut result = Vec::new();
+    let mut authorities = HashSet::new();
+    for source in explicit {
+        if source.operator_id.trim().is_empty() {
+            return Err(ZeckError::InvalidConfig(
+                "confirmation source operator ID must not be empty".to_owned(),
+            ));
+        }
+        let endpoint = validate_lightwalletd_endpoint(&source.endpoint)?;
+        let authority = normalized_endpoint_authority(&endpoint)?;
+        if !authorities.insert(authority.clone()) {
+            return Err(ZeckError::InvalidConfig(format!(
+                "duplicate confirmation source authority {authority}"
+            )));
+        }
+        result.push(ConfirmationEndpoint {
+            operator_id: canonical_confirmation_operator_id(&source.operator_id, &endpoint),
+            endpoint,
+        });
+    }
+    for endpoint in validated_lightwalletd_endpoints(scan_urls)? {
+        if authorities.insert(normalized_endpoint_authority(&endpoint)?) {
+            result.push(ConfirmationEndpoint {
+                operator_id: known_confirmation_operator(&endpoint)
+                    .unwrap_or("")
+                    .to_owned(),
+                endpoint,
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Shown before signing (CLI) and at sweep review (GUI) when the configured
+/// sources are run by fewer than two independent operators. Recovery still
+/// proceeds: confirmation sources are optional.
+pub const SINGLE_OPERATOR_NOTICE: &str = "Confirmation will rest on a single operator. Keep your source keys or wallet file until an independent source confirms the sweep.";
+
+/// Whether the scan endpoints plus explicit confirmation sources include two
+/// distinct labelled operators.
+pub fn has_independent_confirmation_operators(
+    scan_urls: &str,
+    explicit: &[ConfirmationEndpoint],
+) -> ZeckResult<bool> {
+    let operators = confirmation_endpoints(scan_urls, explicit)?
+        .into_iter()
+        .map(|source| source.operator_id)
+        .filter(|operator| !operator.trim().is_empty())
+        .collect::<HashSet<_>>();
+    Ok(operators.len() >= 2)
+}
+
+/// [`SINGLE_OPERATOR_NOTICE`] when it applies to this configuration.
+pub fn single_operator_notice(
+    scan_urls: &str,
+    explicit: &[ConfirmationEndpoint],
+) -> ZeckResult<Option<&'static str>> {
+    Ok(
+        (!has_independent_confirmation_operators(scan_urls, explicit)?)
+            .then_some(SINGLE_OPERATOR_NOTICE),
+    )
+}
+
+pub struct LightwalletdTxObserver {
+    sources: Vec<ConfirmationEndpoint>,
+}
+
+impl LightwalletdTxObserver {
+    pub fn new(scan_urls: &str, explicit: &[ConfirmationEndpoint]) -> ZeckResult<Self> {
+        Ok(Self {
+            sources: confirmation_endpoints(scan_urls, explicit)?,
+        })
+    }
+
+    async fn source_evidence(
+        source: &ConfirmationEndpoint,
+        network: ZeckNetwork,
+        txid: TxId,
+    ) -> EndpointTxEvidence {
+        let mut evidence = EndpointTxEvidence {
+            operator_id: source.operator_id.clone(),
+            endpoint: source.endpoint.clone(),
+            tip_height: None,
+            reported_height: None,
+            block_hash: None,
+            tx_in_block: false,
+        };
+        let Ok(Ok(mut client)) = tokio::time::timeout(
+            CONFIRMATION_RPC_TIMEOUT,
+            CompactTxStreamerClient::connect(source.endpoint.clone()),
+        )
+        .await
+        else {
+            return evidence;
+        };
+        let Ok(Ok(info)) =
+            tokio::time::timeout(CONFIRMATION_RPC_TIMEOUT, client.get_lightd_info(Empty {})).await
+        else {
+            return evidence;
+        };
+        let info = info.into_inner();
+        if validate_lightwalletd_network(network, &info).is_err() {
+            return evidence;
+        }
+        let Ok(tip) = u32::try_from(info.block_height) else {
+            return evidence;
+        };
+        let transaction = tokio::time::timeout(
+            CONFIRMATION_RPC_TIMEOUT,
+            client.get_transaction(TxFilter {
+                block: None,
+                index: 0,
+                hash: txid.as_ref().to_vec(),
+            }),
+        )
+        .await;
+        let transaction = match transaction {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) if status.code() == Code::NotFound => {
+                evidence.tip_height = Some(tip);
+                return evidence;
+            }
+            _ => return evidence,
+        };
+        if transaction.data.is_empty() {
+            return evidence;
+        }
+        evidence.tip_height = Some(tip);
+        if transaction.height == u64::MAX {
+            evidence.reported_height = Some(u32::MAX);
+            return evidence;
+        }
+        let Ok(height) = u32::try_from(transaction.height) else {
+            evidence.tip_height = None;
+            return evidence;
+        };
+        evidence.reported_height = Some(height);
+        if height == 0 || height > tip {
+            return evidence;
+        }
+        let Ok(Ok(block)) = tokio::time::timeout(
+            CONFIRMATION_RPC_TIMEOUT,
+            client.get_block(BlockId {
+                height: u64::from(height),
+                hash: Vec::new(),
+            }),
+        )
+        .await
+        else {
+            return evidence;
+        };
+        let block = block.into_inner();
+        if block.height != u64::from(height) || block.hash.is_empty() {
+            return evidence;
+        }
+        evidence.tx_in_block = block.vtx.iter().any(|tx| tx.txid == txid.as_ref());
+        evidence.block_hash = Some(block.hash);
+        evidence
+    }
+}
+
+#[async_trait]
+impl TxObserver for LightwalletdTxObserver {
+    async fn observe(
+        &mut self,
+        network: ZeckNetwork,
+        txid: TxId,
+        expiry_height: Option<u32>,
+    ) -> ZeckResult<TxObservation> {
+        let mut evidence = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            evidence.push(Self::source_evidence(source, network, txid).await);
+        }
+        Ok(observe_transaction(evidence, expiry_height))
+    }
+}
 
 pub fn parse_lightwalletd_endpoints(raw: &str) -> Vec<String> {
     let mut endpoints = Vec::new();
@@ -340,13 +567,35 @@ fn is_loopback_host(host: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_lightwalletd_endpoints, parse_lightwalletd_endpoints,
-        prioritized_lightwalletd_endpoints, validate_lightwalletd_network,
-        validated_lightwalletd_endpoints, DEFAULT_MAINNET_LIGHTWALLETD,
-        DEFAULT_TESTNET_LIGHTWALLETD, TESTNET_SAPLING_ACTIVATION,
+        confirmation_endpoints, describe_lightwalletd_endpoints, parse_confirmation_sources,
+        parse_lightwalletd_endpoints, prioritized_lightwalletd_endpoints,
+        validate_lightwalletd_network, validated_lightwalletd_endpoints,
+        DEFAULT_MAINNET_LIGHTWALLETD, DEFAULT_TESTNET_LIGHTWALLETD, TESTNET_SAPLING_ACTIVATION,
     };
     use crate::models::ZeckNetwork;
     use zcash_client_backend::proto::service::LightdInfo;
+
+    #[test]
+    fn default_endpoints_are_one_confirmation_operator() {
+        let defaults = "https://zec.rocks:443,https://na.zec.rocks:443";
+        assert!(!super::has_independent_confirmation_operators(defaults, &[]).unwrap());
+        assert_eq!(
+            super::single_operator_notice(defaults, &[]).unwrap(),
+            Some(super::SINGLE_OPERATOR_NOTICE)
+        );
+        let independent =
+            super::parse_confirmation_sources(&["other=https://other.example:443"]).unwrap();
+        assert!(super::has_independent_confirmation_operators(defaults, &independent).unwrap());
+        assert_eq!(
+            super::single_operator_notice(defaults, &independent).unwrap(),
+            None
+        );
+        // A second host of the same operator is not independent.
+        let same = super::parse_confirmation_sources(&["x=https://na.zec.rocks:443"]).unwrap();
+        assert!(
+            !super::has_independent_confirmation_operators("https://zec.rocks:443", &same).unwrap()
+        );
+    }
 
     #[test]
     fn default_endpoints_are_well_formed() {
@@ -360,6 +609,65 @@ mod tests {
         let testnet = validated_lightwalletd_endpoints(DEFAULT_TESTNET_LIGHTWALLETD)
             .expect("testnet default must parse and validate");
         assert_eq!(testnet.len(), 1);
+    }
+
+    #[test]
+    fn confirmation_sources_keep_zec_rocks_hosts_one_operator() {
+        let sources = confirmation_endpoints(DEFAULT_MAINNET_LIGHTWALLETD, &[]).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].operator_id, "zec.rocks");
+        assert_eq!(sources[1].operator_id, "zec.rocks");
+    }
+
+    #[test]
+    fn confirmation_sources_leave_other_scan_hosts_unlabeled() {
+        let sources = confirmation_endpoints("https://scan.example:443", &[]).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].operator_id, "");
+    }
+
+    #[test]
+    fn confirmation_sources_cannot_relabel_builtin_host() {
+        let sources = parse_confirmation_sources(&["independent=https://zec.rocks:443"]).unwrap();
+        assert_eq!(sources[0].operator_id, "zec.rocks");
+    }
+
+    #[test]
+    fn review_trailing_dot_builtin_hosts_share_one_operator() {
+        let sources = parse_confirmation_sources(&[
+            "first=https://zec.rocks.:443",
+            "second=https://na.zec.rocks.:443",
+            "third=https://testnet.zec.rocks.:443",
+        ])
+        .unwrap();
+        assert!(sources
+            .iter()
+            .all(|source| source.operator_id == "zec.rocks"));
+    }
+
+    #[test]
+    fn review_direct_config_operator_id_is_trimmed() {
+        let sources = confirmation_endpoints(
+            "https://scan.example",
+            &[crate::models::ConfirmationEndpoint {
+                operator_id: " one ".to_owned(),
+                endpoint: "https://one.example".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(sources[0].operator_id, "one");
+    }
+
+    #[test]
+    fn confirmation_sources_reject_duplicate_authorities() {
+        let sources = ["one=https://Node.example", "two=https://node.example:443/"];
+        assert!(parse_confirmation_sources(&sources).is_err());
+    }
+
+    #[test]
+    fn confirmation_sources_reject_empty_operator_and_insecure_remote_url() {
+        assert!(parse_confirmation_sources(&["=https://node.example"]).is_err());
+        assert!(parse_confirmation_sources(&["one=http://node.example"]).is_err());
     }
 
     /// Every shipped default must actually answer `GetLightdInfo`.

@@ -104,6 +104,15 @@ fn sweep_help_matches_what_each_route_honours() {
 }
 
 #[test]
+fn reconcile_help_explains_observation_and_exact_byte_resubmission() {
+    let h = help(&["reconcile"]);
+    assert!(h.contains("--txid"), "{h}");
+    assert!(h.contains("--resubmit"), "{h}");
+    assert!(h.contains("exact stored transaction bytes"), "{h}");
+    assert!(h.contains("independent confirmation"), "{h}");
+}
+
+#[test]
 fn scan_sprout_help_does_not_promise_an_exclusive_peer() {
     // `connect_to_any` races the given peers alongside the DNS seeds and
     // keeps whichever answers first.

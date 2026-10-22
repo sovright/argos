@@ -23,6 +23,7 @@ argos-network = ["zcash_protocol/local-consensus"]
 anyhow.workspace = true
 argos-wallet-import = { path = "../argos-wallet-import" }
 async-trait.workspace = true
+base64.workspace = true
 bip0039.workspace = true
 keepawake.workspace = true
 orchard.workspace = true
@@ -41,6 +42,7 @@ chacha20poly1305.workspace = true
 ed25519-zebra.workspace = true
 x25519-dalek.workspace = true
 secrecy.workspace = true
+zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -62,7 +64,6 @@ zcash_transparent.workspace = true
 zip32.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 tempfile.workspace = true
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the stall
 # watchdog unit tests can advance the clock without burning wall-clock.

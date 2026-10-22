@@ -10,6 +10,7 @@ use secrecy::{ExposeSecret, Secret, SecretString, Zeroize};
 use sha2::{Digest, Sha512};
 
 use crate::{
+    bdb::RawRecord,
     error::ImportError,
     zcashd::records::{compact_size, parse_record_key},
 };
@@ -29,6 +30,58 @@ pub struct MkeyRecord {
     pub salt: [u8; 8],
     pub derivation_method: u32,
     pub rounds: u32,
+}
+
+/// Encryption state of the records recovered from a zcashd wallet.
+pub enum EncryptionMetadata {
+    Unencrypted,
+    Encrypted(MkeyRecord),
+    Damaged { reason: String },
+}
+
+/// Classify encryption before extracting any keys. An encrypted record is
+/// never evidence that the wallet is plaintext merely because its `mkey`
+/// is absent or malformed.
+pub fn classify_encryption(pairs: &[RawRecord]) -> EncryptionMetadata {
+    let mut encrypted_records = false;
+    let mut mkey = None;
+    let mut malformed_mkey = false;
+
+    for (key, value) in pairs {
+        let Some(record) = parse_record_key(key) else {
+            continue;
+        };
+        match record.record_type.as_str() {
+            "ckey" | "czkey" | "csapzkey" | "chdseed" | "cmnemonicphrase" => {
+                encrypted_records = true;
+            }
+            "mkey" => match parse_mkey(value) {
+                Some(parsed)
+                    if parsed.derivation_method == DERIVATION_SHA512
+                        && parsed.encrypted_key.len() == 48 =>
+                {
+                    mkey = Some(parsed);
+                }
+                _ => malformed_mkey = true,
+            },
+            _ => {}
+        }
+    }
+
+    if malformed_mkey || (encrypted_records && mkey.is_none()) {
+        let reason = if encrypted_records {
+            "mkey is missing or invalid while encrypted records are present"
+        } else {
+            "mkey is invalid"
+        };
+        EncryptionMetadata::Damaged {
+            reason: reason.to_owned(),
+        }
+    } else if let Some(mkey) = mkey {
+        EncryptionMetadata::Encrypted(mkey)
+    } else {
+        EncryptionMetadata::Unencrypted
+    }
 }
 
 /// The decrypted wallet master key. Every `ckey`, `czkey`, and `csapzkey`
@@ -205,7 +258,7 @@ mod tests {
         // Not as corruption. A user with a correct passphrase and a
         // damaged wallet must not be told their passphrase is wrong.
         let bytes = std::fs::read("tests/fixtures/modern-encrypted.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mkey = find_mkey(&pairs).expect("encrypted wallet must have an mkey");
         let err = derive_master_key(&SecretString::new("definitely-wrong".to_owned()), &mkey)
             .unwrap_err();
@@ -215,7 +268,7 @@ mod tests {
     #[test]
     fn the_correct_passphrase_derives_a_master_key() {
         let bytes = std::fs::read("tests/fixtures/modern-encrypted.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mkey = find_mkey(&pairs).expect("encrypted wallet must have an mkey");
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         assert!(derive_master_key(&pass, &mkey).is_ok());

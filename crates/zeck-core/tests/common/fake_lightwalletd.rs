@@ -24,6 +24,11 @@
 //!   - `hang_after_blocks(N)` — emit `N` blocks normally, then the
 //!     forwarder task parks itself indefinitely without sending or closing
 //!     the stream. Models a dead peer (TCP up, no h2 frames). Drives R-N15.
+//!   - `drop_send_response_after_forward_once()` — forward a submitted raw
+//!     transaction, require a successful upstream response, then return
+//!     `Unavailable` to the caller once. Captured bytes remain inspectable.
+//!   - `scripted_transaction_evidence(...)` — answer `GetTransaction`,
+//!     `GetLightdInfo`, and `GetBlock` from one coherent evidence script.
 //!
 //! For R-N17 (captive-portal-shaped MitM), the fixture has nothing useful
 //! to add — instead, see [`serve_captive_portal_shim`], a sibling helper
@@ -39,12 +44,12 @@
 //! Gated entirely behind `cfg(feature = "argos-network")` — production builds
 //! never see this file.
 
-#![cfg(feature = "argos-network")]
 #![allow(dead_code)] // Some helpers (e.g. the `latency` knob) await follow-up wiring.
 
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prost::Message as _;
@@ -53,6 +58,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
+use zcash_primitives::transaction::Transaction;
+use zcash_protocol::consensus::BranchId;
 
 // Re-export the generated proto code under a stable in-crate path. The
 // `cash.z.wallet.sdk.rpc` package name produces an output file whose name
@@ -87,6 +94,10 @@ pub struct FakeLightwalletd {
     /// `lightwalletd_url`. Argos's `validate_lightwalletd_endpoint` accepts
     /// `http://127.0.0.1:...` because the host is loopback.
     pub url: String,
+    captured_submissions: Arc<Mutex<Vec<Vec<u8>>>>,
+    scripted_transaction_evidence: Arc<Mutex<Option<ScriptedTxEvidence>>>,
+    scripted_address_utxos:
+        Arc<Mutex<Option<Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>>>>,
     /// JoinHandle for the tonic server task; dropping shuts the server down.
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -95,6 +106,76 @@ impl FakeLightwalletd {
     /// Begin building a new fixture. See [`FakeLightwalletdBuilder`].
     pub fn builder() -> FakeLightwalletdBuilder {
         FakeLightwalletdBuilder::default()
+    }
+
+    /// Exact raw bytes received by SendTransaction, in arrival order.
+    pub fn captured_submissions(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        self.captured_submissions.clone()
+    }
+
+    /// Change only the confirmation RPCs after a normal scan has completed.
+    pub fn set_scripted_transaction_evidence(&self, evidence: ScriptedTxEvidence) {
+        evidence.validate();
+        *self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex") = Some(evidence);
+    }
+
+    /// Replace the live UTXO view after review without changing the scanned
+    /// balance, so callers can prove they bind outpoints before signing.
+    pub fn set_scripted_address_utxos(
+        &self,
+        utxos: Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>,
+    ) {
+        *self
+            .scripted_address_utxos
+            .lock()
+            .expect("scripted UTXO mutex") = Some(utxos);
+    }
+}
+
+/// Coherent answers for the three RPCs used by transaction confirmation.
+/// `reported_height` selects the only scripted block. Its explicit txids and
+/// `include_transaction_in_block` decide whether the claimed tx is included.
+#[derive(Clone, Debug)]
+pub struct ScriptedTxEvidence {
+    pub transaction: ScriptedTransaction,
+    pub reported_height: u64,
+    pub tip_height: u64,
+    pub block_hash: Vec<u8>,
+    pub block_txids: Vec<Vec<u8>>,
+    pub include_transaction_in_block: bool,
+}
+
+/// A checked, fixed transaction or the next submission accepted by the node.
+#[derive(Clone, Debug)]
+pub enum ScriptedTransaction {
+    Fixed { txid: Vec<u8>, raw_tx: Vec<u8> },
+    NextAcceptedSubmission,
+}
+
+impl ScriptedTxEvidence {
+    fn validate(&self) {
+        if let ScriptedTransaction::Fixed { txid, raw_tx } = &self.transaction {
+            assert_eq!(txid.len(), 32, "scripted txid must be 32 bytes");
+            let mut cursor = Cursor::new(raw_tx.as_slice());
+            let parsed = Transaction::read(&mut cursor, BranchId::Nu5)
+                .expect("scripted raw bytes must be a valid V5/Nu5 transaction");
+            assert_eq!(cursor.position(), raw_tx.len() as u64);
+            assert_eq!(
+                parsed.txid().as_ref().as_slice(),
+                txid.as_slice(),
+                "scripted transaction ID does not match raw bytes"
+            );
+        }
+        assert!(self.tip_height >= self.reported_height);
+        assert_eq!(
+            self.block_hash.len(),
+            32,
+            "scripted block hash must be 32 bytes"
+        );
+        assert!(self.block_txids.iter().all(|txid| txid.len() == 32));
     }
 }
 
@@ -141,6 +222,11 @@ pub struct FakeLightwalletdBuilder {
     /// without closing the stream. Models a dead peer (TCP up, no h2 frames).
     /// Used by R-N15.
     hang_after_blocks: Option<u64>,
+    drop_send_response_after_forward_once: bool,
+    accept_submissions_for_test: bool,
+    reject_submissions_for_test: Option<i32>,
+    scripted_transaction_evidence: Option<ScriptedTxEvidence>,
+    scripted_address_utxos: Option<Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>>,
 }
 
 impl Default for FakeLightwalletdBuilder {
@@ -155,6 +241,11 @@ impl Default for FakeLightwalletdBuilder {
             inject_hostile_block_at_height: None,
             bandwidth_bytes_per_sec: None,
             hang_after_blocks: None,
+            drop_send_response_after_forward_once: false,
+            accept_submissions_for_test: false,
+            reject_submissions_for_test: None,
+            scripted_transaction_evidence: None,
+            scripted_address_utxos: None,
         }
     }
 }
@@ -182,12 +273,48 @@ impl FakeLightwalletdBuilder {
         self
     }
 
-    /// Forward unknown RPCs to a real upstream lightwalletd. Required for
-    /// every RPC except `GetLightdInfo` in this skeleton PR; the follow-up
-    /// PR will add synthetic responders for the fault-injection cases that
-    /// don't need a real backend.
+    /// Forward RPCs to a real upstream lightwalletd. Local scripted
+    /// confirmation evidence and local send responders can override only
+    /// their named RPCs.
     pub fn upstream(mut self, url: impl Into<String>) -> Self {
         self.upstream_url = Some(url.into());
+        self
+    }
+
+    /// Return Unavailable once, after the upstream has accepted a submitted
+    /// transaction. A node-level rejection never consumes the one-shot fault.
+    pub fn drop_send_response_after_forward_once(mut self) -> Self {
+        self.drop_send_response_after_forward_once = true;
+        self
+    }
+
+    /// Local unit-test upstream that accepts raw bytes without a regtest node.
+    pub fn accept_submissions_for_test(mut self) -> Self {
+        self.accept_submissions_for_test = true;
+        self
+    }
+
+    /// Local unit-test upstream that returns a node rejection response.
+    pub fn reject_submissions_for_test(mut self, code: i32) -> Self {
+        assert_ne!(code, 0);
+        self.reject_submissions_for_test = Some(code);
+        self
+    }
+
+    /// Override confirmation evidence while retaining normal forwarding for
+    /// unrelated RPCs, including transaction submission.
+    pub fn scripted_transaction_evidence(mut self, evidence: ScriptedTxEvidence) -> Self {
+        evidence.validate();
+        self.scripted_transaction_evidence = Some(evidence);
+        self
+    }
+
+    /// Script the unary transparent UTXO query for a local, node-free scan.
+    pub fn scripted_address_utxos(
+        mut self,
+        utxos: Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>,
+    ) -> Self {
+        self.scripted_address_utxos = Some(utxos);
         self
     }
 
@@ -242,6 +369,9 @@ impl FakeLightwalletdBuilder {
         let url = format!("http://{local_addr}");
 
         let service = FakeService::new(self).await;
+        let captured_submissions = service.captured_submissions.clone();
+        let scripted_transaction_evidence = service.scripted_transaction_evidence.clone();
+        let scripted_address_utxos = service.scripted_address_utxos.clone();
         let server = CompactTxStreamerServer::new(service);
 
         let incoming = TcpListenerStream::new(listener);
@@ -254,6 +384,9 @@ impl FakeLightwalletdBuilder {
 
         Ok(FakeLightwalletd {
             url,
+            captured_submissions,
+            scripted_transaction_evidence,
+            scripted_address_utxos,
             _handle: handle,
         })
     }
@@ -306,13 +439,47 @@ struct FakeService {
     chain_name: String,
     sapling_activation_height: u64,
     block_height: u64,
-    /// Lazily-connected upstream client. `None` means no proxy mode; every
-    /// RPC other than `GetLightdInfo` returns `unimplemented`.
+    /// Lazily-connected upstream client. `None` means no proxy mode; RPCs
+    /// without a local scripted responder return `unimplemented`.
     upstream: Option<UpstreamClient<Channel>>,
     fault: Arc<FaultState>,
+    captured_submissions: Arc<Mutex<Vec<Vec<u8>>>>,
+    drop_send_response_after_forward_once: bool,
+    send_response_dropped: AtomicBool,
+    accept_submissions_for_test: bool,
+    reject_submissions_for_test: Option<i32>,
+    scripted_transaction_evidence: Arc<Mutex<Option<ScriptedTxEvidence>>>,
+    scripted_address_utxos:
+        Arc<Mutex<Option<Vec<zcash_client_backend::proto::service::GetAddressUtxosReply>>>>,
 }
 
 impl FakeService {
+    fn bind_accepted_submission(&self, raw_tx: &[u8]) -> Result<(), Status> {
+        let mut script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex");
+        if let Some(script) = script.as_mut() {
+            if matches!(
+                script.transaction,
+                ScriptedTransaction::NextAcceptedSubmission
+            ) {
+                let mut cursor = Cursor::new(raw_tx);
+                let tx = Transaction::read(&mut cursor, BranchId::Nu5).map_err(|err| {
+                    Status::internal(format!("cannot parse accepted transaction: {err}"))
+                })?;
+                if cursor.position() != raw_tx.len() as u64 {
+                    return Err(Status::internal("accepted transaction has trailing bytes"));
+                }
+                script.transaction = ScriptedTransaction::Fixed {
+                    txid: tx.txid().as_ref().to_vec(),
+                    raw_tx: raw_tx.to_vec(),
+                };
+            }
+        }
+        Ok(())
+    }
+
     async fn new(builder: FakeLightwalletdBuilder) -> Self {
         let upstream = match builder.upstream_url.as_deref() {
             Some(url) => {
@@ -343,10 +510,19 @@ impl FakeService {
                 latency: builder.latency,
                 bandwidth_bytes_per_sec: builder.bandwidth_bytes_per_sec,
             }),
+            captured_submissions: Arc::new(Mutex::new(Vec::new())),
+            drop_send_response_after_forward_once: builder.drop_send_response_after_forward_once,
+            send_response_dropped: AtomicBool::new(false),
+            accept_submissions_for_test: builder.accept_submissions_for_test,
+            reject_submissions_for_test: builder.reject_submissions_for_test,
+            scripted_transaction_evidence: Arc::new(Mutex::new(
+                builder.scripted_transaction_evidence,
+            )),
+            scripted_address_utxos: Arc::new(Mutex::new(builder.scripted_address_utxos)),
         }
     }
 
-    /// Return a fresh clone of the upstream client, or an `unavailable` Status
+    /// Return a fresh clone of the upstream client, or an `unimplemented` Status
     /// when proxy mode is disabled. The clone is cheap — tonic channels share
     /// the underlying HTTP/2 connection.
     fn upstream(&self) -> Result<UpstreamClient<Channel>, Status> {
@@ -470,7 +646,14 @@ impl CompactTxStreamer for FakeService {
         // claim its own chain identity (the upstream may legitimately be a
         // testnet or mainnet server; the fixture should still look like a
         // regtest to Argos under argos-network).
-        let block_height = if let Some(mut upstream) = self.upstream.clone() {
+        let script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex")
+            .clone();
+        let block_height = if let Some(script) = &script {
+            script.tip_height
+        } else if let Some(mut upstream) = self.upstream.clone() {
             // Best-effort: ask the upstream for its tip height so the proxy
             // mode reports a realistic value, but fall back to the configured
             // value if the upstream call fails.
@@ -495,6 +678,41 @@ impl CompactTxStreamer for FakeService {
     }
 
     async fn get_block(&self, request: Request<BlockId>) -> Result<Response<CompactBlock>, Status> {
+        let script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex")
+            .clone();
+        if let Some(script) = &script {
+            let requested = request.get_ref();
+            if requested.height != script.reported_height
+                || (!requested.hash.is_empty() && requested.hash != script.block_hash)
+            {
+                return Err(Status::not_found(
+                    "scripted block does not match requested ID",
+                ));
+            }
+            let mut block_txids = script.block_txids.clone();
+            if script.include_transaction_in_block {
+                if let ScriptedTransaction::Fixed { txid, .. } = &script.transaction {
+                    if !block_txids.contains(txid) {
+                        block_txids.push(txid.clone());
+                    }
+                }
+            }
+            return Ok(Response::new(CompactBlock {
+                height: script.reported_height,
+                hash: script.block_hash.clone(),
+                vtx: block_txids
+                    .iter()
+                    .map(|txid| pb::CompactTx {
+                        txid: txid.clone(),
+                        ..pb::CompactTx::default()
+                    })
+                    .collect(),
+                ..CompactBlock::default()
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req = reencode::<_, zcash_client_backend::proto::service::BlockId>(request.get_ref());
         let resp = upstream.get_block(req).await?.into_inner();
@@ -598,6 +816,28 @@ impl CompactTxStreamer for FakeService {
         &self,
         request: Request<TxFilter>,
     ) -> Result<Response<RawTransaction>, Status> {
+        let script = self
+            .scripted_transaction_evidence
+            .lock()
+            .expect("scripted evidence mutex")
+            .clone();
+        if let Some(script) = &script {
+            let (txid, raw_tx) = match &script.transaction {
+                ScriptedTransaction::Fixed { txid, raw_tx } => (txid, raw_tx),
+                ScriptedTransaction::NextAcceptedSubmission => {
+                    return Err(Status::not_found("no accepted transaction to script"));
+                }
+            };
+            if request.get_ref().hash != *txid {
+                return Err(Status::not_found(
+                    "scripted transaction does not match requested hash",
+                ));
+            }
+            return Ok(Response::new(RawTransaction {
+                data: raw_tx.clone(),
+                height: script.reported_height,
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req = reencode::<_, zcash_client_backend::proto::service::TxFilter>(request.get_ref());
         let resp = upstream.get_transaction(req).await?.into_inner();
@@ -608,10 +848,41 @@ impl CompactTxStreamer for FakeService {
         &self,
         request: Request<RawTransaction>,
     ) -> Result<Response<SendResponse>, Status> {
+        self.captured_submissions
+            .lock()
+            .expect("submission capture mutex")
+            .push(request.get_ref().data.clone());
+        if self.accept_submissions_for_test && self.upstream.is_none() {
+            self.bind_accepted_submission(&request.get_ref().data)?;
+            return Ok(Response::new(SendResponse::default()));
+        }
+        if let Some(code) = self
+            .reject_submissions_for_test
+            .filter(|_| self.upstream.is_none())
+        {
+            return Ok(Response::new(SendResponse {
+                error_code: code,
+                error_message: "scripted test rejection".to_owned(),
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req =
             reencode::<_, zcash_client_backend::proto::service::RawTransaction>(request.get_ref());
         let resp = upstream.send_transaction(req).await?.into_inner();
+        if resp.error_code == 0 {
+            self.bind_accepted_submission(&request.get_ref().data)?;
+        }
+        if self.drop_send_response_after_forward_once
+            && resp.error_code == 0
+            && self
+                .send_response_dropped
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(Status::unavailable(
+                "FakeLightwalletd: upstream accepted the transaction, response dropped once",
+            ));
+        }
         Ok(Response::new(reencode::<_, SendResponse>(&resp)))
     }
 
@@ -656,6 +927,21 @@ impl CompactTxStreamer for FakeService {
         &self,
         request: Request<GetAddressUtxosArg>,
     ) -> Result<Response<GetAddressUtxosReplyList>, Status> {
+        if let Some(scripted) = self
+            .scripted_address_utxos
+            .lock()
+            .expect("scripted UTXO mutex")
+            .as_ref()
+        {
+            let addresses = &request.get_ref().addresses;
+            return Ok(Response::new(GetAddressUtxosReplyList {
+                address_utxos: scripted
+                    .iter()
+                    .filter(|utxo| addresses.contains(&utxo.address))
+                    .map(reencode::<_, GetAddressUtxosReply>)
+                    .collect(),
+            }));
+        }
         let mut upstream = self.upstream()?;
         let req = reencode::<_, zcash_client_backend::proto::service::GetAddressUtxosArg>(
             request.get_ref(),
