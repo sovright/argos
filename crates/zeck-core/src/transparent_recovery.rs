@@ -757,6 +757,38 @@ pub(crate) fn check_transparent_fee(
     }
 }
 
+/// Blocks the chain may advance between a CLI quote and its execution. The
+/// transaction is built at the execute-time height, so it carries a full
+/// expiry window from then; this bound only limits how stale the reviewed
+/// UTXO set and fee may be. It is half the default expiry delta.
+pub const TRANSPARENT_QUOTE_MAX_AGE_BLOCKS: u32 = 20;
+
+/// A quote stays executable while the consensus branch (and so the
+/// transaction version and fee rule) is unchanged and the tip has moved by
+/// at most [`TRANSPARENT_QUOTE_MAX_AGE_BLOCKS`] in either direction.
+pub(crate) fn require_quote_height_current(
+    network: ZeckNetwork,
+    quoted_target: u32,
+    current_target: u32,
+) -> ZeckResult<()> {
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    let params = crate::workspace::consensus_network(network);
+    if BranchId::for_height(&params, BlockHeight::from_u32(quoted_target))
+        != BranchId::for_height(&params, BlockHeight::from_u32(current_target))
+    {
+        return Err(ZeckError::StaleSweepProposal(
+            "a network upgrade activated after review; quote again".to_owned(),
+        ));
+    }
+    if current_target.abs_diff(quoted_target) > TRANSPARENT_QUOTE_MAX_AGE_BLOCKS {
+        return Err(ZeckError::StaleSweepProposal(format!(
+            "the transparent sweep quote is more than {TRANSPARENT_QUOTE_MAX_AGE_BLOCKS} blocks old; quote again"
+        )));
+    }
+    Ok(())
+}
+
 /// Execute a standalone transparent quote only while its exact reviewed
 /// coins, fee, output, and target height remain current. When no ceiling was
 /// supplied, the quoted fee is the maximum authorized by this review.
@@ -784,27 +816,30 @@ pub async fn sweep_transparent_only_from_quote(
     crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
     let chain_tip = u32::try_from(info.block_height)
         .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
-    if chain_tip.saturating_add(1) != quote.target_height {
-        return Err(ZeckError::StaleSweepProposal(
-            "transparent sweep target height changed after review; quote again".to_owned(),
-        ));
-    }
+    let current_target = chain_tip.saturating_add(1);
+    require_quote_height_current(network, quote.target_height, current_target)?;
     let current_utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
-    let current_plan = plan_sweep(
-        &crate::workspace::consensus_network(network),
-        BlockHeight::from_u32(quote.target_height),
-        &current_utxos,
-    )?;
     if transparent_input_set_identity(&current_utxos)
         != transparent_input_set_identity(&quote.utxos)
-        || current_plan != quote.plan
     {
         return Err(ZeckError::StaleSweepProposal(
             "selected sweep inputs changed after review; quote again before signing".to_owned(),
         ));
     }
-    let Some(plan) = quote.plan.as_ref() else {
+    let Some(reviewed) = quote.plan.as_ref() else {
         return Ok(None);
+    };
+    // The plan actually built, at the execute-time height. Its fee is
+    // compared with the reviewed quote's fee before anything is signed.
+    let Some(built) = plan_sweep(
+        &crate::workspace::consensus_network(network),
+        BlockHeight::from_u32(current_target),
+        &current_utxos,
+    )?
+    else {
+        return Err(ZeckError::StaleSweepProposal(
+            "the reviewed transparent inputs no longer cover a sweep; quote again".to_owned(),
+        ));
     };
     sweep_transparent_only_reviewed(
         store,
@@ -812,10 +847,10 @@ pub async fn sweep_transparent_only_from_quote(
         network,
         lightwalletd_url,
         destination,
-        Some(max_fee_zatoshis.unwrap_or(plan.fee_zatoshis)),
+        Some(max_fee_zatoshis.unwrap_or(reviewed.fee_zatoshis)),
         0,
-        Some(plan.fee_zatoshis),
-        Some((&current_utxos, plan, quote.target_height)),
+        Some(reviewed.fee_zatoshis),
+        Some((&current_utxos, &built, current_target)),
     )
     .await
 }
@@ -838,6 +873,18 @@ pub(crate) async fn sweep_transparent_only_reviewed(
     // Resolve the destination before touching the network: a bad address
     // should fail instantly, not after a scan.
     let recipient = sapling_receiver(destination, network)?;
+
+    // The reviewed fee against the plan that will be built, before any
+    // network or signing work, and before the fee ceiling: a changed fee is
+    // FeeQuoteChanged, never MaxFeeExceeded.
+    if let (Some(reviewed), Some((_, plan, _))) = (reviewed_fee_zatoshis, reviewed_inputs) {
+        if reviewed != plan.fee_zatoshis {
+            return Err(ZeckError::FeeQuoteChanged {
+                reviewed,
+                current: plan.fee_zatoshis,
+            });
+        }
+    }
 
     let (mut client, _endpoint, info) =
         crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
@@ -952,6 +999,7 @@ async fn submit_transparent_prepared<S: BroadcastStore, N: TxSubmitter>(
                     .unwrap_or_default()
             ),
             confirmed_height: None,
+            safe_to_discard: false,
         },
         disposition: submitted.disposition,
         plan,
@@ -1093,6 +1141,81 @@ mod sweep_tests {
         assert_ne!(
             TxVersion::suggested_for_branch(BranchId::for_height(&MAIN_NETWORK, selected)),
             TxVersion::suggested_for_branch(BranchId::for_height(&MAIN_NETWORK, later)),
+        );
+    }
+
+    #[test]
+    fn quote_survives_a_new_block_but_not_a_branch_change_or_old_age() {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
+
+        let network = ZeckNetwork::Mainnet;
+        let activation = u32::from(MAIN_NETWORK.activation_height(NetworkUpgrade::Nu5).unwrap());
+        let quoted = activation + 1_000;
+        // A block landing between quote and execute is ordinary.
+        assert!(require_quote_height_current(network, quoted, quoted).is_ok());
+        assert!(require_quote_height_current(network, quoted, quoted + 1).is_ok());
+        assert!(require_quote_height_current(
+            network,
+            quoted,
+            quoted + TRANSPARENT_QUOTE_MAX_AGE_BLOCKS
+        )
+        .is_ok());
+        // Too old.
+        assert!(matches!(
+            require_quote_height_current(
+                network,
+                quoted,
+                quoted + TRANSPARENT_QUOTE_MAX_AGE_BLOCKS + 1
+            ),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        // A consensus branch change invalidates the reviewed version.
+        assert!(matches!(
+            require_quote_height_current(network, activation - 1, activation),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reviewed_transparent_fee_is_checked_against_the_built_plan_before_network() {
+        use crate::broadcast::DurableBroadcastLog;
+
+        let key = crate::imported::ImportedTransparentKey {
+            secret: secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap(),
+            address: addr(1),
+        };
+        let utxos = vec![utxo(addr(1), 1_000_000, 9)];
+        let built = plan_sweep(&MAIN_NETWORK, height(), &utxos)
+            .unwrap()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("log.jsonl")).unwrap();
+        // The session endpoint is unroutable: the comparison must come first.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sweep_transparent_only_reviewed(
+                &mut log,
+                &[key],
+                ZeckNetwork::Mainnet,
+                "https://127.0.0.1:1",
+                &super::destination_tests::unified_address_for(
+                    zcash_protocol::consensus::NetworkType::Main,
+                ),
+                None,
+                0,
+                Some(built.fee_zatoshis + 5_000),
+                Some((&utxos, &built, u32::from(height()))),
+            ),
+        )
+        .await
+        .expect("no network before the reviewed-fee check");
+        assert!(
+            matches!(
+                result,
+                Err(ZeckError::FeeQuoteChanged { reviewed, current })
+                    if reviewed == built.fee_zatoshis + 5_000 && current == built.fee_zatoshis
+            ),
+            "{result:?}"
         );
     }
 
@@ -1402,7 +1525,7 @@ mod destination_tests {
     /// a test pass for the wrong reason. Deriving the receiver from a key
     /// and letting `zcash_address` encode it means the fixture is valid by
     /// construction, and the assertion below that it decodes proves it.
-    fn unified_address_for(network: zcash_protocol::consensus::NetworkType) -> String {
+    pub(super) fn unified_address_for(network: zcash_protocol::consensus::NetworkType) -> String {
         use zcash_address::unified::{Address, Encoding, Receiver};
 
         let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32]);

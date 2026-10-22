@@ -517,6 +517,11 @@ pub struct SweepProposal {
     /// The quoted stage shields funds; a mined/rescanned send needs new review.
     #[serde(default)]
     pub follow_up_review_required: bool,
+    /// Set on the reviewed copy shown to the user when fewer than two
+    /// independent confirmation operators are configured. Not part of the
+    /// bound quote: it describes the configuration, not the transactions.
+    #[serde(default)]
+    pub confirmation_notice: Option<String>,
 }
 
 /// Ephemeral authority for one reviewed ordinary sweep in one scan session.
@@ -544,7 +549,13 @@ pub enum TxLifecycleState {
     NotSubmitted,
     SubmissionUnknown,
     Pending,
+    /// Mined with matching block evidence from an independent pair of
+    /// confirmation operators.
     Mined,
+    /// Mined according to a single confirmation operator. Resolved for
+    /// continuing a recovery (later legs, a new review, workspace deletion),
+    /// but never enough to tell the user the source may be discarded.
+    MinedSingleSource,
     Expired,
     Rejected,
 }
@@ -552,7 +563,24 @@ pub enum TxLifecycleState {
 impl TxLifecycleState {
     /// A submitted transaction can still be mined even if its reply was lost.
     pub fn fee_is_at_risk(self) -> bool {
-        matches!(self, Self::SubmissionUnknown | Self::Pending | Self::Mined)
+        matches!(
+            self,
+            Self::SubmissionUnknown | Self::Pending | Self::Mined | Self::MinedSingleSource
+        )
+    }
+
+    /// Either mined state.
+    pub fn is_mined(self) -> bool {
+        matches!(self, Self::Mined | Self::MinedSingleSource)
+    }
+
+    /// Settled enough that a new review may start: the transaction mined
+    /// (by any configured operator), expired, or was definitively rejected.
+    pub fn is_resolved(self) -> bool {
+        matches!(
+            self,
+            Self::Mined | Self::MinedSingleSource | Self::Expired | Self::Rejected
+        )
     }
 }
 
@@ -563,6 +591,7 @@ impl std::fmt::Display for TxLifecycleState {
             Self::SubmissionUnknown => "submission_unknown",
             Self::Pending => "pending",
             Self::Mined => "mined",
+            Self::MinedSingleSource => "mined_single_source",
             Self::Expired => "expired",
             Self::Rejected => "rejected",
         })
@@ -577,6 +606,11 @@ pub struct TxBroadcastResult {
     pub fee_zatoshis: u64,
     pub detail: String,
     pub confirmed_height: Option<u32>,
+    /// Corroborated by independent operators and at least
+    /// `broadcast::MIN_DISCARD_CONFIRMATIONS` deep. The only status that may
+    /// tell the user the source keys or wallet file can be discarded.
+    #[serde(default)]
+    pub safe_to_discard: bool,
 }
 
 /// Outcome of an `execute_sweep`, reported even when the sweep aborts partway.

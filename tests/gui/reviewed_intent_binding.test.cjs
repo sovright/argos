@@ -826,3 +826,11 @@ test("start over restores every scan source setting to its documented default", 
   assert.equal(h.$("data-dir").value, "/platform/default");
   assert.equal(h.$("sprout-scan-peers").value, "");
 });
+
+test("sweep review shows the single-operator confirmation notice", async () => {
+  const notice = "Confirmation will rest on a single operator. Keep your source keys or wallet file until an independent source confirms the sweep.";
+  const h = harness(async () => review("proposal-single", { confirmation_notice: notice }));
+  await h.refresh();
+  assert.match(h.$("sweep-summary").textContent, /single operator/);
+  assert.equal(h.$("execute-sweep").disabled, true, "review alone never executes");
+});

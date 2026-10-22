@@ -19,8 +19,13 @@
 //!   sweep is often reviewed long after an hours-long scan finishes.
 //! - at most [`MAX_SCAN_SESSIONS`] scans and [`MAX_PROPOSALS`] proposals.
 //!
-//! Memory is not zeroized on drop: no zeroizing type is available without a
-//! new dependency, and the wallet-import key types are not zeroizing either.
+//! Held material is wiped on drop with `zeroize`: a scan session's keys sit
+//! in `Zeroizing`, wiped when the last `Arc` (the session's, or a running
+//! worker's) goes, and `SpendableSproutNote` zeroizes its `a_sk` and note
+//! secrets in its own `Drop`, so an expired, released or executed proposal
+//! leaves no key behind in freed memory. This is best effort, not a
+//! guarantee: copies made earlier (decoding buffers, a `Vec` reallocation,
+//! the wallet-import types, which are not all zeroizing) are not reached.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +37,7 @@ use std::{
 use argos_core::{sprout_recovery::SpendableSproutNote, sprout_sweep::SweepJournal, ZeckNetwork};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::commands::{SproutScanReport, SproutSweepResult};
 
@@ -125,7 +131,7 @@ pub struct SproutSweepIntent {
 }
 
 pub struct ScanMaterial {
-    pub keys: Arc<Vec<[u8; 32]>>,
+    pub keys: Arc<Zeroizing<Vec<[u8; 32]>>>,
     pub key_fingerprint: String,
     pub checkpoint: PathBuf,
     pub network: ZeckNetwork,
@@ -135,7 +141,7 @@ pub struct ScanMaterial {
 }
 
 struct SproutScanSession {
-    keys: Arc<Vec<[u8; 32]>>,
+    keys: Arc<Zeroizing<Vec<[u8; 32]>>>,
     key_fingerprint: String,
     checkpoint: PathBuf,
     network: ZeckNetwork,
@@ -328,7 +334,7 @@ impl ReviewedIntentStore {
         inner.scans.insert(
             handle.clone(),
             SproutScanSession {
-                keys: Arc::new(keys),
+                keys: Arc::new(Zeroizing::new(keys)),
                 key_fingerprint,
                 checkpoint,
                 network,
@@ -810,6 +816,35 @@ mod tests {
         assert!(joined.is_err_and(|err| err.is_cancelled()));
         assert!(store.reserve_checkpoint(&checkpoint).is_ok());
         assert!(store.snapshot(&handle).is_err());
+    }
+
+    /// A scan session's keys are held in `Zeroizing`, and the session is
+    /// their only owner once its worker is gone: releasing it leaves the
+    /// last `Arc` here, and dropping that wipes the keys. Wiping is what
+    /// `Zeroizing`'s `Drop` does; it is called directly so the zeros can be
+    /// observed.
+    #[test]
+    fn released_scan_keys_are_held_in_a_wiping_wrapper() {
+        use zeroize::Zeroize;
+        let store = ReviewedIntentStore::default();
+        let handle = store
+            .insert_scan(
+                vec![[0xab; 32], [0xcd; 32]],
+                "fingerprint-z".into(),
+                PathBuf::from("/tmp/scan-z"),
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let material = store.scan_material(&handle).unwrap();
+        store.release_scan(&handle).unwrap();
+        let mut keys: Zeroizing<Vec<[u8; 32]>> =
+            Arc::try_unwrap(material.keys).expect("the released session kept no copy");
+        assert_eq!(keys.len(), 2);
+        keys.zeroize();
+        assert!(keys.is_empty(), "wiped and cleared");
     }
 
     /// A release that lands before the worker is attached still stops it.

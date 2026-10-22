@@ -458,8 +458,12 @@ pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
         }
     };
     set_private_file_permissions(path)?;
-    file.write_all(bytes)
-        .and_then(|_| file.write_all(b"\n"))
+    // One buffer, one write: the event and its terminator are never split
+    // across separate writes.
+    let mut line = Vec::with_capacity(bytes.len() + 1);
+    line.extend_from_slice(bytes);
+    line.push(b'\n');
+    file.write_all(&line)
         .and_then(|_| file.flush())
         .and_then(|_| file.sync_all())
         .map_err(|err| {
@@ -1116,6 +1120,15 @@ mod regtest_params_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn append_private_file_writes_whole_terminated_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        super::append_private_file(&path, br#"{"a":1}"#).unwrap();
+        super::append_private_file(&path, br#"{"b":2}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
     use std::path::PathBuf;
     use std::sync::Arc;
 

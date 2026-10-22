@@ -3311,7 +3311,8 @@ function renderSweepProposal(proposal) {
 
   $("sweep-summary").textContent =
     `Net received: ${fmt(proposal.net_received_zatoshis)} after ${fmt(proposal.total_fee_zatoshis)} in fees.` +
-    (proposal.warning ? `  ⚠ ${proposal.warning}` : "");
+    (proposal.warning ? `  ⚠ ${proposal.warning}` : "") +
+    (proposal.confirmation_notice ? `  ${proposal.confirmation_notice}` : "");
 
   const skippedEl = $("sweep-skipped");
   skippedEl.replaceChildren();
@@ -3441,7 +3442,7 @@ function txStatusKind(status) {
   if (status === "broadcast") return "pending";
   if (status === "confirmed") return "pending";
   if (status === "failed") return "submission_unknown";
-  if (["not_submitted", "submission_unknown", "pending", "mined", "expired", "rejected"].includes(status)) return status;
+  if (["not_submitted", "submission_unknown", "pending", "mined", "mined_single_source", "expired", "rejected"].includes(status)) return status;
   return "submission_unknown";
 }
 
@@ -3451,27 +3452,31 @@ function txStatusLabel(status) {
     submission_unknown: "Submission uncertain — may already be on the network. Do not retry without a fresh status check.",
     pending: "Broadcast — awaiting independent confirmation.",
     mined: "Mined — independently confirmed.",
+    mined_single_source: "Mined — reported by one confirmation operator. Keep your source until an independent source confirms.",
     expired: "Expired — rescan before rebuilding.",
     rejected: "Rejected by the node.",
   }[txStatusKind(status)];
 }
 
 function sweepStatusCounts(results) {
-  const counts = { not_submitted: 0, unknown: 0, pending: 0, mined: 0, expired: 0, rejected: 0, broadcast: 0 };
+  const counts = { not_submitted: 0, unknown: 0, pending: 0, mined: 0, singleSource: 0, expired: 0, rejected: 0, broadcast: 0, safe: 0 };
   for (const r of results) {
     const kind = txStatusKind(r.status);
     if (kind === "submission_unknown") counts.unknown += 1;
+    else if (kind === "mined_single_source") counts.singleSource += 1;
     else counts[kind] += 1;
+    // Only corroborated, deep-enough mining may say the source can go.
+    if (kind === "mined" && r.safe_to_discard === true) counts.safe += 1;
   }
-  counts.broadcast = counts.unknown + counts.pending + counts.mined + counts.expired;
+  counts.broadcast = counts.unknown + counts.pending + counts.mined + counts.singleSource + counts.expired;
   return counts;
 }
 
 function sweepCompleteSummary(results, error, followUpReviewRequired = false, skipped = []) {
-  const { unknown, pending, mined, expired, rejected } = sweepStatusCounts(results);
+  const { unknown, pending, mined, singleSource, expired, rejected, safe } = sweepStatusCounts(results);
   const walletWarning = "Keep the source wallet and its recovery workspace while transaction results or remaining balances need review.";
   if (error) {
-    const atRisk = unknown + pending + mined;
+    const atRisk = unknown + pending + mined + singleSource;
     const sent = atRisk > 0 ? `${atRisk} transaction${atRisk === 1 ? " may" : "s may"} already have moved. ` : "";
     const warning = atRisk ? walletWarning : "Keep the source wallet and recovery workspace until remaining balances are accounted for.";
     return `The sweep stopped before completing. ${sent}${unknown ? "A submission may already have moved; do not retry it without a fresh status check. " : ""}${warning} Rescan and reconcile each txid before any new proposal. Error: ${error}`;
@@ -3497,7 +3502,9 @@ function sweepCompleteSummary(results, error, followUpReviewRequired = false, sk
   if (expired) return `${expired} transaction${expired === 1 ? "" : "s"} expired. Keep the source wallet and recovery workspace; rescan before rebuilding.`;
   if (rejected) return `${rejected} transaction${rejected === 1 ? " was" : "s were"} rejected by the node. Keep the source wallet and recovery workspace; review the details before a new proposal.`;
   if (skipped?.length) return `${mined ? `${mined} transaction${mined === 1 ? "" : "s"} mined, but ` : ""}${skipped.length} account${skipped.length === 1 ? " was" : "s were"} skipped and not swept. Keep the source wallet and recovery workspace; review the remaining balance.`;
-  if (mined === results.length) return `${mined} transaction${mined === 1 ? "" : "s"} mined and independently confirmed. Recovery complete.`;
+  if (singleSource) return `${singleSource} transaction${singleSource === 1 ? "" : "s"} mined according to one confirmation operator. Keep your source keys or wallet file until an independent source confirms.`;
+  if (mined === results.length && safe === results.length) return `${mined} transaction${mined === 1 ? "" : "s"} mined and independently confirmed. Recovery complete.`;
+  if (mined === results.length) return `${mined} transaction${mined === 1 ? "" : "s"} mined and independently confirmed. Keep your source until each has enough confirmations; check status again later.`;
   if (mined) return `${mined} transaction${mined === 1 ? "" : "s"} mined, but this sweep did not finish. ${walletWarning} Review the remaining results before a new proposal.`;
   return "No transaction was submitted. Review the details before trying again.";
 }
@@ -3540,7 +3547,7 @@ async function refreshSweepStatus() {
     const newlyFinal = rows.some((row) => {
       const previous = context.outcome?.transactions?.find((item) => item.txid === row.txid);
       return (!previous || txStatusKind(previous.status) !== txStatusKind(row.status)) &&
-        ["mined", "expired"].includes(txStatusKind(row.status));
+        ["mined", "mined_single_source", "expired", "rejected"].includes(txStatusKind(row.status));
     });
     applyReconciledTransactions(rows);
     if (newlyFinal) {
@@ -3622,7 +3629,15 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
   const { unknown, pending, expired, rejected, not_submitted: notSubmitted } = sweepStatusCounts(results);
   const followUpReviewRequired = !!(completionContext?.outcome?.follow_up_review_required ?? completionContext?.followUpReviewRequired);
   const allMined = !statusOnly && !error && !followUpReviewRequired && !(skipped?.length) && results.length > 0 &&
-    results.every((r) => txStatusKind(r.status) === "mined");
+    results.every((r) => txStatusKind(r.status) === "mined" && r.safe_to_discard === true);
+  const singleSource = results.some((r) => txStatusKind(r.status) === "mined_single_source");
+  const shallow = results.some((r) => txStatusKind(r.status) === "mined" && r.safe_to_discard !== true);
+  // Deleting the workspace needs only resolved broadcasts (the service
+  // enforces the same rule); it never implies the source can be discarded.
+  // A staged sweep still owes its send leg, so the screen keeps the
+  // workspace it will rescan.
+  const deletable = !statusOnly && !followUpReviewRequired &&
+    unknown === 0 && pending === 0 && notSubmitted === 0;
   $("complete-heading").textContent = statusOnly ? "Saved transaction status" : allMined ? "Recovery complete" : "Sweep status";
   $("complete-summary").textContent = statusOnly
     ? "These are saved transactions in this network data directory, which may include another wallet. Keep the source wallets and recovery workspaces; run a fresh scan and review a new quote before another sweep stage."
@@ -3632,6 +3647,8 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     : allMined
     ? "Every submitted transaction has independent mining evidence. Verify the destination balance before deleting your recovery workspace."
     : unknown ? "Keep the source wallet and recovery workspace. A submission may already have moved; do not retry it without a fresh status check. Reconcile its txid before a new proposal."
+    : singleSource ? "Mining was reported by a single confirmation operator. The recovery can continue, but keep your source keys or wallet file until an independent source confirms."
+    : shallow && !pending ? "Mined with independent evidence. Keep your source until each transaction has at least 10 confirmations; check status again later."
     : pending ? "Keep the source wallet and recovery workspace. A pending transaction may still mine; check its txid before a new proposal."
     : expired ? "The transaction expired. Keep the source wallet and recovery workspace; rescan before rebuilding."
     : rejected ? "The node rejected the transaction. Keep the source wallet and recovery workspace; review the evidence before a new proposal."
@@ -3640,8 +3657,8 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     : "No submitted transaction is awaiting confirmation. Review the details before trying again.";
   $("complete-confirmation-note").textContent = confirmationNote +
     (expired && (unknown || pending) ? " An expired transaction also requires a rescan before rebuilding." : "");
-  $("delete-workspace").disabled = !allMined;
-  $("delete-workspace-zone").hidden = !allMined;
+  $("delete-workspace").disabled = !deletable;
+  $("delete-workspace-zone").hidden = !deletable;
   $("restart-flow").textContent = statusOnly || followUpReviewRequired ? "Rescan and review" : "Start over";
 
   const container = $("complete-txids");
@@ -3776,7 +3793,7 @@ function buildReport(results, completionContext = null) {
   const error = outcome?.error ?? null;
   const followUpReviewRequired = !!outcome?.follow_up_review_required;
   const allMined = !statusOnly && !error && !followUpReviewRequired && skipped.length === 0 && transactions.length > 0 &&
-    transactions.every((r) => r.status === "mined");
+    transactions.every((r) => r.status === "mined" && r.safe_to_discard === true);
   const status = statusOnly ? "Saved transaction status" : allMined ? "Recovery complete" : followUpReviewRequired
     ? "Shielding stage — follow-up review required" : "Incomplete";
   const cfg = completionContext?.scanConfig ?? state.scanConfig;
