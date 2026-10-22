@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     ffi::OsString,
     fs,
-    io::{IsTerminal, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -28,7 +28,7 @@ use argos_core::{
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
 use indicatif::{ProgressBar, ProgressStyle};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, Secret, SecretString};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -586,16 +586,71 @@ fn load_wallet_file(path: &Path, network: ZeckNetwork) -> Result<ImportedKeys> {
 
 /// Read a Sapling key file into the same key set a wallet file produces.
 ///
-/// The file is read as UTF-8 text and never logged. Decoding, comment
-/// handling, deduplication, and line-numbered errors all live in
-/// `argos_core::sapling_key`, so the CLI and the GUI cannot drift apart on
-/// what a key file means.
+/// The file is moved into a zeroizing string immediately and never logged.
+/// Decoding and deduplication use the shared core routines; line handling is
+/// kept here so no ordinary `Vec<String>` ever owns the plaintext keys.
 fn load_sapling_key_file(path: &Path, network: ZeckNetwork) -> Result<ImportedKeys> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-    argos_core::sapling_key::keys_from_sapling_strings(&lines, network)
-        .with_context(|| format!("in {}", path.display()))
+    use argos_core::argos_wallet_import::{Provenance, SaplingKey};
+
+    let text = read_secret_text_file(path)?;
+    let text = text.as_str()?;
+    let mut keys = ImportedKeys::default();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let extsk = argos_core::sapling_key::decode_sapling_spending_key(line, network)
+            .with_context(|| format!("line {} of {}", index + 1, path.display()))?;
+        let decoded = ImportedKeys {
+            sapling: vec![SaplingKey {
+                extsk: Secret::new(extsk.to_bytes().to_vec()),
+                provenance: Provenance::Standalone,
+                created_at: None,
+            }],
+            ..Default::default()
+        };
+        argos_core::sapling_key::merge_sapling_keys(&mut keys, decoded);
+    }
+    if keys.sapling.is_empty() {
+        bail!(
+            "in {}: no Sapling spending keys found — expected at least one \
+             `secret-extended-key-…` line",
+            path.display()
+        );
+    }
+    Ok(keys)
+}
+
+/// Upper bound for human-entered seed and spending-key files. It also lets us
+/// allocate the zeroizing buffer before the first byte arrives, so a partial
+/// read or invalid UTF-8 error cannot drop a plaintext `String` allocation.
+const MAX_SECRET_TEXT_FILE_BYTES: usize = 1024 * 1024;
+
+struct SecretTextFile(secrecy::zeroize::Zeroizing<Vec<u8>>);
+
+impl SecretTextFile {
+    fn as_str(&self) -> Result<&str> {
+        std::str::from_utf8(&self.0).context("secret text file is not valid UTF-8")
+    }
+}
+
+fn read_secret_text_file(path: &Path) -> Result<SecretTextFile> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open secret file {}", path.display()))?;
+    let mut bytes =
+        secrecy::zeroize::Zeroizing::new(Vec::with_capacity(MAX_SECRET_TEXT_FILE_BYTES + 1));
+    file.take((MAX_SECRET_TEXT_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read secret file {}", path.display()))?;
+    if bytes.len() > MAX_SECRET_TEXT_FILE_BYTES {
+        bail!(
+            "secret file {} exceeds the {} byte limit",
+            path.display(),
+            MAX_SECRET_TEXT_FILE_BYTES
+        );
+    }
+    Ok(SecretTextFile(bytes))
 }
 
 /// Drop any Sprout key that does not control its stored address, and say so.
@@ -970,8 +1025,11 @@ async fn sweep_sprout(
     } = gate;
     let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Verify(peers)).await;
     let spending_keys = wallet_sprout_keys(keys);
-    let journal =
-        argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+        data_dir,
+        spending_keys.as_slice(),
+        network,
+    );
     let outpoints = recovered
         .notes
         .iter()
@@ -1131,12 +1189,30 @@ fn sprout_post_execution_pool_line(
 /// Both are accepted at once, because a user may hold a `wallet.dat` *and*
 /// a paper key for an address that wallet never rescanned.
 /// The Sprout keys a scan covers.
+struct SecretSproutKeys(Vec<[u8; 32]>);
+
+impl SecretSproutKeys {
+    fn new(keys: Vec<[u8; 32]>) -> Self {
+        Self(keys)
+    }
+
+    fn as_slice(&self) -> &[[u8; 32]] {
+        &self.0
+    }
+}
+
+impl Drop for SecretSproutKeys {
+    fn drop(&mut self) {
+        secrecy::zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 struct SproutScanKeys {
     /// Every key, deduplicated: what the scan decrypts for.
-    all: Vec<[u8; 32]>,
+    all: SecretSproutKeys,
     /// Those that came from `--sprout-key-file`. They carry no creation
     /// time, so the skip decision must see them apart from the wallet's own.
-    from_key_file: Vec<[u8; 32]>,
+    from_key_file: SecretSproutKeys,
 }
 
 fn collect_sprout_scan_keys(
@@ -1146,11 +1222,12 @@ fn collect_sprout_scan_keys(
 ) -> Result<SproutScanKeys> {
     use secrecy::ExposeSecret;
 
-    let mut keys: Vec<[u8; 32]> = Vec::new();
+    let mut from_file_values = secrecy::zeroize::Zeroizing::new(Vec::<[u8; 32]>::new());
 
     if let Some(path) = key_file {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let text = read_secret_text_file(path)?;
+        let text = text.as_str()?;
+        from_file_values.reserve_exact(text.lines().count());
         for (index, line) in text.lines().enumerate() {
             let line = line.trim();
             // Blank lines and `#` comments, so a user can annotate which key
@@ -1160,16 +1237,20 @@ fn collect_sprout_scan_keys(
             }
             let key = argos_core::sprout_key::decode_sprout_spending_key(line, network)
                 .with_context(|| format!("line {} of {}", index + 1, path.display()))?;
-            keys.push(key);
+            from_file_values.push(key);
         }
     }
 
-    let from_key_file = keys.clone();
-
+    let from_key_file = SecretSproutKeys::new(from_file_values.to_vec());
+    // Allocate the combined set once. Reallocating a Vec after it contains
+    // keys can strand the old allocation without a chance to wipe it.
+    let wallet_len = wallet.map_or(0, |wallet| wallet.sprout.len());
+    let mut keys = secrecy::zeroize::Zeroizing::new(Vec::<[u8; 32]>::with_capacity(
+        from_file_values.len() + wallet_len,
+    ));
+    keys.extend_from_slice(&from_file_values);
     if let Some(wallet) = wallet {
-        for key in &wallet.sprout {
-            keys.push(*key.a_sk.expose_secret());
-        }
+        keys.extend(wallet.sprout.iter().map(|key| *key.a_sk.expose_secret()));
     }
 
     // A wallet listing the same address twice, or a key file repeating one,
@@ -1184,7 +1265,7 @@ fn collect_sprout_scan_keys(
         );
     }
     Ok(SproutScanKeys {
-        all: keys,
+        all: SecretSproutKeys::new(std::mem::take(&mut *keys)),
         from_key_file,
     })
 }
@@ -1615,14 +1696,14 @@ async fn recover_with_scan(
             argos_core::sprout_scan_run::wallet_scan_notice_offline(
                 data_dir,
                 network.into(),
-                &spending_keys,
+                spending_keys.as_slice(),
             ),
         ),
         ScanEvidence::Verify(peers) => {
             argos_core::sprout_scan_run::chain_spends_for_wallet(
                 data_dir,
                 network.into(),
-                &spending_keys,
+                spending_keys.as_slice(),
                 peers,
             )
             .await
@@ -1638,12 +1719,11 @@ async fn recover_with_scan(
 
 /// The wallet file's Sprout spending keys, in the form the scan checkpoint
 /// and the sweep journal are keyed by.
-fn wallet_sprout_keys(keys: &ImportedKeys) -> Vec<[u8; 32]> {
+fn wallet_sprout_keys(keys: &ImportedKeys) -> SecretSproutKeys {
     use secrecy::ExposeSecret;
-    keys.sprout
-        .iter()
-        .map(|k| *k.a_sk.expose_secret())
-        .collect()
+    let mut spending_keys = Vec::with_capacity(keys.sprout.len());
+    spending_keys.extend(keys.sprout.iter().map(|k| *k.a_sk.expose_secret()));
+    SecretSproutKeys::new(spending_keys)
 }
 
 /// A txid as explorers show it: byte-reversed hex.
@@ -2077,8 +2157,11 @@ async fn print_sprout_inspection(
         // proposition entirely and is quoted as such.
         let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Offline).await;
         let spending_keys = wallet_sprout_keys(keys);
-        let journal =
-            argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
+        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+            data_dir,
+            spending_keys.as_slice(),
+            network,
+        );
         let outpoints = recovered
             .notes
             .iter()
@@ -2577,7 +2660,7 @@ async fn main() -> Result<()> {
         )?;
         let plan = sprout_scan_plan(
             wallet_keys.as_ref(),
-            &from_key_file,
+            from_key_file.as_slice(),
             network,
             cli.birthday,
             cli.no_birthday_skip,
@@ -2593,7 +2676,7 @@ async fn main() -> Result<()> {
             );
         }
         return scan_sprout(
-            &keys,
+            keys.as_slice(),
             network,
             &cli.lightwalletd_url,
             &cli.confirmation_source,
@@ -3204,18 +3287,20 @@ fn load_seed_phrase(seed_file: Option<PathBuf>) -> Result<SecretString> {
             bail!("seed file {} is not a regular file", path.display());
         }
         validate_seed_file_permissions(&path, &metadata)?;
-        let contents = fs::read_to_string(&path)
+        let contents = read_secret_text_file(&path)
             .with_context(|| format!("failed to read seed file {}", path.display()))?;
-        return Ok(SecretString::new(contents.trim().to_owned()));
+        return Ok(SecretString::new(contents.as_str()?.trim().to_owned()));
     }
 
-    let phrase = Password::new()
-        .with_prompt("Enter your seed phrase (12, 15, 18, 21 or 24 words)")
-        .allow_empty_password(false)
-        .interact()
-        .context("failed to read seed phrase from terminal")?;
+    let phrase = SecretString::new(
+        Password::new()
+            .with_prompt("Enter your seed phrase (12, 15, 18, 21 or 24 words)")
+            .allow_empty_password(false)
+            .interact()
+            .context("failed to read seed phrase from terminal")?,
+    );
 
-    Ok(SecretString::new(phrase.trim().to_owned()))
+    Ok(SecretString::new(phrase.expose_secret().trim().to_owned()))
 }
 
 fn validate_seed_file_permissions(path: &std::path::Path, metadata: &fs::Metadata) -> Result<()> {

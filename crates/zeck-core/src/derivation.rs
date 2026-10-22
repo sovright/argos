@@ -6,6 +6,7 @@ use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
 use zcash_transparent::keys::{
     AccountPrivKey, IncomingViewingKey, NonHardenedChildIndex, TransparentKeyScope,
 };
+use zeroize::Zeroizing;
 use zip32::AccountId;
 
 use crate::{
@@ -13,10 +14,29 @@ use crate::{
     models::{AddressScope, DerivedAccount, ZeckNetwork},
 };
 
-pub fn validate_mnemonic_words(words: &[String]) -> ZeckResult<()> {
+/// Validate word-at-a-time mnemonic input without creating an unprotected
+/// phrase copy. Callers own each word as a [`SecretString`]; normalization
+/// writes directly into a zeroizing buffer that is borrowed by `bip0039`.
+pub fn validate_mnemonic_words(words: &[SecretString]) -> ZeckResult<()> {
     let phrase = normalize_words(words)?;
-    let _ = Mnemonic::<English>::from_phrase(&phrase)
-        .map_err(|err| redact_mnemonic_error(&err, &phrase))?;
+    // Reject unknown English words before `bip0039` constructs its
+    // `UnknownWord(String)` error. The public error remains positional, and
+    // the dependency never receives an invalid word that it would copy into
+    // an ordinary error string.
+    if let Some(index) = words
+        .iter()
+        .position(|word| English::index_of(word.expose_secret().trim()).is_none())
+    {
+        return Err(ZeckError::InvalidMnemonic(format!(
+            "word {} is not in the BIP-39 wordlist",
+            index + 1
+        )));
+    }
+    // Every English BIP-39 word is normalized ASCII. This entry point avoids
+    // a second Unicode-normalization allocation and borrows the protected
+    // phrase directly; `Mnemonic` protects its own internal phrase copy.
+    let _ = Mnemonic::<English>::from_normalized_phrase(phrase.as_str())
+        .map_err(|err| redact_mnemonic_error(&err, phrase.as_str()))?;
     Ok(())
 }
 
@@ -308,7 +328,7 @@ fn redact_mnemonic_error(err: &Bip39Error, phrase: &str) -> ZeckError {
 /// of them.
 const MNEMONIC_WORD_COUNTS: [usize; 5] = [12, 15, 18, 21, 24];
 
-fn normalize_words(words: &[String]) -> ZeckResult<String> {
+fn normalize_words(words: &[SecretString]) -> ZeckResult<Zeroizing<String>> {
     if !MNEMONIC_WORD_COUNTS.contains(&words.len()) {
         return Err(ZeckError::InvalidMnemonic(format!(
             "expected 12, 15, 18, 21 or 24 words, got {}",
@@ -316,11 +336,19 @@ fn normalize_words(words: &[String]) -> ZeckResult<String> {
         )));
     }
 
-    Ok(words
+    let capacity = words
         .iter()
-        .map(|word| word.trim())
-        .collect::<Vec<_>>()
-        .join(" "))
+        .map(|word| word.expose_secret().len())
+        .sum::<usize>()
+        .saturating_add(words.len().saturating_sub(1));
+    let mut phrase = Zeroizing::new(String::with_capacity(capacity));
+    for (index, word) in words.iter().enumerate() {
+        if index != 0 {
+            phrase.push(' ');
+        }
+        phrase.push_str(word.expose_secret().trim());
+    }
+    Ok(phrase)
 }
 
 impl From<AddressScope> for TransparentKeyScope {
@@ -334,7 +362,8 @@ impl From<AddressScope> for TransparentKeyScope {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
+    use zeroize::Zeroizing;
 
     use super::*;
 
@@ -347,9 +376,24 @@ mod tests {
         SecretString::new(TEST_SEED.to_owned())
     }
 
+    fn protected_words(phrase: &str) -> Vec<SecretString> {
+        phrase
+            .split_whitespace()
+            .map(|word| SecretString::new(word.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn normalized_mnemonic_is_zeroizing_and_borrowed() {
+        let words = protected_words(TEST_SEED);
+
+        let phrase: Zeroizing<String> = normalize_words(&words).expect("valid word count");
+        assert_eq!(phrase.as_str(), TEST_SEED);
+    }
+
     #[test]
     fn valid_24_word_seed_validates() {
-        let words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
+        let words = protected_words(TEST_SEED);
         assert!(validate_mnemonic_words(&words).is_ok());
     }
 
@@ -364,7 +408,7 @@ mod tests {
     #[test]
     fn valid_12_and_18_word_seeds_validate() {
         for phrase in [TEST_SEED_12, TEST_SEED_18] {
-            let words: Vec<String> = phrase.split_whitespace().map(str::to_owned).collect();
+            let words = protected_words(phrase);
             assert!(validate_mnemonic_words(&words).is_ok(), "{phrase}");
         }
     }
@@ -386,28 +430,22 @@ mod tests {
 
     #[test]
     fn wrong_word_count_rejected() {
-        let words: Vec<String> = TEST_SEED
-            .split_whitespace()
-            .take(23)
-            .map(str::to_owned)
-            .collect();
+        let mut words = protected_words(TEST_SEED);
+        words.truncate(23);
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
 
         // 13 words: between two valid lengths.
-        let words: Vec<String> = TEST_SEED_12
-            .split_whitespace()
-            .chain(["abandon"])
-            .map(str::to_owned)
-            .collect();
+        let mut words = protected_words(TEST_SEED_12);
+        words.push(SecretString::new("abandon".to_owned()));
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }
 
     #[test]
     fn non_bip39_word_rejected() {
-        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
-        words[0] = "zzzznotaword".to_owned();
+        let mut words = protected_words(TEST_SEED);
+        words[0] = SecretString::new("zzzznotaword".to_owned());
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }
@@ -420,8 +458,8 @@ mod tests {
     fn unknown_word_error_reports_index_not_word() {
         // A near-miss typo: "abandom" is one edit from the valid word "abandon".
         let offending_word = "abandom";
-        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
-        words[6] = offending_word.to_owned(); // 7th word (1-based position 7)
+        let mut words = protected_words(TEST_SEED);
+        words[6] = SecretString::new(offending_word.to_owned()); // 7th word (1-based position 7)
 
         let err = validate_mnemonic_words(&words).unwrap_err();
         let ZeckError::InvalidMnemonic(message) = &err else {
@@ -464,8 +502,8 @@ mod tests {
 
     #[test]
     fn words_with_whitespace_padding_validated() {
-        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
-        words[0] = "  abandon  ".to_owned(); // leading/trailing spaces
+        let mut words = protected_words(TEST_SEED);
+        words[0] = SecretString::new("  abandon  ".to_owned()); // leading/trailing spaces
         assert!(validate_mnemonic_words(&words).is_ok());
     }
 
@@ -488,7 +526,7 @@ mod tests {
         // R-D6: "  " entries normalise to empty strings, which are not BIP-39
         // words. Counts as a non-BIP-39 input, not as "0 words" — the
         // validator's downstream check should still reject it cleanly.
-        let words: Vec<String> = vec!["   ".to_owned(); 24];
+        let words = vec![SecretString::new("   ".to_owned()); 24];
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }
@@ -498,12 +536,12 @@ mod tests {
         // R-D7: control characters inside a word are not BIP-39 wordlist
         // members. Should reject cleanly (no panic from utf-8 boundary
         // issues or from the bip0039 crate).
-        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
-        words[0] = "aband\x00on".to_owned(); // NUL inside the word
+        let mut words = protected_words(TEST_SEED);
+        words[0] = SecretString::new("aband\x00on".to_owned()); // NUL inside the word
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
 
-        words[0] = "aband\non".to_owned(); // LF inside the word
+        words[0] = SecretString::new("aband\non".to_owned()); // LF inside the word
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }
@@ -513,8 +551,8 @@ mod tests {
         // R-D8: defends the validator against absurd inputs from a faulty
         // form / CLI argument. 1 MB of letters in one slot must not crash
         // or hang.
-        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
-        words[0] = "a".repeat(1_000_000);
+        let mut words = protected_words(TEST_SEED);
+        words[0] = SecretString::new("a".repeat(1_000_000));
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }
@@ -529,9 +567,12 @@ mod tests {
         // Constructed by replacing the LAST word (which carries the checksum
         // bits) with a different valid wordlist member, breaking the
         // checksum but keeping all entries in the wordlist.
-        let mut words: Vec<String> = TEST_SEED.split_whitespace().map(str::to_owned).collect();
-        assert_eq!(words.last().map(String::as_str), Some("art"));
-        words[23] = "ability".to_owned(); // also in the wordlist; different bits
+        let mut words = protected_words(TEST_SEED);
+        assert_eq!(
+            words.last().map(|word| word.expose_secret().as_str()),
+            Some("art")
+        );
+        words[23] = SecretString::new("ability".to_owned()); // also in the wordlist; different bits
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }
@@ -540,7 +581,9 @@ mod tests {
     fn unicode_garbage_rejected_without_panic() {
         // R-D10: emoji and other multi-byte unicode aren't BIP-39 wordlist
         // members. Cleanly rejected, no utf-8 indexing bugs.
-        let words: Vec<String> = (0..24).map(|i| format!("🎉{i}")).collect();
+        let words: Vec<SecretString> = (0..24)
+            .map(|i| SecretString::new(format!("🎉{i}")))
+            .collect();
         let err = validate_mnemonic_words(&words).unwrap_err();
         assert!(matches!(err, ZeckError::InvalidMnemonic(_)), "got {err:?}");
     }

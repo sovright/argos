@@ -638,13 +638,15 @@ fn inspect_wallet_redacts_identifier_mismatch() {
 fn damaged_encryption_metadata_does_not_prompt_for_passphrase() {
     use argos_core::argos_wallet_import::{bdb, zcashd::records::parse_record_key};
     let mut bytes = std::fs::read(fixture("modern-encrypted.dat")).unwrap();
-    let value = bdb::walk(&bytes)
-        .unwrap()
+    let walked = bdb::walk(&bytes).unwrap();
+    let value = walked
         .records
-        .into_iter()
-        .find(|(key, _)| parse_record_key(key).is_some_and(|record| record.record_type == "mkey"))
+        .iter()
+        .find(|record| {
+            parse_record_key(&record.key).is_some_and(|parsed| parsed.record_type == "mkey")
+        })
         .unwrap()
-        .1;
+        .value();
     let offset = bytes
         .windows(value.len())
         .position(|window| window == value)
