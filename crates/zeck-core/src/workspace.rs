@@ -833,8 +833,17 @@ pub(crate) fn open_wallet_connection_read_only(
     open_authorized_wallet_connection(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        false,
-        |_, _| Ok(()),
+        true,
+        |connection, _| {
+            connection.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
+            // A read-only WAL connection can lazily create `-shm` on its
+            // first schema read. Force that open while the pre-created exact
+            // WAL/SHM objects are still retained by private authority.
+            let mut statement = connection.prepare("PRAGMA table_list")?;
+            let mut rows = statement.query([])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        },
     )
 }
 
@@ -2870,6 +2879,46 @@ mod tests {
             .query_row("SELECT value FROM held_open", [], |row| row.get(0))
             .expect("read while writer remains live");
         assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn runtime_read_only_connection_preserves_private_wal_sidecars() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let writer = super::open_tuned_wallet_connection(&path).expect("open writer connection");
+        writer
+            .execute_batch(
+                "CREATE TABLE read_only_guard(value INTEGER); \
+                 INSERT INTO read_only_guard VALUES (7);",
+            )
+            .expect("initialize through writer");
+        drop(writer);
+
+        let reader = super::open_wallet_connection_read_only(&path)
+            .expect("open authenticated read-only connection");
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM read_only_guard", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read initialized wallet"),
+            7
+        );
+        drop(reader);
+
+        let parent =
+            crate::private_fs::open_private_sqlite_parent(path.parent().expect("database parent"))
+                .expect("open private database parent");
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.exists() {
+                crate::private_fs::verify_private_child_file(&parent, &sidecar)
+                    .expect("surviving read-only sidecar must remain exact-private");
+            }
+        }
+        super::open_tuned_wallet_connection(&path)
+            .expect("writer must reopen after authenticated read-only use");
     }
 
     #[cfg(unix)]

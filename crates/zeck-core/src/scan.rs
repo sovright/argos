@@ -5292,8 +5292,8 @@ mod tests {
             };
             let params = consensus_network(ZeckNetwork::Mainnet);
             let tip = start + count - 1;
-            let mut wallet_db =
-                WalletDb::for_path(path, params, SystemClock, rand_core::OsRng).expect("wallet_db");
+            let mut wallet_db = crate::workspace::open_wallet_db(path, params)
+                .expect("open authorized wallet database");
             wallet_db.put_sapling_subtree_roots(0, &[]).unwrap();
             wallet_db.put_orchard_subtree_roots(0, &[]).unwrap();
             wallet_db
