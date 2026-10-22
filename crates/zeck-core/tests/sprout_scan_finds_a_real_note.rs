@@ -39,7 +39,8 @@ async fn a_scan_finds_a_note_it_was_never_told_about() {
     // ── Now scan, knowing only the spending key ───────────────────────────
     let dir = std::env::temp_dir().join("argos-scan-e2e");
     let _ = std::fs::remove_dir_all(&dir);
-    let checkpoint = sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+    let checkpoint =
+        sprout_scan_run::checkpoint_path_for_network(&dir, &[a_sk], P2pNetwork::Regtest);
 
     let started = std::time::Instant::now();
     let result = sprout_scan_run::run_sprout_scan(
@@ -140,7 +141,8 @@ async fn a_scan_finds_a_note_it_was_never_told_about() {
     for (bound, expect_found) in [(shield_height, true), (shield_height + 1, false)] {
         let dir = std::env::temp_dir().join(format!("argos-scan-e2e-bound-{bound}"));
         let _ = std::fs::remove_dir_all(&dir);
-        let checkpoint = sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let checkpoint =
+            sprout_scan_run::checkpoint_path_for_network(&dir, &[a_sk], P2pNetwork::Regtest);
         let bounded = sprout_scan_run::run_sprout_scan_with_decrypt_from(
             &[a_sk],
             P2pNetwork::Regtest,
