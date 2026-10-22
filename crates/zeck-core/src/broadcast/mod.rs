@@ -17,10 +17,13 @@
 //!   execution after restart. Unknown is promoted to Pending only on
 //!   acceptance or positive presence, never on absence or contested evidence.
 //! - `Mined` needs an independent pair of operator-labelled sources agreeing on
-//!   block and height; one operator yields `MinedSingleSource`, which lets the
-//!   recovery continue but never says the source may be discarded. Discarding
-//!   also needs [`MIN_DISCARD_CONFIRMATIONS`]. Lost canonical evidence demotes
-//!   a Mined record.
+//!   block and height; one operator yields `MinedSingleSource`, which resolves
+//!   the record for a new review and later legs but never says the source may
+//!   be discarded. Discarding also needs [`MIN_DISCARD_CONFIRMATIONS`]. A
+//!   mined record is demoted only by a positive reorg, absence, or mempool
+//!   observation; unavailable or contested evidence leaves it mined.
+//! - `Expired` needs one labelled source reporting absence past the expiry
+//!   height plus [`EXPIRY_MARGIN_BLOCKS`]; an expiry height of 0 never expires.
 //! - A rejected new transition appends nothing, so invalid input cannot poison
 //!   the journal; replay of older event shapes stays conservative.
 
