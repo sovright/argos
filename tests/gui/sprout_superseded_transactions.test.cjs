@@ -72,3 +72,32 @@ test("a superseded expiry alone is not counted as needing recovery", () => {
   vm.runInContext("renderSproutSweepReport(report, { list, statusId: 'status' })", h.context);
   assert.match(h.$("status").textContent, /^1 transaction\(s\) need recovery/);
 });
+
+test("a superseded expiry does not hold back the all-mined result for its replacement", () => {
+  const h = harness();
+  const list = element();
+  h.context.list = list;
+  h.context.report = {
+    ...report([
+      { txid: "old-tx", value_zatoshis: 7, state: "expired", mined_height: null, superseded: true },
+      { txid: "new-tx", value_zatoshis: 7, state: "mined", mined_height: 120, superseded: false },
+    ]),
+    mined_zatoshis: 7,
+    pending_zatoshis: 0,
+    fresh_all_mined: true,
+  };
+  vm.runInContext("renderSproutSweepReport(report, { list, statusId: 'status' })", h.context);
+  assert.match(h.$("status").textContent, /^✓ Mined 7\./);
+  assert.equal(h.$("status").kind, "success");
+});
+
+test("a superseded row never stands in for a mined one", () => {
+  const h = harness();
+  h.context.report = {
+    ...report([
+      { txid: "old-tx", value_zatoshis: 7, state: "expired", mined_height: null, superseded: true },
+    ]),
+    fresh_all_mined: true,
+  };
+  assert.equal(vm.runInContext("sproutSourceWarningMayClear(report)", h.context), false);
+});

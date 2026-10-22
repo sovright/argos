@@ -1010,7 +1010,11 @@ function noteSproutBroadcast(report, fromScan = false) {
 /// warning. The checks around the backend's aggregate flag fail closed if the
 /// payload is incomplete or internally inconsistent.
 function sproutSourceWarningMayClear(report) {
-  const transactions = report?.transactions;
+  // A superseded row is a replaced expired or rejected transaction: history,
+  // judged by its replacement. Only live rows must all be mined.
+  const transactions = Array.isArray(report?.transactions)
+    ? report.transactions.filter((transaction) => transaction?.superseded !== true)
+    : report?.transactions;
   return (
     report?.fresh_all_mined === true &&
     Array.isArray(transactions) &&

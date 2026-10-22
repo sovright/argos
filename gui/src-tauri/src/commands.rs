@@ -4439,9 +4439,10 @@ mod tests {
         let preview = super::sprout_sweep_preview(&[], &snapshot).unwrap();
         assert_eq!(preview.notes, 0);
         assert_eq!(preview.active.len(), 1);
+        // A 1.5.x journal entry is Pending: accepted, in flight, not final.
         assert_eq!(
             preview.active[0].state,
-            argos_core::TxLifecycleState::SubmissionUnknown
+            argos_core::TxLifecycleState::Pending
         );
         assert!(preview.mined.is_empty());
         let _ = std::fs::remove_dir_all(dir);

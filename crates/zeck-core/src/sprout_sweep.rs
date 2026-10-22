@@ -914,9 +914,9 @@ impl SproutSweepInventory<'_> {
                         amount(entry)
                     ));
                 }
-                // A snapshot loaded through the journal reducer cannot put
-                // these states in `active`. Keep the conservative warning if
-                // a future producer violates that invariant.
+                // MinedSingleSource lands here: one operator's report lets
+                // later notes continue but is not final. Mined without
+                // canonical evidence would too, should a producer emit it.
                 _ => lines.push(format!(
                     "Sprout transaction {txid}: current status is not independently final \
                      ({}). {KEEP_SOURCE}",

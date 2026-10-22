@@ -254,8 +254,8 @@
             <p>
               That checkpoint is spend-capable: it contains the Sprout spending keys, recovered
               note plaintexts, and witnesses. Protect it like the original wallet file. Argos
-              removes it after a successful sweep; remove any leftover only after confirming the
-              destination transaction.
+              does not remove it, even after a sweep; delete it yourself only once Argos reports
+              fresh canonical mined evidence for every Sprout transaction.
             </p>
             <p>
               Sprout funds can only land in Sapling. Argos accepts a bare Sapling address or the

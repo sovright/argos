@@ -410,15 +410,13 @@ fn cli_prints_mined_height_only_for_mined_evidence() {
 }
 
 #[test]
-fn v1_journal_is_reported_as_uncertain_not_already_swept() {
-    let output = sprout_lifecycle_output(
-        "lifecycle-v1-unknown",
-        TxLifecycleState::SubmissionUnknown,
-        None,
-    );
+fn v1_journal_is_reported_as_pending_not_already_swept() {
+    // A 1.5.x journal recorded only that a node accepted the transaction:
+    // pending, never final, and never "already swept".
+    let output = sprout_lifecycle_output("lifecycle-v1-unknown", TxLifecycleState::Pending, None);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("submission status unknown amount unknown"),
+        stdout.contains("broadcast/pending amount unknown"),
         "{stdout}"
     );
     assert!(
