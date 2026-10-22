@@ -1473,7 +1473,7 @@ pub async fn execute_wallet_sprout_sweep(
     // Consume the one-shot proposal first, then bind every checkpoint query,
     // proof and send to the same file object and bytes the user inspected.
     // The proposal's Arc remains valid even if the registry entry expires.
-    let _verified = reviewed_source.verify()?;
+    let _verified = state.wallet_reviews.verify_source(reviewed_source)?;
     execute_reviewed_sprout_sweep(app, intent).await
 }
 
@@ -3136,7 +3136,7 @@ mod tests {
         let replacement = path.with_extension("replacement");
         std::fs::write(&replacement, b"wallet-A").unwrap();
         std::fs::rename(replacement, path).unwrap();
-        assert!(source.verify().is_err());
+        assert!(registry.verify_source(&source).is_err());
 
         let code = include_str!("commands.rs");
         let execute = code
@@ -3144,7 +3144,7 @@ mod tests {
             .nth(1)
             .unwrap();
         assert!(
-            execute.find("reviewed_source.verify").unwrap()
+            execute.find("wallet_reviews.verify_source").unwrap()
                 < execute.find("execute_reviewed_sprout_sweep").unwrap(),
             "wallet verification must precede checkpoint, proving and send work"
         );

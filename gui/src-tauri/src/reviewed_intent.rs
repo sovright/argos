@@ -174,11 +174,25 @@ impl WalletReviewRegistry {
         String,
     > {
         let source = self.resolve(id)?;
+        self.verify_source(&source)
+            .map(|snapshot| (source, snapshot))
+    }
+
+    pub fn verify_source(
+        &self,
+        source: &Arc<ReviewedWalletSource>,
+    ) -> Result<argos_core::wallet_file::WalletFileSnapshot, String> {
         match source.verify() {
-            Ok(snapshot) => Ok((source, snapshot)),
+            Ok(snapshot) => Ok(snapshot),
             Err(err) => {
                 if let Ok(mut inner) = self.lock() {
-                    inner.reviews.remove(id);
+                    let is_matching = inner
+                        .reviews
+                        .get(&source.review_id)
+                        .is_some_and(|stored| Arc::ptr_eq(&stored.source, source));
+                    if is_matching {
+                        inner.reviews.remove(&source.review_id);
+                    }
                 }
                 Err(err)
             }
@@ -1215,6 +1229,20 @@ mod tests {
         std::fs::write(&path, b"wallet-B").unwrap();
         assert!(registry.verify(&id).is_err());
         assert!(registry.verify(&id).is_err(), "the rejected ID was revoked");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retained_source_mismatch_revokes_matching_review_id() {
+        let registry = WalletReviewRegistry::default();
+        let (dir, path, id) = reviewed_wallet(&registry, b"wallet-A");
+        let source = registry.resolve(&id).unwrap();
+        std::fs::write(&path, b"wallet-B").unwrap();
+        assert!(registry.verify_source(&source).is_err());
+        assert!(
+            registry.resolve(&id).is_err(),
+            "the rejected ID was revoked"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
