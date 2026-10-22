@@ -180,78 +180,87 @@ impl RecoveryWorkspace {
     /// path entirely, and costs nothing extra: the rewind already requeued
     /// the whole range from the birthday.
     ///
-    /// Returns the path of the new, initialized database. Any leftover from
-    /// an earlier interrupted rebuild is discarded first. The live
-    /// `wallet.sqlite` is untouched until [`Self::commit_wallet_db_rebuild`].
+    /// Returns the new, initialized database. Any leftover from an earlier
+    /// interrupted rebuild is discarded first. The live `wallet.sqlite` is
+    /// untouched until [`Self::commit_wallet_db_rebuild`]; a rebuild dropped
+    /// without being committed (an import failed, or the scan was
+    /// cancelled) deletes its files, since they hold the viewing keys.
     pub(crate) fn begin_wallet_db_rebuild(
         &self,
         network: ZeckNetwork,
         seed: &[u8; 64],
-    ) -> ZeckResult<PathBuf> {
+    ) -> ZeckResult<WalletDbRebuild> {
         let path = self.rebuilt_wallet_db_path();
         remove_sqlite_files(&path)?;
-        let mut wallet_db = open_wallet_db(&path, consensus_network(network))?;
+        // Armed before the first write, so even a failed init is cleaned up.
+        let rebuild = WalletDbRebuild {
+            path,
+            committed: false,
+        };
+        let mut wallet_db = open_wallet_db(&rebuild.path, consensus_network(network))?;
         init_wallet_db(&mut wallet_db, Some(SecretVec::new(seed.to_vec()))).map_err(|err| {
             ZeckError::Wallet(format!(
                 "initializing replacement wallet database {}: {err}",
-                path.display()
+                rebuild.path.display()
             ))
         })?;
         drop(wallet_db);
-        set_private_file_permissions(&path)?;
-        Ok(path)
+        set_private_file_permissions(&rebuild.path)?;
+        Ok(rebuild)
     }
 
     /// Atomically replace `wallet.sqlite` with a database built by
     /// [`Self::begin_wallet_db_rebuild`].
     ///
-    /// The caller must hold no open connection to either database. The new
-    /// database is folded back to a single file (WAL checkpointed and
-    /// removed) before the rename, and the old database's `-wal`/`-shm` are
-    /// removed after it, so a stale WAL belonging to the old database can
-    /// never be replayed against the new one. A crash before the rename
-    /// leaves the old database intact; after it, the new one.
-    pub(crate) fn commit_wallet_db_rebuild(&self, rebuilt: &Path) -> ZeckResult<()> {
+    /// The caller must hold no open connection to either database. Both
+    /// databases are folded back to a single file (WAL checkpointed and
+    /// removed) before the rename, and the commit is refused if the old one
+    /// cannot be, so no `-wal` belonging to the old database is ever beside
+    /// the new file for SQLite to replay into it after a crash. A crash
+    /// before the rename leaves the old database intact; after it, the new
+    /// one.
+    ///
+    /// Another process briefly holding `wallet.sqlite` (the launch-time
+    /// resume list, an indexer or antivirus scanner) is waited out with a
+    /// short bounded backoff; one that outlasts it fails the commit with the
+    /// old database unchanged, so resuming the scan rebuilds again.
+    pub(crate) fn commit_wallet_db_rebuild(&self, mut rebuild: WalletDbRebuild) -> ZeckResult<()> {
+        let rebuilt = rebuild.path.clone();
         if rebuilt != self.rebuilt_wallet_db_path() {
             return Err(ZeckError::Internal(format!(
                 "refusing to install {} as the wallet database: not this workspace's rebuild path",
                 rebuilt.display()
             )));
         }
-        collapse_to_single_file(rebuilt)?;
-        // Folding the old database too keeps it consistent should a crash land
-        // before the rename. Best-effort: a transient reader (the launch-time
-        // resume list) can hold it open, and the old contents are being
-        // discarded either way.
+        let in_use = |what: String| {
+            ZeckError::Storage(format!(
+                "could not replace the wallet database {}: it is in use by another program \
+                 ({what}). The existing database is unchanged; close anything that may have it \
+                 open and resume the scan, which rebuilds it again.",
+                self.wallet_db_path.display()
+            ))
+        };
+        collapse_to_single_file(&rebuilt)?;
         if self.wallet_db_path.exists() {
-            if let Err(err) = collapse_to_single_file(&self.wallet_db_path) {
-                tracing::warn!("could not checkpoint the wallet database being replaced: {err}");
-            }
+            retry_transient(
+                &COMMIT_RETRY_DELAYS,
+                |_| true,
+                || collapse_to_single_file(&self.wallet_db_path),
+            )
+            .map_err(|err| in_use(err.to_string()))?;
         }
-        fs::File::open(rebuilt)
+        // Folded, so these hold no committed data; remove whatever a reader
+        // may have left so nothing of the old database survives the rename.
+        remove_sqlite_sidecars(&self.wallet_db_path)?;
+        fs::File::open(&rebuilt)
             .and_then(|file| file.sync_all())
             .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", rebuilt.display())))?;
-        fs::rename(rebuilt, &self.wallet_db_path).map_err(|err| {
-            ZeckError::Storage(format!(
-                "replacing {} with {}: {err}",
-                self.wallet_db_path.display(),
-                rebuilt.display()
-            ))
-        })?;
-        // Anything left beside the new file belongs to the old database.
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = sqlite_sidecar(&self.wallet_db_path, suffix);
-            match fs::remove_file(&sidecar) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(ZeckError::Storage(format!(
-                        "removing stale {}: {err}",
-                        sidecar.display()
-                    )))
-                }
-            }
-        }
+        retry_transient(&COMMIT_RETRY_DELAYS, is_sharing_violation, || {
+            fs::rename(&rebuilt, &self.wallet_db_path)
+        })
+        .map_err(|err| in_use(format!("renaming {}: {err}", rebuilt.display())))?;
+        rebuild.committed = true;
+        remove_sqlite_sidecars(&self.wallet_db_path)?;
         // Persist the rename itself. Directories cannot be opened for sync on
         // Windows, where the rename is already durable on return.
         #[cfg(unix)]
@@ -260,6 +269,95 @@ impl RecoveryWorkspace {
             .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", self.root.display())))?;
         set_private_file_permissions(&self.wallet_db_path)
     }
+}
+
+/// A replacement wallet database under construction, from
+/// [`RecoveryWorkspace::begin_wallet_db_rebuild`]. Dropping it without a
+/// successful [`RecoveryWorkspace::commit_wallet_db_rebuild`] deletes its
+/// files (best-effort): they hold the same viewing keys as the live
+/// database.
+#[must_use = "an uncommitted rebuild is deleted when dropped"]
+pub(crate) struct WalletDbRebuild {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl WalletDbRebuild {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WalletDbRebuild {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(err) = remove_sqlite_files(&self.path) {
+                tracing::warn!("could not remove an abandoned wallet database rebuild: {err}");
+            }
+        }
+    }
+}
+
+/// Backoff for another process briefly holding the wallet database during
+/// a commit: about 1.5 seconds in all.
+const COMMIT_RETRY_DELAYS: [std::time::Duration; 5] = [
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(400),
+    std::time::Duration::from_millis(800),
+];
+
+/// Run `op`, retrying after each of `delays` while it fails with an error
+/// `transient` accepts. Returns the last error once the delays run out.
+fn retry_transient<T, E>(
+    delays: &[std::time::Duration],
+    mut transient: impl FnMut(&E) -> bool,
+    mut op: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut delays = delays.iter();
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) => match delays.next() {
+                Some(delay) if transient(&err) => std::thread::sleep(*delay),
+                _ => return Err(err),
+            },
+        }
+    }
+}
+
+/// Whether a file operation failed because another process has the file
+/// open. On Windows a rename over an open file fails with
+/// `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION` or
+/// `ERROR_LOCK_VIOLATION`.
+fn is_sharing_violation(err: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || (cfg!(windows)
+            && matches!(
+                err.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+            ))
+}
+
+/// Remove a SQLite database's `-wal`/`-shm`, tolerating either being absent.
+fn remove_sqlite_sidecars(path: &Path) -> ZeckResult<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar(path, suffix);
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(ZeckError::Storage(format!(
+                    "removing stale {}: {err}",
+                    sidecar.display()
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -1336,6 +1434,122 @@ mod tests {
                               useful legal winner thank year wave sausage \
                               worth useful legal winner thank year wave \
                               sausage worth title";
+
+    fn rebuild_fixture() -> (tempfile::TempDir, RecoveryWorkspace, [u8; 64]) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = runtime_config(SEED);
+        cfg.data_dir = dir.path().to_owned();
+        let workspace = RecoveryWorkspace::from_runtime(&cfg).unwrap();
+        let seed: [u8; 64] = mnemonic_seed(&SecretString::new(SEED.to_owned()))
+            .unwrap()
+            .expose_secret()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        workspace.initialize(ZeckNetwork::Mainnet, &seed).unwrap();
+        (dir, workspace, seed)
+    }
+
+    fn rebuild_leftovers(workspace: &RecoveryWorkspace) -> Vec<String> {
+        fs::read_dir(workspace.root())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("rebuild"))
+            .collect()
+    }
+
+    /// Review nit 3 on #279: a rebuild that is abandoned (cancelled, or an
+    /// import failed) must not leave a second copy of the viewing keys on
+    /// disk for a user who never resumes.
+    #[test]
+    fn an_abandoned_wallet_db_rebuild_removes_its_files() {
+        let (_dir, workspace, seed) = rebuild_fixture();
+        let rebuild = workspace
+            .begin_wallet_db_rebuild(ZeckNetwork::Mainnet, &seed)
+            .unwrap();
+        assert!(rebuild.path().exists());
+        drop(rebuild);
+        assert_eq!(rebuild_leftovers(&workspace), Vec::<String>::new());
+        assert!(
+            workspace.wallet_db_path().exists(),
+            "the live DB is untouched"
+        );
+    }
+
+    /// Review nit 2 on #279: when the old database cannot be folded to a
+    /// single file (another connection holds it), the commit must not go
+    /// ahead and leave the old `-wal` next to the new file, where a crash
+    /// would replay it. It fails clearly, keeps the old database, and
+    /// discards the rebuild.
+    #[test]
+    fn a_commit_while_the_old_wallet_db_is_held_open_keeps_it_and_says_why() {
+        let (_dir, workspace, seed) = rebuild_fixture();
+        let holder = open_wallet_db(
+            workspace.wallet_db_path(),
+            consensus_network(ZeckNetwork::Mainnet),
+        )
+        .unwrap();
+        // A reader mid-transaction, as the resume list's summary query is.
+        let reader = rusqlite::Connection::open(workspace.wallet_db_path()).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        let before = fs::read(workspace.wallet_db_path()).unwrap();
+
+        let rebuild = workspace
+            .begin_wallet_db_rebuild(ZeckNetwork::Mainnet, &seed)
+            .unwrap();
+        let err = workspace
+            .commit_wallet_db_rebuild(rebuild)
+            .expect_err("the commit must refuse while the old database is open");
+        let message = err.to_string();
+        assert!(
+            message.contains("in use") && message.contains("unchanged"),
+            "the error must say what happened: {message}"
+        );
+        assert_eq!(fs::read(workspace.wallet_db_path()).unwrap(), before);
+        assert_eq!(rebuild_leftovers(&workspace), Vec::<String>::new());
+        drop(reader);
+        drop(holder);
+    }
+
+    /// Review nit 1 on #279: a sharing violation (Windows, while an
+    /// indexer or the resume list holds the file) is retried with backoff;
+    /// anything else, or a violation that outlasts the retries, is returned.
+    #[test]
+    fn transient_file_errors_are_retried_a_bounded_number_of_times() {
+        use std::io::{Error, ErrorKind};
+        let delays = [std::time::Duration::from_millis(1); 3];
+
+        let mut calls = 0;
+        let result = retry_transient(&delays, is_sharing_violation, || {
+            calls += 1;
+            if calls < 3 {
+                Err(Error::from(ErrorKind::PermissionDenied))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_transient(&delays, is_sharing_violation, || {
+            calls += 1;
+            Err(Error::from(ErrorKind::PermissionDenied))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 4, "one attempt plus one per delay, then give up");
+
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_transient(&delays, is_sharing_violation, || {
+            calls += 1;
+            Err(Error::from(ErrorKind::NotFound))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "a non-transient error is not retried");
+    }
 
     #[test]
     fn identical_args_produce_identical_workspace_path() {
