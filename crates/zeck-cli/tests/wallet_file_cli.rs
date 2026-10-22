@@ -13,7 +13,10 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use argos_core::broadcast::{EndpointTxEvidence, TxObservation, TxObservationState};
+use argos_core::broadcast::{
+    BroadcastStore, EndpointTxEvidence, PreparedTransaction, SubmissionDisposition, TxObservation,
+    TxObservationState,
+};
 use argos_core::{TxLifecycleState, ZeckNetwork};
 use secrecy::ExposeSecret;
 use zcash_primitives::transaction::TxId;
@@ -92,9 +95,10 @@ fn wallet_network_mismatch_stops_before_lightwalletd() {
 #[test]
 fn reconcile_empty_registry_needs_no_wallet_or_network_probe() {
     let dir = tempfile::tempdir().unwrap();
+    let data_dir = artifact_data_dir(&dir);
     let out = argos(&[
         "--data-dir",
-        dir.path().to_str().unwrap(),
+        data_dir.to_str().unwrap(),
         "--lightwalletd-url",
         "http://127.0.0.1:1",
         "--accept-tos",
@@ -109,9 +113,10 @@ fn reconcile_empty_registry_needs_no_wallet_or_network_probe() {
 #[test]
 fn reconcile_unknown_txid_refuses_before_network_probe() {
     let dir = tempfile::tempdir().unwrap();
+    let data_dir = artifact_data_dir(&dir);
     let out = argos(&[
         "--data-dir",
-        dir.path().to_str().unwrap(),
+        data_dir.to_str().unwrap(),
         "--lightwalletd-url",
         "http://127.0.0.1:1",
         "--accept-tos",
@@ -132,7 +137,8 @@ fn reconcile_observes_every_stored_txid_or_only_the_selected_one() {
     use zcash_primitives::transaction::TxId;
 
     let dir = tempfile::tempdir().unwrap();
-    let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+    let data_dir = artifact_data_dir(&dir);
+    let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
     let mut log = guard.open_broadcast_log().unwrap();
     let first = TxId::from_bytes([0xA1; 32]);
     let second = TxId::from_bytes([0xB2; 32]);
@@ -156,7 +162,7 @@ fn reconcile_observes_every_stored_txid_or_only_the_selected_one() {
     drop(guard);
     let common = [
         "--data-dir",
-        dir.path().to_str().unwrap(),
+        data_dir.to_str().unwrap(),
         "--lightwalletd-url",
         "http://127.0.0.1:1",
         "--accept-tos",
@@ -175,7 +181,7 @@ fn reconcile_observes_every_stored_txid_or_only_the_selected_one() {
 
     let selected = argos(&[
         "--data-dir",
-        dir.path().to_str().unwrap(),
+        data_dir.to_str().unwrap(),
         "--lightwalletd-url",
         "http://127.0.0.1:1",
         "--accept-tos",
@@ -242,7 +248,12 @@ fn scan_routes_writer_wallet_seed_with_standalone_key_as_combined() {
 /// accidentally reaches an interactive prompt fails with a terminal error
 /// instead of hanging CI forever.
 fn argos(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_argos"))
+    let isolated = (!args.contains(&"--data-dir")).then(|| tempfile::tempdir().unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_argos"));
+    if let Some(dir) = isolated.as_ref() {
+        command.arg("--data-dir").arg(artifact_data_dir(dir));
+    }
+    command
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -250,7 +261,7 @@ fn argos(args: &[&str]) -> std::process::Output {
 }
 
 fn sprout_lifecycle_output(
-    tag: &str,
+    _tag: &str,
     state: TxLifecycleState,
     mined_height: Option<u32>,
 ) -> std::process::Output {
@@ -272,39 +283,43 @@ fn sprout_lifecycle_output(
         js_index: 0,
         output_index: 0,
     };
-    let note_txid = outpoint
-        .txid
-        .iter()
-        .rev()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let data_dir = PathBuf::from(scratch_dir(tag));
-    std::fs::create_dir_all(&data_dir).expect("create lifecycle test data dir");
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = artifact_data_dir(&dir);
     let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
         &data_dir,
         &spending_keys,
         ZeckNetwork::Mainnet,
     );
-    let txid = TxId::from_bytes([0x22; 32]);
-    std::fs::write(
-        journal.path(),
-        format!(
-            "{}:{}:{} {}\n",
-            note_txid, outpoint.js_index, outpoint.output_index, txid
-        ),
-    )
-    .expect("write legacy journal");
-    let mut snapshot = journal.load_or_migrate().expect("migrate legacy journal");
-    if state != TxLifecycleState::SubmissionUnknown {
-        let block_hash = vec![0x33; 32];
-        let observation = TxObservation {
-            state: match state {
-                TxLifecycleState::Pending => TxObservationState::PresentUnmined,
-                TxLifecycleState::Mined => TxObservationState::Mined,
-                other => panic!("unsupported test lifecycle state {other}"),
+    let mut snapshot = journal
+        .load_or_migrate()
+        .expect("create v4 journal authority");
+    let transaction = lifecycle_transaction();
+    journal
+        .scoped_store(
+            argos_core::sprout_sweep_journal::JournalNoteContext {
+                outpoint,
+                value_zatoshis: 1_000_000,
             },
-            mined_height,
-            expiry_height: None,
+            &mut snapshot,
+        )
+        .persist_prepared(&transaction)
+        .expect("persist v4 lifecycle transaction");
+    if state != TxLifecycleState::NotSubmitted {
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::SubmissionUnknown,
+                None,
+                None,
+            )
+            .expect("append unknown lifecycle transition");
+    }
+    if matches!(state, TxLifecycleState::Pending | TxLifecycleState::Mined) {
+        let pending = TxObservation {
+            state: TxObservationState::PresentUnmined,
+            mined_height: None,
+            expiry_height: transaction.expiry_height,
             primary_tip: Some(200),
             secondary_tip: Some(200),
             evidence: ["alpha", "beta"]
@@ -313,6 +328,36 @@ fn sprout_lifecycle_output(
                     operator_id: operator.to_owned(),
                     endpoint: format!("https://{operator}.example"),
                     tip_height: Some(200),
+                    reported_height: None,
+                    block_hash: None,
+                    tx_in_block: false,
+                })
+                .collect(),
+        };
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::Pending,
+                Some(&SubmissionDisposition::Accepted),
+                Some(&pending),
+            )
+            .expect("append pending lifecycle transition");
+    }
+    if state == TxLifecycleState::Mined {
+        let block_hash = vec![0x33; 32];
+        let observation = TxObservation {
+            state: TxObservationState::Mined,
+            mined_height,
+            expiry_height: transaction.expiry_height,
+            primary_tip: Some(300),
+            secondary_tip: Some(300),
+            evidence: ["alpha", "beta"]
+                .into_iter()
+                .map(|operator| EndpointTxEvidence {
+                    operator_id: operator.to_owned(),
+                    endpoint: format!("https://{operator}.example"),
+                    tip_height: Some(300),
                     reported_height: mined_height,
                     block_hash: mined_height.map(|_| block_hash.clone()),
                     tx_in_block: mined_height.is_some(),
@@ -320,7 +365,13 @@ fn sprout_lifecycle_output(
                 .collect(),
         };
         journal
-            .append_transition(&mut snapshot, txid, state, None, Some(&observation))
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                state,
+                None,
+                Some(&observation),
+            )
             .expect("append lifecycle transition");
     }
     argos(&[
@@ -330,6 +381,24 @@ fn sprout_lifecycle_output(
         data_dir.to_str().expect("UTF-8 data dir"),
         "inspect-wallet",
     ])
+}
+
+fn lifecycle_transaction() -> PreparedTransaction {
+    PreparedTransaction {
+        txid: TxId::from_bytes([
+            0x82, 0xc4, 0x41, 0x23, 0xee, 0x91, 0xd0, 0xdf, 0xc7, 0x26, 0x8c, 0x1a, 0xad, 0xa2,
+            0x91, 0x91, 0x5c, 0xf5, 0xfa, 0xec, 0xab, 0x7d, 0xa6, 0x07, 0xc3, 0xbb, 0x4e, 0xe2,
+            0xef, 0x75, 0x8c, 0xf8,
+        ]),
+        // Empty NU5 v5 transaction with expiry height 300. The journal
+        // validates these exact bytes against the txid before persisting.
+        raw_tx: vec![
+            5, 0, 0, 128, 10, 39, 167, 38, 180, 208, 214, 194, 0, 0, 0, 0, 44, 1, 0, 0, 0, 0, 0, 0,
+            0,
+        ],
+        fee_zatoshis: 10_000,
+        expiry_height: Some(300),
+    }
 }
 
 #[test]
@@ -365,10 +434,7 @@ fn cli_never_calls_pending_value_swept() {
         None,
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("broadcast/pending amount unknown"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("broadcast/pending "), "{stdout}");
     let lifecycle = stdout
         .lines()
         .filter(|line| {
@@ -398,7 +464,7 @@ fn cli_prints_mined_height_only_for_mined_evidence() {
         sprout_lifecycle_output("lifecycle-mined-height", TxLifecycleState::Mined, Some(123));
     let mined_stdout = String::from_utf8_lossy(&mined.stdout);
     assert!(
-        mined_stdout.contains("mined at height 123 amount unknown"),
+        mined_stdout.contains("mined at height 123 0.01000000 ZEC"),
         "{mined_stdout}"
     );
     assert!(
@@ -411,14 +477,67 @@ fn cli_prints_mined_height_only_for_mined_evidence() {
 
 #[test]
 fn v1_journal_is_reported_as_uncertain_not_already_swept() {
-    let output = sprout_lifecycle_output(
-        "lifecycle-v1-unknown",
-        TxLifecycleState::SubmissionUnknown,
-        None,
+    let wallet = fixture(SPROUT_PLAINTEXT);
+    let bytes = std::fs::read(&wallet).expect("fixture");
+    let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
+        .expect("Sprout fixture imports");
+    let spending_keys = keys
+        .sprout
+        .iter()
+        .map(|key| *key.a_sk.expose_secret())
+        .collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = artifact_data_dir(&dir);
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+        &data_dir,
+        &spending_keys,
+        ZeckNetwork::Mainnet,
     );
+    let mut snapshot = journal
+        .load_or_migrate()
+        .expect("create v4 journal authority");
+    let transaction = lifecycle_transaction();
+    let outpoint = argos_core::argos_wallet_import::keys::JsOutPoint {
+        txid: [0x11; 32],
+        js_index: 0,
+        output_index: 0,
+    };
+    journal
+        .scoped_store(
+            argos_core::sprout_sweep_journal::JournalNoteContext {
+                outpoint,
+                value_zatoshis: 1_000_000,
+            },
+            &mut snapshot,
+        )
+        .persist_prepared(&transaction)
+        .expect("create authenticated journal object");
+    std::fs::write(
+        journal.path(),
+        format!(
+            "{}:{}:{} {}\n",
+            outpoint
+                .txid
+                .iter()
+                .rev()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            outpoint.js_index,
+            outpoint.output_index,
+            transaction.txid
+        ),
+    )
+    .expect("replace authenticated journal content with legacy v1 fixture");
+    let output = argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("UTF-8 wallet path"),
+        "--data-dir",
+        data_dir.to_str().expect("UTF-8 data dir"),
+        "inspect-wallet",
+    ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("submission status unknown amount unknown"),
+        stdout.contains("legacy journal content has no mandatory v4 lineage boundary"),
         "{stdout}"
     );
     assert!(
@@ -426,16 +545,12 @@ fn v1_journal_is_reported_as_uncertain_not_already_swept() {
         "{stdout}"
     );
     assert!(
-        !stdout.contains("These were recovered from this file alone — no scan needed"),
-        "active-only journal was described as a newly recovered note: {stdout}"
-    );
-    assert!(
-        !stdout.contains("To move them:"),
-        "active-only journal offered a conflicting new sweep: {stdout}"
+        stdout.contains("preserve it unchanged for explicit reconciliation"),
+        "legacy journal refusal omitted preservation guidance: {stdout}"
     );
     assert!(
         !stdout.contains("Nothing is left to sweep"),
-        "orphan uncertain history was hidden by a terminal verdict: {stdout}"
+        "legacy history was hidden by a terminal verdict: {stdout}"
     );
 }
 
@@ -450,13 +565,31 @@ fn unreadable_journal_keeps_source_warning_and_suppresses_all_clear() {
         .iter()
         .map(|key| *key.a_sk.expose_secret())
         .collect::<Vec<_>>();
-    let data_dir = PathBuf::from(scratch_dir("unreadable-sprout-journal"));
-    std::fs::create_dir_all(&data_dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = artifact_data_dir(&dir);
     let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
         &data_dir,
         &spending_keys,
         ZeckNetwork::Mainnet,
     );
+    let mut snapshot = journal
+        .load_or_migrate()
+        .expect("create v4 journal authority");
+    let transaction = lifecycle_transaction();
+    journal
+        .scoped_store(
+            argos_core::sprout_sweep_journal::JournalNoteContext {
+                outpoint: argos_core::argos_wallet_import::keys::JsOutPoint {
+                    txid: [0x11; 32],
+                    js_index: 0,
+                    output_index: 0,
+                },
+                value_zatoshis: 1_000_000,
+            },
+            &mut snapshot,
+        )
+        .persist_prepared(&transaction)
+        .expect("create authenticated journal object");
     std::fs::write(journal.path(), b"{broken journal\n").unwrap();
 
     let output = argos(&[
@@ -1098,6 +1231,10 @@ fn scratch_dir(tag: &str) -> String {
         .to_owned()
 }
 
+fn artifact_data_dir(outer: &tempfile::TempDir) -> PathBuf {
+    outer.path().join("recovery-data")
+}
+
 /// Write a key file under the test's temp dir and hand back its path.
 fn key_file(name: &str, contents: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("argos-test-{name}"));
@@ -1412,9 +1549,9 @@ fn test_vector_sapling_address(dir: &std::path::Path) -> String {
 /// progress line must not claim a checkpoint exists before one is written.
 #[test]
 fn scan_sprout_refuses_an_unusable_server_before_scanning() {
-    let dir = std::env::temp_dir().join(format!("argos-sprout-url-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let destination = test_vector_sapling_address(&dir);
+    let outer = tempfile::tempdir().unwrap();
+    let dir = artifact_data_dir(&outer);
+    let destination = test_vector_sapling_address(outer.path());
     let wallet = fixture(SPROUT_PLAINTEXT);
 
     // Killed at a deadline rather than awaited: a build that does not refuse
@@ -1453,7 +1590,6 @@ fn scan_sprout_refuses_an_unusable_server_before_scanning() {
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().expect("piped"), &mut stderr)
         .expect("stderr");
-    let _ = std::fs::remove_dir_all(&dir);
     let status = status.unwrap_or_else(|| {
         panic!("scan-sprout started scanning instead of refusing the server:\n{stderr}")
     });
@@ -1569,13 +1705,13 @@ fn inspection_refuses_an_unverified_scan_of_the_same_keys() {
         .collect();
     assert!(!spending_keys.is_empty(), "the fixture holds Sprout keys");
 
-    let dir = scratch_dir("chain-spends");
-    std::fs::create_dir_all(&dir).unwrap();
+    let outer = tempfile::tempdir().unwrap();
+    let dir = artifact_data_dir(&outer);
     let mut scanner = argos_core::sprout_scan::SproutScanner::new(&spending_keys);
     scanner
         .scan_block_at(&[], [0xCD; 32], 2_000_000)
         .expect("an empty block");
-    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(dir.as_ref(), &spending_keys);
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &spending_keys);
     argos_core::sprout_scan_run::save_checkpoint(
         &scanner,
         argos_core::p2p::wire::P2pNetwork::Mainnet,
@@ -1587,14 +1723,15 @@ fn inspection_refuses_an_unverified_scan_of_the_same_keys() {
         "--wallet-file",
         path.to_str().unwrap(),
         "--data-dir",
-        &dir,
+        dir.to_str().unwrap(),
         "inspect-wallet",
     ]);
+    let empty_data_dir = outer.path().join("empty-recovery-data");
     let without_scan = argos(&[
         "--wallet-file",
         path.to_str().unwrap(),
         "--data-dir",
-        &scratch_dir("chain-spends-empty"),
+        empty_data_dir.to_str().unwrap(),
         "inspect-wallet",
     ]);
     let _ = std::fs::remove_file(&checkpoint);
@@ -1662,7 +1799,12 @@ fn a_scan_says_how_it_ended_on_stderr_when_stdout_is_captured() {
 /// Run `argos`, killing it at a deadline: a build that does not stop where
 /// the test expects goes on to dial public peers for hours.
 fn argos_with_deadline(args: &[&str], secs: u64) -> (Option<std::process::ExitStatus>, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_argos"))
+    let isolated = (!args.contains(&"--data-dir")).then(|| tempfile::tempdir().unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_argos"));
+    if let Some(dir) = isolated.as_ref() {
+        command.arg("--data-dir").arg(artifact_data_dir(dir));
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1759,9 +1901,9 @@ fn auto_detect_on_testnet_scans_from_the_start() {
 /// after. The fixture's Sprout key is dated, so on mainnet there is a skip.
 #[test]
 fn scan_sprout_states_the_skip_and_can_turn_it_off() {
-    let dir = std::env::temp_dir().join(format!("argos-sprout-skip-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let destination = test_vector_sapling_address(&dir);
+    let outer = tempfile::tempdir().unwrap();
+    let dir = artifact_data_dir(&outer);
+    let destination = test_vector_sapling_address(outer.path());
     let wallet = fixture(SPROUT_PLAINTEXT);
     let base = [
         "--wallet-file",
@@ -1806,7 +1948,6 @@ fn scan_sprout_states_the_skip_and_can_turn_it_off() {
         stderr.contains("Trial decryption starts at block 500000, the birthday given"),
         "a lower --birthday wins:\n{stderr}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Only scan-sprout skips trial decryption, so the flag anywhere else
@@ -1898,9 +2039,9 @@ fn scan_sprout_refuses_birthday_date_and_auto_detect() {
 /// chain-dependent fallback is tracked separately.
 #[test]
 fn scan_and_sweep_auto_detect_the_same_birthday() {
-    let dir = std::env::temp_dir().join(format!("argos-scan-sweep-bday-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let destination = test_vector_sapling_address(&dir);
+    let outer = tempfile::tempdir().unwrap();
+    let dir = artifact_data_dir(&outer);
+    let destination = test_vector_sapling_address(outer.path());
     let wallet = fixture(SPROUT_PLAINTEXT);
     let base = [
         "--wallet-file",
@@ -1929,7 +2070,6 @@ fn scan_and_sweep_auto_detect_the_same_birthday() {
     let (_, sweep_stderr) = argos_with_deadline(&sweep, 20);
 
     assert_eq!(birthday_line(&scan_stderr), birthday_line(&sweep_stderr));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Kristi's #1 on #260, CLI paste route: a `--sapling-key-file` key has no

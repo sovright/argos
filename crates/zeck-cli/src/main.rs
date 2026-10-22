@@ -4178,6 +4178,10 @@ fn powershell_quote(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn artifact_data_dir(outer: &Path) -> PathBuf {
+        outer.join("artifact-data")
+    }
+
     fn preview_note(value: u64, id: u8) -> argos_core::sprout_recovery::SpendableSproutNote {
         let a_sk = [0x42; 32];
         let address = argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk);
@@ -4203,6 +4207,51 @@ mod tests {
         }
     }
 
+    fn append_unknown_journal_entry(
+        journal: &argos_core::sprout_sweep::SweepJournal,
+        snapshot: &mut argos_core::sprout_sweep::SproutJournalSnapshot,
+        outpoint: argos_core::argos_wallet_import::keys::JsOutPoint,
+        value_zatoshis: u64,
+    ) {
+        use argos_core::broadcast::{
+            BroadcastStore as _, PreparedTransaction, SubmissionDisposition,
+        };
+        use zcash_primitives::transaction::TxId;
+
+        let transaction = PreparedTransaction {
+            txid: TxId::from_bytes([
+                0xb6, 0x87, 0xca, 0x64, 0xc4, 0x39, 0xe3, 0xc6, 0x0e, 0x5f, 0x72, 0x31, 0x13, 0x88,
+                0xd9, 0x8b, 0x54, 0x3e, 0xa7, 0xe0, 0xd1, 0xa4, 0x50, 0x61, 0x44, 0x99, 0xae, 0xbf,
+                0xc1, 0xd5, 0x78, 0x1a,
+            ]),
+            raw_tx: vec![
+                0x05, 0x00, 0x00, 0x80, 0x0a, 0x27, 0xa7, 0x26, 0xb4, 0xd0, 0xd6, 0xc2, 0x00, 0x00,
+                0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+            fee_zatoshis: 20_000,
+            expiry_height: Some(100),
+        };
+        journal
+            .scoped_store(
+                argos_core::sprout_sweep_journal::JournalNoteContext {
+                    outpoint,
+                    value_zatoshis,
+                },
+                snapshot,
+            )
+            .persist_prepared(&transaction)
+            .unwrap();
+        journal
+            .append_transition(
+                snapshot,
+                transaction.txid,
+                argos_core::TxLifecycleState::SubmissionUnknown,
+                Some(&SubmissionDisposition::AmbiguousTransport),
+                None,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn cli_preview_counts_only_executable_ready_notes_and_cannot_wrap() {
         let empty = argos_core::sprout_sweep::SproutJournalSnapshot::default();
@@ -4211,19 +4260,21 @@ mod tests {
         let dust_inventory = argos_core::sprout_sweep::classify_sprout_notes(&dust, &empty);
         assert_eq!(sprout_preview_plan(&dust_inventory).unwrap(), None);
 
-        let dir = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = artifact_data_dir(outer.path());
         let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
-            dir.path(),
+            &data_dir,
             &[[0x42; 32]],
             argos_core::ZeckNetwork::Mainnet,
         );
-        std::fs::write(
-            journal.path(),
-            format!("{}:0:0 {}\n", "11".repeat(32), "33".repeat(32)),
-        )
-        .unwrap();
-        let snapshot = journal.load_or_migrate().unwrap();
         let notes = [preview_note(1_000_000, 0x11), preview_note(2_000_000, 0x12)];
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        append_unknown_journal_entry(
+            &journal,
+            &mut snapshot,
+            notes[0].outpoint,
+            notes[0].note.value,
+        );
         let mixed = argos_core::sprout_sweep::classify_sprout_notes(&notes, &snapshot);
         let plan = sprout_preview_plan(&mixed)
             .unwrap()
@@ -4304,18 +4355,16 @@ mod tests {
 
     #[test]
     fn orphan_nonterminal_journal_blocks_nothing_left_verdict() {
-        let dir = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = artifact_data_dir(outer.path());
         let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
-            dir.path(),
+            &data_dir,
             &[[0x42; 32]],
             ZeckNetwork::Mainnet,
         );
-        std::fs::write(
-            journal.path(),
-            format!("{}:0:0 {}\n", "11".repeat(32), "22".repeat(32)),
-        )
-        .unwrap();
-        let snapshot = journal.load_or_migrate().unwrap();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let note = preview_note(1_000_000, 0x11);
+        append_unknown_journal_entry(&journal, &mut snapshot, note.outpoint, note.note.value);
         let recovered = argos_core::sprout_recovery::SproutRecovery {
             dust: vec![argos_core::argos_wallet_import::keys::JsOutPoint {
                 txid: [0x33; 32],
@@ -4600,10 +4649,11 @@ mod tests {
     async fn empty_transparent_scan_reports_prior_blocking_txid() {
         use argos_core::broadcast::{BroadcastStore, PreparedTransaction, SubmissionDisposition};
         use zcash_primitives::transaction::TxId;
-        let dir = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = artifact_data_dir(outer.path());
         let txid = TxId::from_bytes([9; 32]);
         let registry =
-            argos_core::service::NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet)
+            argos_core::service::NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet)
                 .unwrap();
         let mut log = registry.open_broadcast_log().unwrap();
         log.persist_prepared(&PreparedTransaction {
@@ -4624,7 +4674,7 @@ mod tests {
         drop(registry);
         let error = run_transparent_sweep(
             &[],
-            dir.path(),
+            &data_dir,
             ZeckNetwork::Mainnet,
             "http://127.0.0.1:1",
             "irrelevant",
@@ -4643,9 +4693,10 @@ mod tests {
         use argos_core::broadcast::{BroadcastStore, PreparedTransaction};
         use zcash_primitives::transaction::TxId;
 
-        let dir = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = artifact_data_dir(outer.path());
         let registry =
-            argos_core::service::NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet)
+            argos_core::service::NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet)
                 .unwrap();
         let mut log = registry.open_broadcast_log().unwrap();
         let txid = TxId::from_bytes([0xC1; 32]);
@@ -4663,7 +4714,7 @@ mod tests {
             Duration::from_secs(2),
             run_transparent_sweep(
                 &[],
-                dir.path(),
+                &data_dir,
                 ZeckNetwork::Mainnet,
                 "http://127.0.0.1:1",
                 "irrelevant",
@@ -4685,7 +4736,8 @@ mod tests {
         use secrecy::Secret;
         use zcash_primitives::transaction::TxId;
 
-        let dir = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = artifact_data_dir(outer.path());
         let make_keys = |include_second: bool| {
             let mut imported = ImportedKeys::default();
             imported.transparent.push(TransparentKey {
@@ -4705,8 +4757,12 @@ mod tests {
         let first_keys = make_keys(false);
         let overlapping_keys = make_keys(true);
         let txid = TxId::from_bytes([0xA5; 32]);
+        drop(
+            argos_core::service::NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Testnet)
+                .unwrap(),
+        );
         let legacy = argos_core::transparent_recovery::standalone_broadcast_log_path(
-            dir.path(),
+            &data_dir,
             &first_keys,
             ZeckNetwork::Testnet,
         );
@@ -4732,7 +4788,7 @@ mod tests {
             Duration::from_secs(2),
             run_transparent_sweep(
                 &overlapping_keys,
-                dir.path(),
+                &data_dir,
                 ZeckNetwork::Testnet,
                 "http://127.0.0.1:1",
                 "irrelevant",
@@ -4752,7 +4808,8 @@ mod tests {
         use argos_core::argos_wallet_import::keys::{Provenance, TransparentKey};
         use secrecy::Secret;
 
-        let dir = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = artifact_data_dir(outer.path());
         let mut imported = ImportedKeys::default();
         imported.transparent.push(TransparentKey {
             secret: Secret::new([0x41; 32]),
@@ -4760,8 +4817,12 @@ mod tests {
             created_at: None,
         });
         let keys = imported_transparent_keys(&imported).unwrap();
+        drop(
+            argos_core::service::NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Testnet)
+                .unwrap(),
+        );
         let legacy_path = argos_core::transparent_recovery::standalone_broadcast_log_path(
-            dir.path(),
+            &data_dir,
             &keys,
             ZeckNetwork::Testnet,
         );
@@ -4773,7 +4834,7 @@ mod tests {
             Duration::from_secs(2),
             run_transparent_sweep(
                 &keys,
-                dir.path(),
+                &data_dir,
                 ZeckNetwork::Testnet,
                 "http://127.0.0.1:1",
                 "irrelevant",
