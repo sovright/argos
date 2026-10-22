@@ -103,6 +103,8 @@ jobs:
           cargo test -p argos-core retained_registry_handles_deny_parent_and_sidecar_replacement --target x86_64-pc-windows-msvc
           cargo test -p argos-core sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core workspace::tests::listing_wallet_connection_is_immutable_and_query_only --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core workspace::tests::listing_reads_an_initialized_trusted_workspace_without_mutation --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core service::propose_workspace_guard_tests::restart_restores_tombstone_and_requires_new_scan_before_deletion --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation --target x86_64-pc-windows-msvc -- --exact
