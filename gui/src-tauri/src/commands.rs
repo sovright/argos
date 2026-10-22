@@ -1845,6 +1845,16 @@ fn summary_nu7_warning(sprout_keys: usize, network_name: &str) -> String {
     argos_core::sprout_sweep::nu7_recovery_warning(network_from(network_name))
 }
 
+/// The completion screen's summary, next steps, donation line, and status
+/// labels, from the same rules the CLI prints. Stateless: the frontend calls
+/// it again whenever a reconciliation changes a displayed row.
+#[tauri::command]
+pub fn sweep_completion_guidance(
+    input: argos_core::sweep_guidance::CompletionGuidanceInput,
+) -> argos_core::sweep_guidance::CompletionGuidance {
+    argos_core::sweep_guidance::completion_guidance(&input)
+}
+
 /// The NU7 warning text, re-fetched by the frontend when the network picker
 /// changes after a wallet was opened, and after a Sprout sweep broadcast
 /// (`broadcast`), when the advice becomes "confirm it is mined".
@@ -2720,6 +2730,38 @@ mod tests {
 
     /// PR #263 review items 2 and 3: the GUI re-fetches the warning when the
     /// network changes, and after a broadcast switches to the mining wording.
+    #[test]
+    fn completion_guidance_command_reads_the_frontend_shape() {
+        let input = serde_json::from_value(serde_json::json!({
+            "transactions": [
+                { "status": "mined", "safe_to_discard": true },
+                { "status": "submission_unknown" }
+            ],
+            "skipped_accounts": 0,
+            "follow_up_review_required": false,
+            "error": null,
+            "status_only": false,
+            "donation_requested": true,
+            "donated_zatoshis": 0,
+            "donation_note": null
+        }))
+        .unwrap();
+        let guidance = super::sweep_completion_guidance(input);
+        assert!(!guidance.recovery_complete);
+        assert_eq!(guidance.status_labels.len(), 2);
+        assert!(guidance.summary.contains("may already have moved"));
+        let json = serde_json::to_value(&guidance).unwrap();
+        for field in [
+            "recovery_complete",
+            "summary",
+            "next_steps",
+            "donation",
+            "status_labels",
+        ] {
+            assert!(json.get(field).is_some(), "{field}");
+        }
+    }
+
     #[test]
     fn sprout_nu7_warning_command_picks_network_and_broadcast_wording() {
         let before = sprout_nu7_warning("testnet".into(), false);
