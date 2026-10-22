@@ -118,8 +118,7 @@ jobs:
           & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::restart_restores_tombstone_and_a_new_scan_may_delete_it
           & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing
           & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation
-          cargo test -p argos-core separate_connection_lock_blocks_migration_and_append --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $exact -Package argos-core -TestName sprout_sweep_journal::tests::separate_connection_lock_blocks_load_and_append
           & $exact -Package argos-core -TestName birthday::tests::probe_guard_retires_active_authority_before_removing_container
           & $exact -Package argos-core -TestName birthday::tests::probe_guard_cleans_active_authority_during_unwind
           & $exact -Package argos-core -TestName birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_marker_before_secret
@@ -196,7 +195,7 @@ jobs:
           cargo test -p argos-core quarantine_swap_after_verification_preserves_the_sentinel
           cargo test -p argos-core registry_log_refuses_replaced_parent_without_touching_replacement
           cargo test -p argos-core registry_log_refuses_replaced_sidecar_without_touching_registry
-          cargo test -p argos-core separate_connection_lock_blocks_migration_and_append
+          cargo test -p argos-core separate_connection_lock_blocks_load_and_append
 
   test:
     name: Cargo test

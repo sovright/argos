@@ -7480,7 +7480,7 @@ mod propose_workspace_guard_tests {
     use secrecy::Secret;
 
     fn artifact_data_dir(outer: &tempfile::TempDir) -> std::path::PathBuf {
-        outer.path().join("recovery-data")
+        outer.path().join("publication/recovery-data")
     }
 
     #[cfg(unix)]

@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     fn private_test_directory(tempdir: &tempfile::TempDir) -> PathBuf {
-        let private_root = tempdir.path().join("private-root");
+        let private_root = tempdir.path().join("publication/private-root");
         let workspace = private_root.join("birthday-1/auto-gap-20");
         let database = workspace.join("wallet.sqlite");
         crate::private_fs::ensure_private_workspace_lineage(&private_root, &workspace, &database)
@@ -2372,7 +2372,7 @@ mod tests {
     // `open_tuned_wallet_connection` gets WAL + NORMAL + busy-timeout.
 
     fn private_database_path(tempdir: &tempfile::TempDir) -> PathBuf {
-        let private_root = tempdir.path().join("private-root");
+        let private_root = tempdir.path().join("publication/private-root");
         let leaf = private_root.join("birthday-1/auto-gap-20");
         let database = leaf.join("wallet.sqlite");
         crate::private_fs::ensure_private_workspace_lineage(&private_root, &leaf, &database)

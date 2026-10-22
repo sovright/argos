@@ -6054,7 +6054,7 @@ mod tests {
     #[test]
     fn windows_write_private_report_creates_private_and_refuses_untrusted_reuse() {
         let outer = unused_temp_dir("windows-private-report");
-        std::fs::create_dir(&outer).unwrap();
+        argos_core::private_fs::create_private_dir_all(&outer).unwrap();
         let private = outer.join("private-report.txt");
         super::write_private_report(&private, b"private").expect("create private report");
         assert_eq!(std::fs::read(&private).unwrap(), b"private");

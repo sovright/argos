@@ -2173,7 +2173,7 @@ mod tests {
     }
 
     fn artifact_data_dir(outer: &Path) -> PathBuf {
-        outer.join("recovery-data")
+        outer.join("publication/recovery-data")
     }
 
     fn checkpoint_fixture(
