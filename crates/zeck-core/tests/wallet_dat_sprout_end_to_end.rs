@@ -30,6 +30,9 @@
 use argos_core::{sprout, sprout_key, sprout_spend, sprout_witness};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 
+#[path = "common/sprout_wallet_sync.rs"]
+mod sprout_wallet_sync;
+
 const RPC: &str = "http://127.0.0.1:18242";
 const SHIELD_FEE: u64 = 15_000;
 const CONTAINER: &str = "argos-zcashd-sprout";
@@ -131,6 +134,10 @@ async fn zcashd_records_no_inbound_sprout_note_so_no_funded_fixture_exists() {
     };
 
     rpc("generate", serde_json::json!([110])).await;
+    sprout_wallet_sync::wait_for_spendable_balance(3.01, || {
+        rpc("getbalance", serde_json::json!(["*", 1]))
+    })
+    .await;
     let addr = argos_core::imported::encode_transparent_address(
         &t_address,
         argos_core::ZeckNetwork::Testnet,

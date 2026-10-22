@@ -34,6 +34,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "common/sprout_wallet_sync.rs"]
+mod sprout_wallet_sync;
+
 use argos_core::{sprout, sprout_spend, sprout_witness};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 
@@ -140,6 +143,10 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
 
     // Fund it. zcashd's own wallet pays a key we hold; Zebra cannot do this.
     rpc("generate", serde_json::json!([120])).await;
+    sprout_wallet_sync::wait_for_spendable_balance(5.01, || {
+        rpc("getbalance", serde_json::json!(["*", 1]))
+    })
+    .await;
     let addr = argos_core::imported::encode_transparent_address(
         &key.address,
         argos_core::ZeckNetwork::Testnet,

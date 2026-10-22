@@ -5,6 +5,9 @@
 use argos_core::{sprout, sprout_spend, sprout_witness};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 
+#[path = "sprout_wallet_sync.rs"]
+mod sprout_wallet_sync;
+
 const RPC: &str = "http://127.0.0.1:18242";
 pub const NODE_P2P: &str = "127.0.0.1:18344";
 const SHIELD_FEE: u64 = 15_000;
@@ -103,21 +106,10 @@ pub async fn plant_sprout_note(a_sk: [u8; 32]) -> PlantedSproutNote {
     // matured coinbase outputs. Sending immediately then races wallet sync
     // and intermittently reports "Insufficient funds" even though the chain
     // is already at the required height.
-    let balance_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let balance = rpc("getbalance", serde_json::json!([]))
-            .await
-            .as_f64()
-            .expect("numeric wallet balance");
-        if balance > 4.0 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < balance_deadline,
-            "zcashd wallet did not index enough matured coinbase funds within 30 seconds"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    sprout_wallet_sync::wait_for_spendable_balance(4.01, || {
+        rpc("getbalance", serde_json::json!(["*", 1]))
+    })
+    .await;
     let addr = argos_core::imported::encode_transparent_address(
         &address,
         argos_core::ZeckNetwork::Testnet,
