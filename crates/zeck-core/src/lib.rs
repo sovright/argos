@@ -54,9 +54,13 @@ pub mod sprout_scan_cost;
 // Drives a scan: connects, walks the chain, checkpoints. SproutScanner
 // itself is a passive consumer and knows nothing about the network.
 pub mod sprout_scan_run;
+pub mod sweep_guidance;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
+
+#[cfg(test)]
+mod test_support;
 
 pub use address::validate_destination_address;
 pub use birthday::{

@@ -44,7 +44,6 @@
 //! Gated entirely behind `cfg(feature = "argos-network")` — production builds
 //! never see this file.
 
-#![cfg(feature = "argos-network")]
 #![allow(dead_code)] // Some helpers (e.g. the `latency` knob) await follow-up wiring.
 
 use std::io::Cursor;

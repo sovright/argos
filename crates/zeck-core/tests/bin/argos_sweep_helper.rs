@@ -344,7 +344,6 @@ async fn main() {
         max_fee_zatoshis: None,
         donation_rate: None,
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
     let reviewed = service
         .propose_sweep(&handle, sweep_request)

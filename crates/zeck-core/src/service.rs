@@ -69,6 +69,19 @@ use crate::{
     workspace::{consensus_network, open_wallet_db, RecoveryWorkspace},
 };
 
+mod cleanup;
+mod confirmation;
+
+#[cfg(test)]
+use cleanup::cleanup_marker_path;
+use cleanup::{recover_interrupted_cleanup, refuse_interrupted_cleanup};
+use confirmation::{broadcast_transactions, chain_tip_height};
+#[cfg(test)]
+use confirmation::{
+    is_distinct_lightwalletd_endpoint, submit_and_confirm_batch, wait_for_confirmation,
+    ConfirmationResult,
+};
+
 const RECOVERY_MEMO_DEFAULT: &str = "Argos recovery";
 const SESSION_RETENTION_SECS: u64 = 300;
 /// Maximum iterations for the donation-split fee-convergence loop. The extra
@@ -362,7 +375,9 @@ fn canonical_proposal<NoteRef: std::fmt::Debug>(
                 .txout()
                 .write(&mut identity)
                 .expect("serializing TxOut into Vec cannot fail");
-            identity.extend_from_slice(format!("{:?}", input.recipient_address()).as_bytes());
+            identity.extend_from_slice(&crate::transparent_recovery::transparent_address_identity(
+                input.recipient_address(),
+            ));
             local_inputs.push(identity);
         }
         for input in step
@@ -373,7 +388,7 @@ fn canonical_proposal<NoteRef: std::fmt::Debug>(
             local_inputs.push(canonical_shielded_note_identity(
                 input.txid().as_ref(),
                 input.output_index(),
-                &format!("{:?}", input.note().pool()),
+                shielded_pool_tag(input.note().pool()),
                 u64::from(input.note().value()),
                 input.internal_note_id(),
             ));
@@ -388,10 +403,19 @@ fn canonical_proposal<NoteRef: std::fmt::Debug>(
     bytes
 }
 
+/// A stable tag for a shielded pool in canonical identities.
+fn shielded_pool_tag(pool: ShieldedPool) -> u8 {
+    match pool {
+        ShieldedPool::Sapling => 0,
+        ShieldedPool::Orchard => 1,
+        ShieldedPool::Ironwood => 2,
+    }
+}
+
 fn canonical_shielded_note_identity<NoteRef: std::fmt::Debug>(
     txid: &[u8],
     output_index: u16,
-    pool: &str,
+    pool: u8,
     value: u64,
     local_id: &NoteRef,
 ) -> Vec<u8> {
@@ -399,9 +423,12 @@ fn canonical_shielded_note_identity<NoteRef: std::fmt::Debug>(
     identity.extend_from_slice(&(txid.len() as u64).to_le_bytes());
     identity.extend_from_slice(txid);
     identity.extend_from_slice(&output_index.to_le_bytes());
-    identity.extend_from_slice(&(pool.len() as u64).to_le_bytes());
-    identity.extend_from_slice(pool.as_bytes());
+    identity.push(pool);
     identity.extend_from_slice(&value.to_le_bytes());
+    // The wallet-local note ID (zcash_client_sqlite's ReceivedNoteId) is an
+    // opaque upstream type with no byte accessor, so its Debug text is the
+    // only available encoding. The note is already pinned by txid, output
+    // index, pool, and value above; this only binds the local row too.
     let local_id = format!("{local_id:?}");
     identity.extend_from_slice(&(local_id.len() as u64).to_le_bytes());
     identity.extend_from_slice(local_id.as_bytes());
@@ -451,9 +478,9 @@ fn canonical_transparent_input(utxo: &crate::transparent_recovery::TransparentUt
     utxo.txout
         .write(&mut bytes)
         .expect("serializing a TxOut into Vec cannot fail");
-    let address = format!("{:?}", utxo.address);
-    bytes.extend_from_slice(&(address.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(address.as_bytes());
+    bytes.extend_from_slice(&crate::transparent_recovery::transparent_address_identity(
+        &utxo.address,
+    ));
     bytes
 }
 
@@ -573,6 +600,9 @@ struct ReviewedSweepIntent {
     quoted_transactions: Vec<ProposedTx>,
     quoted_proposal: Option<SweepProposal>,
     quoted_inputs: Vec<CanonicalLegInputs>,
+    /// Total fee of the quote the user reviewed. Set only by binding the
+    /// service's own quote; no caller input reaches it.
+    reviewed_fee_zatoshis: Option<u64>,
     /// Per-leg fees of the plan the user reviewed, captured at propose time.
     /// Execution compares each leg it actually builds against these, never
     /// against a fee recomputed from the execute-time plan.
@@ -580,8 +610,7 @@ struct ReviewedSweepIntent {
 }
 
 impl ReviewedSweepIntent {
-    fn capture(mut request: SweepRequest, session: &ScanSession, progress: &ScanProgress) -> Self {
-        request.reviewed_fee_zatoshis = None;
+    fn capture(request: SweepRequest, session: &ScanSession, progress: &ScanProgress) -> Self {
         Self {
             request,
             snapshot: SweepBalanceSnapshot::capture(session, progress),
@@ -589,6 +618,7 @@ impl ReviewedSweepIntent {
             quoted_transactions: Vec::new(),
             quoted_proposal: None,
             quoted_inputs: Vec::new(),
+            reviewed_fee_zatoshis: None,
             reviewed_leg_fees: None,
         }
     }
@@ -606,7 +636,7 @@ impl ReviewedSweepIntent {
     }
 
     fn bind_quote(&mut self, proposal: &SweepProposal) {
-        self.request.reviewed_fee_zatoshis = Some(proposal.total_fee_zatoshis);
+        self.reviewed_fee_zatoshis = Some(proposal.total_fee_zatoshis);
         self.request
             .max_fee_zatoshis
             .get_or_insert(proposal.total_fee_zatoshis);
@@ -616,7 +646,6 @@ impl ReviewedSweepIntent {
 
     fn require_current_fee(&self, current_fee_zatoshis: u64) -> ZeckResult<()> {
         let reviewed = self
-            .request
             .reviewed_fee_zatoshis
             .ok_or_else(|| ZeckError::StaleSweepProposal("reviewed fee is missing".to_owned()))?;
         if reviewed != current_fee_zatoshis {
@@ -727,12 +756,7 @@ impl ReviewedSweepIntent {
     /// while the split moves, and the split decides who signs what.
     fn validate_scan_state(&self, session: &ScanSession, state: &ScanTaskState) -> ZeckResult<()> {
         self.validate_state(session, &state.progress)?;
-        if self.authority.as_ref() != Some(&SweepAuthoritySnapshot::capture(state)) {
-            return Err(ZeckError::StaleSweepProposal(
-                "scan spend authority or standalone balance changed".to_owned(),
-            ));
-        }
-        Ok(())
+        self.require_current_authority(state)
     }
 }
 
@@ -745,6 +769,23 @@ tokio::task_local! {
     /// `attach_direct_sweep_leg`, so offline tests reach the review checks
     /// that follow it instead of a network error.
     static DIRECT_LEG_CHAIN: (u32, Vec<crate::transparent_recovery::TransparentUtxo>);
+}
+
+#[cfg(any(test, feature = "argos-network"))]
+tokio::task_local! {
+    /// A fixed pause between per-account broadcasts. Set only by
+    /// `execute_sweep_with_test_pause`, so the R-S29 crash test
+    /// (`argos-sweep-helper`) can SIGKILL in the gap deterministically.
+    static PAUSE_BETWEEN_BROADCASTS: std::time::Duration;
+}
+
+/// A no-op in released builds; inside `PAUSE_BETWEEN_BROADCASTS.scope` it
+/// sleeps for the scoped duration.
+async fn pause_between_broadcasts() {
+    #[cfg(any(test, feature = "argos-network"))]
+    if let Ok(pause) = PAUSE_BETWEEN_BROADCASTS.try_with(|pause| *pause) {
+        tokio::time::sleep(pause).await;
+    }
 }
 
 /// Store a reviewed intent and issue its id, but only if `current` scan state
@@ -862,250 +903,6 @@ fn canonical_workspace_identity(root: &std::path::Path) -> ZeckResult<std::path:
     }
 }
 
-fn cleanup_marker_path(root: &std::path::Path) -> ZeckResult<std::path::PathBuf> {
-    let name = root.file_name().ok_or_else(|| {
-        ZeckError::Storage(format!(
-            "workspace {} has no final component",
-            root.display()
-        ))
-    })?;
-    let mut marker = name.to_os_string();
-    marker.push(".cleanup-pending.json");
-    Ok(root.with_file_name(marker))
-}
-
-fn refuse_interrupted_cleanup(root: &std::path::Path) -> ZeckResult<()> {
-    let marker = cleanup_marker_path(root)?;
-    if marker.exists() {
-        return Err(ZeckError::ScanNotReady(format!(
-            "workspace cleanup is incomplete; inspect {} before using this wallet",
-            marker.display()
-        )));
-    }
-    // Older partial deletions may have left a tombstone without a marker.
-    // A fresh scan must not create a new empty journal beside that history.
-    if let Some(parent) = root.parent() {
-        let prefix = format!(
-            "{}.deleting-",
-            root.file_name().unwrap_or_default().to_string_lossy()
-        );
-        match std::fs::read_dir(parent) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry.map_err(|err| {
-                        ZeckError::Storage(format!(
-                            "reading workspace parent {}: {err}",
-                            parent.display()
-                        ))
-                    })?;
-                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                        return Err(ZeckError::ScanNotReady(format!(
-                            "workspace cleanup is incomplete; inspect {} before using this wallet",
-                            entry.path().display()
-                        )));
-                    }
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(ZeckError::Storage(format!(
-                    "reading workspace parent {}: {err}",
-                    parent.display()
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn create_cleanup_marker(
-    root: &std::path::Path,
-    tombstone: &std::path::Path,
-    broadcast_log: &DurableBroadcastLog,
-    outcome: Option<&SweepOutcome>,
-    local_journal_exists: bool,
-) -> ZeckResult<()> {
-    use sha2::{Digest, Sha256};
-    use std::io::Write;
-
-    let records = broadcast_log.records();
-    let mut receipts = Vec::new();
-    // A workspace deleted without a sweep has no receipts to bind.
-    for transaction in outcome.map_or(&[][..], |outcome| &outcome.transactions[..]) {
-        let txid = transaction.txid.as_deref().ok_or_else(|| {
-            ZeckError::Storage("cannot mark cleanup without a durable transaction ID".to_owned())
-        })?;
-        let record = records
-            .iter()
-            .find(|record| record.prepared.txid.to_string() == txid)
-            .ok_or_else(|| ZeckError::Storage(format!("cleanup receipt {txid} is missing")))?;
-        receipts.push(serde_json::json!({
-            "txid": txid,
-            "raw_sha256": format!("{:x}", Sha256::digest(&record.prepared.raw_tx)),
-        }));
-    }
-    let path = cleanup_marker_path(root)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).map_err(|err| {
-        ZeckError::Storage(format!("creating cleanup marker {}: {err}", path.display()))
-    })?;
-    let payload = serde_json::json!({
-        "workspace": root,
-        "tombstone": tombstone,
-        "receipts": receipts,
-        "local_journal_exists": local_journal_exists,
-    });
-    file.write_all(payload.to_string().as_bytes())
-        .map_err(|err| {
-            ZeckError::Storage(format!("writing cleanup marker {}: {err}", path.display()))
-        })?;
-    file.sync_all().map_err(|err| {
-        ZeckError::Storage(format!("syncing cleanup marker {}: {err}", path.display()))
-    })?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| {
-                ZeckError::Storage(format!(
-                    "syncing cleanup marker parent {}: {err}",
-                    parent.display()
-                ))
-            })?;
-    }
-    Ok(())
-}
-
-/// Resolve a crash between renaming and removing a workspace. This restores
-/// the old journal for inspection, but never resurrects the old GUI approval:
-/// the caller must start a fresh scan and review before another deletion.
-fn recover_interrupted_cleanup(
-    root: &std::path::Path,
-    operation_lock: &NetworkOperationGuard,
-) -> ZeckResult<()> {
-    use sha2::{Digest, Sha256};
-
-    let marker = cleanup_marker_path(root)?;
-    if !marker.exists() {
-        return refuse_interrupted_cleanup(root);
-    }
-    let manual = |why: &str| {
-        ZeckError::ScanNotReady(format!(
-            "workspace cleanup requires manual recovery at {}: {why}",
-            marker.display()
-        ))
-    };
-    let bytes = std::fs::read(&marker).map_err(|_| manual("cannot read cleanup marker"))?;
-    let payload: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| manual("invalid cleanup marker"))?;
-    if payload.get("workspace").and_then(|value| value.as_str()) != root.to_str() {
-        return Err(manual(&format!(
-            "workspace identity does not match (marker {:?}, current {})",
-            payload.get("workspace"),
-            root.display()
-        )));
-    }
-    let tombstone = payload
-        .get("tombstone")
-        .and_then(|value| value.as_str())
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| manual("missing tombstone path"))?;
-    let expected_prefix = format!(
-        "{}.deleting-",
-        root.file_name().unwrap_or_default().to_string_lossy()
-    );
-    if tombstone.parent() != root.parent()
-        || !tombstone
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(&expected_prefix))
-    {
-        return Err(manual("tombstone path does not match workspace"));
-    }
-    let receipts = payload
-        .get("receipts")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| manual("missing durable receipt list"))?;
-    let local_journal_exists = payload
-        .get("local_journal_exists")
-        .and_then(|value| value.as_bool())
-        .ok_or_else(|| manual("missing journal location"))?;
-    let expected = receipts
-        .iter()
-        .map(|receipt| {
-            let txid = receipt
-                .get("txid")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| manual("invalid receipt transaction ID"))?;
-            let digest = receipt
-                .get("raw_sha256")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| manual("invalid receipt digest"))?;
-            Ok((txid.to_owned(), digest.to_owned()))
-        })
-        .collect::<ZeckResult<Vec<_>>>()?;
-    if root.exists() && tombstone.exists() {
-        return Err(manual("both original workspace and tombstone exist"));
-    }
-    if !root.exists() {
-        if !tombstone.is_dir() || tombstone.is_symlink() {
-            return Err(manual("surviving tombstone is missing or unsafe"));
-        }
-        std::fs::rename(&tombstone, root)
-            .map_err(|_| manual("cannot restore surviving tombstone"))?;
-    }
-    if !root.is_dir() || root.is_symlink() {
-        return Err(manual("surviving workspace is missing or unsafe"));
-    }
-    let local_path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
-    if local_journal_exists && (!local_path.is_file() || local_path.is_symlink()) {
-        return Err(manual("surviving workspace journal is missing or unsafe"));
-    }
-    let registry = operation_lock
-        .open_broadcast_log_for(&local_path)
-        .map_err(|_| manual("surviving journal cannot be imported into the registry"))?;
-    let registry_records = registry.records();
-    for (txid, digest) in expected {
-        let Some(receipt) = registry_records
-            .iter()
-            .find(|record| record.prepared.txid.to_string() == txid)
-        else {
-            return Err(manual("registry receipt is missing"));
-        };
-        if format!("{:x}", Sha256::digest(&receipt.prepared.raw_tx)) != digest {
-            return Err(manual("registry raw transaction changed"));
-        }
-    }
-    // The registry owns and replays the exact surviving local source lock.
-    // Newer outcome receipts live only in the global registry and need not
-    // also appear in an older imported prefix.
-    drop(registry);
-    clear_cleanup_marker(root)?;
-    refuse_interrupted_cleanup(root)
-}
-
-fn clear_cleanup_marker(root: &std::path::Path) -> ZeckResult<()> {
-    let path = cleanup_marker_path(root)?;
-    std::fs::remove_file(&path).map_err(|err| {
-        ZeckError::Storage(format!("clearing cleanup marker {}: {err}", path.display()))
-    })?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| {
-                ZeckError::Storage(format!(
-                    "syncing cleanup marker parent {}: {err}",
-                    parent.display()
-                ))
-            })?;
-    }
-    Ok(())
-}
-
 /// Stable, cross-process exclusion for every workspace operation. It is
 /// separate from the broadcast journal lock because a sweep opens that lock
 /// after syncing and must not recursively acquire the same SQLite lock.
@@ -1184,56 +981,10 @@ impl NetworkOperationGuard {
         network_broadcast_log_path(&self.data_dir, self.network)
     }
 
-    /// Migrate every pre-registry journal while holding the network-wide
-    /// operation lock. Existing source locks remain held for the returned
-    /// log's lifetime, including sidecars whose JSONL has not appeared yet.
-    /// A failed lock or import stops the caller before signing or deletion.
+    /// Open the network registry. The caller already holds the network-wide
+    /// operation lock, so no other Argos operation can append concurrently.
     pub fn open_broadcast_log(&self) -> ZeckResult<DurableBroadcastLog> {
-        self.open_broadcast_log_with_current(None)
-    }
-
-    /// Also lock this operation's exact pre-registry workspace/key-set path,
-    /// even if no old process has created a sidecar or JSONL there yet.
-    pub fn open_broadcast_log_for(
-        &self,
-        current_legacy_path: &std::path::Path,
-    ) -> ZeckResult<DurableBroadcastLog> {
-        self.open_broadcast_log_with_current(Some(current_legacy_path))
-    }
-
-    fn open_broadcast_log_with_current(
-        &self,
-        current_legacy_path: Option<&std::path::Path>,
-    ) -> ZeckResult<DurableBroadcastLog> {
-        let mut registry = DurableBroadcastLog::open(self.broadcast_log_path()?)?;
-        let mut sources = discover_legacy_broadcast_logs(&self.data_dir, self.network)?;
-        if let Some(current_legacy_path) = current_legacy_path {
-            let parent = current_legacy_path.parent().ok_or_else(|| {
-                ZeckError::Storage(format!(
-                    "legacy log {} has no parent",
-                    current_legacy_path.display()
-                ))
-            })?;
-            let name = current_legacy_path.file_name().ok_or_else(|| {
-                ZeckError::Storage(format!(
-                    "legacy log {} has no file name",
-                    current_legacy_path.display()
-                ))
-            })?;
-            // Canonicalize the parent, not the file: the held-source check
-            // must still see and reject a symlink at the JSONL path itself.
-            sources.push(canonical_workspace_identity(parent)?.join(name));
-        }
-        sources.sort();
-        sources.dedup();
-        for path in sources {
-            if path.is_file() {
-                registry.import_legacy_log(&path)?;
-            } else {
-                registry.hold_legacy_source(&path)?;
-            }
-        }
-        Ok(registry)
+        DurableBroadcastLog::open(self.broadcast_log_path()?)
     }
 }
 
@@ -1251,91 +1002,6 @@ pub fn network_broadcast_log_path(
     network: crate::models::ZeckNetwork,
 ) -> ZeckResult<std::path::PathBuf> {
     Ok(network_registry_root(data_dir, network)?.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-}
-
-fn discover_legacy_broadcast_logs(
-    data_dir: &std::path::Path,
-    network: crate::models::ZeckNetwork,
-) -> ZeckResult<Vec<std::path::PathBuf>> {
-    let lock_suffix = format!(".{}.lock.sqlite", crate::broadcast::BROADCAST_LOG_FILE_NAME);
-    let network_root = canonical_workspace_identity(data_dir)?.join(network.label());
-    let entries = match std::fs::read_dir(&network_root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(ZeckError::Storage(format!(
-                "reading legacy workspace root {}: {err}",
-                network_root.display()
-            )));
-        }
-    };
-    let mut stack = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|err| {
-            ZeckError::Storage(format!(
-                "reading legacy workspace root {}: {err}",
-                network_root.display()
-            ))
-        })?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("workspace-") || name.starts_with("transparent-") {
-            stack.push(entry.path());
-        }
-    }
-    let mut journals = Vec::new();
-    while let Some(path) = stack.pop() {
-        let metadata = std::fs::symlink_metadata(&path).map_err(|err| {
-            ZeckError::Storage(format!(
-                "inspecting legacy workspace {}: {err}",
-                path.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(ZeckError::Storage(format!(
-                "refusing symlink in legacy workspace discovery: {}",
-                path.display()
-            )));
-        }
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(&path).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "reading legacy workspace {}: {err}",
-                    path.display()
-                ))
-            })? {
-                stack.push(
-                    entry
-                        .map_err(|err| {
-                            ZeckError::Storage(format!(
-                                "reading legacy workspace {}: {err}",
-                                path.display()
-                            ))
-                        })?
-                        .path(),
-                );
-            }
-        } else if metadata.is_file() {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    ZeckError::Storage(format!("invalid legacy source name {}", path.display()))
-                })?;
-            if name == crate::broadcast::BROADCAST_LOG_FILE_NAME {
-                journals.push(path);
-            } else if let Some(source_name) = name.strip_suffix(&lock_suffix) {
-                journals.push(
-                    path.parent()
-                        .expect("sidecar file has a parent")
-                        .join(source_name)
-                        .join(crate::broadcast::BROADCAST_LOG_FILE_NAME),
-                );
-            }
-        }
-    }
-    journals.sort();
-    Ok(journals)
 }
 
 impl RecoveryService {
@@ -1416,9 +1082,8 @@ impl RecoveryService {
             })?;
         let operation_lock = NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network)?;
         recover_interrupted_cleanup(&workspace_root, &operation_lock)?;
-        workspace.ensure_broadcast_log_directory()?;
-        let legacy_log_guards =
-            operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        // Refuse to start on a registry that cannot be replayed.
+        drop(operation_lock.open_broadcast_log()?);
 
         // Cancel any existing session targeting the same workspace to prevent
         // concurrent SQLite writers from locking each other out.
@@ -1460,7 +1125,6 @@ impl RecoveryService {
         let task = tokio::spawn(async move {
             let _workspace_guard = scan_guard;
             let _operation_lock = operation_lock;
-            let _legacy_log_guards = legacy_log_guards;
             // Acquire a power-management guard so the OS doesn't put the
             // machine to sleep mid-scan. Held for the entire scan task; the
             // Drop impl releases on completion, error, panic, or task abort.
@@ -1553,7 +1217,7 @@ impl RecoveryService {
     pub async fn propose_sweep(
         &self,
         handle: &ScanHandle,
-        mut request: SweepRequest,
+        request: SweepRequest,
     ) -> ZeckResult<ReviewedSweepProposal> {
         let session = self.session(handle).await?;
         let _workspace_guard = self
@@ -1563,8 +1227,7 @@ impl RecoveryService {
         let _operation_lock =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let global_log = _operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let global_log = _operation_lock.open_broadcast_log()?;
         if global_log.has_unresolved_history() {
             return Err(ZeckError::Broadcast(
                 "cannot review a new sweep while the network registry has unresolved prepared transaction history".to_owned(),
@@ -1669,7 +1332,6 @@ impl RecoveryService {
         }
 
         refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
-        request.reviewed_fee_zatoshis = None;
         let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
         let mut plan = build_exact_sweep_proposal(
             &progress,
@@ -1709,7 +1371,7 @@ impl RecoveryService {
         handle: &ScanHandle,
         proposal_id: &SweepProposalId,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, proposal_id, None).await
+        self.execute_sweep_inner(handle, proposal_id).await
     }
 
     /// Refresh every historical broadcast receipt for an active recovery
@@ -1740,8 +1402,7 @@ impl RecoveryService {
         let operation_guard =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let mut log = operation_guard.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let mut log = operation_guard.open_broadcast_log()?;
         let previous_states = log
             .records()
             .into_iter()
@@ -1830,8 +1491,7 @@ impl RecoveryService {
         let operation_guard =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let mut log = operation_guard.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let mut log = operation_guard.open_broadcast_log()?;
         let previous_states = log
             .records()
             .into_iter()
@@ -1863,8 +1523,7 @@ impl RecoveryService {
     /// Test-only sweep entrypoint that inserts a fixed pause between
     /// per-account broadcasts. Exists so R-S29 (`argos-sweep-helper`) can
     /// SIGKILL the subprocess deterministically in the gap between two
-    /// broadcasts; production builds compile this method out so the
-    /// pause-duration field is unreachable from any released binary.
+    /// broadcasts; production builds compile this method and the hook out.
     #[cfg(feature = "argos-network")]
     pub async fn execute_sweep_with_test_pause(
         &self,
@@ -1872,7 +1531,11 @@ impl RecoveryService {
         proposal_id: &SweepProposalId,
         pause_between_broadcasts: std::time::Duration,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, proposal_id, Some(pause_between_broadcasts))
+        PAUSE_BETWEEN_BROADCASTS
+            .scope(
+                pause_between_broadcasts,
+                self.execute_sweep_inner(handle, proposal_id),
+            )
             .await
     }
 
@@ -1880,7 +1543,6 @@ impl RecoveryService {
         &self,
         handle: &ScanHandle,
         proposal_id: &SweepProposalId,
-        pause_between_broadcasts: Option<std::time::Duration>,
     ) -> ZeckResult<SweepOutcome> {
         let session = self.session(handle).await?;
         let _workspace_guard = self
@@ -1890,16 +1552,14 @@ impl RecoveryService {
         let _operation_lock =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let global_log = _operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let global_log = _operation_lock.open_broadcast_log()?;
         if global_log.has_unresolved_history() {
             return Err(ZeckError::Broadcast(
                 "cannot start a new sweep while the network registry has unresolved prepared transaction history".to_owned(),
             ));
         }
-        // Per-leg signers reopen the registry. Release only that registry
-        // lock, retaining every legacy source lock through the entire route.
-        let _legacy_source_guards = global_log.into_legacy_source_guards();
+        // Per-leg signers reopen the registry under the held operation lock.
+        drop(global_log);
         if self
             .reconciliation_rescan_required
             .lock()
@@ -1930,9 +1590,7 @@ impl RecoveryService {
                 "workspace removal was interrupted; retry cleanup before sweeping".to_owned(),
             ));
         }
-        let outcome = self
-            .execute_sweep_locked(session, proposal_id, pause_between_broadcasts)
-            .await;
+        let outcome = self.execute_sweep_locked(session, proposal_id).await;
         if let Ok(ref completed) = outcome {
             self.last_sweep_outcomes
                 .lock()
@@ -1946,7 +1604,6 @@ impl RecoveryService {
         &self,
         session: SharedScanSession,
         proposal_id: &SweepProposalId,
-        pause_between_broadcasts: Option<std::time::Duration>,
     ) -> ZeckResult<SweepOutcome> {
         // The token is consumed while holding only the in-memory store lock.
         // No wallet, proving, or network operation runs under this lock.
@@ -2172,7 +1829,6 @@ impl RecoveryService {
             let hd_outcome = execute_sweep_for_session(
                 session,
                 request,
-                pause_between_broadcasts,
                 imported_fee,
                 quoted_transactions,
                 quoted_skipped,
@@ -2187,7 +1843,6 @@ impl RecoveryService {
         execute_sweep_for_session(
             session,
             request,
-            pause_between_broadcasts,
             0,
             quoted_transactions,
             quoted_skipped,
@@ -2196,226 +1851,6 @@ impl RecoveryService {
             exact_fees,
         )
         .await
-    }
-
-    /// Recursively delete the on-disk recovery workspace for a completed scan
-    /// and drop the session. Used by the GUI's post-recovery "Delete workspace"
-    /// action (threat-model T-L3).
-    ///
-    /// Returns the path that was deleted. Refuses to act on an in-flight scan
-    /// — call `cancel_scan` first if the user truly wants to discard mid-run.
-    ///
-    /// Caveat: on modern SSDs `remove_dir_all` is not a cryptographic wipe;
-    /// the filesystem and SSD controller may retain blocks until the cells
-    /// are overwritten or TRIM'd. UI callers should surface this honestly.
-    pub async fn delete_workspace(&self, handle: &ScanHandle) -> ZeckResult<std::path::PathBuf> {
-        let session = self.session(handle).await?;
-        let mut observer = LightwalletdTxObserver::new(
-            &session.runtime.lightwalletd_url,
-            &session.runtime.confirmation_sources,
-        )?;
-        self.delete_workspace_with_observer(handle, &mut observer)
-            .await
-    }
-
-    async fn delete_workspace_with_observer<O: TxObserver>(
-        &self,
-        handle: &ScanHandle,
-        observer: &mut O,
-    ) -> ZeckResult<std::path::PathBuf> {
-        let session = self.session(handle).await?;
-        let _workspace_guard = self
-            .workspace_gate(&session.workspace_root)
-            .try_lock_owned()
-            .map_err(|_| {
-                ZeckError::ScanNotReady(
-                    "cannot delete workspace while a scan or sweep is active".to_owned(),
-                )
-            })?;
-        let _operation_lock =
-            NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
-        if !self
-            .sessions
-            .read()
-            .await
-            .get(&handle.id)
-            .is_some_and(|current| Arc::ptr_eq(current, &session))
-        {
-            return Err(ZeckError::UnknownScanHandle);
-        }
-        let cleanup_retry = self
-            .cleanup_retry
-            .lock()
-            .await
-            .get(&session.workspace_root)
-            .cloned();
-        if cleanup_retry.is_none() {
-            refuse_interrupted_cleanup(&session.workspace_root)?;
-        }
-        if let Some(remaining) = cleanup_retry {
-            // Restore a surviving tombstone before inspecting any persisted
-            // state. `RecoveryWorkspace` paths then refer to the actual
-            // wallet and journal, rather than a fresh empty original path.
-            if remaining != session.workspace_root {
-                if session.workspace_root.exists() {
-                    return Err(ZeckError::Storage(format!(
-                        "cannot retry deletion while both {} and {} exist",
-                        session.workspace_root.display(),
-                        remaining.display()
-                    )));
-                }
-                std::fs::rename(&remaining, &session.workspace_root).map_err(|err| {
-                    ZeckError::Storage(format!(
-                        "restoring workspace {} for deletion retry: {err}",
-                        remaining.display()
-                    ))
-                })?;
-                self.cleanup_retry.lock().await.insert(
-                    session.workspace_root.clone(),
-                    session.workspace_root.clone(),
-                );
-            } else if !remaining.exists() {
-                return Err(ZeckError::Storage(format!(
-                    "cannot retry deletion because workspace {} is missing",
-                    remaining.display()
-                )));
-            }
-        }
-
-        // Refuse mid-scan to avoid tearing the SQLite write-ahead state out
-        // from under the running task. Callers can cancel first if they really
-        // mean it. A finished scan -- complete, cancelled or failed -- may be
-        // deleted with or without a sweep: spend authority lives in the
-        // source keys, not in this workspace.
-        {
-            let state = session.state.lock().await;
-            let phase = state.progress.phase;
-            if !matches!(
-                phase,
-                ScanPhase::Complete | ScanPhase::Cancelled | ScanPhase::Error
-            ) {
-                return Err(ZeckError::ScanNotReady(format!(
-                    "cannot delete workspace while scan is {phase:?}; cancel first",
-                )));
-            }
-        }
-
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        // Import and inspect the surviving workspace journal after a retry
-        // restored its actual path. The network registry (outside the
-        // workspace, so it survives deletion) is authoritative for all
-        // aliases; the local journal is also checked so a changed source
-        // cannot be silently ignored.
-        let local_path = workspace.broadcast_log_path();
-        let local_journal_exists = local_path.exists();
-        let mut broadcast_log = _operation_lock.open_broadcast_log_for(&local_path)?;
-        // The only refusal: a broadcast whose outcome is not yet resolved.
-        // Observe each once first, so a transaction that has since mined (by
-        // any operator), expired, or been rejected does not block. An
-        // observation failure leaves the record as it was. The registry is
-        // network-wide, so this conservatively includes broadcasts from
-        // other workspaces on the same network.
-        for record in broadcast_log.records() {
-            if record.state.is_resolved() {
-                continue;
-            }
-            let txid = record.prepared.txid;
-            let observed = observer
-                .observe(session.runtime.network, txid, record.prepared.expiry_height)
-                .await
-                .unwrap_or_else(|_| {
-                    crate::broadcast::observe_transaction(Vec::new(), record.prepared.expiry_height)
-                });
-            crate::reconciliation::record_observation(&mut broadcast_log, txid, &observed)?;
-        }
-        if let Some(record) = broadcast_log
-            .records()
-            .into_iter()
-            .find(|record| !record.state.is_resolved())
-        {
-            return Err(ZeckError::Broadcast(format!(
-                "cannot delete workspace: transaction {} is {}; reconcile it first",
-                record.prepared.txid, record.state
-            )));
-        }
-        let outcome = self
-            .last_sweep_outcomes
-            .lock()
-            .await
-            .get(&handle.id)
-            .cloned();
-
-        // Drop any lingering task handle so the SQLite files aren't held open.
-        if let Some(task) = session.task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
-        }
-
-        let workspace_root = session.workspace_root.clone();
-        if workspace_root.exists() {
-            let tombstone = workspace_root.with_file_name(format!(
-                "{}.deleting-{}",
-                workspace_root
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("workspace"),
-                uuid::Uuid::new_v4(),
-            ));
-            if !cleanup_marker_path(&workspace_root)?.exists() {
-                create_cleanup_marker(
-                    &workspace_root,
-                    &tombstone,
-                    &broadcast_log,
-                    outcome.as_ref(),
-                    local_journal_exists,
-                )?;
-            }
-            if let Err(err) = std::fs::rename(&workspace_root, &tombstone) {
-                self.cleanup_retry
-                    .lock()
-                    .await
-                    .insert(workspace_root.clone(), workspace_root.clone());
-                return Err(ZeckError::Storage(format!(
-                    "renaming workspace {} for deletion: {err}",
-                    workspace_root.display()
-                )));
-            }
-            if let Err(err) = std::fs::remove_dir_all(&tombstone) {
-                let remaining = if std::fs::rename(&tombstone, &workspace_root).is_ok() {
-                    workspace_root.clone()
-                } else {
-                    tombstone.clone()
-                };
-                self.cleanup_retry
-                    .lock()
-                    .await
-                    .insert(workspace_root.clone(), remaining);
-                return Err(ZeckError::Storage(format!(
-                    "deleting workspace {}: {err}; cleanup can be retried",
-                    tombstone.display()
-                )));
-            }
-        }
-
-        if cleanup_marker_path(&workspace_root)?.exists() {
-            if let Err(err) = clear_cleanup_marker(&workspace_root) {
-                self.cleanup_retry
-                    .lock()
-                    .await
-                    .insert(workspace_root.clone(), workspace_root.clone());
-                return Err(err);
-            }
-        }
-
-        self.sessions.write().await.remove(&handle.id);
-        self.reconciliation_rescan_required
-            .lock()
-            .await
-            .remove(&handle.id);
-        self.last_sweep_outcomes.lock().await.remove(&handle.id);
-        self.cleanup_retry.lock().await.remove(&workspace_root);
-
-        Ok(workspace_root)
     }
 
     async fn session(&self, handle: &ScanHandle) -> ZeckResult<SharedScanSession> {
@@ -2583,6 +2018,7 @@ fn build_sweep_proposal(
 
                 transactions.push(ProposedTx {
                     kind: ProposedTxKind::ShieldTransparent,
+                    leg_kind: crate::models::ProposedLegKind::Wallet,
                     source_account: account.account_index,
                     destination: account.unified_address.clone(),
                     gross_zatoshis: account.transparent_zatoshis,
@@ -2647,6 +2083,7 @@ fn build_sweep_proposal(
 
         transactions.push(ProposedTx {
             kind: ProposedTxKind::SweepShielded,
+            leg_kind: crate::models::ProposedLegKind::Wallet,
             source_account: account.account_index,
             destination: destination.encoded.clone(),
             gross_zatoshis: shielded_available,
@@ -2793,6 +2230,7 @@ fn build_exact_sweep_proposal(
                         })?;
                         transactions.push(ProposedTx {
                             kind: ProposedTxKind::ShieldTransparent,
+                            leg_kind: crate::models::ProposedLegKind::Wallet,
                             source_account: row.account_index,
                             destination: row.unified_address.clone(),
                             gross_zatoshis: gross,
@@ -2838,6 +2276,7 @@ fn build_exact_sweep_proposal(
                     let gross = checked_fee_total(net, fee)?;
                     transactions.push(ProposedTx {
                         kind: ProposedTxKind::SweepShielded,
+                        leg_kind: crate::models::ProposedLegKind::Wallet,
                         source_account: row.account_index,
                         destination: destination.encoded.clone(),
                         gross_zatoshis: gross,
@@ -2892,6 +2331,7 @@ fn build_exact_sweep_proposal(
                 let gross = checked_fee_total(net, fee)?;
                 transactions.push(ProposedTx {
                     kind: ProposedTxKind::SweepShielded,
+                    leg_kind: crate::models::ProposedLegKind::Wallet,
                     source_account: row.account_index,
                     destination: destination.encoded.clone(),
                     gross_zatoshis: gross,
@@ -2947,6 +2387,7 @@ fn build_exact_sweep_proposal(
             direct_account_index = Some(account_index);
             transactions.push(ProposedTx {
                 kind: ProposedTxKind::SweepShielded,
+                leg_kind: crate::models::ProposedLegKind::DirectTransparent,
                 source_account: account_index,
                 destination: destination.encoded.clone(),
                 gross_zatoshis: standalone_total,
@@ -2997,17 +2438,7 @@ fn build_exact_sweep_proposal(
             .then_some(account.derived.index)
         })
         .collect::<std::collections::HashSet<_>>();
-    // Imported Sapling sends run first, then the standalone transparent
-    // follow-up, then HD accounts. The review displays that same order.
-    transactions.sort_by_key(|tx| {
-        if tx.note.starts_with("Direct sweep of ") {
-            1
-        } else if imported_indices.contains(&tx.source_account) {
-            0
-        } else {
-            2
-        }
-    });
+    order_quoted_transactions(&mut transactions, &imported_indices);
     legs.sort_by_key(exact_leg_execution_rank);
     Ok(ExactSweepPlan {
         quote: SweepProposal {
@@ -3098,14 +2529,7 @@ async fn attach_direct_sweep_leg(
             "direct sweep inputs disappeared".to_owned(),
         ));
     };
-    let quoted = plan
-        .quote
-        .transactions
-        .iter()
-        .find(|tx| tx.source_account == account_index && tx.note.starts_with("Direct sweep of "))
-        .ok_or_else(|| {
-            ZeckError::StaleSweepProposal("direct sweep quote disappeared".to_owned())
-        })?;
+    let quoted = direct_leg_quote(&plan.quote.transactions, account_index)?;
     if quoted.gross_zatoshis != direct_plan.total_input_zatoshis
         || quoted.fee_zatoshis != direct_plan.fee_zatoshis
         || quoted.net_zatoshis != direct_plan.output_zatoshis
@@ -3131,6 +2555,32 @@ async fn attach_direct_sweep_leg(
     });
     plan.legs.sort_by_key(exact_leg_execution_rank);
     Ok(())
+}
+
+/// Imported Sapling sends run first, then the standalone transparent
+/// follow-up, then HD accounts. The review displays that same order.
+fn order_quoted_transactions(
+    transactions: &mut [ProposedTx],
+    imported_indices: &std::collections::HashSet<u32>,
+) {
+    transactions.sort_by_key(|tx| match tx.leg_kind {
+        crate::models::ProposedLegKind::DirectTransparent => 1,
+        crate::models::ProposedLegKind::Wallet if imported_indices.contains(&tx.source_account) => {
+            0
+        }
+        crate::models::ProposedLegKind::Wallet => 2,
+    });
+}
+
+/// The quoted direct transparent leg for `account_index`.
+fn direct_leg_quote(transactions: &[ProposedTx], account_index: u32) -> ZeckResult<&ProposedTx> {
+    transactions
+        .iter()
+        .find(|tx| {
+            tx.source_account == account_index
+                && tx.leg_kind == crate::models::ProposedLegKind::DirectTransparent
+        })
+        .ok_or_else(|| ZeckError::StaleSweepProposal("direct sweep quote disappeared".to_owned()))
 }
 
 fn exact_leg_execution_rank(leg: &ExactSweepLeg) -> u8 {
@@ -3286,6 +2736,7 @@ fn build_seedless_sweep_proposal(
             proposal.net_received_zatoshis = add(proposal.net_received_zatoshis, net_zatoshis)?;
             proposal.transactions.push(ProposedTx {
                 kind: ProposedTxKind::SweepShielded,
+                leg_kind: crate::models::ProposedLegKind::DirectTransparent,
                 source_account: account_index,
                 destination,
                 gross_zatoshis: transparent_zatoshis,
@@ -3469,11 +2920,6 @@ fn partition_mixed_spend_authorities(
 async fn execute_sweep_for_session(
     session: SharedScanSession,
     request: SweepRequest,
-    // Test-only knob threaded through from `execute_sweep_with_test_pause`.
-    // Production callers pass None and the per-account loop runs at full
-    // speed. Threaded as `Option<Duration>` rather than gated behind cfg so
-    // the function signature stays stable across feature configurations.
-    pause_between_broadcasts: Option<std::time::Duration>,
     initial_fee_zatoshis: u64,
     quoted_transactions: Vec<ProposedTx>,
     quoted_skipped: Vec<SkippedSweepAccount>,
@@ -3563,12 +3009,8 @@ async fn execute_sweep_for_session(
     let sweep_result: ZeckResult<()> = async {
         for (position, (tracked_account, zip32_index, leg)) in hd_legs.into_iter().enumerate() {
             if position > 0 {
-                // R-S29 hook: pause between broadcasts so the test parent can
-                // SIGKILL the helper deterministically in the gap. Always None
-                // in production.
-                if let Some(d) = pause_between_broadcasts {
-                    tokio::time::sleep(d).await;
-                }
+                // R-S29 hook: a no-op outside execute_sweep_with_test_pause.
+                pause_between_broadcasts().await;
             }
             let usk =
                 UnifiedSpendingKey::from_seed(&network, &seed, zip32_index).map_err(|err| {
@@ -3874,19 +3316,11 @@ async fn execute_shielding_step(
     .map_err(|err| ZeckError::TransactionBuild(format!("creating shielding transaction: {err}")))?;
 
     broadcast_transactions(
+        ctx,
         &mut wallet_db,
-        ctx.workspace,
-        ctx.client,
         tracked_account.derived.index,
         txids.into_iter().collect(),
         "shielding",
-        ctx.results,
-        ctx.broadcast_log,
-        ctx.lightwalletd_url,
-        ctx.confirmation_sources,
-        ctx.network,
-        ctx.prior_fee_zatoshis,
-        ctx.max_fee_zatoshis,
         fee_zatoshis,
     )
     .await?;
@@ -4224,342 +3658,16 @@ async fn execute_send_max_step(
     .map_err(|err| ZeckError::TransactionBuild(format!("creating sweep transaction: {err}")))?;
 
     broadcast_transactions(
+        ctx,
         &mut wallet_db,
-        ctx.workspace,
-        ctx.client,
         tracked_account.derived.index,
         txids.into_iter().collect(),
         "sweep",
-        ctx.results,
-        ctx.broadcast_log,
-        ctx.lightwalletd_url,
-        ctx.confirmation_sources,
-        ctx.network,
-        ctx.prior_fee_zatoshis,
-        ctx.max_fee_zatoshis,
         fee_zatoshis,
     )
     .await?;
 
     Ok((fee_zatoshis, donation_zatoshis))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn broadcast_transactions(
-    wallet_db: &mut WalletDb<
-        rusqlite::Connection,
-        crate::workspace::ArgosParams,
-        SystemClock,
-        rand_core::OsRng,
-    >,
-    workspace: &RecoveryWorkspace,
-    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-    account_index: u32,
-    txids: Vec<TxId>,
-    label: &str,
-    results: &mut Vec<TxBroadcastResult>,
-    log: &mut DurableBroadcastLog,
-    lightwalletd_url: &str,
-    confirmation_sources: &[ConfirmationEndpoint],
-    network: crate::models::ZeckNetwork,
-    prior_fee_zatoshis: u64,
-    max_fee_zatoshis: Option<u64>,
-    reviewed_batch_fee_zatoshis: u64,
-) -> ZeckResult<()> {
-    use rusqlite::OptionalExtension;
-
-    // An earlier leg of this execution that was accepted (Pending) does not
-    // stop this one: it spends disjoint reviewed inputs.
-    if let Some(txid) = log.blocking_next_leg() {
-        return Err(ZeckError::Broadcast(format!(
-            "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before another submission"
-        )));
-    }
-    let fee_db = rusqlite::Connection::open_with_flags(
-        workspace.wallet_db_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|err| ZeckError::Wallet(format!("opening wallet fee records: {err}")))?;
-    let mut prepared = Vec::with_capacity(txids.len());
-    for txid in txids {
-        let tx = wallet_db
-            .get_transaction(txid)
-            .map_err(|err| ZeckError::Wallet(format!("loading {label} transaction {txid}: {err}")))?
-            .ok_or_else(|| {
-                ZeckError::Wallet(format!(
-                    "wallet did not persist the {label} transaction {txid}"
-                ))
-            })?;
-
-        let mut tx_bytes = Vec::new();
-        tx.write(&mut tx_bytes).map_err(|err| {
-            ZeckError::TransactionBuild(format!("serializing transaction {txid}: {err}"))
-        })?;
-        let fee_zatoshis: Option<i64> = fee_db
-            .query_row(
-                "SELECT fee FROM transactions WHERE txid = ?1",
-                [txid.as_ref()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| ZeckError::Wallet(format!("reading transaction fee for {txid}: {err}")))?
-            .flatten();
-        let fee_zatoshis = fee_zatoshis
-            .and_then(|fee| u64::try_from(fee).ok())
-            .ok_or_else(|| {
-                ZeckError::Wallet(format!(
-                    "wallet did not persist a valid fee for {label} transaction {txid}"
-                ))
-            })?;
-        prepared.push(PreparedTransaction {
-            txid,
-            raw_tx: tx_bytes,
-            fee_zatoshis,
-            expiry_height: Some(u32::from(tx.expiry_height())),
-        });
-    }
-    // The reviewed fee was already compared with the proposal before it was
-    // built and stored. This second check reads the fee the wallet recorded
-    // for the built transaction. On a mismatch nothing is submitted or
-    // journaled; the wallet's unsent transaction keeps its inputs reserved
-    // only until its expiry height, after which a rescan frees them.
-    if let Err(err) = require_persisted_batch_fee(
-        reviewed_batch_fee_zatoshis,
-        prepared.iter().map(|tx| tx.fee_zatoshis),
-    ) {
-        tracing::warn!(
-            "{label} batch not submitted: {err}; inputs are released at expiry height(s) {:?}",
-            prepared
-                .iter()
-                .map(|tx| tx.expiry_height)
-                .collect::<Vec<_>>()
-        );
-        return Err(err);
-    }
-    enforce_max_fee(
-        checked_fee_total(prior_fee_zatoshis, reviewed_batch_fee_zatoshis)?,
-        max_fee_zatoshis,
-    )?;
-    let mut observer = LightwalletdTxObserver::new(lightwalletd_url, confirmation_sources)?;
-    submit_and_confirm_batch(
-        prepared,
-        account_index,
-        label,
-        results,
-        log,
-        &mut LightwalletdSubmitter { client },
-        &mut observer,
-        network,
-        &mut |txid, height| {
-            wallet_db
-                .set_transaction_status(
-                    txid,
-                    TransactionStatus::Mined(BlockHeight::from_u32(height)),
-                )
-                .map_err(|err| {
-                    ZeckError::Wallet(format!(
-                        "marking mined transaction {txid} in wallet db: {err}"
-                    ))
-                })
-        },
-    )
-    .await
-}
-
-/// Submit one leg's prepared transactions and poll each for confirmation.
-/// Separated from wallet access so the leg-to-leg gating is testable
-/// against a scripted node and observer.
-///
-/// Gating within one reviewed execution: an earlier leg that was accepted
-/// (Pending) does not stop this one, since every leg spends disjoint
-/// reviewed inputs. Only an unknown outcome (lost reply, retryable refusal)
-/// blocks the next submission.
-#[allow(clippy::too_many_arguments)]
-async fn submit_and_confirm_batch<N, O>(
-    prepared: Vec<PreparedTransaction>,
-    account_index: u32,
-    label: &str,
-    results: &mut Vec<TxBroadcastResult>,
-    log: &mut DurableBroadcastLog,
-    submitter: &mut N,
-    observer: &mut O,
-    network: crate::models::ZeckNetwork,
-    mark_mined: &mut (dyn FnMut(TxId, u32) -> ZeckResult<()> + Send),
-) -> ZeckResult<()>
-where
-    N: crate::broadcast::TxSubmitter,
-    O: TxObserver,
-{
-    if let Some(txid) = log.blocking_next_leg() {
-        return Err(ZeckError::Broadcast(format!(
-            "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before another submission"
-        )));
-    }
-    for tx in prepared {
-        let txid = tx.txid;
-        let fee_zatoshis = tx.fee_zatoshis;
-        let expiry_height = tx.expiry_height;
-        let submission =
-            submit_prepared_transaction(log, submitter, tx, Duration::from_secs(30)).await?;
-
-        // Record the submission before examining its disposition. A lost reply
-        // still leaves a known txid, fee, and possibly an on-chain transaction.
-        // Accepted submissions are updated if confirmation polling resolves.
-        let result_index = results.len();
-        results.push(TxBroadcastResult {
-            source_account: account_index,
-            txid: Some(txid.to_string()),
-            status: submission.state,
-            fee_zatoshis,
-            detail: format!(
-                "{label} submission: {:?}{}",
-                submission.disposition,
-                submission
-                    .persistence_warning
-                    .as_ref()
-                    .map(|warning| format!(" Persistence warning: {warning}"))
-                    .unwrap_or_default()
-            ),
-            confirmed_height: None,
-            safe_to_discard: false,
-        });
-        if submission.blocks_followup_submission() {
-            return Err(ZeckError::Broadcast(format!(
-                "{label} transaction {txid} may already have reached the network or was retryably refused; reconcile its stored bytes before retrying or submitting another sweep leg",
-            )));
-        }
-        if submission.state == TxLifecycleState::Rejected {
-            return Err(ZeckError::Broadcast(format!(
-                "{label} transaction {txid} was rejected: {:?}",
-                submission.disposition,
-            )));
-        }
-
-        let confirmation = wait_for_confirmation(
-            mark_mined,
-            log,
-            observer,
-            network,
-            txid,
-            expiry_height,
-            label,
-        )
-        .await?;
-        let entry = &mut results[result_index];
-        entry.status = confirmation.state;
-        entry.detail = confirmation.detail;
-        entry.confirmed_height = confirmation.confirmed_height;
-        entry.safe_to_discard = confirmation.safe_to_discard;
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-fn is_distinct_lightwalletd_endpoint(candidate: &str, primary: &str) -> bool {
-    crate::lightwalletd::normalized_endpoint_authority(candidate).ok()
-        != crate::lightwalletd::normalized_endpoint_authority(primary).ok()
-}
-
-/// Poll a submitted transaction until it mines (by any configured operator),
-/// expires, or the polling budget runs out. Returns the lifecycle state, a
-/// detail line, the mined height, and whether it is safe to discard the source.
-async fn wait_for_confirmation<O: TxObserver>(
-    mark_mined: &mut (dyn FnMut(TxId, u32) -> ZeckResult<()> + Send),
-    log: &mut impl BroadcastStore,
-    observer: &mut O,
-    network: crate::models::ZeckNetwork,
-    txid: TxId,
-    expiry_height: Option<u32>,
-    label: &str,
-) -> ZeckResult<ConfirmationResult> {
-    let mut last_state = TxObservationState::Unavailable;
-    for attempt in 0..CONFIRMATION_POLL_ATTEMPTS {
-        let observation = observer.observe(network, txid, expiry_height).await?;
-        last_state = observation.state.clone();
-        let state = crate::reconciliation::record_observation(log, txid, &observation)?;
-        if state.is_mined() {
-            let evidence = if observation.state_is_mined() {
-                observation
-            } else {
-                log.latest(txid)
-                    .and_then(|record| record.observation)
-                    .ok_or_else(|| {
-                        ZeckError::Broadcast(format!("mined record {txid} has no evidence"))
-                    })?
-            };
-            let height = evidence.mined_height.ok_or_else(|| {
-                ZeckError::Broadcast(format!("mining evidence for {txid} has no height"))
-            })?;
-            mark_mined(txid, height)?;
-            let safe_to_discard = state == TxLifecycleState::Mined && evidence.is_safe_to_discard();
-            return Ok(ConfirmationResult {
-                state,
-                detail: format!(
-                    "{label}: {}",
-                    crate::reconciliation::lifecycle_detail(
-                        state,
-                        &evidence.state,
-                        Some(height),
-                        safe_to_discard
-                    )
-                ),
-                confirmed_height: Some(height),
-                safe_to_discard,
-            });
-        }
-        if state == TxLifecycleState::Expired {
-            return Ok(ConfirmationResult {
-                state,
-                detail: format!(
-                    "{label} transaction expired: reported absent from chain and mempool past its expiry height."
-                ),
-                confirmed_height: None,
-                safe_to_discard: false,
-            });
-        }
-        if attempt + 1 < CONFIRMATION_POLL_ATTEMPTS {
-            tokio::time::sleep(Duration::from_secs(CONFIRMATION_POLL_INTERVAL_SECS)).await;
-        }
-    }
-    let state = log
-        .latest(txid)
-        .ok_or_else(|| ZeckError::Storage(format!("missing prepared transaction {txid}")))?
-        .state;
-    let detail = if state == TxLifecycleState::SubmissionUnknown {
-        format!(
-            "{label} submission remains unknown ({last_state:?}); reconcile its stored bytes before another sweep leg."
-        )
-    } else {
-        format!(
-            "{label} transaction is pending ({last_state:?}); mining evidence is not yet available."
-        )
-    };
-    Ok(ConfirmationResult {
-        state,
-        detail,
-        confirmed_height: None,
-        safe_to_discard: false,
-    })
-}
-
-struct ConfirmationResult {
-    state: TxLifecycleState,
-    detail: String,
-    confirmed_height: Option<u32>,
-    safe_to_discard: bool,
-}
-
-async fn chain_tip_height(
-    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-) -> ZeckResult<u32> {
-    let info = client
-        .get_lightd_info(zcash_client_backend::proto::service::Empty {})
-        .await
-        .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
-        .into_inner();
-    u32::try_from(info.block_height)
-        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))
 }
 
 pub(crate) fn proposal_fee_zatoshis<NoteRef>(
@@ -5196,7 +4304,6 @@ mod tests {
             max_fee_zatoshis: Some(20_000),
             donation_rate: Some(0.10),
             donor_email: Some("reviewed@example.com".to_owned()),
-            reviewed_fee_zatoshis: None,
         }
     }
 
@@ -5243,10 +4350,17 @@ mod tests {
         let handle = ScanHandle::new();
         let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
         let progress = reviewed_progress(handle);
-        let mut request = reviewed_request();
-        request.reviewed_fee_zatoshis = Some(1);
+        // A frontend that still sends the old field cannot seed the fee the
+        // service compares execution against: the request has no such field.
+        let mut json = serde_json::to_value(reviewed_request()).unwrap();
+        json["reviewed_fee_zatoshis"] = serde_json::json!(1);
+        let request: SweepRequest = serde_json::from_value(json).unwrap();
+        assert!(serde_json::to_value(&request)
+            .unwrap()
+            .get("reviewed_fee_zatoshis")
+            .is_none());
         let intent = ReviewedSweepIntent::capture(request, &session, &progress);
-        assert_eq!(intent.request.reviewed_fee_zatoshis, None);
+        assert_eq!(intent.reviewed_fee_zatoshis, None);
     }
 
     #[test]
@@ -5256,7 +4370,6 @@ mod tests {
         let progress = reviewed_progress(handle);
         let mut request = reviewed_request();
         request.max_fee_zatoshis = None;
-        request.reviewed_fee_zatoshis = Some(1);
         let mut intent = ReviewedSweepIntent::capture(request, &session, &progress);
         let quote = super::SweepProposal {
             transactions: vec![],
@@ -5272,7 +4385,7 @@ mod tests {
             confirmation_notice: None,
         };
         intent.bind_quote(&quote);
-        assert_eq!(intent.request.reviewed_fee_zatoshis, Some(25_000));
+        assert_eq!(intent.reviewed_fee_zatoshis, Some(25_000));
         assert_eq!(intent.request.max_fee_zatoshis, Some(25_000));
     }
 
@@ -5282,7 +4395,7 @@ mod tests {
         let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
         let progress = reviewed_progress(handle);
         let mut intent = ReviewedSweepIntent::capture(reviewed_request(), &session, &progress);
-        intent.request.reviewed_fee_zatoshis = Some(25_000);
+        intent.reviewed_fee_zatoshis = Some(25_000);
         let id = SweepProposalId("fee-review".to_owned());
         let mut store = ReviewedSweepStore::default();
         store.insert(id.clone(), intent);
@@ -5307,6 +4420,7 @@ mod tests {
     fn reviewed_tx(account: u32, kind: ProposedTxKind, fee: u64) -> super::ProposedTx {
         super::ProposedTx {
             kind,
+            leg_kind: crate::models::ProposedLegKind::Wallet,
             source_account: account,
             destination: format!("destination-{account}"),
             gross_zatoshis: 100_000,
@@ -5316,6 +4430,73 @@ mod tests {
             note: String::new(),
             memo: None,
         }
+    }
+
+    #[test]
+    fn canonical_pool_identity_is_an_explicit_tag() {
+        use zcash_protocol::ShieldedPool;
+        assert_eq!(
+            [
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood
+            ]
+            .map(super::shielded_pool_tag),
+            [0, 1, 2]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_pause_applies_only_inside_its_scope() {
+        let start = tokio::time::Instant::now();
+        super::pause_between_broadcasts().await;
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::ZERO,
+            "production has no pause"
+        );
+        super::PAUSE_BETWEEN_BROADCASTS
+            .scope(
+                std::time::Duration::from_secs(5),
+                super::pause_between_broadcasts(),
+            )
+            .await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn direct_leg_is_identified_by_its_kind_not_its_note_text() {
+        use crate::models::ProposedLegKind;
+
+        // A wallet leg whose display text happens to read like a direct
+        // sweep must not be ordered or matched as one.
+        let mut wallet = reviewed_tx(0, ProposedTxKind::SweepShielded, 10_000);
+        wallet.note = "Direct sweep of 3 standalone transparent UTXOs.".to_owned();
+        let mut direct = reviewed_tx(0, ProposedTxKind::SweepShielded, 15_000);
+        direct.leg_kind = ProposedLegKind::DirectTransparent;
+        let mut imported = reviewed_tx(4, ProposedTxKind::SweepShielded, 20_000);
+        imported.note = "Direct sweep of nothing.".to_owned();
+
+        let mut transactions = vec![wallet, direct, imported];
+        super::order_quoted_transactions(&mut transactions, &[4].into_iter().collect());
+        assert_eq!(
+            transactions
+                .iter()
+                .map(|tx| (tx.source_account, tx.leg_kind, tx.fee_zatoshis))
+                .collect::<Vec<_>>(),
+            vec![
+                (4, ProposedLegKind::Wallet, 20_000),
+                (0, ProposedLegKind::DirectTransparent, 15_000),
+                (0, ProposedLegKind::Wallet, 10_000),
+            ]
+        );
+        assert_eq!(
+            super::direct_leg_quote(&transactions, 0)
+                .unwrap()
+                .fee_zatoshis,
+            15_000
+        );
+        assert!(super::direct_leg_quote(&transactions, 4).is_err());
     }
 
     fn reviewed_quote(transactions: Vec<super::ProposedTx>) -> super::SweepProposal {
@@ -5612,12 +4793,10 @@ mod tests {
 
     #[test]
     fn shielded_local_id_stays_paired_with_its_chain_output() {
-        let a = super::canonical_shielded_note_identity(&[1; 32], 0, "Sapling", 50_000, &"local-a");
-        let b = super::canonical_shielded_note_identity(&[2; 32], 0, "Sapling", 50_000, &"local-b");
-        let swapped_a =
-            super::canonical_shielded_note_identity(&[1; 32], 0, "Sapling", 50_000, &"local-b");
-        let swapped_b =
-            super::canonical_shielded_note_identity(&[2; 32], 0, "Sapling", 50_000, &"local-a");
+        let a = super::canonical_shielded_note_identity(&[1; 32], 0, 0, 50_000, &"local-a");
+        let b = super::canonical_shielded_note_identity(&[2; 32], 0, 0, 50_000, &"local-b");
+        let swapped_a = super::canonical_shielded_note_identity(&[1; 32], 0, 0, 50_000, &"local-b");
+        let swapped_b = super::canonical_shielded_note_identity(&[2; 32], 0, 0, 50_000, &"local-a");
         let mut reviewed = vec![a, b];
         let mut changed = vec![swapped_a, swapped_b];
         reviewed.sort();
@@ -5743,7 +4922,6 @@ mod tests {
                 destination: derived_destination(),
                 memo: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: Some(1),
                 donation_rate: None,
                 donor_email: None,
             },
@@ -6117,7 +5295,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -6161,7 +5338,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: Some("donor@example.com".to_owned()),
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -6213,7 +5389,6 @@ mod tests {
             max_fee_zatoshis: None,
             donation_rate: None,
             donor_email: None,
-            reviewed_fee_zatoshis: None,
         };
         let given = build_sweep_proposal(
             &progress_with_account(seedless_test_account()),
@@ -6271,7 +5446,6 @@ mod tests {
                 max_fee_zatoshis: Some(real_fee),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -6312,7 +5486,6 @@ mod tests {
                 max_fee_zatoshis: Some(1),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -6333,7 +5506,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -6359,7 +5531,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -6383,7 +5554,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -6425,7 +5595,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -6455,7 +5624,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Testnet,
             DONATION_TEST_UA,
@@ -6487,7 +5655,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -6526,7 +5693,6 @@ mod tests {
                 max_fee_zatoshis: Some(9_999),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -6961,7 +6127,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -7111,7 +6276,6 @@ mod tests {
                 max_fee_zatoshis: Some(45_000),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Testnet,
             &[0],
@@ -7158,7 +6322,6 @@ mod tests {
                 max_fee_zatoshis: Some(15_000),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Testnet,
             &[0],
@@ -7239,7 +6402,6 @@ mod tests {
             max_fee_zatoshis: None,
             donation_rate: None,
             donor_email: None,
-            reviewed_fee_zatoshis: None,
         };
         let proposal = super::build_combined_sweep_proposal(
             &state.progress,
@@ -7380,7 +6542,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -7426,7 +6587,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.0),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -7459,7 +6619,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: Some("donor@example.com".to_owned()),
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "", // address blanked
@@ -7478,7 +6637,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(1.5),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -7502,7 +6660,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: Some("notanemail".to_owned()),
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -7599,7 +6756,6 @@ mod propose_workspace_guard_tests {
             max_fee_zatoshis: None,
             donation_rate: None,
             donor_email: None,
-            reviewed_fee_zatoshis: None,
         }
     }
 
@@ -8133,14 +7289,7 @@ mod propose_workspace_guard_tests {
         )
         .await;
         let session = service.session(&handle).await.unwrap();
-        let path = session
-            .state
-            .lock()
-            .await
-            .workspace
-            .as_ref()
-            .unwrap()
-            .broadcast_log_path();
+        let path = registry_log_path(&session.workspace_root);
         let lock = DurableBroadcastLog::open(&path).unwrap();
         let error = service
             .delete_workspace(&handle)
@@ -8155,97 +7304,6 @@ mod propose_workspace_guard_tests {
         assert!(session.workspace_root.exists());
         assert!(service.session(&handle).await.is_ok());
         drop(lock);
-    }
-
-    #[tokio::test]
-    async fn absent_legacy_journal_lock_blocks_scan_review_and_execution() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle) = completed_session(
-            tempdir.path(),
-            Arc::new(SeedKeySource::new(SecretString::new(
-                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
-            ))),
-            transparent_account(0),
-        )
-        .await;
-        let session = service.session(&handle).await.unwrap();
-        let legacy_path = RecoveryWorkspace::from_runtime(&session.runtime)
-            .unwrap()
-            .broadcast_log_path();
-        assert!(!legacy_path.exists());
-        let legacy_writer = DurableBroadcastLog::open(&legacy_path).unwrap();
-        assert!(!legacy_path.exists(), "only the legacy sidecar exists");
-
-        let fresh_service = RecoveryService::new();
-        let runtime = &session.runtime;
-        let scan_error = fresh_service
-            .start_scan_from_key_source(
-                ScanConfig {
-                    birthday: runtime.birthday,
-                    num_accounts: runtime.num_accounts,
-                    gap_limit: runtime.gap_limit,
-                    transparent_scan: runtime.transparent_scan,
-                    lightwalletd_url: runtime.lightwalletd_url.clone(),
-                    confirmation_sources: runtime.confirmation_sources.clone(),
-                    data_dir: runtime.data_dir.clone(),
-                    network: runtime.network,
-                    label: runtime.label.clone(),
-                },
-                runtime.key_source.clone(),
-            )
-            .await
-            .expect_err("a scan cannot race an older writer before JSONL appears");
-        assert!(scan_error.to_string().contains("in use"), "{scan_error}");
-
-        let review_error = service
-            .propose_sweep(&handle, request())
-            .await
-            .expect_err("a quote cannot race the older writer");
-        assert!(
-            review_error.to_string().contains("in use"),
-            "{review_error}"
-        );
-        let execution_error = service
-            .execute_sweep(&handle, &SweepProposalId("unused".to_owned()))
-            .await
-            .expect_err("execution cannot enter before the older writer releases its lock");
-        assert!(
-            execution_error.to_string().contains("in use"),
-            "{execution_error}"
-        );
-        drop(legacy_writer);
-    }
-
-    #[test]
-    fn network_registry_holds_an_alias_legacy_sidecar_without_jsonl() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let alias_root = tempdir
-            .path()
-            .join("mainnet/workspace-old/birthday-1/scope-old");
-        std::fs::create_dir_all(&alias_root).unwrap();
-        let legacy_path = alias_root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
-        let legacy_writer = DurableBroadcastLog::open(&legacy_path).unwrap();
-        assert!(
-            !legacy_path.exists(),
-            "older process has not written JSONL yet"
-        );
-
-        let operation =
-            NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
-        let error = operation
-            .open_broadcast_log()
-            .err()
-            .expect("existing legacy sidecar must block a global signer");
-        assert!(error.to_string().contains("in use"), "{error}");
-        drop(legacy_writer);
-
-        let registry = operation.open_broadcast_log().unwrap();
-        let attempted_old_open = DurableBroadcastLog::open(&legacy_path)
-            .err()
-            .expect("the global registry must retain the legacy lock until it closes");
-        assert!(attempted_old_open.to_string().contains("in use"));
-        drop(registry);
-        DurableBroadcastLog::open(&legacy_path).unwrap();
     }
 
     fn mined_outcome(txid: String) -> SweepOutcome {
@@ -8298,13 +7356,29 @@ mod propose_workspace_guard_tests {
         )
     }
 
+    /// The network registry a workspace (or its tombstone) shares.
+    fn registry_log_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
+        let network_root = workspace_root
+            .ancestors()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "mainnet" || name == "testnet")
+            })
+            .expect("workspace lives under a network directory");
+        let path = network_root
+            .join(".broadcast-registry")
+            .join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
     fn seed_source() -> Arc<dyn KeySource> {
         Arc::new(SeedKeySource::new(SecretString::new(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
         )))
     }
 
-    /// Pre-registry eligibility: a Complete, Cancelled or Error scan may be
+    /// Baseline eligibility: a Complete, Cancelled or Error scan may be
     /// deleted with or without a sweep outcome, and with tracked shielded
     /// accounts -- the source keys, not the workspace, hold spend authority.
     #[tokio::test]
@@ -8411,9 +7485,7 @@ mod propose_workspace_guard_tests {
             .workspace_root
             .clone();
         let txid = TxId::from_bytes([84; 32]);
-        let mut log =
-            DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-                .unwrap();
+        let mut log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid,
             raw_tx: vec![84, 85],
@@ -8466,7 +7538,7 @@ mod propose_workspace_guard_tests {
             .insert(root.clone(), root.clone());
         let added_txid = TxId::from_bytes([85; 32]);
         let raw = vec![85, 86, 87];
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid: added_txid,
@@ -8501,7 +7573,7 @@ mod propose_workspace_guard_tests {
             .lock()
             .await
             .insert(root.clone(), tombstone.clone());
-        let path = tombstone.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&tombstone);
         let added_txid = TxId::from_bytes([86; 32]);
         let raw = vec![86, 87, 88];
         let mut log = DurableBroadcastLog::open(&path).unwrap();
@@ -8521,9 +7593,7 @@ mod propose_workspace_guard_tests {
             root.exists(),
             "the surviving tombstone must be restored for validation"
         );
-        let reopened =
-            DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-                .unwrap();
+        let reopened = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(reopened.latest(added_txid).unwrap().prepared.raw_tx, raw);
         assert_eq!(
             reopened.latest(added_txid).unwrap().state,
@@ -8567,8 +7637,7 @@ mod propose_workspace_guard_tests {
             result.is_err(),
             "a durable deletion marker must survive process restart"
         );
-        let log = DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-            .unwrap();
+        let log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
     }
 
@@ -8594,7 +7663,6 @@ mod propose_workspace_guard_tests {
                     "txid": txid.to_string(),
                     "raw_sha256": format!("{:x}", Sha256::digest([84, 85])),
                 }],
-                "local_journal_exists": true,
             })
             .to_string(),
         )
@@ -8661,17 +7729,19 @@ mod propose_workspace_guard_tests {
     }
 
     #[tokio::test]
-    async fn restart_without_surviving_journal_receipt_requires_manual_recovery() {
+    async fn restart_without_registry_receipt_requires_manual_recovery() {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, _) = completed_mined_session(tempdir.path()).await;
         let root = root.canonicalize().unwrap();
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let tombstone = root.with_file_name(format!(
             "{}.deleting-restart-missing",
             root.file_name().unwrap().to_string_lossy()
         ));
+        // The marker binds a receipt the registry never recorded.
+        let missing = TxId::from_bytes([0xEE; 32]);
         let marker = super::cleanup_marker_path(&root).unwrap();
         std::fs::write(
             &marker,
@@ -8679,16 +7749,14 @@ mod propose_workspace_guard_tests {
                 "workspace": root,
                 "tombstone": tombstone,
                 "receipts": [{
-                    "txid": txid.to_string(),
+                    "txid": missing.to_string(),
                     "raw_sha256": format!("{:x}", Sha256::digest([84, 85])),
                 }],
-                "local_journal_exists": true,
             })
             .to_string(),
         )
         .unwrap();
         std::fs::rename(&root, &tombstone).unwrap();
-        std::fs::remove_file(tombstone.join(crate::broadcast::BROADCAST_LOG_FILE_NAME)).unwrap();
 
         let restarted = RecoveryService::new();
         let error = restarted
@@ -8714,136 +7782,6 @@ mod propose_workspace_guard_tests {
             "surviving tombstone remains available for inspection"
         );
         assert!(marker.exists());
-    }
-
-    #[tokio::test]
-    async fn restart_accepts_global_outcome_after_immutable_legacy_prefix() {
-        use sha2::{Digest, Sha256};
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, legacy_txid) = completed_mined_session(tempdir.path()).await;
-        let root = root.canonicalize().unwrap();
-        let runtime = service.session(&handle).await.unwrap().runtime.clone();
-        let global_txid = TxId::from_bytes([99; 32]);
-        let raw = vec![99, 100];
-        let guard =
-            super::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network).unwrap();
-        let mut registry = guard.open_broadcast_log().unwrap();
-        registry
-            .persist_prepared(&PreparedTransaction {
-                txid: global_txid,
-                raw_tx: raw.clone(),
-                fee_zatoshis: 10_000,
-                expiry_height: Some(130),
-            })
-            .unwrap();
-        registry
-            .transition(global_txid, TxLifecycleState::SubmissionUnknown, None, None)
-            .unwrap();
-        registry
-            .transition(
-                global_txid,
-                TxLifecycleState::Pending,
-                Some(&SubmissionDisposition::Accepted),
-                None,
-            )
-            .unwrap();
-        registry
-            .transition(
-                global_txid,
-                TxLifecycleState::Mined,
-                None,
-                Some(&mined_deletion_observation()),
-            )
-            .unwrap();
-        drop(registry);
-        drop(guard);
-
-        let tombstone = root.with_file_name(format!(
-            "{}.deleting-global-outcome",
-            root.file_name().unwrap().to_string_lossy()
-        ));
-        let marker = super::cleanup_marker_path(&root).unwrap();
-        std::fs::write(
-            &marker,
-            serde_json::json!({
-                "workspace": root,
-                "tombstone": tombstone,
-                "receipts": [{
-                    "txid": global_txid.to_string(),
-                    "raw_sha256": format!("{:x}", Sha256::digest(&raw)),
-                }],
-                "local_journal_exists": true,
-            })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::rename(&root, &tombstone).unwrap();
-
-        let restarted = RecoveryService::new();
-        let started = restarted
-            .start_scan_from_key_source(
-                ScanConfig {
-                    birthday: runtime.birthday,
-                    num_accounts: runtime.num_accounts,
-                    gap_limit: runtime.gap_limit,
-                    transparent_scan: runtime.transparent_scan,
-                    lightwalletd_url: runtime.lightwalletd_url.clone(),
-                    confirmation_sources: runtime.confirmation_sources.clone(),
-                    data_dir: runtime.data_dir.clone(),
-                    network: runtime.network,
-                    label: runtime.label.clone(),
-                },
-                runtime.key_source.clone(),
-            )
-            .await
-            .expect("global receipt can follow an immutable legacy journal");
-        assert!(root.exists());
-        assert!(!marker.exists());
-        restarted.cancel_scan(&started).await.unwrap();
-        let guard =
-            super::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network).unwrap();
-        let registry = guard.open_broadcast_log().unwrap();
-        assert_eq!(
-            registry.latest(legacy_txid).unwrap().prepared.raw_tx,
-            vec![84, 85]
-        );
-        assert_eq!(registry.latest(global_txid).unwrap().prepared.raw_tx, raw);
-    }
-
-    #[test]
-    fn global_registry_imports_legacy_transparent_history() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir
-            .path()
-            .join("mainnet")
-            .join("transparent-legacy")
-            .join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let txid = TxId::from_bytes([96; 32]);
-        let mut source = DurableBroadcastLog::open(&path).unwrap();
-        source
-            .persist_prepared(&PreparedTransaction {
-                txid,
-                raw_tx: vec![96, 97, 98],
-                fee_zatoshis: 10_000,
-                expiry_height: Some(140),
-            })
-            .unwrap();
-        source
-            .transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
-            .unwrap();
-        drop(source);
-
-        let guard =
-            super::NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
-        let registry = guard.open_broadcast_log().unwrap();
-        assert_eq!(
-            registry.latest(txid).unwrap().prepared.raw_tx,
-            vec![96, 97, 98]
-        );
-        assert!(registry.has_unresolved_history());
-        assert!(path.exists(), "migration must preserve the original source");
     }
 
     #[tokio::test]
@@ -8876,8 +7814,7 @@ mod propose_workspace_guard_tests {
         );
         assert!(root.exists());
         scanner.cancel_scan(&scanning).await.unwrap();
-        let log = DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-            .unwrap();
+        let log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
     }
 
@@ -8911,60 +7848,8 @@ mod propose_workspace_guard_tests {
         );
         assert!(root.exists());
         scanner.cancel_scan(&scanning).await.unwrap();
-        let log = DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-            .unwrap();
+        let log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
-    }
-
-    #[tokio::test]
-    async fn network_registry_discovers_unknown_from_reordered_imported_workspace() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let source = |first: u8, second: u8| {
-            let mut keys = argos_wallet_import::ImportedKeys::default();
-            for byte in [first, second] {
-                keys.transparent.push(TransparentKey {
-                    secret: Secret::new([byte; 32]),
-                    provenance: Provenance::Standalone,
-                    created_at: None,
-                });
-            }
-            Arc::new(ImportedKeySource::new(keys)) as Arc<dyn KeySource>
-        };
-        let (service, handle) =
-            completed_session(tempdir.path(), source(0x41, 0x42), transparent_account(0)).await;
-        let first = service.session(&handle).await.unwrap();
-        let mut reordered = first.runtime.clone();
-        reordered.key_source = source(0x42, 0x41);
-        let second_root = RecoveryWorkspace::from_runtime(&reordered)
-            .unwrap()
-            .root()
-            .to_owned();
-        assert_ne!(first.workspace_root, second_root);
-        let txid = TxId::from_bytes([93; 32]);
-        let mut old = DurableBroadcastLog::open(
-            first
-                .workspace_root
-                .join(crate::broadcast::BROADCAST_LOG_FILE_NAME),
-        )
-        .unwrap();
-        old.persist_prepared(&PreparedTransaction {
-            txid,
-            raw_tx: vec![93, 94, 95],
-            fee_zatoshis: 10_000,
-            expiry_height: Some(130),
-        })
-        .unwrap();
-        old.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
-            .unwrap();
-        drop(old);
-
-        let guard = NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
-        let registry = guard.open_broadcast_log().unwrap();
-        assert_eq!(registry.blocking_submission(), Some(txid));
-        assert_eq!(
-            registry.latest(txid).unwrap().prepared.raw_tx,
-            vec![93, 94, 95]
-        );
     }
 
     #[tokio::test]
@@ -9019,7 +7904,7 @@ mod propose_workspace_guard_tests {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle, root, original) = completed_mined_session(tempdir.path()).await;
         let extra = TxId::from_bytes([97; 32]);
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid: extra,
@@ -9147,7 +8032,7 @@ mod propose_workspace_guard_tests {
             .workspace_root
             .clone();
         let txid = TxId::from_bytes([91; 32]);
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid,
@@ -9262,7 +8147,7 @@ mod propose_workspace_guard_tests {
             .unwrap()
             .workspace_root
             .clone();
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let txid = TxId::from_bytes([71; 32]);
         let raw = vec![71, 72, 73];
         let (unknown_written, unknown_seen) = tokio::sync::oneshot::channel();
@@ -9330,7 +8215,7 @@ mod propose_workspace_guard_tests {
             .unwrap()
             .workspace_root
             .clone();
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let txid = TxId::from_bytes([72; 32]);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
@@ -9424,7 +8309,7 @@ mod propose_workspace_guard_tests {
             .unwrap()
             .workspace_root
             .clone();
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let txid = TxId::from_bytes([73; 32]);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
@@ -9719,6 +8604,7 @@ pub(crate) mod leg_fee_pin_tests {
         let quote = SweepProposal {
             transactions: vec![ProposedTx {
                 kind: ProposedTxKind::ShieldTransparent,
+                leg_kind: crate::models::ProposedLegKind::Wallet,
                 source_account: 0,
                 destination: "u-test".to_owned(),
                 gross_zatoshis: 100_000,
@@ -9785,7 +8671,6 @@ pub(crate) mod leg_fee_pin_tests {
                 destination: "u-test".to_owned(),
                 memo: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
             },
@@ -9872,30 +8757,9 @@ mod leg_gating_tests {
     use crate::broadcast::{EndpointTxEvidence, TxObservation, TxSubmitter};
     use crate::models::ZeckNetwork;
     use zcash_client_backend::proto::service::SendResponse;
-    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
-    use zcash_protocol::consensus::BranchId;
 
     fn prepared(expiry: u32) -> PreparedTransaction {
-        let tx = TransactionData::<Authorized>::from_parts(
-            TxVersion::V5,
-            BranchId::Nu5,
-            0,
-            BlockHeight::from_u32(expiry),
-            None,
-            None,
-            None,
-            None,
-        )
-        .freeze()
-        .unwrap();
-        let mut raw_tx = Vec::new();
-        tx.write(&mut raw_tx).unwrap();
-        PreparedTransaction {
-            txid: tx.txid(),
-            raw_tx,
-            fee_zatoshis: 10_000,
-            expiry_height: Some(expiry),
-        }
+        crate::test_support::empty_v5_prepared(expiry, 10_000)
     }
 
     #[derive(Default)]
