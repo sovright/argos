@@ -1524,13 +1524,36 @@ async fn verify_review_at_execute(
     let Some(reverify) = wallet_checkpoint else {
         return Ok(None);
     };
-    let (chain, notice) = argos_core::sprout_scan_run::chain_spends_for_wallet(
-        &reverify.data_dir,
-        network.into(),
-        reverify.keys.as_slice(),
-        &reverify.peers,
-    )
-    .await;
+    verify_review_with(notes, || async {
+        argos_core::sprout_scan_run::chain_spends_for_wallet(
+            &reverify.data_dir,
+            network.into(),
+            reverify.keys.as_slice(),
+            &reverify.peers,
+        )
+        .await
+    })
+    .await
+}
+
+/// The scan evidence a wallet proposal's execute-time check looks up: the
+/// spends the saved scan shows, and the notice describing how it got there.
+type ReverifyEvidence = (
+    Option<std::sync::Arc<argos_core::sprout_recovery::ChainSpends>>,
+    Option<String>,
+);
+
+/// [`verify_review_at_execute`] with the live-peer lookup of the saved scan
+/// supplied by the caller, so the refusal logic can be driven offline.
+async fn verify_review_with<F, Fut>(
+    notes: &[argos_core::sprout_recovery::SpendableSproutNote],
+    lookup: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ReverifyEvidence>,
+{
+    let (chain, notice) = lookup().await;
     reviewed_notes_still_spendable(notes, chain.as_deref())
         .map_err(|err| with_chain_notice(err, notice.as_deref()))?;
     Ok(notice)
@@ -1581,6 +1604,23 @@ async fn execute_reviewed_sprout_sweep(
     app: AppHandle,
     intent: SproutSweepIntent,
 ) -> Result<SproutSweepReport, String> {
+    verified_then_sweep(intent, |intent, chain_notice| {
+        sweep_reviewed_intent(app, intent, chain_notice)
+    })
+    .await
+}
+
+/// Execute's ordering, free of any `AppHandle`: the review is verified
+/// first, and `sweep` (the only step that spends) runs only if it passes,
+/// receiving execute's own verification notice.
+async fn verified_then_sweep<F, Fut>(
+    intent: SproutSweepIntent,
+    sweep: F,
+) -> Result<SproutSweepReport, String>
+where
+    F: FnOnce(SproutSweepIntent, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<SproutSweepReport, String>>,
+{
     refuse_unverified_review(&intent)?;
     let chain_notice = verify_review_at_execute(
         &intent.notes,
@@ -1588,6 +1628,14 @@ async fn execute_reviewed_sprout_sweep(
         intent.wallet_checkpoint.as_ref(),
     )
     .await?;
+    sweep(intent, chain_notice).await
+}
+
+async fn sweep_reviewed_intent(
+    app: AppHandle,
+    intent: SproutSweepIntent,
+    chain_notice: Option<String>,
+) -> Result<SproutSweepReport, String> {
     let source = match &intent.source {
         SproutIntentSource::Wallet(_) => argos_core::sprout_sweep::NoteSource::WalletFile,
         SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
@@ -5358,6 +5406,108 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("spent on chain"), "{err}");
+    }
+
+    /// Drives the execute-time check end to end, offline, with the live-peer
+    /// lookup replaced by evidence that a reviewed note is now spent: the
+    /// whole check refuses with the "changed since reviewed" error, and
+    /// evidence naming nothing lets it pass with the lookup's notice.
+    #[tokio::test]
+    async fn execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent() {
+        let dir = unused_artifact_data_dir("reverify-spent-note");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
+        let (_, intent) = reviewed_one_note_wallet(&dir).await;
+        let nullifier =
+            argos_core::sprout::prf_nf(&intent.notes[0].a_sk, &intent.notes[0].note.rho);
+        let evidence = |spent: bool| {
+            let mut chain = argos_core::sprout_recovery::ChainSpends {
+                nullifiers: Default::default(),
+                scanned_to: 2_000_000,
+                complete: true,
+            };
+            if spent {
+                chain.nullifiers.insert(nullifier, Some([0xEE; 32]));
+            }
+            (Some(std::sync::Arc::new(chain)), Some("fresh".to_owned()))
+        };
+
+        let err = verify_review_with(&intent.notes, || async { evidence(true) })
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("changed since this sweep was reviewed"),
+            "{err}"
+        );
+        assert!(err.contains("spent on chain"), "{err}");
+
+        let notice = verify_review_with(&intent.notes, || async { evidence(false) })
+            .await
+            .expect("evidence that names no reviewed note lets execute proceed");
+        assert_eq!(notice.as_deref(), Some("fresh"));
+        remove_artifact_fixture(&dir);
+    }
+
+    fn empty_sweep_report() -> SproutSweepReport {
+        SproutSweepReport {
+            transactions: Vec::new(),
+            mined_zatoshis: 0,
+            pending_zatoshis: 0,
+            unknown_zatoshis: 0,
+            skipped: Vec::new(),
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+            error: None,
+            fresh_all_mined: true,
+        }
+    }
+
+    /// Execute's ordering: when verification refuses, the step that spends
+    /// is never invoked; when it passes, the step runs exactly once.
+    #[tokio::test]
+    async fn the_sweep_step_runs_only_after_verification_passes() {
+        let dir = unused_artifact_data_dir("reverify-sweep-order");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let sweep = |_: SproutSweepIntent, _: Option<String>| async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(empty_sweep_report())
+        };
+
+        // Refused: a review built with a malformed peer field.
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        let store = ReviewedIntentStore::default();
+        let review = propose_wallet_sprout_sweep_core(
+            &store,
+            test_wallet_source(),
+            &mut keys,
+            dir.clone(),
+            "zs-reviewed".into(),
+            ZeckNetwork::Mainnet,
+            "https://zec.rocks:443".into(),
+            Vec::new(),
+            &["no-port-here".to_owned()],
+            |_| {},
+        )
+        .await
+        .expect("a malformed peer degrades the review, not fails it");
+        let refused = store.take_wallet_proposal(&review.proposal_id).unwrap();
+        let err = verified_then_sweep(refused, &sweep)
+            .await
+            .err()
+            .expect("verification refuses");
+        assert!(err.contains("no-port-here"), "{err}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused verification must never reach the sweep"
+        );
+
+        // Passes: nothing to re-verify offline.
+        let (_, mut passing) = reviewed_one_note_wallet(&dir).await;
+        passing.wallet_checkpoint = None;
+        assert!(verified_then_sweep(passing, &sweep).await.is_ok());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        remove_artifact_fixture(&dir);
     }
 
     /// The peer-field refusal comes first: a review built with a malformed
