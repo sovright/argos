@@ -509,8 +509,10 @@ pub struct SproutSweepOutcome {
     /// rejections that read as "my funds are gone". The HD sweep learned
     /// this as audit Issue E; this path is the same shape.
     pub error: Option<String>,
-    /// True only when every relevant transaction was observed canonically
-    /// mined during this invocation.
+    /// True only when every journal transaction was observed during this
+    /// invocation as corroborated Mined at least
+    /// [`crate::broadcast::MIN_DISCARD_CONFIRMATIONS`] deep. Nothing else may
+    /// tell the operator the source material can be discarded.
     pub fresh_all_mined: bool,
 }
 
@@ -957,7 +959,10 @@ pub struct SproutReconciliation {
     pub snapshot: SproutJournalSnapshot,
     pub transactions: Vec<SproutSweepTransaction>,
     pub stop_reason: Option<String>,
-    pub freshly_observed_mined: HashSet<TxId>,
+    /// Transactions this pass observed as corroborated Mined at least
+    /// `MIN_DISCARD_CONFIRMATIONS` deep. An observer error, a single
+    /// operator, or a shallow block leaves a transaction out.
+    pub fresh_safe_to_discard: HashSet<TxId>,
 }
 
 fn transaction_summary(entry: &SproutJournalEntry) -> SproutSweepTransaction {
@@ -1116,7 +1121,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
     let mut retries = Vec::new();
     let mut unresolved_unknown = false;
     let mut unknown_observation_errors = Vec::new();
-    let mut freshly_observed_mined = HashSet::new();
+    let mut fresh_safe_to_discard = HashSet::new();
 
     for entry in entries {
         if entry.state == TxLifecycleState::NotSubmitted {
@@ -1166,7 +1171,11 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                 None,
                 Some(&observation),
             )?;
-            freshly_observed_mined.insert(entry.txid());
+            // Only corroborated and deep enough may ever tell the operator
+            // the source is no longer needed.
+            if observation.is_safe_to_discard() {
+                fresh_safe_to_discard.insert(entry.txid());
+            }
             continue;
         }
         if observation.has_single_source_mined_evidence() {
@@ -1358,7 +1367,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         transactions: transaction_summaries(&snapshot),
         snapshot,
         stop_reason,
-        freshly_observed_mined,
+        fresh_safe_to_discard,
     })
 }
 
@@ -1536,12 +1545,12 @@ pub(crate) async fn run_sweep(
             &mut outcome,
             &snapshot,
             notes,
-            &reconciliation.freshly_observed_mined,
+            &reconciliation.fresh_safe_to_discard,
         );
         return outcome;
     }
 
-    let freshly_observed_mined = reconciliation.freshly_observed_mined;
+    let fresh_safe_to_discard = reconciliation.fresh_safe_to_discard;
     let ready_ids = classify_sprout_notes(notes, &snapshot)
         .ready
         .into_iter()
@@ -1746,7 +1755,7 @@ pub(crate) async fn run_sweep(
         }
     }
 
-    refresh_outcome(&mut outcome, &snapshot, notes, &freshly_observed_mined);
+    refresh_outcome(&mut outcome, &snapshot, notes, &fresh_safe_to_discard);
     outcome
 }
 
@@ -1754,7 +1763,7 @@ fn refresh_outcome(
     outcome: &mut SproutSweepOutcome,
     snapshot: &SproutJournalSnapshot,
     notes: &[SpendableSproutNote],
-    freshly_observed_mined: &HashSet<TxId>,
+    fresh_safe_to_discard: &HashSet<TxId>,
 ) {
     outcome.transactions = transaction_summaries(snapshot);
     outcome.mined_zatoshis = 0;
@@ -1789,7 +1798,7 @@ fn refresh_outcome(
     let no_ready_notes = classify_sprout_notes(notes, snapshot).ready.is_empty();
     outcome.fresh_all_mined = !journal_entries.is_empty()
         && journal_entries.iter().all(|entry| {
-            entry.state == TxLifecycleState::Mined && freshly_observed_mined.contains(&entry.txid())
+            entry.state == TxLifecycleState::Mined && fresh_safe_to_discard.contains(&entry.txid())
         })
         && no_ready_notes
         && outcome.error.is_none()
@@ -2239,6 +2248,7 @@ mod tests {
         shared_observed:
             Option<std::sync::Arc<std::sync::Mutex<Vec<zcash_primitives::transaction::TxId>>>>,
         before_observe: Option<Box<dyn FnMut() + Send>>,
+        failing: Vec<zcash_primitives::transaction::TxId>,
     }
 
     impl LifecycleObserver {
@@ -2255,6 +2265,7 @@ mod tests {
                 observed: Vec::new(),
                 shared_observed: None,
                 before_observe: None,
+                failing: Vec::new(),
             }
         }
     }
@@ -2273,6 +2284,9 @@ mod tests {
             self.observed.push(txid);
             if let Some(shared) = &self.shared_observed {
                 shared.lock().unwrap().push(txid);
+            }
+            if self.failing.contains(&txid) {
+                return Err(ZeckError::Broadcast("observer unreachable".into()));
             }
             let (expected, mut observation) = self
                 .observations
@@ -3826,5 +3840,76 @@ mod tests {
             crate::broadcast::TxLifecycleState::MinedSingleSource
         );
         assert!(!outcome.fresh_all_mined);
+    }
+
+    #[test]
+    fn observer_error_for_a_stored_mined_entry_keeps_it_mined_but_never_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 107);
+        let tx = fixture_transaction(1070, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &tx,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        let mut node = LifecycleNode::accepted(200, 0);
+        let mut observer = LifecycleObserver::default();
+        observer.failing.push(tx.txid);
+        let (outcome, builds, _) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1071,
+        );
+        assert_eq!(observer.observed, vec![tx.txid]);
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::Mined
+        );
+        assert!(!outcome.fresh_all_mined);
+    }
+
+    #[test]
+    fn corroborated_mining_below_the_discard_depth_is_not_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 108);
+        let tx = fixture_transaction(1080, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &tx,
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+        let height = 110;
+        let shallow_tip = height + crate::broadcast::MIN_DISCARD_CONFIRMATIONS - 2;
+        let shallow = mined(Some(140), height, shallow_tip);
+        assert!(shallow.has_canonical_mined_evidence());
+        assert!(!shallow.is_safe_to_discard());
+        let mut node = LifecycleNode::accepted(shallow_tip, 0);
+        let mut observer = LifecycleObserver::new([(tx.txid, shallow)]);
+        let expected = note.note.value - SPROUT_SWEEP_FEE;
+        let (outcome, _, _) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1081,
+        );
+        assert_eq!(outcome.mined_zatoshis, expected);
+        assert!(!outcome.fresh_all_mined);
+
+        let deep_tip = height + crate::broadcast::MIN_DISCARD_CONFIRMATIONS - 1;
+        let deep = mined(Some(140), height, deep_tip);
+        assert!(deep.is_safe_to_discard());
+        let mut node = LifecycleNode::accepted(deep_tip, 0);
+        let mut observer = LifecycleObserver::new([(tx.txid, deep)]);
+        let (outcome, _, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1082);
+        assert!(outcome.fresh_all_mined, "{:?}", outcome.error);
     }
 }
