@@ -1150,6 +1150,20 @@ fn valid_for_exact_retry(observation: &TxObservation, expiry: u32) -> bool {
             .any(|item| item.tip_height.is_some())
 }
 
+/// A transition to the record's current state whose observation reports
+/// the same thing as the stored one. Appending it would only record a newer
+/// tip, and doing so on every pass grows the journal without bound.
+fn repeats_record(
+    entry: &SproutJournalEntry,
+    state: TxLifecycleState,
+    observation: &TxObservation,
+) -> bool {
+    entry.state == state
+        && entry.observation.as_ref().is_some_and(|stored| {
+            stored.state == observation.state && stored.mined_height == observation.mined_height
+        })
+}
+
 pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
     journal: &SweepJournal,
     mut snapshot: SproutJournalSnapshot,
@@ -1207,13 +1221,15 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         };
 
         if observation.has_canonical_mined_evidence() {
-            journal.append_transition(
-                &mut snapshot,
-                entry.txid(),
-                TxLifecycleState::Mined,
-                None,
-                Some(&observation),
-            )?;
+            if !repeats_record(&entry, TxLifecycleState::Mined, &observation) {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    TxLifecycleState::Mined,
+                    None,
+                    Some(&observation),
+                )?;
+            }
             // Only corroborated and deep enough may ever tell the operator
             // the source is no longer needed.
             if observation.is_safe_to_discard() {
@@ -1225,7 +1241,9 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             // Preserve a previously corroborated result. Otherwise record
             // the one-operator result so later legs may continue without
             // presenting it as independent finality to the operator.
-            if entry.state != TxLifecycleState::Mined {
+            if entry.state != TxLifecycleState::Mined
+                && !repeats_record(&entry, TxLifecycleState::MinedSingleSource, &observation)
+            {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -1237,13 +1255,15 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             continue;
         }
         if observation.state == TxObservationState::PresentUnmined {
-            journal.append_transition(
-                &mut snapshot,
-                entry.txid(),
-                TxLifecycleState::Pending,
-                None,
-                Some(&observation),
-            )?;
+            if !repeats_record(&entry, TxLifecycleState::Pending, &observation) {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    TxLifecycleState::Pending,
+                    None,
+                    Some(&observation),
+                )?;
+            }
             continue;
         }
         if observation.is_expired() {
@@ -1332,7 +1352,10 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                     transaction.txid
                 ))
             })?;
-            if entry.state != TxLifecycleState::SubmissionUnknown && !mined_was_displaced {
+            if entry.state != TxLifecycleState::SubmissionUnknown
+                && !mined_was_displaced
+                && !repeats_record(&entry, TxLifecycleState::Pending, &observation)
+            {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -1343,7 +1366,9 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             }
             retries.push((entry.outpoint, value_zatoshis, transaction));
         } else {
-            if entry.state == TxLifecycleState::Pending {
+            if entry.state == TxLifecycleState::Pending
+                && !repeats_record(&entry, TxLifecycleState::Pending, &observation)
+            {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -4129,6 +4154,64 @@ mod tests {
                 "{error}"
             );
             assert!(error.contains("cannot"), "{error}");
+        }
+    }
+
+    #[test]
+    fn repeated_reconciles_with_nothing_new_do_not_grow_the_journal() {
+        type Observe = fn(u32) -> crate::broadcast::TxObservation;
+        let cases: [(&str, crate::broadcast::TxLifecycleState, Observe); 4] = [
+            (
+                "pending contested",
+                crate::broadcast::TxLifecycleState::Pending,
+                |tip| contested(Some(140), 110, tip),
+            ),
+            (
+                "pending absent, not retryable",
+                crate::broadcast::TxLifecycleState::Pending,
+                |tip| absent(Some(140), tip),
+            ),
+            (
+                "single-source mined",
+                crate::broadcast::TxLifecycleState::Pending,
+                |tip| mined_by_one_source(Some(140), 110, tip),
+            ),
+            (
+                "corroborated mined",
+                crate::broadcast::TxLifecycleState::Mined,
+                |tip| mined(Some(140), 90, tip),
+            ),
+        ];
+        for (offset, (name, seeded, observe)) in cases.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = lifecycle_journal(dir.path());
+            let note = lifecycle_note(1_000_000, 130 + offset as u8);
+            let tx = fixture_transaction(1300 + offset as u32, 140);
+            seed_entry(&journal, &note, &tx, seeded);
+            let lines = || {
+                std::fs::read_to_string(journal.path())
+                    .unwrap()
+                    .lines()
+                    .count()
+            };
+
+            let mut counts = Vec::new();
+            for tip in [150, 151, 152] {
+                let mut node = LifecycleNode::accepted(tip, 0);
+                let mut observer = LifecycleObserver::new([(tx.txid, observe(tip))]);
+                let (outcome, builds, _) = run_lifecycle(
+                    std::slice::from_ref(&note),
+                    &mut node,
+                    &mut observer,
+                    &journal,
+                    1310,
+                );
+                assert_eq!(builds, 0, "{name}: {:?}", outcome.error);
+                assert!(node.sent.is_empty(), "{name}");
+                counts.push(lines());
+            }
+            assert_eq!(counts[0], counts[1], "{name}: {counts:?}");
+            assert_eq!(counts[1], counts[2], "{name}: {counts:?}");
         }
     }
 }
