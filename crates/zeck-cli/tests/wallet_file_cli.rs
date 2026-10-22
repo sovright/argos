@@ -11,7 +11,8 @@
 //! points at the freshly-built binary.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 
 use argos_core::broadcast::{
     BroadcastStore, EndpointTxEvidence, PreparedTransaction, SubmissionDisposition, TxObservation,
@@ -26,6 +27,22 @@ use zcash_primitives::transaction::TxId;
 /// `mnemonicphrase` HD seed, which Argos verifies but does not scan from. See
 /// `tests/regtest/fixtures/README.md`.
 const SPROUT_PLAINTEXT: &str = "sprout-plaintext.dat";
+
+// The Unix artifact authority uses nonblocking flock locks. A concurrently
+// spawned child briefly inherits the test process's descriptors between fork
+// and exec, so keep process creation out of in-process journal mutations.
+static ARGOS_SPAWN_GATE: Mutex<()> = Mutex::new(());
+
+fn lock_argos_spawn() -> MutexGuard<'static, ()> {
+    ARGOS_SPAWN_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn spawn_argos(command: &mut Command) -> Child {
+    let _guard = lock_argos_spawn();
+    command.spawn().expect("argos binary should run")
+}
 
 fn fixture(name: &str) -> PathBuf {
     relabeled_fixture(name, "mainnet")
@@ -256,8 +273,11 @@ fn argos(args: &[&str]) -> std::process::Output {
     command
         .args(args)
         .stdin(Stdio::null())
-        .output()
-        .expect("argos binary should run")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn_argos(&mut command)
+        .wait_with_output()
+        .expect("argos binary should finish")
 }
 
 fn sprout_lifecycle_output(
@@ -265,6 +285,7 @@ fn sprout_lifecycle_output(
     state: TxLifecycleState,
     mined_height: Option<u32>,
 ) -> std::process::Output {
+    let spawn_guard = lock_argos_spawn();
     let wallet = fixture(SPROUT_PLAINTEXT);
     let bytes = std::fs::read(&wallet).expect("fixture");
     let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
@@ -374,6 +395,7 @@ fn sprout_lifecycle_output(
             )
             .expect("append lifecycle transition");
     }
+    drop(spawn_guard);
     argos(&[
         "--wallet-file",
         wallet.to_str().expect("UTF-8 wallet path"),
@@ -477,6 +499,7 @@ fn cli_prints_mined_height_only_for_mined_evidence() {
 
 #[test]
 fn v1_journal_is_reported_as_uncertain_not_already_swept() {
+    let spawn_guard = lock_argos_spawn();
     let wallet = fixture(SPROUT_PLAINTEXT);
     let bytes = std::fs::read(&wallet).expect("fixture");
     let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
@@ -528,6 +551,7 @@ fn v1_journal_is_reported_as_uncertain_not_already_swept() {
         ),
     )
     .expect("replace authenticated journal content with legacy v1 fixture");
+    drop(spawn_guard);
     let output = argos(&[
         "--wallet-file",
         wallet.to_str().expect("UTF-8 wallet path"),
@@ -556,6 +580,7 @@ fn v1_journal_is_reported_as_uncertain_not_already_swept() {
 
 #[test]
 fn unreadable_journal_keeps_source_warning_and_suppresses_all_clear() {
+    let spawn_guard = lock_argos_spawn();
     let wallet = fixture(SPROUT_PLAINTEXT);
     let bytes = std::fs::read(&wallet).expect("fixture");
     let keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None)
@@ -592,6 +617,7 @@ fn unreadable_journal_keeps_source_warning_and_suppresses_all_clear() {
         .expect("create authenticated journal object");
     std::fs::write(journal.path(), b"{broken journal\n").unwrap();
 
+    drop(spawn_guard);
     let output = argos(&[
         "--wallet-file",
         wallet.to_str().unwrap(),
@@ -1557,7 +1583,8 @@ fn scan_sprout_refuses_an_unusable_server_before_scanning() {
     // Killed at a deadline rather than awaited: a build that does not refuse
     // goes on to scan mainnet for hours, and a failing test must neither
     // hang nor load public peers for longer than it takes to fail.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_argos"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_argos"));
+    command
         .args([
             "--wallet-file",
             wallet.to_str().expect("utf-8"),
@@ -1572,9 +1599,8 @@ fn scan_sprout_refuses_an_unusable_server_before_scanning() {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("argos binary should run");
+        .stderr(Stdio::piped());
+    let mut child = spawn_argos(&mut command);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait") {
@@ -1804,13 +1830,12 @@ fn argos_with_deadline(args: &[&str], secs: u64) -> (Option<std::process::ExitSt
     if let Some(dir) = isolated.as_ref() {
         command.arg("--data-dir").arg(artifact_data_dir(dir));
     }
-    let mut child = command
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("argos binary should run");
+        .stderr(Stdio::piped());
+    let mut child = spawn_argos(&mut command);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait") {
