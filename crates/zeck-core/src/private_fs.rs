@@ -423,8 +423,7 @@ mod unix_private {
             macos_acl::acl_free(acl);
         }
         match result {
-            0 => Ok(()),
-            value if value > 0 => Err(io::Error::new(
+            0 => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "private object retained an extended macOS ACL",
             )),
@@ -575,7 +574,7 @@ mod unix_private {
         })
     }
 
-    fn open_staging_directory(parent: RawFd, name: &CString) -> io::Result<File> {
+    fn open_owned_directory(parent: RawFd, name: &CString) -> io::Result<File> {
         let descriptor = unsafe {
             libc::openat(
                 parent,
@@ -588,10 +587,18 @@ mod unix_private {
         }
         let directory = unsafe { File::from_raw_fd(descriptor) };
         let metadata = directory.metadata()?;
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o777 != 0o700
-        {
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private directory is not owned by the current user",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn open_staging_directory(parent: RawFd, name: &CString) -> io::Result<File> {
+        let directory = open_owned_directory(parent, name)?;
+        if directory.metadata()?.mode() & 0o777 != 0o700 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "private staging directory is not owner-only",
@@ -609,7 +616,7 @@ mod unix_private {
                 return Err(error);
             }
         }
-        let directory = open_staging_directory(parent.as_raw_fd(), &name)?;
+        let directory = open_owned_directory(parent.as_raw_fd(), &name)?;
         remove_extended_acl(&directory)?;
         directory.set_permissions(fs::Permissions::from_mode(0o700))?;
         if directory.metadata()?.mode() & 0o777 != 0o700 {
@@ -675,8 +682,26 @@ mod unix_private {
         remove_staging_entry_with_observer(parent, name, expected, || Ok(()))
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     struct DirectoryStream(*mut libc::DIR);
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     impl Drop for DirectoryStream {
         fn drop(&mut self) {
             unsafe {
@@ -685,16 +710,30 @@ mod unix_private {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "dragonfly"))]
     fn errno_location() -> *mut libc::c_int {
         unsafe { libc::__errno_location() }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__errno() }
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
     fn errno_location() -> *mut libc::c_int {
         unsafe { libc::__error() }
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     fn directory_names(directory: &File) -> io::Result<Vec<OsString>> {
         let descriptor = unsafe { libc::dup(directory.as_raw_fd()) };
         if descriptor < 0 {
@@ -710,28 +749,14 @@ mod unix_private {
         let stream = DirectoryStream(stream);
         let mut names = Vec::new();
         loop {
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "macos",
-                target_os = "ios"
-            ))]
             unsafe {
                 *errno_location() = 0;
             }
             let entry = unsafe { libc::readdir(stream.0) };
             if entry.is_null() {
-                #[cfg(any(
-                    target_os = "linux",
-                    target_os = "android",
-                    target_os = "macos",
-                    target_os = "ios"
-                ))]
-                {
-                    let error = last_error();
-                    if error.raw_os_error() != Some(0) {
-                        return Err(error);
-                    }
+                let error = last_error();
+                if error.raw_os_error() != Some(0) {
+                    return Err(error);
                 }
                 break;
             }
@@ -742,6 +767,22 @@ mod unix_private {
         }
         names.sort();
         Ok(names)
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    fn directory_names(_directory: &File) -> io::Result<Vec<OsString>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private staging enumeration is unsupported on this Unix target",
+        ))
     }
 
     fn open_staged_artifact(directory: RawFd) -> io::Result<Option<File>> {
@@ -1724,7 +1765,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn atomic_private_objects_drop_inherited_macos_acls_before_use() {
-        use std::process::Command;
+        use std::{cell::RefCell, process::Command};
 
         fn has_extended_acl(path: &Path) -> bool {
             let output = Command::new("ls").arg("-lde").arg(path).output().unwrap();
@@ -1750,7 +1791,9 @@ mod tests {
         assert!(has_extended_acl(tmp.path()));
 
         let path = tmp.path().join("checkpoint");
+        let staging_path = RefCell::new(None);
         write_private_file_atomic_with_observer(&path, b"spend-capable", |staging| {
+            *staging_path.borrow_mut() = Some(staging.to_path_buf());
             assert!(
                 !has_extended_acl(staging),
                 "the staging directory retained an inherited macOS ACL"
@@ -1763,6 +1806,34 @@ mod tests {
         })
         .unwrap();
         assert!(!has_extended_acl(&path));
+        assert!(
+            !staging_path.borrow().as_ref().unwrap().exists(),
+            "the private staging directory was not cleaned up"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_acl_verifier_rejects_an_inherited_entry() {
+        use std::{os::unix::fs::PermissionsExt, process::Command};
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(Command::new("chmod")
+            .arg("+a")
+            .arg(
+                "everyone allow list,search,add_file,add_subdirectory,delete_child,\
+                 file_inherit,directory_inherit",
+            )
+            .arg(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        let child = tmp.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        let child = File::open(child).unwrap();
+
+        assert!(super::unix_private::verify_no_extended_acl(&child).is_err());
     }
 }
 
