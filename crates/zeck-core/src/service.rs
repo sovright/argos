@@ -704,6 +704,17 @@ impl ReviewedSweepIntent {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Runs inside `propose_sweep` after the quote is built and before its id
+    /// is issued. Task-local so parallel tests cannot see each other's hook.
+    static PROPOSE_AFTER_BUILD: Box<dyn Fn(&ScanSession) + Send + Sync>;
+    /// Replaces the lightwalletd tip and UTXO lookup in
+    /// `attach_direct_sweep_leg`, so offline tests reach the review checks
+    /// that follow it instead of a network error.
+    static DIRECT_LEG_CHAIN: (u32, Vec<crate::transparent_recovery::TransparentUtxo>);
+}
+
 /// Store a reviewed intent and issue its id, but only if `current` scan state
 /// still matches the state it was reviewed against. Proposal construction
 /// can read a wallet and take time; a progress refresh during that work must
@@ -1716,6 +1727,10 @@ impl RecoveryService {
         let mut intent = ReviewedSweepIntent::capture(request, &session, &progress);
         intent.bind_plan(&plan);
         intent.authority = Some(authority);
+        // Test seam: lets a test move progress between the build above and
+        // the issue below, which is the window the re-check exists for.
+        #[cfg(test)]
+        let _ = PROPOSE_AFTER_BUILD.try_with(|hook| hook(&session));
         let state = session.state.lock().await;
         let proposal_id = issue_reviewed_proposal(&session, intent, &state).await?;
         Ok(ReviewedSweepProposal {
@@ -3111,18 +3126,29 @@ async fn attach_direct_sweep_leg(
             })
             .collect::<ZeckResult<Vec<_>>>()?
     };
-    let (mut client, _endpoint, info) =
-        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(&runtime.lightwalletd_url)
+    #[cfg(test)]
+    let fixture = DIRECT_LEG_CHAIN.try_with(Clone::clone).ok();
+    #[cfg(not(test))]
+    let fixture: Option<(u32, Vec<crate::transparent_recovery::TransparentUtxo>)> = None;
+    let (tip, mut utxos) = if let Some(fixture) = fixture {
+        fixture
+    } else {
+        let (mut client, _endpoint, info) =
+            crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(
+                &runtime.lightwalletd_url,
+            )
             .await?;
-    validate_lightwalletd_network(runtime.network, &info)?;
-    let tip = u32::try_from(info.block_height)
-        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
-    let mut utxos = crate::transparent_recovery::fetch_transparent_utxos(
-        &mut client,
-        &selected,
-        runtime.network,
-    )
-    .await?;
+        validate_lightwalletd_network(runtime.network, &info)?;
+        let tip = u32::try_from(info.block_height)
+            .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+        let utxos = crate::transparent_recovery::fetch_transparent_utxos(
+            &mut client,
+            &selected,
+            runtime.network,
+        )
+        .await?;
+        (tip, utxos)
+    };
     utxos.sort_by_cached_key(canonical_transparent_input);
     let params = consensus_network(runtime.network);
     let Some(direct_plan) = crate::transparent_recovery::plan_sweep(
@@ -8028,6 +8054,59 @@ mod propose_workspace_guard_tests {
             .expect("unchanged progress issues an id");
         drop(state);
         assert!(session.reviewed_sweeps.lock().await.take(&id).is_ok());
+    }
+
+    /// The same re-check at its call site: `propose_sweep` must compare the
+    /// intent with the progress current at issue time, not the snapshot the
+    /// quote was built from. Progress is moved between build and issue; a
+    /// call site passing the stale snapshot would issue an id here.
+    #[tokio::test]
+    async fn propose_refuses_when_progress_moves_between_build_and_issue() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            transparent_only_source(),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+        let hook: Box<dyn Fn(&ScanSession) + Send + Sync> = Box::new(|session| {
+            session
+                .state
+                .try_lock()
+                .expect("nothing else holds the scan state")
+                .progress
+                .accounts[0]
+                .sapling_zatoshis += 1;
+        });
+        // Offline chain for the direct transparent leg: one UTXO matching the
+        // scanned balance, so the quote builds and the issue-time re-check is
+        // what refuses it -- quickly, with no lightwalletd probe.
+        let chain = (
+            3_000_000,
+            vec![crate::transparent_recovery::tests_support::utxo(
+                crate::transparent_recovery::tests_support::addr(0x42),
+                2_099_979_000,
+                7,
+            )],
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            DIRECT_LEG_CHAIN.scope(
+                chain,
+                PROPOSE_AFTER_BUILD.scope(hook, service.propose_sweep(&handle, request())),
+            ),
+        )
+        .await
+        .expect("the stale check needs no network");
+        assert!(
+            matches!(result, Err(ZeckError::StaleSweepProposal(_))),
+            "got: {result:?}"
+        );
+        let session = service.session(&handle).await.expect("session");
+        assert!(
+            session.reviewed_sweeps.lock().await.entries.is_empty(),
+            "a refused proposal must not be stored"
+        );
     }
 
     /// The other half: the guard still refuses a route whose balances do come

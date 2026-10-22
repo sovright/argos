@@ -399,6 +399,9 @@ pub enum ImportCoverage {
     /// recovered from it — absent, or present only as a record that could
     /// not be read or decrypted. A truncated or damaged wallet.
     DerivedKeysMissing,
+    /// The file records an HD key at an account index past the most HD
+    /// accounts the scan walks, so those accounts are not scanned.
+    HdAccountsBeyondScanLimit,
     /// The seed is verified, but unified accounts derived from it hold
     /// keys the file does not store, so they are not scanned.
     SeedAccountsNotScanned,
@@ -439,6 +442,7 @@ impl ImportCoverage {
             | ImportDiagnostic::ConflictingNetworkMetadata { .. }
             | ImportDiagnostic::UnrecognizedNetworkMetadata { .. } => Self::UnknownRecordsSkipped,
             ImportDiagnostic::UnscannedSeedAccounts { .. } => Self::SeedAccountsNotScanned,
+            ImportDiagnostic::HdAccountsBeyondScanLimit { .. } => Self::HdAccountsBeyondScanLimit,
             ImportDiagnostic::MissingDerivedKeys { .. } => Self::DerivedKeysMissing,
             ImportDiagnostic::UncheckedLegacySeed { .. } => Self::LegacySeedUnchecked,
             // A key without a creation time is still a key, and is scanned
@@ -480,6 +484,11 @@ impl ImportCoverage {
             Self::DerivedKeysMissing => Some(
                 "Incomplete — this wallet's own records say its seed derived keys that \
                  were not read from this file, so balances may be missing funds.",
+            ),
+            Self::HdAccountsBeyondScanLimit => Some(
+                "Incomplete — this wallet records HD keys at more accounts than Argos \
+                 scans. Accounts past the scan's limit are not scanned, so balances may \
+                 be missing funds.",
             ),
             Self::SeedAccountsNotScanned => Some(
                 "Incomplete — this wallet created unified accounts from its seed \

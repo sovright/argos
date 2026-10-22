@@ -606,6 +606,9 @@ fn read_key_vectors(
         note_hd_index(out, hd_index);
         match entry {
             ZKeyEntry::Recovered(k) => out.sapling.push(k),
+            // A locked HD key beside a recovered seed is one of the seed's
+            // own accounts: the scan recreates it, so it is not missing.
+            ZKeyEntry::Locked(Provenance::HdDerived) if out.mnemonic.is_some() => {}
             ZKeyEntry::Locked(provenance) => {
                 out.diagnostics.push(locked_key("zwl-zkey", provenance))
             }
@@ -692,6 +695,8 @@ fn read_key_vectors(
                             identifier: "transparent address",
                         })
                 }
+                // As for zkeys: covered by the recovered seed.
+                TKeyEntry::Locked(Provenance::HdDerived) if out.mnemonic.is_some() => {}
                 TKeyEntry::Locked(provenance) => {
                     out.diagnostics.push(locked_key("zwl-tkey", provenance))
                 }
@@ -1694,21 +1699,24 @@ mod tests {
         vectors.extend_from_slice(&cs(0));
         let bytes = wallet(25, &keys_body(21, false, &vectors));
         let keys = import_zwl(&bytes, None).unwrap();
+        // The seed is recovered, so the locked HD key is one of its own
+        // accounts and is not reported; the standalone one, which no seed
+        // holds, still is, with its own guidance.
+        assert!(keys.mnemonic.is_some());
+        let locked: Vec<_> = keys
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, ImportDiagnostic::LockedKey { .. }))
+            .collect();
+        assert_eq!(locked.len(), 1, "{:?}", keys.diagnostics);
         assert!(matches!(
-            &keys.diagnostics[0],
-            ImportDiagnostic::LockedKey {
-                provenance: Provenance::HdDerived,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &keys.diagnostics[1],
+            locked[0],
             ImportDiagnostic::LockedKey {
                 provenance: Provenance::Standalone,
                 ..
             }
         ));
-        assert!(keys.diagnostics[1]
+        assert!(locked[0]
             .to_string()
             .contains("cannot be recreated from the seed"));
     }
@@ -1722,21 +1730,24 @@ mod tests {
         vectors.extend_from_slice(&standalone);
         let bytes = wallet(25, &keys_body(21, false, &vectors));
         let keys = import_zwl(&bytes, None).unwrap();
+        // The seed is recovered, so the locked HD key is one of its own
+        // accounts and is not reported; the standalone one, which no seed
+        // holds, still is, with its own guidance.
+        assert!(keys.mnemonic.is_some());
+        let locked: Vec<_> = keys
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, ImportDiagnostic::LockedKey { .. }))
+            .collect();
+        assert_eq!(locked.len(), 1, "{:?}", keys.diagnostics);
         assert!(matches!(
-            &keys.diagnostics[0],
-            ImportDiagnostic::LockedKey {
-                provenance: Provenance::HdDerived,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &keys.diagnostics[1],
+            locked[0],
             ImportDiagnostic::LockedKey {
                 provenance: Provenance::Standalone,
                 ..
             }
         ));
-        assert!(keys.diagnostics[1]
+        assert!(locked[0]
             .to_string()
             .contains("cannot be recreated from the seed"));
     }
@@ -1924,8 +1935,10 @@ mod tests {
         // The seed decrypts fine (a correct passphrase), but these locked
         // entries are HD keys: zwl-lib never seals an HD key per record (the
         // junk `enc_key` here is ignored), so the seed is their only source.
-        // A passphrase must not make them look recovered: every locked
-        // entry has to show up as a diagnostic, never a fabricated key.
+        // A passphrase must not make them look recovered: no key is
+        // fabricated from them. With the seed recovered they are the seed's
+        // own accounts, recreated by the scan, so they are not reported as
+        // locked either (round-2 item D on #275).
         // keys_version 21: no okeys vector at all (only present > 21).
         let mut vectors = cs(1);
         vectors.extend_from_slice(&zkey_locked());
@@ -1942,11 +1955,12 @@ mod tests {
 
         assert!(keys.sapling.is_empty(), "no fabricated sapling key");
         assert!(keys.transparent.is_empty(), "no fabricated transparent key");
-        assert_eq!(keys.diagnostics.len(), 2);
         assert!(
             keys.mnemonic.is_some(),
             "the whole-wallet seed still decrypts even though these two keys don't"
         );
+        assert!(keys.diagnostics.is_empty(), "{:?}", keys.diagnostics);
+        assert_eq!(keys.highest_hd_index, Some(0));
     }
 
     #[test]
@@ -2129,6 +2143,29 @@ mod tests {
             keys.diagnostics
         );
         assert_eq!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    /// Round-2 item D on #275: an encrypted ZWL wallet drops its HD keys
+    /// while locked, but once the seed decrypts they are the seed's own HD
+    /// accounts, recreated by the scan (their `hdkey_num` widens its range).
+    /// They are not reported as locked or missing.
+    #[test]
+    fn locked_hd_keys_are_not_reported_once_the_seed_decrypts() {
+        let bytes = encrypted_mixed_wallet("correct horse", &zkey_locked(), &tkey_locked());
+        let keys =
+            import_zwl(&bytes, Some(&SecretString::new("correct horse".to_owned()))).unwrap();
+        assert!(keys.mnemonic.is_some());
+        assert!(
+            !keys
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ImportDiagnostic::LockedKey { .. })),
+            "{:?}",
+            keys.diagnostics
+        );
+        assert_eq!(keys.highest_hd_index, Some(0), "the HD index still counts");
+        assert_eq!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+        assert_eq!(keys.coverage_notice(), None);
     }
 
     #[test]
