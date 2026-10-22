@@ -8,8 +8,9 @@
 //! re-decrypt the wallet file, or re-collect the panel's keys, from form
 //! fields at click time. That let execution diverge from the review (a
 //! different file, passphrase, key box, network or server than the one the
-//! user approved) and re-opened the decrypt window on every click. Holding
-//! the reviewed material instead binds execution to the review, at the cost
+//! user approved). Holding the reviewed material binds execution to the
+//! review; wallet-backed execution reopens the file only to verify its
+//! backend-held snapshot identity before any network or proving work, at the cost
 //! of keeping keys resident for a bounded time:
 //!
 //! - a proposal lives at most [`PROPOSAL_TTL`], is swept on every store
@@ -38,6 +39,8 @@ use crate::commands::{SproutScanReport, SproutSweepResult};
 pub const MAX_SCAN_SESSIONS: usize = 16;
 pub const MAX_PROPOSALS: usize = 32;
 pub const MAX_IN_FLIGHT_CHECKPOINTS: usize = 16;
+pub const MAX_WALLET_REVIEWS: usize = 16;
+pub const WALLET_REVIEW_TTL: Duration = Duration::from_secs(30 * 60);
 /// How long a reviewed Sprout proposal stays executable. Long enough to read
 /// the review and tick the box; short enough that spending keys held for it
 /// do not linger behind a review the user walked away from.
@@ -50,6 +53,138 @@ pub struct SproutScanHandle(pub String);
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SproutProposalId(pub String);
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WalletReviewId(pub String);
+
+/// Backend-owned authority for the exact file object and bytes inspected.
+/// It deliberately exposes neither the digest nor object identity to IPC.
+#[derive(PartialEq, Eq)]
+pub struct ReviewedWalletSource {
+    review_id: WalletReviewId,
+    path: PathBuf,
+    identity: Arc<argos_core::wallet_file::WalletFileIdentity>,
+}
+
+impl ReviewedWalletSource {
+    pub fn verify(&self) -> Result<argos_core::wallet_file::WalletFileSnapshot, String> {
+        argos_core::wallet_file::verify_wallet_snapshot(&self.path, &self.identity)
+            .map_err(|err| err.to_string())
+    }
+}
+
+struct StoredWalletReview {
+    source: Arc<ReviewedWalletSource>,
+    created: Instant,
+}
+
+struct WalletReviewInner {
+    reviews: HashMap<WalletReviewId, StoredWalletReview>,
+    ttl: Duration,
+}
+
+impl Default for WalletReviewInner {
+    fn default() -> Self {
+        Self {
+            reviews: HashMap::new(),
+            ttl: WALLET_REVIEW_TTL,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct WalletReviewRegistry(Arc<Mutex<WalletReviewInner>>);
+
+impl WalletReviewRegistry {
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self(Arc::new(Mutex::new(WalletReviewInner {
+            ttl,
+            ..WalletReviewInner::default()
+        })))
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, WalletReviewInner>, String> {
+        self.0
+            .lock()
+            .map_err(|_| "wallet review registry unavailable".to_owned())
+    }
+
+    fn sweep_expired(inner: &mut WalletReviewInner) {
+        let now = Instant::now();
+        let ttl = inner.ttl;
+        inner
+            .reviews
+            .retain(|_, stored| now.saturating_duration_since(stored.created) < ttl);
+    }
+
+    pub fn register(
+        &self,
+        path: PathBuf,
+        identity: Arc<argos_core::wallet_file::WalletFileIdentity>,
+    ) -> Result<WalletReviewId, String> {
+        let mut inner = self.lock()?;
+        Self::sweep_expired(&mut inner);
+        if inner.reviews.len() >= MAX_WALLET_REVIEWS {
+            return Err(
+                "too many wallet reviews; inspect the file again after an older review expires"
+                    .into(),
+            );
+        }
+        let review_id = loop {
+            let candidate = WalletReviewId(Uuid::new_v4().to_string());
+            if !inner.reviews.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let source = Arc::new(ReviewedWalletSource {
+            review_id: review_id.clone(),
+            path,
+            identity,
+        });
+        inner.reviews.insert(
+            review_id.clone(),
+            StoredWalletReview {
+                source,
+                created: Instant::now(),
+            },
+        );
+        Ok(review_id)
+    }
+
+    pub fn resolve(&self, id: &WalletReviewId) -> Result<Arc<ReviewedWalletSource>, String> {
+        let mut inner = self.lock()?;
+        Self::sweep_expired(&mut inner);
+        inner
+            .reviews
+            .get(id)
+            .map(|stored| Arc::clone(&stored.source))
+            .ok_or_else(|| "unknown or expired wallet review; inspect the wallet again".to_owned())
+    }
+
+    pub fn verify(
+        &self,
+        id: &WalletReviewId,
+    ) -> Result<
+        (
+            Arc<ReviewedWalletSource>,
+            argos_core::wallet_file::WalletFileSnapshot,
+        ),
+        String,
+    > {
+        let source = self.resolve(id)?;
+        match source.verify() {
+            Ok(snapshot) => Ok((source, snapshot)),
+            Err(err) => {
+                if let Ok(mut inner) = self.lock() {
+                    inner.reviews.remove(id);
+                }
+                Err(err)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,12 +237,13 @@ pub struct ReviewedSproutSweep {
     pub warnings: Vec<String>,
 }
 
-/// Where a proposal's notes came from. A wallet proposal carries no file
-/// identity: its notes and their spending keys are held in the intent, so
-/// execution never re-reads the file and there is nothing to compare.
+/// Where a proposal's notes came from. A wallet proposal holds both the
+/// reviewed notes and an Arc to the backend-owned file snapshot identity.
+/// The registry may expire while the proposal remains live; execute still
+/// re-verifies the exact source before it touches the network or prover.
 #[derive(PartialEq, Eq)]
 pub enum SproutIntentSource {
-    Wallet,
+    Wallet(Arc<ReviewedWalletSource>),
     Scan(SproutScanHandle),
 }
 
@@ -505,7 +641,7 @@ impl ReviewedIntentStore {
                 .proposals
                 .get(id)
                 .ok_or("unknown or already used Sprout proposal")?;
-            if !matches!(intent.intent.source, SproutIntentSource::Wallet) {
+            if !matches!(intent.intent.source, SproutIntentSource::Wallet(_)) {
                 return Err("proposal belongs to a scan-derived sweep".into());
             }
         }
@@ -550,6 +686,19 @@ mod tests {
         )
     }
 
+    fn wallet_source(marker: u8) -> Arc<ReviewedWalletSource> {
+        let registry = WalletReviewRegistry::default();
+        let dir = std::env::temp_dir().join(format!("argos-wallet-source-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, [marker]).unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(path, Arc::new(snapshot.identity().clone()))
+            .unwrap();
+        registry.resolve(&id).unwrap()
+    }
+
     fn scan(store: &ReviewedIntentStore, marker: u8) -> SproutScanHandle {
         store
             .insert_scan(
@@ -589,7 +738,7 @@ mod tests {
             SproutIntentSource::Scan(handle) => {
                 store.scan_material(handle).unwrap().lightwalletd_url
             }
-            SproutIntentSource::Wallet => "https://node-a".to_owned(),
+            SproutIntentSource::Wallet(_) => "https://node-a".to_owned(),
         };
         store
             .insert_proposal(
@@ -635,7 +784,11 @@ mod tests {
     #[test]
     fn sprout_intent_is_one_shot() {
         let store = ReviewedIntentStore::default();
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(1)),
+            "zs-reviewed",
+        );
         assert!(store.take_proposal(&id).is_ok());
         assert!(store.take_proposal(&id).is_err());
     }
@@ -643,7 +796,11 @@ mod tests {
     #[test]
     fn wrong_execution_route_cannot_consume_a_proposal() {
         let store = ReviewedIntentStore::default();
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(2)),
+            "zs-reviewed",
+        );
         assert!(store.take_scan_proposal(&id).is_err());
         assert!(store.take_wallet_proposal(&id).is_ok());
     }
@@ -653,8 +810,8 @@ mod tests {
         let store = ReviewedIntentStore::default();
         // B finishes first; older A returns later. A must not evict the ID
         // already displayed for B, and B remains one-shot executable.
-        let b = proposal(&store, SproutIntentSource::Wallet, "zs-B");
-        let a = proposal(&store, SproutIntentSource::Wallet, "zs-A");
+        let b = proposal(&store, SproutIntentSource::Wallet(wallet_source(3)), "zs-B");
+        let a = proposal(&store, SproutIntentSource::Wallet(wallet_source(4)), "zs-A");
         assert_eq!(store.take_wallet_proposal(&b).unwrap().destination, "zs-B");
         assert!(store.take_wallet_proposal(&b).is_err());
         store.release_proposal(&a).unwrap();
@@ -727,12 +884,16 @@ mod tests {
             )
             .is_err());
         for _ in 0..MAX_PROPOSALS {
-            proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+            proposal(
+                &store,
+                SproutIntentSource::Wallet(wallet_source(5)),
+                "zs-reviewed",
+            );
         }
         assert!(store
             .insert_proposal(
                 SproutSweepIntent {
-                    source: SproutIntentSource::Wallet,
+                    source: SproutIntentSource::Wallet(wallet_source(6)),
                     notes: Vec::new(),
                     destination: "zs-reviewed".into(),
                     network: ZeckNetwork::Mainnet,
@@ -854,7 +1015,11 @@ mod tests {
     #[test]
     fn sprout_proposals_expire() {
         let store = ReviewedIntentStore::with_proposal_ttl(std::time::Duration::ZERO);
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(7)),
+            "zs-reviewed",
+        );
         assert_eq!(
             store.take_wallet_proposal(&id).err().unwrap(),
             "unknown or already used Sprout proposal"
@@ -862,7 +1027,11 @@ mod tests {
         assert_eq!(store.proposal_count(), 0, "expired proposals are dropped");
 
         let store = ReviewedIntentStore::default();
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(8)),
+            "zs-reviewed",
+        );
         assert!(store.take_wallet_proposal(&id).is_ok());
         assert_eq!(PROPOSAL_TTL, std::time::Duration::from_secs(15 * 60));
     }
@@ -872,7 +1041,11 @@ mod tests {
     fn expired_proposals_do_not_fill_the_store() {
         let store = ReviewedIntentStore::with_proposal_ttl(std::time::Duration::ZERO);
         for _ in 0..MAX_PROPOSALS + 1 {
-            proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+            proposal(
+                &store,
+                SproutIntentSource::Wallet(wallet_source(9)),
+                "zs-reviewed",
+            );
         }
     }
 
@@ -983,7 +1156,11 @@ mod tests {
         store.release_scan(&handle).unwrap();
         assert!(store.snapshot(&handle).is_err());
         assert!(store.take_proposal(&id).is_err());
-        let wallet = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let wallet = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(10)),
+            "zs-reviewed",
+        );
         store.release_proposal(&wallet).unwrap();
         assert!(store.take_proposal(&wallet).is_err());
     }
@@ -1003,5 +1180,87 @@ mod tests {
         .unwrap();
         assert_eq!(value["handle"], handle.0);
         assert_eq!(value["height"], 50);
+    }
+
+    fn reviewed_wallet(
+        registry: &WalletReviewRegistry,
+        bytes: &[u8],
+    ) -> (PathBuf, PathBuf, WalletReviewId) {
+        let dir = std::env::temp_dir().join(format!("argos-wallet-review-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, bytes).unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(path.clone(), Arc::new(snapshot.identity().clone()))
+            .unwrap();
+        (dir, path, id)
+    }
+
+    #[test]
+    fn stale_or_unknown_review_id_is_rejected() {
+        let registry = WalletReviewRegistry::with_ttl(Duration::ZERO);
+        let (dir, _path, id) = reviewed_wallet(&registry, b"wallet");
+        assert!(registry.verify(&id).is_err());
+        assert!(registry
+            .verify(&WalletReviewId("unknown".to_owned()))
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn changed_wallet_revokes_matching_review_id() {
+        let registry = WalletReviewRegistry::default();
+        let (dir, path, id) = reviewed_wallet(&registry, b"wallet-A");
+        std::fs::write(&path, b"wallet-B").unwrap();
+        assert!(registry.verify(&id).is_err());
+        assert!(registry.verify(&id).is_err(), "the rejected ID was revoked");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn registry_expiry_does_not_kill_a_reviewed_proposal() {
+        let registry = WalletReviewRegistry::with_ttl(Duration::from_millis(5));
+        let (dir, _path, id) = reviewed_wallet(&registry, b"wallet");
+        let source = registry.resolve(&id).unwrap();
+        let store = ReviewedIntentStore::default();
+        let proposal_id = proposal(
+            &store,
+            SproutIntentSource::Wallet(Arc::clone(&source)),
+            "zs-reviewed",
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(registry.resolve(&id).is_err(), "registry entry expired");
+        let intent = store.take_wallet_proposal(&proposal_id).unwrap();
+        let SproutIntentSource::Wallet(retained) = intent.source else {
+            panic!("wallet proposal source changed")
+        };
+        assert!(
+            retained.verify().is_ok(),
+            "proposal retains reviewed source"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wallet_review_registry_is_bounded() {
+        let registry = WalletReviewRegistry::default();
+        let mut roots = Vec::new();
+        for marker in 0..MAX_WALLET_REVIEWS {
+            let reviewed = reviewed_wallet(&registry, &[marker as u8]);
+            roots.push(reviewed);
+        }
+        let dir = std::env::temp_dir().join(format!("argos-wallet-review-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overflow.dat");
+        std::fs::write(&path, b"overflow").unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        assert!(registry
+            .register(path, Arc::new(snapshot.identity().clone()))
+            .is_err());
+        for (dir, _, _) in roots {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

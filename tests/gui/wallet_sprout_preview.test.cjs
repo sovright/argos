@@ -92,8 +92,10 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       $(id).textContent = text;
     },
     invalidateSproutScanSource() {},
-    invoke: (command, args) => intercept(command, args, async () => {
+    invoke: (command, args) => {
+      const result = intercept(command, args, async () => {
       if (command === "inspect_wallet_file") return {
+        review_id: `review:${args.path}`,
         needs_passphrase: false, transparent_keys: 0, sapling_keys: 0,
         sprout_keys: 1, has_mnemonic: false, sprout_spendable_notes: 1,
         sprout_spendable_zatoshis: 100000, sprout_addresses: [], diagnostics: [],
@@ -128,8 +130,18 @@ function harness(intercept = (_, __, fallback) => fallback()) {
           nu7_warning: "NU7: Sprout recovery must be mined before activation.",
         };
       }
-      throw new Error(`Unexpected IPC command: ${command}`);
-    }),
+        throw new Error(`Unexpected IPC command: ${command}`);
+      });
+      if (command !== "inspect_wallet_file") return result;
+      return Promise.resolve(result).then((summary) => {
+        if (summary && !summary.needs_passphrase &&
+            (summary.transparent_keys + summary.sapling_keys + summary.sprout_keys > 0) &&
+            summary.review_id === undefined) {
+          return { ...summary, review_id: `review:${args.path}` };
+        }
+        return summary;
+      });
+    },
   });
   const source = fs.readFileSync("gui/src/main.js", "utf8");
   vm.runInContext(source.slice(
@@ -192,6 +204,34 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     },
   };
 }
+
+test("opaque wallet review ID is passed to every wallet-backed command", async () => {
+  const calls = [];
+  const h = harness((command, args, fallback) => {
+    if (["propose_wallet_sprout_sweep", "start_sprout_scan"].includes(command)) {
+      calls.push({ command, args: { ...args } });
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat", "secret");
+  await flush();
+  h.loadScanPanel();
+  await h.scan();
+
+  for (const call of calls) {
+    assert.equal(call.args.reviewId, "review:/fixture/wallet.dat", call.command);
+    assert.equal("path" in call.args, false, call.command);
+  }
+  const source = fs.readFileSync("gui/src/main.js", "utf8");
+  for (const command of ["detect_birthday_from_wallet_file"]) {
+    const invocation = source.slice(source.indexOf(`invoke(\"${command}\"`), source.indexOf(`invoke(\"${command}\"`) + 700);
+    assert.match(invocation, /reviewId:\s*walletFile\.reviewId/, command);
+    assert.doesNotMatch(invocation, /path:\s*walletFile\.path/, command);
+  }
+  const ordinary = source.slice(source.indexOf('invoke("start_scan_from_wallet_file"'), source.indexOf('invoke("start_scan_from_wallet_file"') + 900);
+  assert.match(ordinary, /review_id:\s*walletFile\s*\?\s*walletFile\.reviewId/);
+  assert.doesNotMatch(ordinary, /path:\s*walletFile\s*\?\s*walletFile\.path/);
+});
 
 test("wallet Sprout sweep requires explicit irreversible confirmation", async () => {
   const executions = [];
@@ -339,11 +379,11 @@ test("network and data directory edits hide wallet Sprout evidence until reinspe
   }
 });
 
-test("first wallet open displays its Sprout preview without a null-path error", async () => {
+test("first wallet open displays its Sprout preview with reviewed authority", async () => {
   const h = harness();
   await h.open("/fixture/first.dat");
   assert.deepEqual(h.previews, [{
-    path: "/fixture/first.dat", passphrase: null, destination: "fixture-destination",
+    reviewId: "review:/fixture/first.dat", passphrase: null, destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
     network: "mainnet", dataDir: null, peers: [],
   }]);
@@ -353,12 +393,12 @@ test("first wallet open displays its Sprout preview without a null-path error", 
   assert.equal(h.$("sprout-sweep-run").disabled, true);
 });
 
-test("opening another wallet previews the new path and passphrase", async () => {
+test("opening another wallet previews the new review and passphrase", async () => {
   const h = harness();
   await h.open("/fixture/first.dat", "fixture-one");
   await h.open("/fixture/second.dat", "fixture-two");
   assert.deepEqual(h.previews.at(-1), {
-    path: "/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
+    reviewId: "review:/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
     network: "mainnet", dataDir: null, peers: [],
   });
@@ -638,7 +678,7 @@ for (const fails of [false, true]) {
   test(`older preview ${fails ? "failure" : "success"} cannot overwrite the current preview`, async () => {
     const old = deferred();
     const h = harness(async (command, args, fallback) => {
-      if (command === "propose_wallet_sprout_sweep" && args.path === "/fixture/old.dat") {
+      if (command === "propose_wallet_sprout_sweep" && args.reviewId === "review:/fixture/old.dat") {
         await old.promise;
         return { proposal_id: "old-proposal", notes: 99, gross_zatoshis: 999,
           fee_zatoshis: 1, net_zatoshis: 998, params_present: true };
@@ -661,10 +701,9 @@ test("a new import blocks spending until its own preview is ready", async () => 
   const inspection = deferred(), preview = deferred();
   const executions = [];
   const h = harness(async (command, args, fallback) => {
-    if (args.path === "/fixture/new.dat") {
-      if (command === "inspect_wallet_file") await inspection.promise;
-      if (command === "propose_wallet_sprout_sweep") await preview.promise;
-    }
+    if (command === "inspect_wallet_file" && args.path === "/fixture/new.dat") await inspection.promise;
+    if (command === "propose_wallet_sprout_sweep" &&
+        args.reviewId === "review:/fixture/new.dat") await preview.promise;
     if (command === "execute_wallet_sprout_sweep") {
       executions.push(args.proposalId);
       return sproutLifecycleReport([]);
@@ -973,7 +1012,7 @@ test("lifecycle action label resets for a ready-only preview", async () => {
   const h = harness(async (command, args, fallback) => {
     if (command !== "propose_wallet_sprout_sweep") return fallback();
     const review = await fallback();
-    return args.path.endsWith("status.dat")
+    return args.reviewId.endsWith("status.dat")
       ? { ...review, notes: 0, gross_zatoshis: 0, fee_zatoshis: 0, net_zatoshis: 0,
         active: [sproutTransaction("pending")], params_present: false }
       : { ...review, active: [], mined: [], params_present: true };
@@ -1579,7 +1618,7 @@ test("a no-file scan sends only the pasted lines, with no wallet path or passphr
   // decrypt bound, for one) are owned by their own tests.
   const sent = JSON.parse(JSON.stringify(calls[0]));
   assert.deepEqual(sent.keys, ["# paper backup", "SKfixture", ""]);
-  assert.equal(sent.path, null);
+  assert.equal(sent.reviewId, null);
   assert.equal(sent.passphrase, null);
   assert.equal(sent.network, "mainnet");
   assert.equal(sent.dataDir, "");
@@ -1626,7 +1665,7 @@ test("a no-file scan sweep sends the pasted lines and switches the panel to broa
   await h.scan();
   // #271 binds the pasted lines when the scan starts, with no wallet file.
   assert.equal(starts.length, 1);
-  assert.equal(starts[0].path, null);
+  assert.equal(starts[0].reviewId, null);
   assert.equal(starts[0].passphrase, null);
   assert.deepEqual([...starts[0].keys], ["STfixture"]);
   assert.equal(starts[0].network, "testnet");

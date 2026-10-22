@@ -30,6 +30,7 @@ fn main() {
             service: RecoveryService::new(),
             address_search: argos_core::address_search::AddressSearchService::default(),
             reviewed_intent: reviewed_intent::ReviewedIntentStore::default(),
+            wallet_reviews: reviewed_intent::WalletReviewRegistry::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::validate_seed,

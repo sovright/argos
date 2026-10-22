@@ -809,7 +809,7 @@ async function showSproutSweep() {
   try {
     const previewNetwork = previewConfig.network;
     const preview = await invoke("propose_wallet_sprout_sweep", {
-      path: source.path,
+      reviewId: source.reviewId,
       passphrase: source.passphrase,
       destination,
       lightwalletdUrl: previewConfig.lightwalletdUrl,
@@ -1331,7 +1331,10 @@ async function openWalletFile() {
 
     // Rendering can immediately request a Sprout preview, so install the
     // newly opened file before it reads the path and passphrase.
-    walletFile = { path, passphrase, summary };
+    if (!summary.review_id) {
+      throw new Error("wallet inspection did not return review authority; inspect it again");
+    }
+    walletFile = { path, reviewId: summary.review_id, passphrase, summary };
     renderWalletSummary(summary);
     // Carried forward so every later screen can say what the totals leave
     // out. Recorded at open time because the summary is not in scope later.
@@ -1791,7 +1794,7 @@ async function runSproutScan() {
       keys: sproutScanKeyLines(),
       // The wallet file's own Sprout keys are merged in by the backend, so
       // leaving the box blank genuinely works now.
-      path: walletFile ? walletFile.path : null,
+      reviewId: walletFile ? walletFile.reviewId : null,
       passphrase: walletFile ? walletFile.passphrase : null,
       network: $("network-select").value,
       dataDir: $("data-dir").value.trim(),
@@ -2376,7 +2379,7 @@ async function runBirthdayAutodetect() {
       source.kind === "wallet"
         ? await invoke("detect_birthday_from_wallet_file", {
             ...probe,
-            path: walletFile.path,
+            reviewId: walletFile.reviewId,
             passphrase: walletFile.passphrase,
             // Scanned with the file, and undated, so they must be counted.
             saplingKeys: hasSaplingScanKeys() ? saplingScanKeyLines() : [],
@@ -2621,7 +2624,7 @@ go back and provide one.",
       handle = await invoke("start_scan_from_wallet_file", {
         config: {
           ...rest,
-          path: walletFile ? walletFile.path : null,
+          review_id: walletFile ? walletFile.reviewId : null,
           passphrase: walletFile ? walletFile.passphrase : null,
           sapling_keys: typedSaplingKeys,
           // Checked against the key source before the scan starts.

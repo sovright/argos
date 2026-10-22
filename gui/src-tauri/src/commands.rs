@@ -10,6 +10,7 @@ use crate::reviewed_intent::{
     CheckpointReservation, ReviewedIntentStore, ReviewedSproutSweep, ScanMaterial,
     SproutIntentSource, SproutProposalId, SproutScanHandle, SproutScanProgressEvent,
     SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData, WalletCheckpointAuthority,
+    WalletReviewId, WalletReviewRegistry,
 };
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
@@ -26,6 +27,7 @@ pub struct AppState {
     pub service: RecoveryService,
     pub address_search: argos_core::address_search::AddressSearchService,
     pub reviewed_intent: ReviewedIntentStore,
+    pub wallet_reviews: WalletReviewRegistry,
 }
 
 #[derive(Deserialize)]
@@ -312,6 +314,8 @@ pub async fn validate_address(
 /// `argos inspect-wallet` prints.
 #[derive(Serialize)]
 pub struct WalletFileSummary {
+    /// Opaque backend authority for the exact file object and bytes inspected.
+    pub review_id: Option<WalletReviewId>,
     pub path: String,
     pub transparent_keys: usize,
     pub sapling_keys: usize,
@@ -631,6 +635,7 @@ fn sprout_screen_with_journal(
 #[tauri::command]
 pub async fn inspect_wallet_file(
     app: AppHandle,
+    state: State<'_, AppState>,
     path: String,
     passphrase: Option<SecretString>,
     network: Option<String>,
@@ -641,63 +646,84 @@ pub async fn inspect_wallet_file(
     // defaulting to mainnet as everything else here does.
     let network_name = network.unwrap_or_else(|| "mainnet".to_owned());
     let selected = parse_wallet_network(&network_name)?;
-    let bytes = argos_core::wallet_file::read_wallet_file(&path)
+    let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
-    let (keys, sprout) =
-        match import_gui_wallet_then(&bytes, passphrase.as_ref(), selected, |mut keys| {
+    let (keys, sprout) = match import_gui_wallet_then(
+        snapshot.bytes(),
+        passphrase.as_ref(),
+        selected,
+        |mut keys| {
             let sprout = compute_sprout_summary(&app, &mut keys, selected, data_dir.as_deref());
             (keys, sprout)
-        }) {
-            Ok(result) => result,
-            // An encrypted wallet with a missing or wrong passphrase is an
-            // ordinary user situation, not a failure to show raw. Matched on
-            // the parser's typed error, which the core wrapper carries in
-            // ZeckError::WalletFile, rather than on its message text: a
-            // reworded message must not turn the passphrase prompt into a
-            // raw error.
-            Err(argos_core::ZeckError::WalletFile(
-                argos_core::argos_wallet_import::ImportError::WrongPassphrase,
-            )) => {
-                return Ok(WalletFileSummary {
-                    path,
-                    transparent_keys: 0,
-                    sapling_keys: 0,
-                    sprout_keys: 0,
-                    sprout_nu7_warning: String::new(),
-                    sprout_addresses: Vec::new(),
-                    sprout_spendable_notes: 0,
-                    sprout_spendable_zatoshis: 0,
-                    sprout_has_lifecycle_status: false,
-                    sprout_issues: Vec::new(),
-                    sprout_scan_warning: Vec::new(),
-                    sprout_accounting: Vec::new(),
-                    sprout_nothing_left: false,
-                    sprout_history_read: false,
-                    sprout_spent_status: String::new(),
-                    has_mnemonic: false,
-                    seed_note: None,
-                    transparent_only: false,
-                    diagnostics: Vec::new(),
-                    seed_diagnostics: Vec::new(),
-                    coverage_notice: None,
-                    coverage_may_hide_funds: false,
-                    needs_passphrase: true,
-                });
-            }
-            Err(err) => return Err(err.to_string()),
-        };
+        },
+    ) {
+        Ok(result) => result,
+        // An encrypted wallet with a missing or wrong passphrase is an
+        // ordinary user situation, not a failure to show raw. Matched on
+        // the parser's typed error, which the core wrapper carries in
+        // ZeckError::WalletFile, rather than on its message text: a
+        // reworded message must not turn the passphrase prompt into a
+        // raw error.
+        Err(argos_core::ZeckError::WalletFile(
+            argos_core::argos_wallet_import::ImportError::WrongPassphrase,
+        )) => {
+            return Ok(WalletFileSummary {
+                review_id: None,
+                path,
+                transparent_keys: 0,
+                sapling_keys: 0,
+                sprout_keys: 0,
+                sprout_nu7_warning: String::new(),
+                sprout_addresses: Vec::new(),
+                sprout_spendable_notes: 0,
+                sprout_spendable_zatoshis: 0,
+                sprout_has_lifecycle_status: false,
+                sprout_issues: Vec::new(),
+                sprout_scan_warning: Vec::new(),
+                sprout_accounting: Vec::new(),
+                sprout_nothing_left: false,
+                sprout_history_read: false,
+                sprout_spent_status: String::new(),
+                has_mnemonic: false,
+                seed_note: None,
+                transparent_only: false,
+                diagnostics: Vec::new(),
+                seed_diagnostics: Vec::new(),
+                coverage_notice: None,
+                coverage_may_hide_funds: false,
+                needs_passphrase: true,
+            });
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    let review_id = if keys.is_empty() {
+        None
+    } else {
+        Some(state.wallet_reviews.register(
+            PathBuf::from(&path),
+            std::sync::Arc::new(snapshot.identity().clone()),
+        )?)
+    };
 
-    Ok(wallet_summary_from_keys(path, keys, sprout, &network_name))
+    Ok(wallet_summary_from_keys(
+        path,
+        review_id,
+        keys,
+        sprout,
+        &network_name,
+    ))
 }
 
 /// Keep IPC coverage and diagnostics bound to the same parsed key set.
 fn wallet_summary_from_keys(
     path: String,
+    review_id: Option<WalletReviewId>,
     keys: argos_core::argos_wallet_import::ImportedKeys,
     sprout: SproutSummary,
     network_name: &str,
 ) -> WalletFileSummary {
     WalletFileSummary {
+        review_id,
         path,
         transparent_keys: keys.transparent.len(),
         sapling_keys: keys.sapling.len(),
@@ -742,7 +768,7 @@ pub struct WalletFileScanInput {
     /// Absent when the user supplied only typed Sapling keys — a key string
     /// is a key source in its own right, with no file behind it.
     #[serde(default)]
-    pub path: Option<String>,
+    pub review_id: Option<WalletReviewId>,
     pub passphrase: Option<SecretString>,
     /// Sapling spending keys typed or pasted in the GUI, one per entry.
     #[serde(default)]
@@ -813,12 +839,11 @@ pub async fn start_scan_from_wallet_file(
     // user may hold a wallet whose keys were never rescanned *and* a paper
     // key for an address it never knew about. Mirrors the CLI's
     // `--wallet-file` + `--sapling-key-file` combination.
-    let mut keys = match &config.path {
-        Some(path) => {
-            let bytes = argos_core::wallet_file::read_wallet_file(path)
-                .map_err(|err| format!("could not read {path}: {err}"))?;
+    let mut keys = match &config.review_id {
+        Some(review_id) => {
+            let (_, snapshot) = state.wallet_reviews.verify(review_id)?;
             argos_core::import_wallet_file_for_network(
-                &bytes,
+                snapshot.bytes(),
                 config.passphrase.as_ref(),
                 config.network,
             )
@@ -1253,7 +1278,7 @@ fn sprout_network(name: &str) -> Result<ZeckNetwork, String> {
 pub async fn propose_wallet_sprout_sweep(
     app: AppHandle,
     state: State<'_, AppState>,
-    path: String,
+    review_id: WalletReviewId,
     passphrase: Option<SecretString>,
     destination: String,
     lightwalletd_url: String,
@@ -1272,18 +1297,21 @@ pub async fn propose_wallet_sprout_sweep(
     // Validated before the wallet file is decrypted: neither check needs the
     // keys, so a bad address or server is reported without them.
     validate_sweep_request(&destination, network, &lightwalletd_url)?;
-    let bytes = argos_core::wallet_file::read_wallet_file(&path)
-        .map_err(|err| format!("could not read {path}: {err}"))?;
-    let (keys, forged_warnings) =
-        import_gui_wallet_then(&bytes, passphrase.as_ref(), network, |mut keys| {
+    let (reviewed_source, snapshot) = state.wallet_reviews.verify(&review_id)?;
+    let (keys, forged_warnings) = import_gui_wallet_then(
+        snapshot.bytes(),
+        passphrase.as_ref(),
+        network,
+        |mut keys| {
             // As inspect does: a forged key is dropped and named in the
             // review, and the genuine keys' notes are still swept. A forged
             // key controls no note of its own, and the commitment check
             // stops it spending anyone else's.
             let forged_warnings = drop_and_warn_forged_sprout_keys(&app, &mut keys);
             (keys, forged_warnings)
-        })
-        .map_err(|err| err.to_string())?;
+        },
+    )
+    .map_err(|err| err.to_string())?;
     let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref(), &peers).await;
     let wallet_checkpoint = WalletCheckpointAuthority {
         data_dir: resolve_data_dir(&app, data_dir.as_deref())?,
@@ -1331,13 +1359,13 @@ pub async fn propose_wallet_sprout_sweep(
             recovered.chain_notice.as_deref(),
         ));
     }
-    // The reviewed notes, with their keys, are held in the proposal (see
-    // `reviewed_intent`'s key-retention note), so execution never re-reads
-    // the file and no file identity needs recording.
+    // The reviewed notes and backend-owned wallet identity are held together.
+    // Execute reopens only to verify identity; it never re-imports notes or
+    // accepts a path from the webview.
     let scan_warning = recovered.chain_notice.clone();
     let mut review = state.reviewed_intent.insert_proposal(
         SproutSweepIntent {
-            source: SproutIntentSource::Wallet,
+            source: SproutIntentSource::Wallet(reviewed_source),
             notes: recovered.notes,
             destination,
             network,
@@ -1392,7 +1420,7 @@ async fn execute_reviewed_sprout_sweep(
         fresh_checkpoint_warning = notice;
     }
     let source = match &intent.source {
-        SproutIntentSource::Wallet => argos_core::sprout_sweep::NoteSource::WalletFile,
+        SproutIntentSource::Wallet(_) => argos_core::sprout_sweep::NoteSource::WalletFile,
         SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
     };
     let emitter = app.clone();
@@ -1439,6 +1467,13 @@ pub async fn execute_wallet_sprout_sweep(
 ) -> Result<SproutSweepReport, String> {
     ensure_tos_accepted(&app)?;
     let intent = state.reviewed_intent.take_wallet_proposal(&proposal_id)?;
+    let SproutIntentSource::Wallet(reviewed_source) = &intent.source else {
+        return Err("proposal belongs to a scan-derived sweep".into());
+    };
+    // Consume the one-shot proposal first, then bind every checkpoint query,
+    // proof and send to the same file object and bytes the user inspected.
+    // The proposal's Arc remains valid even if the registry entry expires.
+    let _verified = reviewed_source.verify()?;
     execute_reviewed_sprout_sweep(app, intent).await
 }
 
@@ -1511,8 +1546,8 @@ struct ScanKeys {
     wallet: Option<argos_core::argos_wallet_import::ImportedKeys>,
 }
 
-fn collect_scan_keys(
-    path: Option<&str>,
+fn collect_scan_keys_from_bytes(
+    wallet_bytes: Option<&[u8]>,
     passphrase: Option<&SecretString>,
     typed: &[String],
     network: argos_core::ZeckNetwork,
@@ -1537,10 +1572,8 @@ fn collect_scan_keys(
 
     let typed_keys = keys.clone();
     let mut wallet_keys = None;
-    if let Some(path) = path {
-        let bytes = argos_core::wallet_file::read_wallet_file(path)
-            .map_err(|err| format!("could not read {path}: {err}"))?;
-        let mut wallet = argos_core::import_wallet_file_for_network(&bytes, passphrase, network)
+    if let Some(bytes) = wallet_bytes {
+        let mut wallet = argos_core::import_wallet_file_for_network(bytes, passphrase, network)
             .map_err(|err| err.to_string())?;
         // Drop any Sprout key that does not control its stored address before
         // it is trial-decrypted against — parity with the CLI loader and the
@@ -1567,6 +1600,20 @@ fn collect_scan_keys(
         typed: typed_keys,
         wallet: wallet_keys,
     })
+}
+
+#[cfg(test)]
+fn collect_scan_keys(
+    path: Option<&str>,
+    passphrase: Option<&SecretString>,
+    typed: &[String],
+    network: argos_core::ZeckNetwork,
+) -> Result<ScanKeys, String> {
+    let bytes = path
+        .map(argos_core::wallet_file::read_wallet_file)
+        .transpose()
+        .map_err(|err| err.to_string())?;
+    collect_scan_keys_from_bytes(bytes.as_deref(), passphrase, typed, network)
 }
 
 /// Where the Sprout scan starts trial-decrypting, and the line saying why.
@@ -1749,7 +1796,7 @@ pub async fn start_sprout_scan(
     app: AppHandle,
     state: State<'_, AppState>,
     keys: Vec<String>,
-    path: Option<String>,
+    review_id: Option<WalletReviewId>,
     passphrase: Option<SecretString>,
     network: String,
     data_dir: String,
@@ -1771,7 +1818,16 @@ pub async fn start_sprout_scan(
     // can. Previously this took typed keys only, so the one user it exists
     // for — a wallet holding Sprout keys but no note data — was told to
     // leave the box blank and then refused, with no way to see the keys.
-    let scan_keys = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
+    let wallet_snapshot = match review_id.as_ref() {
+        Some(review_id) => Some(state.wallet_reviews.verify(review_id)?.1),
+        None => None,
+    };
+    let scan_keys = collect_scan_keys_from_bytes(
+        wallet_snapshot.as_ref().map(|snapshot| snapshot.bytes()),
+        passphrase.as_ref(),
+        &keys,
+        network,
+    )?;
     // Planned here, not in the worker: the wallet file's `ImportedKeys` are
     // needed only for this decision and die with this command rather than
     // living as long as an hours-long scan.
@@ -2460,16 +2516,14 @@ fn birthday_route(
 /// undated Sapling keys, they also rule out the transparent-UTXO fallback
 /// (see `argos_core::birthday::needs_chain_fallback`), so a wallet with one
 /// gets no birthday and Sapling is scanned from activation.
-fn birthday_route_for_file(
-    path: &str,
+fn birthday_route_for_bytes(
+    bytes: &[u8],
     passphrase: Option<&SecretString>,
     sapling_keys: &[String],
     network: ZeckNetwork,
 ) -> Result<BirthdayRoute, String> {
-    let bytes = argos_core::wallet_file::read_wallet_file(path)
-        .map_err(|err| format!("could not read {path}: {err}"))?;
-    let format = argos_core::argos_wallet_import::sniff(&bytes).map_err(|err| err.to_string())?;
-    let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, passphrase)
+    let format = argos_core::argos_wallet_import::sniff(bytes).map_err(|err| err.to_string())?;
+    let mut keys = argos_core::argos_wallet_import::import_wallet_file(bytes, passphrase)
         .map_err(|err| err.to_string())?;
     let mut pasted = 0;
     if keys.mnemonic.is_none() && sapling_keys.iter().any(|k| !k.trim().is_empty()) {
@@ -2479,6 +2533,18 @@ fn birthday_route_for_file(
             .map_err(|err| err.to_string())?;
     }
     birthday_route(keys, pasted, format)
+}
+
+#[cfg(test)]
+fn birthday_route_for_file(
+    path: &str,
+    passphrase: Option<&SecretString>,
+    sapling_keys: &[String],
+    network: ZeckNetwork,
+) -> Result<BirthdayRoute, String> {
+    let bytes = argos_core::wallet_file::read_wallet_file(path)
+        .map_err(|err| format!("could not read {path}: {err}"))?;
+    birthday_route_for_bytes(&bytes, passphrase, sapling_keys, network)
 }
 
 /// Turn a wallet.dat birthday into what the birthday field shows. No height
@@ -2521,15 +2587,17 @@ fn wallet_dat_birthday_result(
 #[tauri::command]
 pub async fn detect_birthday_from_wallet_file(
     app: AppHandle,
-    path: String,
+    state: State<'_, AppState>,
+    review_id: WalletReviewId,
     passphrase: Option<SecretString>,
     sapling_keys: Option<Vec<String>>,
     lightwalletd_url: String,
     network: ZeckNetwork,
 ) -> Result<BirthdayDetectResult, String> {
     ensure_tos_accepted(&app)?;
-    let route = birthday_route_for_file(
-        &path,
+    let (_, snapshot) = state.wallet_reviews.verify(&review_id)?;
+    let route = birthday_route_for_bytes(
+        snapshot.bytes(),
         passphrase.as_ref(),
         sapling_keys.as_deref().unwrap_or_default(),
         network,
@@ -3009,6 +3077,77 @@ mod tests {
             &[[marker; 32]],
             argos_core::ZeckNetwork::Mainnet,
         )
+    }
+
+    fn test_wallet_source() -> std::sync::Arc<crate::reviewed_intent::ReviewedWalletSource> {
+        let registry = crate::reviewed_intent::WalletReviewRegistry::default();
+        let dir =
+            std::env::temp_dir().join(format!("argos-command-wallet-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, b"wallet").unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(path, std::sync::Arc::new(snapshot.identity().clone()))
+            .unwrap();
+        registry.resolve(&id).unwrap()
+    }
+
+    fn test_wallet_review() -> (
+        crate::reviewed_intent::WalletReviewRegistry,
+        crate::reviewed_intent::WalletReviewId,
+        std::path::PathBuf,
+    ) {
+        let registry = crate::reviewed_intent::WalletReviewRegistry::default();
+        let dir =
+            std::env::temp_dir().join(format!("argos-command-review-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, b"wallet-A").unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(
+                path.clone(),
+                std::sync::Arc::new(snapshot.identity().clone()),
+            )
+            .unwrap();
+        (registry, id, path)
+    }
+
+    #[test]
+    fn wallet_review_rejects_changed_file_for_scan() {
+        let (registry, id, path) = test_wallet_review();
+        std::fs::write(path, b"wallet-B").unwrap();
+        assert!(registry.verify(&id).is_err());
+    }
+
+    #[test]
+    fn wallet_review_rejects_changed_file_for_sprout_proposal() {
+        let (registry, id, path) = test_wallet_review();
+        std::fs::write(path, b"wallet-B").unwrap();
+        assert!(registry.verify(&id).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_review_rejects_replaced_file_before_sprout_execute() {
+        let (registry, id, path) = test_wallet_review();
+        let source = registry.resolve(&id).unwrap();
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, b"wallet-A").unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        assert!(source.verify().is_err());
+
+        let code = include_str!("commands.rs");
+        let execute = code
+            .split("pub async fn execute_wallet_sprout_sweep")
+            .nth(1)
+            .unwrap();
+        assert!(
+            execute.find("reviewed_source.verify").unwrap()
+                < execute.find("execute_reviewed_sprout_sweep").unwrap(),
+            "wallet verification must precede checkpoint, proving and send work"
+        );
     }
 
     #[test]
@@ -3530,6 +3669,7 @@ mod tests {
                 service: argos_core::RecoveryService::new(),
                 address_search: argos_core::address_search::AddressSearchService::default(),
                 reviewed_intent: crate::reviewed_intent::ReviewedIntentStore::default(),
+                wallet_reviews: crate::reviewed_intent::WalletReviewRegistry::default(),
             })
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
@@ -3816,7 +3956,7 @@ mod tests {
             store
                 .insert_proposal(
                     SproutSweepIntent {
-                        source: SproutIntentSource::Wallet,
+                        source: SproutIntentSource::Wallet(test_wallet_source()),
                         notes: Vec::new(),
                         destination: "zs-reviewed".into(),
                         network: ZeckNetwork::Mainnet,
@@ -3901,6 +4041,7 @@ mod tests {
         }
         serde_json::to_value(wallet_summary_from_keys(
             "test.dat".to_owned(),
+            None,
             keys,
             empty_sprout_summary(),
             "mainnet",
@@ -4003,6 +4144,7 @@ mod tests {
         )));
         let summary = serde_json::to_value(wallet_summary_from_keys(
             "public-fixture.dat".to_owned(),
+            None,
             keys,
             empty_sprout_summary(),
             "mainnet",
