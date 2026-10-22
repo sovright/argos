@@ -169,16 +169,18 @@ pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
-        drop(file);
         // Preflight the platform-specific directory handle before changing
         // the name. A bad Windows directory open must not turn a completed
         // replacement into a reported failure.
         let parent_sync = open_parent_sync_handle(parent)?;
         parent_sync.sync_all()?;
+        // The create-new handle was already hardened and verified. Windows
+        // creation grants FILE_SHARE_DELETE, so keep that exact verified
+        // object open across the rename instead of reopening by path.
         fs::rename(&temporary, path)?;
-        let final_file = options_for(PrivateOpenMode::Append, false).open(path)?;
-        harden_private_file(&final_file)?;
-        parent_sync.sync_all()
+        parent_sync.sync_all()?;
+        drop(file);
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
