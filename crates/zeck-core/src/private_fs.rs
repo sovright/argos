@@ -2802,6 +2802,14 @@ fn open_publication_parent(path: &Path) -> io::Result<File> {
     Ok(parent)
 }
 
+fn ensure_publication_parent_exists(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_private_dir_all(path),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn verify_private_workspace_lineage(
     private_root: &Path,
 ) -> io::Result<PrivateRootLineageLease> {
@@ -3055,7 +3063,7 @@ fn ensure_private_artifact_root_with_parent(
                 )
             })?;
             if retained_parent.is_none() {
-                fs::create_dir_all(publication_parent_path)?;
+                ensure_publication_parent_exists(publication_parent_path)?;
             }
             let context = private_artifact_root_context(private_root, purpose)?;
             #[cfg(windows)]
@@ -3408,7 +3416,7 @@ fn ensure_private_workspace_lineage_impl(
             let publish_parent = private_root.parent().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "private root has no parent")
             })?;
-            fs::create_dir_all(publish_parent)?;
+            ensure_publication_parent_exists(publish_parent)?;
             #[cfg(windows)]
             let sqlite_context = sqlite_lineage_context_paths(private_root, database)?;
             #[cfg(windows)]
@@ -3561,7 +3569,7 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
         };
         let data_access = match mode {
             PrivateOpenMode::Append => FILE_APPEND_DATA,
@@ -3569,7 +3577,7 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
             PrivateOpenMode::ReadWriteAppend => FILE_GENERIC_READ | FILE_APPEND_DATA,
             PrivateOpenMode::Truncate | PrivateOpenMode::CreateNew => FILE_GENERIC_WRITE,
         };
-        options.access_mode(data_access | READ_CONTROL);
+        options.access_mode(data_access | FILE_READ_ATTRIBUTES | READ_CONTROL);
         if mode == PrivateOpenMode::ReadWriteLock {
             options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         }
@@ -4073,7 +4081,7 @@ pub(crate) fn prepare_ephemeral_probe_workspace(
             "ephemeral probe private root has no publication parent",
         )
     })?;
-    fs::create_dir_all(publication_parent_path)?;
+    ensure_publication_parent_exists(publication_parent_path)?;
     let registration = EphemeralProbeRegistration::acquire(private_root)?;
     ensure_private_workspace_lineage_impl(private_root, leaf, database, false)?;
     let directory = open_private_sqlite_parent(leaf)?;
@@ -7484,9 +7492,10 @@ mod windows_acl {
     use windows_sys::Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FileDirectoryInformation, NtCreateFile, NtFlushBuffersFileEx, NtQueryDirectoryFile,
-            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE,
-            FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            FileDirectoryInformation, FileRenameInformation, NtCreateFile, NtFlushBuffersFileEx,
+            NtQueryDirectoryFile, NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE,
+            FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
         },
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -7512,15 +7521,15 @@ mod windows_acl {
             SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
-            CreateDirectoryW, CreateFileW, FileDispositionInfo, FileRenameInfo,
-            GetFileInformationByHandle, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-            CREATE_NEW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS,
-            FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
-            READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+            CreateDirectoryW, CreateFileW, FileDispositionInfo, GetFileInformationByHandle,
+            SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE,
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_APPEND_DATA,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+            WRITE_OWNER,
         },
         System::Threading::{
             CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
@@ -7993,7 +8002,7 @@ mod windows_acl {
         let entry = nt_open_child_with_options(
             parent,
             path,
-            FILE_READ_ATTRIBUTES,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_OPEN,
             ptr::null(),
@@ -8522,7 +8531,8 @@ mod windows_acl {
             super::PrivateOpenMode::Truncate | super::PrivateOpenMode::CreateNew => {
                 FILE_GENERIC_WRITE
             }
-        } | DELETE
+        } | FILE_READ_ATTRIBUTES
+            | DELETE
             | READ_CONTROL;
         let share = match mode {
             super::PrivateOpenMode::ReadWriteLock => FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -8587,7 +8597,7 @@ mod windows_acl {
             super::PrivateOpenMode::Truncate | super::PrivateOpenMode::CreateNew => {
                 FILE_GENERIC_WRITE
             }
-        };
+        } | FILE_READ_ATTRIBUTES;
         let share = match mode {
             super::PrivateOpenMode::ReadWriteLock => FILE_SHARE_READ | FILE_SHARE_WRITE,
             super::PrivateOpenMode::CreateNew => FILE_SHARE_DELETE,
@@ -8680,23 +8690,25 @@ mod windows_acl {
             io::Error::new(io::ErrorKind::InvalidInput, "private file has no name")
         })?;
         let name = name.encode_wide().collect::<Vec<_>>();
-        let header_len = mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let header_len = mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
         let buffer_len = header_len + name.len() * mem::size_of::<u16>();
         let mut buffer = vec![0usize; buffer_len.div_ceil(mem::size_of::<usize>())];
-        let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         unsafe {
             (*rename).Anonymous.ReplaceIfExists = replace;
             (*rename).RootDirectory = parent.as_raw_handle() as HANDLE;
             (*rename).FileNameLength = (name.len() * mem::size_of::<u16>()) as u32;
             ptr::copy_nonoverlapping(name.as_ptr(), (*rename).FileName.as_mut_ptr(), name.len());
-            if SetFileInformationByHandle(
+            let mut status_block = IO_STATUS_BLOCK::default();
+            let status = NtSetInformationFile(
                 file.as_raw_handle() as HANDLE,
-                FileRenameInfo,
+                &mut status_block,
                 rename.cast(),
                 buffer_len as u32,
-            ) == 0
-            {
-                return Err(last_error());
+                FileRenameInformation,
+            );
+            if status < 0 {
+                return Err(nt_error(status));
             }
         }
         Ok(())
@@ -8965,6 +8977,14 @@ mod windows_acl {
 }
 
 #[cfg(test)]
+fn private_publication_parent() -> (tempfile::TempDir, std::path::PathBuf) {
+    let outer = tempfile::tempdir().unwrap();
+    let parent = outer.path().join("publication");
+    create_private_dir_all(&parent).unwrap();
+    (outer, parent)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -8973,7 +8993,7 @@ mod tests {
     #[test]
     fn fresh_absent_artifact_data_dir_is_published_as_authenticated_container() {
         let outer = tempfile::tempdir().unwrap();
-        let data_dir = outer.path().join("artifact-data");
+        let data_dir = outer.path().join("missing-publication/artifact-data");
 
         let first = ensure_private_artifact_container(&data_dir).unwrap();
         let first_id = first.id.clone();
@@ -8989,8 +9009,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_authenticated_container_and_root_reopen_and_enumerate() {
-        let outer = tempfile::tempdir().unwrap();
-        let data_dir = outer.path().join("artifact-data");
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("artifact-data");
         let container = ensure_private_artifact_container(&data_dir).unwrap();
         assert!(container
             .child_names()
@@ -9016,8 +9036,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_artifact_container_recovers_pending_before_publish() {
-        let outer = tempfile::tempdir().unwrap();
-        let data_dir = outer.path().join("artifact-data");
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("artifact-data");
         let context =
             private_artifact_root_context(&data_dir, private_artifact_container_purpose()).unwrap();
         prepare_windows_artifact_root_creation(&context).unwrap();
@@ -9032,9 +9052,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_artifact_container_registry_prevents_rollback_or_remint() {
-        let outer = tempfile::tempdir().unwrap();
-        let data_dir = outer.path().join("artifact-data");
-        let parked = outer.path().join("parked-artifact-data");
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("artifact-data");
+        let parked = publication.join("parked-artifact-data");
         ensure_private_artifact_container(&data_dir).unwrap();
         fs::rename(&data_dir, &parked).unwrap();
 
@@ -9076,10 +9096,8 @@ mod tests {
 
     #[test]
     fn fresh_private_artifact_root_binds_every_precreated_authority_object() {
-        let outer = tempfile::tempdir().unwrap();
-        let root = outer
-            .path()
-            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
+        let (_outer, publication) = private_publication_parent();
+        let root = publication.join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         let context = b"mainnet\0full-fingerprint\0artifact-root";
 
         let first = ensure_private_artifact_root(&root, context).unwrap();
@@ -9095,8 +9113,8 @@ mod tests {
 
     #[test]
     fn unmarked_private_artifact_root_is_refused_without_mutation() {
-        let outer = tempfile::tempdir().unwrap();
-        let data_dir = outer.path().join("artifact-data");
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("artifact-data");
         ensure_private_artifact_container(&data_dir).unwrap();
         let root = data_dir.join(".argos-private-artifacts-mainnet-deadbeef");
         create_private_dir_all(&root).unwrap();
@@ -9112,10 +9130,8 @@ mod tests {
 
     #[test]
     fn private_artifact_root_context_replay_is_refused() {
-        let outer = tempfile::tempdir().unwrap();
-        let root = outer
-            .path()
-            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
+        let (_outer, publication) = private_publication_parent();
+        let root = publication.join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         ensure_private_artifact_root(&root, b"mainnet\0fingerprint-a").unwrap();
 
         let error = ensure_private_artifact_root(&root, b"testnet\0fingerprint-a")
@@ -9169,10 +9185,8 @@ mod tests {
 
     #[test]
     fn artifact_authority_is_durable_before_the_first_secret_byte() {
-        let outer = tempfile::tempdir().unwrap();
-        let root = outer
-            .path()
-            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
+        let (_outer, publication) = private_publication_parent();
+        let root = publication.join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         let artifact = root.join("journal");
         let purpose = b"mainnet\0full-fingerprint";
         let access = PrivateArtifactAccess::acquire(
@@ -9202,10 +9216,8 @@ mod tests {
 
     #[test]
     fn existing_unbound_artifact_is_refused_without_read_or_mutation() {
-        let outer = tempfile::tempdir().unwrap();
-        let root = outer
-            .path()
-            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
+        let (_outer, publication) = private_publication_parent();
+        let root = publication.join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         let purpose = b"mainnet\0full-fingerprint";
         ensure_private_artifact_root(&root, purpose).unwrap();
         let artifact = root.join("journal");
@@ -9228,9 +9240,9 @@ mod tests {
 
     #[test]
     fn artifact_replacement_records_exact_generation_before_publication() {
-        let outer = tempfile::tempdir().unwrap();
+        let (_outer, publication) = private_publication_parent();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
+        let root = private_artifact_root_path(&publication.join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -9255,9 +9267,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_artifact_domains_cold_verify_before_retaining_their_bound_locks() {
-        let outer = tempfile::tempdir().unwrap();
+        let (_outer, publication) = private_publication_parent();
         let purpose = format!("mainnet\0{}", uuid::Uuid::new_v4()).into_bytes();
-        let root = private_artifact_root_path(&outer.path().join("artifact-data"), &purpose);
+        let root = private_artifact_root_path(&publication.join("artifact-data"), &purpose);
         let checkpoint = root.join("checkpoint");
         let journal = root.join("journal");
 
@@ -9284,10 +9296,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_artifact_registry_prevents_root_rollback_or_remint() {
-        let outer = tempfile::tempdir().unwrap();
+        let (_outer, publication) = private_publication_parent();
         let purpose = format!("mainnet\0{}", uuid::Uuid::new_v4()).into_bytes();
-        let root = private_artifact_root_path(&outer.path().join("artifact-data"), &purpose);
-        let parked = outer.path().join("parked-root");
+        let root = private_artifact_root_path(&publication.join("artifact-data"), &purpose);
+        let parked = publication.join("parked-root");
         ensure_private_artifact_root(&root, &purpose).unwrap();
         fs::rename(&root, &parked).unwrap();
 
@@ -9306,9 +9318,9 @@ mod tests {
 
     #[test]
     fn artifact_authority_stays_bounded_across_full_chain_checkpoint_cadence() {
-        let outer = tempfile::tempdir().unwrap();
+        let (_outer, publication) = private_publication_parent();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
+        let root = private_artifact_root_path(&publication.join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -9336,9 +9348,9 @@ mod tests {
 
     #[test]
     fn torn_newest_authority_slot_falls_back_to_previous_durable_state() {
-        let outer = tempfile::tempdir().unwrap();
+        let (_outer, publication) = private_publication_parent();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
+        let root = private_artifact_root_path(&publication.join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -9383,9 +9395,9 @@ mod tests {
 
     #[test]
     fn checkpoint_retirement_restores_after_restart_and_retires_before_reuse() {
-        let outer = tempfile::tempdir().unwrap();
+        let (_outer, publication) = private_publication_parent();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
+        let root = private_artifact_root_path(&publication.join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -9435,9 +9447,9 @@ mod tests {
 
     #[test]
     fn retained_root_allows_checkpoint_and_journal_domains_to_coexist() {
-        let outer = tempfile::tempdir().unwrap();
+        let (_outer, publication) = private_publication_parent();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
+        let root = private_artifact_root_path(&publication.join("artifact-data"), purpose);
         let checkpoint = root.join("checkpoint");
         let journal = root.join("journal");
         let checkpoint_access = PrivateArtifactAccess::acquire(
@@ -9488,8 +9500,8 @@ mod tests {
 
     #[test]
     fn existing_private_root_without_lineage_is_refused_without_minting_a_marker() {
-        let outer = tempfile::tempdir().unwrap();
-        let private_root = outer.path().join("workspace-private-root");
+        let (_outer, publication) = private_publication_parent();
+        let private_root = publication.join("workspace-private-root");
         let leaf = private_root.join("birthday-1/scope");
         let database = leaf.join("wallet.sqlite");
         create_private_dir_all(&leaf).unwrap();
@@ -9504,8 +9516,8 @@ mod tests {
 
     #[test]
     fn fresh_private_root_gets_create_only_identity_lineage() {
-        let outer = tempfile::tempdir().unwrap();
-        let private_root = outer.path().join("workspace-private-root");
+        let (_outer, publication) = private_publication_parent();
+        let private_root = publication.join("workspace-private-root");
         let leaf = private_root.join("birthday-1/scope");
         let database = leaf.join("wallet.sqlite");
 
@@ -10457,9 +10469,9 @@ mod windows_tests {
 
     #[test]
     fn windows_checkpoint_generation_refuses_a_permissive_dacl() {
-        let tmp = tempfile::tempdir().unwrap();
+        let (_tmp, publication) = private_publication_parent();
         let purpose = format!("mainnet\0{}", uuid::Uuid::new_v4()).into_bytes();
-        let root = private_artifact_root_path(&tmp.path().join("artifact-data"), &purpose);
+        let root = private_artifact_root_path(&publication.join("artifact-data"), &purpose);
         let path = root.join("scan.checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -10500,8 +10512,8 @@ mod windows_tests {
 
     #[test]
     fn windows_sqlite_preflight_refuses_a_preheld_data_handle() {
-        let tmp = tempfile::tempdir().unwrap();
-        let private_root = tmp.path().join("workspace-private-root");
+        let (_tmp, publication) = private_publication_parent();
+        let private_root = publication.join("workspace-private-root");
         let parent_path = private_root.join("birthday-1/scope");
         let path = parent_path.join("wallet.sqlite");
         let root = ensure_private_workspace_lineage(&private_root, &parent_path, &path).unwrap();
@@ -10528,8 +10540,8 @@ mod windows_tests {
 
     #[test]
     fn windows_existing_private_root_reserves_pending_before_a_second_leaf() {
-        let tmp = tempfile::tempdir().unwrap();
-        let private_root = tmp.path().join("workspace-private-root");
+        let (_tmp, publication) = private_publication_parent();
+        let private_root = publication.join("workspace-private-root");
         let first_leaf = private_root.join("birthday-1/scope-a");
         let first_database = first_leaf.join("wallet.sqlite");
         ensure_private_workspace_lineage(&private_root, &first_leaf, &first_database).unwrap();
@@ -10729,6 +10741,7 @@ mod windows_tests {
         .unwrap();
         file.write_all(b"spend-capable checkpoint").unwrap();
         file.sync_all().unwrap();
+        drop(file);
         assert_eq!(fs::read(path).unwrap(), b"spend-capable checkpoint");
     }
 
