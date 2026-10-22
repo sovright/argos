@@ -153,17 +153,42 @@ with private permissions on Unix. Protect the checkpoint and the original
 wallet or Sprout key until Argos has freshly observed every saved transaction
 as canonically mined. A successful broadcast, a node accepting a transaction,
 or a previously observed mined state is not enough to discard either source.
+Argos does not delete the checkpoint for you, even after a sweep completes;
+remove it yourself once Argos reports fresh canonical mined evidence for every
+saved Sprout transaction.
 
 Before submitting a Sprout transaction, Argos durably journals its exact
-serialized bytes. An accepted submission remains **pending** until independent
-confirmation sources report canonical mined evidence. If submission has an
-unknown outcome, Argos stops before processing later notes: on the next run it
-reconciles that transaction and, while it remains valid, retries the same bytes
-rather than building a different spend. For an absent or unresolved saved
-transaction, Argos builds a replacement only after independent sources
-corroborate absence beyond its expiry height. A deterministic, retryable, or
-already-known reply from the primary submission endpoint remains
-**SubmissionUnknown** until independent observation resolves its lifecycle.
+serialized bytes. An accepted submission remains **pending** until a
+confirmation source reports it mined. Mining reported by a single operator
+(the default, with no `--confirmation-source`) lets the sweep move on but is
+never final: only an independent pair of operators agreeing on the block, at
+least 10 confirmations deep, counts as fresh canonical mined evidence. If a
+submission has an unknown outcome (a lost reply or an unfamiliar refusal),
+Argos stops before processing later notes: on the next run it reconciles that
+transaction and, while it remains valid, retries the same bytes rather than
+building a different spend. A saved transaction is replaced only once a
+configured source reports it absent more than 20 blocks past its expiry
+height. It can never be mined after that, so a source that lies about it can at
+worst cause a replacement that consensus rejects as a double spend; the old
+transaction stays listed as superseded. A refusal about one note alone (its
+nullifier is already spent, its witness anchor is unknown, another mempool
+transaction spends it, or the mempool evicted it) records that note as
+rejected, and the sweep continues with the next note. Any other reply from the
+primary submission endpoint remains **SubmissionUnknown** until observation
+resolves its lifecycle. On a network whose NU7 activation height is assigned
+(testnet: 4,465,026), Argos refuses to build a Sprout transaction for a block
+at or past activation, because NU7 disables the version 4 format Sprout needs.
+
+The journal (`sprout-sweep-<fingerprint>.journal` in the data directory)
+holds each note's outpoint and swept value, each transaction's exact signed
+bytes, fee and expiry, and its lifecycle states with the observations behind
+them. It holds no spending keys and no note plaintexts, so it cannot spend
+anything, but the signed bytes reveal each note's nullifier and link the
+wallet's Sprout notes to their sweep transactions. On Unix it is kept at
+`0600`. It is appended one synced record at a time, not atomically replaced: a
+crash can leave a torn final record, which the next run discards. A journal
+written by Argos 1.5.x is upgraded in place on first use; its entries, which
+recorded only that a node accepted a transaction, become pending.
 Keep the wallet or key, checkpoint, and journal available through every retry
 and restart. Do not run an older Argos version concurrently against the same
 Sprout data directory: older binaries do not honor the directory-wide network
@@ -237,7 +262,7 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Transparent funds are imported into the wallet workspace using Argos's audited legacy derivation, not modern per-account transparent derivation.
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
-- Sprout transactions are journaled before submission. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. An absent or unresolved transaction requires independently corroborated absence beyond expiry before rebuilding. A deterministic, retryable, or already-known reply from the primary submission endpoint remains SubmissionUnknown until independent observation resolves it.
+- Sprout transactions are journaled before submission. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. A saved transaction is rebuilt only after a configured source reports it absent more than 20 blocks past its expiry height. A refusal about one note alone records that note as rejected and the sweep continues; any other non-accept reply from the primary submission endpoint remains SubmissionUnknown until observation resolves it.
 - Keep the original wallet or Sprout key and the scan checkpoint until Argos reports fresh canonical mined evidence for every saved Sprout transaction.
 - A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
 - A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.

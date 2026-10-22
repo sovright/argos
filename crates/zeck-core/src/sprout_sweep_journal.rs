@@ -1,4 +1,24 @@
 //! Durable, versioned Sprout sweep transactions, keyed by note and source.
+//!
+//! # What is on disk
+//!
+//! `sprout-sweep-<fingerprint>.journal` in the data directory: a header
+//! (version, network, full key-set fingerprint), then one JSON record per
+//! event -- each note's outpoint and swept value, each transaction's exact
+//! signed bytes, fee and expiry, and its lifecycle transitions with the
+//! observations behind them.
+//!
+//! It holds no spending key (`a_sk`) and no note plaintext, so it cannot
+//! spend anything; the scan checkpoint is the spend-capable file. It is
+//! still linkable: the signed bytes reveal each note's nullifier and the
+//! destination's encrypted output, tying the wallet's Sprout notes to their
+//! sweep transactions.
+//!
+//! On Unix it is created `0600` and narrowed to `0600` before every append.
+//! Records are appended and synced one at a time, not atomically replaced; a
+//! crash can leave a torn final record, which the next load truncates away.
+//! Only the one-time upgrade of a v1 journal (Argos 1.5.x) is an atomic
+//! replace.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -808,6 +828,15 @@ impl SweepJournal {
         let mut file = options
             .open(&self.path)
             .map_err(|err| journal_error(format!("opening journal: {err}")))?;
+        // The create mode only applies to a new file. A journal copied in
+        // or restored with wider permissions is narrowed before anything
+        // more is written to it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|err| journal_error(format!("securing journal: {err}")))?;
+        }
         if missing
             || file
                 .metadata()
@@ -1453,6 +1482,78 @@ mod tests {
             std::path::PathBuf::from(format!("{}.lock.sqlite", journal.path().display()));
         let lock_mode = std::fs::metadata(lock_path).unwrap().permissions().mode();
         assert_eq!(lock_mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn appending_to_a_world_readable_v2_journal_makes_it_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+        std::fs::set_permissions(journal.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        journal
+            .append_transition(
+                &mut snapshot,
+                fixture().txid,
+                TxLifecycleState::SubmissionUnknown,
+                None,
+                None,
+            )
+            .unwrap();
+        let mode = std::fs::metadata(journal.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn the_journal_holds_no_spending_key_or_note_plaintext_fields() {
+        // What the journal is documented to hold. A new record field that
+        // carries key or note material must update the README and this test.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+        let text = std::fs::read_to_string(journal.path()).unwrap();
+        let mut keys = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            fn collect(value: &serde_json::Value, keys: &mut std::collections::BTreeSet<String>) {
+                if let Some(object) = value.as_object() {
+                    for (key, inner) in object {
+                        keys.insert(key.clone());
+                        collect(inner, keys);
+                    }
+                }
+            }
+            collect(&value, &mut keys);
+        }
+        let expected = [
+            "expiry_height",
+            "fee_zatoshis",
+            "network",
+            "note_id",
+            "raw_tx_base64",
+            "record",
+            "source_fingerprint",
+            "transaction",
+            "txid",
+            "value_zatoshis",
+            "version",
+        ];
+        assert_eq!(
+            keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected.to_vec()
+        );
     }
 
     #[test]

@@ -1983,6 +1983,15 @@ mod tests {
         assert!(readme.contains("SubmissionUnknown") || readme.contains("submission unknown"));
         assert!(readme.contains("independent"));
         assert!(readme.contains("older Argos") && readme.contains("concurrently"));
+        // The single-operator policy: one source's absence past expiry plus
+        // the margin is enough to replace a transaction.
+        assert!(!readme.contains("only after independent sources corroborate absence"));
+        assert!(!readme.contains("requires independently corroborated absence"));
+        // What the journal holds, stated honestly.
+        assert!(readme.contains("no spending keys and no note plaintexts"));
+        assert!(readme.contains("not atomically replaced"));
+        // Nothing deletes the checkpoint for the user.
+        assert!(readme.contains("does not delete the checkpoint"));
     }
 
     /// Kristi's F5 on #239: the plan printed before confirmation must not
