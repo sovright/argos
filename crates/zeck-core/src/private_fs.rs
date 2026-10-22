@@ -4446,12 +4446,16 @@ impl EphemeralProbeRegistration {
             )
         })?;
         let parent = open_publication_parent(parent_path)?;
+        Self::acquire_from_parent(&parent, private_root)
+    }
+
+    fn acquire_from_parent(parent: &File, private_root: &Path) -> io::Result<Self> {
         let path = ephemeral_probe_registration_path(private_root)?;
-        let file = open_child_file_for_lock(&parent, &path)?;
+        let file = open_child_file_for_lock(parent, &path)?;
         let id = private_object_id(&file)?;
         lock_exclusive(&file)?;
         let registration = Self { file, id, path };
-        sync_private_directory(&parent)?;
+        sync_private_directory(parent)?;
         Ok(registration)
     }
 
@@ -4743,6 +4747,10 @@ impl EphemeralProbeCleanup {
             &self.private_root_directory,
             &self.private_root_id,
         )?;
+        // Windows completes the verified delete disposition when the retained
+        // directory handle closes. Keep the parent, registration, SQLite-open
+        // gate, and lineage mutex held while confirming durable absence.
+        drop(self.private_root_directory);
         sync_private_directory(&self.publication_parent)?;
         if parent_child_names(&self.publication_parent, &self.publication_parent_path)?
             .iter()
@@ -4855,7 +4863,13 @@ fn remove_ephemeral_probe_cleanup_marker(
 pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Result<()> {
     let (publication_parent, publication_parent_path, marker_id, record) =
         read_ephemeral_probe_cleanup_marker(marker_path)?;
-    let _registration = match EphemeralProbeRegistration::acquire(&record.private_root) {
+    // Reuse the authenticated marker's retained parent. On Windows, reopening
+    // our own DELETE-capable, no-delete-share parent would look like a live
+    // registration's sharing conflict and silently skip stale recovery.
+    let _registration = match EphemeralProbeRegistration::acquire_from_parent(
+        &publication_parent,
+        &record.private_root,
+    ) {
         Ok(registration) => registration,
         Err(error) if ephemeral_probe_lock_is_contended(&error) => return Ok(()),
         Err(error) => return Err(error),
@@ -4937,6 +4951,7 @@ pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Re
             &private_root_directory,
             &private_root_id,
         )?;
+        drop(private_root_directory);
         sync_private_directory(&publication_parent)?;
     }
     if parent_child_names(&publication_parent, &publication_parent_path)?
@@ -12453,27 +12468,38 @@ mod windows_tests {
         assert!(!data_dir.exists());
         let container = ensure_private_artifact_container(&data_dir)
             .expect("publish an authenticated container through a long unprefixed path");
+        container.verify_current().unwrap();
+        let container_id = private_object_id(&container.root).unwrap();
+        // A cold acquisition must follow the previous phase's lease release:
+        // Windows intentionally forbids a second DELETE-capable parent lease.
+        drop(container);
         let purpose = b"long-path-artifact";
         let root_path = private_artifact_root_path(&data_dir, purpose);
         let root = ensure_private_artifact_root(&root_path, purpose)
             .expect("publish the longer staged artifact root");
         root.verify_current().unwrap();
+        let root_id = private_object_id(&root.root).unwrap();
+        drop(root);
         let report = root_path.join("private-report.txt");
         write_private_file(&report, b"private").expect("create a private file past MAX_PATH");
         assert_eq!(fs::read(&report).unwrap(), b"private");
         let reopened_file = windows_acl::open_file_for_identity(&report)
             .expect("identity-only CreateFileW also supports the long path");
         drop(reopened_file);
-        ensure_private_artifact_root(&root_path, purpose)
-            .expect("reopen the same authenticated long-path root")
-            .verify_current()
-            .unwrap();
+        let reopened = ensure_private_artifact_root(&root_path, purpose)
+            .expect("reopen the same authenticated long-path root");
+        reopened.verify_current().unwrap();
+        assert_eq!(private_object_id(&reopened.root).unwrap(), root_id);
+        drop(reopened);
         let reused = root_path.join("untrusted-report.txt");
         fs::write(&reused, b"preserve").unwrap();
         write_private_file(&reused, b"replacement")
             .expect_err("extended paths must not weaken exact reused-file DACL checks");
         assert_eq!(fs::read(&reused).unwrap(), b"preserve");
-        container.verify_current().unwrap();
+        let reopened = ensure_private_artifact_container(&data_dir)
+            .expect("reopen the same authenticated long-path container");
+        reopened.verify_current().unwrap();
+        assert_eq!(private_object_id(&reopened.root).unwrap(), container_id);
     }
 
     #[test]

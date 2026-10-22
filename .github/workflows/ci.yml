@@ -82,8 +82,7 @@ jobs:
         run: |
           $collect = (Resolve-Path scripts/collect-exact-cargo-test.ps1).Path
           $failures = [System.Collections.Generic.List[string]]::new()
-          cargo test -p argos-core private_fs --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/collect-cargo-module-test.ps1 -Failures $failures -Package argos-core -TestFilter private_fs
           "exact_tests_started=true" >> $env:GITHUB_OUTPUT
           & $collect -Failures $failures -Package argos-core -TestName private_fs::tests::windows_workspace_cleanup_uses_retained_directory_handles
           & $collect -Failures $failures -Package argos-core -TestName private_fs::tests::retained_sqlite_authority_can_enumerate_sync_and_delete_its_workspace
@@ -135,12 +134,12 @@ jobs:
           & $collect -Failures $failures -Package argos-gui -TestName commands::tests::windows_long_data_directory_can_review_and_reverify_a_sprout_wallet
 
           if ($failures.Count -gt 0) {
-            throw ("{0} exact Cargo test(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
+            throw ("{0} Cargo test invocation(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
           }
 
       - name: private artifact authority and sweep safety tests (x64)
-        # A named-test failure must not hide the other diagnostic stage. Setup
-        # or module failures still stop immediately, without repeated builds.
+        # Completed test failures must not hide the other diagnostic stage.
+        # Compile/tool failures or empty module runs still stop immediately.
         if: ${{ matrix.label == 'x64' && !cancelled() && steps.windows_private_fs.outputs.exact_tests_started == 'true' }}
         shell: pwsh
         run: |
@@ -193,7 +192,7 @@ jobs:
             & $collect -Failures $failures -Package argos-core -TestName $test
           }
           if ($failures.Count -gt 0) {
-            throw ("{0} exact Cargo test(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
+            throw ("{0} Cargo test invocation(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
           }
 
   check-macos-private-authority:
