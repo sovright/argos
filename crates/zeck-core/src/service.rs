@@ -17,11 +17,11 @@ use zcash_client_backend::{
     data_api::{
         wallet::{
             create_proposed_transactions,
-            input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
+            input_selection::{GreedyInputSelector, LockedInputPolicy, SpendPolicy},
             propose_send_max_transfer, propose_shielding, propose_transfer, ConfirmationsPolicy,
             SpendingKeys,
         },
-        CoinbaseFilter, InputSource, MaxSpendMode, TransactionStatus, WalletRead, WalletWrite,
+        CoinbaseFilter, MaxSpendMode, TransactionStatus, WalletRead, WalletWrite,
     },
     fees::{standard::SingleOutputChangeStrategy, DustOutputPolicy, StandardFeeRule},
     proto::service::compact_tx_streamer_client::CompactTxStreamerClient,
@@ -573,6 +573,10 @@ struct ReviewedSweepIntent {
     quoted_transactions: Vec<ProposedTx>,
     quoted_proposal: Option<SweepProposal>,
     quoted_inputs: Vec<CanonicalLegInputs>,
+    /// Per-leg fees of the plan the user reviewed, captured at propose time.
+    /// Execution compares each leg it actually builds against these, never
+    /// against a fee recomputed from the execute-time plan.
+    reviewed_leg_fees: Option<ExactLegFees>,
 }
 
 impl ReviewedSweepIntent {
@@ -585,6 +589,7 @@ impl ReviewedSweepIntent {
             quoted_transactions: Vec::new(),
             quoted_proposal: None,
             quoted_inputs: Vec::new(),
+            reviewed_leg_fees: None,
         }
     }
 
@@ -633,9 +638,36 @@ impl ReviewedSweepIntent {
         Ok(())
     }
 
-    fn bind_plan(&mut self, plan: &ExactSweepPlan) {
+    fn bind_plan(&mut self, plan: &ExactSweepPlan) -> ZeckResult<()> {
         self.bind_quote(&plan.quote);
         self.quoted_inputs = plan.canonical_inputs();
+        self.reviewed_leg_fees = Some(ExactLegFees::from_legs(&plan.legs)?);
+        Ok(())
+    }
+
+    /// Authorize the execute-time plan: it must be the reviewed plan (a fee
+    /// difference is reported as FeeQuoteChanged), and only then is the fee
+    /// ceiling applied, so a changed fee never surfaces as MaxFeeExceeded.
+    /// Returns the reviewed per-leg fees for the leg executors.
+    fn authorize_current_plan(&self, current: &ExactSweepPlan) -> ZeckResult<ExactLegFees> {
+        self.require_current_plan(current)?;
+        enforce_max_fee(
+            current.quote.total_fee_zatoshis,
+            self.request.max_fee_zatoshis,
+        )?;
+        let reviewed = self.reviewed_leg_fees.clone().ok_or_else(|| {
+            ZeckError::StaleSweepProposal("reviewed per-leg fees are missing".to_owned())
+        })?;
+        let current_keys = ExactLegFees::from_legs(&current.legs)?
+            .0
+            .into_keys()
+            .collect::<HashSet<_>>();
+        if reviewed.0.keys().copied().collect::<HashSet<_>>() != current_keys {
+            return Err(ZeckError::StaleSweepProposal(
+                "the executable legs no longer match the reviewed legs".to_owned(),
+            ));
+        }
+        Ok(reviewed)
     }
 
     fn require_current_plan(&self, current: &ExactSweepPlan) -> ZeckResult<()> {
@@ -1649,8 +1681,9 @@ impl RecoveryService {
         )?;
         attach_direct_sweep_leg(&mut plan, &session.runtime, &standalone_transparent_indices)
             .await?;
+        enforce_max_fee(plan.quote.total_fee_zatoshis, request.max_fee_zatoshis)?;
         let mut intent = ReviewedSweepIntent::capture(request, &session, &progress);
-        intent.bind_plan(&plan);
+        intent.bind_plan(&plan)?;
         intent.authority = Some(authority);
         // Test seam: lets a test move progress between the build above and
         // the issue below, which is the window the re-check exists for.
@@ -2032,9 +2065,14 @@ impl RecoveryService {
             &standalone_transparent_indices,
         )
         .await?;
-        intent.require_current_plan(&current_plan)?;
-        let exact_fees = ExactLegFees::from_legs(&current_plan.legs)?;
+        let exact_fees = intent.authorize_current_plan(&current_plan)?;
+        hd_leg_plan(&current_plan.legs, &tracked_accounts)?;
         let quoted_transactions = intent.quoted_transactions;
+        let quoted_skipped = intent
+            .quoted_proposal
+            .as_ref()
+            .map(|quote| quote.skipped_accounts.clone())
+            .unwrap_or_default();
         let backend_legs = current_plan.legs;
         let request = intent.request;
 
@@ -2137,6 +2175,7 @@ impl RecoveryService {
                 pause_between_broadcasts,
                 imported_fee,
                 quoted_transactions,
+                quoted_skipped,
                 backend_legs,
                 tracked_accounts,
                 exact_fees,
@@ -2151,6 +2190,7 @@ impl RecoveryService {
             pause_between_broadcasts,
             0,
             quoted_transactions,
+            quoted_skipped,
             backend_legs,
             tracked_accounts,
             exact_fees,
@@ -2924,10 +2964,11 @@ fn build_exact_sweep_proposal(
             });
         }
     }
+    // The fee ceiling is applied by the caller: at review on this quote, and
+    // at execution only after the plan matched the reviewed one.
     let total_fee_zatoshis = transactions
         .iter()
         .try_fold(0u64, |sum, tx| checked_fee_total(sum, tx.fee_zatoshis))?;
-    enforce_max_fee(total_fee_zatoshis, request.max_fee_zatoshis)?;
     let total_send_zatoshis = transactions
         .iter()
         .try_fold(0u64, |sum, tx| checked_fee_total(sum, tx.gross_zatoshis))?;
@@ -3435,6 +3476,7 @@ async fn execute_sweep_for_session(
     pause_between_broadcasts: Option<std::time::Duration>,
     initial_fee_zatoshis: u64,
     quoted_transactions: Vec<ProposedTx>,
+    quoted_skipped: Vec<SkippedSweepAccount>,
     backend_legs: Vec<ExactSweepLeg>,
     tracked_accounts: Vec<TrackedAccount>,
     exact_fees: ExactLegFees,
@@ -3501,144 +3543,110 @@ async fn execute_sweep_for_session(
     // The final sync, balance refresh, and complete plan comparison ran in
     // execute_sweep_locked. A second sync here could change selected inputs
     // after the review gate, so every builder below uses that validated plan.
-    let standalone_balances = session
-        .state
-        .lock()
-        .await
-        .standalone_transparent_balances
-        .clone();
 
-    // The per-account loop broadcasts transactions one account at a time. Run
-    // it inside a block whose `?` failures are *caught* rather than propagated,
-    // so a mid-sequence abort still surfaces the records of every transaction
-    // already broadcast (audit Issue E) instead of discarding `results`.
+    // Walk the validated reviewed legs, not the tracked accounts: a leg the
+    // user reviewed can never be silently skipped. `hd_leg_plan` already
+    // refused (before anything was signed) a leg with no executable account.
+    let hd_legs = hd_leg_plan(&backend_legs, &tracked_accounts)?;
+    // Accounts the review itself skipped are reported as reviewed.
+    skipped_accounts.extend(quoted_skipped.into_iter().filter(|skipped| {
+        tracked_accounts.iter().any(|account| {
+            account.derived.index == skipped.account_index
+                && matches!(account.spend_authority, TrackedSpendAuthority::Hd { .. })
+        })
+    }));
+
+    // The legs broadcast one at a time. Run them inside a block whose `?`
+    // failures are *caught* rather than propagated, so a mid-sequence abort
+    // still surfaces the records of every transaction already broadcast
+    // (audit Issue E) instead of discarding `results`.
     let sweep_result: ZeckResult<()> = async {
-        'accounts: for tracked_account in tracked_accounts {
-            let TrackedSpendAuthority::Hd { zip32_index } = tracked_account.spend_authority else {
-                continue;
-            };
-            let account_total = account_total_zatoshis(
-                &workspace,
-                runtime.network,
-                tracked_account.wallet_account_id,
-            )?.checked_sub(standalone_balances.get(&tracked_account.derived.index).map_or(0, |balance| balance.zatoshis))
-                .ok_or_else(|| ZeckError::Wallet("standalone transparent balance exceeds HD account total".to_owned()))?;
-            if account_total == 0 {
-                continue;
+        for (position, (tracked_account, zip32_index, leg)) in hd_legs.into_iter().enumerate() {
+            if position > 0 {
+                // R-S29 hook: pause between broadcasts so the test parent can
+                // SIGKILL the helper deterministically in the gap. Always None
+                // in production.
+                if let Some(d) = pause_between_broadcasts {
+                    tokio::time::sleep(d).await;
+                }
             }
-            let zip32_index =
-                zip32::AccountId::try_from(zip32_index).map_err(|_| {
-                    ZeckError::InvalidConfig(format!(
-                        "account index {} is out of range",
-                        tracked_account.derived.index
-                    ))
-                })?;
-            let usk = UnifiedSpendingKey::from_seed(&network, &seed, zip32_index)
-                .map_err(|err| {
+            let usk =
+                UnifiedSpendingKey::from_seed(&network, &seed, zip32_index).map_err(|err| {
                     ZeckError::Wallet(format!(
                         "deriving account {}: {err}",
                         tracked_account.derived.index
                     ))
                 })?;
-
-            let transparent_balance =
-                account_transparent_zatoshis(&workspace, runtime.network, &tracked_account)?;
-            if balance_covers_sweep_fee(transparent_balance) {
-                if let Some(ExactSweepLeg::HdShield { proposal, .. }) = backend_legs.iter().find(|leg| {
-                    matches!(leg, ExactSweepLeg::HdShield { account_index, .. } if *account_index == tracked_account.derived.index)
-                }) {
-                let prior_fee_zatoshis =
-                    checked_fee_total(initial_fee_zatoshis, at_risk_fee_total(&results)?)?;
-                let mut ctx = SweepStepCtx {
-                    workspace: &workspace,
-                    network: runtime.network,
-                    client: &mut client,
-                    prover: &prover,
-                    results: &mut results,
-                    broadcast_log: &mut broadcast_log,
-                    prior_fee_zatoshis,
-                    max_fee_zatoshis: request.max_fee_zatoshis,
-                    reviewed_fee_zatoshis: exact_fees.require(ExactFeeKey::HdShield(tracked_account.derived.index))?,
-                    lightwalletd_url: runtime.lightwalletd_url.as_str(),
-                    confirmation_sources: &runtime.confirmation_sources,
-                };
-                execute_shielding_step(&mut ctx, &tracked_account, &transparent_account, &usk, proposal)
+            let prior_fee_zatoshis =
+                checked_fee_total(initial_fee_zatoshis, at_risk_fee_total(&results)?)?;
+            match leg {
+                ExactSweepLeg::HdShield {
+                    account_index,
+                    proposal,
+                } => {
+                    let mut ctx = SweepStepCtx {
+                        workspace: &workspace,
+                        network: runtime.network,
+                        client: &mut client,
+                        prover: &prover,
+                        results: &mut results,
+                        broadcast_log: &mut broadcast_log,
+                        prior_fee_zatoshis,
+                        max_fee_zatoshis: request.max_fee_zatoshis,
+                        reviewed_fee_zatoshis: exact_fees
+                            .require(ExactFeeKey::HdShield(*account_index))?,
+                        lightwalletd_url: runtime.lightwalletd_url.as_str(),
+                        confirmation_sources: &runtime.confirmation_sources,
+                    };
+                    execute_shielding_step(
+                        &mut ctx,
+                        tracked_account,
+                        &transparent_account,
+                        &usk,
+                        proposal,
+                    )
                     .await?;
-                    follow_up_review_required = true;
                     // The shielded output is not spendable until it has mined
                     // and acquired a witness. A new scan and proposal must
                     // authorize the later send-max transaction.
-                    continue 'accounts;
+                    follow_up_review_required = true;
                 }
-            }
-
-            // The shielded balance must cover the send-max fee, or the transfer
-            // proposal fails the same way. Re-query the (post-shield) spendable
-            // shielded balance — total minus any unshielded remainder — and skip
-            // the account if it is at or below the fee floor, matching the dry
-            // run's shielded-dust skip.
-            let shielded_spendable =
-                shielded_spendable_zatoshis(&workspace, runtime.network, &tracked_account)?;
-            if !balance_covers_sweep_fee(shielded_spendable) {
-                skipped_accounts.push(SkippedSweepAccount {
-                    account_index: tracked_account.derived.index,
-                    gross_zatoshis: account_total,
-                    reason: format!(
-                        "Balance is too small to cover the ZIP 317 sweep fee floor of {MIN_SHIELDED_SEND_FEE_ZATOSHIS} zats."
-                    ),
-                });
-                continue;
-            }
-
-            let send_max_fee = if let Some(ExactSweepLeg::HdSend { proposal, donation_zatoshis, .. }) = backend_legs.iter().find(|leg| {
-                matches!(leg, ExactSweepLeg::HdSend { account_index, .. } if *account_index == tracked_account.derived.index)
-            }) {
-                let prior_fee_zatoshis = checked_fee_total(initial_fee_zatoshis, at_risk_fee_total(&results)?)?;
-                let mut ctx = SweepStepCtx {
-                    workspace: &workspace,
-                    network: runtime.network,
-                    client: &mut client,
-                    prover: &prover,
-                    results: &mut results,
-                    broadcast_log: &mut broadcast_log,
-                    prior_fee_zatoshis,
-                    max_fee_zatoshis: request.max_fee_zatoshis,
-                    reviewed_fee_zatoshis: exact_fees.require(ExactFeeKey::HdSend(tracked_account.derived.index))?,
-                    lightwalletd_url: runtime.lightwalletd_url.as_str(),
-                    confirmation_sources: &runtime.confirmation_sources,
-                };
-                execute_send_max_step(
-                    &mut ctx,
-                    &tracked_account,
-                    &usk,
+                ExactSweepLeg::HdSend {
+                    account_index,
                     proposal,
-                    *donation_zatoshis,
-                )
-                .await?
-            } else { None };
-            // `None` => no selectable shielded value for this account; skip it
-            // rather than aborting the whole sweep.
-            let Some((_fee, account_donation)) = send_max_fee else {
-                skipped_accounts.push(SkippedSweepAccount {
-                    account_index: tracked_account.derived.index,
-                    gross_zatoshis: account_total,
-                    reason: format!(
-                        "No spendable balance cleared the ZIP 317 fee floor of {MIN_SHIELDED_SEND_FEE_ZATOSHIS} zats."
-                    ),
-                });
-                continue;
-            };
-            // The next account reads its prior cost from recorded submissions.
-            total_donation_zatoshis =
-                total_donation_zatoshis.checked_add(account_donation).ok_or_else(|| {
-                    ZeckError::Internal("donation total overflowed the supported range".to_owned())
-                })?;
-
-            // R-S29 hook: pause between per-account broadcasts so the test parent
-            // can SIGKILL the helper subprocess deterministically in the gap. The
-            // pause is unconditional; in production this is always None.
-            if let Some(d) = pause_between_broadcasts {
-                tokio::time::sleep(d).await;
+                    donation_zatoshis,
+                } => {
+                    let mut ctx = SweepStepCtx {
+                        workspace: &workspace,
+                        network: runtime.network,
+                        client: &mut client,
+                        prover: &prover,
+                        results: &mut results,
+                        broadcast_log: &mut broadcast_log,
+                        prior_fee_zatoshis,
+                        max_fee_zatoshis: request.max_fee_zatoshis,
+                        reviewed_fee_zatoshis: exact_fees
+                            .require(ExactFeeKey::HdSend(*account_index))?,
+                        lightwalletd_url: runtime.lightwalletd_url.as_str(),
+                        confirmation_sources: &runtime.confirmation_sources,
+                    };
+                    let (_fee, account_donation) = execute_send_max_step(
+                        &mut ctx,
+                        tracked_account,
+                        &usk,
+                        proposal,
+                        *donation_zatoshis,
+                    )
+                    .await?;
+                    total_donation_zatoshis = total_donation_zatoshis
+                        .checked_add(account_donation)
+                        .ok_or_else(|| {
+                            ZeckError::Internal(
+                                "donation total overflowed the supported range".to_owned(),
+                            )
+                        })?;
+                }
+                _ => unreachable!("hd_leg_plan returns only HD legs"),
             }
         }
         Ok(())
@@ -3656,6 +3664,43 @@ async fn execute_sweep_for_session(
         apply_recorded_shield_follow_up(&mut outcome, &quoted_transactions);
         outcome
     })
+}
+
+/// Pair every reviewed HD leg with the HD account that signs it, in the
+/// reviewed order. Refuses -- before anything is signed -- a leg whose account
+/// is missing, is not HD, or has an out-of-range ZIP-32 index.
+fn hd_leg_plan<'a>(
+    legs: &'a [ExactSweepLeg],
+    tracked_accounts: &'a [TrackedAccount],
+) -> ZeckResult<Vec<(&'a TrackedAccount, zip32::AccountId, &'a ExactSweepLeg)>> {
+    legs.iter()
+        .filter_map(|leg| match leg {
+            ExactSweepLeg::HdShield { account_index, .. }
+            | ExactSweepLeg::HdSend { account_index, .. } => Some((*account_index, leg)),
+            _ => None,
+        })
+        .map(|(account_index, leg)| {
+            let tracked = tracked_accounts
+                .iter()
+                .find(|account| account.derived.index == account_index)
+                .ok_or_else(|| {
+                    ZeckError::StaleSweepProposal(format!(
+                        "reviewed leg for account {account_index} has no scanned account; nothing was signed"
+                    ))
+                })?;
+            let TrackedSpendAuthority::Hd { zip32_index } = tracked.spend_authority else {
+                return Err(ZeckError::StaleSweepProposal(format!(
+                    "reviewed HD leg for account {account_index} is not signed by the seed; nothing was signed"
+                )));
+            };
+            let zip32_index = zip32::AccountId::try_from(zip32_index).map_err(|_| {
+                ZeckError::InvalidConfig(format!(
+                    "account index {account_index} is out of range; nothing was signed"
+                ))
+            })?;
+            Ok((tracked, zip32_index, leg))
+        })
+        .collect()
 }
 
 fn hd_has_shielded_balance(row: &crate::models::AccountBalancePreview) -> ZeckResult<bool> {
@@ -4152,7 +4197,7 @@ async fn execute_send_max_step(
     usk: &UnifiedSpendingKey,
     proposal: &ImportedSweepProposal,
     donation_zatoshis: u64,
-) -> ZeckResult<Option<(u64, u64)>> {
+) -> ZeckResult<(u64, u64)> {
     let mut wallet_db = open_wallet_db(
         ctx.workspace.wallet_db_path(),
         consensus_network(ctx.network),
@@ -4196,7 +4241,7 @@ async fn execute_send_max_step(
     )
     .await?;
 
-    Ok(Some((fee_zatoshis, donation_zatoshis)))
+    Ok((fee_zatoshis, donation_zatoshis))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4273,10 +4318,24 @@ async fn broadcast_transactions(
             expiry_height: Some(u32::from(tx.expiry_height())),
         });
     }
-    require_persisted_batch_fee(
+    // The reviewed fee was already compared with the proposal before it was
+    // built and stored. This second check reads the fee the wallet recorded
+    // for the built transaction. On a mismatch nothing is submitted or
+    // journaled; the wallet's unsent transaction keeps its inputs reserved
+    // only until its expiry height, after which a rescan frees them.
+    if let Err(err) = require_persisted_batch_fee(
         reviewed_batch_fee_zatoshis,
         prepared.iter().map(|tx| tx.fee_zatoshis),
-    )?;
+    ) {
+        tracing::warn!(
+            "{label} batch not submitted: {err}; inputs are released at expiry height(s) {:?}",
+            prepared
+                .iter()
+                .map(|tx| tx.expiry_height)
+                .collect::<Vec<_>>()
+        );
+        return Err(err);
+    }
     enforce_max_fee(
         checked_fee_total(prior_fee_zatoshis, reviewed_batch_fee_zatoshis)?,
         max_fee_zatoshis,
@@ -4472,59 +4531,6 @@ async fn chain_tip_height(
         .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))
 }
 
-fn account_total_zatoshis(
-    workspace: &RecoveryWorkspace,
-    network: crate::models::ZeckNetwork,
-    account_id: zcash_client_sqlite::AccountUuid,
-) -> ZeckResult<u64> {
-    let wallet_db = open_wallet_db(workspace.wallet_db_path(), consensus_network(network))?;
-    let summary = wallet_db
-        .get_wallet_summary(ConfirmationsPolicy::MIN)
-        .map_err(|err| ZeckError::Wallet(format!("loading wallet summary: {err}")))?
-        .ok_or_else(|| ZeckError::Wallet("wallet summary is unavailable".to_owned()))?;
-    Ok(summary
-        .account_balances()
-        .get(&account_id)
-        .map(|balance| u64::from(balance.total()))
-        .unwrap_or(0))
-}
-
-fn account_transparent_zatoshis(
-    workspace: &RecoveryWorkspace,
-    network: crate::models::ZeckNetwork,
-    tracked_account: &TrackedAccount,
-) -> ZeckResult<u64> {
-    let wallet_db = open_wallet_db(workspace.wallet_db_path(), consensus_network(network))?;
-    let summary = wallet_db
-        .get_wallet_summary(ConfirmationsPolicy::MIN)
-        .map_err(|err| ZeckError::Wallet(format!("loading wallet summary: {err}")))?
-        .ok_or_else(|| ZeckError::Wallet("wallet summary is unavailable".to_owned()))?;
-    let target_height = (summary.chain_tip_height() + 1).into();
-    let mut seen = std::collections::HashSet::new();
-    let mut total = 0u64;
-    for address in &tracked_account.transparent_receivers {
-        for output in wallet_db
-            .get_spendable_transparent_outputs(
-                address,
-                target_height,
-                ConfirmationsPolicy::MIN,
-                CoinbaseFilter::AllTransparentOutputs,
-                LockFilter::Unfiltered,
-            )
-            .map_err(|err| ZeckError::Wallet(format!("loading HD transparent outputs: {err}")))?
-        {
-            if seen.insert(output.outpoint().clone()) {
-                total = total
-                    .checked_add(u64::from(output.txout().value()))
-                    .ok_or_else(|| {
-                        ZeckError::Wallet("HD transparent balance overflowed".to_owned())
-                    })?;
-            }
-        }
-    }
-    Ok(total)
-}
-
 pub(crate) fn proposal_fee_zatoshis<NoteRef>(
     proposal: &zcash_client_backend::proposal::Proposal<StandardFeeRule, NoteRef>,
 ) -> ZeckResult<u64> {
@@ -4581,27 +4587,6 @@ pub(crate) fn enforce_max_fee(
     }
 
     Ok(())
-}
-
-/// Spendable shielded balance for an account = total spendable minus the
-/// unshielded (transparent) portion.
-fn shielded_spendable_zatoshis(
-    workspace: &RecoveryWorkspace,
-    network: crate::models::ZeckNetwork,
-    tracked_account: &TrackedAccount,
-) -> ZeckResult<u64> {
-    let total = account_total_zatoshis(workspace, network, tracked_account.wallet_account_id)?;
-    let wallet_db = open_wallet_db(workspace.wallet_db_path(), consensus_network(network))?;
-    let summary = wallet_db
-        .get_wallet_summary(ConfirmationsPolicy::MIN)
-        .map_err(|err| ZeckError::Wallet(format!("loading wallet summary: {err}")))?
-        .ok_or_else(|| ZeckError::Wallet("wallet summary is unavailable".to_owned()))?;
-    let transparent = summary
-        .account_balances()
-        .get(&tracked_account.wallet_account_id)
-        .map(|balance| u64::from(balance.unshielded_balance().total()))
-        .unwrap_or(0);
-    Ok(total.saturating_sub(transparent))
 }
 
 fn normalized_memo_text(memo: Option<&str>) -> ZeckResult<String> {
@@ -5478,7 +5463,7 @@ mod tests {
             direct_account_index: Some(0),
             network: ZeckNetwork::Mainnet,
         };
-        intent.bind_plan(&reviewed);
+        intent.bind_plan(&reviewed).unwrap();
         let current = super::ExactSweepPlan {
             quote,
             legs: vec![super::ExactSweepLeg::DirectTransparent {
@@ -5526,7 +5511,7 @@ mod tests {
             direct_account_index: Some(0),
             network: ZeckNetwork::Mainnet,
         };
-        intent.bind_plan(&reviewed);
+        intent.bind_plan(&reviewed).unwrap();
         let current = super::ExactSweepPlan {
             quote,
             legs: vec![super::ExactSweepLeg::DirectTransparent {
@@ -9500,5 +9485,356 @@ mod propose_workspace_guard_tests {
             )
             .await
             .is_ok());
+    }
+}
+
+/// Each per-leg reviewed-fee check compares the fee captured at review with
+/// the leg actually about to be built, and each is pinned here: removing the
+/// check changes the error these tests see.
+#[cfg(test)]
+pub(crate) mod leg_fee_pin_tests {
+    use super::*;
+    use crate::models::ZeckNetwork;
+    use std::collections::BTreeMap;
+    use zcash_client_backend::{
+        fees::{ChangeValue, TransactionBalance},
+        proposal::Proposal,
+        wallet::WalletTransparentOutput,
+        zip321::TransactionRequest,
+    };
+    use zcash_transparent::{
+        address::TransparentAddress,
+        bundle::{OutPoint, TxOut},
+    };
+
+    const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// A structurally valid one-input shielding proposal with the given fee,
+    /// built offline. Only the fee and change differ between two calls, so
+    /// two proposals can share every local input identity.
+    pub(crate) fn offline_proposal<N>(fee: u64) -> Proposal<StandardFeeRule, N> {
+        let address = TransparentAddress::PublicKeyHash([7; 20]);
+        let txout = TxOut::new(Zatoshis::const_from_u64(100_000), address.script().into());
+        let input = WalletTransparentOutput::<()>::from_parts(
+            OutPoint::new([3; 32], 0),
+            txout,
+            Some(BlockHeight::from_u32(1)),
+            None,
+            None,
+            None,
+        )
+        .expect("P2PKH output");
+        let balance = TransactionBalance::new(
+            vec![ChangeValue::sapling(
+                Zatoshis::from_u64(100_000 - fee).unwrap(),
+                None,
+            )],
+            Zatoshis::from_u64(fee).unwrap(),
+        )
+        .unwrap();
+        Proposal::single_step(
+            TransactionRequest::empty(),
+            BTreeMap::new(),
+            vec![input],
+            None,
+            BlockHeight::from_u32(1),
+            balance,
+            StandardFeeRule::Zip317,
+            BlockHeight::from_u32(2).into(),
+            ConfirmationsPolicy::MIN,
+            true,
+            false,
+        )
+        .expect("offline proposal")
+    }
+
+    fn hd_account() -> TrackedAccount {
+        let derived = crate::derive_accounts(
+            &secrecy::SecretString::new(PHRASE.to_owned()),
+            ZeckNetwork::Mainnet,
+            1,
+        )
+        .unwrap()
+        .remove(0);
+        TrackedAccount {
+            wallet_account_id: zcash_client_sqlite::AccountUuid::default(),
+            derived,
+            transparent_receivers: Vec::new(),
+            spend_authority: TrackedSpendAuthority::Hd { zip32_index: 0 },
+            standalone_transparent_receivers: Vec::new(),
+            transparent_key_coordinates: Vec::new(),
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        workspace: RecoveryWorkspace,
+        log: DurableBroadcastLog,
+        seed: [u8; 64],
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let key_source: Arc<dyn KeySource> = Arc::new(SeedKeySource::new(
+            secrecy::SecretString::new(PHRASE.to_owned()),
+        ));
+        let runtime = RuntimeScanConfig {
+            key_source: key_source.clone(),
+            birthday: 1_000_000,
+            num_accounts: Some(1),
+            gap_limit: 1,
+            transparent_scan: None,
+            lightwalletd_url: "https://127.0.0.1:1".to_owned(),
+            confirmation_sources: Vec::new(),
+            data_dir: dir.path().to_owned(),
+            network: ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        let workspace = RecoveryWorkspace::from_runtime(&runtime).unwrap();
+        workspace
+            .initialize_from_source(runtime.network, key_source.as_ref())
+            .unwrap();
+        let log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        let seed = key_source.wallet_seed().unwrap().unwrap();
+        Fixture {
+            _dir: dir,
+            workspace,
+            log,
+            seed,
+        }
+    }
+
+    fn offline_client() -> CompactTxStreamerClient<tonic::transport::Channel> {
+        CompactTxStreamerClient::new(
+            tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+        )
+    }
+
+    #[tokio::test]
+    async fn shield_leg_compares_reviewed_fee_before_the_cap() {
+        let mut fx = fixture();
+        let proposal = offline_proposal::<Infallible>(15_000);
+        let mut client = offline_client();
+        let prover = LocalTxProver::bundled();
+        let mut results = Vec::new();
+        let tracked = hd_account();
+        let network = consensus_network(ZeckNetwork::Mainnet);
+        let usk =
+            UnifiedSpendingKey::from_seed(&network, &fx.seed, zip32::AccountId::ZERO).unwrap();
+        let transparent_account =
+            legacy_transparent_account_key_from_seed(ZeckNetwork::Mainnet, &fx.seed).unwrap();
+        let mut ctx = SweepStepCtx {
+            workspace: &fx.workspace,
+            network: ZeckNetwork::Mainnet,
+            client: &mut client,
+            prover: &prover,
+            results: &mut results,
+            broadcast_log: &mut fx.log,
+            prior_fee_zatoshis: 0,
+            // Below the built fee: the cap must not mask a changed fee.
+            max_fee_zatoshis: Some(1),
+            reviewed_fee_zatoshis: 10_000,
+            lightwalletd_url: "https://127.0.0.1:1",
+            confirmation_sources: &[],
+        };
+        let result =
+            execute_shielding_step(&mut ctx, &tracked, &transparent_account, &usk, &proposal).await;
+        assert!(
+            matches!(
+                result,
+                Err(ZeckError::FeeQuoteChanged {
+                    reviewed: 10_000,
+                    current: 15_000
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_leg_compares_reviewed_fee_before_the_cap() {
+        let mut fx = fixture();
+        let proposal = offline_proposal::<zcash_client_sqlite::ReceivedNoteId>(15_000);
+        let mut client = offline_client();
+        let prover = LocalTxProver::bundled();
+        let mut results = Vec::new();
+        let tracked = hd_account();
+        let network = consensus_network(ZeckNetwork::Mainnet);
+        let usk =
+            UnifiedSpendingKey::from_seed(&network, &fx.seed, zip32::AccountId::ZERO).unwrap();
+        let mut ctx = SweepStepCtx {
+            workspace: &fx.workspace,
+            network: ZeckNetwork::Mainnet,
+            client: &mut client,
+            prover: &prover,
+            results: &mut results,
+            broadcast_log: &mut fx.log,
+            prior_fee_zatoshis: 0,
+            max_fee_zatoshis: Some(1),
+            reviewed_fee_zatoshis: 10_000,
+            lightwalletd_url: "https://127.0.0.1:1",
+            confirmation_sources: &[],
+        };
+        let result = execute_send_max_step(&mut ctx, &tracked, &usk, &proposal, 0).await;
+        assert!(
+            matches!(
+                result,
+                Err(ZeckError::FeeQuoteChanged {
+                    reviewed: 10_000,
+                    current: 15_000
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(results.is_empty());
+    }
+
+    fn plan_with_leg_fee(fee: u64) -> ExactSweepPlan {
+        let proposal = offline_proposal::<Infallible>(fee);
+        let quote = SweepProposal {
+            transactions: vec![ProposedTx {
+                kind: ProposedTxKind::ShieldTransparent,
+                source_account: 0,
+                destination: "u-test".to_owned(),
+                gross_zatoshis: 100_000,
+                fee_zatoshis: fee,
+                net_zatoshis: 100_000 - fee,
+                donation_zatoshis: 0,
+                note: String::new(),
+                memo: None,
+            }],
+            donation_note: None,
+            skipped_accounts: Vec::new(),
+            total_send_zatoshis: 100_000,
+            total_fee_zatoshis: fee,
+            net_received_zatoshis: 0,
+            total_donation_zatoshis: 0,
+            dry_run_default: true,
+            warning: None,
+            follow_up_review_required: true,
+            confirmation_notice: None,
+        };
+        ExactSweepPlan {
+            quote,
+            legs: vec![ExactSweepLeg::HdShield {
+                account_index: 0,
+                proposal,
+            }],
+            direct_account_index: None,
+            network: ZeckNetwork::Mainnet,
+        }
+    }
+
+    fn intent_for(plan: &ExactSweepPlan) -> ReviewedSweepIntent {
+        let fx_dir = tempfile::tempdir().unwrap();
+        let key_source: Arc<dyn KeySource> = Arc::new(SeedKeySource::new(
+            secrecy::SecretString::new(PHRASE.to_owned()),
+        ));
+        let runtime = RuntimeScanConfig {
+            key_source: key_source.clone(),
+            birthday: 1_000_000,
+            num_accounts: Some(1),
+            gap_limit: 1,
+            transparent_scan: None,
+            lightwalletd_url: "https://127.0.0.1:1".to_owned(),
+            confirmation_sources: Vec::new(),
+            data_dir: fx_dir.path().to_owned(),
+            network: ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        let handle = crate::models::ScanHandle::new();
+        let session = ScanSession {
+            source_fingerprint: key_source.fingerprint().unwrap(),
+            state: Arc::new(Mutex::new(crate::scan::ScanTaskState::new(handle.clone()))),
+            workspace_root: fx_dir.path().to_owned(),
+            runtime,
+            started_at: Instant::now(),
+            task: Mutex::new(None),
+            reviewed_sweeps: Mutex::new(ReviewedSweepStore::default()),
+        };
+        let progress = ScanProgress {
+            ..crate::scan::ScanTaskState::new(handle).progress
+        };
+        let mut intent = ReviewedSweepIntent::capture(
+            SweepRequest {
+                destination: "u-test".to_owned(),
+                memo: None,
+                max_fee_zatoshis: None,
+                reviewed_fee_zatoshis: None,
+                donation_rate: None,
+                donor_email: None,
+            },
+            &session,
+            &progress,
+        );
+        intent.bind_plan(plan).unwrap();
+        intent
+    }
+
+    #[test]
+    fn executed_fee_change_is_fee_quote_changed_not_max_fee_exceeded() {
+        let reviewed = plan_with_leg_fee(10_000);
+        let intent = intent_for(&reviewed);
+        // A blank cap was bound to the reviewed total, so a higher executed
+        // fee would also exceed the cap; the fee change must be reported.
+        assert_eq!(intent.request.max_fee_zatoshis, Some(10_000));
+        let current = plan_with_leg_fee(15_000);
+        assert!(matches!(
+            intent.authorize_current_plan(&current),
+            Err(ZeckError::FeeQuoteChanged {
+                reviewed: 10_000,
+                current: 15_000
+            })
+        ));
+        // The same plan authorizes, returning the fees captured at review.
+        let fees = intent.authorize_current_plan(&reviewed).unwrap();
+        assert_eq!(fees.require(ExactFeeKey::HdShield(0)).unwrap(), 10_000);
+    }
+
+    #[test]
+    fn reviewed_leg_fees_come_from_the_reviewed_plan() {
+        let intent = intent_for(&plan_with_leg_fee(10_000));
+        let fees = intent.reviewed_leg_fees.as_ref().unwrap();
+        assert_eq!(fees.require(ExactFeeKey::HdShield(0)).unwrap(), 10_000);
+        assert!(fees.require(ExactFeeKey::HdSend(0)).is_err());
+    }
+
+    #[test]
+    fn canonical_identity_binds_the_protobuf_proposal() {
+        // Same single transparent input, same version; only the fee and the
+        // change value (carried by the protobuf proposal) differ.
+        let a = offline_proposal::<Infallible>(10_000);
+        let b = offline_proposal::<Infallible>(15_000);
+        assert_ne!(
+            canonical_proposal(&a, ZeckNetwork::Mainnet),
+            canonical_proposal(&b, ZeckNetwork::Mainnet)
+        );
+        assert_eq!(
+            canonical_proposal(&a, ZeckNetwork::Mainnet),
+            canonical_proposal(
+                &offline_proposal::<Infallible>(10_000),
+                ZeckNetwork::Mainnet
+            )
+        );
+    }
+
+    #[test]
+    fn a_reviewed_leg_without_an_executable_account_fails_closed() {
+        let plan = plan_with_leg_fee(10_000);
+        assert!(hd_leg_plan(&plan.legs, &[hd_account()]).is_ok());
+        assert!(matches!(
+            hd_leg_plan(&plan.legs, &[]),
+            Err(ZeckError::StaleSweepProposal(message)) if message.contains("nothing was signed")
+        ));
+        let mut imported = hd_account();
+        imported.spend_authority = TrackedSpendAuthority::ImportedSapling {
+            key_index: 0,
+            wallet_account_id: zcash_client_sqlite::AccountUuid::default(),
+        };
+        assert!(matches!(
+            hd_leg_plan(&plan.legs, &[imported]),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
     }
 }

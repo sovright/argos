@@ -1079,6 +1079,19 @@ async fn sweep_imported_sapling_leg(
             "no imported account to sweep from".to_owned(),
         ));
     }
+    // Every reviewed Sapling leg must map to an account this executor will
+    // visit; otherwise it would be silently dropped. Fail before signing.
+    if let Some(plan) = planned {
+        if let Some(missing) = plan.sapling.keys().find(|reviewed| {
+            !accounts
+                .iter()
+                .any(|(_, account)| account.wallet_account_id == **reviewed)
+        }) {
+            return Err(ZeckError::StaleSweepProposal(format!(
+                "reviewed imported Sapling leg for account {missing:?} cannot be executed; nothing was signed"
+            )));
+        }
+    }
 
     let recipient = ZcashAddress::try_from_encoded(destination)
         .map_err(|err| ZeckError::InvalidAddress(format!("could not decode destination: {err}")))?;
@@ -1130,6 +1143,72 @@ fn unique_registered_accounts(
 #[cfg(test)]
 mod fee_cap_tests {
     use super::*;
+
+    /// The imported-Sapling leg compares the fee captured at review with the
+    /// proposal it is about to build, before the PCZT is created.
+    #[test]
+    fn imported_leg_compares_reviewed_fee_with_the_planned_proposal() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let key_source: std::sync::Arc<dyn crate::key_source::KeySource> =
+            std::sync::Arc::new(crate::key_source::SeedKeySource::new(
+                secrecy::SecretString::new(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                        .to_owned(),
+                ),
+            ));
+        let runtime = crate::models::RuntimeScanConfig {
+            key_source: key_source.clone(),
+            birthday: 419_200,
+            num_accounts: Some(1),
+            gap_limit: 1,
+            transparent_scan: None,
+            lightwalletd_url: "http://127.0.0.1:1".to_owned(),
+            confirmation_sources: Vec::new(),
+            data_dir: tempdir.path().to_owned(),
+            network: crate::models::ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        let workspace = crate::workspace::RecoveryWorkspace::from_runtime(&runtime).unwrap();
+        workspace
+            .initialize_from_source(runtime.network, key_source.as_ref())
+            .unwrap();
+        let params = crate::workspace::consensus_network(runtime.network);
+        let mut wallet_db =
+            crate::workspace::open_wallet_db(workspace.wallet_db_path(), params).unwrap();
+        let extsk = ExtendedSpendingKey::master(&[1; 32]);
+        let (_, address) = extsk.default_address();
+        let destination =
+            ZcashAddress::try_from_encoded(&zcash_keys::encoding::encode_payment_address(
+                zcash_protocol::constants::mainnet::HRP_SAPLING_PAYMENT_ADDRESS,
+                &address,
+            ))
+            .unwrap();
+        let planned = crate::service::leg_fee_pin_tests::offline_proposal::<ReceivedNoteId>(15_000);
+        let prover = LocalTxProver::bundled();
+        let result = build_imported_sapling_sweep_reviewed(
+            &mut wallet_db,
+            &params,
+            AccountUuid::default(),
+            &extsk,
+            &destination,
+            &prover,
+            None,
+            0,
+            Some(10_000),
+            Some(&planned),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ZeckError::FeeQuoteChanged {
+                    reviewed: 10_000,
+                    current: 15_000
+                })
+            ),
+            "{:?}",
+            result.map(|tx| tx.txid())
+        );
+    }
 
     #[tokio::test]
     async fn filtered_transparent_only_route_skips_sapling_registration_and_reaches_t_key() {
