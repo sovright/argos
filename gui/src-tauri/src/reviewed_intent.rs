@@ -22,8 +22,10 @@
 //! Held material is wiped on drop with `zeroize`: a scan session's keys sit
 //! in `Zeroizing`, wiped when the last `Arc` (the session's, or a running
 //! worker's) goes, and `SpendableSproutNote` zeroizes its `a_sk` and note
-//! secrets in its own `Drop`, so an expired, released or executed proposal
-//! leaves no key behind in freed memory. This is best effort, not a
+//! secrets in its own `Drop`; a wallet proposal's copy of its Sprout keys,
+//! kept so execute can verify the saved scan again (#272), is `Zeroizing`
+//! too. So an expired, released or executed proposal leaves no key behind
+//! in freed memory. This is best effort, not a
 //! guarantee: copies made earlier (decoding buffers, a `Vec` reallocation,
 //! the wallet-import types, which are not all zeroizing) are not reached.
 
@@ -131,14 +133,25 @@ pub struct SproutSweepIntent {
     /// Set when the catch-up scan behind a scan-derived proposal could not
     /// confirm the chain tip; it leads the sweep report's warnings.
     pub tip_warning: Option<String>,
-    /// A wallet proposal's verdict from verifying its saved scan against
-    /// live headers at review time (#272). It ends the sweep report's
-    /// warnings and is appended to a sweep error. Execution spends the
-    /// reviewed notes and does not verify again.
-    pub chain_notice: Option<String>,
+    /// What a wallet proposal needs to verify its saved scan against live
+    /// headers again at execute (#272), through the peers it was reviewed
+    /// with. `None` for a scan-derived proposal. Execute's own verdict, not
+    /// the review's, ends the sweep report's warnings, and a reviewed note
+    /// that verdict or the sweep journal no longer leaves spendable refuses
+    /// the sweep.
+    pub wallet_reverify: Option<WalletReverification>,
     /// Set when the scan panel's peer field was malformed at review time.
     /// The review degrades to a warning, but execution refuses the proposal.
     pub peer_error: Option<String>,
+}
+
+/// The inputs to a wallet proposal's execute-time scan verification: the
+/// data directory its review looked in, the wallet's Sprout keys the
+/// checkpoint is keyed by (wiped on drop), and the review's parsed peer list.
+pub struct WalletReverification {
+    pub data_dir: Option<PathBuf>,
+    pub scan_keys: Zeroizing<Vec<[u8; 32]>>,
+    pub peers: Vec<String>,
 }
 
 pub struct ScanMaterial {
@@ -613,7 +626,7 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(1),
                     tip_warning: None,
-                    chain_notice: None,
+                    wallet_reverify: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -692,7 +705,7 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(2),
                     tip_warning: None,
-                    chain_notice: None,
+                    wallet_reverify: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -753,7 +766,7 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(3),
                     tip_warning: None,
-                    chain_notice: None,
+                    wallet_reverify: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
