@@ -12,7 +12,10 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, MutexGuard, OnceLock,
+};
 
 use argos_core::broadcast::{
     BroadcastStore, EndpointTxEvidence, PreparedTransaction, SubmissionDisposition, TxObservation,
@@ -1262,8 +1265,21 @@ fn a_transparent_sweep_refuses_to_broadcast_without_confirmation() {
 }
 
 fn scratch_dir(tag: &str) -> String {
-    std::env::temp_dir()
-        .join(format!("argos-cli-{tag}-{}", std::process::id()))
+    static PRIVATE_PARENT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    let parent = PRIVATE_PARENT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("argos-cli-data-")
+            .tempdir()
+            .expect("private CLI test data parent")
+    });
+    parent
+        .path()
+        .join(format!(
+            "{tag}-{}",
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ))
         .to_str()
         .expect("temp path is UTF-8")
         .to_owned()
