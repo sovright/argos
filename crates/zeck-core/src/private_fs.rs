@@ -7863,7 +7863,18 @@ mod windows_acl {
             }
             let mut offset = 0usize;
             loop {
-                if offset + mem::size_of::<FILE_DIRECTORY_INFORMATION>() > available {
+                // FILE_DIRECTORY_INFORMATION ends in a variable-length UTF-16
+                // name. `size_of` includes the one-element placeholder and
+                // trailing alignment padding, neither of which is part of the
+                // fixed header returned by NtQueryDirectoryFile.
+                let header_len = mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
+                let header_end = offset.checked_add(header_len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "overflow in Windows directory enumeration",
+                    )
+                })?;
+                if header_end > available {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid Windows directory enumeration record",
@@ -7876,7 +7887,31 @@ mod windows_acl {
                         .add(offset)
                         .cast::<FILE_DIRECTORY_INFORMATION>()
                 };
-                let units = usize::try_from(entry.FileNameLength).unwrap() / mem::size_of::<u16>();
+                let name_len = usize::try_from(entry.FileNameLength).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid Windows directory enumeration name length",
+                    )
+                })?;
+                if name_len % mem::size_of::<u16>() != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid Windows directory enumeration name length",
+                    ));
+                }
+                let record_end = header_end.checked_add(name_len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "overflow in Windows directory enumeration",
+                    )
+                })?;
+                if record_end > available {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid Windows directory enumeration record",
+                    ));
+                }
+                let units = name_len / mem::size_of::<u16>();
                 let value = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), units) };
                 if value != [b'.' as u16] && value != [b'.' as u16, b'.' as u16] {
                     names.push(std::ffi::OsString::from_wide(value));
@@ -7884,14 +7919,19 @@ mod windows_acl {
                 if entry.NextEntryOffset == 0 {
                     break;
                 }
-                offset = offset
-                    .checked_add(entry.NextEntryOffset as usize)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "overflow in Windows directory enumeration",
-                        )
-                    })?;
+                let next = entry.NextEntryOffset as usize;
+                if next < header_len + name_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "overlapping Windows directory enumeration records",
+                    ));
+                }
+                offset = offset.checked_add(next).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "overflow in Windows directory enumeration",
+                    )
+                })?;
                 if offset >= available {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -10838,7 +10878,7 @@ mod windows_tests {
         })
         .unwrap();
         rename_child_file(lease.parent(), &child, &renamed).unwrap();
-        let opened = open_child_file(lease.parent(), &renamed).unwrap();
+        let opened = open_child_file_for_removal(lease.parent(), &renamed).unwrap();
         let opened_id = private_object_id(&opened).unwrap();
         remove_open_child_file(lease.parent(), &renamed, &opened, &opened_id).unwrap();
 
@@ -10935,7 +10975,7 @@ mod windows_tests {
         source_handle.write_all(b"rename then delete").unwrap();
         drop(source_handle);
         rename_child_file(&retained, &source, &renamed).unwrap();
-        let opened = open_child_file(&retained, &renamed).unwrap();
+        let opened = open_child_file_for_removal(&retained, &renamed).unwrap();
         let opened_id = private_object_id(&opened).unwrap();
         remove_open_child_file(&retained, &renamed, &opened, &opened_id).unwrap();
 
