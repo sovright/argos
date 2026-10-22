@@ -4165,9 +4165,12 @@ mod tests {
         };
 
         let dir = ScratchDir::new("checkpoint-preheld-data-handle");
-        crate::private_fs::create_private_dir_all(&dir.0).unwrap();
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"spending-key checkpoint").unwrap();
+        let scanner = reorg_scanner();
+        let keys = scanner.spending_keys();
+        let data_dir = dir.0.join("artifact-data");
+        let path = checkpoint_path_for_network(&data_dir, keys.as_slice(), P2pNetwork::Regtest);
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let expected = Zeroizing::new(std::fs::read(&path).unwrap());
         let held = std::fs::OpenOptions::new()
             .read(true)
             .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
@@ -4177,12 +4180,12 @@ mod tests {
 
         assert!(checkpoint_generation(&path).is_err());
         assert!(read_checkpoint_file(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"spending-key checkpoint");
+        assert_eq!(std::fs::read(&path).unwrap(), expected.as_slice());
         drop(held);
         checkpoint_generation(&path).unwrap();
         assert_eq!(
             read_checkpoint_file(&path).unwrap().unwrap().as_slice(),
-            b"spending-key checkpoint"
+            expected.as_slice()
         );
     }
 
