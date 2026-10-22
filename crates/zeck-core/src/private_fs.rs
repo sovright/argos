@@ -2820,8 +2820,16 @@ pub(crate) fn verify_private_workspace_lineage(
         )
     })?;
     let publication_parent = open_publication_parent(publication_parent_path)?;
-    let publication_parent_id = private_object_id(&publication_parent)?;
     let root = open_private_directory_lease(private_root)?;
+    verify_private_workspace_lineage_from_handles(private_root, &publication_parent, root)
+}
+
+fn verify_private_workspace_lineage_from_handles(
+    private_root: &Path,
+    publication_parent: &File,
+    root: File,
+) -> io::Result<PrivateRootLineageLease> {
+    let publication_parent_id = private_object_id(publication_parent)?;
     let id = private_object_id(&root)?;
     let marker = private_root.join(PRIVATE_ROOT_LINEAGE_FILE_NAME);
     let (bytes, marker_id) = read_private_lineage_child_bytes(&root, &marker).map_err(|error| {
@@ -3476,13 +3484,16 @@ fn ensure_private_workspace_lineage_impl(
             // before reopening the published path; the object-ID comparison
             // below still detects any substitution in that window.
             drop(staging);
-            let current_parent = open_publication_parent(publish_parent)?;
-            if private_object_id(&current_parent)? != publication_parent_id {
-                return Err(invalid_lineage(
-                    "workspace publication parent changed during publication",
-                ));
-            }
-            let verified = verify_private_workspace_lineage(private_root)?;
+            // Keep the publication parent continuously pinned while opening
+            // and verifying the published root. Reopening a second parent
+            // authority would conflict with the retained Windows handle's
+            // intentional delete-share denial.
+            let published = open_private_directory_lease(private_root)?;
+            let verified = verify_private_workspace_lineage_from_handles(
+                private_root,
+                &publication_parent,
+                published,
+            )?;
             if verified.id != staged_id {
                 return Err(invalid_lineage(
                     "private workspace root changed during staged publication",
@@ -8999,12 +9010,9 @@ mod windows_acl {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
-            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | READ_CONTROL)
-            // Withholding delete sharing pins the directory pathname and
-            // rejects any preheld delete-capable handle. The lease itself
-            // does not need DELETE access: mutations use exact child handles.
-            // Omitting DELETE here also lets independent verified leases on
-            // the same namespace coexist.
+            .access_mode(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | DELETE | READ_CONTROL,
+            )
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let directory = options.open(path)?;
