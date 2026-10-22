@@ -361,14 +361,31 @@ impl SproutJournalSnapshot {
                         false,
                     )?;
                 } else {
-                    // A v1 acceptance has no raw bytes or expiry; it cannot be
-                    // declared final without independently corroborated evidence.
+                    // A v1 acceptance has no raw bytes or expiry. It follows
+                    // the same evidence policy as a v2 record: corroborated
+                    // mining for Mined, one operator for MinedSingleSource,
+                    // absence past the derived expiry bound for Expired, and
+                    // only a positive reorg, absence, or mempool sighting
+                    // demotes a mined record back to Pending.
+                    use crate::broadcast::TxObservationState as Seen;
+                    let seen = observation.as_ref().map(|o| &o.state);
+                    let final_state = matches!(
+                        entry.state,
+                        TxLifecycleState::Expired | TxLifecycleState::Rejected
+                    );
                     match state {
-                        TxLifecycleState::SubmissionUnknown => {}
+                        TxLifecycleState::SubmissionUnknown if !entry.state.is_mined() => {}
                         TxLifecycleState::Mined
-                            if observation
-                                .as_ref()
-                                .is_some_and(TxObservation::has_canonical_mined_evidence) => {}
+                            if !final_state
+                                && observation
+                                    .as_ref()
+                                    .is_some_and(TxObservation::has_canonical_mined_evidence) => {}
+                        TxLifecycleState::MinedSingleSource
+                            if !final_state
+                                && entry.state != TxLifecycleState::Mined
+                                && observation.as_ref().is_some_and(
+                                    TxObservation::has_single_source_mined_evidence,
+                                ) => {}
                         TxLifecycleState::Expired
                             if observation.as_ref().is_some_and(TxObservation::is_expired)
                                 && entry.legacy_expiry_bound.is_some_and(|bound| {
@@ -376,9 +393,15 @@ impl SproutJournalSnapshot {
                                         == Some(bound)
                                 }) => {}
                         TxLifecycleState::Pending
-                            if observation.as_ref().is_some_and(|o| {
-                                o.state == crate::broadcast::TxObservationState::PresentUnmined
-                            }) => {}
+                            if !final_state
+                                && if entry.state.is_mined() {
+                                    matches!(
+                                        seen,
+                                        Some(Seen::Reorged | Seen::Absent | Seen::PresentUnmined)
+                                    )
+                                } else {
+                                    !matches!(seen, Some(Seen::Mined | Seen::MinedSingleSource))
+                                } => {}
                         _ => {
                             return Err(journal_error(
                                 "legacy transaction lacks evidence for transition",
@@ -421,7 +444,10 @@ impl SproutJournalSnapshot {
                         transaction: None,
                         legacy_txid: Some(txid),
                         value_zatoshis: None,
-                        state: TxLifecycleState::SubmissionUnknown,
+                        // v1 recorded only that a node accepted the bytes:
+                        // in flight, never final, and not a reason to stop
+                        // the other notes.
+                        state: TxLifecycleState::Pending,
                         last_submission: None,
                         observation: None,
                         legacy_expiry_bound: None,
@@ -1291,7 +1317,10 @@ mod tests {
     }
 
     #[test]
-    fn v1_accepted_entry_migrates_to_submission_unknown_not_mined() {
+    fn v1_accepted_entry_migrates_to_pending_not_mined() {
+        // v1 (released in 1.5.0) recorded only node acceptance. Accepted is
+        // Pending in the lifecycle model: in flight, not final, and not a
+        // reason to stop every other note.
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let txid = fixture().txid;
@@ -1300,7 +1329,7 @@ mod tests {
         let entry = snapshot.entry_for_note(&outpoint()).unwrap();
         assert_eq!(entry.legacy_txid, Some(txid));
         assert!(entry.transaction.is_none());
-        assert_eq!(entry.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(entry.state, TxLifecycleState::Pending);
         assert!(!snapshot.all_mined_for([&outpoint()]));
         assert!(std::fs::read_to_string(journal.path())
             .unwrap()
@@ -1360,7 +1389,7 @@ mod tests {
         std::fs::write(journal.path(), legacy_line(&fixture().txid.to_string())).unwrap();
         let snapshot = journal.load_or_migrate().unwrap();
         let entry = snapshot.entry_for_note(&outpoint()).unwrap();
-        assert_eq!(entry.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(entry.state, TxLifecycleState::Pending);
         assert_eq!(entry.legacy_expiry_bound, None);
         assert!(!snapshot.ready_for_new_plan(&outpoint()));
     }

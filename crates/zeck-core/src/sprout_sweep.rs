@@ -983,14 +983,37 @@ fn transaction_summaries(snapshot: &SproutJournalSnapshot) -> Vec<SproutSweepTra
         .collect()
 }
 
+/// The tip a v1 entry's expiry bound is derived from.
+///
+/// The highest tip an independent pair agrees on when there is one;
+/// otherwise the first configured source reporting absence -- the primary,
+/// in the default single-operator setup. One source suffices for the same
+/// reason it suffices for expiry (see `EXPIRY_MARGIN_BLOCKS`): a source
+/// that lies low can at worst cause a rebuild that conflicts with the old
+/// transaction on the same nullifier, and consensus rejects whichever
+/// arrives second. A tip too high to be a real chain is never used, so a
+/// lying source cannot push the bound out of reach.
 fn reliable_observed_tip(observation: &TxObservation) -> Option<u32> {
     let reduced = crate::broadcast::observe_transaction(
         observation.evidence.clone(),
         observation.expiry_height,
     );
-    (reduced.state == TxObservationState::Absent)
-        .then(|| highest_corroborated_absent_tip(&reduced))
-        .flatten()
+    if reduced.state != TxObservationState::Absent {
+        return None;
+    }
+    highest_corroborated_absent_tip(&reduced)
+        .or_else(|| {
+            reduced
+                .evidence
+                .iter()
+                .find(|item| {
+                    is_absent_evidence(item)
+                        && crate::models::normalized_confirmation_authority(&item.endpoint)
+                            .is_some()
+                })
+                .and_then(|item| item.tip_height)
+        })
+        .filter(|tip| tip_from_height(u64::from(*tip)).is_ok())
 }
 
 fn independently_administered_absence(
@@ -1195,6 +1218,20 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         }
 
         let Some(transaction) = entry.transaction.clone() else {
+            if entry.state.is_mined()
+                && matches!(
+                    observation.state,
+                    TxObservationState::Absent | TxObservationState::Reorged
+                )
+            {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    TxLifecycleState::Pending,
+                    None,
+                    Some(&observation),
+                )?;
+            }
             if entry.legacy_expiry_bound.is_none() {
                 if let Some(verified_tip) = reliable_observed_tip(&observation) {
                     let expiry_bound = verified_tip.checked_add(EXPIRY_DELTA).ok_or_else(|| {
@@ -1208,7 +1245,12 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                     )?;
                 }
             }
-            unresolved_unknown = true;
+            // Without raw bytes there is nothing to resend. A v1 entry is
+            // Pending and leaves the other notes free; only a genuinely
+            // unknown submission stops them.
+            if entry.state == TxLifecycleState::SubmissionUnknown {
+                unresolved_unknown = true;
+            }
             continue;
         };
         let expiry = transaction.expiry_height.ok_or_else(|| {
@@ -3324,7 +3366,8 @@ mod tests {
         );
         assert_eq!(builds, 0);
         assert!(raw.is_empty() && node.sent.is_empty());
-        assert!(outcome.error.is_some());
+        // A v1 entry is Pending: it waits without stopping the sweep.
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(
             journal
                 .load_or_migrate()
@@ -3346,7 +3389,8 @@ mod tests {
         );
         assert_eq!(builds, 0);
         assert!(raw.is_empty() && node.sent.is_empty());
-        assert!(outcome.error.is_some());
+        // A v1 entry is Pending: it waits without stopping the sweep.
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
         let expired_tip = first_expired_tip(140);
         let mut node = LifecycleNode::accepted(expired_tip, 1);
@@ -3400,7 +3444,8 @@ mod tests {
 
         assert_eq!(builds, 0);
         assert!(raw.is_empty() && node.sent.is_empty());
-        assert!(outcome.error.is_some());
+        // A v1 entry is Pending: it waits without stopping the sweep.
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(
             journal
                 .load_or_migrate()
@@ -3584,5 +3629,202 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("lightwalletd server")));
+    }
+
+    fn one_operator_absent(expiry: Option<u32>, tip: u32) -> crate::broadcast::TxObservation {
+        crate::broadcast::observe_transaction(vec![endpoint("primary", tip, None, false)], expiry)
+    }
+
+    fn write_legacy_line(
+        journal: &crate::sprout_sweep_journal::SweepJournal,
+        note: &SpendableSproutNote,
+        legacy_txid: zcash_primitives::transaction::TxId,
+    ) {
+        let note_txid: String = note
+            .outpoint
+            .txid
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        std::fs::write(
+            journal.path(),
+            format!(
+                "{note_txid}:{}:{} {legacy_txid}\n",
+                note.outpoint.js_index, note.outpoint.output_index
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_single_operator_resolves_a_lost_reply_to_expired_and_replans() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 101);
+        let old = fixture_transaction(1010, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &old,
+            crate::broadcast::TxLifecycleState::SubmissionUnknown,
+        );
+
+        // Inside the margin the one configured source cannot release it.
+        let inside = 140 + crate::broadcast::EXPIRY_MARGIN_BLOCKS;
+        let mut node = LifecycleNode::accepted(inside, 0);
+        let mut observer =
+            LifecycleObserver::new([(old.txid, one_operator_absent(Some(140), inside))]);
+        let (outcome, builds, _) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1011,
+        );
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert!(outcome.error.is_some());
+
+        let expired_tip = first_expired_tip(140);
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
+        let mut observer =
+            LifecycleObserver::new([(old.txid, one_operator_absent(Some(140), expired_tip))]);
+        let (outcome, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &journal, 1012);
+        assert_eq!(builds, 1, "{:?}", outcome.error);
+        assert_eq!(node.sent, raw);
+        assert_ne!(node.sent[0], old.raw_tx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    }
+
+    #[test]
+    fn one_operator_mining_resolves_without_stalling_or_offering_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let mined_note = lifecycle_note(1_000_000, 102);
+        let next_note = lifecycle_note(2_000_000, 103);
+        let tx = fixture_transaction(1020, 140);
+        seed_entry(
+            &journal,
+            &mined_note,
+            &tx,
+            crate::broadcast::TxLifecycleState::SubmissionUnknown,
+        );
+        let mut node = LifecycleNode::accepted(200, 1);
+        let mut observer =
+            LifecycleObserver::new([(tx.txid, mined_by_one_source(Some(140), 120, 200))]);
+        let (outcome, builds, raw) = run_lifecycle(
+            &[mined_note, next_note],
+            &mut node,
+            &mut observer,
+            &journal,
+            1021,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(builds, 1);
+        assert_eq!(node.sent, raw);
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::MinedSingleSource
+        );
+        assert!(!outcome.fresh_all_mined);
+    }
+
+    #[test]
+    fn a_v1_entry_under_one_operator_neither_blocks_other_notes_nor_waits_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let legacy_note = lifecycle_note(1_000_000, 104);
+        let other_note = lifecycle_note(2_000_000, 105);
+        let legacy_txid = zcash_primitives::transaction::TxId::from_bytes([0xcd; 32]);
+        write_legacy_line(&journal, &legacy_note, legacy_txid);
+
+        // First pass: one source bounds the old expiry, and the other note
+        // is swept rather than stopped behind it.
+        let mut node = LifecycleNode::accepted(100, 1);
+        let mut observer = LifecycleObserver::new([(legacy_txid, one_operator_absent(None, 100))]);
+        let (outcome, builds, _) = run_lifecycle(
+            &[lifecycle_note(1_000_000, 104), other_note],
+            &mut node,
+            &mut observer,
+            &journal,
+            1040,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(builds, 1);
+        let bound = 100 + EXPIRY_DELTA;
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_note(&legacy_note.outpoint)
+                .unwrap()
+                .legacy_expiry_bound,
+            Some(bound)
+        );
+
+        // Past bound plus margin, the one source expires it and the note is
+        // planned again.
+        let expired_tip = first_expired_tip(bound);
+        let other_txid = journal
+            .load_or_migrate()
+            .unwrap()
+            .entries()
+            .find(|entry| entry.outpoint != legacy_note.outpoint)
+            .unwrap()
+            .txid();
+        let other_expiry = journal
+            .load_or_migrate()
+            .unwrap()
+            .entry_for_txid(other_txid)
+            .unwrap()
+            .transaction
+            .as_ref()
+            .unwrap()
+            .expiry_height;
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
+        let mut observer = LifecycleObserver::new([
+            (legacy_txid, one_operator_absent(Some(bound), expired_tip)),
+            (
+                other_txid,
+                mined_by_one_source(other_expiry, 110, expired_tip),
+            ),
+        ]);
+        let (outcome, builds, _) = run_lifecycle(
+            std::slice::from_ref(&legacy_note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1041,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(builds, 1);
+    }
+
+    #[test]
+    fn a_v1_entry_mined_per_one_operator_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let legacy_note = lifecycle_note(1_000_000, 106);
+        let legacy_txid = zcash_primitives::transaction::TxId::from_bytes([0xce; 32]);
+        write_legacy_line(&journal, &legacy_note, legacy_txid);
+        let mut node = LifecycleNode::accepted(200, 0);
+        let mut observer =
+            LifecycleObserver::new([(legacy_txid, mined_by_one_source(None, 120, 200))]);
+        let (outcome, builds, _) = run_lifecycle(
+            std::slice::from_ref(&legacy_note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1060,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(builds, 0);
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::MinedSingleSource
+        );
+        assert!(!outcome.fresh_all_mined);
     }
 }
