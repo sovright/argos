@@ -99,7 +99,6 @@ jobs:
           cargo test -p argos-core private_fs::windows_tests::windows_namespace_append_create_and_reuse_keep_retained_identity --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core windows_relative_primitives_never_touch_a_recreated_ancestor_tree --target x86_64-pc-windows-msvc
           cargo test -p argos-core windows_checkpoint_quarantine_uses_exact_open_handle_rename_and_delete --target x86_64-pc-windows-msvc
-          cargo test -p argos-core sprout_sweep_journal::tests::cleanup_restart_restores_a_surviving_exact_quarantine --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core windows_journal_authority_denies_sidecar_replacement_and_second_writer --target x86_64-pc-windows-msvc
           cargo test -p argos-core retained_registry_handles_deny_parent_and_sidecar_replacement --target x86_64-pc-windows-msvc
           cargo test -p argos-core sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle --target x86_64-pc-windows-msvc -- --exact
@@ -113,7 +112,47 @@ jobs:
           cargo test -p argos-core birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_marker_before_secret --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_secret_write --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core birthday::tests::stale_probe_scan_skips_registered_live_probe --target x86_64-pc-windows-msvc -- --exact
-          cargo test -p argos-gui write_private_report --target x86_64-pc-windows-msvc
+          cargo test -p argos-gui commands::tests::windows_write_private_report_creates_private_and_refuses_untrusted_reuse --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-gui commands::tests::fresh_gui_workspace_is_authenticated_before_sprout_work_starts --target x86_64-pc-windows-msvc -- --exact
+
+      - name: private artifact authority and sweep safety tests (x64)
+        if: matrix.label == 'x64'
+        shell: pwsh
+        run: |
+          $tests = @(
+            'private_fs::tests::fresh_absent_artifact_data_dir_is_published_as_authenticated_container'
+            'private_fs::tests::windows_authenticated_container_and_root_reopen_and_enumerate'
+            'private_fs::tests::preexisting_unmarked_artifact_data_dir_is_refused_unchanged'
+            'private_fs::tests::fresh_private_artifact_root_binds_every_precreated_authority_object'
+            'private_fs::tests::unmarked_private_artifact_root_is_refused_without_mutation'
+            'private_fs::tests::private_artifact_root_context_replay_is_refused'
+            'private_fs::tests::artifact_authority_is_durable_before_the_first_secret_byte'
+            'private_fs::tests::existing_unbound_artifact_is_refused_without_read_or_mutation'
+            'private_fs::tests::artifact_replacement_records_exact_generation_before_publication'
+            'private_fs::tests::windows_artifact_domains_cold_verify_before_retaining_their_bound_locks'
+            'private_fs::tests::windows_artifact_registry_prevents_root_rollback_or_remint'
+            'private_fs::tests::torn_newest_authority_slot_falls_back_to_previous_durable_state'
+            'private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse'
+            'private_fs::tests::retained_root_allows_checkpoint_and_journal_domains_to_coexist'
+            'sprout_sweep_journal::tests::scoped_load_strictly_validates_sibling_header_and_raw_transaction'
+            'sprout_sweep_journal::tests::scoped_load_ignores_only_a_fully_valid_other_network_sibling'
+            'sprout_sweep_journal::tests::scoped_load_rejects_an_overlapping_authorized_key_set_root'
+            'sprout_sweep_journal::tests::scoped_load_accepts_a_nonoverlapping_authorized_key_set_root'
+            'sprout_sweep_journal::tests::scoped_load_rejects_a_tampered_private_root_before_reading_its_journal'
+            'sprout_sweep_journal::tests::every_direct_legacy_journal_blocks_even_for_another_fingerprint'
+            'sprout_sweep_journal::tests::cleanup_restart_never_deletes_a_surviving_generation_from_stale_observations'
+            'sprout_sweep_journal::tests::cleanup_restart_after_unlink_commits_an_idempotent_tombstone'
+            'sprout_sweep_journal::tests::cleanup_restart_completes_old_generation_without_deleting_replacement'
+            'sprout_sweep::tests::first_run_with_no_artifact_root_has_no_interrupted_cleanup'
+            'sprout_sweep::tests::production_restart_completes_a_crash_after_unlink_before_completion'
+            'service::network_namespace_tests::network_guard_creates_and_reopens_only_an_authenticated_absent_data_dir'
+            'service::network_namespace_tests::network_guard_refuses_a_preexisting_unmarked_data_dir_unchanged'
+            'service::network_namespace_tests::retained_registry_handles_deny_parent_and_sidecar_replacement'
+          )
+          foreach ($test in $tests) {
+            cargo test -p argos-core --target x86_64-pc-windows-msvc $test -- --exact
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
   check-macos-private-authority:
     name: Private authority tests (macOS)
