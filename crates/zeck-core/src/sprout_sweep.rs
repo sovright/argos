@@ -32,6 +32,7 @@ use std::{
 
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
+use zeroize::Zeroizing;
 
 use crate::{
     broadcast::{
@@ -242,7 +243,7 @@ pub fn build_sweep_for_note(
     let anchor = note.anchor;
     let witness_path = note.witness_path.clone();
 
-    let signing_key = sprout_spend::JoinSplitSigningKey::from_bytes(random_bytes(&mut rng));
+    let signing_key = sprout_spend::JoinSplitSigningKey::from_bytes(*random_bytes(&mut rng));
 
     // The second input is a dummy: a JoinSplit always has two, and a
     // zero-value note with a dummy path is how the spec says to fill one.
@@ -255,8 +256,8 @@ pub fn build_sweep_for_note(
         sprout_spend::JoinSplitInput {
             note: SproutNotePlaintext {
                 value: 0,
-                rho: random_bytes(&mut rng),
-                r: random_bytes(&mut rng),
+                rho: *random_bytes(&mut rng),
+                r: *random_bytes(&mut rng),
                 memo: [0u8; 512],
             },
             a_sk: note.a_sk,
@@ -1748,9 +1749,9 @@ fn refresh_outcome(
         && outcome.rejected.is_empty();
 }
 
-fn random_bytes(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    rng.fill_bytes(&mut out);
+fn random_bytes(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> Zeroizing<[u8; 32]> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut *out);
     out
 }
 
@@ -1875,6 +1876,8 @@ mod tests {
                 js_index: 0,
                 output_index: 0,
             },
+            #[cfg(test)]
+            drop_probe: None,
         }
     }
 

@@ -59,6 +59,19 @@ use argos_wallet_import::keys::{ImportedKeys, JsOutPoint, SproutJoinSplit, Sprou
 use secrecy::ExposeSecret;
 
 use crate::sprout::{self, SproutNotePlaintext, SproutPaymentAddress};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_SPENDABLE_DROP_PROBE: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::atomic::AtomicBool>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_spendable_drop_probe() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    NEXT_SPENDABLE_DROP_PROBE.with(|probe| probe.borrow_mut().take())
+}
 
 /// Hex for diagnostics. Inline rather than a dependency: this is the only
 /// place in the crate that needs it, and it is four lines.
@@ -85,6 +98,8 @@ pub struct SpendableSproutNote {
     /// The 966-byte authentication path the JoinSplit prover parses.
     pub witness_path: Vec<u8>,
     pub outpoint: JsOutPoint,
+    #[cfg(test)]
+    pub(crate) drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl core::fmt::Debug for SpendableSproutNote {
@@ -96,6 +111,37 @@ impl core::fmt::Debug for SpendableSproutNote {
             .field("commitment", &hex(&self.commitment))
             .field("anchor", &hex(&self.anchor))
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpendableSproutNote {
+    fn drop(&mut self) {
+        self.a_sk.zeroize();
+        self.witness_path.zeroize();
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl ZeroizeOnDrop for SpendableSproutNote {}
+
+impl SpendableSproutNote {
+    /// Copy into a new wiping owner while leaving a boxed source intact so
+    /// its destructor can erase the original allocation before deallocation.
+    fn clone_for_owned_transfer(&self) -> Self {
+        Self {
+            note: self.note.clone(),
+            a_sk: self.a_sk,
+            address: self.address,
+            commitment: self.commitment,
+            anchor: self.anchor,
+            witness_path: self.witness_path.clone(),
+            outpoint: self.outpoint,
+            #[cfg(test)]
+            drop_probe: None,
+        }
     }
 }
 
@@ -560,6 +606,11 @@ pub fn recover_spendable_sprout_notes_with_chain(
         }
     }
 
+    // Moving an inline spendable note during Vec growth would leave its key
+    // and plaintext in the allocator's abandoned block. Reserve before the
+    // first note leaves its stable Box; `order.len()` is a conservative
+    // upper bound because some records resolve to spent/dust/issues.
+    out.notes.reserve(order.len());
     for key in order {
         match best.remove(&key) {
             Some(Ok((
@@ -572,7 +623,7 @@ pub fn recover_spendable_sprout_notes_with_chain(
                 if unconfirmed_spend {
                     out.unconfirmed_spends.push(note.outpoint);
                 }
-                out.notes.push(*note);
+                out.notes.push(note.clone_for_owned_transfer());
             }
             Some(Ok((Recovered::Spent(spent), _))) => out.spent.push(spent),
             Some(Ok((Recovered::Dust(outpoint), _))) => out.dust.push(outpoint),
@@ -766,6 +817,8 @@ impl<'a> RecoveryContext<'a> {
                 anchor: witness.root(),
                 witness_path,
                 outpoint,
+                #[cfg(test)]
+                drop_probe: take_spendable_drop_probe(),
             }),
             unconfirmed_spend: self.unconfirmed.contains(&nullifier),
         })
@@ -857,6 +910,25 @@ mod tests {
         });
 
         (keys, a_sk)
+    }
+
+    #[test]
+    fn recovery_wipes_the_boxed_source_before_returning_destination() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let (keys, a_sk) = wallet_with_one_note(1_000_000);
+        let dropped = Arc::new(AtomicBool::new(false));
+        NEXT_SPENDABLE_DROP_PROBE.with(|probe| *probe.borrow_mut() = Some(Arc::clone(&dropped)));
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the original boxed allocation must be wiped while the returned note remains alive"
+        );
+        assert_eq!(recovered.notes[0].a_sk, a_sk);
     }
 
     /// A key filed under an address it does not control must be dropped,

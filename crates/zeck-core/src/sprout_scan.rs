@@ -36,8 +36,12 @@
 //! balance they cannot move.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Deref;
 
 use argos_wallet_import::keys::{JsOutPoint, SproutJoinSplit};
+#[cfg(test)]
+use zeroize::Zeroize;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     sprout::{self, SproutPaymentAddress},
@@ -47,19 +51,22 @@ use crate::{
 
 /// A key being scanned for, with its address precomputed.
 struct ScanKey {
-    a_sk: [u8; 32],
+    a_sk: Zeroizing<[u8; 32]>,
     address: SproutPaymentAddress,
     /// `sk_enc(a_sk)` as an x25519 secret, kept so the per-JoinSplit
     /// Diffie-Hellman agreement does not re-derive it on every attempt.
-    enc_secret: x25519_dalek::StaticSecret,
+    enc_secret: Zeroizing<x25519_dalek::StaticSecret>,
 }
 
 impl ScanKey {
     fn new(a_sk: [u8; 32]) -> Self {
+        let a_sk = Zeroizing::new(a_sk);
+        let address = SproutPaymentAddress::from_spending_key(&a_sk);
+        let enc_secret = Zeroizing::new(x25519_dalek::StaticSecret::from(sprout::sk_enc(&a_sk)));
         Self {
             a_sk,
-            address: SproutPaymentAddress::from_spending_key(&a_sk),
-            enc_secret: x25519_dalek::StaticSecret::from(sprout::sk_enc(&a_sk)),
+            address,
+            enc_secret,
         }
     }
 
@@ -67,23 +74,40 @@ impl ScanKey {
     ///
     /// Depends only on `(sk_enc, epk)`, so it is the same for both outputs —
     /// computed once per JoinSplit rather than once per output.
-    fn agree(&self, epk: &[u8; 32]) -> [u8; 32] {
-        *self
-            .enc_secret
-            .diffie_hellman(&x25519_dalek::PublicKey::from(*epk))
-            .as_bytes()
+    fn agree(&self, epk: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(
+            *self
+                .enc_secret
+                .diffie_hellman(&x25519_dalek::PublicKey::from(*epk))
+                .as_bytes(),
+        )
     }
 }
+
+impl ZeroizeOnDrop for ScanKey {}
 
 /// A note found mid-scan, whose witness is still being brought forward.
 struct PendingNote {
     note: crate::sprout::SproutNotePlaintext,
-    a_sk: [u8; 32],
+    a_sk: Zeroizing<[u8; 32]>,
     address: SproutPaymentAddress,
     commitment: [u8; 32],
     outpoint: JsOutPoint,
     nullifier: [u8; 32],
     witness: IncrementalWitness,
+    #[cfg(test)]
+    drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl ZeroizeOnDrop for PendingNote {}
+
+#[cfg(test)]
+impl Drop for PendingNote {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.drop_probe {
+            probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// A decrypted note, before its witness exists.
@@ -92,12 +116,14 @@ struct PendingNote {
 /// the note's own commitment is in the tree, which happens after decryption.
 struct DecryptedNote {
     note: crate::sprout::SproutNotePlaintext,
-    a_sk: [u8; 32],
+    a_sk: Zeroizing<[u8; 32]>,
     address: SproutPaymentAddress,
     commitment: [u8; 32],
     outpoint: JsOutPoint,
     nullifier: [u8; 32],
 }
+
+impl ZeroizeOnDrop for DecryptedNote {}
 
 /// Progress, for a scan that runs for hours.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -110,6 +136,38 @@ pub struct SproutScanProgress {
     /// for next.
     pub last_height: u32,
 }
+
+/// A collection of Sprout spending keys whose allocation is wiped on drop.
+///
+/// The wrapper deliberately exposes borrowing only: converting it back into
+/// an ordinary `Vec` would silently transfer secret-retention responsibility
+/// and recreate the raw-return boundary this type closes.
+#[derive(PartialEq, Eq)]
+pub struct SecretSproutKeys(Zeroizing<Vec<[u8; 32]>>);
+
+impl SecretSproutKeys {
+    pub fn as_slice(&self) -> &[[u8; 32]] {
+        self.0.as_slice()
+    }
+
+    pub(crate) fn copied_from(keys: &[[u8; 32]]) -> Self {
+        Self(Zeroizing::new(keys.to_vec()))
+    }
+
+    pub(crate) fn from_vec(keys: Zeroizing<Vec<[u8; 32]>>) -> Self {
+        Self(keys)
+    }
+}
+
+impl Deref for SecretSproutKeys {
+    type Target = [[u8; 32]];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl ZeroizeOnDrop for SecretSproutKeys {}
 
 /// Where the block walk had reached.
 ///
@@ -153,7 +211,11 @@ pub enum RewindError {
 pub struct SproutScanner {
     keys: Vec<ScanKey>,
     tree: IncrementalMerkleTree,
-    pending: Vec<PendingNote>,
+    // Boxed so growing the index vector moves only pointers. Moving an
+    // inline secret-bearing note during Vec reallocation would leave its old
+    // key and plaintext in the allocator's abandoned block.
+    #[allow(clippy::vec_box)]
+    pending: Vec<Box<PendingNote>>,
     /// Every nullifier seen, to tell a live note from a spent one, with the
     /// transaction that revealed it. `None` only in the version-1 layout,
     /// which did not record it and is no longer resumed.
@@ -170,6 +232,12 @@ pub struct SproutScanner {
     /// [`SproutScanner::with_decrypt_from`].
     decrypt_from: Option<u32>,
 }
+
+// All spend-authorizing fields are owned by `ScanKey` or `PendingNote`,
+// whose destructors wipe them. The marker makes that ownership contract
+// compile-time visible without giving `SproutScanner` a `Drop` impl (which
+// would prevent `finish` from moving its large public state without copies).
+impl ZeroizeOnDrop for SproutScanner {}
 
 impl SproutScanner {
     pub fn new(spending_keys: &[[u8; 32]]) -> Self {
@@ -258,11 +326,24 @@ impl SproutScanner {
     ///
     /// Exposed so a resumed checkpoint can be checked against the keys the
     /// caller actually asked about; the file path alone does not prove it.
-    pub fn spending_keys(&self) -> Vec<[u8; 32]> {
-        let mut keys: Vec<[u8; 32]> = self.keys.iter().map(|k| k.a_sk).collect();
+    pub fn spending_keys(&self) -> SecretSproutKeys {
+        self.normalized_spending_keys()
+    }
+
+    pub(crate) fn spending_keys_match(&self, wanted: &[[u8; 32]]) -> bool {
+        let actual = self.normalized_spending_keys();
+        let mut wanted = Zeroizing::new(wanted.to_vec());
+        wanted.sort_unstable();
+        wanted.dedup();
+        actual.as_slice() == wanted.as_slice()
+    }
+
+    fn normalized_spending_keys(&self) -> SecretSproutKeys {
+        let mut keys = Zeroizing::new(Vec::with_capacity(self.keys.len()));
+        keys.extend(self.keys.iter().map(|key| *key.a_sk));
         keys.sort_unstable();
         keys.dedup();
-        keys
+        SecretSproutKeys::from_vec(keys)
     }
 
     pub fn progress(&self) -> SproutScanProgress {
@@ -459,7 +540,7 @@ impl SproutScanner {
         // One Diffie-Hellman per key for this JoinSplit, shared by both of its
         // outputs. Trial decryption is the dominant cost of a full-chain scan,
         // and the agreement is the expensive part of it.
-        let agreements: Vec<[u8; 32]> = if decrypt {
+        let agreements: Vec<Zeroizing<[u8; 32]>> = if decrypt {
             self.keys
                 .iter()
                 .map(|k| k.agree(&js.ephemeral_key))
@@ -493,7 +574,7 @@ impl SproutScanner {
                 // from the tree that already contains the note. Building it
                 // from the tree beforehand yields a witness over an empty
                 // tree for the very first note.
-                self.pending.push(PendingNote {
+                self.pending.push(Box::new(PendingNote {
                     witness: IncrementalWitness::from_tree(self.tree.clone()),
                     note: found.note,
                     a_sk: found.a_sk,
@@ -501,7 +582,9 @@ impl SproutScanner {
                     commitment: found.commitment,
                     outpoint: found.outpoint,
                     nullifier: found.nullifier,
-                });
+                    #[cfg(test)]
+                    drop_probe: None,
+                }));
                 self.progress.notes_found += 1;
             }
         }
@@ -516,7 +599,7 @@ impl SproutScanner {
         index: usize,
         h_sig: &[u8; 32],
         commitment: &[u8; 32],
-        agreements: &[[u8; 32]],
+        agreements: &[Zeroizing<[u8; 32]>],
     ) -> Option<DecryptedNote> {
         let ciphertext = js.ciphertexts.get(index)?;
 
@@ -545,7 +628,7 @@ impl SproutScanner {
 
             return Some(DecryptedNote {
                 note,
-                a_sk: key.a_sk,
+                a_sk: Zeroizing::new(*key.a_sk),
                 address: key.address,
                 commitment: derived,
                 outpoint: JsOutPoint {
@@ -565,7 +648,7 @@ impl SproutScanner {
     /// nullifiers were published on the same chain this scan just read, so
     /// offering them would promise funds that cannot move.
     pub fn finish(self) -> Result<SproutScanResult, WitnessError> {
-        let mut notes = Vec::new();
+        let mut notes = Vec::with_capacity(self.pending.len());
         let mut spent_notes = 0usize;
 
         for pending in self.pending {
@@ -574,13 +657,18 @@ impl SproutScanner {
                 continue;
             }
             notes.push(SpendableSproutNote {
-                note: pending.note,
-                a_sk: pending.a_sk,
+                // Copy into the returned owner while the boxed source stays
+                // in place. Dropping that Box below wipes its original heap
+                // allocation instead of deallocating moved-out secret bytes.
+                note: pending.note.clone(),
+                a_sk: *pending.a_sk,
                 address: pending.address,
                 commitment: pending.commitment,
                 anchor: pending.witness.root(),
                 witness_path: pending.witness.encode_for_prover()?.to_vec(),
                 outpoint: pending.outpoint,
+                #[cfg(test)]
+                drop_probe: None,
             });
         }
 
@@ -639,7 +727,10 @@ impl SproutScanResult {
 /// holds spending keys and note plaintexts, and a text format invites being
 /// pasted into a bug report.
 pub struct SproutScanCheckpoint {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
+    body_start: usize,
+    #[cfg(test)]
+    drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Bumped when the layout changes, so a stale file is refused rather than
@@ -688,11 +779,61 @@ pub enum CheckpointError {
 
 impl SproutScanCheckpoint {
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[self.body_start..]
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self {
+            bytes: Zeroizing::new(bytes),
+            body_start: 0,
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
+    pub(crate) fn from_tagged_bytes(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self {
+            bytes,
+            body_start: 2,
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
+    pub(crate) fn from_secret_bytes(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self {
+            bytes,
+            body_start: 0,
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_bytes_with_drop_probe(
+        bytes: Vec<u8>,
+        probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            bytes: Zeroizing::new(bytes),
+            body_start: 0,
+            drop_probe: Some(probe),
+        }
+    }
+}
+
+impl ZeroizeOnDrop for SproutScanCheckpoint {}
+
+#[cfg(test)]
+impl Drop for SproutScanCheckpoint {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        if let Some(probe) = &self.drop_probe {
+            probe.store(
+                self.bytes.iter().all(|byte| *byte == 0),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
     }
 }
 
@@ -704,10 +845,10 @@ impl SproutScanCheckpoint {
 /// every pending witness only to discard them, then the caller clones the
 /// set; on a completed mainnet scan that is the bulk of a large file, parsed
 /// on every wallet open. [`read_chain_evidence`] walks past both.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct ChainEvidence {
     /// Sorted and deduplicated, as [`SproutScanner::spending_keys`].
-    pub spending_keys: Vec<[u8; 32]>,
+    pub spending_keys: SecretSproutKeys,
     /// Every nullifier seen, with its revealing txid where recorded.
     pub spent: HashMap<[u8; 32], Option<[u8; 32]>>,
     /// Where the walk reached; `None` if it scanned nothing.
@@ -719,23 +860,44 @@ pub struct ChainEvidence {
     pub decrypt_from_height: Option<u32>,
 }
 
+impl core::fmt::Debug for ChainEvidence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ChainEvidence")
+            .field(
+                "spending_keys",
+                &format_args!("<{} redacted>", self.spending_keys.len()),
+            )
+            .field("spent", &self.spent)
+            .field("cursor", &self.cursor)
+            .field("complete", &self.complete)
+            .field("decrypt_from_height", &self.decrypt_from_height)
+            .finish()
+    }
+}
+
+impl ZeroizeOnDrop for ChainEvidence {}
+
 /// The key set a checkpoint was made for, read from its header alone.
 ///
 /// Everything a caller needs to decide whether a checkpoint covers a wallet,
 /// without parsing a spent set that runs to hundreds of megabytes. `bytes`
 /// may be only a prefix of the checkpoint, as long as it reaches the keys.
-pub fn read_spending_keys(bytes: &[u8]) -> Result<Vec<[u8; 32]>, CheckpointError> {
+pub fn read_spending_keys(bytes: &[u8]) -> Result<SecretSproutKeys, CheckpointError> {
     let mut r = codec::Reader::new(bytes);
     read_version(&mut r)?;
     r.bytes().ok_or(CheckpointError::Corrupt)?; // tree
-    let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
-    let mut keys = Vec::new();
+    let key_count = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+        .map_err(|_| CheckpointError::Corrupt)?;
+    if key_count > (r.bytes.len() - r.pos) / 32 {
+        return Err(CheckpointError::Corrupt);
+    }
+    let mut keys = Zeroizing::new(Vec::with_capacity(key_count));
     for _ in 0..key_count {
         keys.push(r.array32().ok_or(CheckpointError::Corrupt)?);
     }
     keys.sort_unstable();
     keys.dedup();
-    Ok(keys)
+    Ok(SecretSproutKeys::from_vec(keys))
 }
 
 /// Read a checkpoint's chain evidence. Validates the layout end to end —
@@ -749,8 +911,12 @@ pub fn read_chain_evidence(
     require_authenticated_version(version)?;
     r.bytes().ok_or(CheckpointError::Corrupt)?; // tree
 
-    let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
-    let mut spending_keys = Vec::new();
+    let key_count = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+        .map_err(|_| CheckpointError::Corrupt)?;
+    if key_count > (r.bytes.len() - r.pos) / 32 {
+        return Err(CheckpointError::Corrupt);
+    }
+    let mut spending_keys = Zeroizing::new(Vec::with_capacity(key_count));
     for _ in 0..key_count {
         spending_keys.push(r.array32().ok_or(CheckpointError::Corrupt)?);
     }
@@ -786,7 +952,7 @@ pub fn read_chain_evidence(
     }
 
     Ok(ChainEvidence {
-        spending_keys,
+        spending_keys: SecretSproutKeys::from_vec(spending_keys),
         spent,
         cursor: (blocks_scanned > 0).then_some(cursor),
         complete,
@@ -1039,18 +1205,81 @@ impl SproutScanner {
     fn encode(&self, version: u8) -> SproutScanCheckpoint {
         use codec::{put_bytes, put_u64};
 
-        let mut out = vec![version];
+        // Size the one secret allocation before writing the first key byte.
+        // Growing a `Vec` after that point would free an allocation whose old
+        // contents the allocator does not wipe. Tree and witness encodings
+        // are public authentication data, so this length-only pass does not
+        // create another plaintext copy.
+        let add = |total: &mut usize, amount: usize| {
+            *total = total
+                .checked_add(amount)
+                .expect("an in-memory checkpoint fits in usize");
+        };
+        let mut encoded_len = 1usize;
+        add(&mut encoded_len, 8 + self.tree.to_bytes().len());
+        add(&mut encoded_len, 8 + 32 * self.keys.len());
+        add(&mut encoded_len, 8);
+        for pending in &self.pending {
+            add(
+                &mut encoded_len,
+                32 + 8 + 32 + 32 + 8 + 512 + 32 + 32 + 32 + 8 + 1 + 8,
+            );
+            add(&mut encoded_len, pending.witness.to_bytes().len());
+        }
+        add(&mut encoded_len, 8);
+        for txid in self.spent.values() {
+            add(&mut encoded_len, 32);
+            if version >= 2 {
+                add(&mut encoded_len, 1 + usize::from(txid.is_some()) * 32);
+            }
+        }
+        add(&mut encoded_len, 5 * 8 + 32 + 8);
+        if version >= 2 {
+            add(&mut encoded_len, 1);
+        }
+        if version >= 3 {
+            add(
+                &mut encoded_len,
+                1 + usize::from(self.decrypt_from.is_some()) * 8,
+            );
+        }
+        if version >= 5 {
+            add(&mut encoded_len, 8);
+            for frame in &self.history {
+                add(
+                    &mut encoded_len,
+                    40 + 1 + usize::from(frame.cursor_before.is_some()) * 40,
+                );
+                add(&mut encoded_len, 8 + frame.tree_before.to_bytes().len());
+                add(&mut encoded_len, 8 + 8);
+                for witness in &frame.witnesses_before {
+                    add(&mut encoded_len, 8 + witness.to_bytes().len());
+                }
+                add(&mut encoded_len, 8);
+                for undo in &frame.spent_before {
+                    add(
+                        &mut encoded_len,
+                        32 + 1 + usize::from(matches!(undo.previous, Some(Some(_)))) * 32,
+                    );
+                }
+                add(&mut encoded_len, 5 * 8);
+            }
+        }
+
+        let mut out = Zeroizing::new(Vec::with_capacity(encoded_len));
+        let initial_capacity = out.capacity();
+        out.push(version);
 
         put_bytes(&mut out, &self.tree.to_bytes());
 
         put_u64(&mut out, self.keys.len() as u64);
         for key in &self.keys {
-            out.extend_from_slice(&key.a_sk);
+            out.extend_from_slice(&*key.a_sk);
         }
 
         put_u64(&mut out, self.pending.len() as u64);
         for p in &self.pending {
-            out.extend_from_slice(&p.a_sk);
+            out.extend_from_slice(&*p.a_sk);
             put_u64(&mut out, p.note.value);
             out.extend_from_slice(&p.note.rho);
             out.extend_from_slice(&p.note.r);
@@ -1134,7 +1363,15 @@ impl SproutScanner {
             }
         }
 
-        SproutScanCheckpoint { bytes: out }
+        debug_assert_eq!(out.len(), encoded_len);
+        debug_assert_eq!(out.capacity(), initial_capacity);
+
+        SproutScanCheckpoint {
+            bytes: out,
+            body_start: 0,
+            #[cfg(test)]
+            drop_probe: None,
+        }
     }
 
     /// Rebuild a scanner from a checkpoint.
@@ -1145,25 +1382,36 @@ impl SproutScanner {
 
         let tree = IncrementalMerkleTree::parse(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
 
-        let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
-        let mut keys = Vec::new();
+        let key_count = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?;
+        if key_count > (r.bytes.len() - r.pos) / 32 {
+            return Err(CheckpointError::Corrupt);
+        }
+        let mut keys = Vec::with_capacity(key_count);
         for _ in 0..key_count {
-            let a_sk = r.array32().ok_or(CheckpointError::Corrupt)?;
-            keys.push(ScanKey::new(a_sk));
+            let a_sk = Zeroizing::new(r.array32().ok_or(CheckpointError::Corrupt)?);
+            keys.push(ScanKey::new(*a_sk));
         }
 
-        let pending_count = r.u64().ok_or(CheckpointError::Corrupt)?;
-        let mut pending = Vec::new();
+        let pending_count = usize::try_from(r.u64().ok_or(CheckpointError::Corrupt)?)
+            .map_err(|_| CheckpointError::Corrupt)?;
+        // Every pending record has at least the fixed fields through the
+        // witness length prefix. Check before allocating or iterating.
+        if pending_count > (r.bytes.len() - r.pos) / 737 {
+            return Err(CheckpointError::Corrupt);
+        }
+        let mut pending = Vec::with_capacity(pending_count);
         for _ in 0..pending_count {
-            let a_sk = r.array32().ok_or(CheckpointError::Corrupt)?;
+            let a_sk = Zeroizing::new(r.array32().ok_or(CheckpointError::Corrupt)?);
             let value = r.u64().ok_or(CheckpointError::Corrupt)?;
-            let rho = r.array32().ok_or(CheckpointError::Corrupt)?;
-            let note_r = r.array32().ok_or(CheckpointError::Corrupt)?;
-            let memo: [u8; 512] = r
-                .bytes()
-                .ok_or(CheckpointError::Corrupt)?
-                .try_into()
-                .map_err(|_| CheckpointError::Corrupt)?;
+            let rho = Zeroizing::new(r.array32().ok_or(CheckpointError::Corrupt)?);
+            let note_r = Zeroizing::new(r.array32().ok_or(CheckpointError::Corrupt)?);
+            let memo = Zeroizing::new(
+                r.bytes()
+                    .ok_or(CheckpointError::Corrupt)?
+                    .try_into()
+                    .map_err(|_| CheckpointError::Corrupt)?,
+            );
             let commitment = r.array32().ok_or(CheckpointError::Corrupt)?;
             let nullifier = r.array32().ok_or(CheckpointError::Corrupt)?;
             let txid = r.array32().ok_or(CheckpointError::Corrupt)?;
@@ -1175,14 +1423,14 @@ impl SproutScanner {
             let witness =
                 IncrementalWitness::parse_one(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
 
-            pending.push(PendingNote {
+            pending.push(Box::new(PendingNote {
                 note: crate::sprout::SproutNotePlaintext {
                     value,
-                    rho,
-                    r: note_r,
-                    memo,
+                    rho: *rho,
+                    r: *note_r,
+                    memo: *memo,
                 },
-                a_sk,
+                a_sk: Zeroizing::new(*a_sk),
                 address: SproutPaymentAddress::from_spending_key(&a_sk),
                 commitment,
                 outpoint: JsOutPoint {
@@ -1192,7 +1440,9 @@ impl SproutScanner {
                 },
                 nullifier,
                 witness,
-            });
+                #[cfg(test)]
+                drop_probe: None,
+            }));
         }
 
         let spent = read_spent(&mut r, version)?;
@@ -1254,6 +1504,63 @@ pub fn joinsplits_by_transaction(joinsplits: &[SproutJoinSplit]) -> HashMap<[u8;
 mod tests {
     use super::*;
     use crate::sprout::SproutNotePlaintext;
+
+    #[test]
+    fn checkpoint_secret_buffer_owners_zeroize_on_drop() {
+        fn requires_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        fn field_requires_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        requires_zeroize_on_drop::<SproutScanCheckpoint>();
+        requires_zeroize_on_drop::<SproutScanner>();
+        requires_zeroize_on_drop::<SecretSproutKeys>();
+        requires_zeroize_on_drop::<ChainEvidence>();
+        requires_zeroize_on_drop::<SproutNotePlaintext>();
+        requires_zeroize_on_drop::<SpendableSproutNote>();
+        requires_zeroize_on_drop::<ScanKey>();
+        requires_zeroize_on_drop::<PendingNote>();
+        requires_zeroize_on_drop::<zeroize::Zeroizing<x25519_dalek::StaticSecret>>();
+        requires_zeroize_on_drop::<crate::sprout_spend::JoinSplitInput>();
+        requires_zeroize_on_drop::<crate::sprout_spend::JoinSplitFields>();
+        requires_zeroize_on_drop::<crate::sprout_spend::JoinSplitRandomness>();
+        requires_zeroize_on_drop::<crate::sprout_spend::JoinSplitSigningKey>();
+
+        let checkpoint = SproutScanCheckpoint::from_bytes(vec![CHECKPOINT_VERSION]);
+        field_requires_zeroize_on_drop(&checkpoint.bytes);
+        let scan_key = ScanKey::new([0x53; 32]);
+        field_requires_zeroize_on_drop(&scan_key.a_sk);
+        field_requires_zeroize_on_drop(&scan_key.enc_secret);
+        let plaintext = SproutNotePlaintext {
+            value: 1,
+            rho: [0x52; 32],
+            r: [0x53; 32],
+            memo: [0x54; 512],
+        };
+        field_requires_zeroize_on_drop(&plaintext.to_bytes());
+    }
+
+    #[test]
+    fn checkpoint_secret_buffer_is_wiped_on_parse_error() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let wiped = Arc::new(AtomicBool::new(false));
+        {
+            let checkpoint = SproutScanCheckpoint::from_bytes_with_drop_probe(
+                vec![CHECKPOINT_VERSION, 0x53, 0x4b, 0x01],
+                Arc::clone(&wiped),
+            );
+            assert!(matches!(
+                SproutScanner::resume(&checkpoint),
+                Err(CheckpointError::Corrupt)
+            ));
+        }
+        assert!(
+            wiped.load(Ordering::SeqCst),
+            "the malformed checkpoint must be wiped before its allocation is released"
+        );
+    }
 
     #[test]
     fn orphaned_nullifier_is_removed_and_the_note_is_live_again() {
@@ -1505,7 +1812,10 @@ mod tests {
             read_chain_evidence(&v4),
             Err(CheckpointError::UnauthenticatedLegacy)
         ));
-        assert_eq!(read_spending_keys(v4.as_bytes()).unwrap(), vec![[0x42; 32]]);
+        assert_eq!(
+            read_spending_keys(v4.as_bytes()).unwrap().as_slice(),
+            [[0x42; 32]]
+        );
     }
 
     /// Build a JoinSplit paying `value` to `a_sk` in output `index`, with
@@ -1589,6 +1899,29 @@ mod tests {
         assert_eq!(result.total_value(), 500_000);
         // Both outputs must have been appended, ours and the stranger's.
         assert_eq!(result.progress.commitments_appended, 2);
+    }
+
+    #[test]
+    fn finishing_wipes_the_boxed_pending_source_before_returning() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let a_sk = [0x42u8; 32];
+        let (js, _) = joinsplit_paying(&a_sk, 500_000, 0, 1);
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block(&[js]).expect("scan");
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        scanner.pending[0].drop_probe = Some(Arc::clone(&dropped));
+        let result = scanner.finish().expect("finish");
+
+        assert_eq!(result.notes.len(), 1);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the source Box must drop and wipe while the returned note is still alive"
+        );
     }
 
     /// The note can be in either output slot; a scanner that only checked
@@ -1942,7 +2275,10 @@ mod tests {
 
         let v1 = scanner.encode(1);
         assert_eq!(v1.as_bytes()[0], 1);
-        assert_eq!(read_spending_keys(v1.as_bytes()).unwrap(), vec![a_sk]);
+        assert_eq!(
+            read_spending_keys(v1.as_bytes()).unwrap().as_slice(),
+            [a_sk]
+        );
         assert!(matches!(
             SproutScanner::resume(&v1),
             Err(CheckpointError::UnauthenticatedLegacy)
@@ -1959,7 +2295,10 @@ mod tests {
         let mut scanner = SproutScanner::new(&[a_sk]);
         scanner.scan_block_at(&[], [0xAB; 32], 9).expect("scan");
         let v2 = scanner.encode(2);
-        assert_eq!(read_spending_keys(v2.as_bytes()).unwrap(), vec![a_sk]);
+        assert_eq!(
+            read_spending_keys(v2.as_bytes()).unwrap().as_slice(),
+            [a_sk]
+        );
         assert!(matches!(
             SproutScanner::resume(&v2),
             Err(CheckpointError::UnauthenticatedLegacy)
@@ -2010,10 +2349,13 @@ mod tests {
 
         let evidence = read_chain_evidence(&checkpoint).expect("evidence");
         let resumed = SproutScanner::resume(&checkpoint).expect("resume");
-        assert_eq!(evidence.spending_keys, resumed.spending_keys());
         assert_eq!(
-            evidence.spending_keys,
-            vec![a_sk],
+            evidence.spending_keys.as_slice(),
+            resumed.spending_keys().as_slice()
+        );
+        assert_eq!(
+            evidence.spending_keys.as_slice(),
+            [a_sk],
             "duplicate keys are one key"
         );
         assert_eq!(&evidence.spent, resumed.spent_nullifiers());
@@ -2151,7 +2493,10 @@ mod tests {
                 ),
                 "v{version}"
             );
-            assert_eq!(read_spending_keys(old.as_bytes()).unwrap(), vec![a_sk]);
+            assert_eq!(
+                read_spending_keys(old.as_bytes()).unwrap().as_slice(),
+                [a_sk]
+            );
         }
 
         // A damaged bound is corruption, not "no bound".

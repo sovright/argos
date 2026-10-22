@@ -35,11 +35,11 @@
 //! wrong `pk_enc` and fails against bytes zcashd wrote, which is a real
 //! oracle rather than a self-consistency check.
 
-use blake2b_simd::Params as Blake2bParams;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use sha2::compress256;
 use sha2::digest::generic_array::GenericArray;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// `ZC_NOTEPLAINTEXT_SIZE`: leading byte + value + rho + r + memo.
 pub const NOTE_PLAINTEXT_LEN: usize = 1 + 8 + 32 + 32 + 512;
@@ -61,6 +61,32 @@ const SHA256_IV: [u32; 8] = [
     0x5be0_cd19,
 ];
 
+const BLAKE2B_IV: [u64; 8] = [
+    0x6a09_e667_f3bc_c908,
+    0xbb67_ae85_84ca_a73b,
+    0x3c6e_f372_fe94_f82b,
+    0xa54f_f53a_5f1d_36f1,
+    0x510e_527f_ade6_82d1,
+    0x9b05_688c_2b3e_6c1f,
+    0x1f83_d9ab_fb41_bd6b,
+    0x5be0_cd19_137e_2179,
+];
+
+const BLAKE2B_SIGMA: [[usize; 16]; 12] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+];
+
 /// The bare SHA-256 compression function over one 512-bit block — *not*
 /// SHA-256 itself.
 ///
@@ -68,11 +94,163 @@ const SHA256_IV: [u32; 8] = [
 /// that make SHA-256 a hash function. Substituting `Sha256::digest` here
 /// produces plausible-looking output that is wrong everywhere it is used.
 pub fn sha256_compress(block: &[u8; 64]) -> [u8; 32] {
-    let mut state = SHA256_IV;
-    compress256(&mut state, &[*GenericArray::from_slice(block)]);
+    let mut state = Zeroizing::new(SHA256_IV);
+    compress256(
+        &mut state,
+        core::slice::from_ref(GenericArray::from_slice(block)),
+    );
     let mut out = [0u8; 32];
     for (chunk, word) in out.chunks_exact_mut(4).zip(state.iter()) {
         chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// SHA-256 for the small secret-bearing inputs used by Sprout notes and
+/// Base58Check. The padded blocks and chaining state are wiping owners.
+pub(crate) fn sha256_wipeable(input: &[u8]) -> [u8; 32] {
+    assert!(
+        input.len() <= 119,
+        "the wipeable SHA-256 helper accepts at most two blocks"
+    );
+    let padded_len = if input.len() <= 55 { 64 } else { 128 };
+    let mut padded = Zeroizing::new([0u8; 128]);
+    padded[..input.len()].copy_from_slice(input);
+    padded[input.len()] = 0x80;
+    padded[padded_len - 8..padded_len].copy_from_slice(&(input.len() as u64 * 8).to_be_bytes());
+
+    let mut state = Zeroizing::new(SHA256_IV);
+    for block in padded[..padded_len].chunks_exact(64) {
+        compress256(
+            &mut state,
+            core::slice::from_ref(GenericArray::from_slice(block)),
+        );
+    }
+    let mut out = [0u8; 32];
+    for (chunk, word) in out.chunks_exact_mut(4).zip(state.iter()) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+pub(crate) fn sha256d_wipeable(input: &[u8]) -> [u8; 32] {
+    let first = Zeroizing::new(sha256_wipeable(input));
+    sha256_wipeable(&*first)
+}
+
+fn blake2b_g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+    v[d] = (v[d] ^ v[a]).rotate_right(32);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(24);
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+    v[d] = (v[d] ^ v[a]).rotate_right(16);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(63);
+}
+
+/// BLAKE2b-256 over exactly one full block, with a 16-byte personalization.
+/// Sprout's `hSig` and note KDF both have that shape. Keeping the compression
+/// state here avoids an opaque incremental hasher retaining the exact input.
+fn blake2b_256_block(block: &[u8; 128], personal: &[u8; 16]) -> [u8; 32] {
+    let mut message = Zeroizing::new([0u64; 16]);
+    for (word, bytes) in message.iter_mut().zip(block.chunks_exact(8)) {
+        *word = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
+    }
+
+    let mut state = Zeroizing::new(BLAKE2B_IV);
+    // digest_length=32, key_length=0, fanout=1, depth=1.
+    state[0] ^= 0x0101_0020;
+    state[6] ^= u64::from_le_bytes(personal[..8].try_into().expect("personalization half"));
+    state[7] ^= u64::from_le_bytes(personal[8..].try_into().expect("personalization half"));
+
+    let mut work = Zeroizing::new([0u64; 16]);
+    work[..8].copy_from_slice(&*state);
+    work[8..].copy_from_slice(&BLAKE2B_IV);
+    work[12] ^= 128;
+    work[14] ^= u64::MAX;
+
+    for schedule in BLAKE2B_SIGMA {
+        blake2b_g(
+            &mut work,
+            0,
+            4,
+            8,
+            12,
+            message[schedule[0]],
+            message[schedule[1]],
+        );
+        blake2b_g(
+            &mut work,
+            1,
+            5,
+            9,
+            13,
+            message[schedule[2]],
+            message[schedule[3]],
+        );
+        blake2b_g(
+            &mut work,
+            2,
+            6,
+            10,
+            14,
+            message[schedule[4]],
+            message[schedule[5]],
+        );
+        blake2b_g(
+            &mut work,
+            3,
+            7,
+            11,
+            15,
+            message[schedule[6]],
+            message[schedule[7]],
+        );
+        blake2b_g(
+            &mut work,
+            0,
+            5,
+            10,
+            15,
+            message[schedule[8]],
+            message[schedule[9]],
+        );
+        blake2b_g(
+            &mut work,
+            1,
+            6,
+            11,
+            12,
+            message[schedule[10]],
+            message[schedule[11]],
+        );
+        blake2b_g(
+            &mut work,
+            2,
+            7,
+            8,
+            13,
+            message[schedule[12]],
+            message[schedule[13]],
+        );
+        blake2b_g(
+            &mut work,
+            3,
+            4,
+            9,
+            14,
+            message[schedule[14]],
+            message[schedule[15]],
+        );
+    }
+    for i in 0..8 {
+        state[i] ^= work[i] ^ work[i + 8];
+    }
+
+    let mut out = [0u8; 32];
+    for (chunk, word) in out.chunks_exact_mut(8).zip(state.iter()) {
+        chunk.copy_from_slice(&word.to_le_bytes());
     }
     out
 }
@@ -83,7 +261,7 @@ pub fn sha256_compress(block: &[u8; 64]) -> [u8; 32] {
 /// and replaced by the tag `1100`. `a_sk` is a 252-bit value stored in 32
 /// bytes, which is why those four bits are free to carry the tag.
 pub fn prf_addr(a_sk: &[u8; 32], t: u8) -> [u8; 32] {
-    let mut block = [0u8; 64];
+    let mut block = Zeroizing::new([0u8; 64]);
     block[..32].copy_from_slice(a_sk);
     block[0] &= 0x0F;
     block[0] |= 0b1100_0000;
@@ -118,17 +296,12 @@ pub fn h_sig(
     nullifiers: &[[u8; 32]; 2],
     joinsplit_pubkey: &[u8; 32],
 ) -> [u8; 32] {
-    let mut state = Blake2bParams::new()
-        .hash_length(32)
-        .personal(b"ZcashComputehSig")
-        .to_state();
-    state.update(random_seed);
-    state.update(&nullifiers[0]);
-    state.update(&nullifiers[1]);
-    state.update(joinsplit_pubkey);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(state.finalize().as_bytes());
-    out
+    let mut block = Zeroizing::new([0u8; 128]);
+    block[..32].copy_from_slice(random_seed);
+    block[32..64].copy_from_slice(&nullifiers[0]);
+    block[64..96].copy_from_slice(&nullifiers[1]);
+    block[96..].copy_from_slice(joinsplit_pubkey);
+    blake2b_256_block(&block, b"ZcashComputehSig")
 }
 
 /// `KDF^Sprout`, per §5.4.4.1.
@@ -145,21 +318,16 @@ pub fn kdf_sprout(
     output_index: u8,
 ) -> [u8; 32] {
     assert!(output_index < 2, "a JoinSplit has exactly two outputs");
-    let mut personal = [0u8; 16];
+    let mut personal = Zeroizing::new([0u8; 16]);
     personal[..8].copy_from_slice(b"ZcashKDF");
     personal[8] = output_index;
 
-    let mut state = Blake2bParams::new()
-        .hash_length(32)
-        .personal(&personal)
-        .to_state();
-    state.update(h_sig);
-    state.update(dhsecret);
-    state.update(epk);
-    state.update(pk_enc);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(state.finalize().as_bytes());
-    out
+    let mut block = Zeroizing::new([0u8; 128]);
+    block[..32].copy_from_slice(h_sig);
+    block[32..64].copy_from_slice(dhsecret);
+    block[64..96].copy_from_slice(epk);
+    block[96..].copy_from_slice(pk_enc);
+    blake2b_256_block(&block, &personal)
 }
 
 /// The transmission key `pk_enc`, forming the second half of a Sprout
@@ -170,8 +338,8 @@ pub fn kdf_sprout(
 /// `sk_enc` or a missing clamp shows up as a mismatch against bytes zcashd
 /// wrote rather than as a silently wrong decryption later.
 pub fn pk_enc(a_sk: &[u8; 32]) -> [u8; 32] {
-    let sk = x25519_dalek::StaticSecret::from(sk_enc(a_sk));
-    *x25519_dalek::PublicKey::from(&sk).as_bytes()
+    let sk = Zeroizing::new(x25519_dalek::StaticSecret::from(sk_enc(a_sk)));
+    *x25519_dalek::PublicKey::from(&*sk).as_bytes()
 }
 
 /// Decrypt one output of a JoinSplit, if it is addressed to `a_sk`.
@@ -196,8 +364,8 @@ pub fn decrypt_note(
         return Err(SproutNoteError::CiphertextLength(ciphertext.len()));
     }
 
-    let secret = x25519_dalek::StaticSecret::from(sk_enc(a_sk));
-    let dhsecret = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*epk));
+    let secret = Zeroizing::new(x25519_dalek::StaticSecret::from(sk_enc(a_sk)));
+    let dhsecret = Zeroizing::new(secret.diffie_hellman(&x25519_dalek::PublicKey::from(*epk)));
     decrypt_note_with_agreement(
         dhsecret.as_bytes(),
         epk,
@@ -239,18 +407,20 @@ pub fn decrypt_note_with_agreement(
         return Err(SproutNoteError::CiphertextLength(ciphertext.len()));
     }
 
-    let key = kdf_sprout(dhsecret, epk, pk_enc, h_sig, output_index);
+    let key = Zeroizing::new(kdf_sprout(dhsecret, epk, pk_enc, h_sig, output_index));
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(&[0u8; 12]),
-            Payload {
-                msg: ciphertext,
-                aad: &[],
-            },
-        )
-        .map_err(|_| SproutNoteError::NotForThisKey)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*key));
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&[0u8; 12]),
+                Payload {
+                    msg: ciphertext,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| SproutNoteError::NotForThisKey)?,
+    );
 
     SproutNotePlaintext::parse(&plaintext)
 }
@@ -260,7 +430,7 @@ pub fn decrypt_note_with_agreement(
 /// Tag `1110`, unlike `PRF^addr`'s `1100`. The tags are what stop one PRF's
 /// output being a valid value for another.
 pub fn prf_nf(a_sk: &[u8; 32], rho: &[u8; 32]) -> [u8; 32] {
-    let mut block = [0u8; 64];
+    let mut block = Zeroizing::new([0u8; 64]);
     block[..32].copy_from_slice(a_sk);
     block[0] &= 0x0F;
     block[0] |= 0b1110_0000;
@@ -278,7 +448,7 @@ pub fn prf_nf(a_sk: &[u8; 32], rho: &[u8; 32]) -> [u8; 32] {
 /// indication of which field was wrong.
 pub fn prf_pk(a_sk: &[u8; 32], input_index: usize, h_sig: &[u8; 32]) -> [u8; 32] {
     assert!(input_index < 2, "a JoinSplit has exactly two inputs");
-    let mut block = [0u8; 64];
+    let mut block = Zeroizing::new([0u8; 64]);
     block[..32].copy_from_slice(a_sk);
     block[0] &= 0x0F;
     if input_index == 1 {
@@ -294,7 +464,7 @@ pub fn prf_pk(a_sk: &[u8; 32], input_index: usize, h_sig: &[u8; 32]) -> [u8; 32]
 /// in bit `b` = `0x40`.
 pub fn prf_rho(phi: &[u8; 32], output_index: usize, h_sig: &[u8; 32]) -> [u8; 32] {
     assert!(output_index < 2, "a JoinSplit has exactly two outputs");
-    let mut block = [0u8; 64];
+    let mut block = Zeroizing::new([0u8; 64]);
     block[..32].copy_from_slice(phi);
     block[0] &= 0x0F;
     block[0] |= 0b0010_0000;
@@ -310,19 +480,16 @@ pub fn prf_rho(phi: &[u8; 32], output_index: usize, h_sig: &[u8; 32]) -> [u8; 32
 pub fn note_commitment(a_pk: &[u8; 32], value: u64, rho: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
     // The input is 8 + 256 + 64 + 256 + 256 = 840 bits, which spans two
     // compression blocks with the standard padding zcashd applies.
-    let mut input = Vec::with_capacity(105);
-    input.push(0xB0);
-    input.extend_from_slice(a_pk);
-    input.extend_from_slice(&value.to_le_bytes());
-    input.extend_from_slice(rho);
-    input.extend_from_slice(r);
+    let mut input = Zeroizing::new([0u8; 105]);
+    input[0] = 0xB0;
+    input[1..33].copy_from_slice(a_pk);
+    input[33..41].copy_from_slice(&value.to_le_bytes());
+    input[41..73].copy_from_slice(rho);
+    input[73..].copy_from_slice(r);
 
     // SHA256 of the 105-byte input, using the full hash (padding included),
     // which is what §5.4.8.1 specifies for NoteCommit^Sprout.
-    use sha2::{Digest, Sha256};
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(&input));
-    out
+    sha256_wipeable(&*input)
 }
 
 /// Encrypt a note plaintext to a recipient's `pk_enc`.
@@ -344,18 +511,18 @@ pub fn encrypt_note(
     if plaintext.len() != NOTE_PLAINTEXT_LEN {
         return Err(SproutNoteError::PlaintextLength(plaintext.len()));
     }
-    let secret = x25519_dalek::StaticSecret::from(*esk);
-    let epk = x25519_dalek::PublicKey::from(&secret);
-    let dhsecret = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*pk_enc));
-    let key = kdf_sprout(
+    let secret = Zeroizing::new(x25519_dalek::StaticSecret::from(*esk));
+    let epk = x25519_dalek::PublicKey::from(&*secret);
+    let dhsecret = Zeroizing::new(secret.diffie_hellman(&x25519_dalek::PublicKey::from(*pk_enc)));
+    let key = Zeroizing::new(kdf_sprout(
         dhsecret.as_bytes(),
         epk.as_bytes(),
         pk_enc,
         h_sig,
         output_index,
-    );
+    ));
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*key));
     cipher
         .encrypt(
             Nonce::from_slice(&[0u8; 12]),
@@ -369,14 +536,14 @@ pub fn encrypt_note(
 
 /// The ephemeral public key for a given ephemeral secret.
 pub fn epk_for(esk: &[u8; 32]) -> [u8; 32] {
-    let secret = x25519_dalek::StaticSecret::from(*esk);
-    *x25519_dalek::PublicKey::from(&secret).as_bytes()
+    let secret = Zeroizing::new(x25519_dalek::StaticSecret::from(*esk));
+    *x25519_dalek::PublicKey::from(&*secret).as_bytes()
 }
 
 impl SproutNotePlaintext {
     /// Serialize to the 585-byte body that gets encrypted.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(NOTE_PLAINTEXT_LEN);
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(NOTE_PLAINTEXT_LEN));
         out.push(NOTE_PLAINTEXT_LEAD_BYTE);
         out.extend_from_slice(&self.value.to_le_bytes());
         out.extend_from_slice(&self.rho);
@@ -487,19 +654,19 @@ impl SproutNotePlaintext {
         if bytes[0] != NOTE_PLAINTEXT_LEAD_BYTE {
             return Err(SproutNoteError::LeadByte(bytes[0]));
         }
-        let mut value = [0u8; 8];
+        let mut value = Zeroizing::new([0u8; 8]);
         value.copy_from_slice(&bytes[1..9]);
-        let mut rho = [0u8; 32];
+        let mut rho = Zeroizing::new([0u8; 32]);
         rho.copy_from_slice(&bytes[9..41]);
-        let mut r = [0u8; 32];
+        let mut r = Zeroizing::new([0u8; 32]);
         r.copy_from_slice(&bytes[41..73]);
-        let mut memo = [0u8; 512];
+        let mut memo = Zeroizing::new([0u8; 512]);
         memo.copy_from_slice(&bytes[73..]);
         Ok(Self {
-            value: u64::from_le_bytes(value),
-            rho,
-            r,
-            memo,
+            value: u64::from_le_bytes(*value),
+            rho: *rho,
+            r: *r,
+            memo: *memo,
         })
     }
 }
@@ -524,9 +691,40 @@ impl PartialEq for SproutNotePlaintext {
             && self.memo[..] == other.memo[..]
     }
 }
+
+impl Drop for SproutNotePlaintext {
+    fn drop(&mut self) {
+        self.rho.zeroize();
+        self.r.zeroize();
+        self.memo.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SproutNotePlaintext {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wiping_hash_implementations_match_the_reference_crates() {
+        use sha2::Digest;
+
+        for len in [0usize, 32, 55, 56, 70, 105, 119] {
+            let input: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            assert_eq!(
+                sha256_wipeable(&input).as_slice(),
+                sha2::Sha256::digest(&input).as_slice()
+            );
+        }
+
+        let block = [0x53u8; 128];
+        let personal = *b"ZcashComputehSig";
+        let expected = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(&personal)
+            .hash(&block);
+        assert_eq!(blake2b_256_block(&block, &personal), expected.as_bytes());
+    }
 
     /// The all-zero `a_sk` is not a realistic key, but the tag-masking in
     /// `PRF^addr` is visible on it: whatever the input, the first byte of the

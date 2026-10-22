@@ -104,6 +104,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::{
     error::{ZeckError, ZeckResult},
@@ -114,7 +115,8 @@ use crate::{
         wire::P2pNetwork,
     },
     sprout_scan::{
-        CheckpointError, ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner,
+        CheckpointError, ScanCursor, SecretSproutKeys, SproutScanCheckpoint, SproutScanResult,
+        SproutScanner,
     },
 };
 use zcash_protocol::consensus::BranchId;
@@ -417,10 +419,10 @@ fn hash_checkpoint_handle(file: &fs::File, path: &Path) -> ZeckResult<(u64, [u8;
         ZeckError::TransactionBuild(format!("seeking checkpoint {}: {err}", path.display()))
     })?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = Zeroizing::new([0u8; 64 * 1024]);
     let mut len = 0u64;
     loop {
-        let read = reader.read(&mut buffer).map_err(|err| {
+        let read = reader.read(&mut *buffer).map_err(|err| {
             ZeckError::TransactionBuild(format!("reading checkpoint {}: {err}", path.display()))
         })?;
         if read == 0 {
@@ -612,30 +614,67 @@ fn load_checkpoint_while_leased(
     let Some(mut file) = lease.open_child(checkpoint_file)? else {
         return Ok(None);
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|err| {
+    let bytes = read_checkpoint_handle(&mut file, checkpoint_file)?;
+    parse_checkpoint(checkpoint_file, bytes, network, spending_keys).map(Some)
+}
+
+/// Read a checkpoint into one fixed-size allocation, wiping it on every exit.
+/// The metadata length is checked again by attempting one extra byte, so a
+/// concurrent append is rejected instead of growing the secret buffer and
+/// leaving an abandoned allocation behind.
+fn read_checkpoint_handle(
+    file: &mut fs::File,
+    checkpoint_file: &Path,
+) -> ZeckResult<Zeroizing<Vec<u8>>> {
+    let len = usize::try_from(
+        file.metadata()
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!(
+                    "inspecting the scan checkpoint at {}: {err}",
+                    checkpoint_file.display()
+                ))
+            })?
+            .len(),
+    )
+    .map_err(|_| ZeckError::TransactionBuild("the scan checkpoint is too large".into()))?;
+    let mut bytes = Zeroizing::new(vec![0u8; len]);
+    file.read_exact(&mut bytes).map_err(|err| {
         ZeckError::TransactionBuild(format!(
             "reading the scan checkpoint at {}: {err}",
             checkpoint_file.display()
         ))
     })?;
-    parse_checkpoint(checkpoint_file, bytes, network, spending_keys).map(Some)
+    let mut extra = Zeroizing::new([0u8; 1]);
+    match file.read(&mut *extra) {
+        Ok(0) => Ok(bytes),
+        Ok(_) => Err(ZeckError::TransactionBuild(format!(
+            "the scan checkpoint at {} changed while it was read",
+            checkpoint_file.display()
+        ))),
+        Err(err) => Err(ZeckError::TransactionBuild(format!(
+            "checking the end of the scan checkpoint at {}: {err}",
+            checkpoint_file.display()
+        ))),
+    }
 }
 
 /// The checks of [`load_checkpoint`], on bytes already read.
 fn parse_checkpoint(
     checkpoint_file: &Path,
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
 ) -> ZeckResult<SproutScanner> {
     // Checked after the scanner loads, so a corrupt file is still
     // reported as corrupt rather than as the wrong network.
-    let (tag, body) = match bytes.as_slice() {
-        [NETWORK_TAGGED, tag, body @ ..] => (Some(*tag), body.to_vec()),
-        _ => (None, bytes),
+    let tag = matches!(bytes.first(), Some(&NETWORK_TAGGED))
+        .then(|| bytes.get(1).copied())
+        .flatten();
+    let checkpoint = if tag.is_some() {
+        SproutScanCheckpoint::from_tagged_bytes(bytes)
+    } else {
+        SproutScanCheckpoint::from_secret_bytes(bytes)
     };
-    let checkpoint = SproutScanCheckpoint::from_bytes(body);
     let resumed = SproutScanner::resume(&checkpoint).map_err(|err| match err {
         CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(checkpoint_file),
         _ => ZeckError::TransactionBuild(format!(
@@ -651,10 +690,7 @@ fn parse_checkpoint(
     // the scan would report results for whichever keys the file
     // holds while the caller believed it scanned the ones it passed,
     // hiding one wallet's funds and touching another's key material.
-    let mut wanted: Vec<[u8; 32]> = spending_keys.to_vec();
-    wanted.sort_unstable();
-    wanted.dedup();
-    if resumed.spending_keys() != wanted {
+    if !resumed.spending_keys_match(spending_keys) {
         return Err(ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} was made for a different set of spending \
              keys. Resuming it would report that wallet's results as though they \
@@ -807,9 +843,9 @@ pub fn saved_decrypt_from(
 /// Read a checkpoint file. `Ok(None)` only when there is no file: any other
 /// failure — permissions, I/O, a directory in its place — is an error, so a
 /// scan that ran for hours never reads as one that never ran.
-fn read_checkpoint_file(path: &Path) -> ZeckResult<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
+fn read_checkpoint_file(path: &Path) -> ZeckResult<Option<Zeroizing<Vec<u8>>>> {
+    match fs::File::open(path) {
+        Ok(mut file) => read_checkpoint_handle(&mut file, path).map(Some),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(ZeckError::TransactionBuild(format!(
             "reading the scan checkpoint at {}: {err}",
@@ -877,7 +913,7 @@ fn lookup_chain_spends(
     let Some(bytes) = read_checkpoint_file(&path)? else {
         return Ok(ChainSpendsLookup::NotFound { path });
     };
-    let [NETWORK_TAGGED, tag, body @ ..] = bytes.as_slice() else {
+    let [NETWORK_TAGGED, tag, ..] = bytes.as_slice() else {
         return Err(ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} does not record its network, so its spends \
              cannot be trusted for this one. Preserve the file and the original \
@@ -886,23 +922,25 @@ fn lookup_chain_spends(
             path.display()
         )));
     };
-    let evidence =
-        crate::sprout_scan::read_chain_evidence(&SproutScanCheckpoint::from_bytes(body.to_vec()))
+    let tag = *tag;
+    let mut evidence =
+        crate::sprout_scan::read_chain_evidence(&SproutScanCheckpoint::from_tagged_bytes(bytes))
             .map_err(|err| match err {
-            CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(&path),
-            _ => ZeckError::TransactionBuild(format!(
-                "the scan checkpoint at {} could not be read ({err}).",
-                path.display()
-            )),
-        })?;
-    if evidence.spending_keys != scan_key_set(spending_keys, &[]) {
+                CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(&path),
+                _ => ZeckError::TransactionBuild(format!(
+                    "the scan checkpoint at {} could not be read ({err}).",
+                    path.display()
+                )),
+            })?;
+    let expected_keys = scan_key_set(spending_keys, &[]);
+    if evidence.spending_keys.as_slice() != expected_keys.as_slice() {
         return Err(ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} was made for a different set of spending keys, \
              so it says nothing about this wallet's notes.",
             path.display()
         )));
     }
-    if *tag != network_tag(network) {
+    if tag != network_tag(network) {
         return Err(ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} was made on a different network, so its spends \
              say nothing about this one's notes.",
@@ -913,7 +951,7 @@ fn lookup_chain_spends(
         None => ChainSpendsLookup::NothingScanned { path },
         Some(cursor) => ChainSpendsLookup::Found(ScanEvidence {
             path,
-            spent: evidence.spent,
+            spent: core::mem::take(&mut evidence.spent),
             scanned_to: cursor.last_height,
             complete: evidence.complete,
         }),
@@ -960,7 +998,7 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 
 fn stamp_of(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_checkpoint_file(path).ok()??;
     Some((bytes.len() as u64, meta.modified().ok(), digest(&bytes)))
 }
 
@@ -995,8 +1033,11 @@ const HEADER_READ_LIMIT: u64 = 1 << 20;
 /// spending keys can only have been made by someone who can already spend
 /// the wallet's funds, which is what keeps a planted checkpoint
 /// self-defeating. Untagged legacy checkpoints are not evidence, as before.
-fn scans_covering(data_dir: &Path, network: P2pNetwork, wanted: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
-    use std::io::Read;
+fn scans_covering(
+    data_dir: &Path,
+    network: P2pNetwork,
+    wanted: &[[u8; 32]],
+) -> Vec<SecretSproutKeys> {
     let Ok(entries) = std::fs::read_dir(data_dir) else {
         return Vec::new();
     };
@@ -1008,13 +1049,12 @@ fn scans_covering(data_dir: &Path, network: P2pNetwork, wanted: &[[u8; 32]]) -> 
         if !(name.starts_with("sprout-scan-") && name.ends_with(".checkpoint")) {
             continue;
         }
-        let mut head = Vec::new();
-        let Ok(file) = std::fs::File::open(entry.path()) else {
+        let Ok(mut file) = std::fs::File::open(entry.path()) else {
             continue;
         };
-        if file.take(HEADER_READ_LIMIT).read_to_end(&mut head).is_err() {
+        let Ok(head) = read_secret_prefix(&mut file, HEADER_READ_LIMIT as usize) else {
             continue;
-        }
+        };
         let [NETWORK_TAGGED, file_tag, body @ ..] = head.as_slice() else {
             continue;
         };
@@ -1031,6 +1071,30 @@ fn scans_covering(data_dir: &Path, network: P2pNetwork, wanted: &[[u8; 32]]) -> 
     found
 }
 
+/// Read at most `limit` bytes without ever growing or replacing the backing
+/// allocation after the first byte arrives. Checkpoint headers contain raw
+/// spending keys, so an ordinary `read_to_end` capacity probe could abandon
+/// a full allocation containing those keys.
+fn read_secret_prefix(
+    reader: &mut impl std::io::Read,
+    limit: usize,
+) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(vec![0u8; limit]);
+    let allocation = bytes.as_ptr();
+    let mut used = 0usize;
+    while used < limit {
+        match reader.read(&mut bytes[used..]) {
+            Ok(0) => break,
+            Ok(read) => used += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    bytes.truncate(used);
+    debug_assert_eq!(bytes.as_ptr(), allocation);
+    Ok(bytes)
+}
+
 /// Select one checkpoint without exposing its parsed spends. Ranking a
 /// covering scan still parses its evidence, but that transient map is dropped
 /// here; only the selected file may later become wallet evidence.
@@ -1038,10 +1102,10 @@ fn select_wallet_checkpoint(
     data_dir: &Path,
     network: P2pNetwork,
     keys: &[[u8; 32]],
-) -> Result<(Vec<[u8; 32]>, Option<usize>), String> {
+) -> Result<(SecretSproutKeys, Option<usize>), String> {
     let path = checkpoint_path(data_dir, keys);
     match std::fs::metadata(&path) {
-        Ok(_) => Ok((keys.to_vec(), None)),
+        Ok(_) => Ok((SecretSproutKeys::copied_from(keys), None)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let mut unusable = Vec::new();
             let best = scans_covering(data_dir, network, keys)
@@ -1104,7 +1168,7 @@ async fn verified_checkpoint_lookup_with<V: CursorVerifier>(
     // A completed mainnet scan is millions of nullifiers: read and parse it
     // once, off the async runtime.
     let loaded = {
-        let (path, keys) = (path.clone(), keys.to_vec());
+        let (path, keys) = (path.clone(), SecretSproutKeys::copied_from(keys));
         tokio::task::spawn_blocking(move || load_checkpoint_stamped(&path, network, &keys))
             .await
             .map_err(|err| {
@@ -1278,11 +1342,16 @@ pub async fn chain_spends_for_wallet(
 /// this set, so a caller looking for a scan must build it the same way, or a
 /// scan run with an extra `--sprout-key-file`, or over a wallet holding one
 /// key twice, is never found.
-pub fn scan_key_set(wallet_keys: &[[u8; 32]], extra_keys: &[[u8; 32]]) -> Vec<[u8; 32]> {
-    let mut keys: Vec<[u8; 32]> = wallet_keys.iter().chain(extra_keys).copied().collect();
+pub fn scan_key_set(wallet_keys: &[[u8; 32]], extra_keys: &[[u8; 32]]) -> SecretSproutKeys {
+    let capacity = wallet_keys
+        .len()
+        .checked_add(extra_keys.len())
+        .expect("the in-memory Sprout key set fits in usize");
+    let mut keys = Zeroizing::new(Vec::with_capacity(capacity));
+    keys.extend(wallet_keys.iter().chain(extra_keys).copied());
     keys.sort_unstable();
     keys.dedup();
-    keys
+    SecretSproutKeys::from_vec(keys)
 }
 
 /// Where a scan's checkpoint lives for a given key set.
@@ -1311,7 +1380,8 @@ pub fn full_key_set_fingerprint(spending_keys: &[[u8; 32]]) -> String {
     let mut h = sha2::Sha256::new();
     // Deduplicated as well as sorted: [A, A] is the scan of [A], and must
     // name the same file.
-    for key in &scan_key_set(spending_keys, &[]) {
+    let keys = scan_key_set(spending_keys, &[]);
+    for key in keys.iter() {
         h.update(key);
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -2663,8 +2733,10 @@ fn save_checkpoint_while_leased(
     // Windows directory is never opened as an ordinary file after mutation.
     remove_stale_temp_files_while_leased(lease, path)?;
     lease.verify_for(path)?;
-    let mut bytes = vec![NETWORK_TAGGED, network_tag(network)];
-    bytes.extend_from_slice(scanner.checkpoint().as_bytes());
+    let checkpoint = scanner.checkpoint();
+    let mut bytes = Zeroizing::new(Vec::with_capacity(2 + checkpoint.as_bytes().len()));
+    bytes.extend_from_slice(&[NETWORK_TAGGED, network_tag(network)]);
+    bytes.extend_from_slice(checkpoint.as_bytes());
     crate::private_fs::write_private_file_atomic_in_parent(lease.namespace.parent(), path, &bytes)
         .map_err(|err| ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}")))
 }
@@ -5195,6 +5267,43 @@ mod tests {
         assert!(a.to_string_lossy().contains("sprout-scan-"));
     }
 
+    #[test]
+    fn secret_checkpoint_prefix_never_reallocates_or_probes_past_its_bound() {
+        struct AllocationCheckingReader {
+            emitted: usize,
+            total: usize,
+            allocation: Option<usize>,
+        }
+
+        impl std::io::Read for AllocationCheckingReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let base = out.as_ptr() as usize - self.emitted;
+                match self.allocation {
+                    Some(expected) => assert_eq!(base, expected, "the destination reallocated"),
+                    None => self.allocation = Some(base),
+                }
+                let read = out.len().min(4096).min(self.total - self.emitted);
+                out[..read].fill(0x53);
+                self.emitted += read;
+                Ok(read)
+            }
+        }
+
+        let limit = HEADER_READ_LIMIT as usize;
+        let mut reader = AllocationCheckingReader {
+            emitted: 0,
+            total: limit + 1,
+            allocation: None,
+        };
+        let head = read_secret_prefix(&mut reader, limit).expect("bounded header read");
+        assert_eq!(head.len(), limit);
+        assert_eq!(
+            reader.emitted, limit,
+            "must not perform an EOF capacity probe"
+        );
+        assert!(head.iter().all(|byte| *byte == 0x53));
+    }
+
     /// Key order is not part of a scan's identity: the same wallet listed in
     /// a different order must resume its own checkpoint, not start over.
     #[test]
@@ -5824,8 +5933,8 @@ mod tests {
     #[test]
     fn the_scan_key_set_merges_sorts_and_dedups() {
         let (a, b, c) = ([0x01; 32], [0x02; 32], [0x03; 32]);
-        assert_eq!(scan_key_set(&[c, a, a], &[b, c]), vec![a, b, c]);
-        assert_eq!(scan_key_set(&[], &[]), Vec::<[u8; 32]>::new());
+        assert_eq!(scan_key_set(&[c, a, a], &[b, c]).as_slice(), [a, b, c]);
+        assert!(scan_key_set(&[], &[]).is_empty());
     }
 
     /// A checkpoint records its network, so resuming one elsewhere is
