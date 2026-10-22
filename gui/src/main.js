@@ -836,6 +836,17 @@ async function showSproutSweep() {
 
   try {
     const previewNetwork = previewConfig.network;
+    // A malformed entry in the scan panel's peer field must not cost the
+    // preview: the raw entries go to the backend, which skips live
+    // verification, keeps the wallet file's own spent record and says why
+    // in the scan warning. The sweep itself still refuses the field, and the
+    // backend refuses to execute a proposal reviewed with it.
+    let previewPeers;
+    try {
+      previewPeers = sproutScanPeers();
+    } catch {
+      previewPeers = previewConfig.peers;
+    }
     const preview = await invoke("propose_wallet_sprout_sweep", {
       reviewId: source.reviewId,
       passphrase: source.passphrase,
@@ -846,7 +857,9 @@ async function showSproutSweep() {
       // Where the scan panel keeps its checkpoint: a scan of these keys
       // settles spends the wallet file cannot see.
       dataDir: previewConfig.dataDir,
-      peers: previewConfig.peers,
+      // The scan panel's peers, dialled first when that checkpoint is
+      // verified against live headers. Opening the wallet never dials.
+      peers: previewPeers,
     });
 
     if (walletFile !== source || generation !== walletSproutProposalGeneration ||
@@ -856,6 +869,9 @@ async function showSproutSweep() {
       return;
     }
 
+    // Verification runs again for this preview. Show its current verdict
+    // beside the plan, even if inspection used an earlier checkpoint view.
+    setStatus("sprout-sweep-status", preview.scan_warning || "", "");
     // A preview for a network the user has since moved off, or one that
     // lands after a broadcast, would put back the wrong warning.
     if (preview.nu7_warning && previewNetwork === $("network-select").value && !sproutNu7Broadcast) {
@@ -955,6 +971,8 @@ async function runSproutSweep() {
       "",
     );
 
+    // Refuses a malformed scan peer field before anything is sent (#272).
+    sproutScanPeers();
     const report = await invoke("execute_wallet_sprout_sweep", { proposalId });
 
     if (walletFile !== source) return;
@@ -1985,6 +2003,8 @@ for (const id of ["sprout-scan-keys", "sprout-scan-peers", "network-select",
   $(id)?.addEventListener("input", invalidateSproutScanSource);
   $(id)?.addEventListener("change", invalidateSproutScanSource);
 }
+// The scan panel's peers verify the saved scan behind a wallet review (#272),
+// so they define its notes as much as the data directory does.
 for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset", "sprout-scan-peers"]) {
   $(id)?.addEventListener("input", invalidateWalletSproutReview);
   $(id)?.addEventListener("change", invalidateWalletSproutReview);

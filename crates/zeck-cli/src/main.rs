@@ -2184,6 +2184,9 @@ async fn print_sprout_inspection(
         // witness. A wallet with both needs no network at all; a wallet
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
+        // Inspection makes no network contact: a saved scan is named but
+        // not used, since only live peers can show its cursor survived any
+        // reorganization.
         let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Offline).await;
         let spending_keys = wallet_sprout_keys(keys);
         let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
@@ -4031,6 +4034,125 @@ mod tests {
         outer.join("artifact-data")
     }
 
+    #[tokio::test]
+    async fn inspection_does_not_count_an_unverified_orphan_only_nullifier_as_spent() {
+        use argos_core::argos_wallet_import::keys::{
+            JsOutPoint, Provenance, SproutJoinSplit, SproutKey, SproutNoteData,
+        };
+        use argos_core::sprout::{self, SproutNotePlaintext, SproutPaymentAddress};
+        use argos_core::sprout_witness::{IncrementalMerkleTree, IncrementalWitness};
+
+        let outer = tempfile::tempdir().unwrap();
+        let dir = artifact_data_dir(outer.path());
+        let a_sk = [0x42; 32];
+        let address = SproutPaymentAddress::from_spending_key(&a_sk);
+        let note = SproutNotePlaintext {
+            value: 1_000_000,
+            rho: [0x11; 32],
+            r: [0x22; 32],
+            memo: [0; 512],
+        };
+        let random_seed = [0x33; 32];
+        let nullifiers = [[0x44; 32], [0x55; 32]];
+        let joinsplit_pubkey = [0x66; 32];
+        let esk = [0x77; 32];
+        let h_sig = sprout::h_sig(&random_seed, &nullifiers, &joinsplit_pubkey);
+        let ciphertext =
+            sprout::encrypt_note(&esk, address.pk_enc(), &h_sig, 0, &note.to_bytes()).unwrap();
+        let commitment = sprout::note_commitment(address.a_pk(), note.value, &note.rho, &note.r);
+        let outpoint = JsOutPoint {
+            txid: [0x99; 32],
+            js_index: 0,
+            output_index: 0,
+        };
+        let mut tree = IncrementalMerkleTree::default();
+        tree.append(commitment).unwrap();
+        let witness = IncrementalWitness::from_tree(tree);
+        let mut witness_blob = vec![1];
+        witness_blob.extend_from_slice(&witness.to_bytes());
+        witness_blob.extend_from_slice(&0i32.to_le_bytes());
+        let mut keys = ImportedKeys::default();
+        keys.sprout.push(SproutKey {
+            a_sk: secrecy::Secret::new(a_sk),
+            address: address.to_bytes(),
+            provenance: Provenance::Standalone,
+            created_at: None,
+        });
+        let joinsplit = SproutJoinSplit {
+            txid: outpoint.txid,
+            js_index: 0,
+            anchor: [0; 32],
+            nullifiers,
+            commitments: [commitment, [0; 32]],
+            ephemeral_key: sprout::epk_for(&esk),
+            random_seed,
+            joinsplit_pubkey,
+            ciphertexts: [ciphertext, vec![0; 601]],
+        };
+        keys.sprout_joinsplits.push(joinsplit.clone());
+        keys.sprout_notes.push(SproutNoteData {
+            address: address.to_bytes(),
+            nullifier: None,
+            witness: witness_blob,
+            outpoint,
+        });
+        let note_nullifier = sprout::prf_nf(&a_sk, &note.rho);
+        let mut orphan_spend = joinsplit;
+        orphan_spend.txid = [0xAB; 32];
+        orphan_spend.nullifiers[0] = note_nullifier;
+        let mut scanner = argos_core::sprout_scan::SproutScanner::new(&[a_sk]);
+        scanner
+            .scan_block_at(&[orphan_spend], [0xCD; 32], 2_000_000)
+            .unwrap();
+        assert!(scanner.spent_nullifiers().contains_key(&note_nullifier));
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        argos_core::sprout_scan_run::save_checkpoint(
+            &scanner,
+            argos_core::p2p::wire::P2pNetwork::Mainnet,
+            &checkpoint,
+        )
+        .unwrap();
+
+        let recovered =
+            recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir, ScanEvidence::Offline).await;
+        assert_eq!(
+            recovered.notes.len(),
+            1,
+            "unverified cached spend reduced wallet balance"
+        );
+        assert!(recovered.spent.is_empty());
+        assert!(recovered
+            .chain_notice
+            .unwrap()
+            .contains("not verified offline"));
+    }
+
+    #[tokio::test]
+    async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {
+        let outer = tempfile::tempdir().unwrap();
+        let dir = artifact_data_dir(outer.path());
+        let a_sk = [0x51; 32];
+        let mut keys = ImportedKeys::default();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk)
+                    .to_bytes(),
+                provenance: argos_core::argos_wallet_import::keys::Provenance::Standalone,
+                created_at: None,
+            });
+        let recovered =
+            recover_with_scan(&keys, ZeckNetwork::Mainnet, &dir, ScanEvidence::Offline).await;
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let notice = recovered.chain_notice.unwrap();
+        assert!(
+            notice.contains(&checkpoint.display().to_string()),
+            "{notice}"
+        );
+        assert!(notice.contains("wallet file's own record"), "{notice}");
+        assert!(recovered.spent.is_empty());
+    }
+
     fn preview_note(value: u64, id: u8) -> argos_core::sprout_recovery::SpendableSproutNote {
         let a_sk = [0x42; 32];
         let address = argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk);
@@ -4539,6 +4661,26 @@ mod tests {
         .expect("unresolved submission must block before contacting lightwalletd")
         .expect_err("overlapping keys must not start a second sweep");
         assert!(error.to_string().contains(&txid.to_string()), "{error}");
+    }
+
+    /// sweep-sprout verifies a saved scan through the user's own peers.
+    #[test]
+    fn sweep_sprout_takes_repeatable_peers() {
+        let cli = Cli::try_parse_from([
+            "argos",
+            "sweep-sprout",
+            "--destination",
+            "zs1x",
+            "--peer",
+            "192.0.2.1:8233",
+            "--peer",
+            "node.example.org:8233",
+        ])
+        .unwrap();
+        let Commands::SweepSprout { peer, .. } = cli.command else {
+            panic!("parsed as sweep-sprout");
+        };
+        assert_eq!(peer, ["192.0.2.1:8233", "node.example.org:8233"]);
     }
 
     /// The speed-for-memory knob reaches the scanner.

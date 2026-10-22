@@ -87,8 +87,10 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     fmt: (value) => String(value),
     confirmationSourcesFromForm: () => $("confirmation-sources").value
       .split("\n").map((line) => line.trim()).filter(Boolean),
-    sproutScanPeerEntries: () => [],
-    sproutScanPeers: () => [],
+    // The scan panel's peer field; replaced by the real helpers when a test
+    // loads the scan panel.
+    sproutScanPeerEntries: () => ["192.0.2.7:8233"],
+    sproutScanPeers: () => ["192.0.2.7:8233"],
     setTimeout(callback, delay) {
       const id = nextTimerId++;
       timers.set(id, { callback, delay, cleared: false });
@@ -459,12 +461,34 @@ test("first wallet open displays its Sprout preview with reviewed authority", as
   assert.deepEqual(h.previews, [{
     reviewId: "review:/fixture/first.dat", passphrase: null, destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
-    network: "mainnet", dataDir: null, peers: [],
+    network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
   }]);
   assert.equal(h.$("wallet-sprout-sweep").hidden, false);
   assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
   assert.equal(h.$("sprout-sweep-status").textContent, "");
   assert.equal(h.$("sprout-sweep-run").disabled, true);
+});
+
+test("inspection carries no peers; the review verifies through the scan panel's", async () => {
+  const seen = {};
+  const h = harness(async (command, args, fallback) => {
+    seen[command] = { ...args };
+    if (command === "execute_wallet_sprout_sweep") return {
+      sent: [], total_swept: 0, skipped: [], rejected: [], warnings: [], error: null,
+    };
+    return fallback();
+  });
+  await h.open("/fixture/peers.dat");
+  await flush();
+  assert.equal("peers" in seen.inspect_wallet_file, false, "opening a wallet never dials");
+  assert.equal(seen.propose_wallet_sprout_sweep.reviewId, "review:/fixture/peers.dat");
+  assert.equal("path" in seen.propose_wallet_sprout_sweep, false);
+  assert.deepEqual(seen.propose_wallet_sprout_sweep.peers, ["192.0.2.7:8233"]);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  // Under #271 the reviewed proposal carries the verified notes; execute
+  // takes only its ID and no peers or other authority.
+  assert.deepEqual(Object.keys(seen.execute_wallet_sprout_sweep), ["proposalId"]);
 });
 
 test("opening another wallet previews the new review and passphrase", async () => {
@@ -474,7 +498,7 @@ test("opening another wallet previews the new review and passphrase", async () =
   assert.deepEqual(h.previews.at(-1), {
     reviewId: "review:/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
-    network: "mainnet", dataDir: null, peers: [],
+    network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
   });
   assert.equal(h.$("sprout-sweep-status").textContent, "");
 });
@@ -1243,6 +1267,90 @@ function inspected(overrides) {
 }
 const texts = (el) => el.children.map((c) => c.textContent);
 
+test("unverified checkpoint notice stays visible while wallet-file preview remains available", async () => {
+  const checkpoint = "/fixture/workspace/sprout-scan-123.checkpoint";
+  const notice = `Not using the full-block scan checkpoint at ${checkpoint}. Spent status is the wallet file's own record.`;
+  const h = harness(inspected({
+    sprout_spendable_notes: 1,
+    sprout_spendable_zatoshis: 100000,
+    sprout_accounting: [notice],
+    sprout_spent_status: "Spent status comes from this wallet file's own history.",
+  }));
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), [notice]);
+  assert.match(h.$("sprout-sweep-spent-status").textContent, /wallet file's own history/);
+  // Under #271 the review is sweepable once the irreversible box is ticked.
+  assert.equal(h.$("sprout-sweep-confirm").disabled, false);
+  h.$("sprout-sweep-confirm").checked = true;
+  h.$("sprout-sweep-confirm").dispatch("change");
+  assert.equal(h.$("sprout-sweep-run").disabled, false);
+  assert.deepEqual(h.previews.at(-1), {
+    reviewId: "review:/fixture/wallet.dat", passphrase: null, destination: "fixture-destination",
+    lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
+    network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
+  });
+});
+
+test("deep reorg notice names the preserved checkpoint and source wallet", async () => {
+  const checkpoint = "/fixture/workspace/sprout-scan-456.checkpoint";
+  const notice = `The scan checkpoint at ${checkpoint} could not be reconciled. Keep the original wallet or key for a safe full rescan.`;
+  const h = harness(inspected({
+    sprout_spendable_notes: 0,
+    sprout_spendable_zatoshis: 0,
+    sprout_nothing_left: false,
+    sprout_accounting: [notice],
+  }));
+  await h.open("/fixture/wallet.dat");
+  assert.deepEqual(texts(h.$("wallet-sprout-accounting")), [notice]);
+  assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /keep the original wallet or key/i);
+  assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /sprout-scan-456\.checkpoint/);
+});
+
+test("the review shows its verification warning and execute shows its report's", async () => {
+  const previewNotice = "Preview: checkpoint verification is unavailable; use wallet-file evidence.";
+  const executeNotice = "Execute: checkpoint changed after preview; use wallet-file evidence.";
+  const calls = [];
+  const h = harness(async (command, args, fallback) => {
+    if (command === "propose_wallet_sprout_sweep") {
+      calls.push(command);
+      return { ...(await fallback()), scan_warning: previewNotice };
+    }
+    if (command === "execute_wallet_sprout_sweep") {
+      calls.push(command);
+      return {
+        sent: [], total_swept: 0, skipped: [], rejected: [],
+        warnings: [executeNotice], error: null,
+      };
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-status").textContent, /Preview: checkpoint verification/);
+  assert.equal(h.$("sprout-sweep-confirm").disabled, false);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  assert.deepEqual(calls, ["propose_wallet_sprout_sweep", "execute_wallet_sprout_sweep"]);
+  assert.ok(texts(h.$("sprout-sweep-results")).includes(executeNotice));
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /Preview: checkpoint/);
+});
+
+test("execute displays a changed spent verdict after a spendable preview", async () => {
+  const h = harness(async (command, args, fallback) => {
+    if (command === "execute_wallet_sprout_sweep") {
+      throw new Error("nothing is left to sweep; fresh checkpoint verification found this note spent");
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat");
+  await flush();
+  assert.match(h.$("sprout-sweep-plan").textContent, /1 note\(s\)/);
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  assert.match(h.$("sprout-sweep-status").textContent, /fresh checkpoint verification found this note spent/);
+});
+
 test("a wallet that spent every Sprout note says so instead of asking for note data", async () => {
   const h = harness(inspected({
     sprout_spendable_notes: 0, sprout_spendable_zatoshis: 0, sprout_nothing_left: true,
@@ -1861,4 +1969,33 @@ test("a wallet review names a dropped forged Sprout key and stays sweepable", as
   h.$("sprout-sweep-confirm").checked = true;
   h.$("sprout-sweep-confirm").dispatch("change");
   assert.equal(h.$("sprout-sweep-run").disabled, false);
+});
+
+test("a malformed scan peer does not fail the preview; the backend warns and the sweep still refuses", async () => {
+  const seen = {};
+  const h = harness(async (command, args, fallback) => {
+    seen[command] = { ...args };
+    if (command === "propose_wallet_sprout_sweep") {
+      const response = await fallback();
+      return {
+        ...response,
+        scan_warning: "The scan panel's peers were not used: custom peer \"no-port-here\" is not valid.",
+      };
+    }
+    return fallback();
+  });
+  h.loadScanPanel();
+  h.$("sprout-scan-peers").value = "192.0.2.7:8233, no-port-here";
+  await h.open("/fixture/bad-peer.dat");
+  await flush();
+  // The raw entries reach the backend, which decides how to degrade.
+  assert.deepEqual([...seen.propose_wallet_sprout_sweep.peers], ["192.0.2.7:8233", "no-port-here"]);
+  assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
+  assert.match(h.$("sprout-sweep-status").textContent, /peers were not used/);
+  // Sweeping with the same field refuses before anything is sent.
+  h.$("sprout-destination").value = "fixture-destination";
+  await h.sweepConfirmed();
+  await flush();
+  assert.equal("execute_wallet_sprout_sweep" in seen, false);
+  assert.match(h.$("sprout-sweep-status").textContent, /no-port-here.*host:port/);
 });
