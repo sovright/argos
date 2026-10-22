@@ -586,6 +586,9 @@ struct ReviewedSweepIntent {
     quoted_transactions: Vec<ProposedTx>,
     quoted_proposal: Option<SweepProposal>,
     quoted_inputs: Vec<CanonicalLegInputs>,
+    /// Total fee of the quote the user reviewed. Set only by binding the
+    /// service's own quote; no caller input reaches it.
+    reviewed_fee_zatoshis: Option<u64>,
     /// Per-leg fees of the plan the user reviewed, captured at propose time.
     /// Execution compares each leg it actually builds against these, never
     /// against a fee recomputed from the execute-time plan.
@@ -593,8 +596,7 @@ struct ReviewedSweepIntent {
 }
 
 impl ReviewedSweepIntent {
-    fn capture(mut request: SweepRequest, session: &ScanSession, progress: &ScanProgress) -> Self {
-        request.reviewed_fee_zatoshis = None;
+    fn capture(request: SweepRequest, session: &ScanSession, progress: &ScanProgress) -> Self {
         Self {
             request,
             snapshot: SweepBalanceSnapshot::capture(session, progress),
@@ -602,6 +604,7 @@ impl ReviewedSweepIntent {
             quoted_transactions: Vec::new(),
             quoted_proposal: None,
             quoted_inputs: Vec::new(),
+            reviewed_fee_zatoshis: None,
             reviewed_leg_fees: None,
         }
     }
@@ -619,7 +622,7 @@ impl ReviewedSweepIntent {
     }
 
     fn bind_quote(&mut self, proposal: &SweepProposal) {
-        self.request.reviewed_fee_zatoshis = Some(proposal.total_fee_zatoshis);
+        self.reviewed_fee_zatoshis = Some(proposal.total_fee_zatoshis);
         self.request
             .max_fee_zatoshis
             .get_or_insert(proposal.total_fee_zatoshis);
@@ -629,7 +632,6 @@ impl ReviewedSweepIntent {
 
     fn require_current_fee(&self, current_fee_zatoshis: u64) -> ZeckResult<()> {
         let reviewed = self
-            .request
             .reviewed_fee_zatoshis
             .ok_or_else(|| ZeckError::StaleSweepProposal("reviewed fee is missing".to_owned()))?;
         if reviewed != current_fee_zatoshis {
@@ -1184,7 +1186,7 @@ impl RecoveryService {
     pub async fn propose_sweep(
         &self,
         handle: &ScanHandle,
-        mut request: SweepRequest,
+        request: SweepRequest,
     ) -> ZeckResult<ReviewedSweepProposal> {
         let session = self.session(handle).await?;
         let _workspace_guard = self
@@ -1299,7 +1301,6 @@ impl RecoveryService {
         }
 
         refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
-        request.reviewed_fee_zatoshis = None;
         let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
         let mut plan = build_exact_sweep_proposal(
             &progress,
@@ -4284,7 +4285,6 @@ mod tests {
             max_fee_zatoshis: Some(20_000),
             donation_rate: Some(0.10),
             donor_email: Some("reviewed@example.com".to_owned()),
-            reviewed_fee_zatoshis: None,
         }
     }
 
@@ -4331,10 +4331,17 @@ mod tests {
         let handle = ScanHandle::new();
         let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
         let progress = reviewed_progress(handle);
-        let mut request = reviewed_request();
-        request.reviewed_fee_zatoshis = Some(1);
+        // A frontend that still sends the old field cannot seed the fee the
+        // service compares execution against: the request has no such field.
+        let mut json = serde_json::to_value(reviewed_request()).unwrap();
+        json["reviewed_fee_zatoshis"] = serde_json::json!(1);
+        let request: SweepRequest = serde_json::from_value(json).unwrap();
+        assert!(serde_json::to_value(&request)
+            .unwrap()
+            .get("reviewed_fee_zatoshis")
+            .is_none());
         let intent = ReviewedSweepIntent::capture(request, &session, &progress);
-        assert_eq!(intent.request.reviewed_fee_zatoshis, None);
+        assert_eq!(intent.reviewed_fee_zatoshis, None);
     }
 
     #[test]
@@ -4344,7 +4351,6 @@ mod tests {
         let progress = reviewed_progress(handle);
         let mut request = reviewed_request();
         request.max_fee_zatoshis = None;
-        request.reviewed_fee_zatoshis = Some(1);
         let mut intent = ReviewedSweepIntent::capture(request, &session, &progress);
         let quote = super::SweepProposal {
             transactions: vec![],
@@ -4360,7 +4366,7 @@ mod tests {
             confirmation_notice: None,
         };
         intent.bind_quote(&quote);
-        assert_eq!(intent.request.reviewed_fee_zatoshis, Some(25_000));
+        assert_eq!(intent.reviewed_fee_zatoshis, Some(25_000));
         assert_eq!(intent.request.max_fee_zatoshis, Some(25_000));
     }
 
@@ -4370,7 +4376,7 @@ mod tests {
         let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
         let progress = reviewed_progress(handle);
         let mut intent = ReviewedSweepIntent::capture(reviewed_request(), &session, &progress);
-        intent.request.reviewed_fee_zatoshis = Some(25_000);
+        intent.reviewed_fee_zatoshis = Some(25_000);
         let id = SweepProposalId("fee-review".to_owned());
         let mut store = ReviewedSweepStore::default();
         store.insert(id.clone(), intent);
@@ -4867,7 +4873,6 @@ mod tests {
                 destination: derived_destination(),
                 memo: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: Some(1),
                 donation_rate: None,
                 donor_email: None,
             },
@@ -5241,7 +5246,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -5285,7 +5289,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: Some("donor@example.com".to_owned()),
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -5337,7 +5340,6 @@ mod tests {
             max_fee_zatoshis: None,
             donation_rate: None,
             donor_email: None,
-            reviewed_fee_zatoshis: None,
         };
         let given = build_sweep_proposal(
             &progress_with_account(seedless_test_account()),
@@ -5395,7 +5397,6 @@ mod tests {
                 max_fee_zatoshis: Some(real_fee),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -5436,7 +5437,6 @@ mod tests {
                 max_fee_zatoshis: Some(1),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -5457,7 +5457,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -5483,7 +5482,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -5507,7 +5505,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -5549,7 +5546,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
         )
@@ -5579,7 +5575,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Testnet,
             DONATION_TEST_UA,
@@ -5611,7 +5606,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -5650,7 +5644,6 @@ mod tests {
                 max_fee_zatoshis: Some(9_999),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -6085,7 +6078,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "",
@@ -6235,7 +6227,6 @@ mod tests {
                 max_fee_zatoshis: Some(45_000),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Testnet,
             &[0],
@@ -6282,7 +6273,6 @@ mod tests {
                 max_fee_zatoshis: Some(15_000),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Testnet,
             &[0],
@@ -6363,7 +6353,6 @@ mod tests {
             max_fee_zatoshis: None,
             donation_rate: None,
             donor_email: None,
-            reviewed_fee_zatoshis: None,
         };
         let proposal = super::build_combined_sweep_proposal(
             &state.progress,
@@ -6504,7 +6493,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -6550,7 +6538,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.0),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -6583,7 +6570,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: Some("donor@example.com".to_owned()),
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             "", // address blanked
@@ -6602,7 +6588,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(1.5),
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -6626,7 +6611,6 @@ mod tests {
                 max_fee_zatoshis: None,
                 donation_rate: Some(0.10),
                 donor_email: Some("notanemail".to_owned()),
-                reviewed_fee_zatoshis: None,
             },
             ZeckNetwork::Mainnet,
             DONATION_TEST_UA,
@@ -6723,7 +6707,6 @@ mod propose_workspace_guard_tests {
             max_fee_zatoshis: None,
             donation_rate: None,
             donor_email: None,
-            reviewed_fee_zatoshis: None,
         }
     }
 
@@ -8639,7 +8622,6 @@ pub(crate) mod leg_fee_pin_tests {
                 destination: "u-test".to_owned(),
                 memo: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
             },

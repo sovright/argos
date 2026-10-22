@@ -2578,7 +2578,6 @@ async fn main() -> Result<()> {
                 destination: destination.clone(),
                 memo: memo.clone(),
                 max_fee_zatoshis: max_fee,
-                reviewed_fee_zatoshis: None,
                 donation_rate,
                 donor_email,
             };

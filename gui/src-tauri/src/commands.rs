@@ -979,7 +979,6 @@ pub async fn propose_sweep(
                 destination,
                 memo,
                 max_fee_zatoshis,
-                reviewed_fee_zatoshis: None,
                 donation_rate,
                 donor_email,
             },

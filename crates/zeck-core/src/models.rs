@@ -455,10 +455,6 @@ pub struct SweepRequest {
     /// service binds `None` to the exact reviewed proposal total before
     /// issuing the one-shot proposal ID.
     pub max_fee_zatoshis: Option<u64>,
-    /// Informational input only. The service replaces this with its own
-    /// proposal fee before storing a one-shot reviewed intent.
-    #[serde(default)]
-    pub reviewed_fee_zatoshis: Option<u64>,
     /// Fraction of each account's send amount to donate (e.g. 0.10). `None`
     /// skips the donation entirely. Validated to 0.0..1.0.
     #[serde(default)]

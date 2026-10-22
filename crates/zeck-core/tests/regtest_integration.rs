@@ -161,7 +161,6 @@ async fn local_public_transparent_review_binds_live_outpoint_before_submission()
                 destination,
                 memo: None,
                 max_fee_zatoshis: Some(100_000),
-                reviewed_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
             },
@@ -747,7 +746,6 @@ async fn dropped_response_sweep(
                 max_fee_zatoshis: Some(100_000),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -953,7 +951,6 @@ async fn hostile_primary_height_with_secondary_disagreement_is_not_mined() {
                 max_fee_zatoshis: Some(100_000),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -3027,7 +3024,6 @@ async fn workspace_deleted_between_scan_and_sweep_surfaces_clean_error() {
         max_fee_zatoshis: None,
         donation_rate: None,
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
 
     let result = fixture
@@ -3086,7 +3082,6 @@ async fn deleting_only_the_wallet_db_surfaces_a_clean_error() {
         max_fee_zatoshis: None,
         donation_rate: None,
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
 
     let result = fixture
@@ -3147,7 +3142,6 @@ async fn workspace_permissions_tampered_surfaces_clean_error() {
         max_fee_zatoshis: None,
         donation_rate: None,
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
 
     let result = fixture
@@ -3206,7 +3200,6 @@ async fn sweep_places_a_donation_output_when_rate_is_set() {
         max_fee_zatoshis: None,
         donation_rate: Some(0.10),
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
     let reviewed = fixture
         .service
@@ -3259,7 +3252,6 @@ async fn reviewed_proposal_cannot_be_replayed_after_execution() {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -3648,7 +3640,6 @@ async fn post_ironwood_sweep_is_accepted_by_the_node() {
                 max_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -4083,7 +4074,6 @@ async fn an_imported_sapling_key_can_be_spent_via_pczt() {
                 donation_rate: None,
                 donor_email: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: None,
             },
         )
         .await
@@ -4259,7 +4249,6 @@ async fn address_match_index_997_recovers_and_sweeps_funded_utxos() {
         max_fee_zatoshis: Some(100_000),
         donation_rate: None,
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
     let reviewed = service
         .propose_sweep(&handle, request)
@@ -4456,7 +4445,6 @@ async fn internal_sapling_match_recovers_and_sweeps_mined_note() {
         max_fee_zatoshis: Some(100_000),
         donation_rate: None,
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
     let reviewed = service.propose_sweep(&handle, request).await.unwrap();
     let mining = tokio::spawn(async {
@@ -4579,7 +4567,6 @@ async fn imported_multi_action_quote_matches_built_transaction_fee() {
                 destination: regtest_encoded_unified_address_at(harness.test_seed(), 3),
                 memo: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: Some(1), // service must ignore caller-supplied fee
                 donation_rate: None,
                 donor_email: None,
             },
@@ -4636,7 +4623,6 @@ async fn multi_note_shielded_quote_uses_real_zip317_fee() {
                 destination: fixture.destination_ua,
                 memo: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: Some(1), // ignored; the wallet proposal supplies the fee
                 donation_rate: None,
                 donor_email: None,
             },
@@ -4750,7 +4736,6 @@ async fn ironwood_only_hd_account_quotes_real_send_max() {
                 destination: regtest_encoded_unified_address_at(harness.test_seed(), 6),
                 memo: None,
                 max_fee_zatoshis: None,
-                reviewed_fee_zatoshis: None,
                 donation_rate: None,
                 donor_email: None,
             },
@@ -4918,7 +4903,6 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
         max_fee_zatoshis: Some(100_000),
         donation_rate: None,
         donor_email: None,
-        reviewed_fee_zatoshis: None,
     };
     let reviewed = resumed
         .propose_sweep(&resumed_handle, request)
@@ -5015,7 +4999,6 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
                 max_fee_zatoshis: Some(100_000),
                 donation_rate: None,
                 donor_email: None,
-                reviewed_fee_zatoshis: None,
             },
         )
         .await
