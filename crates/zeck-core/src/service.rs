@@ -757,6 +757,23 @@ tokio::task_local! {
     static DIRECT_LEG_CHAIN: (u32, Vec<crate::transparent_recovery::TransparentUtxo>);
 }
 
+#[cfg(any(test, feature = "argos-network"))]
+tokio::task_local! {
+    /// A fixed pause between per-account broadcasts. Set only by
+    /// `execute_sweep_with_test_pause`, so the R-S29 crash test
+    /// (`argos-sweep-helper`) can SIGKILL in the gap deterministically.
+    static PAUSE_BETWEEN_BROADCASTS: std::time::Duration;
+}
+
+/// A no-op in released builds; inside `PAUSE_BETWEEN_BROADCASTS.scope` it
+/// sleeps for the scoped duration.
+async fn pause_between_broadcasts() {
+    #[cfg(any(test, feature = "argos-network"))]
+    if let Ok(pause) = PAUSE_BETWEEN_BROADCASTS.try_with(|pause| *pause) {
+        tokio::time::sleep(pause).await;
+    }
+}
+
 /// Store a reviewed intent and issue its id, but only if `current` scan state
 /// still matches the state it was reviewed against. Proposal construction
 /// can read a wallet and take time; a progress refresh during that work must
@@ -1340,7 +1357,7 @@ impl RecoveryService {
         handle: &ScanHandle,
         proposal_id: &SweepProposalId,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, proposal_id, None).await
+        self.execute_sweep_inner(handle, proposal_id).await
     }
 
     /// Refresh every historical broadcast receipt for an active recovery
@@ -1492,8 +1509,7 @@ impl RecoveryService {
     /// Test-only sweep entrypoint that inserts a fixed pause between
     /// per-account broadcasts. Exists so R-S29 (`argos-sweep-helper`) can
     /// SIGKILL the subprocess deterministically in the gap between two
-    /// broadcasts; production builds compile this method out so the
-    /// pause-duration field is unreachable from any released binary.
+    /// broadcasts; production builds compile this method and the hook out.
     #[cfg(feature = "argos-network")]
     pub async fn execute_sweep_with_test_pause(
         &self,
@@ -1501,7 +1517,11 @@ impl RecoveryService {
         proposal_id: &SweepProposalId,
         pause_between_broadcasts: std::time::Duration,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, proposal_id, Some(pause_between_broadcasts))
+        PAUSE_BETWEEN_BROADCASTS
+            .scope(
+                pause_between_broadcasts,
+                self.execute_sweep_inner(handle, proposal_id),
+            )
             .await
     }
 
@@ -1509,7 +1529,6 @@ impl RecoveryService {
         &self,
         handle: &ScanHandle,
         proposal_id: &SweepProposalId,
-        pause_between_broadcasts: Option<std::time::Duration>,
     ) -> ZeckResult<SweepOutcome> {
         let session = self.session(handle).await?;
         let _workspace_guard = self
@@ -1557,9 +1576,7 @@ impl RecoveryService {
                 "workspace removal was interrupted; retry cleanup before sweeping".to_owned(),
             ));
         }
-        let outcome = self
-            .execute_sweep_locked(session, proposal_id, pause_between_broadcasts)
-            .await;
+        let outcome = self.execute_sweep_locked(session, proposal_id).await;
         if let Ok(ref completed) = outcome {
             self.last_sweep_outcomes
                 .lock()
@@ -1573,7 +1590,6 @@ impl RecoveryService {
         &self,
         session: SharedScanSession,
         proposal_id: &SweepProposalId,
-        pause_between_broadcasts: Option<std::time::Duration>,
     ) -> ZeckResult<SweepOutcome> {
         // The token is consumed while holding only the in-memory store lock.
         // No wallet, proving, or network operation runs under this lock.
@@ -1799,7 +1815,6 @@ impl RecoveryService {
             let hd_outcome = execute_sweep_for_session(
                 session,
                 request,
-                pause_between_broadcasts,
                 imported_fee,
                 quoted_transactions,
                 quoted_skipped,
@@ -1814,7 +1829,6 @@ impl RecoveryService {
         execute_sweep_for_session(
             session,
             request,
-            pause_between_broadcasts,
             0,
             quoted_transactions,
             quoted_skipped,
@@ -2892,11 +2906,6 @@ fn partition_mixed_spend_authorities(
 async fn execute_sweep_for_session(
     session: SharedScanSession,
     request: SweepRequest,
-    // Test-only knob threaded through from `execute_sweep_with_test_pause`.
-    // Production callers pass None and the per-account loop runs at full
-    // speed. Threaded as `Option<Duration>` rather than gated behind cfg so
-    // the function signature stays stable across feature configurations.
-    pause_between_broadcasts: Option<std::time::Duration>,
     initial_fee_zatoshis: u64,
     quoted_transactions: Vec<ProposedTx>,
     quoted_skipped: Vec<SkippedSweepAccount>,
@@ -2986,12 +2995,8 @@ async fn execute_sweep_for_session(
     let sweep_result: ZeckResult<()> = async {
         for (position, (tracked_account, zip32_index, leg)) in hd_legs.into_iter().enumerate() {
             if position > 0 {
-                // R-S29 hook: pause between broadcasts so the test parent can
-                // SIGKILL the helper deterministically in the gap. Always None
-                // in production.
-                if let Some(d) = pause_between_broadcasts {
-                    tokio::time::sleep(d).await;
-                }
+                // R-S29 hook: a no-op outside execute_sweep_with_test_pause.
+                pause_between_broadcasts().await;
             }
             let usk =
                 UnifiedSpendingKey::from_seed(&network, &seed, zip32_index).map_err(|err| {
@@ -4411,6 +4416,24 @@ mod tests {
             note: String::new(),
             memo: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_pause_applies_only_inside_its_scope() {
+        let start = tokio::time::Instant::now();
+        super::pause_between_broadcasts().await;
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::ZERO,
+            "production has no pause"
+        );
+        super::PAUSE_BETWEEN_BROADCASTS
+            .scope(
+                std::time::Duration::from_secs(5),
+                super::pause_between_broadcasts(),
+            )
+            .await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
     }
 
     #[test]
