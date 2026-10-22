@@ -105,6 +105,7 @@ jobs:
           cargo test -p argos-core workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core workspace::tests::listing_wallet_connection_is_immutable_and_query_only --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core workspace::tests::listing_reads_an_initialized_trusted_workspace_without_mutation --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core workspace::tests::private_workspace_file_authority_publishes_inside_verified_workspace --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core service::propose_workspace_guard_tests::restart_restores_tombstone_and_requires_new_scan_before_deletion --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation --target x86_64-pc-windows-msvc -- --exact
@@ -124,6 +125,8 @@ jobs:
           $tests = @(
             'private_fs::tests::fresh_absent_artifact_data_dir_is_published_as_authenticated_container'
             'private_fs::tests::windows_authenticated_container_and_root_reopen_and_enumerate'
+            'private_fs::tests::windows_artifact_container_recovers_pending_before_publish'
+            'private_fs::tests::windows_artifact_container_registry_prevents_rollback_or_remint'
             'private_fs::tests::preexisting_unmarked_artifact_data_dir_is_refused_unchanged'
             'private_fs::tests::fresh_private_artifact_root_binds_every_precreated_authority_object'
             'private_fs::tests::unmarked_private_artifact_root_is_refused_without_mutation'
