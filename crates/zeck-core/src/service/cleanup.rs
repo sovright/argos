@@ -718,6 +718,14 @@ impl RecoveryService {
                     workspace_root.display()
                 )));
             }
+            // Opening the global registry imports and retains the legacy
+            // workspace-local journal so its receipts can be authenticated
+            // above. Keep that lock until the reviewed workspace has been
+            // revoked and renamed, then release the self-held SQLite source
+            // before recursive removal: Windows correctly refuses to remove
+            // an open SQLite child. The network operation lock and retained
+            // directory handle continue to pin the registry and exact object.
+            drop(broadcast_log);
             if let Err(err) =
                 cleanup_authority.remove_retained_workspace_all(&tombstone, &retained_workspace)
             {
