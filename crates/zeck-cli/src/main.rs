@@ -3282,6 +3282,9 @@ fn sweep_status_label(status: argos_core::TxLifecycleState) -> &'static str {
         }
         State::Pending => "Broadcast — awaiting independent confirmation.",
         State::Mined => "Mined — independently confirmed.",
+        State::MinedSingleSource => {
+            "Mined — reported by one confirmation operator. Keep the source until an independent source confirms."
+        }
         State::Expired => "Expired — rescan before rebuilding.",
         State::Rejected => "Rejected by the node.",
     }

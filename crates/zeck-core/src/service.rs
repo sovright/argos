@@ -47,7 +47,7 @@ use crate::{
     address::validate_destination_address,
     broadcast::{
         submit_prepared_transaction, BroadcastStore, DurableBroadcastLog, LightwalletdSubmitter,
-        PreparedTransaction, TxObservation, TxObservationState, TxObserver,
+        PreparedTransaction, TxObservationState, TxObserver,
     },
     derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
     error::{ZeckError, ZeckResult},
@@ -1803,6 +1803,7 @@ impl RecoveryService {
                     transaction.status = updated.status;
                     transaction.confirmed_height = updated.confirmed_height;
                     transaction.detail = updated.detail.clone();
+                    transaction.safe_to_discard = updated.safe_to_discard;
                 }
             }
         }
@@ -2381,7 +2382,7 @@ impl RecoveryService {
             let observation = observer
                 .observe(session.runtime.network, txid, record.prepared.expiry_height)
                 .await?;
-            record_confirmation_observation(&mut broadcast_log, txid, &observation)?;
+            crate::reconciliation::record_observation(&mut broadcast_log, txid, &observation)?;
             if !observation.has_canonical_mined_evidence() {
                 return Err(ZeckError::Broadcast(format!(
                     "cannot delete workspace: transaction {txid} lacks fresh canonical mining evidence"
@@ -3134,10 +3135,8 @@ async fn attach_direct_sweep_leg(
         fixture
     } else {
         let (mut client, _endpoint, info) =
-            crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(
-                &runtime.lightwalletd_url,
-            )
-            .await?;
+            crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(&runtime.lightwalletd_url)
+                .await?;
         validate_lightwalletd_network(runtime.network, &info)?;
         let tip = u32::try_from(info.block_height)
             .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
@@ -3555,7 +3554,10 @@ async fn execute_sweep_for_session(
         &runtime.data_dir,
         runtime.network,
     )?)?;
-    if let Some(txid) = broadcast_log.blocking_submission() {
+    // The execution-start gate refused unresolved history from earlier
+    // reviews. Imported legs of this same execution may already be Pending;
+    // only an unknown outcome stops the HD legs.
+    if let Some(txid) = broadcast_log.blocking_next_leg() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep leg"
         )));
@@ -4324,7 +4326,9 @@ async fn broadcast_transactions(
 ) -> ZeckResult<()> {
     use rusqlite::OptionalExtension;
 
-    if let Some(txid) = log.blocking_submission() {
+    // An earlier leg of this execution that was accepted (Pending) does not
+    // stop this one: it spends disjoint reviewed inputs.
+    if let Some(txid) = log.blocking_next_leg() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before another submission"
         )));
@@ -4412,6 +4416,7 @@ async fn broadcast_transactions(
                     .unwrap_or_default()
             ),
             confirmed_height: None,
+            safe_to_discard: false,
         });
         if submission.state.fee_is_at_risk() {
             batch_fee_zatoshis = checked_fee_total(batch_fee_zatoshis, fee_zatoshis)?;
@@ -4429,7 +4434,7 @@ async fn broadcast_transactions(
         }
 
         let mut observer = LightwalletdTxObserver::new(lightwalletd_url, confirmation_sources)?;
-        let (status, detail, confirmed_height) = wait_for_confirmation(
+        let confirmation = wait_for_confirmation(
             wallet_db,
             log,
             &mut observer,
@@ -4440,9 +4445,10 @@ async fn broadcast_transactions(
         )
         .await?;
         let entry = &mut results[result_index];
-        entry.status = status;
-        entry.detail = detail;
-        entry.confirmed_height = confirmed_height;
+        entry.status = confirmation.state;
+        entry.detail = confirmation.detail;
+        entry.confirmed_height = confirmation.confirmed_height;
+        entry.safe_to_discard = confirmation.safe_to_discard;
     }
 
     Ok(())
@@ -4454,35 +4460,9 @@ fn is_distinct_lightwalletd_endpoint(candidate: &str, primary: &str) -> bool {
         != crate::lightwalletd::normalized_endpoint_authority(primary).ok()
 }
 
-fn record_confirmation_observation(
-    log: &mut impl BroadcastStore,
-    txid: TxId,
-    observation: &TxObservation,
-) -> ZeckResult<TxLifecycleState> {
-    let previous = log
-        .latest(txid)
-        .ok_or_else(|| ZeckError::Storage(format!("missing prepared transaction {txid}")))?
-        .state;
-    let state = if observation.state == TxObservationState::Mined {
-        TxLifecycleState::Mined
-    } else if observation.is_expired() {
-        TxLifecycleState::Expired
-    } else if matches!(
-        previous,
-        TxLifecycleState::NotSubmitted | TxLifecycleState::SubmissionUnknown
-    ) && observation.state != TxObservationState::PresentUnmined
-    {
-        // Absence, disagreement, and an unavailable server say nothing about
-        // whether an ambiguous send reached the network. Keep exact bytes
-        // eligible for reconciliation.
-        return Ok(previous);
-    } else {
-        TxLifecycleState::Pending
-    };
-    log.transition(txid, state, None, Some(observation))?;
-    Ok(state)
-}
-
+/// Poll a submitted transaction until it mines (by any configured operator),
+/// expires, or the polling budget runs out. Returns the lifecycle state, a
+/// detail line, the mined height, and whether it is safe to discard the source.
 async fn wait_for_confirmation<O: TxObserver>(
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
@@ -4496,15 +4476,24 @@ async fn wait_for_confirmation<O: TxObserver>(
     txid: TxId,
     expiry_height: Option<u32>,
     label: &str,
-) -> ZeckResult<(TxLifecycleState, String, Option<u32>)> {
+) -> ZeckResult<ConfirmationResult> {
     let mut last_state = TxObservationState::Unavailable;
     for attempt in 0..CONFIRMATION_POLL_ATTEMPTS {
         let observation = observer.observe(network, txid, expiry_height).await?;
         last_state = observation.state.clone();
-        let state = record_confirmation_observation(log, txid, &observation)?;
-        if state == TxLifecycleState::Mined {
-            let height = observation.mined_height.ok_or_else(|| {
-                ZeckError::Broadcast(format!("canonical evidence for {txid} has no height"))
+        let state = crate::reconciliation::record_observation(log, txid, &observation)?;
+        if state.is_mined() {
+            let evidence = if observation.state_is_mined() {
+                observation
+            } else {
+                log.latest(txid)
+                    .and_then(|record| record.observation)
+                    .ok_or_else(|| {
+                        ZeckError::Broadcast(format!("mined record {txid} has no evidence"))
+                    })?
+            };
+            let height = evidence.mined_height.ok_or_else(|| {
+                ZeckError::Broadcast(format!("mining evidence for {txid} has no height"))
             })?;
             wallet_db
                 .set_transaction_status(
@@ -4516,18 +4505,31 @@ async fn wait_for_confirmation<O: TxObserver>(
                         "marking mined transaction {txid} in wallet db: {err}"
                     ))
                 })?;
-            return Ok((
+            let safe_to_discard = state == TxLifecycleState::Mined && evidence.is_safe_to_discard();
+            return Ok(ConfirmationResult {
                 state,
-                format!("{label} transaction canonically mined at height {height} with matching independent block evidence."),
-                Some(height),
-            ));
+                detail: format!(
+                    "{label}: {}",
+                    crate::reconciliation::lifecycle_detail(
+                        state,
+                        &evidence.state,
+                        Some(height),
+                        safe_to_discard
+                    )
+                ),
+                confirmed_height: Some(height),
+                safe_to_discard,
+            });
         }
         if state == TxLifecycleState::Expired {
-            return Ok((
+            return Ok(ConfirmationResult {
                 state,
-                format!("{label} transaction expired with independent absence beyond its expiry height."),
-                None,
-            ));
+                detail: format!(
+                    "{label} transaction expired: reported absent from chain and mempool past its expiry height."
+                ),
+                confirmed_height: None,
+                safe_to_discard: false,
+            });
         }
         if attempt + 1 < CONFIRMATION_POLL_ATTEMPTS {
             tokio::time::sleep(Duration::from_secs(CONFIRMATION_POLL_INTERVAL_SECS)).await;
@@ -4543,10 +4545,22 @@ async fn wait_for_confirmation<O: TxObserver>(
         )
     } else {
         format!(
-            "{label} transaction is pending ({last_state:?}); independent confirmation is unavailable."
+            "{label} transaction is pending ({last_state:?}); mining evidence is not yet available."
         )
     };
-    Ok((state, detail, None))
+    Ok(ConfirmationResult {
+        state,
+        detail,
+        confirmed_height: None,
+        safe_to_discard: false,
+    })
+}
+
+struct ConfirmationResult {
+    state: TxLifecycleState,
+    detail: String,
+    confirmed_height: Option<u32>,
+    safe_to_discard: bool,
 }
 
 async fn chain_tip_height(
@@ -4856,8 +4870,8 @@ mod tests {
 
     use super::{
         build_seedless_sweep_proposal, build_sweep_proposal, is_distinct_lightwalletd_endpoint,
-        record_confirmation_observation, standalone_transparent_signing_keys, ReviewedSweepIntent,
-        ReviewedSweepStore, ScanSession, SweepBalanceSnapshot, MAX_REVIEWED_SWEEPS,
+        standalone_transparent_signing_keys, ReviewedSweepIntent, ReviewedSweepStore, ScanSession,
+        SweepBalanceSnapshot, MAX_REVIEWED_SWEEPS,
     };
     use crate::{
         broadcast::{
@@ -4895,7 +4909,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_one_source_remains_pending_in_durable_log() {
+    fn confirmation_one_source_is_mined_single_source_in_durable_log() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
         let txid = zcash_primitives::transaction::TxId::from_bytes([42; 32]);
@@ -4932,15 +4946,23 @@ mod tests {
             }],
             Some(130),
         );
-        assert_eq!(observation.state, TxObservationState::Unavailable);
-        let state = record_confirmation_observation(&mut log, txid, &observation).unwrap();
-        assert_eq!(state, crate::models::TxLifecycleState::Pending);
+        assert_eq!(observation.state, TxObservationState::MinedSingleSource);
+        let state =
+            crate::reconciliation::record_observation(&mut log, txid, &observation).unwrap();
+        assert_eq!(state, crate::models::TxLifecycleState::MinedSingleSource);
         drop(log);
         let reopened = DurableBroadcastLog::open(&path).unwrap();
         assert_eq!(
             reopened.latest(txid).unwrap().observation,
             Some(observation)
         );
+        assert_eq!(
+            reopened.latest(txid).unwrap().state,
+            crate::models::TxLifecycleState::MinedSingleSource
+        );
+        // Resolved for a new review, but never counted as corroborated.
+        assert!(!reopened.has_unresolved_history());
+        assert!(reopened.mined_records().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4981,7 +5003,12 @@ mod tests {
                 crate::workspace::consensus_network(ZeckNetwork::Testnet),
             )
             .unwrap();
-            let (reported, detail, height) = super::wait_for_confirmation(
+            let super::ConfirmationResult {
+                state: reported,
+                detail,
+                confirmed_height: height,
+                ..
+            } = super::wait_for_confirmation(
                 &mut wallet_db,
                 &mut log,
                 &mut observer,
@@ -5003,7 +5030,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_independent_absence_only_expires_after_deadline() {
+    fn confirmation_absence_only_expires_past_the_margin() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
         let txid = zcash_primitives::transaction::TxId::from_bytes([43; 32]);
@@ -5037,16 +5064,16 @@ mod tests {
             block_hash: None,
             tx_in_block: false,
         };
-        let pending =
-            observe_transaction(vec![evidence("one", 130), evidence("two", 131)], Some(130));
+        let margin = crate::broadcast::EXPIRY_MARGIN_BLOCKS;
+        let pending = observe_transaction(vec![evidence("one", 130 + margin)], Some(130));
         assert_eq!(
-            record_confirmation_observation(&mut log, txid, &pending).unwrap(),
+            crate::reconciliation::record_observation(&mut log, txid, &pending).unwrap(),
             crate::models::TxLifecycleState::Pending
         );
-        let expired =
-            observe_transaction(vec![evidence("one", 131), evidence("two", 131)], Some(130));
+        // One configured source past expiry + margin is enough.
+        let expired = observe_transaction(vec![evidence("one", 131 + margin)], Some(130));
         assert_eq!(
-            record_confirmation_observation(&mut log, txid, &expired).unwrap(),
+            crate::reconciliation::record_observation(&mut log, txid, &expired).unwrap(),
             crate::models::TxLifecycleState::Expired
         );
     }
@@ -5087,7 +5114,7 @@ mod tests {
         );
         assert_eq!(mined.state, TxObservationState::Mined);
         assert_eq!(
-            record_confirmation_observation(&mut log, txid, &mined).unwrap(),
+            crate::reconciliation::record_observation(&mut log, txid, &mined).unwrap(),
             crate::models::TxLifecycleState::Mined
         );
         let mempool = observe_transaction(
@@ -5106,26 +5133,24 @@ mod tests {
         );
         assert_eq!(mempool.state, TxObservationState::PresentUnmined);
         assert_eq!(
-            record_confirmation_observation(&mut log, txid, &mempool).unwrap(),
+            crate::reconciliation::record_observation(&mut log, txid, &mempool).unwrap(),
             crate::models::TxLifecycleState::Pending
         );
         assert_eq!(
-            record_confirmation_observation(&mut log, txid, &mined).unwrap(),
+            crate::reconciliation::record_observation(&mut log, txid, &mined).unwrap(),
             crate::models::TxLifecycleState::Mined
         );
+        // A timeout is not reorg evidence: the record stays Mined.
         let unavailable = observe_transaction(vec![], Some(130));
         assert_eq!(unavailable.state, TxObservationState::Unavailable);
         assert_eq!(
-            record_confirmation_observation(&mut log, txid, &unavailable).unwrap(),
-            crate::models::TxLifecycleState::Pending
+            crate::reconciliation::record_observation(&mut log, txid, &unavailable).unwrap(),
+            crate::models::TxLifecycleState::Mined
         );
         drop(log);
         let reopened = DurableBroadcastLog::open(&path).unwrap();
-        assert_eq!(reopened.blocking_submission(), Some(txid));
-        assert_eq!(
-            reopened.latest(txid).unwrap().observation,
-            Some(unavailable)
-        );
+        assert_eq!(reopened.blocking_submission(), None);
+        assert_eq!(reopened.latest(txid).unwrap().observation, Some(mined));
     }
 
     #[test]
@@ -5171,7 +5196,7 @@ mod tests {
         );
         assert_eq!(observation.state, TxObservationState::Absent);
         assert_eq!(
-            record_confirmation_observation(&mut log, txid, &observation).unwrap(),
+            crate::reconciliation::record_observation(&mut log, txid, &observation).unwrap(),
             crate::models::TxLifecycleState::SubmissionUnknown
         );
         drop(log);
@@ -6621,6 +6646,7 @@ mod tests {
             fee_zatoshis: 0,
             detail: "mined".to_owned(),
             confirmed_height: Some(1_000_000),
+            safe_to_discard: false,
         }
     }
 
@@ -6636,6 +6662,7 @@ mod tests {
             fee_zatoshis: 10_000,
             detail: detail.to_owned(),
             confirmed_height: None,
+            safe_to_discard: false,
         }
     }
 
@@ -6865,6 +6892,7 @@ mod tests {
                 fee_zatoshis: 0,
                 detail: String::new(),
                 confirmed_height: None,
+                safe_to_discard: false,
             }],
             skipped_accounts: Vec::new(),
             total_donation_zatoshis: 0,
@@ -6894,6 +6922,7 @@ mod tests {
                 fee_zatoshis: 0,
                 detail: "imported Sapling".into(),
                 confirmed_height: None,
+                safe_to_discard: false,
             }],
             skipped_accounts: Vec::new(),
             total_donation_zatoshis: 0,
@@ -7763,7 +7792,7 @@ mod propose_workspace_guard_tests {
     }
 
     #[tokio::test]
-    async fn partial_reconciliation_error_invalidates_old_review() {
+    async fn partial_reconciliation_failure_still_invalidates_old_review() {
         let dir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
             dir.path(),
@@ -7799,11 +7828,16 @@ mod propose_workspace_guard_tests {
             path
         };
         let mut observer = OneMinedThenObserverError(0);
-        let err = service
+        // One observer failure is reported on its row, not as an error that
+        // hides the rows already observed.
+        let rows = service
             .reconcile_sweep_with_observer(&handle, &mut observer)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("second observation failed"));
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row.detail.contains("second observation failed")));
         let mut log = DurableBroadcastLog::open(&registry_path).unwrap();
         let records = log.records();
         assert_eq!(records[0].state, TxLifecycleState::Mined);
@@ -8276,6 +8310,7 @@ mod propose_workspace_guard_tests {
                 fee_zatoshis: 10_000,
                 detail: "canonical mining evidence".to_owned(),
                 confirmed_height: Some(120),
+                safe_to_discard: false,
             }],
             donation_note: None,
             skipped_accounts: vec![],

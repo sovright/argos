@@ -952,6 +952,7 @@ async fn submit_transparent_prepared<S: BroadcastStore, N: TxSubmitter>(
                     .unwrap_or_default()
             ),
             confirmed_height: None,
+            safe_to_discard: false,
         },
         disposition: submitted.disposition,
         plan,

@@ -523,6 +523,7 @@ fn record_sapling_submission(
         fee_zatoshis: submission.fee_zatoshis,
         detail,
         confirmed_height: None,
+        safe_to_discard: false,
     });
     outcome.sapling_transaction_count += 1;
     outcome.followup_blocked |= submission.blocks_followup_submission();
@@ -687,12 +688,15 @@ fn open_imported_broadcast_log(
         .map_err(|err| ZeckError::Storage(format!("securing network broadcast registry: {err}")))?;
     }
     let log = DurableBroadcastLog::open(path)?;
-    if let Some(txid) = log.blocking_submission() {
+    // The execution-start gate already refused unresolved history from any
+    // earlier review. Here only an unknown outcome blocks: a leg of this same
+    // execution that was accepted (Pending) spends disjoint reviewed inputs.
+    if let Some(txid) = log.blocking_next_leg() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep leg"
         )));
     }
-    if log.has_unresolved_history() {
+    if log.has_not_submitted() {
         return Err(ZeckError::Broadcast(
             "cannot start another sweep leg with unresolved prepared transaction history"
                 .to_owned(),
