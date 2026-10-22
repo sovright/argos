@@ -9078,7 +9078,7 @@ mod propose_workspace_guard_tests {
 
     #[cfg(feature = "argos-network")]
     #[tokio::test]
-    async fn hostile_primary_zero_cannot_hide_secondary_transparent_funds_on_delete_or_retry() {
+    async fn transparent_funds_reported_elsewhere_do_not_pin_a_resolved_workspace() {
         use super::deletion_fake_lightwalletd::FakeLightwalletd;
         use crate::models::ConfirmationEndpoint;
         use zcash_client_backend::proto::service::GetAddressUtxosReply;
@@ -9179,29 +9179,23 @@ mod propose_workspace_guard_tests {
             .await
             .insert(handle.id.clone(), mined_outcome(txid.to_string()));
 
-        assert!(service
-            .delete_workspace_with_observer(
-                &handle,
-                &mut FixedDeletionObserver(mined_deletion_observation())
-            )
-            .await
-            .is_err());
-        assert!(root.exists());
+        // Standalone transparent funds that a secondary still reports stay
+        // spendable from the source wallet file, not from this workspace.
+        // With every broadcast resolved, deletion proceeds; the registry
+        // keeps the receipt.
         service
-            .cleanup_retry
-            .lock()
-            .await
-            .insert(root.clone(), root.clone());
-        assert!(service
             .delete_workspace_with_observer(
                 &handle,
-                &mut FixedDeletionObserver(mined_deletion_observation())
+                &mut FixedDeletionObserver(mined_deletion_observation()),
             )
             .await
-            .is_err());
-        assert!(root.exists());
-        let log = DurableBroadcastLog::open(&path).unwrap();
+            .unwrap();
+        assert!(!root.exists());
+        let registry_path =
+            super::network_broadcast_log_path(tempdir.path(), ZeckNetwork::Testnet).unwrap();
+        let log = DurableBroadcastLog::open(registry_path).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![91, 92]);
+        drop((primary, secondary));
     }
 
     #[tokio::test]
