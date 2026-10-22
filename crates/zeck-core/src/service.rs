@@ -10108,3 +10108,234 @@ mod leg_gating_tests {
         assert_eq!(node.sent, vec![shield.raw_tx, send.raw_tx]);
     }
 }
+
+/// ZIP-317 fee fidelity without a funded chain: the fee the proposal path
+/// quotes (Argos's own change strategy, and the transparent planner) equals
+/// the fee of the transaction the builder actually produces, including the
+/// padded single-output case (one Sapling output is billed as two, per
+/// `BundleType::num_outputs`). The wallet-backed equivalents
+/// (`multi_note_shielded_quote_uses_real_zip317_fee` and friends) need the
+/// funded regtest harness and are `#[ignore]`d.
+#[cfg(test)]
+mod zip317_fee_fidelity_tests {
+    use super::*;
+    use crate::models::ZeckNetwork;
+    use rand_core::OsRng;
+    use sapling_crypto as sapling;
+    use zcash_client_backend::fees::{ChangeStrategy, ChangeValue};
+    use zcash_primitives::transaction::{
+        builder::{BuildConfig, Builder, BundlePadding},
+        fees::zip317::FeeRule,
+    };
+    use zcash_protocol::{
+        consensus::{NetworkUpgrade, Parameters},
+        memo::MemoBytes,
+    };
+
+    struct Spend(u32, Zatoshis);
+
+    impl zcash_client_backend::fees::sapling::InputView<u32> for Spend {
+        fn note_id(&self) -> &u32 {
+            &self.0
+        }
+        fn value(&self) -> Zatoshis {
+            self.1
+        }
+    }
+
+    fn zip317(logical_actions: usize) -> u64 {
+        5_000 * (logical_actions.max(2) as u64)
+    }
+
+    /// Quote through the production change strategy, then build the same
+    /// shape and read the fee the built transaction pays.
+    fn quote_and_build(note_values: &[u64]) -> (u64, u64) {
+        let network = consensus_network(ZeckNetwork::Mainnet);
+        let height = network.activation_height(NetworkUpgrade::Nu5).unwrap() + 10_000;
+        let total: u64 = note_values.iter().sum();
+        let spends = note_values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| Spend(index as u32, Zatoshis::from_u64(*value).unwrap()))
+            .collect::<Vec<_>>();
+        // Send-max shape: the payment is total - fee, and no change remains.
+        let expected_outputs = sapling::builder::BundleType::DEFAULT
+            .num_outputs(spends.len(), 1)
+            .unwrap();
+        let fee_guess = zip317(spends.len().max(expected_outputs));
+        let payment = [Zatoshis::from_u64(total - fee_guess).unwrap()];
+        // The production change strategy used for every Argos proposal.
+        let strategy = standard_zip317_change_strategy::<SweepWalletDb>();
+        let balance = strategy
+            .compute_balance::<_, u32>(
+                &network,
+                height.into(),
+                &[] as &[Infallible],
+                &[] as &[zcash_transparent::bundle::TxOut],
+                &(
+                    sapling::builder::BundleType::DEFAULT,
+                    &spends[..],
+                    &payment[..],
+                ),
+                &zcash_client_backend::fees::orchard::EmptyBundleView,
+                &zcash_client_backend::fees::orchard::EmptyBundleView,
+                None,
+                &(),
+            )
+            .expect("change strategy prices the sweep");
+        assert!(
+            balance
+                .proposed_change()
+                .iter()
+                .all(|change: &ChangeValue| change.value() == Zatoshis::ZERO),
+            "a send-max quote leaves no change"
+        );
+        let quoted = u64::from(balance.fee_required());
+
+        // Build the same transaction for real.
+        let extsk = sapling::zip32::ExtendedSpendingKey::master(&[7; 32]);
+        let (_, address) = extsk.default_address();
+        let fvk = extsk.to_diversifiable_full_viewing_key().fvk().clone();
+        let notes = note_values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                sapling::Note::from_parts(
+                    address,
+                    sapling::value::NoteValue::from_raw(*value),
+                    sapling::Rseed::AfterZip212([index as u8 + 1; 32]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut tree = sapling::CommitmentTree::empty();
+        let mut witnesses: Vec<sapling::IncrementalWitness> = Vec::new();
+        for note in &notes {
+            let node = sapling::Node::from_cmu(&note.cmu());
+            tree.append(node).unwrap();
+            for witness in &mut witnesses {
+                witness.append(node).unwrap();
+            }
+            witnesses.push(sapling::IncrementalWitness::from_tree(tree.clone()).unwrap());
+        }
+        let anchor = sapling::Anchor::from(tree.root());
+        let mut builder = Builder::new(
+            network,
+            height,
+            BuildConfig::Standard {
+                sapling_anchor: Some(anchor),
+                orchard_anchor: None,
+                ironwood_anchor: None,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
+            },
+        );
+        for (note, witness) in notes.iter().zip(&witnesses) {
+            builder
+                .add_sapling_spend::<Infallible>(fvk.clone(), note.clone(), witness.path().unwrap())
+                .unwrap();
+        }
+        builder
+            .add_sapling_output::<Infallible>(None, address, payment[0], MemoBytes::empty())
+            .unwrap();
+        let prover = LocalTxProver::bundled();
+        let built = builder
+            .build(
+                &zcash_transparent::builder::TransparentSigningSet::new(),
+                &[extsk],
+                &[],
+                OsRng,
+                &prover,
+                &prover,
+                &FeeRule::standard(),
+            )
+            .expect("the quoted shape builds");
+        let tx = built.transaction();
+        let paid = tx
+            .sapling_bundle()
+            .map(|bundle| bundle.value_balance().as_fee_paid())
+            .expect("a Sapling bundle");
+        (quoted, paid)
+    }
+
+    trait FeePaid {
+        fn as_fee_paid(&self) -> u64;
+    }
+
+    impl FeePaid for zcash_protocol::value::ZatBalance {
+        fn as_fee_paid(&self) -> u64 {
+            u64::try_from(i64::from(*self)).expect("spends exceed outputs by the fee")
+        }
+    }
+
+    #[test]
+    fn multi_note_shielded_quote_equals_built_fee() {
+        // Three spends, one output (padded to two): three logical actions,
+        // above the two-action floor that a single-note estimate would use.
+        let (quoted, paid) = quote_and_build(&[100_000, 200_000, 300_000]);
+        assert_eq!(quoted, zip317(3));
+        assert_eq!(paid, quoted);
+    }
+
+    #[test]
+    fn padded_single_output_quote_equals_built_fee() {
+        // One spend and one output: the output pads to two, so two actions.
+        assert_eq!(
+            sapling::builder::BundleType::DEFAULT
+                .num_outputs(1, 1)
+                .unwrap(),
+            2
+        );
+        let (quoted, paid) = quote_and_build(&[500_000]);
+        assert_eq!(quoted, zip317(2));
+        assert_eq!(paid, quoted);
+    }
+
+    #[test]
+    fn transparent_sweep_plan_equals_built_fee() {
+        use crate::transparent_recovery::tests_support::utxo;
+        let network = consensus_network(ZeckNetwork::Mainnet);
+        let height = network.activation_height(NetworkUpgrade::Nu5).unwrap() + 10_000;
+        let secret = secp256k1::SecretKey::from_slice(&[0x24; 32]).unwrap();
+        let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+        let address = zcash_transparent::address::TransparentAddress::from_pubkey(&public);
+        let key = crate::imported::ImportedTransparentKey { secret, address };
+        let recipient = sapling::zip32::ExtendedSpendingKey::master(&[9; 32])
+            .default_address()
+            .1;
+        let prover = LocalTxProver::bundled();
+        for inputs in [1usize, 2, 5] {
+            let utxos = (0..inputs)
+                .map(|index| utxo(address, 1_000_000, index as u8 + 1))
+                .collect::<Vec<_>>();
+            let plan = crate::transparent_recovery::plan_sweep(&network, height, &utxos)
+                .unwrap()
+                .unwrap();
+            // n P2PKH inputs + one Sapling output padded to two.
+            assert_eq!(plan.fee_zatoshis, zip317(inputs + 2), "{inputs} inputs");
+            assert_eq!(
+                plan.fee_zatoshis,
+                crate::transparent_recovery::transparent_sweep_fee(ZeckNetwork::Mainnet, inputs)
+                    .unwrap()
+            );
+            let tx = crate::transparent_recovery::build_sweep_transaction(
+                &network,
+                height,
+                &utxos,
+                std::slice::from_ref(&key),
+                &plan,
+                recipient,
+                &prover,
+                &prover,
+            )
+            .unwrap();
+            let input_total = 1_000_000 * inputs as u64;
+            let into_sapling =
+                u64::try_from(-i64::from(*tx.sapling_bundle().unwrap().value_balance())).unwrap();
+            assert_eq!(
+                input_total - into_sapling,
+                plan.fee_zatoshis,
+                "{inputs} inputs"
+            );
+        }
+    }
+}
