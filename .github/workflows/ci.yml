@@ -111,6 +111,7 @@ jobs:
           cargo test -p argos-core retained_registry_handles_deny_parent_and_sidecar_replacement --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $exact -Package argos-core -TestName sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle
+          & $exact -Package argos-core -TestName workspace::tests::append_private_file_writes_whole_terminated_lines
           & $exact -Package argos-core -TestName workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader
           & $exact -Package argos-core -TestName workspace::tests::runtime_read_only_connection_preserves_private_wal_sidecars
           & $exact -Package argos-core -TestName workspace::tests::busy_wallet_rebuild_times_out_without_changing_the_live_database

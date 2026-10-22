@@ -719,14 +719,12 @@ pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
                 path.display()
             ))
         })?;
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|err| {
-                ZeckError::Storage(format!(
-                    "syncing broadcast log parent {}: {err}",
-                    parent.display()
-                ))
-            })?;
+        private_fs::sync_parent_directory(path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "syncing broadcast log parent {}: {err}",
+                parent.display()
+            ))
+        })?;
     }
     Ok(())
 }
