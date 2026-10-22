@@ -2831,6 +2831,12 @@ fn verify_private_workspace_lineage_from_handles(
 ) -> io::Result<PrivateRootLineageLease> {
     let publication_parent_id = private_object_id(publication_parent)?;
     let id = private_object_id(&root)?;
+    let current = open_child_directory_for_identity(publication_parent, private_root)?;
+    if private_object_id(&current)? != id {
+        return Err(invalid_lineage(
+            "private workspace root is no longer the retained publication-parent child",
+        ));
+    }
     let marker = private_root.join(PRIVATE_ROOT_LINEAGE_FILE_NAME);
     let (bytes, marker_id) = read_private_lineage_child_bytes(&root, &marker).map_err(|error| {
         invalid_lineage(format!(
@@ -3480,15 +3486,26 @@ fn ensure_private_workspace_lineage_impl(
                 &staging,
             )?;
             sync_private_directory(&publication_parent)?;
-            // The mutation handle denies delete sharing on Windows. Release it
-            // before reopening the published path; the object-ID comparison
-            // below still detects any substitution in that window.
+            // Bridge the mutation handle to a handle opened relative to the
+            // retained parent before releasing it. The identity handle shares
+            // delete, so it can coexist with the mutation handle on Windows.
+            let published_identity =
+                open_child_directory_for_identity(&publication_parent, private_root)?;
+            if private_object_id(&published_identity)? != staged_id {
+                return Err(invalid_lineage(
+                    "private workspace root changed during staged publication",
+                ));
+            }
             drop(staging);
             // Keep the publication parent continuously pinned while opening
-            // and verifying the published root. Reopening a second parent
-            // authority would conflict with the retained Windows handle's
-            // intentional delete-share denial.
-            let published = open_private_directory_lease(private_root)?;
+            // the long-lived root authority through that exact parent.
+            let published = open_child_directory_for_authority(&publication_parent, private_root)?;
+            if private_object_id(&published)? != private_object_id(&published_identity)? {
+                return Err(invalid_lineage(
+                    "private workspace root changed before authority retention",
+                ));
+            }
+            drop(published_identity);
             let verified = verify_private_workspace_lineage_from_handles(
                 private_root,
                 &publication_parent,
@@ -5224,6 +5241,23 @@ fn open_child_directory_for_identity(parent: &File, path: &Path) -> io::Result<F
             "private directory identity is unsupported on this platform",
         ))
     }
+}
+
+fn open_child_directory_for_authority(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let directory = unix_private::open_child_directory_for_mutation(parent, path)?;
+    #[cfg(windows)]
+    let directory = windows_acl::open_child_directory_for_authority(parent, path)?;
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private directory authority is unsupported on this platform",
+        ));
+    }
+    validate_private_directory_handle(&directory)?;
+    Ok(directory)
 }
 
 fn rename_open_child_directory(
@@ -8019,6 +8053,29 @@ mod windows_acl {
                 | FILE_GENERIC_WRITE
                 | FILE_TRAVERSE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            ptr::null(),
+            FILE_DIRECTORY_FILE,
+        )?;
+        if !validate_recursive_entry(&directory)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace entry is not a directory",
+            ));
+        }
+        PrivateSecurity::new(true)?.verify(&directory)?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_child_directory_for_authority(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let directory = nt_open_child_with_options(
+            parent,
+            path,
+            READ_CONTROL | FILE_LIST_DIRECTORY | FILE_GENERIC_WRITE | FILE_TRAVERSE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             FILE_OPEN,
             ptr::null(),
             FILE_DIRECTORY_FILE,
