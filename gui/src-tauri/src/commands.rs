@@ -3309,20 +3309,23 @@ fn data_dir_from_workspace(workspace_path: &Path) -> Option<PathBuf> {
     Some(p)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn powershell_quote(input: &str) -> String {
+    // PowerShell ends a single-quoted string at ASCII `'` and at the
+    // typographic quotes U+2018-U+201B; each is escaped by doubling it.
+    // Server-controlled text reaches the notification body through scan
+    // errors, so missing the typographic ones let it run code.
     let escaped: String = input
         .chars()
         .filter(|c| !c.is_control())
-        .map(|c| {
-            if c == '\'' {
-                "''".to_string()
-            } else {
-                c.to_string()
-            }
-        })
+        .flat_map(|c| std::iter::once(c).chain(is_powershell_single_quote(c).then_some(c)))
         .collect();
     format!("'{escaped}'")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_powershell_single_quote(c: char) -> bool {
+    matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
 }
 
 #[cfg(target_os = "macos")]
@@ -6025,6 +6028,18 @@ mod tests {
     #[test]
     fn applescript_quote_strips_control_chars() {
         assert_eq!(applescript_quote("abc\x00def"), "\"abcdef\"");
+    }
+
+    #[test]
+    fn powershell_quote_doubles_every_single_quote_powershell_recognises() {
+        assert_eq!(powershell_quote("it's"), "'it''s'");
+        // PowerShell also ends a single-quoted string at U+2018..U+201B; an
+        // unescaped one would let server text after it run as code.
+        assert_eq!(
+            powershell_quote("x\u{2019}+$(calc)+\u{2018}y\u{201A}\u{201B}"),
+            "'x\u{2019}\u{2019}+$(calc)+\u{2018}\u{2018}y\u{201A}\u{201A}\u{201B}\u{201B}'"
+        );
+        assert_eq!(powershell_quote("abc\x00def"), "'abcdef'");
     }
 
     #[cfg(unix)]

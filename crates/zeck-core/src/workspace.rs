@@ -55,6 +55,26 @@ pub struct RecoveryWorkspace {
     wallet_db_path: PathBuf,
 }
 
+/// An initialized replacement wallet that has never been written to disk.
+pub(crate) struct WalletDbRebuild {
+    connection: rusqlite::Connection,
+    destination: PathBuf,
+    network: ZeckNetwork,
+}
+
+impl WalletDbRebuild {
+    pub(crate) fn wallet_db(
+        &mut self,
+    ) -> WalletDb<&mut rusqlite::Connection, ArgosParams, SystemClock, OsRng> {
+        WalletDb::from_connection(
+            &mut self.connection,
+            consensus_network(self.network),
+            SystemClock,
+            OsRng,
+        )
+    }
+}
+
 /// Retained create-time authority for files exported into one recovery
 /// workspace. Holding this value pins the private workspace root while a UI
 /// resolves the destination and publishes the file through an exact parent
@@ -266,6 +286,168 @@ impl RecoveryWorkspace {
 
     pub fn wallet_db_path(&self) -> &Path {
         &self.wallet_db_path
+    }
+
+    /// Build a fresh wallet database entirely in memory.
+    ///
+    /// Gap extension sometimes needs a database containing every account
+    /// before any blocks are scanned. Keeping that rebuild in memory avoids a
+    /// second on-disk copy of wallet material and, more importantly, avoids
+    /// introducing another filesystem object whose lineage would have to be
+    /// published and retired safely.
+    pub(crate) fn begin_wallet_db_rebuild(
+        &self,
+        network: ZeckNetwork,
+        seed: &[u8; 64],
+    ) -> ZeckResult<WalletDbRebuild> {
+        self.ensure_private_lineage()?;
+        let mut connection = rusqlite::Connection::open_in_memory().map_err(|err| {
+            ZeckError::Storage(format!("opening an in-memory wallet rebuild: {err}"))
+        })?;
+        rusqlite::vtab::array::load_module(&connection).map_err(|err| {
+            ZeckError::Storage(format!(
+                "loading SQLite modules for a wallet rebuild: {err}"
+            ))
+        })?;
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "keeping wallet rebuild temporary data in memory: {err}"
+                ))
+            })?;
+        {
+            let mut wallet_db = WalletDb::from_connection(
+                &mut connection,
+                consensus_network(network),
+                SystemClock,
+                OsRng,
+            );
+            init_wallet_db(&mut wallet_db, Some(SecretVec::new(seed.to_vec()))).map_err(|err| {
+                ZeckError::Wallet(format!("initializing an in-memory wallet rebuild: {err}"))
+            })?;
+        }
+        Ok(WalletDbRebuild {
+            connection,
+            destination: self.wallet_db_path.clone(),
+            network,
+        })
+    }
+
+    /// Transactionally replace the live wallet's contents from a fresh,
+    /// in-memory database while preserving the exact on-disk object bound by
+    /// the private-lineage marker and Windows authority.
+    pub(crate) fn commit_wallet_db_rebuild(&self, rebuilt: WalletDbRebuild) -> ZeckResult<()> {
+        self.commit_wallet_db_rebuild_with_timeout(rebuilt, std::time::Duration::from_secs(5))
+    }
+
+    fn commit_wallet_db_rebuild_with_timeout(
+        &self,
+        rebuilt: WalletDbRebuild,
+        timeout: std::time::Duration,
+    ) -> ZeckResult<()> {
+        if rebuilt.destination != self.wallet_db_path {
+            return Err(ZeckError::Internal(format!(
+                "refusing to install a wallet rebuild for {} into {}",
+                rebuilt.destination.display(),
+                self.wallet_db_path.display()
+            )));
+        }
+        let rebuilt = rebuilt.connection;
+        let source_path: String = rebuilt
+            .query_row("PRAGMA database_list", [], |row| row.get(2))
+            .map_err(|err| {
+                ZeckError::Storage(format!("verifying the wallet rebuild source: {err}"))
+            })?;
+        if !source_path.is_empty() {
+            return Err(ZeckError::Internal(
+                "refusing to install a wallet rebuild that is not in memory".to_owned(),
+            ));
+        }
+        let integrity: String = rebuilt
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|err| {
+                ZeckError::Storage(format!("checking the in-memory wallet rebuild: {err}"))
+            })?;
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(ZeckError::Storage(format!(
+                "the in-memory wallet rebuild failed SQLite integrity checking: {integrity}"
+            )));
+        }
+
+        let mut destination =
+            open_tuned_wallet_connection(&self.wallet_db_path).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "opening wallet database {} for transactional rebuild: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })?;
+        destination.busy_timeout(timeout).map_err(|err| {
+            ZeckError::Storage(format!(
+                "setting the wallet rebuild lock timeout for {}: {err}",
+                self.wallet_db_path.display()
+            ))
+        })?;
+        destination
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "enabling durable wallet rebuild commits for {}: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })?;
+        let destination_mode: String = destination
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "verifying WAL mode before rebuilding {}: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })?;
+        if !destination_mode.eq_ignore_ascii_case("wal") {
+            return Err(ZeckError::Storage(format!(
+                "wallet database {} is in {destination_mode} mode before rebuild",
+                self.wallet_db_path.display()
+            )));
+        }
+
+        let backup = rusqlite::backup::Backup::new(&rebuilt, &mut destination).map_err(|err| {
+            ZeckError::Storage(format!(
+                "starting transactional wallet rebuild for {}: {err}",
+                self.wallet_db_path.display()
+            ))
+        })?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match backup.step(256).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "copying the rebuilt wallet into {}: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })? {
+                rusqlite::backup::StepResult::Done => break,
+                rusqlite::backup::StepResult::More => {}
+                rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ZeckError::Storage(format!(
+                            "timed out waiting to install the rebuilt wallet into {}",
+                            self.wallet_db_path.display()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                _ => {
+                    return Err(ZeckError::Storage(format!(
+                        "SQLite returned an unknown state while rebuilding {}",
+                        self.wallet_db_path.display()
+                    )))
+                }
+            }
+        }
+        // `Done` is the commit point. Keep this return path infallible: a
+        // caller must never see an error after SQLite has installed the new
+        // contents and mistake a completed rebuild for an unchanged wallet.
+        Ok(())
     }
 
     pub(crate) fn authorize_recreation(&self) -> ZeckResult<()> {
@@ -2505,6 +2687,72 @@ mod tests {
         let db = super::open_wallet_db(&path, network).expect("open fresh wallet db");
         drop(db);
         super::open_wallet_db(&path, network).expect("reopen existing wallet db");
+    }
+
+    #[test]
+    fn busy_wallet_rebuild_times_out_without_changing_the_live_database() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let root = path.parent().expect("workspace leaf").to_path_buf();
+        let private_root = root
+            .parent()
+            .and_then(Path::parent)
+            .expect("private root")
+            .to_path_buf();
+        let workspace = RecoveryWorkspace {
+            root,
+            private_root,
+            wallet_db_path: path.clone(),
+        };
+        let seed = [7u8; 64];
+        workspace
+            .initialize(ZeckNetwork::Mainnet, &seed)
+            .expect("initialize live wallet");
+        let live = super::open_tuned_wallet_connection(&path).expect("open live wallet");
+        live.execute_batch("CREATE TABLE live_only(value INTEGER);")
+            .expect("mark live database");
+        drop(live);
+
+        let rebuilt = workspace
+            .begin_wallet_db_rebuild(ZeckNetwork::Mainnet, &seed)
+            .expect("begin in-memory rebuild");
+        rebuilt
+            .connection
+            .execute_batch("CREATE TABLE rebuilt_only(value INTEGER);")
+            .expect("mark rebuilt database");
+
+        let blocker = super::open_tuned_wallet_connection(&path).expect("open lock holder");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold the WAL writer lock");
+        let error = workspace
+            .commit_wallet_db_rebuild_with_timeout(rebuilt, std::time::Duration::from_millis(50))
+            .expect_err("a busy destination must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        blocker.execute_batch("ROLLBACK").expect("release lock");
+        drop(blocker);
+
+        let live = super::open_tuned_wallet_connection(&path).expect("reopen unchanged wallet");
+        let live_only: i64 = live
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'live_only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rebuilt_only: i64 = live
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'rebuilt_only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let journal_mode: String = live
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(live_only, 1);
+        assert_eq!(rebuilt_only, 0);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     }
 
     #[test]
