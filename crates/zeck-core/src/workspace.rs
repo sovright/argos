@@ -160,6 +160,178 @@ impl RecoveryWorkspace {
     pub fn wallet_db_path(&self) -> &Path {
         &self.wallet_db_path
     }
+
+    /// Where a replacement wallet database is built before it takes the
+    /// place of `wallet.sqlite`. Inside the workspace root, so the final
+    /// rename never crosses a filesystem.
+    fn rebuilt_wallet_db_path(&self) -> PathBuf {
+        self.root.join("wallet.sqlite.rebuild")
+    }
+
+    /// Start building a fresh wallet database alongside the live one.
+    ///
+    /// Accounts must never be imported into a wallet database that has
+    /// already scanned blocks: `zcash_client_sqlite`'s `add_account` rewinds
+    /// the wallet to the new account's birthday, and consecutive rewinds of a
+    /// scanned wallet can leave the pools' note commitment tree checkpoints
+    /// out of step, after which the next import fails as `CorruptedData`
+    /// ("retains checkpoints both above and below height ..."). Building a
+    /// fresh database with every account imported up front avoids that
+    /// path entirely, and costs nothing extra: the rewind already requeued
+    /// the whole range from the birthday.
+    ///
+    /// Returns the path of the new, initialized database. Any leftover from
+    /// an earlier interrupted rebuild is discarded first. The live
+    /// `wallet.sqlite` is untouched until [`Self::commit_wallet_db_rebuild`].
+    pub(crate) fn begin_wallet_db_rebuild(
+        &self,
+        network: ZeckNetwork,
+        seed: &[u8; 64],
+    ) -> ZeckResult<PathBuf> {
+        let path = self.rebuilt_wallet_db_path();
+        remove_sqlite_files(&path)?;
+        let mut wallet_db = open_wallet_db(&path, consensus_network(network))?;
+        init_wallet_db(&mut wallet_db, Some(SecretVec::new(seed.to_vec()))).map_err(|err| {
+            ZeckError::Wallet(format!(
+                "initializing replacement wallet database {}: {err}",
+                path.display()
+            ))
+        })?;
+        drop(wallet_db);
+        set_private_file_permissions(&path)?;
+        Ok(path)
+    }
+
+    /// Atomically replace `wallet.sqlite` with a database built by
+    /// [`Self::begin_wallet_db_rebuild`].
+    ///
+    /// The caller must hold no open connection to either database. The new
+    /// database is folded back to a single file (WAL checkpointed and
+    /// removed) before the rename, and the old database's `-wal`/`-shm` are
+    /// removed after it, so a stale WAL belonging to the old database can
+    /// never be replayed against the new one. A crash before the rename
+    /// leaves the old database intact; after it, the new one.
+    pub(crate) fn commit_wallet_db_rebuild(&self, rebuilt: &Path) -> ZeckResult<()> {
+        if rebuilt != self.rebuilt_wallet_db_path() {
+            return Err(ZeckError::Internal(format!(
+                "refusing to install {} as the wallet database: not this workspace's rebuild path",
+                rebuilt.display()
+            )));
+        }
+        collapse_to_single_file(rebuilt)?;
+        // Folding the old database too keeps it consistent should a crash land
+        // before the rename. Best-effort: a transient reader (the launch-time
+        // resume list) can hold it open, and the old contents are being
+        // discarded either way.
+        if self.wallet_db_path.exists() {
+            if let Err(err) = collapse_to_single_file(&self.wallet_db_path) {
+                tracing::warn!("could not checkpoint the wallet database being replaced: {err}");
+            }
+        }
+        fs::File::open(rebuilt)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", rebuilt.display())))?;
+        fs::rename(rebuilt, &self.wallet_db_path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "replacing {} with {}: {err}",
+                self.wallet_db_path.display(),
+                rebuilt.display()
+            ))
+        })?;
+        // Anything left beside the new file belongs to the old database.
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar(&self.wallet_db_path, suffix);
+            match fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(ZeckError::Storage(format!(
+                        "removing stale {}: {err}",
+                        sidecar.display()
+                    )))
+                }
+            }
+        }
+        // Persist the rename itself. Directories cannot be opened for sync on
+        // Windows, where the rename is already durable on return.
+        #[cfg(unix)]
+        fs::File::open(&self.root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", self.root.display())))?;
+        set_private_file_permissions(&self.wallet_db_path)
+    }
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+/// Remove a SQLite database and its WAL sidecars, tolerating any that are
+/// absent.
+fn remove_sqlite_files(path: &Path) -> ZeckResult<()> {
+    for candidate in [
+        path.to_owned(),
+        sqlite_sidecar(path, "-wal"),
+        sqlite_sidecar(path, "-shm"),
+    ] {
+        match fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(ZeckError::Storage(format!(
+                    "removing {}: {err}",
+                    candidate.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checkpoint a WAL-mode database into its main file and leave it in
+/// rollback-journal mode, so the main file alone holds every committed
+/// write. [`open_wallet_db`] switches it back to WAL on the next open.
+fn collapse_to_single_file(path: &Path) -> ZeckResult<()> {
+    let storage = |err: rusqlite::Error| {
+        ZeckError::Storage(format!(
+            "checkpointing wallet database {}: {err}",
+            path.display()
+        ))
+    };
+    let conn = rusqlite::Connection::open(path).map_err(storage)?;
+    conn.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))
+        .map_err(storage)?;
+    let mode = conn
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(storage)?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(ZeckError::Storage(format!(
+            "wallet database {} stayed in {mode} journal mode; another connection may still be open",
+            path.display()
+        )));
+    }
+    drop(conn);
+    let wal = sqlite_sidecar(path, "-wal");
+    if wal.exists() {
+        return Err(ZeckError::Storage(format!(
+            "{} still exists after checkpointing; another connection may still be open",
+            wal.display()
+        )));
+    }
+    // The shared-memory index holds no committed data; with no connection
+    // open it is safe to drop, and must not outlive the file it indexes.
+    match fs::remove_file(sqlite_sidecar(path, "-shm")) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ZeckError::Storage(format!(
+            "removing shared-memory index for {}: {err}",
+            path.display()
+        ))),
+    }
 }
 
 /// The consensus parameter set Argos evaluates heights against.

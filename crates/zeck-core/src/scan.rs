@@ -13,7 +13,7 @@ use tonic::{
     client::GrpcService,
     codegen::{Body, Bytes, StdError},
 };
-use tracing::warn;
+use tracing::{info, warn};
 use zcash_client_backend::{
     data_api::{
         chain::{error::Error as ChainError, BlockCache, BlockSource},
@@ -724,10 +724,6 @@ async fn run_recovery_scan_inner(
             }
         }
 
-        let new_accounts = &derived_accounts[usize::try_from(imported_accounts)
-            .map_err(|_| ZeckError::Internal("account index overflowed usize".to_owned()))?
-            ..usize::try_from(target_accounts)
-                .map_err(|_| ZeckError::Internal("account index overflowed usize".to_owned()))?];
         let import_mode = match &config.transparent_scan {
             Some(range) => TransparentImportMode::Range {
                 account: &transparent_account,
@@ -735,16 +731,26 @@ async fn run_recovery_scan_inner(
             },
             None => TransparentImportMode::Legacy(&transparent_account),
         };
-        import_accounts_scoped(
+        // On a gap extension the wallet database has already scanned to the
+        // tip, so this rebuilds it with every account rather than importing
+        // the new ones into it (see `prepare_scan_accounts`).
+        let preparation = prepare_scan_accounts(
             &workspace,
             config.network,
             &seed,
             &account_birthday,
             import_mode,
-            new_accounts,
+            &derived_accounts[..new_slice_end],
+            new_slice_start,
             &state,
         )
         .await?;
+        if preparation == AccountPreparation::Rebuilt {
+            info!(
+                "rebuilt the wallet database with accounts 0 through {} before rescanning",
+                target_accounts.saturating_sub(1)
+            );
+        }
         if let Some(range) = &config.transparent_scan {
             if imported_accounts == 0 {
                 if let Err(err) = run_transparent_range_quick_probe(
@@ -1404,15 +1410,162 @@ async fn import_accounts_scoped(
     accounts: &[DerivedAccount],
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
+    let tracked = import_accounts_into(
+        workspace.wallet_db_path(),
+        network,
+        seed,
+        birthday,
+        &transparent_mode,
+        accounts,
+        state,
+    )
+    .await?;
+    state.lock().await.tracked_accounts.extend(tracked);
+    Ok(())
+}
+
+/// How [`prepare_scan_accounts`] brought the wallet database up to the
+/// requested account set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountPreparation {
+    /// The new accounts were imported into the existing database, which had
+    /// not scanned any blocks (or already held every account).
+    Imported,
+    /// The existing database had scanned blocks and lacked some of the
+    /// accounts, so it was replaced by a fresh one holding all of them.
+    Rebuilt,
+}
+
+/// Make the workspace's wallet database hold every account in `accounts`,
+/// importing `accounts[new_from..]` when that is safe.
+///
+/// Never imports into a database that has already scanned blocks. Doing so
+/// makes `zcash_client_sqlite`'s `add_account` rewind the scanned wallet to
+/// the birthday, and consecutive rewinds (one per account in a gap
+/// extension) can leave the Sapling and Orchard commitment tree checkpoints
+/// out of step, so a later import fails with "the Sapling note commitment
+/// tree retains checkpoints both above and below height ...". (Reproduced
+/// in tests only above the NU6.3 activation height, where commitment tree
+/// anchor retention is active; see
+/// `upstream_consecutive_import_into_a_scanned_wallet_reports_corruption`.)
+/// In that case a fresh database is built with every account imported before any block
+/// is scanned, and atomically swapped in. That costs nothing over the old
+/// path: each rewind already requeued the whole range from the birthday.
+///
+/// This also covers a resumed workspace whose earlier run died partway
+/// through such an extension: whatever accounts it holds, a scanned
+/// database missing any requested account is rebuilt rather than imported
+/// into.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_scan_accounts(
+    workspace: &RecoveryWorkspace,
+    network: crate::models::ZeckNetwork,
+    seed: &[u8; 64],
+    birthday: &AccountBirthday,
+    transparent_mode: TransparentImportMode<'_>,
+    accounts: &[DerivedAccount],
+    new_from: usize,
+    state: &SharedScanTaskState,
+) -> ZeckResult<AccountPreparation> {
+    let new_accounts = accounts.get(new_from..).ok_or_else(|| {
+        ZeckError::Internal(format!(
+            "new-account offset {new_from} exceeds the {} derived accounts",
+            accounts.len()
+        ))
+    })?;
+    if !wallet_db_needs_rebuild(workspace.wallet_db_path(), network, seed, accounts)? {
+        import_accounts_scoped(
+            workspace,
+            network,
+            seed,
+            birthday,
+            transparent_mode,
+            new_accounts,
+            state,
+        )
+        .await?;
+        return Ok(AccountPreparation::Imported);
+    }
+
+    let rebuilt = workspace.begin_wallet_db_rebuild(network, seed)?;
+    let tracked = import_accounts_into(
+        &rebuilt,
+        network,
+        seed,
+        birthday,
+        &transparent_mode,
+        accounts,
+        state,
+    )
+    .await?;
+    workspace.commit_wallet_db_rebuild(&rebuilt)?;
+    // Account ids are per-database, so every previously tracked id now
+    // points at nothing. Replace, never extend.
+    state.lock().await.tracked_accounts = tracked;
+    Ok(AccountPreparation::Rebuilt)
+}
+
+/// True when the wallet database at `path` has scanned at least one block
+/// and is missing at least one of `accounts`.
+fn wallet_db_needs_rebuild(
+    path: &std::path::Path,
+    network: crate::models::ZeckNetwork,
+    seed: &[u8; 64],
+    accounts: &[DerivedAccount],
+) -> ZeckResult<bool> {
+    let seed_fingerprint = SeedFingerprint::from_seed(seed).ok_or_else(|| {
+        ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
+    })?;
+    let wallet_db = open_wallet_db(path, consensus_network(network))?;
+    let mut missing = false;
+    for account in accounts {
+        let zip32_index = AccountId::try_from(account.index).map_err(|_| {
+            ZeckError::InvalidConfig(format!("account index {} is out of range", account.index))
+        })?;
+        let derivation = Zip32Derivation::new(seed_fingerprint, zip32_index);
+        if wallet_db
+            .get_derived_account(&derivation)
+            .map_err(|err| {
+                ZeckError::Wallet(format!("loading derived account {}: {err}", account.index))
+            })?
+            .is_none()
+        {
+            missing = true;
+            break;
+        }
+    }
+    if !missing {
+        return Ok(false);
+    }
+    let scanned = wallet_db
+        .block_max_scanned()
+        .map_err(|err| ZeckError::Wallet(format!("reading the highest scanned block: {err}")))?
+        .is_some();
+    Ok(scanned)
+}
+
+/// Import `accounts` into the wallet database at `db_path`, returning what
+/// the scan should track for each. Existing accounts are reused, not
+/// re-imported. Callers decide whether the result extends or replaces
+/// `ScanTaskState::tracked_accounts`.
+async fn import_accounts_into(
+    db_path: &std::path::Path,
+    network: crate::models::ZeckNetwork,
+    seed: &[u8; 64],
+    birthday: &AccountBirthday,
+    transparent_mode: &TransparentImportMode<'_>,
+    accounts: &[DerivedAccount],
+    state: &SharedScanTaskState,
+) -> ZeckResult<Vec<TrackedAccount>> {
     if accounts.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let cancelled = state.lock().await.cancelled.clone();
 
     let seed_fingerprint = SeedFingerprint::from_seed(seed).ok_or_else(|| {
         ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
     })?;
-    let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), consensus_network(network))?;
+    let mut wallet_db = open_wallet_db(db_path, consensus_network(network))?;
 
     let mut tracked_accounts = Vec::with_capacity(accounts.len());
 
@@ -1442,7 +1595,7 @@ async fn import_accounts_scoped(
                 .id()
         };
 
-        let (transparent_receivers, transparent_key_coordinates) = match &transparent_mode {
+        let (transparent_receivers, transparent_key_coordinates) = match transparent_mode {
             TransparentImportMode::Legacy(transparent_account) => {
                 let external_pubkey = legacy_transparent_pubkey(
                     transparent_account,
@@ -1592,9 +1745,7 @@ async fn import_accounts_scoped(
         });
     }
 
-    let mut guard = state.lock().await;
-    guard.tracked_accounts.extend(tracked_accounts);
-    Ok(())
+    Ok(tracked_accounts)
 }
 
 const MAX_SYNC_RETRIES: u32 = 10;
@@ -3196,8 +3347,8 @@ mod tests {
         use zcash_protocol::consensus::BlockHeight;
 
         use super::super::{
-            import_accounts, import_accounts_scoped, MemoryBlockCache, ScanTaskState,
-            TransparentImportMode,
+            import_accounts, import_accounts_scoped, prepare_scan_accounts, AccountPreparation,
+            MemoryBlockCache, ScanTaskState, TransparentImportMode,
         };
         use crate::{
             derivation::{derive_accounts, legacy_transparent_account_key, mnemonic_seed},
@@ -3947,6 +4098,412 @@ mod tests {
                     range,
                 );
             }
+        }
+
+        fn fake_hash(height: u32) -> [u8; 32] {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&u64::from(height).to_le_bytes());
+            hash[31] = 0x5a;
+            hash
+        }
+
+        fn field_bytes(n: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&(n + 1).to_le_bytes());
+            b
+        }
+
+        /// Scan a fake chain of `count` blocks from `start`, where `activity(h)`
+        /// gives the number of (Sapling outputs, Orchard actions) in block h.
+        async fn scan_fake_chain(
+            path: &std::path::Path,
+            start: u32,
+            count: u32,
+            batch: u32,
+            activity: &dyn Fn(u32) -> (u32, u32),
+        ) {
+            use zcash_client_backend::proto::compact_formats::{
+                CompactOrchardAction, CompactSaplingOutput, CompactTx,
+            };
+            let params = consensus_network(ZeckNetwork::Mainnet);
+            let tip = start + count - 1;
+            let mut wallet_db =
+                WalletDb::for_path(path, params, SystemClock, rand_core::OsRng).expect("wallet_db");
+            wallet_db.put_sapling_subtree_roots(0, &[]).unwrap();
+            wallet_db.put_orchard_subtree_roots(0, &[]).unwrap();
+            wallet_db
+                .update_chain_tip(BlockHeight::from_u32(tip))
+                .unwrap();
+
+            let base = ChainState::empty(
+                BlockHeight::from_u32(start - 1),
+                BlockHash(fake_hash(start - 1)),
+            );
+            let mut sap = base.final_sapling_tree().clone();
+            let mut orc = base.final_orchard_tree().clone();
+            let iw = base.final_ironwood_tree().clone();
+            let mut states = std::collections::BTreeMap::new();
+            states.insert(start - 1, base.clone());
+            let mut blocks = Vec::new();
+            let mut counter = 0u64;
+            for h in start..=tip {
+                let (ns, no) = activity(h);
+                let mut tx = CompactTx {
+                    index: 0,
+                    txid: fake_hash(h).to_vec(),
+                    ..Default::default()
+                };
+                for _ in 0..ns {
+                    counter += 1;
+                    let cmu = field_bytes(counter);
+                    let node = sapling_crypto::Node::from_cmu(
+                        &sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&cmu).unwrap(),
+                    );
+                    sap.append(node);
+                    tx.outputs.push(CompactSaplingOutput {
+                        cmu: cmu.to_vec(),
+                        ephemeral_key: vec![0u8; 32],
+                        ciphertext: vec![0u8; 52],
+                    });
+                }
+                for _ in 0..no {
+                    counter += 1;
+                    let cmx = field_bytes(counter);
+                    let node = orchard::tree::MerkleHashOrchard::from_cmx(
+                        &orchard::note::ExtractedNoteCommitment::from_bytes(&cmx).unwrap(),
+                    );
+                    orc.append(node);
+                    tx.actions.push(CompactOrchardAction {
+                        nullifier: field_bytes(counter + 1_000_000).to_vec(),
+                        cmx: cmx.to_vec(),
+                        ephemeral_key: vec![0u8; 32],
+                        ciphertext: vec![0u8; 52],
+                    });
+                }
+                let vtx = if ns + no > 0 { vec![tx] } else { vec![] };
+                blocks.push(CompactBlock {
+                    height: u64::from(h),
+                    hash: fake_hash(h).to_vec(),
+                    prev_hash: fake_hash(h - 1).to_vec(),
+                    time: 0,
+                    header: vec![],
+                    vtx,
+                    chain_metadata: Some(ChainMetadata {
+                        sapling_commitment_tree_size: u32::try_from(sap.tree_size()).unwrap(),
+                        orchard_commitment_tree_size: u32::try_from(orc.tree_size()).unwrap(),
+                        ironwood_commitment_tree_size: 0,
+                    }),
+                });
+                states.insert(
+                    h,
+                    ChainState::new(
+                        BlockHeight::from_u32(h),
+                        BlockHash(fake_hash(h)),
+                        sap.clone(),
+                        orc.clone(),
+                        iw.clone(),
+                    ),
+                );
+            }
+            let cache = MemoryBlockCache::new();
+            <MemoryBlockCache as super::super::BlockCache>::insert(&cache, blocks)
+                .await
+                .unwrap();
+            let mut from = start;
+            while from <= tip {
+                let n = (tip - from + 1).min(batch);
+                scan_cached_blocks(
+                    &params,
+                    &cache,
+                    &mut wallet_db,
+                    BlockHeight::from_u32(from),
+                    &states[&(from - 1)],
+                    usize::try_from(n).unwrap(),
+                )
+                .expect("scan_cached_blocks");
+                from += n;
+            }
+        }
+
+        /// Post-NU6.3 (mainnet anchor retention is active), dense enough that
+        /// the pruning window sits well above the birthday, and spanning
+        /// several 100-block sync batches: the shape of the user's failing
+        /// gap extension, which reached a mainnet tip of ~3_526_285.
+        const DIVERGENCE_START: u32 = 3_500_000;
+        const DIVERGENCE_BLOCKS: u32 = 450;
+
+        /// Sapling output in every block, an Orchard action in roughly one in
+        /// thirty — deterministic, so the failure below is reproducible.
+        fn divergence_activity(height: u32) -> (u32, u32) {
+            let x = u64::from(height)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = x ^ (x >> 29);
+            (1, u32::from((x >> 20) % 100 < 3))
+        }
+
+        fn divergence_birthday() -> AccountBirthday {
+            AccountBirthday::from_parts(
+                ChainState::empty(
+                    BlockHeight::from_u32(DIVERGENCE_START - 1),
+                    BlockHash(fake_hash(DIVERGENCE_START - 1)),
+                ),
+                None,
+            )
+        }
+
+        struct ScannedWorkspace {
+            _tempdir: tempfile::TempDir,
+            workspace: RecoveryWorkspace,
+            seed: secrecy::SecretVec<u8>,
+            accounts: Vec<crate::models::DerivedAccount>,
+            transparent_account: zcash_transparent::keys::AccountPrivKey,
+            state: crate::scan::SharedScanTaskState,
+        }
+
+        impl ScannedWorkspace {
+            fn seed(&self) -> &[u8; 64] {
+                self.seed.expose_secret().as_slice().try_into().unwrap()
+            }
+
+            fn wallet_db(
+                &self,
+            ) -> WalletDb<
+                rusqlite::Connection,
+                crate::workspace::ArgosParams,
+                SystemClock,
+                rand_core::OsRng,
+            > {
+                crate::workspace::open_wallet_db(
+                    self.workspace.wallet_db_path(),
+                    consensus_network(ZeckNetwork::Mainnet),
+                )
+                .unwrap()
+            }
+
+            async fn prepare(
+                &self,
+                target: usize,
+                new_from: usize,
+            ) -> crate::error::ZeckResult<AccountPreparation> {
+                prepare_scan_accounts(
+                    &self.workspace,
+                    ZeckNetwork::Mainnet,
+                    self.seed(),
+                    &divergence_birthday(),
+                    TransparentImportMode::Legacy(&self.transparent_account),
+                    &self.accounts[..target],
+                    new_from,
+                    &self.state,
+                )
+                .await
+            }
+        }
+
+        /// A workspace holding accounts 0 and 1, synced over the divergence
+        /// chain — the state the gap loop is in when it decides to extend.
+        async fn scanned_workspace() -> ScannedWorkspace {
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.birthday = DIVERGENCE_START;
+            config.num_accounts = None;
+            let seed = mnemonic_seed(&test_seed_phrase()).unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize(config.network, seed.expose_secret())
+                .unwrap();
+            let transparent_account =
+                legacy_transparent_account_key(&test_seed_phrase(), config.network).unwrap();
+            let accounts = derive_accounts(&test_seed_phrase(), config.network, 6).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let scanned = ScannedWorkspace {
+                _tempdir: tempdir,
+                workspace,
+                seed: secrecy::SecretVec::new(seed.expose_secret().to_vec()),
+                accounts,
+                transparent_account,
+                state,
+            };
+            assert_eq!(
+                scanned.prepare(2, 0).await.unwrap(),
+                AccountPreparation::Imported,
+                "a fresh database must be imported into, not rebuilt"
+            );
+            scan_fake_chain(
+                scanned.workspace.wallet_db_path(),
+                DIVERGENCE_START,
+                DIVERGENCE_BLOCKS,
+                100,
+                &divergence_activity,
+            )
+            .await;
+            scanned
+        }
+
+        fn assert_holds_accounts(scanned: &ScannedWorkspace, count: usize) {
+            let db = scanned.wallet_db();
+            let fingerprint =
+                zip32::fingerprint::SeedFingerprint::from_seed(scanned.seed()).unwrap();
+            assert_eq!(db.get_account_ids().unwrap().len(), count);
+            for account in &scanned.accounts[..count] {
+                let derivation = zcash_client_backend::data_api::Zip32Derivation::new(
+                    fingerprint,
+                    zip32::AccountId::try_from(account.index).unwrap(),
+                );
+                assert!(
+                    db.get_derived_account(&derivation).unwrap().is_some(),
+                    "account {} missing",
+                    account.index
+                );
+            }
+        }
+
+        /// Pins the upstream behaviour this module works around:
+        /// `zcash_client_sqlite`'s `add_account` rewinds a scanned wallet to
+        /// the new account's birthday, and the second consecutive rewind finds
+        /// the pools' commitment tree checkpoints out of step. This is the
+        /// exact error a user hit at the end of a mainnet gap extension.
+        ///
+        /// If a dependency bump makes this pass, upstream has fixed the bug;
+        /// the rebuild in `prepare_scan_accounts` stays correct regardless.
+        #[tokio::test]
+        async fn upstream_consecutive_import_into_a_scanned_wallet_reports_corruption() {
+            let scanned = scanned_workspace().await;
+            let err = import_accounts(
+                &scanned.workspace,
+                ZeckNetwork::Mainnet,
+                scanned.seed(),
+                &divergence_birthday(),
+                &scanned.transparent_account,
+                &scanned.accounts[2..6],
+                &scanned.state,
+            )
+            .await
+            .expect_err(
+                "importing consecutive accounts into a scanned post-NU6.3 wallet is expected \
+                 to fail upstream; if it now succeeds, zcash_client_sqlite fixed it",
+            );
+            assert!(
+                err.to_string()
+                    .contains("retains checkpoints both above and below height"),
+                "unexpected failure: {err}"
+            );
+        }
+
+        /// The fix: a gap extension over a scanned database rebuilds it with
+        /// every account up front instead of importing into it, and the
+        /// rebuilt database then rescans cleanly from the birthday.
+        #[tokio::test]
+        async fn gap_extension_rebuilds_a_scanned_wallet_instead_of_importing_into_it() {
+            let scanned = scanned_workspace().await;
+            assert!(
+                scanned.wallet_db().block_max_scanned().unwrap().is_some(),
+                "fixture must have scanned blocks or this test proves nothing"
+            );
+
+            let preparation = scanned
+                .prepare(6, 2)
+                .await
+                .expect("gap extension over a scanned wallet must succeed");
+            assert_eq!(preparation, AccountPreparation::Rebuilt);
+
+            assert_holds_accounts(&scanned, 6);
+            assert!(
+                scanned.wallet_db().block_max_scanned().unwrap().is_none(),
+                "the extension must import into a database with no scanned blocks"
+            );
+            // Old account ids point into the replaced database, so the tracked
+            // set is replaced (6), not extended (2 + 6).
+            let tracked = scanned.state.lock().await.tracked_accounts.clone();
+            let indices: Vec<u32> = tracked.iter().map(|t| t.derived.index).collect();
+            assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+            let db_ids = scanned.wallet_db().get_account_ids().unwrap();
+            for t in &tracked {
+                assert!(db_ids.contains(&t.wallet_account_id), "stale tracked id");
+            }
+            let leftovers: Vec<_> = std::fs::read_dir(scanned.workspace.root())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("rebuild") || n.ends_with("-wal") || n.ends_with("-shm"))
+                .collect();
+            assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+
+            // The rebuilt database rescans from the birthday to the tip, and a
+            // second extension over it works the same way.
+            scan_fake_chain(
+                scanned.workspace.wallet_db_path(),
+                DIVERGENCE_START,
+                DIVERGENCE_BLOCKS,
+                100,
+                &divergence_activity,
+            )
+            .await;
+            assert_eq!(
+                scanned
+                    .wallet_db()
+                    .block_max_scanned()
+                    .unwrap()
+                    .map(|m| m.block_height()),
+                Some(BlockHeight::from_u32(
+                    DIVERGENCE_START + DIVERGENCE_BLOCKS - 1
+                ))
+            );
+        }
+
+        /// Resume invariant: a scanned database that already holds every
+        /// requested account is reused, never thrown away.
+        #[tokio::test]
+        async fn a_scanned_wallet_holding_every_account_is_not_rebuilt() {
+            let scanned = scanned_workspace().await;
+            let before = scanned.wallet_db().block_max_scanned().unwrap();
+            assert!(before.is_some());
+            assert_eq!(
+                scanned.prepare(2, 0).await.unwrap(),
+                AccountPreparation::Imported
+            );
+            assert_eq!(
+                scanned
+                    .wallet_db()
+                    .block_max_scanned()
+                    .unwrap()
+                    .map(|m| m.block_height()),
+                before.map(|m| m.block_height()),
+                "resuming a complete workspace must keep its scan progress"
+            );
+        }
+
+        /// The user's on-disk state: an earlier run imported one extension
+        /// account into the scanned database and then failed on the next. On
+        /// resume, the initial pass reuses it; the extension rebuilds it.
+        #[tokio::test]
+        async fn resume_after_a_failed_extension_rebuilds_rather_than_importing_again() {
+            let scanned = scanned_workspace().await;
+            import_accounts(
+                &scanned.workspace,
+                ZeckNetwork::Mainnet,
+                scanned.seed(),
+                &divergence_birthday(),
+                &scanned.transparent_account,
+                &scanned.accounts[2..3],
+                &scanned.state,
+            )
+            .await
+            .expect("the first import into a scanned wallet succeeds upstream");
+            assert!(scanned.wallet_db().block_max_scanned().unwrap().is_some());
+
+            // Fresh process: nothing tracked yet.
+            scanned.state.lock().await.tracked_accounts.clear();
+            assert_eq!(
+                scanned.prepare(2, 0).await.unwrap(),
+                AccountPreparation::Imported
+            );
+            assert_eq!(
+                scanned.prepare(6, 2).await.expect("resumed extension"),
+                AccountPreparation::Rebuilt
+            );
+            assert_holds_accounts(&scanned, 6);
+            assert_eq!(scanned.state.lock().await.tracked_accounts.len(), 6);
         }
     }
 
