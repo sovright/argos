@@ -1,4 +1,24 @@
 //! Durable, versioned Sprout sweep transactions, keyed by note and source.
+//!
+//! # What is on disk
+//!
+//! `sprout-sweep-<fingerprint>.journal` in the data directory: a header
+//! (version, network, full key-set fingerprint), then one JSON record per
+//! event -- each note's outpoint and swept value, each transaction's exact
+//! signed bytes, fee and expiry, and its lifecycle transitions with the
+//! observations behind them.
+//!
+//! It holds no spending key (`a_sk`) and no note plaintext, so it cannot
+//! spend anything; the scan checkpoint is the spend-capable file. It is
+//! still linkable: the signed bytes reveal each note's nullifier and the
+//! destination's encrypted output, tying the wallet's Sprout notes to their
+//! sweep transactions.
+//!
+//! The journal is created through the private artifact container before its
+//! first byte is written. Every append verifies the retained namespace, exact
+//! object identity, lineage anchor, and artifact generation. Legacy journals
+//! without that v4 lineage boundary are preserved unchanged and refused until
+//! explicitly reconciled.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -363,6 +383,10 @@ pub struct SproutJournalSnapshot {
     checkpoint_manifests: HashMap<CheckpointGeneration, CheckpointManifest>,
     discard_started: HashSet<CheckpointGeneration>,
     discarded_checkpoints: HashSet<CheckpointGeneration>,
+    /// Expired or rejected transactions a later plan replaced, in the order
+    /// they were replaced. Kept so the old txid stays visible to the user;
+    /// never indexed by txid, so no transition can reach them.
+    superseded: Vec<SproutJournalEntry>,
 }
 
 impl SproutJournalSnapshot {
@@ -380,6 +404,12 @@ impl SproutJournalSnapshot {
 
     pub fn entries_in_journal_order(&self) -> impl Iterator<Item = &SproutJournalEntry> {
         self.entries()
+    }
+
+    /// Transactions replaced by a later plan for the same note. Their state
+    /// is final (Expired or Rejected) and their value is never counted.
+    pub fn superseded_entries(&self) -> impl Iterator<Item = &SproutJournalEntry> {
+        self.superseded.iter()
     }
 
     pub fn ready_for_new_plan(&self, outpoint: &JsOutPoint) -> bool {
@@ -542,8 +572,10 @@ impl SproutJournalSnapshot {
                             "conflicting prepared transaction for active note",
                         ));
                     }
-                    self.by_txid.remove(&existing.txid());
+                    let replaced = existing.clone();
+                    self.by_txid.remove(&replaced.txid());
                     self.order.retain(|existing| *existing != note_id);
+                    self.superseded.push(replaced);
                 }
                 self.seen_transactions
                     .insert(tx.txid, (note_id, value_zatoshis, tx.clone()));
@@ -593,14 +625,31 @@ impl SproutJournalSnapshot {
                         false,
                     )?;
                 } else {
-                    // A v1 acceptance has no raw bytes or expiry; it cannot be
-                    // declared final without independently corroborated evidence.
+                    // A v1 acceptance has no raw bytes or expiry. It follows
+                    // the same evidence policy as a v2 record: corroborated
+                    // mining for Mined, one operator for MinedSingleSource,
+                    // absence past the derived expiry bound for Expired, and
+                    // only a positive reorg, absence, or mempool sighting
+                    // demotes a mined record back to Pending.
+                    use crate::broadcast::TxObservationState as Seen;
+                    let seen = observation.as_ref().map(|o| &o.state);
+                    let final_state = matches!(
+                        entry.state,
+                        TxLifecycleState::Expired | TxLifecycleState::Rejected
+                    );
                     match state {
-                        TxLifecycleState::SubmissionUnknown => {}
+                        TxLifecycleState::SubmissionUnknown if !entry.state.is_mined() => {}
                         TxLifecycleState::Mined
-                            if observation
-                                .as_ref()
-                                .is_some_and(TxObservation::has_canonical_mined_evidence) => {}
+                            if !final_state
+                                && observation
+                                    .as_ref()
+                                    .is_some_and(TxObservation::has_canonical_mined_evidence) => {}
+                        TxLifecycleState::MinedSingleSource
+                            if !final_state
+                                && entry.state != TxLifecycleState::Mined
+                                && observation.as_ref().is_some_and(
+                                    TxObservation::has_single_source_mined_evidence,
+                                ) => {}
                         TxLifecycleState::Expired
                             if observation.as_ref().is_some_and(TxObservation::is_expired)
                                 && entry.legacy_expiry_bound.is_some_and(|bound| {
@@ -608,9 +657,15 @@ impl SproutJournalSnapshot {
                                         == Some(bound)
                                 }) => {}
                         TxLifecycleState::Pending
-                            if observation.as_ref().is_some_and(|o| {
-                                o.state == crate::broadcast::TxObservationState::PresentUnmined
-                            }) => {}
+                            if !final_state
+                                && if entry.state.is_mined() {
+                                    matches!(
+                                        seen,
+                                        Some(Seen::Reorged | Seen::Absent | Seen::PresentUnmined)
+                                    )
+                                } else {
+                                    !matches!(seen, Some(Seen::Mined | Seen::MinedSingleSource))
+                                } => {}
                         _ => {
                             return Err(journal_error(
                                 "legacy transaction lacks evidence for transition",
@@ -654,7 +709,10 @@ impl SproutJournalSnapshot {
                         transaction: None,
                         legacy_txid: Some(txid),
                         value_zatoshis: None,
-                        state: TxLifecycleState::SubmissionUnknown,
+                        // v1 recorded only that a node accepted the bytes:
+                        // in flight, never final, and not a reason to stop
+                        // the other notes.
+                        state: TxLifecycleState::Pending,
                         last_submission: None,
                         observation: None,
                         observations: Vec::new(),

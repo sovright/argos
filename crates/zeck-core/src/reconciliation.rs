@@ -266,17 +266,16 @@ mod tests {
     use std::{collections::VecDeque, time::Duration};
 
     use async_trait::async_trait;
-    use zcash_client_backend::proto::service::SendResponse;
-    use zcash_primitives::transaction::{Authorized, TransactionData, TxId, TxVersion};
-    use zcash_protocol::consensus::{BlockHeight, BranchId};
+    use zcash_primitives::transaction::TxId;
 
     use crate::{
         broadcast::{
             observe_transaction, BroadcastStore, DurableBroadcastLog, EndpointTxEvidence,
             PreparedTransaction, SubmissionDisposition, TxObservation, TxObservationState,
-            TxObserver, TxSubmitter,
+            TxObserver,
         },
         models::{TxLifecycleState, ZeckNetwork},
+        test_support::{AcceptingSubmitter, LostReplySubmitter},
         ZeckResult,
     };
 
@@ -310,26 +309,7 @@ mod tests {
     }
 
     fn prepared_with_expiry(expiry: u32) -> PreparedTransaction {
-        let tx = TransactionData::<Authorized>::from_parts(
-            TxVersion::V5,
-            BranchId::Nu5,
-            0,
-            BlockHeight::from_u32(expiry),
-            None,
-            None,
-            None,
-            None,
-        )
-        .freeze()
-        .unwrap();
-        let mut raw_tx = Vec::new();
-        tx.write(&mut raw_tx).unwrap();
-        PreparedTransaction {
-            txid: tx.txid(),
-            raw_tx,
-            fee_zatoshis: 10_000,
-            expiry_height: Some(expiry),
-        }
+        crate::test_support::empty_v5_prepared(expiry, 10_000)
     }
 
     fn prepared() -> PreparedTransaction {
@@ -764,21 +744,12 @@ mod tests {
         }
     }
 
-    struct LostReplySubmitter;
-
-    #[async_trait]
-    impl TxSubmitter for LostReplySubmitter {
-        async fn send_raw(&mut self, _raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
-            Err(tonic::Status::unavailable("GoAway"))
-        }
-    }
-
     #[tokio::test]
     async fn default_operator_mining_resolves_review_but_not_discard() {
         let dir = tempfile::tempdir().unwrap();
         let tx = prepared();
         let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
-        let mut node = CapturingSubmitter::default();
+        let mut node = AcceptingSubmitter::default();
         let submitted = crate::broadcast::submit_prepared_transaction(
             &mut log,
             &mut node,
@@ -905,20 +876,6 @@ mod tests {
         assert!(!log.has_unresolved_history());
     }
 
-    #[derive(Default)]
-    struct CapturingSubmitter(Vec<Vec<u8>>);
-
-    #[async_trait]
-    impl TxSubmitter for CapturingSubmitter {
-        async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
-            self.0.push(raw);
-            Ok(SendResponse {
-                error_code: 0,
-                error_message: String::new(),
-            })
-        }
-    }
-
     #[tokio::test]
     async fn explicit_unknown_retry_sends_only_the_stored_transaction() {
         let dir = tempfile::tempdir().unwrap();
@@ -933,7 +890,7 @@ mod tests {
             tx.expiry_height,
         );
         let mut observer = ScriptedObserver(VecDeque::from([absent]));
-        let mut submitter = CapturingSubmitter::default();
+        let mut submitter = AcceptingSubmitter::default();
         let result = super::retry_unknown_transaction(
             &mut log,
             &mut observer,
@@ -973,7 +930,7 @@ mod tests {
             tx.expiry_height,
         );
         let mut observer = ScriptedObserver(VecDeque::from([present]));
-        let mut submitter = CapturingSubmitter::default();
+        let mut submitter = AcceptingSubmitter::default();
         let result = super::retry_unknown_transaction(
             &mut log,
             &mut observer,
@@ -1003,7 +960,7 @@ mod tests {
             tx.expiry_height,
         );
         let mut observer = ScriptedObserver(VecDeque::from([absent]));
-        let mut submitter = CapturingSubmitter::default();
+        let mut submitter = AcceptingSubmitter::default();
         let result = super::retry_unknown_transaction(
             &mut log,
             &mut observer,

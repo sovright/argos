@@ -455,10 +455,6 @@ pub struct SweepRequest {
     /// service binds `None` to the exact reviewed proposal total before
     /// issuing the one-shot proposal ID.
     pub max_fee_zatoshis: Option<u64>,
-    /// Informational input only. The service replaces this with its own
-    /// proposal fee before storing a one-shot reviewed intent.
-    #[serde(default)]
-    pub reviewed_fee_zatoshis: Option<u64>,
     /// Fraction of each account's send amount to donate (e.g. 0.10). `None`
     /// skips the donation entirely. Validated to 0.0..1.0.
     #[serde(default)]
@@ -475,9 +471,23 @@ pub enum ProposedTxKind {
     SweepShielded,
 }
 
+/// The signing route a quoted transaction takes. Ordering and execution key
+/// on this, never on the display `note`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposedLegKind {
+    /// Built and signed through the wallet database (HD or imported Sapling).
+    #[default]
+    Wallet,
+    /// Standalone transparent UTXOs swept directly, with no wallet account.
+    DirectTransparent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedTx {
     pub kind: ProposedTxKind,
+    #[serde(default)]
+    pub leg_kind: ProposedLegKind,
     pub source_account: u32,
     pub destination: String,
     pub gross_zatoshis: u64,

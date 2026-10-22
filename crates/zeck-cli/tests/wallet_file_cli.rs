@@ -470,6 +470,18 @@ fn cli_never_calls_pending_value_swept() {
         !lifecycle.to_ascii_lowercase().contains("swept"),
         "pending lifecycle output claimed finality: {lifecycle}"
     );
+    assert!(
+        !stdout.contains("These were recovered from this file alone — no scan needed"),
+        "active-only journal was described as a newly recovered note: {stdout}"
+    );
+    assert!(
+        !stdout.contains("To move them:"),
+        "active-only journal offered a conflicting new sweep: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Nothing is left to sweep"),
+        "pending history was hidden by a terminal verdict: {stdout}"
+    );
 }
 
 #[test]

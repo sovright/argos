@@ -22,7 +22,21 @@ function result(status, detail = "") {
     detail, confirmed_height: 2222222 };
 }
 
-function screen() {
+// The completion text is the backend's (argos_core::sweep_guidance, whose
+// Rust tests pin the wording and precedence). This stub echoes its input so
+// the tests can check what the screen sent and where it put the answer.
+function stubGuidance(input) {
+  const statuses = input.transactions.map((tx) => tx.status);
+  return {
+    recovery_complete: false,
+    summary: `summary:${statuses.join(",")}`,
+    next_steps: `next:${statuses.join(",")}`,
+    donation: input.donation_requested || input.donated_zatoshis ? `donation:${input.donated_zatoshis}` : null,
+    status_labels: statuses.map((status) => `label:${status}`),
+  };
+}
+
+function screen(override = () => ({})) {
   const elements = new Map();
   function element() {
     return { textContent: "", innerHTML: "", hidden: false, disabled: false,
@@ -36,73 +50,201 @@ function screen() {
     if (!elements.has(id)) elements.set(id, element());
     return elements.get(id);
   };
-  const context = { $, state: { retainedAddressSearchId: null, scanConfig: null,
+  const inputs = [];
+  const invoke = async (command, args) => {
+    assert.equal(command, "sweep_completion_guidance");
+    inputs.push(JSON.parse(JSON.stringify(args.input)));
+    return { ...stubGuidance(args.input), ...override(args.input) };
+  };
+  const context = { $, invoke, state: { retainedAddressSearchId: null, scanConfig: null,
       lastProgress: null }, fmt: (n) => `${(n / 1e8).toFixed(8)} ZEC`,
     document: { createElement: element }, Date };
-  const names = ["txStatusKind", "txStatusLabel", "sweepStatusCounts",
-    "sweepCompleteSummary", "renderCompleteScreen", "buildReport", "buildDefaultReportPath"];
-  return { $, ...loadFunctions(names, context) };
+  const names = ["txStatusKind", "sweepStatusCounts", "completionGuidanceInput",
+    "loadCompletionGuidance", "renderCompleteScreen", "buildReport", "buildDefaultReportPath"];
+  return { $, inputs, ...loadFunctions(names, context) };
 }
 
-test("submission_unknown is not rendered as failed or zero broadcasts", () => {
+function label(h, index = 0) {
+  return h.$("complete-txids").children[index].children[0].textContent;
+}
+
+test("backend guidance fills the summary, next steps, labels, and report", async () => {
   const h = screen();
-  const unknown = result("submission_unknown", "transport reply was lost");
-  h.renderCompleteScreen([unknown], [], 0, null, null, null);
-  assert.match(h.$("complete-summary").textContent, /may already have moved/i);
-  assert.doesNotMatch(h.$("complete-summary").textContent, /no funds were moved|failed to broadcast/i);
+  await h.renderCompleteScreen([result("submission_unknown", "transport reply was lost")],
+    [], 0, null, null, null);
+  assert.equal(h.$("complete-summary").textContent, "summary:submission_unknown");
+  assert.equal(h.$("complete-confirmation-note").textContent, "next:submission_unknown");
+  assert.equal(label(h), "Account 0 · label:submission_unknown");
+  assert.match(h.$("save-report").dataset.report, /Guidance: summary:submission_unknown/);
   assert.equal(h.$("complete-txids").children[0].className.includes("failed"), false);
-  assert.match(h.$("complete-txids").children[0].children[0].textContent,
-    /Submission uncertain — may already be on the network\. Do not retry without a fresh status check\./);
-  assert.equal(h.sweepStatusCounts([unknown]).unknown, 1);
+  assert.equal(h.sweepStatusCounts([result("submission_unknown")]).unknown, 1);
 });
 
-test("secondary disagreement never renders confirmed or mined", () => {
+test("the screen sends normalized statuses and every flag the text depends on", async () => {
   const h = screen();
-  h.renderCompleteScreen([result("pending", "Independent servers disagree on block inclusion")],
+  const outcome = { transactions: [{ ...result("mined"), safe_to_discard: true }, result("broadcast"),
+      result("confirmed"), result("failed")],
+    skipped_accounts: [{ account_index: 4, gross_zatoshis: 1, reason: "dust" }],
+    error: "later account failed", follow_up_review_required: true };
+  await h.renderCompleteScreen(outcome.transactions, outcome.skipped_accounts, 100000, 0.1,
+    outcome.error, "route note", { outcome });
+  assert.deepEqual(h.inputs, [{
+    transactions: [
+      { status: "mined", safe_to_discard: true },
+      { status: "pending", safe_to_discard: false },
+      { status: "pending", safe_to_discard: false },
+      { status: "submission_unknown", safe_to_discard: false },
+    ],
+    skipped_accounts: 1,
+    follow_up_review_required: true,
+    error: "later account failed",
+    status_only: false,
+    donation_requested: true,
+    donated_zatoshis: 100000,
+    donation_note: "route note",
+  }]);
+});
+
+test("a zero donation rate is not a donation request", async () => {
+  const h = screen();
+  await h.renderCompleteScreen([result("mined")], [], 0, 0, null, null);
+  assert.equal(h.inputs[0].donation_requested, false);
+  assert.equal(h.$("complete-donation").hidden, true);
+  assert.equal(h.$("complete-donation").textContent, "");
+});
+
+test("the donation line is the backend's and hidden when it has none", async () => {
+  const h = screen();
+  await h.renderCompleteScreen([result("pending")], [], 100000, 0.1, null, null);
+  assert.equal(h.$("complete-donation").hidden, false);
+  assert.equal(h.$("complete-donation").textContent, "donation:100000");
+});
+
+test("only the backend can say recovery is complete", async () => {
+  const deep = { ...result("mined"), safe_to_discard: true };
+  const incomplete = screen();
+  await incomplete.renderCompleteScreen([deep], [], 0, null, null, null);
+  assert.equal(incomplete.$("complete-heading").textContent, "Sweep status");
+  const complete = screen(() => ({ recovery_complete: true }));
+  await complete.renderCompleteScreen([deep], [], 0, null, null, null);
+  assert.equal(complete.$("complete-heading").textContent, "Recovery complete");
+  assert.match(complete.$("save-report").dataset.report, /Status: Recovery complete/);
+});
+
+test("a saved-journal view asks for status-only guidance and keeps its heading", async () => {
+  const h = screen(() => ({ recovery_complete: true }));
+  const outcome = { transactions: [result("mined")], skipped_accounts: [] };
+  await h.renderCompleteScreen(outcome.transactions, [], 0, null, null, null,
+    { outcome, statusOnly: true });
+  assert.equal(h.inputs[0].status_only, true);
+  assert.equal(h.$("complete-heading").textContent, "Saved transaction status");
+  assert.equal(h.$("delete-workspace").disabled, true);
+});
+
+test("a failed guidance lookup keeps the transaction cards and a conservative instruction", async () => {
+  const h = screen();
+  const failing = loadFunctions(["txStatusKind", "sweepStatusCounts", "completionGuidanceInput",
+    "loadCompletionGuidance", "renderCompleteScreen", "buildReport", "buildDefaultReportPath"], {
+    $: h.$, invoke: async () => { throw new Error("ipc down"); },
+    state: { retainedAddressSearchId: null }, fmt: (n) => `${n}`,
+    document: { createElement: () => ({ children: [], style: {}, dataset: {},
+      appendChild(child) { this.children.push(child); }, addEventListener() {} }) },
+    Date,
+  });
+  await failing.renderCompleteScreen([result("submission_unknown")], [], 0, null, null, null);
+  assert.equal(h.$("complete-txids").children.length, 1);
+  const text = (node) => [node.textContent || "", ...(node.children || []).map(text)].join(" ");
+  assert.match(text(h.$("complete-txids").children[0]), /abc123/);
+  assert.match(h.$("complete-summary").textContent, /Keep the source wallet/);
+  assert.match(h.$("complete-confirmation-note").textContent, /ipc down/);
+  assert.notEqual(h.$("complete-heading").textContent, "Recovery complete");
+});
+
+test("an older render's late guidance cannot overwrite a newer screen", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let calls = 0;
+  const h = screen();
+  const shared = { retainedAddressSearchId: null };
+  const slow = loadFunctions(["txStatusKind", "sweepStatusCounts", "completionGuidanceInput",
+    "loadCompletionGuidance", "renderCompleteScreen", "buildReport", "buildDefaultReportPath"], {
+    $: h.$, state: shared, fmt: (n) => `${n}`, Date,
+    document: { createElement: () => ({ children: [], style: {}, dataset: {},
+      appendChild(child) { this.children.push(child); }, addEventListener() {} }) },
+    invoke: async (_command, args) => {
+      calls += 1;
+      if (calls === 1) await gate;
+      return stubGuidance(args.input);
+    },
+  });
+  const first = slow.renderCompleteScreen([result("pending")], [], 0, null, null, null);
+  await slow.renderCompleteScreen([result("mined")], [], 0, null, null, null);
+  release();
+  await first;
+  assert.equal(h.$("complete-summary").textContent, "summary:mined");
+});
+
+test("secondary disagreement never renders mined evidence for a pending row", async () => {
+  const h = screen();
+  await h.renderCompleteScreen([result("pending", "Independent servers disagree on block inclusion")],
     [], 0, null, null, null);
   const card = h.$("complete-txids").children[0];
-  assert.match(card.children[0].textContent, /Broadcast — awaiting independent confirmation/);
-  assert.doesNotMatch(card.children.map((x) => x.textContent).join(" "), /Mined at block|independently confirmed/i);
+  assert.doesNotMatch(card.children.map((x) => x.textContent).join(" "), /Mined at block/);
   assert.match(card.children.map((x) => x.textContent).join(" "), /Independent servers disagree/);
 });
 
-test("pending and unknown keep the original wallet warning", () => {
-  for (const status of ["pending", "submission_unknown"]) {
-    const h = screen();
-    h.renderCompleteScreen([result(status)], [], 0, null, null, null);
-    assert.match(h.$("complete-summary").textContent, /keep the source wallet/i);
-    assert.equal(h.$("delete-workspace").disabled, true);
+test("unresolved results disable workspace deletion; resolved ones allow it", async () => {
+  const h = screen();
+  for (const status of ["pending", "submission_unknown", "confirmed", "not_submitted"]) {
+    await h.renderCompleteScreen([result("mined"), result(status)], [], 0, null, null, null);
+    assert.equal(h.$("delete-workspace").disabled, true, status);
+  }
+  for (const status of ["mined", "mined_single_source", "expired", "rejected"]) {
+    await h.renderCompleteScreen([result(status)], [], 0, null, null, null);
+    assert.equal(h.$("delete-workspace").disabled, false, status);
   }
 });
 
-test("unresolved results disable workspace deletion; resolved ones allow it", () => {
+test("a staged sweep keeps its workspace for the follow-up review", async () => {
   const h = screen();
-  h.renderCompleteScreen([result("mined"), result("pending")], [], 0, null, null, null);
+  await h.renderCompleteScreen([result("mined")], [], 0, null, null, null,
+    { followUpReviewRequired: true });
+  assert.equal(h.inputs[0].follow_up_review_required, true);
   assert.equal(h.$("delete-workspace").disabled, true);
-  h.renderCompleteScreen([result("mined"), result("mined")], [], 0, null, null, null);
-  assert.equal(h.$("delete-workspace").disabled, false);
-  assert.match(h.$("complete-summary").textContent, /2 transactions mined/i);
-  h.renderCompleteScreen([result("mined_single_source")], [], 0, null, null, null);
-  assert.equal(h.$("delete-workspace").disabled, false);
+  assert.equal(h.$("restart-flow").textContent, "Rescan and review");
 });
 
-test("single-operator mining never says recovery is complete or safe to discard", () => {
+test("partial abort report includes error, skipped balances, and incomplete status", async () => {
   const h = screen();
-  h.renderCompleteScreen([result("mined_single_source")], [], 0, null, null, null);
-  assert.equal(h.txStatusKind("mined_single_source"), "mined_single_source");
-  const copy = `${h.$("complete-heading").textContent} ${h.$("complete-summary").textContent} ${h.$("complete-confirmation-note").textContent}`;
-  assert.doesNotMatch(copy, /Recovery complete|independently confirmed/i);
-  assert.match(copy, /independent source/i);
-  assert.match(h.$("complete-txids").children[0].children[0].textContent, /one confirmation operator/i);
+  const outcome = { transactions: [result("pending", "one node accepted")],
+    skipped_accounts: [{ account_index: 4, gross_zatoshis: 500000, reason: "dust" }],
+    total_donation_zatoshis: 0, error: "later account failed", follow_up_review_required: false };
+  await h.renderCompleteScreen(outcome.transactions, outcome.skipped_accounts, 0, null,
+    outcome.error, null, { outcome });
+  const report = h.$("save-report").dataset.report;
+  assert.match(report, /Status: Incomplete/i);
+  assert.match(report, /later account failed/);
+  assert.match(report, /Account 4: dust \(0\.00500000 ZEC\)/);
+  assert.doesNotMatch(report, /Status: Recovery complete/i);
 });
 
-test("corroborated mining says recovery complete only when deep enough", () => {
+test("shield-only report identifies required fresh review", async () => {
   const h = screen();
-  h.renderCompleteScreen([result("mined")], [], 0, null, null, null);
-  assert.notEqual(h.$("complete-heading").textContent, "Recovery complete");
-  assert.match(h.$("complete-confirmation-note").textContent, /confirmations/i);
-  h.renderCompleteScreen([{ ...result("mined"), safe_to_discard: true }], [], 0, null, null, null);
-  assert.equal(h.$("complete-heading").textContent, "Recovery complete");
+  const outcome = { transactions: [result("mined")], skipped_accounts: [],
+    total_donation_zatoshis: 0, error: null, follow_up_review_required: true };
+  await h.renderCompleteScreen(outcome.transactions, [], 0, null, null, null, { outcome });
+  const report = h.$("save-report").dataset.report;
+  assert.match(report, /Status: Shielding stage/i);
+  assert.match(report, /Follow-up review required: yes/i);
+  assert.doesNotMatch(report, /Status: Recovery complete/i);
+});
+
+test("legacy failed is sent as an uncertain submission, never a rejection", async () => {
+  const h = screen();
+  await h.renderCompleteScreen([result("failed")], [], 0, null, null, null);
+  assert.equal(h.txStatusKind("failed"), "submission_unknown");
+  assert.equal(h.inputs[0].transactions[0].status, "submission_unknown");
+  assert.doesNotMatch(label(h), /Rejected/);
 });
 
 test("proposal fee populates a blank execution cap", async () => {
@@ -122,36 +264,6 @@ test("proposal fee populates a blank execution cap", async () => {
   assert.equal(state.sweepReview.proposal_id, "reviewed");
 });
 
-test("follow-up review does not say sweep complete", () => {
-  const h = screen();
-  h.renderCompleteScreen([result("mined")], [], 0, null, null, null,
-    { followUpReviewRequired: true });
-  assert.doesNotMatch(h.$("complete-summary").textContent, /sweep complete|recovery complete/i);
-  assert.match(h.$("complete-summary").textContent, /rescan.*review/i);
-  assert.equal(h.$("delete-workspace").disabled, true);
-});
-
-test("saved report includes exact fee and evidence but no unmined height", () => {
-  const h = screen();
-  const report = h.buildReport([result("pending", "servers disagree"), result("mined", "two matching blocks")]);
-  assert.match(report, /pending[\s\S]*fee: 0\.00012345 ZEC[\s\S]*servers disagree/);
-  assert.match(report, /mined[\s\S]*mined at block 2222222/);
-  assert.equal((report.match(/mined at block/g) || []).length, 1);
-});
-
-test("legacy broadcast from merged seedless routes remains pending", () => {
-  const h = screen();
-  assert.equal(h.txStatusKind("broadcast"), "pending");
-  assert.equal(h.sweepStatusCounts([result("broadcast")]).pending, 1);
-});
-
-test("legacy confirmed does not qualify for independent-mining cleanup", () => {
-  const h = screen();
-  h.renderCompleteScreen([result("confirmed")], [], 0, null, null, null);
-  assert.equal(h.$("delete-workspace").disabled, true);
-  assert.doesNotMatch(h.$("complete-summary").textContent, /Recovery complete/);
-});
-
 test("an explicit user fee cap remains unchanged after review", async () => {
   const input = { value: "0.002" };
   const state = { scanHandle: { id: "scan" }, proposalGeneration: 0,
@@ -165,23 +277,6 @@ test("an explicit user fee cap remains unchanged after review", async () => {
   const { refreshSweepProposal } = loadFunctions(["refreshSweepProposal"], context);
   await refreshSweepProposal();
   assert.equal(input.value, "0.002");
-});
-
-test("uncertain shielding follow-up retains no-retry guidance", () => {
-  const h = screen();
-  h.renderCompleteScreen([result("submission_unknown")], [], 0, null, null, null,
-    { followUpReviewRequired: true });
-  assert.match(h.$("complete-summary").textContent, /may already have moved/i);
-  assert.match(h.$("complete-summary").textContent, /do not retry/i);
-  assert.match(h.$("complete-summary").textContent, /rescan.*review/i);
-});
-
-test("partially mined outcome does not claim nothing was submitted", () => {
-  const h = screen();
-  h.renderCompleteScreen([result("mined"), result("not_submitted")], [], 0, null, null, null);
-  assert.doesNotMatch(h.$("complete-summary").textContent, /No transaction was submitted/);
-  assert.match(h.$("complete-summary").textContent, /1 transaction mined/i);
-  assert.equal(h.$("delete-workspace").disabled, true);
 });
 
 test("auto-derived fee cap refreshes when a later proposal quote rises", async () => {
@@ -247,99 +342,16 @@ test("failed refresh clears an obsolete auto-derived fee cap", async () => {
   assert.equal(state.maxFeeZec, null);
 });
 
-test("partial abort report includes error, skipped balances, and incomplete status", () => {
+test("saved report includes exact fee and evidence but no unmined height", () => {
   const h = screen();
-  const outcome = { transactions: [result("pending", "one node accepted")],
-    skipped_accounts: [{ account_index: 4, gross_zatoshis: 500000, reason: "dust" }],
-    total_donation_zatoshis: 0, error: "later account failed", follow_up_review_required: false };
-  h.renderCompleteScreen(outcome.transactions, outcome.skipped_accounts, 0, null,
-    outcome.error, null, { outcome });
-  const report = h.$("save-report").dataset.report;
-  assert.match(report, /Status: Incomplete/i);
-  assert.match(report, /later account failed/);
-  assert.match(report, /Account 4: dust \(0\.00500000 ZEC\)/);
-  assert.doesNotMatch(report, /Status: Recovery complete/i);
+  const report = h.buildReport([result("pending", "servers disagree"), result("mined", "two matching blocks")]);
+  assert.match(report, /pending[\s\S]*fee: 0\.00012345 ZEC[\s\S]*servers disagree/);
+  assert.match(report, /mined[\s\S]*mined at block 2222222/);
+  assert.equal((report.match(/mined at block/g) || []).length, 1);
 });
 
-test("shield-only report identifies required fresh review", () => {
+test("legacy broadcast from merged seedless routes remains pending", () => {
   const h = screen();
-  const outcome = { transactions: [result("mined")], skipped_accounts: [],
-    total_donation_zatoshis: 0, error: null, follow_up_review_required: true };
-  h.renderCompleteScreen(outcome.transactions, [], 0, null, null, null, { outcome });
-  const report = h.$("save-report").dataset.report;
-  assert.match(report, /Status: Shielding stage/i);
-  assert.match(report, /Follow-up review required: yes/i);
-  assert.match(report, /rescan and review/i);
-  assert.doesNotMatch(report, /Status: Recovery complete/i);
-});
-
-test("unknown submission keeps donation amount uncertain even when recorded total is zero", () => {
-  const h = screen();
-  h.renderCompleteScreen([result("submission_unknown")], [], 0, 0.1, null, null);
-  assert.match(h.$("complete-donation").textContent, /donation.*uncertain/i);
-  assert.doesNotMatch(h.$("complete-donation").textContent, /No donation was sent|Donated 0/);
-});
-
-test("all mined with skipped balance is incomplete", () => {
-  const h = screen();
-  const skipped = [{ account_index: 2, gross_zatoshis: 100000, reason: "dust" }];
-  h.renderCompleteScreen([{ ...result("mined"), safe_to_discard: true }], skipped, 0, null, null, null);
-  assert.doesNotMatch(h.$("complete-summary").textContent, /Recovery complete/);
-  assert.match(h.$("complete-summary").textContent, /skipped|not swept/i);
-});
-
-test("expired rejected and not-submitted messages do not imply future mining", () => {
-  for (const [status, deletable] of [["expired", true], ["rejected", true], ["not_submitted", false]]) {
-    const h = screen();
-    h.renderCompleteScreen([result(status)], [], 0, null, null, null);
-    const copy = `${h.$("complete-summary").textContent} ${h.$("complete-confirmation-note").textContent}`;
-    assert.doesNotMatch(copy, /until.*mined|may still mine|pending or uncertain/i, status);
-    assert.equal(h.$("delete-workspace").disabled, !deletable, status);
-  }
-});
-
-test("legacy failed does not become definite rejection", () => {
-  const h = screen();
-  h.renderCompleteScreen([result("failed")], [], 0, null, null, null);
-  assert.equal(h.txStatusKind("failed"), "submission_unknown");
-  assert.match(h.$("complete-summary").textContent, /may already have moved/i);
-  assert.doesNotMatch(h.$("complete-txids").children[0].children[0].textContent, /Rejected/);
-});
-
-test("donation receipt waits for canonical mining", () => {
-  for (const [status, expected] of [
-    ["pending", /awaiting independent confirmation/i],
-    ["expired", /not confirmed.*rescan/i],
-  ]) {
-    const h = screen();
-    h.renderCompleteScreen([result(status)], [], 100000, 0.1, null, null);
-    const copy = h.$("complete-donation").textContent;
-    assert.match(copy, expected, status);
-    assert.doesNotMatch(copy, /Donated /, status);
-  }
-  const zeroPending = screen();
-  zeroPending.renderCompleteScreen([result("pending")], [], 0, 0.1, null, null);
-  assert.doesNotMatch(zeroPending.$("complete-donation").textContent, /No donation was sent|Donated /);
-  for (const status of ["rejected", "not_submitted"]) {
-    const h = screen();
-    h.renderCompleteScreen([result(status)], [], 100000, 0.1, null, null);
-    assert.match(h.$("complete-donation").textContent, /No donation was sent or confirmed/i, status);
-  }
-  const mined = screen();
-  mined.renderCompleteScreen([result("mined")], [], 100000, 0.1, null, null);
-  assert.match(mined.$("complete-donation").textContent, /^Donated 0\.00100000 ZEC/);
-});
-
-test("mixed pending or unknown and expired results give both recovery actions", () => {
-  for (const first of ["pending", "submission_unknown"]) {
-    for (const followUpReviewRequired of [false, true]) {
-      const h = screen();
-      h.renderCompleteScreen([result(first), result("expired")], [], 0, null, null, null,
-        { followUpReviewRequired });
-      const copy = `${h.$("complete-summary").textContent} ${h.$("complete-confirmation-note").textContent}`;
-      assert.match(copy, /reconcile/i, `${first} follow-up=${followUpReviewRequired}`);
-      assert.match(copy, /rescan/i, `${first} follow-up=${followUpReviewRequired}`);
-      assert.doesNotMatch(copy, /every submitted transaction.*mine/i, first);
-    }
-  }
+  assert.equal(h.txStatusKind("broadcast"), "pending");
+  assert.equal(h.sweepStatusCounts([result("broadcast")]).pending, 1);
 });

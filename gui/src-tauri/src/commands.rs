@@ -1114,7 +1114,6 @@ pub async fn propose_sweep(
                 destination,
                 memo,
                 max_fee_zatoshis,
-                reviewed_fee_zatoshis: None,
                 donation_rate,
                 donor_email,
             },
@@ -1174,6 +1173,8 @@ pub struct SproutSweepResult {
     pub value_zatoshis: Option<u64>,
     pub state: argos_core::TxLifecycleState,
     pub mined_height: Option<u32>,
+    /// Replaced by a later plan for the same note; listed, needs no action.
+    pub superseded: bool,
 }
 
 #[derive(Serialize)]
@@ -1201,6 +1202,8 @@ fn sprout_result_from_entry(
             .as_ref()
             .filter(|observation| observation.has_canonical_mined_evidence())
             .and_then(|observation| observation.mined_height),
+        // Built from a live journal entry, which a later plan has not replaced.
+        superseded: false,
     }
 }
 
@@ -2162,6 +2165,7 @@ fn sprout_sweep_report(
                 value_zatoshis: transaction.value_zatoshis,
                 state: transaction.state,
                 mined_height: transaction.mined_height,
+                superseded: transaction.superseded,
             })
             .collect(),
         mined_zatoshis: outcome.mined_zatoshis,
@@ -2351,6 +2355,16 @@ fn summary_nu7_warning(sprout_keys: usize, network_name: &str) -> String {
         return String::new();
     }
     argos_core::sprout_sweep::nu7_recovery_warning(network_from(network_name))
+}
+
+/// The completion screen's summary, next steps, donation line, and status
+/// labels, from the same rules the CLI prints. Stateless: the frontend calls
+/// it again whenever a reconciliation changes a displayed row.
+#[tauri::command]
+pub fn sweep_completion_guidance(
+    input: argos_core::sweep_guidance::CompletionGuidanceInput,
+) -> argos_core::sweep_guidance::CompletionGuidance {
+    argos_core::sweep_guidance::completion_guidance(&input)
 }
 
 /// The NU7 warning text, re-fetched by the frontend when the network picker
@@ -3440,6 +3454,38 @@ mod tests {
 
     /// PR #263 review items 2 and 3: the GUI re-fetches the warning when the
     /// network changes, and after a broadcast switches to the mining wording.
+    #[test]
+    fn completion_guidance_command_reads_the_frontend_shape() {
+        let input = serde_json::from_value(serde_json::json!({
+            "transactions": [
+                { "status": "mined", "safe_to_discard": true },
+                { "status": "submission_unknown" }
+            ],
+            "skipped_accounts": 0,
+            "follow_up_review_required": false,
+            "error": null,
+            "status_only": false,
+            "donation_requested": true,
+            "donated_zatoshis": 0,
+            "donation_note": null
+        }))
+        .unwrap();
+        let guidance = super::sweep_completion_guidance(input);
+        assert!(!guidance.recovery_complete);
+        assert_eq!(guidance.status_labels.len(), 2);
+        assert!(guidance.summary.contains("may already have moved"));
+        let json = serde_json::to_value(&guidance).unwrap();
+        for field in [
+            "recovery_complete",
+            "summary",
+            "next_steps",
+            "donation",
+            "status_labels",
+        ] {
+            assert!(json.get(field).is_some(), "{field}");
+        }
+    }
+
     #[test]
     fn sprout_nu7_warning_command_picks_network_and_broadcast_wording() {
         let before = sprout_nu7_warning("testnet".into(), false);
@@ -4651,18 +4697,21 @@ mod tests {
                     value_zatoshis: Some(7),
                     state: argos_core::TxLifecycleState::Pending,
                     mined_height: None,
+                    superseded: false,
                 },
                 argos_core::sprout_sweep::SproutSweepTransaction {
                     txid: "unknown".to_owned(),
                     value_zatoshis: None,
                     state: argos_core::TxLifecycleState::SubmissionUnknown,
                     mined_height: None,
+                    superseded: false,
                 },
                 argos_core::sprout_sweep::SproutSweepTransaction {
                     txid: "mined".to_owned(),
                     value_zatoshis: Some(11),
                     state: argos_core::TxLifecycleState::Mined,
                     mined_height: Some(123),
+                    superseded: false,
                 },
             ],
             mined_zatoshis: 11,
@@ -4789,6 +4838,7 @@ mod tests {
                 value_zatoshis: Some(11),
                 state: argos_core::TxLifecycleState::Mined,
                 mined_height: Some(123),
+                superseded: false,
             }],
             mined_zatoshis: 11,
             fresh_all_mined: false,
@@ -4806,7 +4856,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_only_preview_returns_status_without_loading_proving_parameters() {
+    fn unknown_only_preview_returns_status_without_loading_proving_parameters() {
         let journal = test_sprout_journal(0x42);
         let mut snapshot = journal.load_or_migrate().unwrap();
         let note = preview_note(1_000_000, 0x11);
@@ -4814,6 +4864,8 @@ mod tests {
         let preview = super::sprout_sweep_preview(&[], &snapshot).unwrap();
         assert_eq!(preview.notes, 0);
         assert_eq!(preview.active.len(), 1);
+        // A 1.5.x "broadcast" entry cannot prove node acceptance, so it is
+        // retained as submission-unknown rather than upgraded to pending.
         assert_eq!(
             preview.active[0].state,
             argos_core::TxLifecycleState::SubmissionUnknown

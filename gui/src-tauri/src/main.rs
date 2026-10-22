@@ -67,6 +67,7 @@ fn main() {
             commands::propose_sprout_scan_sweep,
             commands::execute_sprout_scan_sweep,
             commands::sprout_nu7_warning,
+            commands::sweep_completion_guidance,
             commands::default_data_dir,
             commands::notify_user,
             commands::list_incomplete_sessions,

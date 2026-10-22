@@ -37,7 +37,8 @@ use zeroize::Zeroizing;
 use crate::{
     broadcast::{
         resubmit_prepared_transaction, submit_prepared_transaction, PreparedTransaction,
-        TxLifecycleState, TxObservation, TxObservationState, TxObserver, TxSubmitter,
+        SubmissionDisposition, TxLifecycleState, TxObservation, TxObservationState, TxObserver,
+        TxSubmitter,
     },
     error::{ZeckError, ZeckResult},
     sprout::{self, SproutNotePlaintext},
@@ -79,6 +80,40 @@ const MAINNET_NU7_TIMELINE: &str =
     "NU7 timeline: https://forum.zcashcommunity.com/t/nu7-timeline/57655";
 
 const TESTNET_NU7_SCHEDULE: &str = "The testnet NU7 activation height is 4,465,026.";
+
+/// Testnet NU7 activation height (ZIP 259). The pinned `zcash_protocol`
+/// carries it only behind `zcash_unstable = "nu7"`, so it is stated here.
+const TESTNET_NU7_ACTIVATION_HEIGHT: u32 = 4_465_026;
+
+/// The height at which NU7 activates on `network`, when one is assigned.
+///
+/// Mainnet has no assigned height yet (see [`MAINNET_NU7_SCHEDULE`]), so it
+/// has no hard guard: the warnings carry the deadline instead. A local
+/// regtest chain under the dev-only `argos-network` feature never activates
+/// NU7.
+pub fn nu7_activation_height(network: crate::ZeckNetwork) -> Option<u32> {
+    #[cfg(feature = "argos-network")]
+    if crate::workspace::regtest_consensus_params_installed() {
+        return None;
+    }
+    match network {
+        crate::ZeckNetwork::Mainnet => None,
+        crate::ZeckNetwork::Testnet => Some(TESTNET_NU7_ACTIVATION_HEIGHT),
+    }
+}
+
+/// `1234567` as `1,234,567`.
+fn group_thousands(value: u32) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
 
 /// The NU7 spending deadline, shared by every Sprout recovery interface.
 ///
@@ -381,6 +416,9 @@ pub struct SproutSweepTransaction {
     pub value_zatoshis: Option<u64>,
     pub state: TxLifecycleState,
     pub mined_height: Option<u32>,
+    /// An expired or rejected transaction a later plan for the same note
+    /// replaced. Listed so its txid is not lost; it needs no action.
+    pub superseded: bool,
 }
 
 /// One note the network refused to let the sweep spend.
@@ -509,8 +547,10 @@ pub struct SproutSweepOutcome {
     /// rejections that read as "my funds are gone". The HD sweep learned
     /// this as audit Issue E; this path is the same shape.
     pub error: Option<String>,
-    /// True only when every relevant transaction was observed canonically
-    /// mined during this invocation.
+    /// True only when every journal transaction was observed during this
+    /// invocation as corroborated Mined at least
+    /// [`crate::broadcast::MIN_DISCARD_CONFIRMATIONS`] deep. Nothing else may
+    /// tell the operator the source material can be discarded.
     pub fresh_all_mined: bool,
 }
 
@@ -921,6 +961,66 @@ pub(crate) fn tip_from_height(height: u64) -> Result<u32, String> {
         .ok_or_else(|| format!("implausible chain tip {height}"))
 }
 
+/// Unknown-anchor refusals in a row, with nothing yet accepted, after which
+/// the sweep stops.
+///
+/// An unknown anchor is normally about one note's witness. But a server that
+/// knows no Sprout anchor at all -- pruned, on a fork, on another chain --
+/// answers that way for every note, and each answer costs a proving run.
+/// Until something has been accepted there is no evidence the server can
+/// judge Sprout anchors, so a short run of these stops it and names the
+/// server. Spent-note refusals never count: those are genuinely per note, and
+/// the sweep tries every one.
+const UNKNOWN_ANCHOR_BREAKER: usize = 3;
+
+/// Passes submissions through and keeps the node's last reply.
+///
+/// The shared broadcast classifier only knows reasons that mean the same
+/// thing for every kind of transaction, so it leaves Sprout's per-note
+/// refusals (a spent nullifier, an unknown anchor) as an unknown outcome.
+/// The Sprout loop reads the reply itself, so one bad note is recorded as
+/// rejected instead of stopping every note after it.
+struct RecordingSubmitter<'a, N> {
+    inner: &'a mut N,
+    last_reply: Option<zcash_client_backend::proto::service::SendResponse>,
+}
+
+#[async_trait::async_trait]
+impl<N: TxSubmitter + Send> TxSubmitter for RecordingSubmitter<'_, N> {
+    async fn send_raw(
+        &mut self,
+        raw: Vec<u8>,
+    ) -> Result<zcash_client_backend::proto::service::SendResponse, tonic::Status> {
+        self.last_reply = None;
+        let reply = self.inner.send_raw(raw).await;
+        if let Ok(response) = &reply {
+            self.last_reply = Some(response.clone());
+        }
+        reply
+    }
+}
+
+/// A node reply that refuses this one note and says nothing about the rest.
+fn per_note_refusal(
+    reply: &zcash_client_backend::proto::service::SendResponse,
+) -> Option<(Refusal, String)> {
+    if reply.error_code == 0 {
+        return None;
+    }
+    let reason = if reply.error_message.trim().is_empty() {
+        format!("error code {}", reply.error_code)
+    } else {
+        reply.error_message.trim().to_owned()
+    };
+    match classify_refusal(reply.error_code, &reason) {
+        kind @ (Refusal::Spent
+        | Refusal::UnknownAnchor
+        | Refusal::PendingSpend
+        | Refusal::Evicted) => Some((kind, reason)),
+        Refusal::AlreadyAccepted | Refusal::Expired | Refusal::Other => None,
+    }
+}
+
 pub struct SproutSweepInventory<'a> {
     pub ready: Vec<&'a SpendableSproutNote>,
     pub active: Vec<SproutJournalEntry>,
@@ -953,9 +1053,9 @@ impl SproutSweepInventory<'_> {
                         amount(entry)
                     ));
                 }
-                // A snapshot loaded through the journal reducer cannot put
-                // these states in `active`. Keep the conservative warning if
-                // a future producer violates that invariant.
+                // MinedSingleSource lands here: one operator's report lets
+                // later notes continue but is not final. Mined without
+                // canonical evidence would too, should a producer emit it.
                 _ => lines.push(format!(
                     "Sprout transaction {txid}: current status is not independently final \
                      ({}). {KEEP_SOURCE}",
@@ -1036,11 +1136,15 @@ pub struct SproutReconciliation {
     pub snapshot: SproutJournalSnapshot,
     pub transactions: Vec<SproutSweepTransaction>,
     pub stop_reason: Option<String>,
-    pub freshly_observed_mined: HashSet<TxId>,
+    /// Transactions this pass observed as corroborated Mined at least
+    /// `MIN_DISCARD_CONFIRMATIONS` deep. An observer error, a single
+    /// operator, or a shallow block leaves a transaction out.
+    pub fresh_safe_to_discard: HashSet<TxId>,
 }
 
-fn transaction_summary(entry: &SproutJournalEntry) -> SproutSweepTransaction {
+fn transaction_summary(entry: &SproutJournalEntry, superseded: bool) -> SproutSweepTransaction {
     SproutSweepTransaction {
+        superseded,
         txid: entry.txid().to_string(),
         value_zatoshis: entry.value_zatoshis,
         state: entry.state,
@@ -1057,19 +1161,47 @@ fn transaction_summary(entry: &SproutJournalEntry) -> SproutSweepTransaction {
 
 fn transaction_summaries(snapshot: &SproutJournalSnapshot) -> Vec<SproutSweepTransaction> {
     snapshot
-        .entries_in_journal_order()
-        .map(transaction_summary)
+        .superseded_entries()
+        .map(|entry| transaction_summary(entry, true))
+        .chain(
+            snapshot
+                .entries_in_journal_order()
+                .map(|entry| transaction_summary(entry, false)),
+        )
         .collect()
 }
 
+/// The tip a v1 entry's expiry bound is derived from.
+///
+/// The highest tip an independent pair agrees on when there is one;
+/// otherwise the first configured source reporting absence -- the primary,
+/// in the default single-operator setup. One source suffices for the same
+/// reason it suffices for expiry (see `EXPIRY_MARGIN_BLOCKS`): a source
+/// that lies low can at worst cause a rebuild that conflicts with the old
+/// transaction on the same nullifier, and consensus rejects whichever
+/// arrives second. A tip too high to be a real chain is never used, so a
+/// lying source cannot push the bound out of reach.
 fn reliable_observed_tip(observation: &TxObservation) -> Option<u32> {
     let reduced = crate::broadcast::observe_transaction(
         observation.evidence.clone(),
         observation.expiry_height,
     );
-    (reduced.state == TxObservationState::Absent)
-        .then(|| highest_corroborated_absent_tip(&reduced))
-        .flatten()
+    if reduced.state != TxObservationState::Absent {
+        return None;
+    }
+    highest_corroborated_absent_tip(&reduced)
+        .or_else(|| {
+            reduced
+                .evidence
+                .iter()
+                .find(|item| {
+                    is_absent_evidence(item)
+                        && crate::models::normalized_confirmation_authority(&item.endpoint)
+                            .is_some()
+                })
+                .and_then(|item| item.tip_height)
+        })
+        .filter(|tip| tip_from_height(u64::from(*tip)).is_ok())
 }
 
 fn independently_administered_absence(
@@ -1158,6 +1290,20 @@ fn valid_for_exact_retry(observation: &TxObservation, expiry: u32) -> bool {
             .any(|item| item.tip_height.is_some())
 }
 
+/// A transition to the record's current state whose observation reports
+/// the same thing as the stored one. Appending it would only record a newer
+/// tip, and doing so on every pass grows the journal without bound.
+fn repeats_record(
+    entry: &SproutJournalEntry,
+    state: TxLifecycleState,
+    observation: &TxObservation,
+) -> bool {
+    entry.state == state
+        && entry.observation.as_ref().is_some_and(|stored| {
+            stored.state == observation.state && stored.mined_height == observation.mined_height
+        })
+}
+
 pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
     journal: &SweepJournal,
     mut snapshot: SproutJournalSnapshot,
@@ -1172,7 +1318,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
     let mut retries = Vec::new();
     let mut unresolved_unknown = false;
     let mut unknown_observation_errors = Vec::new();
-    let mut freshly_observed_mined = HashSet::new();
+    let mut fresh_safe_to_discard = HashSet::new();
 
     for entry in entries {
         if entry.state == TxLifecycleState::NotSubmitted {
@@ -1215,21 +1361,29 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         };
 
         if observation.has_canonical_mined_evidence() {
-            journal.append_transition(
-                &mut snapshot,
-                entry.txid(),
-                TxLifecycleState::Mined,
-                None,
-                Some(&observation),
-            )?;
-            freshly_observed_mined.insert(entry.txid());
+            if !repeats_record(&entry, TxLifecycleState::Mined, &observation) {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    TxLifecycleState::Mined,
+                    None,
+                    Some(&observation),
+                )?;
+            }
+            // Only corroborated and deep enough may ever tell the operator
+            // the source is no longer needed.
+            if observation.is_safe_to_discard() {
+                fresh_safe_to_discard.insert(entry.txid());
+            }
             continue;
         }
         if observation.has_single_source_mined_evidence() {
             // Preserve a previously corroborated result. Otherwise record
             // the one-operator result so later legs may continue without
             // presenting it as independent finality to the operator.
-            if entry.state != TxLifecycleState::Mined {
+            if entry.state != TxLifecycleState::Mined
+                && !repeats_record(&entry, TxLifecycleState::MinedSingleSource, &observation)
+            {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -1241,13 +1395,15 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             continue;
         }
         if observation.state == TxObservationState::PresentUnmined {
-            journal.append_transition(
-                &mut snapshot,
-                entry.txid(),
-                TxLifecycleState::Pending,
-                None,
-                Some(&observation),
-            )?;
+            if !repeats_record(&entry, TxLifecycleState::Pending, &observation) {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    TxLifecycleState::Pending,
+                    None,
+                    Some(&observation),
+                )?;
+            }
             continue;
         }
         if observation.is_expired() {
@@ -1274,6 +1430,20 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         }
 
         let Some(transaction) = entry.transaction.clone() else {
+            if entry.state.is_mined()
+                && matches!(
+                    observation.state,
+                    TxObservationState::Absent | TxObservationState::Reorged
+                )
+            {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    TxLifecycleState::Pending,
+                    None,
+                    Some(&observation),
+                )?;
+            }
             if entry.legacy_expiry_bound.is_none() {
                 if let Some(verified_tip) = reliable_observed_tip(&observation) {
                     let expiry_bound = verified_tip.checked_add(EXPIRY_DELTA).ok_or_else(|| {
@@ -1287,7 +1457,12 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                     )?;
                 }
             }
-            unresolved_unknown = true;
+            // Without raw bytes there is nothing to resend. A v1 entry is
+            // Pending and leaves the other notes free; only a genuinely
+            // unknown submission stops them.
+            if entry.state == TxLifecycleState::SubmissionUnknown {
+                unresolved_unknown = true;
+            }
             continue;
         };
         let expiry = transaction.expiry_height.ok_or_else(|| {
@@ -1317,7 +1492,10 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                     transaction.txid
                 ))
             })?;
-            if entry.state != TxLifecycleState::SubmissionUnknown && !mined_was_displaced {
+            if entry.state != TxLifecycleState::SubmissionUnknown
+                && !mined_was_displaced
+                && !repeats_record(&entry, TxLifecycleState::Pending, &observation)
+            {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -1328,7 +1506,9 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             }
             retries.push((entry.outpoint, value_zatoshis, transaction));
         } else {
-            if entry.state == TxLifecycleState::Pending {
+            if entry.state == TxLifecycleState::Pending
+                && !repeats_record(&entry, TxLifecycleState::Pending, &observation)
+            {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -1395,7 +1575,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         transactions: transaction_summaries(&snapshot),
         snapshot,
         stop_reason,
-        freshly_observed_mined,
+        fresh_safe_to_discard,
     })
 }
 
@@ -1528,11 +1708,11 @@ fn note_label(index: usize, total: usize, note: &SpendableSproutNote) -> String 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sweep(
     notes: &[SpendableSproutNote],
-    node: &mut impl SweepNode,
+    node: &mut (impl SweepNode + Send),
     observer: &mut impl TxObserver,
     network: crate::ZeckNetwork,
     mut build: impl FnMut(&SpendableSproutNote, BlockHeight, BranchId) -> ZeckResult<BuiltSproutSweep>,
-    _source: NoteSource,
+    source: NoteSource,
     journal: &SweepJournal,
     mut progress: impl FnMut(String),
 ) -> SproutSweepOutcome {
@@ -1569,18 +1749,20 @@ pub(crate) async fn run_sweep(
             &mut outcome,
             &snapshot,
             notes,
-            &reconciliation.freshly_observed_mined,
+            &reconciliation.fresh_safe_to_discard,
         );
         return outcome;
     }
 
-    let freshly_observed_mined = reconciliation.freshly_observed_mined;
+    let fresh_safe_to_discard = reconciliation.fresh_safe_to_discard;
     let ready_ids = classify_sprout_notes(notes, &snapshot)
         .ready
         .into_iter()
         .map(|note| note_id(&note.outpoint))
         .collect::<HashSet<_>>();
 
+    let mut server_has_accepted = false;
+    let mut unknown_anchor_run = 0usize;
     for (index, note) in notes.iter().enumerate() {
         let label = note_label(index, total, note);
         if !ready_ids.contains(&note_id(&note.outpoint)) {
@@ -1626,6 +1808,23 @@ pub(crate) async fn run_sweep(
             ));
             break;
         };
+        // A Sprout spend is a version 4 transaction, and NU7 disables
+        // version 4 outright. A transaction built for a block at or past
+        // activation can never be mined, so refuse before a proving run.
+        if let Some(activation) = nu7_activation_height(network) {
+            if tip.saturating_add(1) >= activation {
+                outcome.error = Some(format!(
+                    "the next block ({}) is at or past NU7 activation at height {} on {}. NU7 \
+                     disables version 4 transactions, the only format that can spend Sprout, \
+                     so Sprout funds cannot move after activation. Nothing was built or sent \
+                     for {label}.",
+                    group_thousands(tip.saturating_add(1)),
+                    group_thousands(activation),
+                    network.label(),
+                ));
+                break;
+            }
+        }
         let branch_id = branch_id_for_height(network, tip);
         let expiry = BlockHeight::from_u32(tip + EXPIRY_DELTA);
 
@@ -1677,6 +1876,10 @@ pub(crate) async fn run_sweep(
             ));
             break;
         }
+        let mut recorder = RecordingSubmitter {
+            inner: &mut *node,
+            last_reply: None,
+        };
         let result = {
             let mut store = journal.scoped_store(
                 JournalNoteContext {
@@ -1685,9 +1888,15 @@ pub(crate) async fn run_sweep(
                 },
                 &mut snapshot,
             );
-            submit_prepared_transaction(&mut store, node, transaction, Duration::from_secs(30))
-                .await
+            submit_prepared_transaction(
+                &mut store,
+                &mut recorder,
+                transaction,
+                Duration::from_secs(30),
+            )
+            .await
         };
+        let last_reply = recorder.last_reply.take();
         let result = match result {
             Ok(result) => result,
             Err(err) => {
@@ -1706,6 +1915,58 @@ pub(crate) async fn run_sweep(
             outcome.error = Some(warning);
             break;
         }
+        if result.state == TxLifecycleState::Pending {
+            server_has_accepted = true;
+            unknown_anchor_run = 0;
+        }
+        // A refusal about this note alone: the node did not take these bytes
+        // and said why in terms of the note. Record the note as rejected and
+        // carry on; only a lost or unfamiliar reply stays unknown and stops.
+        let refusal = (result.state == TxLifecycleState::SubmissionUnknown)
+            .then(|| last_reply.as_ref().and_then(per_note_refusal))
+            .flatten();
+        if let Some((kind, reason)) = refusal {
+            let code = last_reply.as_ref().map_or(0, |reply| reply.error_code);
+            let disposition = SubmissionDisposition::DeterministicRejection {
+                code,
+                reason: reason.clone(),
+            };
+            if let Err(err) = journal.append_transition(
+                &mut snapshot,
+                result.txid,
+                TxLifecycleState::Rejected,
+                Some(&disposition),
+                None,
+            ) {
+                outcome.error = Some(format!(
+                    "{label} was refused ({reason}), but the refusal could not be recorded:                      {err}. It stays unknown; no later Sprout note was built or broadcast."
+                ));
+                break;
+            }
+            progress(format!("{label} was refused: {reason}"));
+            outcome.rejected.push(RejectedSweep {
+                outpoint: note.outpoint,
+                value: note.note.value,
+                kind,
+                source,
+                reason,
+            });
+            unknown_anchor_run = match kind {
+                Refusal::UnknownAnchor => unknown_anchor_run + 1,
+                _ => 0,
+            };
+            if !server_has_accepted && unknown_anchor_run >= UNKNOWN_ANCHOR_BREAKER {
+                outcome.error = Some(format!(
+                    "the server refused {unknown_anchor_run} notes in a row because it does \
+                     not recognise their witnesses' tree roots, and has accepted none in this \
+                     sweep. That points at the lightwalletd server (pruned, on a fork, or on \
+                     another chain) rather than the notes. The sweep stopped rather than prove \
+                     every remaining note into the same answer; try another lightwalletd server."
+                ));
+                break;
+            }
+            continue;
+        }
         if result.blocks_followup_submission() {
             outcome.error = Some(format!(
                 "{} remains {}; no later Sprout note was built or broadcast",
@@ -1715,7 +1976,7 @@ pub(crate) async fn run_sweep(
         }
     }
 
-    refresh_outcome(&mut outcome, &snapshot, notes, &freshly_observed_mined);
+    refresh_outcome(&mut outcome, &snapshot, notes, &fresh_safe_to_discard);
     outcome
 }
 
@@ -1723,7 +1984,7 @@ fn refresh_outcome(
     outcome: &mut SproutSweepOutcome,
     snapshot: &SproutJournalSnapshot,
     notes: &[SpendableSproutNote],
-    freshly_observed_mined: &HashSet<TxId>,
+    fresh_safe_to_discard: &HashSet<TxId>,
 ) {
     outcome.transactions = transaction_summaries(snapshot);
     outcome.mined_zatoshis = 0;
@@ -1758,7 +2019,7 @@ fn refresh_outcome(
     let no_ready_notes = classify_sprout_notes(notes, snapshot).ready.is_empty();
     outcome.fresh_all_mined = !journal_entries.is_empty()
         && journal_entries.iter().all(|entry| {
-            entry.state == TxLifecycleState::Mined && freshly_observed_mined.contains(&entry.txid())
+            entry.state == TxLifecycleState::Mined && fresh_safe_to_discard.contains(&entry.txid())
         })
         && no_ready_notes
         && outcome.error.is_none()
@@ -1851,6 +2112,7 @@ mod tests {
     #[test]
     fn readme_does_not_treat_a_primary_rejection_as_terminal_evidence() {
         let readme = include_str!("../../../README.md");
+        let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(!readme.contains(
             "deterministically rejected follows a separate terminal path back to a new plan"
         ));
@@ -1859,6 +2121,15 @@ mod tests {
         assert!(readme.contains("SubmissionUnknown") || readme.contains("submission unknown"));
         assert!(readme.contains("independent"));
         assert!(readme.contains("older Argos") && readme.contains("concurrently"));
+        // The single-operator policy: one source's absence past expiry plus
+        // the margin is enough to replace a transaction.
+        assert!(!readme.contains("only after independent sources corroborate absence"));
+        assert!(!readme.contains("requires independently corroborated absence"));
+        // What the journal holds, stated honestly.
+        assert!(normalized_readme.contains("no spending keys and no note plaintexts"));
+        assert!(readme.contains("not atomically replaced"));
+        // Nothing deletes the checkpoint for the user.
+        assert!(readme.contains("does not delete the checkpoint"));
     }
 
     /// Kristi's F5 on #239: the plan printed before confirmation must not
@@ -2424,6 +2695,7 @@ mod tests {
         shared_observed:
             Option<std::sync::Arc<std::sync::Mutex<Vec<zcash_primitives::transaction::TxId>>>>,
         before_observe: Option<Box<dyn FnMut() + Send>>,
+        failing: Vec<zcash_primitives::transaction::TxId>,
     }
 
     impl LifecycleObserver {
@@ -2440,6 +2712,7 @@ mod tests {
                 observed: Vec::new(),
                 shared_observed: None,
                 before_observe: None,
+                failing: Vec::new(),
             }
         }
     }
@@ -2458,6 +2731,9 @@ mod tests {
             self.observed.push(txid);
             if let Some(shared) = &self.shared_observed {
                 shared.lock().unwrap().push(txid);
+            }
+            if self.failing.contains(&txid) {
+                return Err(ZeckError::Broadcast("observer unreachable".into()));
             }
             let (expected, mut observation) = self
                 .observations
@@ -3684,5 +3960,489 @@ mod tests {
         assert_eq!(builds, 1);
         assert_eq!(node.sent, raw);
         assert!(outcome.error.is_some());
+    }
+
+    fn replies(tip: u32, replies: &[(i32, &str)]) -> LifecycleNode {
+        LifecycleNode {
+            tip,
+            tip_calls: 0,
+            replies: replies
+                .iter()
+                .map(|(code, message)| {
+                    Ok(zcash_client_backend::proto::service::SendResponse {
+                        error_code: *code,
+                        error_message: (*message).to_owned(),
+                    })
+                })
+                .collect(),
+            sent: Vec::new(),
+            before_send: None,
+        }
+    }
+
+    #[test]
+    fn a_note_refused_as_spent_is_rejected_and_the_next_note_is_still_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let notes = [lifecycle_note(1_000_000, 90), lifecycle_note(2_000_000, 91)];
+        let mut node = replies(
+            120,
+            &[(-26, "bad-txns-sprout-duplicate-nullifier"), (0, "")],
+        );
+        let mut observer = LifecycleObserver::default();
+        let (outcome, builds, raw) = run_lifecycle(&notes, &mut node, &mut observer, &journal, 900);
+        assert_eq!(builds, 2, "{:?}", outcome.error);
+        assert_eq!(node.sent, raw);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].kind, Refusal::Spent);
+        assert_eq!(outcome.rejected[0].outpoint, notes[0].outpoint);
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::Rejected
+        );
+        assert_eq!(
+            outcome.transactions[1].state,
+            crate::broadcast::TxLifecycleState::Pending
+        );
+        assert_eq!(outcome.pending_zatoshis, 2_000_000 - SPROUT_SWEEP_FEE);
+        assert!(!outcome.fresh_all_mined);
+        let snapshot = journal.load_or_migrate().unwrap();
+        assert!(snapshot.ready_for_new_plan(&notes[0].outpoint));
+    }
+
+    #[test]
+    fn each_per_note_refusal_kind_is_recorded_and_carried_past() {
+        for (id, message, kind) in [
+            (92, "bad-txns-sprout-unknown-anchor", Refusal::UnknownAnchor),
+            (
+                93,
+                "transaction already spent some of its inputs",
+                Refusal::PendingSpend,
+            ),
+            (94, "zip-401 denial of service limits", Refusal::Evicted),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = lifecycle_journal(dir.path());
+            let notes = [
+                lifecycle_note(1_000_000, id),
+                lifecycle_note(2_000_000, id + 50),
+            ];
+            let mut node = replies(120, &[(-26, message), (0, "")]);
+            let mut observer = LifecycleObserver::default();
+            let (outcome, builds, _) =
+                run_lifecycle(&notes, &mut node, &mut observer, &journal, 920 + id as u32);
+            assert_eq!(builds, 2, "{message}: {:?}", outcome.error);
+            assert!(outcome.error.is_none(), "{message}: {:?}", outcome.error);
+            assert_eq!(outcome.rejected.len(), 1, "{message}");
+            assert_eq!(outcome.rejected[0].kind, kind, "{message}");
+            assert_eq!(outcome.rejected[0].reason, message);
+        }
+    }
+
+    #[test]
+    fn a_refusal_about_the_node_still_stops_the_sweep_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let notes = [lifecycle_note(1_000_000, 95), lifecycle_note(2_000_000, 96)];
+        let mut node = replies(120, &[(-1, "something unfamiliar")]);
+        let mut observer = LifecycleObserver::default();
+        let (outcome, builds, _) = run_lifecycle(&notes, &mut node, &mut observer, &journal, 950);
+        assert_eq!(builds, 1);
+        assert!(outcome.error.is_some());
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[test]
+    fn a_run_of_unknown_anchors_with_nothing_accepted_stops_and_names_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let notes = [
+            lifecycle_note(1_000_000, 97),
+            lifecycle_note(1_000_000, 98),
+            lifecycle_note(1_000_000, 99),
+            lifecycle_note(1_000_000, 100),
+        ];
+        let anchor = (-26, "bad-txns-sprout-unknown-anchor");
+        let mut node = replies(120, &[anchor, anchor, anchor]);
+        let mut observer = LifecycleObserver::default();
+        let (outcome, builds, _) = run_lifecycle(&notes, &mut node, &mut observer, &journal, 970);
+        assert_eq!(builds, UNKNOWN_ANCHOR_BREAKER);
+        assert_eq!(outcome.rejected.len(), UNKNOWN_ANCHOR_BREAKER);
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("lightwalletd server")));
+    }
+
+    fn one_operator_absent(expiry: Option<u32>, tip: u32) -> crate::broadcast::TxObservation {
+        crate::broadcast::observe_transaction(vec![endpoint("primary", tip, None, false)], expiry)
+    }
+
+    #[test]
+    fn default_single_operator_resolves_a_lost_reply_to_expired_and_replans() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 101);
+        let old = fixture_transaction(1010, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &old,
+            crate::broadcast::TxLifecycleState::SubmissionUnknown,
+        );
+
+        // Inside the margin the one configured source cannot release it.
+        let inside = 140 + crate::broadcast::EXPIRY_MARGIN_BLOCKS;
+        let mut node = LifecycleNode::accepted(inside, 0);
+        let mut observer =
+            LifecycleObserver::new([(old.txid, one_operator_absent(Some(140), inside))]);
+        let (outcome, builds, _) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1011,
+        );
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert!(outcome.error.is_some());
+
+        let expired_tip = first_expired_tip(140);
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
+        let mut observer =
+            LifecycleObserver::new([(old.txid, one_operator_absent(Some(140), expired_tip))]);
+        let (outcome, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &journal, 1012);
+        assert_eq!(builds, 1, "{:?}", outcome.error);
+        assert_eq!(node.sent, raw);
+        assert_ne!(node.sent[0], old.raw_tx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    }
+
+    #[test]
+    fn one_operator_mining_resolves_without_stalling_or_offering_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let mined_note = lifecycle_note(1_000_000, 102);
+        let next_note = lifecycle_note(2_000_000, 103);
+        let tx = fixture_transaction(1020, 140);
+        seed_entry(
+            &journal,
+            &mined_note,
+            &tx,
+            crate::broadcast::TxLifecycleState::SubmissionUnknown,
+        );
+        let mut node = LifecycleNode::accepted(200, 1);
+        let mut observer =
+            LifecycleObserver::new([(tx.txid, mined_by_one_source(Some(140), 120, 200))]);
+        let (outcome, builds, raw) = run_lifecycle(
+            &[mined_note, next_note],
+            &mut node,
+            &mut observer,
+            &journal,
+            1021,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(builds, 1);
+        assert_eq!(node.sent, raw);
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::MinedSingleSource
+        );
+        assert!(!outcome.fresh_all_mined);
+    }
+
+    #[test]
+    fn observer_error_for_a_stored_mined_entry_keeps_it_mined_but_never_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 107);
+        let tx = fixture_transaction(1070, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &tx,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        let mut node = LifecycleNode::accepted(200, 0);
+        let mut observer = LifecycleObserver::default();
+        observer.failing.push(tx.txid);
+        let (outcome, builds, _) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1071,
+        );
+        assert_eq!(observer.observed, vec![tx.txid]);
+        assert_eq!(builds, 0);
+        assert!(node.sent.is_empty());
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::Mined
+        );
+        assert!(!outcome.fresh_all_mined);
+    }
+
+    #[test]
+    fn corroborated_mining_below_the_discard_depth_is_not_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 108);
+        let tx = fixture_transaction(1080, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &tx,
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+        let height = 110;
+        let shallow_tip = height + crate::broadcast::MIN_DISCARD_CONFIRMATIONS - 2;
+        let shallow = mined(Some(140), height, shallow_tip);
+        assert!(shallow.has_canonical_mined_evidence());
+        assert!(!shallow.is_safe_to_discard());
+        let mut node = LifecycleNode::accepted(shallow_tip, 0);
+        let mut observer = LifecycleObserver::new([(tx.txid, shallow)]);
+        let expected = note.note.value - SPROUT_SWEEP_FEE;
+        let (outcome, _, _) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            1081,
+        );
+        assert_eq!(outcome.mined_zatoshis, expected);
+        assert!(!outcome.fresh_all_mined);
+
+        let deep_tip = height + crate::broadcast::MIN_DISCARD_CONFIRMATIONS - 1;
+        let deep = mined(Some(140), height, deep_tip);
+        assert!(deep.is_safe_to_discard());
+        let mut node = LifecycleNode::accepted(deep_tip, 0);
+        let mut observer = LifecycleObserver::new([(tx.txid, deep)]);
+        let (outcome, _, _) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 1082);
+        assert!(outcome.fresh_all_mined, "{:?}", outcome.error);
+    }
+
+    #[test]
+    fn a_replanned_note_keeps_its_expired_transaction_visible_as_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 109);
+        let old = fixture_transaction(1090, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &old,
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+        let expired_tip = first_expired_tip(140);
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
+        let mut observer = LifecycleObserver::new([(old.txid, absent(Some(140), expired_tip))]);
+        let (outcome, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &journal, 1091);
+        assert_eq!(builds, 1);
+        assert_eq!(node.sent, raw);
+        assert_eq!(outcome.transactions.len(), 2, "{:?}", outcome.transactions);
+        let old_summary = outcome
+            .transactions
+            .iter()
+            .find(|transaction| transaction.txid == old.txid.to_string())
+            .expect("the expired transaction stays visible");
+        assert_eq!(
+            old_summary.state,
+            crate::broadcast::TxLifecycleState::Expired
+        );
+        assert!(old_summary.superseded);
+        let new_summary = outcome
+            .transactions
+            .iter()
+            .find(|transaction| transaction.txid != old.txid.to_string())
+            .unwrap();
+        assert_eq!(
+            new_summary.state,
+            crate::broadcast::TxLifecycleState::Pending
+        );
+        assert!(!new_summary.superseded);
+        // The superseded value is not counted twice.
+        assert_eq!(outcome.pending_zatoshis, 1_000_000 - SPROUT_SWEEP_FEE);
+        // And it survives a reload.
+        let reloaded = journal.load_or_migrate().unwrap();
+        assert_eq!(transaction_summaries(&reloaded).len(), 2);
+    }
+
+    #[test]
+    fn one_hostile_orphan_sentinel_against_an_agreeing_pair_is_contested_not_reorged() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 110);
+        let tx = fixture_transaction(1100, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &tx,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        let observation = crate::broadcast::observe_transaction(
+            vec![
+                endpoint("mallory", 150, Some(u32::MAX), false),
+                endpoint("alpha", 150, Some(90), true),
+                endpoint("bravo", 150, Some(90), true),
+            ],
+            Some(140),
+        );
+        assert_eq!(
+            observation.state,
+            crate::broadcast::TxObservationState::Contested
+        );
+        let mut node = LifecycleNode::accepted(150, 0);
+        let mut observer = LifecycleObserver::new([(tx.txid, observation)]);
+        let (outcome, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &journal, 1101);
+        assert_eq!(builds, 0);
+        assert!(raw.is_empty() && node.sent.is_empty());
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::Mined
+        );
+        assert!(!outcome.fresh_all_mined);
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(tx.txid)
+                .unwrap()
+                .state,
+            crate::broadcast::TxLifecycleState::Mined
+        );
+    }
+
+    fn run_on_testnet_at(tip: u32, id: u8) -> (SproutSweepOutcome, usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("argos-data");
+        let journal = crate::sprout_sweep_journal::SweepJournal::for_keys(
+            &data_dir,
+            &[[0x42; 32]],
+            crate::ZeckNetwork::Testnet,
+        );
+        let notes = [lifecycle_note(1_000_000, id)];
+        let mut node = LifecycleNode::accepted(tip, 1);
+        let mut observer = LifecycleObserver::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut builds = 0;
+        let outcome = runtime.block_on(run_sweep(
+            &notes,
+            &mut node,
+            &mut observer,
+            crate::ZeckNetwork::Testnet,
+            |note: &SpendableSproutNote, expiry: BlockHeight, _| {
+                builds += 1;
+                let tx = fixture_transaction(1200 + id as u32, expiry.into());
+                Ok(BuiltSproutSweep {
+                    txid: tx.txid.to_string(),
+                    raw: tx.raw_tx,
+                    value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                })
+            },
+            NoteSource::WalletFile,
+            &journal,
+            |_| {},
+        ));
+        let sent = node.sent.len();
+        (outcome, builds, sent)
+    }
+
+    #[test]
+    fn no_sprout_transaction_is_built_for_a_block_at_or_past_nu7() {
+        let activation = nu7_activation_height(crate::ZeckNetwork::Testnet).unwrap();
+        assert_eq!(activation, 4_465_026);
+        assert!(TESTNET_NU7_SCHEDULE.contains(&group_thousands(activation)));
+        assert_eq!(nu7_activation_height(crate::ZeckNetwork::Mainnet), None);
+
+        // The next block is the last before activation: still buildable.
+        let (outcome, builds, sent) = run_on_testnet_at(activation - 2, 111);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!((builds, sent), (1, 1));
+
+        // The next block is the activation block: refused before proving.
+        for (offset, tip) in [activation - 1, activation, activation + 1000]
+            .into_iter()
+            .enumerate()
+        {
+            let (outcome, builds, sent) = run_on_testnet_at(tip, 112 + offset as u8);
+            assert_eq!((builds, sent), (0, 0), "tip {tip}");
+            let error = outcome.error.expect("NU7 refusal");
+            assert!(error.contains("NU7"), "{error}");
+            assert!(
+                error.contains("4,465,026") || error.contains("4465026"),
+                "{error}"
+            );
+            assert!(error.contains("cannot"), "{error}");
+        }
+    }
+
+    #[test]
+    fn repeated_reconciles_with_nothing_new_do_not_grow_the_journal() {
+        type Observe = fn(u32) -> crate::broadcast::TxObservation;
+        let cases: [(&str, crate::broadcast::TxLifecycleState, Observe); 4] = [
+            (
+                "pending contested",
+                crate::broadcast::TxLifecycleState::Pending,
+                |tip| contested(Some(140), 110, tip),
+            ),
+            (
+                "pending absent, not retryable",
+                crate::broadcast::TxLifecycleState::Pending,
+                |tip| absent(Some(140), tip),
+            ),
+            (
+                "single-source mined",
+                crate::broadcast::TxLifecycleState::Pending,
+                |tip| mined_by_one_source(Some(140), 110, tip),
+            ),
+            (
+                "corroborated mined",
+                crate::broadcast::TxLifecycleState::Mined,
+                |tip| mined(Some(140), 90, tip),
+            ),
+        ];
+        for (offset, (name, seeded, observe)) in cases.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = lifecycle_journal(dir.path());
+            let note = lifecycle_note(1_000_000, 130 + offset as u8);
+            let tx = fixture_transaction(1300 + offset as u32, 140);
+            seed_entry(&journal, &note, &tx, seeded);
+            let lines = || {
+                std::fs::read_to_string(journal.path())
+                    .unwrap()
+                    .lines()
+                    .count()
+            };
+
+            let mut counts = Vec::new();
+            for tip in [150, 151, 152] {
+                let mut node = LifecycleNode::accepted(tip, 0);
+                let mut observer = LifecycleObserver::new([(tx.txid, observe(tip))]);
+                let (outcome, builds, _) = run_lifecycle(
+                    std::slice::from_ref(&note),
+                    &mut node,
+                    &mut observer,
+                    &journal,
+                    1310,
+                );
+                assert_eq!(builds, 0, "{name}: {:?}", outcome.error);
+                assert!(node.sent.is_empty(), "{name}");
+                counts.push(lines());
+            }
+            assert_eq!(counts[0], counts[1], "{name}: {counts:?}");
+            assert_eq!(counts[1], counts[2], "{name}: {counts:?}");
+        }
     }
 }

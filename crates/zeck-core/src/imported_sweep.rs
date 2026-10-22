@@ -531,8 +531,71 @@ fn record_sapling_submission(
     Ok(outcome.followup_blocked)
 }
 
-fn may_start_transparent_leg(outcome: &ImportedSweepOutcome) -> bool {
-    !outcome.followup_blocked
+/// What the standalone transparent follow-up needs besides its keys.
+struct TransparentFollowup<'a> {
+    runtime: &'a crate::models::RuntimeScanConfig,
+    destination: &'a str,
+    max_fee_zatoshis: Option<u64>,
+    reviewed_fee_zatoshis: Option<u64>,
+    planned: Option<&'a ImportedExecutionPlan>,
+    /// The account row the transparent result is shown under, if any.
+    display_index: Option<u32>,
+}
+
+/// Sweep `keys` through the account-free transparent path and record the
+/// result. An uncertain or retryable submission blocks any later leg; a node
+/// rejection ends the sweep. Nothing is sent when there are no keys or the
+/// reviewed plan had no transparent leg.
+async fn submit_transparent_followup(
+    log: &mut DurableBroadcastLog,
+    keys: &[crate::imported::ImportedTransparentKey],
+    outcome: &mut ImportedSweepOutcome,
+    followup: &TransparentFollowup<'_>,
+) -> ZeckResult<()> {
+    let planned = followup.planned;
+    if keys.is_empty() || planned.is_some_and(|plan| plan.transparent.is_none()) {
+        return Ok(());
+    }
+    let Some(swept) = crate::transparent_recovery::sweep_transparent_only_reviewed(
+        log,
+        keys,
+        followup.runtime.network,
+        &followup.runtime.lightwalletd_url,
+        followup.destination,
+        followup.max_fee_zatoshis,
+        crate::service::at_risk_fee_total(&outcome.transactions)?,
+        followup.reviewed_fee_zatoshis,
+        planned.and_then(|plan| {
+            plan.transparent
+                .as_ref()
+                .map(|(utxos, cost, height)| (utxos.as_slice(), cost, *height))
+        }),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let blocked = matches!(
+        swept.disposition,
+        crate::broadcast::SubmissionDisposition::RetryableRejection { .. }
+    ) || swept.transaction.status == TxLifecycleState::SubmissionUnknown;
+    let rejected = swept.transaction.status == TxLifecycleState::Rejected;
+    outcome.transactions.push(TxBroadcastResult {
+        source_account: followup.display_index.unwrap_or(0),
+        ..swept.transaction
+    });
+    outcome.transparent_transaction_recorded = true;
+    outcome.transparent_display_index = followup.display_index;
+    if blocked {
+        outcome.followup_blocked = true;
+        return Err(ZeckError::Broadcast("transparent submission may already have reached the network; reconcile its txid before retrying".to_owned()));
+    }
+    if rejected {
+        return Err(ZeckError::Broadcast(
+            "the node rejected the transparent sweep transaction".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn run_transparent_followup<F, Fut>(allowed: bool, submit: F) -> ZeckResult<()>
@@ -843,48 +906,39 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
         )
         .await?;
         outcome.sapling_leg_completed = true;
-        if may_start_transparent_leg(&outcome) && !transparent_indices.is_empty() &&
-            planned.is_none_or(|plan| plan.transparent.is_some()) {
+        if !outcome.followup_blocked
+            && !transparent_indices.is_empty()
+            && planned.is_none_or(|plan| plan.transparent.is_some())
+        {
             let all_keys = crate::imported::imported_transparent_keys(keys)?;
             let mut available = all_keys.into_iter().map(Some).collect::<Vec<_>>();
             let selected = transparent_indices
                 .iter()
                 .map(|index| {
-                    available.get_mut(*index).and_then(Option::take).ok_or_else(|| {
-                        ZeckError::Wallet(format!("standalone transparent key {index} is missing"))
-                    })
+                    available
+                        .get_mut(*index)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            ZeckError::Wallet(format!(
+                                "standalone transparent key {index} is missing"
+                            ))
+                        })
                 })
                 .collect::<ZeckResult<Vec<_>>>()?;
-            if let Some(swept) = crate::transparent_recovery::sweep_transparent_only_reviewed(
+            submit_transparent_followup(
                 &mut log,
                 &selected,
-                runtime.network,
-                &runtime.lightwalletd_url,
-                destination,
-                max_fee_zatoshis,
-                crate::service::at_risk_fee_total(&outcome.transactions)?,
-                reviewed_transparent_fee,
-                planned.and_then(|plan| plan.transparent.as_ref().map(|(utxos, cost, height)| (utxos.as_slice(), cost, *height))),
+                &mut outcome,
+                &TransparentFollowup {
+                    runtime,
+                    destination,
+                    max_fee_zatoshis,
+                    reviewed_fee_zatoshis: reviewed_transparent_fee,
+                    planned,
+                    display_index: transparent_display_index,
+                },
             )
-            .await?
-            {
-                let blocked = matches!(swept.disposition, crate::broadcast::SubmissionDisposition::RetryableRejection { .. })
-                    || swept.transaction.status == TxLifecycleState::SubmissionUnknown;
-                let rejected = swept.transaction.status == TxLifecycleState::Rejected;
-                outcome.transactions.push(TxBroadcastResult {
-                    source_account: transparent_display_index.unwrap_or(0),
-                    ..swept.transaction
-                });
-                outcome.transparent_transaction_recorded = true;
-                outcome.transparent_display_index = transparent_display_index;
-                if blocked {
-                    outcome.followup_blocked = true;
-                    return Err(ZeckError::Broadcast("transparent submission may already have reached the network; reconcile its txid before retrying".to_owned()));
-                }
-                if rejected {
-                    return Err(ZeckError::Broadcast("the node rejected the transparent sweep transaction".to_owned()));
-                }
-            }
+            .await?;
         }
         outcome.transparent_leg_completed = true;
         Ok(())
@@ -934,37 +988,22 @@ async fn sweep_imported_wallet_into(
     outcome.sapling_leg_completed = sapling_result.is_ok();
 
     // Transparent, through the path that needs no account at all.
-    let transparent_result = run_transparent_followup(may_start_transparent_leg(outcome), || async {
+    let transparent_result = run_transparent_followup(!outcome.followup_blocked, || async {
         let transparent = imported_transparent_keys(keys)?;
-        if !transparent.is_empty() && planned.is_none_or(|plan| plan.transparent.is_some()) {
-            if let Some(swept) = crate::transparent_recovery::sweep_transparent_only_reviewed(
-                &mut log,
-                &transparent,
-                runtime.network,
-                &runtime.lightwalletd_url,
+        submit_transparent_followup(
+            &mut log,
+            &transparent,
+            outcome,
+            &TransparentFollowup {
+                runtime,
                 destination,
                 max_fee_zatoshis,
-                crate::service::at_risk_fee_total(&outcome.transactions)?,
-                reviewed_transparent_fee,
-                planned.and_then(|plan| plan.transparent.as_ref().map(|(utxos, cost, height)| (utxos.as_slice(), cost, *height))),
-            )
-            .await?
-            {
-                let blocked = matches!(swept.disposition, crate::broadcast::SubmissionDisposition::RetryableRejection { .. })
-                    || swept.transaction.status == TxLifecycleState::SubmissionUnknown;
-                let rejected = swept.transaction.status == TxLifecycleState::Rejected;
-                outcome.transactions.push(swept.transaction);
-                outcome.transparent_transaction_recorded = true;
-                if blocked {
-                    outcome.followup_blocked = true;
-                    return Err(ZeckError::Broadcast("transparent submission may already have reached the network; reconcile its txid before retrying".to_owned()));
-                }
-                if rejected {
-                    return Err(ZeckError::Broadcast("the node rejected the transparent sweep transaction".to_owned()));
-                }
-            }
-        }
-        Ok(())
+                reviewed_fee_zatoshis: reviewed_transparent_fee,
+                planned,
+                display_index: None,
+            },
+        )
+        .await
     })
     .await;
     outcome.transparent_leg_completed = transparent_result.is_ok();
@@ -1478,7 +1517,7 @@ mod tests {
         assert_eq!(runner.submissions, 1, "second Sapling submitter was called");
         assert_eq!(outcome.transactions.len(), 1);
         let transparent_calls = std::cell::Cell::new(0);
-        let result = run_transparent_followup(may_start_transparent_leg(&outcome), || async {
+        let result = run_transparent_followup(!outcome.followup_blocked, || async {
             transparent_calls.set(transparent_calls.get() + 1);
             Ok(())
         })
@@ -1548,7 +1587,7 @@ mod tests {
     async fn unknown_sapling_submission_stops_transparent_leg() {
         let mut outcome = ImportedSweepOutcome::default();
         record_sapling_submission(&mut outcome, 3, &unknown()).unwrap();
-        assert!(!may_start_transparent_leg(&outcome));
+        assert!(outcome.followup_blocked);
     }
 }
 

@@ -197,9 +197,12 @@ planted note and derives a witness anchoring to the chain's root.
 
 The Sprout checkpoint is spend-capable: it contains raw spending keys,
 note plaintexts, and witnesses. `save_checkpoint` creates it atomically at
-`0600` on Unix, and a successful sweep deletes it. Do not describe it as
-mere progress metadata or fold it into the ordinary FVK-only workspace
-claim.
+`0600` on Unix. Nothing deletes it automatically: `discard_checkpoint` has
+no caller outside tests, so it outlives a completed sweep and the user
+removes it once every saved transaction has fresh, corroborated,
+`MIN_DISCARD_CONFIRMATIONS`-deep mined evidence (`fresh_all_mined`). Do not
+describe it as mere progress metadata or fold it into the ordinary
+FVK-only workspace claim.
 
 **Argos takes a `wallet.dat` or a raw `zkey`, and nothing else.** Not a
 txid, not a node URL. `sprout_key` decodes zcashd's `SK…`/`ST…` form, and
@@ -228,12 +231,15 @@ phantom balance. What the file cannot see (spends from another copy of the
 wallet) is handled at the sweep: every note is tried, and a refusal about
 the note itself — a spent nullifier, an unknown anchor, or a ZIP-401
 eviction, classified from the node's reject reason by `classify_refusal`,
-never from `error_code` alone — is recorded and carried past. Spent-note
-refusals never stop it, however many come in a row; unknown-anchor ones do
-after `UNKNOWN_ANCHOR_BREAKER` in a row while nothing has been accepted,
-since that pattern is the server, not the notes. A node saying it already
-has this exact transaction (`txn-already-known` and kin) counts as sent.
-Everything else stops the sweep, because it would repeat for every
+never from `error_code` alone — is journaled as `Rejected` with the node's
+reason and carried past (`run_sweep` reads the reply through
+`RecordingSubmitter`, because the shared broadcast classifier does not know
+these Sprout reasons). Spent-note refusals never stop it, however many come
+in a row; unknown-anchor ones do after `UNKNOWN_ANCHOR_BREAKER` in a row
+while nothing has been accepted, since that pattern is the server, not the
+notes. A node saying it already has this exact transaction
+(`txn-already-known` and kin) is `SubmissionUnknown` until an observation
+places it. Everything else stops the sweep, because it would repeat for every
 remaining note at the cost of a proving run each: `-10`/`-28` (node not
 ready, by code), expiry, any unrecognised reason, a build failure (the
 post-proof failures are about the destination and bundle, not the note),
@@ -259,16 +265,19 @@ planted checkpoint self-defeating. Parsed evidence is cached in
 `ChainSpendsCache`, keyed by path and network and validated by size and
 mtime, because the GUI asks twice per wallet open.
 
-Sprout sweeps are journaled. `sprout_sweep::SweepJournal`
+Sprout sweeps are journaled. `sprout_sweep_journal::SweepJournal`
 (`sprout-sweep-<fingerprint>.journal`, beside the checkpoint, same
-key-set fingerprint, `0600`) gets one line per broadcast — note outpoint
-and sweep txid — appended and synced the moment the node accepts it. Every
-surface drops journaled notes before planning (`drop_already_swept`), and
-the sweep loop skips them as a safety net, so an interrupted sweep of
-hundreds of notes never re-proves one it already sent. Only accepted
-broadcasts are journaled; a refusal may be transient. Unlike the
-checkpoint, it is not deleted after a successful sweep: it holds no keys,
-and it is what stops a repeat run from proving everything again.
+key-set fingerprint) is a v2 lifecycle journal: the exact signed bytes are
+persisted before any send, and every transition (the #276 states, under
+its single-operator policy) is appended and synced. It holds outpoints,
+values, raw transactions and observations — no `a_sk`, no note plaintexts,
+so it is linkable (nullifiers) but not spend-capable. It is kept at `0600`
+and appended, not atomically replaced; only the v1 upgrade is an atomic
+replace. v1 (one `outpoint txid` line per accepted broadcast) shipped in
+1.5.0, so its migration stays; a v1 entry becomes `Pending`. A replaced
+expired/rejected transaction stays visible as superseded. The journal is
+never deleted: it is what stops a repeat run from proving or rebuilding a
+note whose transaction may still mine.
 
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes
