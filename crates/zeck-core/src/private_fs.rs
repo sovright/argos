@@ -1755,7 +1755,7 @@ impl NamespaceLease {
         lock_parent_namespace(&parent)?;
         let parent_id = private_object_id(&parent)?;
         let lock_file = open_child_file_for_lock(&parent, lock_path)?;
-        parent.sync_all()?;
+        sync_private_directory(&parent)?;
         lock_exclusive(&lock_file)?;
         let lock_id = private_object_id(&lock_file)?;
         let lease = Self {
@@ -1835,7 +1835,7 @@ impl NamespaceLease {
     }
 
     pub(crate) fn sync_parent(&self) -> io::Result<()> {
-        self.parent.sync_all()
+        sync_private_directory(&self.parent)
     }
 
     pub(crate) fn require_child(&self, path: &Path) -> io::Result<()> {
@@ -1930,7 +1930,7 @@ impl NamespaceLease {
             ));
         }
         if created {
-            self.parent.sync_all()?;
+            sync_private_directory(&self.parent)?;
         }
         self.verify_current()
     }
@@ -1957,7 +1957,7 @@ impl NamespaceLease {
         let file = open_child_file_for_removal(&self.parent, path)?;
         let expected = private_object_id(&file)?;
         self.remove_open_child(path, &file, &expected)?;
-        self.parent.sync_all()?;
+        sync_private_directory(&self.parent)?;
         self.verify_current()
     }
 
@@ -1990,7 +1990,7 @@ impl NamespaceLease {
             ));
         }
         rename_open_child_file(&self.parent, from, to, file, expected_id)?;
-        self.parent.sync_all()?;
+        sync_private_directory(&self.parent)?;
         #[cfg(unix)]
         {
             let current = open_child_file_for_identity(&self.parent, to)?;
@@ -2022,7 +2022,7 @@ impl NamespaceLease {
         self.verify_current()?;
         verify_open_child_directory(&self.parent, from, &retained.directory, &retained.id)?;
         rename_open_child_directory(&self.parent, from, to, &retained.directory)?;
-        self.parent.sync_all()?;
+        sync_private_directory(&self.parent)?;
         verify_open_child_directory(&self.parent, to, &retained.directory, &retained.id)?;
         self.verify_current()
     }
@@ -2043,7 +2043,7 @@ impl NamespaceLease {
         self.verify_current()?;
         verify_open_child_directory(&self.parent, from, &directory, &expected)?;
         rename_open_child_directory(&self.parent, from, to, &directory)?;
-        self.parent.sync_all()?;
+        sync_private_directory(&self.parent)?;
         verify_open_child_directory(&self.parent, to, &directory, &expected)?;
         self.verify_current()
     }
@@ -2062,10 +2062,10 @@ impl NamespaceLease {
         self.verify_current()?;
         verify_open_child_directory(&self.parent, path, &retained.directory, &retained.id)?;
         remove_open_directory_contents(&retained.directory)?;
-        retained.directory.sync_all()?;
+        sync_private_directory(&retained.directory)?;
         verify_open_child_directory(&self.parent, path, &retained.directory, &retained.id)?;
         remove_open_child_directory(&self.parent, path, &retained.directory, &retained.id)?;
-        self.parent.sync_all()?;
+        sync_private_directory(&self.parent)?;
         self.verify_current()
     }
 
@@ -2083,10 +2083,10 @@ impl NamespaceLease {
         self.verify_current()?;
         verify_open_child_directory(&self.parent, path, &directory, &expected)?;
         remove_open_directory_contents(&directory)?;
-        directory.sync_all()?;
+        sync_private_directory(&directory)?;
         verify_open_child_directory(&self.parent, path, &directory, &expected)?;
         remove_open_child_directory(&self.parent, path, &directory, &expected)?;
-        self.parent.sync_all()?;
+        sync_private_directory(&self.parent)?;
         self.verify_current()
     }
 
@@ -2128,7 +2128,7 @@ impl NamespaceLease {
         self.require_child(path)?;
         self.verify_current()?;
         let file = open_child_file_for_lock(&self.parent, path)?;
-        self.parent.sync_all()?;
+        sync_private_directory(&self.parent)?;
         let id = private_object_id(&file)?;
         let child = RetainedNamespaceChild {
             namespace: self.try_clone_authority()?,
@@ -3141,14 +3141,14 @@ fn ensure_private_artifact_root_with_parent(
                     )
                 },
             )?;
-            staging.sync_all()?;
+            sync_private_directory(&staging)?;
             rename_open_child_directory(
                 &publication_parent,
                 &staging_root,
                 private_root,
                 &staging,
             )?;
-            publication_parent.sync_all()?;
+            sync_private_directory(&publication_parent)?;
             let published = open_child_directory_for_identity(&publication_parent, private_root)?;
             validate_private_directory_handle(&published)?;
             let verified = verify_private_artifact_root_from_handles(
@@ -3286,7 +3286,7 @@ fn ensure_private_sqlite_lineage(
             };
             encode_lineage_record(LineageRecordKind::Sqlite, &record)
         })?;
-        parent.sync_all()?;
+        sync_private_directory(parent)?;
         return Ok(());
     }
     if !marker_exists {
@@ -3371,8 +3371,8 @@ fn initialize_staged_private_root(
     };
     let leaf = open_private_directory_lease(staging_leaf)?;
     ensure_private_sqlite_lineage(&lineage, &leaf, staging_leaf, staging_database)?;
-    leaf.sync_all()?;
-    lineage.root.sync_all()?;
+    sync_private_directory(&leaf)?;
+    sync_private_directory(&lineage.root)?;
     Ok(root_id)
 }
 
@@ -3463,7 +3463,7 @@ fn ensure_private_workspace_lineage_impl(
                 private_root,
                 &staging,
             )?;
-            publication_parent.sync_all()?;
+            sync_private_directory(&publication_parent)?;
             let current_parent = open_publication_parent(publish_parent)?;
             if private_object_id(&current_parent)? != publication_parent_id {
                 return Err(invalid_lineage(
@@ -3565,16 +3565,12 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
         };
         let data_access = match mode {
             PrivateOpenMode::Append => FILE_APPEND_DATA,
-            PrivateOpenMode::ReadWriteLock | PrivateOpenMode::ReadWriteAppend => {
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE
-            }
+            PrivateOpenMode::ReadWriteLock => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            PrivateOpenMode::ReadWriteAppend => FILE_GENERIC_READ | FILE_APPEND_DATA,
             PrivateOpenMode::Truncate | PrivateOpenMode::CreateNew => FILE_GENERIC_WRITE,
         };
         options.access_mode(data_access | READ_CONTROL);
-        if matches!(
-            mode,
-            PrivateOpenMode::ReadWriteLock | PrivateOpenMode::ReadWriteAppend
-        ) {
+        if mode == PrivateOpenMode::ReadWriteLock {
             options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         }
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
@@ -3944,7 +3940,7 @@ impl EphemeralProbeRegistration {
         let file = open_child_file_for_lock(&parent, &path)?;
         let id = private_object_id(&file)?;
         lock_exclusive(&file)?;
-        parent.sync_all()?;
+        sync_private_directory(&parent)?;
         Ok(Self { file, id, path })
     }
 
@@ -4060,7 +4056,7 @@ fn publish_ephemeral_probe_cleanup_marker(
             }
             Err(error) => return Err(error),
         };
-    publication_parent.sync_all()?;
+    sync_private_directory(publication_parent)?;
     Ok((marker_path, marker_id))
 }
 
@@ -4206,14 +4202,14 @@ impl EphemeralProbeCleanup {
         )?;
 
         remove_open_directory_contents(&self.private_root_directory)?;
-        self.private_root_directory.sync_all()?;
+        sync_private_directory(&self.private_root_directory)?;
         remove_open_child_directory(
             &self.publication_parent,
             &self.private_root,
             &self.private_root_directory,
             &self.private_root_id,
         )?;
-        self.publication_parent.sync_all()?;
+        sync_private_directory(&self.publication_parent)?;
         if parent_child_names(&self.publication_parent, &self.publication_parent_path)?
             .iter()
             .any(|name| Some(name.as_os_str()) == self.private_root.file_name())
@@ -4432,14 +4428,14 @@ pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Re
             ));
         }
         remove_open_directory_contents(&private_root_directory)?;
-        private_root_directory.sync_all()?;
+        sync_private_directory(&private_root_directory)?;
         remove_open_child_directory(
             &publication_parent,
             &record.private_root,
             &private_root_directory,
             &private_root_id,
         )?;
-        publication_parent.sync_all()?;
+        sync_private_directory(&publication_parent)?;
     }
     if parent_child_names(&publication_parent, &publication_parent_path)?
         .iter()
@@ -5474,11 +5470,11 @@ fn write_private_file_atomic_windows_in_parent(
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
-        parent.sync_all()?;
+        sync_private_directory(parent)?;
         before_replace(&temporary)?;
         windows_acl::replace_file(&file, parent, path)?;
         replaced = true;
-        parent.sync_all()?;
+        sync_private_directory(parent)?;
         Ok(())
     })();
     if result.is_err() && !replaced {
@@ -5499,6 +5495,22 @@ pub(crate) fn open_parent_sync_handle(parent: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         windows_acl::open_directory_for_sync(parent)
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory synchronization is unsupported on this platform",
+    ))
+}
+
+fn sync_private_directory(directory: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        directory.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::sync_directory(directory)
     }
     #[cfg(not(any(unix, windows)))]
     Err(io::Error::new(
@@ -5633,7 +5645,7 @@ pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    open_parent_sync_handle(parent)?.sync_all()
+    sync_private_directory(&open_parent_sync_handle(parent)?)
 }
 
 #[cfg(windows)]
@@ -7472,9 +7484,9 @@ mod windows_acl {
     use windows_sys::Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FileDirectoryInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE,
-            FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            FileDirectoryInformation, NtCreateFile, NtFlushBuffersFileEx, NtQueryDirectoryFile,
+            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE,
+            FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
         },
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -7507,12 +7519,12 @@ mod windows_acl {
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
             FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
-            SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+            READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
         },
         System::Threading::{
             CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
-            INFINITE,
+            INFINITE, MUTEX_ALL_ACCESS,
         },
     };
 
@@ -7546,7 +7558,7 @@ mod windows_acl {
             ));
         }
         wide_name.push(0);
-        let security = PrivateSecurity::new(false)?;
+        let security = PrivateSecurity::new_mutex()?;
         let handle = unsafe { CreateMutexW(security.attributes(), 0, wide_name.as_ptr()) };
         if handle.is_null() {
             return Err(last_error());
@@ -7558,6 +7570,7 @@ mod windows_acl {
             false,
             security.user_sid,
             security.system_sid,
+            security.access_mask,
         )?;
         match unsafe { WaitForSingleObject(handle.0, INFINITE) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(LineageMutex(handle)),
@@ -7584,6 +7597,26 @@ mod windows_acl {
     fn nt_error(status: i32) -> io::Error {
         let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
         io::Error::from_raw_os_error(code as i32)
+    }
+
+    pub(super) fn sync_directory(directory: &std::fs::File) -> io::Result<()> {
+        // std::fs::File::sync_all uses FlushFileBuffers, which rejects
+        // directory handles on Windows. The native zero-flag flush supports
+        // directory handles and persists their metadata changes.
+        let mut status_block = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtFlushBuffersFileEx(
+                directory.as_raw_handle() as HANDLE,
+                0,
+                ptr::null(),
+                0,
+                &mut status_block,
+            )
+        };
+        if status < 0 {
+            return Err(nt_error(status));
+        }
+        Ok(())
     }
 
     fn relative_name(path: &Path) -> io::Result<Vec<u16>> {
@@ -7891,7 +7924,7 @@ mod windows_acl {
         let directory = nt_open_child_with_options(
             parent,
             path,
-            DELETE | FILE_GENERIC_READ | READ_CONTROL,
+            DELETE | FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             FILE_OPEN,
             ptr::null(),
@@ -7914,7 +7947,11 @@ mod windows_acl {
         let directory = nt_open_child_with_options(
             parent,
             path,
-            READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            READ_CONTROL
+                | FILE_LIST_DIRECTORY
+                | FILE_READ_ATTRIBUTES
+                | FILE_GENERIC_WRITE
+                | FILE_TRAVERSE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_OPEN,
             ptr::null(),
@@ -7937,7 +7974,7 @@ mod windows_acl {
         let entry = nt_open_child_with_options(
             parent,
             path,
-            DELETE | FILE_GENERIC_READ | READ_CONTROL,
+            DELETE | FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             FILE_OPEN,
             ptr::null(),
@@ -7984,7 +8021,7 @@ mod windows_acl {
             let expected = super::private_object_id(&entry)?;
             if is_directory {
                 remove_open_directory_contents(&entry)?;
-                entry.sync_all()?;
+                sync_directory(&entry)?;
             }
             let current = reopen_recursive_entry_for_identity(directory, &path, is_directory)?;
             if super::private_object_id(&current)? != expected {
@@ -7996,7 +8033,7 @@ mod windows_acl {
             delete_open_file(&entry)?;
             drop(current);
             drop(entry);
-            directory.sync_all()?;
+            sync_directory(directory)?;
         }
         if !child_names(directory, Path::new("."))?.is_empty() {
             return Err(io::Error::new(
@@ -8016,10 +8053,22 @@ mod windows_acl {
         user_sid: PSID,
         system_sid: PSID,
         directory: bool,
+        access_mask: u32,
     }
 
     impl PrivateSecurity {
         fn new(directory: bool) -> io::Result<Self> {
+            Self::new_with_access(directory, FILE_ALL_ACCESS)
+        }
+
+        fn new_mutex() -> io::Result<Self> {
+            // Kernel-object access bits are object-specific. Windows
+            // normalizes a mutex DACL to MUTEX_ALL_ACCESS, so comparing it
+            // against FILE_ALL_ACCESS would reject the DACL we just created.
+            Self::new_with_access(false, MUTEX_ALL_ACCESS)
+        }
+
+        fn new_with_access(directory: bool, access_mask: u32) -> io::Result<Self> {
             unsafe {
                 let (token_user, user_sid) = current_user_sid()?;
                 let (system, system_sid) = local_system_sid()?;
@@ -8035,9 +8084,7 @@ mod windows_acl {
                     return Err(last_error());
                 }
                 for sid in [user_sid, system_sid] {
-                    if AddAccessAllowedAceEx(acl_ptr, ACL_REVISION, flags, FILE_ALL_ACCESS, sid)
-                        == 0
-                    {
+                    if AddAccessAllowedAceEx(acl_ptr, ACL_REVISION, flags, access_mask, sid) == 0 {
                         return Err(last_error());
                     }
                 }
@@ -8083,6 +8130,7 @@ mod windows_acl {
                     user_sid,
                     system_sid,
                     directory,
+                    access_mask,
                 })
             }
         }
@@ -8093,7 +8141,13 @@ mod windows_acl {
 
         fn verify(&self, file: &std::fs::File) -> io::Result<()> {
             let _keep_descriptor_alive = &self.descriptor;
-            verify(file, self.directory, self.user_sid, self.system_sid)
+            verify(
+                file,
+                self.directory,
+                self.user_sid,
+                self.system_sid,
+                self.access_mask,
+            )
         }
     }
 
@@ -8156,7 +8210,13 @@ mod windows_acl {
         expected_owner: PSID,
     ) -> io::Result<()> {
         let security = PrivateSecurity::new(directory)?;
-        verify(file, directory, expected_owner, security.system_sid)
+        verify(
+            file,
+            directory,
+            expected_owner,
+            security.system_sid,
+            security.access_mask,
+        )
     }
 
     pub(super) fn require_current_owner_sid(owner_sid: PSID, user_sid: PSID) -> io::Result<()> {
@@ -8321,6 +8381,7 @@ mod windows_acl {
         directory: bool,
         user_sid: PSID,
         system_sid: PSID,
+        expected_access_mask: u32,
     ) -> io::Result<()> {
         verify_handle(
             file.as_raw_handle() as HANDLE,
@@ -8328,6 +8389,7 @@ mod windows_acl {
             directory,
             user_sid,
             system_sid,
+            expected_access_mask,
         )
     }
 
@@ -8337,6 +8399,7 @@ mod windows_acl {
         directory: bool,
         user_sid: PSID,
         system_sid: PSID,
+        expected_access_mask: u32,
     ) -> io::Result<()> {
         unsafe {
             let mut owner = ptr::null_mut();
@@ -8398,7 +8461,7 @@ mod windows_acl {
                 let sid: PSID = (&ace.SidStart as *const u32).cast_mut().cast();
                 if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
                     || u32::from(ace.Header.AceFlags) != expected_flags(directory)
-                    || ace.Mask != FILE_ALL_ACCESS
+                    || ace.Mask != expected_access_mask
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -8454,21 +8517,17 @@ mod windows_acl {
         let security = PrivateSecurity::new(false)?;
         let access = match mode {
             super::PrivateOpenMode::Append => FILE_APPEND_DATA,
-            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend => {
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE
-            }
+            super::PrivateOpenMode::ReadWriteLock => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            super::PrivateOpenMode::ReadWriteAppend => FILE_GENERIC_READ | FILE_APPEND_DATA,
             super::PrivateOpenMode::Truncate | super::PrivateOpenMode::CreateNew => {
                 FILE_GENERIC_WRITE
             }
         } | DELETE
             | READ_CONTROL;
-        let share = if matches!(
-            mode,
-            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend
-        ) {
-            FILE_SHARE_READ | FILE_SHARE_WRITE
-        } else {
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        let share = match mode {
+            super::PrivateOpenMode::ReadWriteLock => FILE_SHARE_READ | FILE_SHARE_WRITE,
+            super::PrivateOpenMode::CreateNew => FILE_SHARE_DELETE,
+            _ => 0,
         };
         let descriptor = security.attributes.lpSecurityDescriptor.cast_const();
         let (file, created) =
@@ -8523,20 +8582,16 @@ mod windows_acl {
         let path = wide(path)?;
         let access = match mode {
             super::PrivateOpenMode::Append => FILE_APPEND_DATA,
-            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend => {
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE
-            }
+            super::PrivateOpenMode::ReadWriteLock => FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            super::PrivateOpenMode::ReadWriteAppend => FILE_GENERIC_READ | FILE_APPEND_DATA,
             super::PrivateOpenMode::Truncate | super::PrivateOpenMode::CreateNew => {
                 FILE_GENERIC_WRITE
             }
         };
-        let share = if matches!(
-            mode,
-            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend
-        ) {
-            FILE_SHARE_READ | FILE_SHARE_WRITE
-        } else {
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        let share = match mode {
+            super::PrivateOpenMode::ReadWriteLock => FILE_SHARE_READ | FILE_SHARE_WRITE,
+            super::PrivateOpenMode::CreateNew => FILE_SHARE_DELETE,
+            _ => 0,
         };
         let handle = unsafe {
             CreateFileW(
@@ -8846,13 +8901,16 @@ mod windows_acl {
     }
 
     pub(super) fn open_directory_for_sync(path: &Path) -> io::Result<std::fs::File> {
-        open_directory(path, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL)
+        open_directory(
+            path,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | READ_CONTROL,
+        )
     }
 
     pub(super) fn open_directory_for_authority(path: &Path) -> io::Result<std::fs::File> {
         let directory = open_directory_with_share(
             path,
-            READ_CONTROL | FILE_LIST_DIRECTORY,
+            READ_CONTROL | FILE_LIST_DIRECTORY | FILE_GENERIC_WRITE | FILE_TRAVERSE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
         )?;
         harden(&directory, true)?;
@@ -8883,7 +8941,9 @@ mod windows_acl {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
-            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL)
+            .access_mode(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | DELETE | READ_CONTROL,
+            )
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let directory = options.open(path)?;
@@ -9636,9 +9696,8 @@ mod tests {
     fn windows_workspace_cleanup_uses_retained_directory_handles() {
         let parent = tempfile::tempdir().unwrap();
         let workspace = parent.path().join("wallet");
-        fs::create_dir(&workspace).unwrap();
-        fs::create_dir(workspace.join("nested")).unwrap();
-        fs::write(workspace.join("nested/secret"), b"delete me").unwrap();
+        create_private_dir_all(&workspace.join("nested")).unwrap();
+        write_private_file(&workspace.join("nested/secret"), b"delete me").unwrap();
         let tombstone = parent.path().join("wallet.deleting-test");
         let lease =
             NamespaceLease::acquire(parent.path(), &parent.path().join("cleanup.lock")).unwrap();
@@ -10399,10 +10458,17 @@ mod windows_tests {
     #[test]
     fn windows_checkpoint_generation_refuses_a_permissive_dacl() {
         let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("private");
-        create_private_dir_all(&parent).unwrap();
-        let path = parent.join("scan.checkpoint");
-        write_private_file(&path, b"spending-key checkpoint").unwrap();
+        let purpose = format!("mainnet\0{}", uuid::Uuid::new_v4()).into_bytes();
+        let root = private_artifact_root_path(&tmp.path().join("artifact-data"), &purpose);
+        let path = root.join("scan.checkpoint");
+        let access = PrivateArtifactAccess::acquire(
+            &root,
+            &purpose,
+            PrivateArtifactDomain::Checkpoint,
+            &path,
+        )
+        .unwrap();
+        access.replace_child(b"spending-key checkpoint").unwrap();
         let file = OpenOptions::new()
             .read(true)
             .access_mode(READ_CONTROL | WRITE_DAC)
@@ -10795,11 +10861,10 @@ mod windows_tests {
         create_private_dir_all(&parent).unwrap();
         let retained = open_parent_sync_handle(&parent).unwrap();
         let detached_ancestor = tmp.path().join("detached-authority");
-        fs::rename(&ancestor, &detached_ancestor).unwrap();
-        create_private_dir_all(&parent).unwrap();
-
-        let replacement_sentinel = parent.join("sentinel");
-        fs::write(&replacement_sentinel, b"replacement tree").unwrap();
+        assert!(
+            fs::rename(&ancestor, &detached_ancestor).is_err(),
+            "a retained descendant handle must pin the ancestor namespace"
+        );
         let child = parent.join("journal");
         let mut created = super::windows_acl::create_child_private(
             &retained,
@@ -10833,23 +10898,18 @@ mod windows_tests {
             .unwrap();
             original.write_all(b"old bytes").unwrap();
         }
-        fs::write(&truncated, b"replacement sentinel").unwrap();
         let mut truncated_handle = super::windows_acl::open_child_private(
             &retained,
             &truncated,
             PrivateOpenMode::Truncate,
         )
         .unwrap();
-        truncated_handle.write_all(b"detached replacement").unwrap();
+        truncated_handle.write_all(b"replacement").unwrap();
         truncated_handle.sync_all().unwrap();
 
         let atomic = parent.join("atomic-target");
-        fs::write(&atomic, b"replacement atomic sentinel").unwrap();
-        write_private_file_atomic_windows_in_parent(&retained, &atomic, b"detached atomic", |_| {
-            assert_eq!(fs::read(&replacement_sentinel)?, b"replacement tree");
-            Ok(())
-        })
-        .unwrap();
+        write_private_file_atomic_windows_in_parent(&retained, &atomic, b"atomic", |_| Ok(()))
+            .unwrap();
 
         let source = parent.join("source");
         let renamed = parent.join("renamed");
@@ -10866,27 +10926,17 @@ mod windows_tests {
         let opened_id = private_object_id(&opened).unwrap();
         remove_open_child_file(&retained, &renamed, &opened, &opened_id).unwrap();
 
-        let detached_parent = detached_ancestor.join("private");
         assert_eq!(
-            fs::read(detached_parent.join("journal")).unwrap(),
+            fs::read(parent.join("journal")).unwrap(),
             b"created-appended"
         );
         assert_eq!(
-            fs::read(detached_parent.join("truncate-target")).unwrap(),
-            b"detached replacement"
+            fs::read(parent.join("truncate-target")).unwrap(),
+            b"replacement"
         );
-        assert_eq!(
-            fs::read(detached_parent.join("atomic-target")).unwrap(),
-            b"detached atomic"
-        );
-        assert!(!detached_parent.join("renamed").exists());
-        assert_eq!(
-            fs::read(&replacement_sentinel).unwrap(),
-            b"replacement tree"
-        );
-        assert_eq!(fs::read(&truncated).unwrap(), b"replacement sentinel");
-        assert_eq!(fs::read(&atomic).unwrap(), b"replacement atomic sentinel");
-        assert!(!child.exists());
+        assert_eq!(fs::read(parent.join("atomic-target")).unwrap(), b"atomic");
+        assert!(!detached_ancestor.exists());
+        assert!(child.exists());
         assert!(!source.exists());
         assert!(!renamed.exists());
     }
