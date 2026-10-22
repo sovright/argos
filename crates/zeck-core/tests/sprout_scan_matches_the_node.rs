@@ -20,9 +20,15 @@
 //!     cargo test -p argos-core --test sprout_scan_matches_the_node -- --ignored
 
 use argos_core::{
-    p2p::{block::joinsplits_in_block, peer::Peer, wire::P2pNetwork},
+    p2p::{
+        block::{joinsplits_in_block, BlockError},
+        peer::Peer,
+        wire::{read_compact_size, write_compact_size, P2pNetwork},
+    },
     sprout_scan::SproutScanner,
 };
+use std::io::Cursor;
+use zcash_primitives::{block::BlockHeader, transaction::Transaction};
 use zcash_protocol::consensus::BranchId;
 
 const NODE_P2P: &str = "127.0.0.1:18344";
@@ -78,6 +84,90 @@ fn from_hex(s: &str) -> Vec<u8> {
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Split bytes from the node without using the block authentication under test.
+/// Cursor offsets retain the original header and transaction serializations.
+fn split_block(block: &[u8], branch_id: BranchId) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut cursor = Cursor::new(block);
+    BlockHeader::read(&mut cursor).expect("node header parses");
+    let header_end = cursor.position() as usize;
+    let (count, count_len) = read_compact_size(&block[header_end..]).expect("transaction count");
+    cursor.set_position((header_end + count_len) as u64);
+
+    let mut transactions = Vec::new();
+    for _ in 0..count {
+        let start = cursor.position() as usize;
+        Transaction::read(&mut cursor, branch_id).expect("node transaction parses");
+        let end = cursor.position() as usize;
+        transactions.push(block[start..end].to_vec());
+    }
+    assert_eq!(cursor.position() as usize, block.len(), "no trailing data");
+    (block[..header_end].to_vec(), transactions)
+}
+
+/// A real node's header must reject any changed transaction vector, even when
+/// every replacement transaction remains individually parseable.
+#[tokio::test]
+#[ignore = "needs the regtest sprout node; see the module docs"]
+async fn an_authentic_header_rejects_altered_transaction_vectors() {
+    let branch_id = BranchId::Canopy;
+    let mut peer = Peer::connect(NODE_P2P, P2pNetwork::Regtest)
+        .await
+        .expect("handshake");
+    let mut locator = [0u8; 32];
+    let (header, transactions) = 'chain: loop {
+        let headers = peer.get_headers(&[locator]).await.expect("getheaders");
+        assert!(
+            !headers.is_empty(),
+            "need a real block with two transactions"
+        );
+        let hashes: Vec<[u8; 32]> = headers.iter().map(|header| header.hash).collect();
+        locator = *hashes.last().expect("non-empty");
+        let fetched = peer.get_blocks(&hashes).await.expect("getdata");
+        for hash in &hashes {
+            let block = fetched.get(hash).expect("requested block returned");
+            let parts = split_block(block, branch_id);
+            if parts.1.len() >= 2 {
+                break 'chain parts;
+            }
+        }
+    };
+
+    let assemble = |transactions: &[Vec<u8>]| {
+        let mut block = header.clone();
+        write_compact_size(&mut block, transactions.len() as u64);
+        for transaction in transactions {
+            block.extend_from_slice(transaction);
+        }
+        block
+    };
+
+    assert!(matches!(
+        joinsplits_in_block(&assemble(&[]), branch_id),
+        Err(BlockError::NoTransactions)
+    ));
+    assert!(matches!(
+        joinsplits_in_block(
+            &assemble(&transactions[..transactions.len() - 1]),
+            branch_id
+        ),
+        Err(BlockError::MerkleRootMismatch)
+    ));
+
+    let mut replaced = transactions.clone();
+    replaced[1] = transactions[0].clone();
+    assert!(matches!(
+        joinsplits_in_block(&assemble(&replaced), branch_id),
+        Err(BlockError::MutatedMerkleTree | BlockError::MerkleRootMismatch)
+    ));
+
+    let mut reordered = transactions;
+    reordered.swap(0, 1);
+    assert!(matches!(
+        joinsplits_in_block(&assemble(&reordered), branch_id),
+        Err(BlockError::MerkleRootMismatch)
+    ));
 }
 
 /// Scan every block on the chain over p2p and compare the resulting Sprout

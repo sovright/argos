@@ -204,6 +204,13 @@ independent. To reconcile the Sprout journal automatically, rerun the confirmed
 network, and `--data-dir`; the generic `reconcile` command does not read the
 Sprout journal.
 
+Sprout scan checkpoints written before block bodies were authenticated
+against their headers (checkpoint versions 1 to 3, including scans saved with
+a decrypt-from bound) are refused for resume and as spend evidence. Keep the
+old file and your spending-key source, move the checkpoint aside or use a new
+data directory, and run a fresh scan; the decrypt-from bound is derived again
+from the wallet when it starts.
+
 ```bash
 # First see whether the wallet already has spendable note data.
 argos --wallet-file /path/to/wallet.dat inspect-wallet

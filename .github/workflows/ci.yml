@@ -209,6 +209,15 @@ jobs:
             --test sprout_scan_finds_a_real_note \
             -- --ignored --nocapture
 
+      - name: Sprout checkpoint reorg test
+        run: |
+          set -o pipefail
+          cargo test -p argos-core --test sprout_scan_reorg \
+            -- --ignored --nocapture 2>&1 | tee reorg-test.log
+          passed=$(grep -cE '^test .* \.\.\. ok$' reorg-test.log || true)
+          echo "reorg tests passed: $passed"
+          test "$passed" -ge 1
+
       # The spend half, and the reason it is no longer optional: `rcm` is now
       # sampled per §4.7.1 rather than derived, which changes *every*
       # commitment Argos produces. A commitment the circuit and the chain

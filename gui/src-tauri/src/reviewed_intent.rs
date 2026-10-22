@@ -106,6 +106,9 @@ pub struct ReviewedSproutSweep {
     pub nu7_warning: String,
     /// Shown with the review, e.g. Sprout keys dropped as forged.
     pub warnings: Vec<String>,
+    /// The verdict from verifying a saved scan for this review, which may
+    /// differ from the earlier inspection if the checkpoint or chain changed.
+    pub scan_warning: Option<String>,
 }
 
 /// Where a proposal's notes came from. A wallet proposal carries no file
@@ -128,6 +131,14 @@ pub struct SproutSweepIntent {
     /// Set when the catch-up scan behind a scan-derived proposal could not
     /// confirm the chain tip; it leads the sweep report's warnings.
     pub tip_warning: Option<String>,
+    /// A wallet proposal's verdict from verifying its saved scan against
+    /// live headers at review time (#272). It ends the sweep report's
+    /// warnings and is appended to a sweep error. Execution spends the
+    /// reviewed notes and does not verify again.
+    pub chain_notice: Option<String>,
+    /// Set when the scan panel's peer field was malformed at review time.
+    /// The review degrades to a warning, but execution refuses the proposal.
+    pub peer_error: Option<String>,
 }
 
 pub struct ScanMaterial {
@@ -479,6 +490,7 @@ impl ReviewedIntentStore {
             lands_in_sapling: argos_core::sprout_sweep::SPROUT_LANDS_IN_SAPLING.to_owned(),
             nu7_warning,
             warnings: Vec::new(),
+            scan_warning: None,
         })
     }
 
@@ -601,6 +613,8 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(1),
                     tip_warning: None,
+                    chain_notice: None,
+                    peer_error: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,
@@ -678,6 +692,8 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(2),
                     tip_warning: None,
+                    chain_notice: None,
+                    peer_error: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,
@@ -737,6 +753,8 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(3),
                     tip_warning: None,
+                    chain_notice: None,
+                    peer_error: None,
                 },
                 SproutSweepPreviewData {
                     notes: 1,

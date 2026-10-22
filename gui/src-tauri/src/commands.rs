@@ -461,7 +461,7 @@ const SPROUT_KEEP_SOURCE_WARNING: &str =
 /// Compute the Sprout summary for a wallet. Body is verbatim the logic that
 /// previously lived inline in `inspect_wallet_file`: reject forged keys, then
 /// try to recover notes, then quote the scan cost when a scan would be needed.
-fn compute_sprout_summary(
+async fn compute_sprout_summary(
     app: &AppHandle,
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
     network: argos_core::ZeckNetwork,
@@ -475,7 +475,8 @@ fn compute_sprout_summary(
     // stored address must not be counted, shown, or spent with.
     let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(keys);
 
-    let recovered = recover_with_scan(app, keys, network, data_dir);
+    let recovered =
+        recover_for_wallet_open(keys, network, resolve_data_dir(app, data_dir).ok()).await;
     let journal_result = if keys.sprout.is_empty() {
         Ok(argos_core::sprout_sweep::SproutJournalSnapshot::default())
     } else {
@@ -633,49 +634,50 @@ pub async fn inspect_wallet_file(
     let selected = parse_wallet_network(&network_name)?;
     let bytes = argos_core::wallet_file::read_wallet_file(&path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
-    let (keys, sprout) =
-        match import_gui_wallet_then(&bytes, passphrase.as_ref(), selected, |mut keys| {
-            let sprout = compute_sprout_summary(&app, &mut keys, selected, data_dir.as_deref());
-            (keys, sprout)
-        }) {
-            Ok(result) => result,
-            // An encrypted wallet with a missing or wrong passphrase is an
-            // ordinary user situation, not a failure to show raw. Matched on
-            // the parser's typed error, which the core wrapper carries in
-            // ZeckError::WalletFile, rather than on its message text: a
-            // reworded message must not turn the passphrase prompt into a
-            // raw error.
-            Err(argos_core::ZeckError::WalletFile(
-                argos_core::argos_wallet_import::ImportError::WrongPassphrase,
-            )) => {
-                return Ok(WalletFileSummary {
-                    path,
-                    transparent_keys: 0,
-                    sapling_keys: 0,
-                    sprout_keys: 0,
-                    sprout_nu7_warning: String::new(),
-                    sprout_addresses: Vec::new(),
-                    sprout_spendable_notes: 0,
-                    sprout_spendable_zatoshis: 0,
-                    sprout_has_lifecycle_status: false,
-                    sprout_issues: Vec::new(),
-                    sprout_scan_warning: Vec::new(),
-                    sprout_accounting: Vec::new(),
-                    sprout_nothing_left: false,
-                    sprout_history_read: false,
-                    sprout_spent_status: String::new(),
-                    has_mnemonic: false,
-                    seed_note: None,
-                    transparent_only: false,
-                    diagnostics: Vec::new(),
-                    seed_diagnostics: Vec::new(),
-                    coverage_notice: None,
-                    coverage_may_hide_funds: false,
-                    needs_passphrase: true,
-                });
-            }
-            Err(err) => return Err(err.to_string()),
-        };
+    // Recovery runs only once the core importer has accepted the wallet's
+    // embedded network; it is async (a saved scan is named offline), so it
+    // follows the import rather than running inside its continuation.
+    let mut keys = match import_gui_wallet_then(&bytes, passphrase.as_ref(), selected, |keys| keys)
+    {
+        Ok(keys) => keys,
+        // An encrypted wallet with a missing or wrong passphrase is an
+        // ordinary user situation, not a failure to show raw. Matched on
+        // the parser's typed error, which the core wrapper carries in
+        // ZeckError::WalletFile, rather than on its message text: a
+        // reworded message must not turn the passphrase prompt into a
+        // raw error.
+        Err(argos_core::ZeckError::WalletFile(
+            argos_core::argos_wallet_import::ImportError::WrongPassphrase,
+        )) => {
+            return Ok(WalletFileSummary {
+                path,
+                transparent_keys: 0,
+                sapling_keys: 0,
+                sprout_keys: 0,
+                sprout_nu7_warning: String::new(),
+                sprout_addresses: Vec::new(),
+                sprout_spendable_notes: 0,
+                sprout_spendable_zatoshis: 0,
+                sprout_has_lifecycle_status: false,
+                sprout_issues: Vec::new(),
+                sprout_scan_warning: Vec::new(),
+                sprout_accounting: Vec::new(),
+                sprout_nothing_left: false,
+                sprout_history_read: false,
+                sprout_spent_status: String::new(),
+                has_mnemonic: false,
+                seed_note: None,
+                transparent_only: false,
+                diagnostics: Vec::new(),
+                seed_diagnostics: Vec::new(),
+                coverage_notice: None,
+                coverage_may_hide_funds: false,
+                needs_passphrase: true,
+            });
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    let sprout = compute_sprout_summary(&app, &mut keys, selected, data_dir.as_deref()).await;
 
     Ok(wallet_summary_from_keys(path, keys, sprout, &network_name))
 }
@@ -1095,6 +1097,16 @@ fn sweep_event_names(status: argos_core::TxLifecycleState) -> &'static [&'static
     }
 }
 
+/// [`sprout_sweep_preview`] for a wallet review, with the review's scan
+/// verification notice (#272) carried on any error.
+fn plan_wallet_sprout_preview(
+    recovered: &argos_core::sprout_recovery::SproutRecovery,
+    snapshot: &argos_core::sprout_sweep::SproutJournalSnapshot,
+) -> Result<SproutSweepPreviewData, String> {
+    sprout_sweep_preview(&recovered.notes, snapshot)
+        .map_err(|err| with_chain_notice(err, recovered.chain_notice.as_deref()))
+}
+
 /// One broadcast Sprout sweep, for the frontend.
 #[derive(Clone, Serialize)]
 pub struct SproutSweepResult {
@@ -1235,8 +1247,39 @@ fn sprout_network(name: &str) -> Result<ZeckNetwork, String> {
     }
 }
 
+fn with_chain_notice(message: String, notice: Option<&str>) -> String {
+    match notice {
+        Some(notice) => format!("{message}. {notice}"),
+        None => message,
+    }
+}
+
+fn append_chain_notice(warnings: &mut Vec<String>, notice: Option<String>) {
+    if let Some(notice) = notice {
+        warnings.push(notice);
+    }
+}
+
+fn no_sprout_notes_error(
+    recovered: &argos_core::sprout_recovery::SproutRecovery,
+    inventory: &argos_core::sprout_sweep::SproutSweepInventory<'_>,
+) -> String {
+    let message = if recovered.nothing_left_to_sweep(inventory) {
+        "nothing is left to sweep: every Sprout note in this wallet file is spent (by the \
+         file's own record, or by this wallet's full-block scan) or worth less than the fee"
+    } else {
+        "no spendable Sprout notes could be recovered from this wallet file"
+    };
+    with_chain_notice(message.to_owned(), recovered.chain_notice.as_deref())
+}
+
 /// Recover once and store the exact notes and execution settings reviewed by
 /// the user. No wallet path or passphrase is accepted at execution time.
+///
+/// `peers` is the scan panel's peer list: a saved scan of these keys is
+/// verified against live headers through them (dialled before the DNS
+/// seeds) before its spent verdicts shape the reviewed notes. A malformed
+/// entry does not fail the review; see [`recover_for_sweep_preview`].
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn propose_wallet_sprout_sweep(
@@ -1249,6 +1292,7 @@ pub async fn propose_wallet_sprout_sweep(
     confirmation_sources: Option<Vec<String>>,
     network: String,
     data_dir: Option<String>,
+    peers: Option<Vec<String>>,
 ) -> Result<ReviewedSproutSweep, String> {
     ensure_tos_accepted(&app)?;
     let network = sprout_network(&network)?;
@@ -1272,18 +1316,20 @@ pub async fn propose_wallet_sprout_sweep(
         network,
         lightwalletd_url,
         confirmation_sources,
+        &peers.unwrap_or_default(),
         |warning| {
             let _ = app.emit("sprout-forged-key", warning);
         },
     )
+    .await
 }
 
 /// `propose_wallet_sprout_sweep` after the file is read and decrypted, with
 /// no `AppHandle`: drop forged keys (reporting each through `on_forged`),
-/// recover the notes, load the exact journal scope, and store the reviewed
-/// proposal.
+/// recover the notes (verifying a saved scan through `raw_peers`), load the
+/// exact journal scope, and store the reviewed proposal.
 #[allow(clippy::too_many_arguments)]
-fn propose_wallet_sprout_sweep_core(
+async fn propose_wallet_sprout_sweep_core(
     store: &ReviewedIntentStore,
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
     dir: PathBuf,
@@ -1291,6 +1337,7 @@ fn propose_wallet_sprout_sweep_core(
     network: ZeckNetwork,
     lightwalletd_url: String,
     confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
+    raw_peers: &[String],
     on_forged: impl Fn(&str),
 ) -> Result<ReviewedSproutSweep, String> {
     // As inspect does: a forged key is dropped and named in the review, and
@@ -1300,7 +1347,13 @@ fn propose_wallet_sprout_sweep_core(
     for warning in &forged_warnings {
         on_forged(warning);
     }
-    let recovered = recover_with_scan_in(keys, network, Some(dir.clone()));
+    // A malformed peer degrades the review to the wallet file's own record
+    // with a warning (#272), but the proposal it yields is refused at
+    // execute: the sweep never runs on a review whose scan could not be
+    // verified because of the peer field.
+    let peer_error = parse_custom_peers(raw_peers).err();
+    let recovered = recover_for_sweep_preview(keys, network, Some(dir.clone()), raw_peers).await;
+    let notice = recovered.chain_notice.as_deref();
     let journal =
         argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(keys), network);
     let outpoints = recovered
@@ -1310,23 +1363,19 @@ fn propose_wallet_sprout_sweep_core(
         .collect::<Vec<_>>();
     let snapshot = journal
         .load_scoped_snapshot(&outpoints)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| with_chain_notice(err.to_string(), notice))?;
     let inventory = argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
-    let plan = sprout_sweep_preview(&recovered.notes, &snapshot)?;
+    let plan = plan_wallet_sprout_preview(&recovered, &snapshot)?;
     let plan_empty = plan.notes == 0 && plan.active.is_empty() && plan.mined.is_empty();
     if let Some(message) = empty_sprout_proposal_error(
         SproutProposalOrigin::Wallet,
         plan_empty,
         snapshot.entries().map(|entry| entry.state),
     ) {
-        return Err(message);
+        return Err(with_chain_notice(message, notice));
     }
     if plan_empty {
-        return Err(if recovered.nothing_left_to_sweep(&inventory) {
-            "nothing is left to sweep: the wallet file or scan shows its Sprout notes spent or below the fee".into()
-        } else {
-            "no spendable Sprout notes could be recovered from this wallet file".into()
-        });
+        return Err(no_sprout_notes_error(&recovered, &inventory));
     }
 
     // The reviewed notes, with their keys, are held in the proposal (see
@@ -1342,17 +1391,34 @@ fn propose_wallet_sprout_sweep_core(
             confirmation_sources,
             journal,
             tip_warning: None,
+            chain_notice: recovered.chain_notice.clone(),
+            peer_error,
         },
         plan,
     )?;
     review.warnings = forged_warnings;
+    review.scan_warning = recovered.chain_notice;
     Ok(review)
+}
+
+/// A wallet review built while the scan panel's peer field was malformed
+/// showed the wallet file's own record with a warning; executing it is
+/// refused, as #272's sweep refuses that field.
+fn refuse_unverified_review(intent: &SproutSweepIntent) -> Result<(), String> {
+    match &intent.peer_error {
+        Some(err) => Err(format!(
+            "{err} This review's saved scan was not verified. Fix the scan panel's peer \
+             field and review the sweep again."
+        )),
+        None => Ok(()),
+    }
 }
 
 async fn execute_reviewed_sprout_sweep(
     app: AppHandle,
     intent: SproutSweepIntent,
 ) -> Result<SproutSweepReport, String> {
+    refuse_unverified_review(&intent)?;
     let source = match &intent.source {
         SproutIntentSource::Wallet => argos_core::sprout_sweep::NoteSource::WalletFile,
         SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
@@ -1374,9 +1440,11 @@ async fn execute_reviewed_sprout_sweep(
         },
     )
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| with_chain_notice(err.to_string(), intent.chain_notice.as_deref()))?;
 
     apply_sprout_tip_warning(&mut outcome, intent.tip_warning);
+    // The verification verdict bound into the proposal at review (#272).
+    append_chain_notice(&mut outcome.warnings, intent.chain_notice);
     Ok(sprout_sweep_report(outcome))
 }
 
@@ -2086,6 +2154,8 @@ pub async fn propose_sprout_scan_sweep(
             confirmation_sources: material.confirmation_sources,
             journal,
             tip_warning,
+            chain_notice: None,
+            peer_error: None,
         },
         plan,
     )
@@ -2161,37 +2231,86 @@ fn import_gui_wallet_then<T>(
     argos_core::import_wallet_file_for_network(bytes, passphrase, selected).map(next)
 }
 
+/// Recovery for opening a wallet (`inspect_wallet_file`), which makes no
+/// network contact: a saved scan is named, not used, until a sweep preview
+/// verifies it against live peers. Its own function so the no-network
+/// wiring is tested rather than only the lower layer it delegates to.
+async fn recover_for_wallet_open(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    dir: Option<PathBuf>,
+) -> argos_core::sprout_recovery::SproutRecovery {
+    recover_with_scan_in_dir(keys, network, dir, None).await
+}
+
+/// Recovery for a sweep preview. A malformed entry in the scan panel's peer
+/// field does not fail the preview: live verification is skipped, so no
+/// network attempt is made and an unverified scan supplies no spent verdict
+/// (fail closed), the wallet file's own record stands, and the reason leads
+/// the preview's scan warning. The sweep itself still refuses the field.
+async fn recover_for_sweep_preview(
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    dir: Option<PathBuf>,
+    raw_peers: &[String],
+) -> argos_core::sprout_recovery::SproutRecovery {
+    match parse_custom_peers(raw_peers) {
+        Ok(peers) => recover_with_scan_in_dir(keys, network, dir, Some(&peers)).await,
+        Err(err) => {
+            let mut recovered = recover_with_scan_in_dir(keys, network, dir, None).await;
+            let line = format!(
+                "The scan panel's peers were not used: {err} No saved scan was verified \
+                 for this preview, so spent status is the wallet file's own record. Fix \
+                 the peer field before sweeping."
+            );
+            recovered.chain_notice = Some(match recovered.chain_notice.take() {
+                Some(notice) => format!("{line} {notice}"),
+                None => line,
+            });
+            recovered
+        }
+    }
+}
+
 /// Recover a wallet file's Sprout notes, letting a full-block scan of the
 /// same keys settle every spend it saw on chain. Looks in the data directory
 /// the scan panel writes to (the field, else the app default), so a scan run
 /// from this app is found without asking. The scan is optional: without one,
 /// or with one that cannot be used, the file's own record stands, and the
-/// reason is logged rather than failing the wallet screen.
-fn recover_with_scan(
-    app: &AppHandle,
-    keys: &argos_core::argos_wallet_import::ImportedKeys,
-    network: argos_core::ZeckNetwork,
-    data_dir: Option<&str>,
-) -> argos_core::sprout_recovery::SproutRecovery {
-    recover_with_scan_in(keys, network, resolve_data_dir(app, data_dir).ok())
-}
-
-/// `recover_with_scan` against an already-resolved data directory.
-fn recover_with_scan_in(
+/// reason is shown rather than failing the wallet screen.
+///
+/// `peers` is `None` for wallet inspection, which makes no network contact:
+/// a saved scan is then named but its evidence is not used. A sweep passes
+/// the user's peer list (possibly empty), dialled before the DNS seeds, to
+/// verify the scan's cursor against live headers first.
+async fn recover_with_scan_in_dir(
     keys: &argos_core::argos_wallet_import::ImportedKeys,
     network: argos_core::ZeckNetwork,
     dir: Option<PathBuf>,
+    peers: Option<&[String]>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
     // The lookup's notice is shown on the wallet screen, not logged: a scan
     // that exists but cannot be used must not look like no scan at all.
-    let (chain, notice) = match &dir {
-        Some(dir) => argos_core::sprout_scan_run::chain_spends_for_wallet(
-            dir,
-            network.into(),
-            &spending_keys,
+    let (chain, notice) = match (&dir, peers) {
+        (Some(dir), None) => (
+            None,
+            argos_core::sprout_scan_run::wallet_scan_notice_offline(
+                dir,
+                network.into(),
+                &spending_keys,
+            ),
         ),
-        None => (None, None),
+        (Some(dir), Some(peers)) => {
+            argos_core::sprout_scan_run::chain_spends_for_wallet(
+                dir,
+                network.into(),
+                &spending_keys,
+                peers,
+            )
+            .await
+        }
+        (None, _) => (None, None),
     };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
@@ -3552,8 +3671,8 @@ mod tests {
     /// made; see the fixtures README), so the proposal ends at "no spendable
     /// notes" rather than a review; a refusal on the forged key would fail
     /// before that, with a different error and nothing reported.
-    #[test]
-    fn proposing_from_a_wallet_with_a_forged_key_drops_it_and_carries_on() {
+    #[tokio::test]
+    async fn proposing_from_a_wallet_with_a_forged_key_drops_it_and_carries_on() {
         let bytes =
             argos_core::wallet_file::read_wallet_file(fixture("sprout-plaintext.dat")).unwrap();
         let mut keys = argos_core::argos_wallet_import::import_wallet_file(&bytes, None).unwrap();
@@ -3579,8 +3698,10 @@ mod tests {
             ZeckNetwork::Mainnet,
             "https://zec.rocks:443".into(),
             Vec::new(),
+            &[],
             |warning| reported.borrow_mut().push(warning.to_owned()),
         )
+        .await
         .err()
         .expect("the fixture has no spendable note");
         assert!(err.contains("no spendable Sprout notes"), "{err}");
@@ -3934,6 +4055,8 @@ mod tests {
                         confirmation_sources: Vec::new(),
                         journal: test_sprout_journal(10),
                         tip_warning: None,
+                        chain_notice: None,
+                        peer_error: None,
                     },
                     SproutSweepPreviewData {
                         notes: 1,
@@ -4519,6 +4642,226 @@ mod tests {
         // `network_validation_rejects_wrong_chain`).
         validate_sweep_endpoint("https://testnet.zec.rocks:443")
             .expect("a well-formed testnet URL passes the syntax check");
+    }
+
+    #[test]
+    fn preview_response_serializes_its_current_scan_warning() {
+        let preview = ReviewedSproutSweep {
+            proposal_id: crate::reviewed_intent::SproutProposalId("fixture".to_owned()),
+            plan: SproutSweepPreviewData {
+                notes: 1,
+                gross_zatoshis: 100_000,
+                fee_zatoshis: 10_000,
+                net_zatoshis: 90_000,
+                active: Vec::new(),
+                mined: Vec::new(),
+            },
+            params_present: true,
+            params_path: "/fixture/params".to_owned(),
+            lands_in_sapling: "Lands in Sapling".to_owned(),
+            nu7_warning: "NU7 fixture".to_owned(),
+            warnings: Vec::new(),
+            scan_warning: Some("fresh checkpoint verification failed".to_owned()),
+        };
+        let json = serde_json::to_value(preview).unwrap();
+        assert_eq!(json["scan_warning"], "fresh checkpoint verification failed");
+        assert_eq!(json["net_zatoshis"], 90_000);
+    }
+
+    /// #272's "the sweep itself still refuses the field", under #271's
+    /// proposal model: a review built with a malformed peer list is refused
+    /// at execute, and one built with a valid list is not.
+    #[test]
+    fn a_review_built_with_a_malformed_peer_is_refused_at_execute() {
+        let intent = |peer_error: Option<String>| SproutSweepIntent {
+            source: SproutIntentSource::Wallet,
+            notes: Vec::new(),
+            destination: "zs-reviewed".into(),
+            network: ZeckNetwork::Mainnet,
+            lightwalletd_url: "https://node".into(),
+            confirmation_sources: Vec::new(),
+            journal: test_sprout_journal(0x5A),
+            tip_warning: None,
+            chain_notice: None,
+            peer_error,
+        };
+        let err = parse_custom_peers(&["no-port-here".to_owned()]).unwrap_err();
+        let refused = refuse_unverified_review(&intent(Some(err))).unwrap_err();
+        assert!(refused.contains("no-port-here"), "{refused}");
+        assert!(refused.contains("host:port"), "{refused}");
+        assert!(refused.contains("review the sweep again"), "{refused}");
+        assert!(refuse_unverified_review(&intent(None)).is_ok());
+    }
+
+    /// With #277's journal an empty recovery is not itself an error (saved
+    /// transactions may still need a status check), so the notice rides on
+    /// the empty-plan error the review returns instead.
+    #[test]
+    fn preview_error_carries_fresh_verification_notice_when_no_note_is_available() {
+        let recovered = SproutRecovery {
+            chain_notice: Some("preview verification found a deep reorg".to_owned()),
+            ..Default::default()
+        };
+        let snapshot = argos_core::sprout_sweep::SproutJournalSnapshot::default();
+        let plan = plan_wallet_sprout_preview(&recovered, &snapshot).unwrap();
+        assert_eq!(plan.notes, 0);
+        let inventory =
+            argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+        let error = no_sprout_notes_error(&recovered, &inventory);
+        assert!(
+            error.contains("preview verification found a deep reorg"),
+            "{error}"
+        );
+    }
+
+    /// The notice helpers compose the verdict they are given into errors and
+    /// warnings. Under #271's proposal model that verdict is the one bound
+    /// into the proposal at review; execute spends the reviewed notes and
+    /// does not verify again.
+    #[test]
+    fn notice_helpers_carry_the_current_verdict_not_an_earlier_one() {
+        let snapshot = argos_core::sprout_sweep::SproutJournalSnapshot::default();
+        let mut preview = SproutRecovery::default();
+        preview.notes.push(preview_note(1_000_000, 0x61));
+        preview.chain_notice = Some("preview verification saw a spendable note".to_owned());
+        assert_eq!(
+            plan_wallet_sprout_preview(&preview, &snapshot)
+                .unwrap()
+                .notes,
+            1
+        );
+
+        let mut current = SproutRecovery::default();
+        current.spent.push(spent_note());
+        current.chain_notice = Some("execute verification found a new reorg".to_owned());
+        let mut warnings = vec!["journal warning".to_owned()];
+        append_chain_notice(&mut warnings, current.chain_notice.clone());
+        assert_eq!(
+            warnings,
+            vec!["journal warning", "execute verification found a new reorg"]
+        );
+        let inventory = argos_core::sprout_sweep::classify_sprout_notes(&current.notes, &snapshot);
+        let error = no_sprout_notes_error(&current, &inventory);
+        assert!(
+            error.contains("execute verification found a new reorg"),
+            "{error}"
+        );
+        assert!(error.contains("nothing is left to sweep"), "{error}");
+        assert!(!error.contains("preview verification"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-gui-unverified-sprout-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_sk = [0x52; 32];
+        let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk)
+                    .to_bytes(),
+                provenance: argos_core::argos_wallet_import::keys::Provenance::Standalone,
+                created_at: None,
+            });
+        let recovered = recover_with_scan_in_dir(
+            &keys,
+            argos_core::ZeckNetwork::Mainnet,
+            Some(dir.clone()),
+            None,
+        )
+        .await;
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let accounting = recovered.accounting_lines().join(" ");
+        assert!(accounting.contains(&checkpoint.display().to_string()));
+        assert!(accounting.contains("wallet file's own record"));
+        assert!(recovered.spent.is_empty());
+
+        // With a scan present, opening the wallet still makes no network
+        // contact: the scan is named and its evidence is not used. Driven
+        // through `recover_for_wallet_open`, the helper `inspect_wallet_file`
+        // uses, so a change that makes wallet open dial peers fails here: it
+        // would reach `chain_spends_for_wallet`, which cannot answer "not
+        // verified offline" and, with no network, cannot answer promptly.
+        let mut scanner = argos_core::sprout_scan::SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[], [0xCD; 32], 2_000_000).unwrap();
+        argos_core::sprout_scan_run::save_checkpoint(
+            &scanner,
+            argos_core::p2p::wire::P2pNetwork::Mainnet,
+            &checkpoint,
+        )
+        .unwrap();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recover_for_wallet_open(&keys, argos_core::ZeckNetwork::Mainnet, Some(dir.clone())),
+        )
+        .await
+        .expect("opening a wallet makes no network attempt, so it returns at once");
+        let accounting = recovered.accounting_lines().join(" ");
+        assert!(accounting.contains("not verified offline"), "{accounting}");
+        assert!(accounting.contains(&checkpoint.display().to_string()));
+        assert!(recovered.spent.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review of #272, round 2: a malformed entry in the scan panel's peer
+    /// field used to fail the wallet's sweep preview outright. It now skips
+    /// live verification and makes no network attempt, keeps the wallet
+    /// file's own spent record (fail closed: the unverified scan is not
+    /// used), and says why in the preview's scan warning.
+    #[tokio::test]
+    async fn a_malformed_scan_peer_degrades_the_preview_to_a_warning() {
+        let dir =
+            std::env::temp_dir().join(format!("argos-gui-preview-bad-peer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_sk = [0x53; 32];
+        let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+        keys.sprout
+            .push(argos_core::argos_wallet_import::keys::SproutKey {
+                a_sk: secrecy::Secret::new(a_sk),
+                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk)
+                    .to_bytes(),
+                provenance: argos_core::argos_wallet_import::keys::Provenance::Standalone,
+                created_at: None,
+            });
+        let checkpoint = argos_core::sprout_scan_run::checkpoint_path(&dir, &[a_sk]);
+        let mut scanner = argos_core::sprout_scan::SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[], [0xCD; 32], 2_000_000).unwrap();
+        argos_core::sprout_scan_run::save_checkpoint(
+            &scanner,
+            argos_core::p2p::wire::P2pNetwork::Mainnet,
+            &checkpoint,
+        )
+        .unwrap();
+
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recover_for_sweep_preview(
+                &keys,
+                argos_core::ZeckNetwork::Mainnet,
+                Some(dir.clone()),
+                &["no-port-here".to_owned()],
+            ),
+        )
+        .await
+        .expect("a malformed peer list makes no network attempt");
+        let notice = recovered
+            .chain_notice
+            .clone()
+            .expect("the preview says why");
+        assert!(notice.contains("no-port-here"), "{notice}");
+        assert!(notice.contains("is not valid"), "{notice}");
+        assert!(notice.contains("wallet file's own"), "{notice}");
+        assert!(notice.contains("before sweeping"), "{notice}");
+        assert!(recovered.spent.is_empty());
+
+        // The sweep itself still refuses the same field, with the format.
+        let err = parse_custom_peers(&["no-port-here".to_owned()]).unwrap_err();
+        assert!(err.contains("host:port"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn spent_note() -> SpentSproutNote {
