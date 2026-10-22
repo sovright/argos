@@ -616,8 +616,8 @@ fn sprout_screen_with_journal(
     }
 }
 
-/// Read a legacy wallet file and report what is in it. No network is used;
-/// legacy sweep-journal migration may replace it in the selected data dir.
+/// Read a legacy wallet file and report what is in it. No network is used.
+/// Legacy or unmarked sweep journals are preserved and refused, never migrated.
 ///
 /// The passphrase crosses the IPC boundary as a `SecretString`, the same
 /// treatment the seed phrase gets (audit Issue A). That is a real exposure
@@ -4910,7 +4910,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_comment_acknowledges_legacy_journal_migration() {
+    fn inspect_comment_matches_refused_legacy_journal_policy() {
         let source = include_str!("commands.rs");
         let inspect = source
             .split("pub async fn inspect_wallet_file")
@@ -4921,10 +4921,8 @@ mod tests {
             !comment.contains("nothing is written anywhere"),
             "{comment}"
         );
-        assert!(
-            comment.contains("journal") && comment.contains("migration"),
-            "{comment}"
-        );
+        assert!(comment.contains("journal") && comment.contains("preserved"));
+        assert!(comment.contains("refused") && comment.contains("never migrated"));
     }
 
     #[test]

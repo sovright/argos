@@ -2128,8 +2128,11 @@ mod tests {
         // What the journal holds, stated honestly.
         assert!(normalized_readme.contains("no spending keys and no note plaintexts"));
         assert!(readme.contains("not atomically replaced"));
-        // Nothing deletes the checkpoint for the user.
-        assert!(readme.contains("does not delete the checkpoint"));
+        // Cleanup matches the implementation: automatic, but only after two
+        // mature independently corroborated reconciliation rounds.
+        assert!(!readme.contains("does not delete the checkpoint"));
+        assert!(normalized_readme.contains("guarded cleanup only after"));
+        assert!(normalized_readme.contains("two newest independently corroborated depth-100"));
     }
 
     /// Kristi's F5 on #239: the plan printed before confirmation must not

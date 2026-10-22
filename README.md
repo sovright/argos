@@ -185,10 +185,12 @@ current binary deliberately has no automatic adoption or migration path.
 Protect the checkpoint and the original wallet
 or Sprout key until Argos has freshly observed every manifested transaction as
 canonical mined. A successful broadcast, a node accepting a transaction, or a
-previously observed mined state is not enough to discard either source. Argos
-does not delete the checkpoint for you, even after a sweep completes; remove
-it yourself only after Argos reports fresh canonical mined evidence for every
-saved Sprout transaction.
+previously observed mined state is not enough to discard either source. After
+a scan-derived sweep, Argos removes the exact checkpoint only when every
+manifested transaction has survived the two newest mature reconciliation
+rounds with the same canonical height and block hash, at least 100 blocks deep
+and corroborated by two independent operator authorities. Every other outcome
+retains the checkpoint and reports why.
 
 Before submitting a Sprout transaction, Argos durably journals its exact
 serialized bytes. The version-4 journal header binds the full key-set
@@ -336,7 +338,7 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
 - Sprout transactions are journaled before submission in version-4 authenticated roots bound to the network, full key-set fingerprint, lineage anchor, and artifact generation. Argos rejects overlapping note claims across sibling roots. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. A saved transaction is rebuilt only after a configured source reports it absent more than 20 blocks past its expiry height; the old transaction remains visible as superseded. A refusal about one note alone records that note as rejected and the sweep continues; any other non-accept reply from the primary submission endpoint remains SubmissionUnknown until observation resolves it.
-- Keep the original wallet or Sprout key, scan checkpoint, and journal until Argos reports fresh canonical mined evidence for every saved Sprout transaction. Argos does not delete the checkpoint after a sweep. A broadcast, visible arrival, node acceptance, or one confirmation is insufficient.
+- Keep the original wallet or Sprout key, scan checkpoint, and journal until Argos reports fresh canonical mined evidence for every saved Sprout transaction. A scan-derived sweep may remove the exact checkpoint through guarded cleanup only after the same canonical mined height and block hash survive the two newest independently corroborated depth-100 reconciliation rounds; otherwise Argos retains it and reports why. A broadcast, visible arrival, node acceptance, or one confirmation is insufficient.
 - A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
 - A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.
 - The GUI defaults to auto gap-limit mode and can switch to an explicit account count when the user wants an exact scan depth.
