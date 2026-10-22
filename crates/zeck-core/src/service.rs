@@ -3301,19 +3301,11 @@ async fn execute_shielding_step(
     .map_err(|err| ZeckError::TransactionBuild(format!("creating shielding transaction: {err}")))?;
 
     broadcast_transactions(
+        ctx,
         &mut wallet_db,
-        ctx.workspace,
-        ctx.client,
         tracked_account.derived.index,
         txids.into_iter().collect(),
         "shielding",
-        ctx.results,
-        ctx.broadcast_log,
-        ctx.lightwalletd_url,
-        ctx.confirmation_sources,
-        ctx.network,
-        ctx.prior_fee_zatoshis,
-        ctx.max_fee_zatoshis,
         fee_zatoshis,
     )
     .await?;
@@ -3651,19 +3643,11 @@ async fn execute_send_max_step(
     .map_err(|err| ZeckError::TransactionBuild(format!("creating sweep transaction: {err}")))?;
 
     broadcast_transactions(
+        ctx,
         &mut wallet_db,
-        ctx.workspace,
-        ctx.client,
         tracked_account.derived.index,
         txids.into_iter().collect(),
         "sweep",
-        ctx.results,
-        ctx.broadcast_log,
-        ctx.lightwalletd_url,
-        ctx.confirmation_sources,
-        ctx.network,
-        ctx.prior_fee_zatoshis,
-        ctx.max_fee_zatoshis,
         fee_zatoshis,
     )
     .await?;

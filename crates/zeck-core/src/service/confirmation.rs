@@ -2,29 +2,22 @@
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn broadcast_transactions(
+    ctx: &mut SweepStepCtx<'_>,
     wallet_db: &mut WalletDb<
         rusqlite::Connection,
         crate::workspace::ArgosParams,
         SystemClock,
         rand_core::OsRng,
     >,
-    workspace: &RecoveryWorkspace,
-    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     account_index: u32,
     txids: Vec<TxId>,
     label: &str,
-    results: &mut Vec<TxBroadcastResult>,
-    log: &mut DurableBroadcastLog,
-    lightwalletd_url: &str,
-    confirmation_sources: &[ConfirmationEndpoint],
-    network: crate::models::ZeckNetwork,
-    prior_fee_zatoshis: u64,
-    max_fee_zatoshis: Option<u64>,
     reviewed_batch_fee_zatoshis: u64,
 ) -> ZeckResult<()> {
     use rusqlite::OptionalExtension;
+
+    let log = &mut *ctx.broadcast_log;
 
     // An earlier leg of this execution that was accepted (Pending) does not
     // stop this one: it spends disjoint reviewed inputs.
@@ -34,7 +27,7 @@ pub(super) async fn broadcast_transactions(
         )));
     }
     let fee_db = rusqlite::Connection::open_with_flags(
-        workspace.wallet_db_path(),
+        ctx.workspace.wallet_db_path(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(|err| ZeckError::Wallet(format!("opening wallet fee records: {err}")))?;
@@ -95,19 +88,19 @@ pub(super) async fn broadcast_transactions(
         return Err(err);
     }
     enforce_max_fee(
-        checked_fee_total(prior_fee_zatoshis, reviewed_batch_fee_zatoshis)?,
-        max_fee_zatoshis,
+        checked_fee_total(ctx.prior_fee_zatoshis, reviewed_batch_fee_zatoshis)?,
+        ctx.max_fee_zatoshis,
     )?;
-    let mut observer = LightwalletdTxObserver::new(lightwalletd_url, confirmation_sources)?;
+    let mut observer = LightwalletdTxObserver::new(ctx.lightwalletd_url, ctx.confirmation_sources)?;
     submit_and_confirm_batch(
         prepared,
         account_index,
         label,
-        results,
+        ctx.results,
         log,
-        &mut LightwalletdSubmitter { client },
+        &mut LightwalletdSubmitter { client: ctx.client },
         &mut observer,
-        network,
+        ctx.network,
         &mut |txid, height| {
             wallet_db
                 .set_transaction_status(
