@@ -10,7 +10,7 @@ use std::{
 use crate::reviewed_intent::{
     CheckpointReservation, ReviewedIntentStore, ReviewedSproutSweep, ScanMaterial,
     SproutIntentSource, SproutProposalId, SproutScanHandle, SproutScanProgressEvent,
-    SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData,
+    SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData, WalletReverification,
 };
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
@@ -1072,15 +1072,25 @@ async fn propose_wallet_sprout_sweep_core(
     // with a warning (#272), but the proposal it yields is refused at
     // execute: the sweep never runs on a review whose scan could not be
     // verified because of the peer field.
-    let peer_error = parse_custom_peers(raw_peers).err();
+    let (peers, peer_error) = match parse_custom_peers(raw_peers) {
+        Ok(peers) => (peers, None),
+        Err(err) => (Vec::new(), Some(err)),
+    };
     let recovered = recover_for_sweep_preview(keys, network, dir.clone(), raw_peers).await;
     if recovered.notes.is_empty() {
         return Err(no_sprout_notes_error(&recovered));
     }
     let plan = plan_wallet_sprout_preview(&recovered)?;
-    let journal = dir.map(|dir| {
-        argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(keys))
+    let journal = dir.as_ref().map(|dir| {
+        argos_core::sprout_sweep::SweepJournal::for_keys(dir, &wallet_sprout_keys(keys))
     });
+    // Bound for execute, which verifies the saved scan again through the
+    // same peers (#272) rather than trusting this review's verdict.
+    let wallet_reverify = WalletReverification {
+        data_dir: dir,
+        scan_keys: wallet_sprout_keys(keys),
+        peers,
+    };
     // The reviewed notes, with their keys, are held in the proposal (see
     // `reviewed_intent`'s key-retention note), so execution never re-reads
     // the file and no file identity needs recording.
@@ -1093,7 +1103,7 @@ async fn propose_wallet_sprout_sweep_core(
             lightwalletd_url,
             journal,
             tip_warning: None,
-            chain_notice: recovered.chain_notice.clone(),
+            wallet_reverify: Some(wallet_reverify),
             peer_error,
         },
         SproutSweepPreviewData {
@@ -1121,11 +1131,106 @@ fn refuse_unverified_review(intent: &SproutSweepIntent) -> Result<(), String> {
     }
 }
 
+/// Everything execute checks before it spends, in order: a review built
+/// with a malformed peer field is refused; then a wallet proposal's saved
+/// scan is verified against live headers again, through the peers it was
+/// reviewed with, exactly as #272's sweep did at execute, and the sweep
+/// journal is re-read. Every reviewed note must still be spendable by that
+/// fresh evidence, or the sweep is refused and must be reviewed again.
+///
+/// Returns execute's own verdict, which the sweep report carries in place
+/// of the review's. A scan-derived proposal has nothing to re-verify here.
+async fn verify_review_at_execute(intent: &SproutSweepIntent) -> Result<Option<String>, String> {
+    refuse_unverified_review(intent)?;
+    let Some(reverify) = &intent.wallet_reverify else {
+        return Ok(None);
+    };
+    // As `recover_with_scan_in_dir` does for a sweep: the live lookup, then
+    // the journal, whose read failure is a notice rather than a refusal.
+    let (chain, mut notice) = match &reverify.data_dir {
+        Some(dir) => {
+            argos_core::sprout_scan_run::chain_spends_for_wallet(
+                dir,
+                intent.network.into(),
+                &reverify.scan_keys,
+                &reverify.peers,
+            )
+            .await
+        }
+        None => (None, None),
+    };
+    let swept = match intent
+        .journal
+        .as_ref()
+        .filter(|_| !reverify.scan_keys.is_empty())
+    {
+        Some(journal) => match journal.load() {
+            Ok(swept) => Some(swept),
+            Err(err) => {
+                let line = format!("Not using the sweep journal: {err}");
+                notice = Some(notice.map_or(line.clone(), |n| format!("{n} {line}")));
+                None
+            }
+        },
+        None => None,
+    };
+    reviewed_notes_still_spendable(&intent.notes, chain.as_deref(), swept.as_ref())
+        .map_err(|err| with_chain_notice(err, notice.as_deref()))?;
+    Ok(notice)
+}
+
+/// The reviewed notes, judged by execute-time evidence: refused if the live
+/// scan shows any of them spent on chain, or the sweep journal records any
+/// as already broadcast. The wallet file itself cannot change under a
+/// proposal (its notes are held in it), so these are the only inputs that
+/// can drop a reviewed note.
+fn reviewed_notes_still_spendable(
+    notes: &[argos_core::sprout_recovery::SpendableSproutNote],
+    chain: Option<&argos_core::sprout_recovery::ChainSpends>,
+    swept: Option<&argos_core::sprout_sweep::SweptNotes>,
+) -> Result<(), String> {
+    let outpoint = |note: &argos_core::sprout_recovery::SpendableSproutNote| {
+        let txid: String = note
+            .outpoint
+            .txid
+            .iter()
+            .rev()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!(
+            "{txid}:{}:{}",
+            note.outpoint.js_index, note.outpoint.output_index
+        )
+    };
+    let mut changed = Vec::new();
+    for note in notes {
+        let nullifier = argos_core::sprout::prf_nf(&note.a_sk, &note.note.rho);
+        if chain.is_some_and(|chain| chain.nullifiers.contains_key(&nullifier)) {
+            changed.push(format!("{} spent on chain", outpoint(note)));
+        } else if swept.is_some_and(|swept| {
+            swept.contains_key(&argos_core::sprout_sweep::swept_key(&note.outpoint))
+        }) {
+            changed.push(format!("{} already swept", outpoint(note)));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the saved scan or sweep journal changed since this sweep was reviewed: {} of {} \
+         reviewed Sprout note(s) are no longer spendable ({}). Nothing was sent. Review the \
+         sweep again",
+        changed.len(),
+        notes.len(),
+        changed.join("; ")
+    ))
+}
+
 async fn execute_reviewed_sprout_sweep(
     app: AppHandle,
     intent: SproutSweepIntent,
 ) -> Result<SproutSweepReport, String> {
-    refuse_unverified_review(&intent)?;
+    let chain_notice = verify_review_at_execute(&intent).await?;
     let source = match &intent.source {
         SproutIntentSource::Wallet => argos_core::sprout_sweep::NoteSource::WalletFile,
         SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
@@ -1146,10 +1251,10 @@ async fn execute_reviewed_sprout_sweep(
         },
     )
     .await
-    .map_err(|err| with_chain_notice(err.to_string(), intent.chain_notice.as_deref()))?;
+    .map_err(|err| with_chain_notice(err.to_string(), chain_notice.as_deref()))?;
 
     let mut report = sweep_report(outcome, intent.tip_warning);
-    append_chain_notice(&mut report.warnings, intent.chain_notice);
+    append_chain_notice(&mut report.warnings, chain_notice);
     Ok(report)
 }
 
@@ -1787,7 +1892,7 @@ pub async fn propose_sprout_scan_sweep(
             lightwalletd_url: material.lightwalletd_url,
             journal: Some(journal),
             tip_warning,
-            chain_notice: None,
+            wallet_reverify: None,
             peer_error: None,
         },
         SproutSweepPreviewData {
@@ -3390,7 +3495,7 @@ mod tests {
                         lightwalletd_url: "https://node".into(),
                         journal: None,
                         tip_warning: None,
-                        chain_notice: None,
+                        wallet_reverify: None,
                         peer_error: None,
                     },
                     SproutSweepPreviewData {
@@ -3566,7 +3671,7 @@ mod tests {
             lightwalletd_url: "https://node".into(),
             journal: None,
             tip_warning: None,
-            chain_notice: None,
+            wallet_reverify: None,
             peer_error,
         };
         let err = parse_custom_peers(&["no-port-here".to_owned()]).unwrap_err();
@@ -3590,49 +3695,199 @@ mod tests {
         );
     }
 
-    /// The notice helpers compose the verdict they are given into errors and
-    /// warnings. Under #271's proposal model that verdict is the one bound
-    /// into the proposal at review; execute spends the reviewed notes and
-    /// does not verify again.
-    #[test]
-    fn notice_helpers_carry_the_current_verdict_not_an_earlier_one() {
-        let a_sk = [0x42; 32];
-        let mut preview = SproutRecovery::default();
-        preview
-            .notes
-            .push(argos_core::sprout_recovery::SpendableSproutNote {
-                note: argos_core::sprout::SproutNotePlaintext {
-                    value: 1_000_000,
-                    rho: [0x11; 32],
-                    r: [0x22; 32],
-                    memo: [0; 512],
-                },
-                a_sk,
-                address: argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk),
-                commitment: [0x33; 32],
-                anchor: [0x44; 32],
-                witness_path: vec![],
-                outpoint: spent_note().outpoint,
-            });
-        preview.chain_notice = Some("preview verification saw a spendable note".to_owned());
-        assert_eq!(plan_wallet_sprout_preview(&preview).unwrap().notes, 1);
+    /// A wallet holding one real, self-consistent Sprout note: the
+    /// ciphertext comes from the encryption path and the witness is a
+    /// genuine zcashd-shaped blob, so recovery yields a spendable note.
+    fn wallet_with_one_note(value: u64) -> (ImportedKeys, [u8; 32]) {
+        use argos_core::argos_wallet_import::keys::{
+            JsOutPoint, SproutJoinSplit, SproutKey, SproutNoteData,
+        };
+        use argos_core::sprout::{self, SproutNotePlaintext, SproutPaymentAddress};
+        let a_sk = [0x42u8; 32];
+        let address = SproutPaymentAddress::from_spending_key(&a_sk);
+        let (rho, r) = ([0x11u8; 32], [0x22u8; 32]);
+        let random_seed = [0x33u8; 32];
+        let nullifiers = [[0x44u8; 32], [0x55u8; 32]];
+        let joinsplit_pubkey = [0x66u8; 32];
+        let esk = [0x77u8; 32];
+        let h_sig = sprout::h_sig(&random_seed, &nullifiers, &joinsplit_pubkey);
+        let note = SproutNotePlaintext {
+            value,
+            rho,
+            r,
+            memo: [0u8; 512],
+        };
+        let ciphertext =
+            sprout::encrypt_note(&esk, address.pk_enc(), &h_sig, 0, &note.to_bytes()).unwrap();
+        let commitment = sprout::note_commitment(address.a_pk(), value, &rho, &r);
+        let txid = [0x99u8; 32];
+        let mut keys = ImportedKeys::default();
+        keys.sprout.push(SproutKey {
+            a_sk: secrecy::Secret::new(a_sk),
+            address: address.to_bytes(),
+            provenance: Provenance::Standalone,
+            created_at: None,
+        });
+        keys.sprout_joinsplits.push(SproutJoinSplit {
+            txid,
+            js_index: 0,
+            anchor: [0u8; 32],
+            nullifiers,
+            commitments: [commitment, [0u8; 32]],
+            ephemeral_key: sprout::epk_for(&esk),
+            random_seed,
+            joinsplit_pubkey,
+            ciphertexts: [ciphertext, vec![0u8; 601]],
+        });
+        let mut tree = argos_core::sprout_witness::IncrementalMerkleTree::default();
+        tree.append(commitment).unwrap();
+        let witness = argos_core::sprout_witness::IncrementalWitness::from_tree(tree);
+        let mut blob = vec![0x01u8];
+        blob.extend_from_slice(&witness.to_bytes());
+        blob.extend_from_slice(&0i32.to_le_bytes());
+        keys.sprout_notes.push(SproutNoteData {
+            address: address.to_bytes(),
+            nullifier: None,
+            witness: blob,
+            outpoint: JsOutPoint {
+                txid,
+                js_index: 0,
+                output_index: 0,
+            },
+        });
+        (keys, a_sk)
+    }
 
-        let mut current = SproutRecovery::default();
-        current.spent.push(spent_note());
-        current.chain_notice = Some("execute verification found a new reorg".to_owned());
-        let mut warnings = vec!["journal warning".to_owned()];
-        append_chain_notice(&mut warnings, current.chain_notice.clone());
-        assert_eq!(
-            warnings,
-            vec!["journal warning", "execute verification found a new reorg"]
-        );
-        let error = no_sprout_notes_error(&current);
+    /// Review a one-note wallet sweep in `dir` with a valid peer list, and
+    /// take the proposal back out as execute does.
+    async fn reviewed_one_note_wallet(
+        dir: &std::path::Path,
+    ) -> (ReviewedSproutSweep, SproutSweepIntent) {
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        let store = ReviewedIntentStore::default();
+        let review = propose_wallet_sprout_sweep_core(
+            &store,
+            &mut keys,
+            Some(dir.to_path_buf()),
+            "zs-reviewed".into(),
+            ZeckNetwork::Mainnet,
+            "https://zec.rocks:443".into(),
+            &["192.0.2.10:8233".to_owned()],
+            |_| {},
+        )
+        .await
+        .expect("one spendable note is reviewed");
+        let intent = store.take_wallet_proposal(&review.proposal_id).unwrap();
+        (review, intent)
+    }
+
+    /// #272: the wallet sweep verifies its saved scan against live peers
+    /// again at execute, through the reviewed peer list, and the report
+    /// carries execute's own verdict, not the one shown with the review.
+    /// Here the review saw no scan; by execute the sweep journal can no
+    /// longer be read, and that is what execute reports.
+    #[tokio::test]
+    async fn execute_uses_its_current_notice_even_when_preview_had_a_different_verdict() {
+        let dir = std::env::temp_dir().join(format!("argos-reverify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (review, intent) = reviewed_one_note_wallet(&dir).await;
+        let preview_notice = review.scan_warning.clone().expect("review verdict");
         assert!(
-            error.contains("execute verification found a new reorg"),
-            "{error}"
+            preview_notice.contains("No full-block scan"),
+            "{preview_notice}"
         );
-        assert!(error.contains("nothing is left to sweep"), "{error}");
-        assert!(!error.contains("preview verification"), "{error}");
+        assert!(
+            !preview_notice.contains("sweep journal"),
+            "{preview_notice}"
+        );
+
+        let journal = intent.journal.as_ref().expect("wallet journal").path();
+        std::fs::create_dir_all(journal).unwrap();
+        let notice = verify_review_at_execute(&intent)
+            .await
+            .expect("an unreadable journal is a warning, as main's execute made it")
+            .expect("execute reports its own verdict");
+        assert!(notice.contains("Not using the sweep journal"), "{notice}");
+        assert!(notice.contains("No full-block scan"), "{notice}");
+        assert_ne!(notice, preview_notice);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The re-verified notes must still contain every reviewed note: one the
+    /// sweep journal records as broadcast after the review is refused, with
+    /// execute's verdict, and nothing is spent.
+    #[tokio::test]
+    async fn execute_refuses_when_a_reviewed_note_was_swept_after_review() {
+        let dir = std::env::temp_dir().join(format!("argos-reverify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_, intent) = reviewed_one_note_wallet(&dir).await;
+        assert!(verify_review_at_execute(&intent).await.is_ok());
+        intent
+            .journal
+            .as_ref()
+            .unwrap()
+            .record(&intent.notes[0].outpoint, "sweep-txid")
+            .unwrap();
+        let err = verify_review_at_execute(&intent).await.unwrap_err();
+        assert!(
+            err.contains("changed since this sweep was reviewed"),
+            "{err}"
+        );
+        assert!(err.contains("Review the sweep again"), "{err}");
+        assert!(err.contains("No full-block scan"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A reviewed note the execute-time scan evidence shows spent on chain
+    /// is refused; evidence that does not name it lets the sweep proceed.
+    #[test]
+    fn a_reviewed_note_the_current_scan_shows_spent_is_refused() {
+        let (keys, a_sk) = wallet_with_one_note(1_000_000);
+        let notes =
+            argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(&keys, None)
+                .notes;
+        assert_eq!(notes.len(), 1);
+        let nullifier = argos_core::sprout::prf_nf(&a_sk, &notes[0].note.rho);
+        let mut chain = argos_core::sprout_recovery::ChainSpends {
+            nullifiers: Default::default(),
+            scanned_to: 2_000_000,
+            complete: true,
+        };
+        assert!(reviewed_notes_still_spendable(&notes, Some(&chain), None).is_ok());
+        chain.nullifiers.insert(nullifier, Some([0xEE; 32]));
+        let err = reviewed_notes_still_spendable(&notes, Some(&chain), None).unwrap_err();
+        assert!(
+            err.contains("changed since this sweep was reviewed"),
+            "{err}"
+        );
+        assert!(err.contains("spent on chain"), "{err}");
+    }
+
+    /// The peer-field refusal comes first: a review built with a malformed
+    /// peer list is refused at execute before any verification is tried.
+    #[tokio::test]
+    async fn execute_refuses_a_malformed_peer_review_before_verifying() {
+        let dir = std::env::temp_dir().join(format!("argos-reverify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut keys, _) = wallet_with_one_note(1_000_000);
+        let store = ReviewedIntentStore::default();
+        let review = propose_wallet_sprout_sweep_core(
+            &store,
+            &mut keys,
+            Some(dir.clone()),
+            "zs-reviewed".into(),
+            ZeckNetwork::Mainnet,
+            "https://zec.rocks:443".into(),
+            &["no-port-here".to_owned()],
+            |_| {},
+        )
+        .await
+        .expect("a malformed peer degrades the review, not fails it");
+        let intent = store.take_wallet_proposal(&review.proposal_id).unwrap();
+        let err = verify_review_at_execute(&intent).await.unwrap_err();
+        assert!(err.contains("no-port-here"), "{err}");
+        assert!(err.contains("review the sweep again"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
