@@ -8134,7 +8134,11 @@ mod windows_acl {
         let directory = nt_open_child_with_options(
             parent,
             path,
-            READ_CONTROL | FILE_LIST_DIRECTORY | FILE_GENERIC_WRITE | FILE_TRAVERSE,
+            READ_CONTROL
+                | FILE_LIST_DIRECTORY
+                | FILE_READ_ATTRIBUTES
+                | FILE_GENERIC_WRITE
+                | FILE_TRAVERSE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             FILE_OPEN,
             ptr::null(),
