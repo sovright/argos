@@ -197,8 +197,10 @@ pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Remove destination-scoped atomic staging left by a crashed writer once it
-/// is old enough that it cannot belong to an active write.
-pub fn remove_stale_private_file_staging(
+/// is old enough that it cannot belong to an active write. The caller must
+/// serialize cleanup with every writer for `path`; age alone cannot prove a
+/// paused writer is inactive.
+pub(crate) fn remove_stale_private_file_staging(
     path: &Path,
     minimum_age: std::time::Duration,
 ) -> io::Result<bool> {
@@ -215,7 +217,7 @@ pub fn remove_stale_private_file_staging(
 
 /// Remove every safe, destination-scoped atomic staging directory for `path`.
 /// Callers must serialize this with writers for the same destination.
-pub fn discard_private_file_staging(path: &Path) -> io::Result<bool> {
+pub(crate) fn discard_private_file_staging(path: &Path) -> io::Result<bool> {
     #[cfg(unix)]
     {
         unix_private::cleanup_staging(path, None)
@@ -318,11 +320,11 @@ mod unix_private {
     use super::{harden_private_file, validate_private_file};
     use sha2::{Digest, Sha256};
     use std::{
-        ffi::{CString, OsStr},
+        ffi::{CStr, CString, OsStr, OsString},
         fs::{self, File},
         io::{self, Write},
         os::unix::{
-            ffi::OsStrExt,
+            ffi::{OsStrExt, OsStringExt},
             fs::{MetadataExt, PermissionsExt},
             io::{AsRawFd, FromRawFd, RawFd},
         },
@@ -330,6 +332,7 @@ mod unix_private {
     };
 
     const ARTIFACT_NAME: &str = "artifact";
+    const CLEANUP_DIRECTORY_NAME: &str = ".argos-private-cleanup";
 
     #[derive(Clone, Copy, Eq, PartialEq)]
     struct FileIdentity {
@@ -572,28 +575,6 @@ mod unix_private {
         })
     }
 
-    fn remove_staging_entry(
-        parent: RawFd,
-        name: &CString,
-        expected: FileIdentity,
-    ) -> io::Result<bool> {
-        match entry_identity(parent, name) {
-            Ok(actual) if actual == expected => {
-                if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
-                    Ok(true)
-                } else {
-                    Err(last_error())
-                }
-            }
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private staging directory changed before cleanup",
-            )),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(err),
-        }
-    }
-
     fn open_staging_directory(parent: RawFd, name: &CString) -> io::Result<File> {
         let descriptor = unsafe {
             libc::openat(
@@ -618,6 +599,149 @@ mod unix_private {
         }
         verify_no_extended_acl(&directory)?;
         Ok(directory)
+    }
+
+    fn open_cleanup_directory(parent: &File) -> io::Result<File> {
+        let name = c_string(OsStr::new(CLEANUP_DIRECTORY_NAME), "cleanup directory name")?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let error = last_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        let directory = open_staging_directory(parent.as_raw_fd(), &name)?;
+        remove_extended_acl(&directory)?;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        if directory.metadata()?.mode() & 0o777 != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private cleanup directory permissions were not established",
+            ));
+        }
+        verify_no_extended_acl(&directory)?;
+        Ok(directory)
+    }
+
+    fn remove_staging_entry_with_observer(
+        parent: &File,
+        name: &CString,
+        expected: FileIdentity,
+        before_move: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let cleanup = open_cleanup_directory(parent)?;
+        let quarantine = c_string(
+            OsStr::new(&format!("entry-{}", uuid::Uuid::new_v4())),
+            "cleanup entry name",
+        )?;
+        before_move()?;
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                cleanup.as_raw_fd(),
+                quarantine.as_ptr(),
+            )
+        } != 0
+        {
+            let error = last_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        cleanup.sync_all()?;
+        parent.sync_all()?;
+        if entry_identity(cleanup.as_raw_fd(), &quarantine)? != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private staging directory changed before cleanup",
+            ));
+        }
+        if unsafe { libc::unlinkat(cleanup.as_raw_fd(), quarantine.as_ptr(), libc::AT_REMOVEDIR) }
+            != 0
+        {
+            return Err(last_error());
+        }
+        cleanup.sync_all()?;
+        Ok(true)
+    }
+
+    fn remove_staging_entry(
+        parent: &File,
+        name: &CString,
+        expected: FileIdentity,
+    ) -> io::Result<bool> {
+        remove_staging_entry_with_observer(parent, name, expected, || Ok(()))
+    }
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__errno_location() }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__error() }
+    }
+
+    fn directory_names(directory: &File) -> io::Result<Vec<OsString>> {
+        let descriptor = unsafe { libc::dup(directory.as_raw_fd()) };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let stream = unsafe { libc::fdopendir(descriptor) };
+        if stream.is_null() {
+            unsafe {
+                libc::close(descriptor);
+            }
+            return Err(last_error());
+        }
+        let stream = DirectoryStream(stream);
+        let mut names = Vec::new();
+        loop {
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos",
+                target_os = "ios"
+            ))]
+            unsafe {
+                *errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "macos",
+                    target_os = "ios"
+                ))]
+                {
+                    let error = last_error();
+                    if error.raw_os_error() != Some(0) {
+                        return Err(error);
+                    }
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                names.push(OsString::from_vec(name.to_vec()));
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 
     fn open_staged_artifact(directory: RawFd) -> io::Result<Option<File>> {
@@ -668,12 +792,20 @@ mod unix_private {
             staging.sync_all()?;
         }
         drop(staging);
-        remove_staging_entry(parent.as_raw_fd(), &name, staging_identity)
+        remove_staging_entry(parent, &name, staging_identity)
     }
 
     pub(super) fn cleanup_staging(
         path: &Path,
         minimum_age: Option<std::time::Duration>,
+    ) -> io::Result<bool> {
+        cleanup_staging_with_observer(path, minimum_age, || Ok(()))
+    }
+
+    fn cleanup_staging_with_observer(
+        path: &Path,
+        minimum_age: Option<std::time::Duration>,
+        after_parent_open: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<bool> {
         let parent_path = path
             .parent()
@@ -681,11 +813,11 @@ mod unix_private {
             .unwrap_or_else(|| Path::new("."));
         let prefix = staging_prefix(path)?;
         let parent = open_directory(parent_path)?;
+        after_parent_open()?;
         let now = std::time::SystemTime::now();
         let mut removed = false;
-        for entry in fs::read_dir(parent_path)? {
-            let entry = entry?;
-            let name = entry.file_name();
+        let mut errors = Vec::new();
+        for name in directory_names(&parent)? {
             let Some(name_text) = name.to_str() else {
                 continue;
             };
@@ -695,22 +827,48 @@ mod unix_private {
             if uuid::Uuid::parse_str(id).is_err() {
                 continue;
             }
-            let candidate =
-                open_staging_directory(parent.as_raw_fd(), &c_string(&name, "staging name")?)?;
-            if minimum_age.is_some_and(|minimum| {
-                candidate
+            let candidate_name = c_string(&name, "staging name")?;
+            let candidate = match open_staging_directory(parent.as_raw_fd(), &candidate_name) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", name.to_string_lossy()));
+                    continue;
+                }
+            };
+            let old_enough = match minimum_age {
+                None => true,
+                Some(minimum) => match candidate
                     .metadata()
                     .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .is_none_or(|age| age < minimum)
-            }) {
+                    .and_then(|modified| {
+                        now.duration_since(modified)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    }) {
+                    Ok(age) => age >= minimum,
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", name.to_string_lossy()));
+                        continue;
+                    }
+                },
+            };
+            if !old_enough {
                 continue;
             }
-            removed |= cleanup_candidate(&parent, &name, candidate)?;
+            match cleanup_candidate(&parent, &name, candidate) {
+                Ok(candidate_removed) => removed |= candidate_removed,
+                Err(error) => errors.push(format!("{}: {error}", name.to_string_lossy())),
+            }
         }
         if removed {
-            parent.sync_all()?;
+            if let Err(error) = parent.sync_all() {
+                errors.push(format!("syncing private staging parent: {error}"));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(io::Error::other(format!(
+                "private staging cleanup was incomplete: {}",
+                errors.join("; ")
+            )));
         }
         Ok(removed)
     }
@@ -738,7 +896,7 @@ mod unix_private {
         let mut file = match create_artifact(staging.as_raw_fd()) {
             Ok(file) => file,
             Err(err) => {
-                let _ = remove_staging_entry(parent.as_raw_fd(), &staging_name, staging_identity);
+                let _ = remove_staging_entry(&parent, &staging_name, staging_identity);
                 return Err(err);
             }
         };
@@ -769,7 +927,7 @@ mod unix_private {
         }
         drop(file);
         drop(staging);
-        let _ = remove_staging_entry(parent.as_raw_fd(), &staging_name, staging_identity);
+        let _ = remove_staging_entry(&parent, &staging_name, staging_identity);
         result
     }
 
@@ -787,6 +945,93 @@ mod unix_private {
         artifact.sync_all()?;
         staging.sync_all()?;
         Ok(parent_path.join(relative))
+    }
+
+    #[cfg(test)]
+    mod race_tests {
+        use super::*;
+        use std::{cell::RefCell, os::unix::fs::MetadataExt};
+
+        #[test]
+        fn final_cleanup_never_unlinks_an_object_swapped_after_identity_check() {
+            let tmp = tempfile::tempdir().unwrap();
+            let parent = open_directory(tmp.path()).unwrap();
+            let name = c_string(OsStr::new("stage"), "staging name").unwrap();
+            fs::create_dir(tmp.path().join("stage")).unwrap();
+            fs::set_permissions(tmp.path().join("stage"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let staging = open_staging_directory(parent.as_raw_fd(), &name).unwrap();
+            let expected = file_identity(&staging.metadata().unwrap());
+            let moved = tmp.path().join("moved-stage");
+            let decoy_handle = RefCell::new(None);
+
+            let error = remove_staging_entry_with_observer(&parent, &name, expected, || {
+                fs::rename(tmp.path().join("stage"), &moved)?;
+                fs::create_dir(tmp.path().join("stage"))?;
+                fs::set_permissions(tmp.path().join("stage"), fs::Permissions::from_mode(0o700))?;
+                *decoy_handle.borrow_mut() = Some(open_directory(&tmp.path().join("stage"))?);
+                Ok(())
+            })
+            .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(moved.is_dir());
+            assert!(
+                decoy_handle
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .nlink()
+                    > 0,
+                "the substituted directory was deleted"
+            );
+        }
+
+        #[test]
+        fn cleanup_enumerates_the_pinned_parent_after_a_path_swap() {
+            let tmp = tempfile::tempdir().unwrap();
+            let parent_path = tmp.path().join("parent");
+            fs::create_dir(&parent_path).unwrap();
+            let checkpoint = parent_path.join("wallet.checkpoint");
+            let staging = abandon_staged_write(&checkpoint, b"spend-capable").unwrap();
+            let staging_name = staging.file_name().unwrap().to_owned();
+            let moved_parent = tmp.path().join("moved-parent");
+
+            assert!(cleanup_staging_with_observer(
+                &checkpoint,
+                Some(std::time::Duration::ZERO),
+                || {
+                    fs::rename(&parent_path, &moved_parent)?;
+                    fs::create_dir(&parent_path)?;
+                    Ok(())
+                },
+            )
+            .unwrap());
+            assert!(!moved_parent.join(staging_name).exists());
+        }
+
+        #[test]
+        fn cleanup_continues_after_a_hostile_candidate() {
+            let tmp = tempfile::tempdir().unwrap();
+            let checkpoint = tmp.path().join("wallet.checkpoint");
+            let first = abandon_staged_write(&checkpoint, b"first").unwrap();
+            let second = abandon_staged_write(&checkpoint, b"second").unwrap();
+            let (hostile, removable) = if first.file_name() < second.file_name() {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            fs::set_permissions(&hostile, fs::Permissions::from_mode(0o777)).unwrap();
+
+            assert!(cleanup_staging(&checkpoint, Some(std::time::Duration::ZERO)).is_err());
+            assert!(hostile.exists());
+            assert!(
+                !removable.exists(),
+                "one hostile candidate prevented cleanup of another secret"
+            );
+        }
     }
 }
 
@@ -1421,7 +1666,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn atomic_cleanup_does_not_remove_a_substituted_empty_directory() {
-        use std::{cell::RefCell, os::unix::fs::PermissionsExt};
+        use std::{
+            cell::RefCell,
+            os::unix::fs::{MetadataExt, PermissionsExt},
+        };
 
         let tmp = tempfile::tempdir().unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
@@ -1431,14 +1679,14 @@ mod tests {
         write_private_file_atomic_with_observer(&path, b"verified secret", |exposed| {
             fs::rename(exposed, &moved)?;
             fs::create_dir(exposed)?;
-            *decoy.borrow_mut() = Some(exposed.to_path_buf());
+            *decoy.borrow_mut() = Some(File::open(exposed)?);
             Ok(())
         })
         .unwrap();
         assert_eq!(fs::read(path).unwrap(), b"verified secret");
         assert!(
-            decoy.borrow().as_ref().unwrap().is_dir(),
-            "cleanup removed an attacker-substituted staging name"
+            decoy.borrow().as_ref().unwrap().metadata().unwrap().nlink() > 0,
+            "cleanup deleted an attacker-substituted staging object"
         );
     }
 
