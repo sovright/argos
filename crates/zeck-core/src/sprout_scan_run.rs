@@ -4165,6 +4165,7 @@ mod tests {
         };
 
         let dir = ScratchDir::new("checkpoint-preheld-data-handle");
+        crate::private_fs::create_private_dir_all(&dir.0).unwrap();
         let path = dir.0.join("scan.checkpoint");
         crate::private_fs::write_private_file(&path, b"spending-key checkpoint").unwrap();
         let held = std::fs::OpenOptions::new()
