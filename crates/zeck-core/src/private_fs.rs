@@ -8911,6 +8911,8 @@ mod windows_acl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::os::fd::AsRawFd as _;
 
     #[test]
     fn fresh_absent_artifact_data_dir_is_published_as_authenticated_container() {
