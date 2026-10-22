@@ -290,13 +290,11 @@ impl RecoveryWorkspace {
 
     /// Build a fresh wallet database entirely in memory.
     ///
-    /// Importing an account into a wallet that has already scanned blocks can
-    /// rewind its pools to inconsistent note-commitment checkpoints. Gap
-    /// extension therefore sometimes needs a database containing every
-    /// account before any blocks are scanned. Keeping that rebuild in memory
-    /// avoids a second on-disk copy of wallet material and, more importantly,
-    /// avoids introducing another filesystem object whose lineage would have
-    /// to be published and retired safely.
+    /// Gap extension sometimes needs a database containing every account
+    /// before any blocks are scanned. Keeping that rebuild in memory avoids a
+    /// second on-disk copy of wallet material and, more importantly, avoids
+    /// introducing another filesystem object whose lineage would have to be
+    /// published and retired safely.
     pub(crate) fn begin_wallet_db_rebuild(
         &self,
         network: ZeckNetwork,

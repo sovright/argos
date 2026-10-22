@@ -64,7 +64,7 @@ function lifecycleHarness() {
 }
 
 for (const exit of [
-  "successful handoff", "completion", "cancellation", "backend error",
+  "successful handoff", "completion", "cancellation", "terminal backend error",
   "navigation away", "Start over", "beforeunload",
 ]) {
   test(`${exit} clears every transient recovery secret and restores hidden inputs`, () => {
@@ -123,7 +123,6 @@ for (const [edge, pattern] of [
   ["successful handoff", /state\.scanHandle = handle;[\s\S]*?clearTransientSecrets\(\)/],
   ["completion", /const terminal = \["complete", "cancelled", "error"\][\s\S]*?if \(terminal\) clearTransientSecrets\(\)/],
   ["cancellation", /\$\("cancel-scan"\).*?clearTransientSecrets\(\)/s],
-  ["backend error", /setStatus\("config-status", `✗ \$\{err\}`[\s\S]*?clearTransientSecrets\(\)/],
   ["navigation away", /btn\.dataset\.prev === "welcome"\) abandonRecoveryFlow\(\)/],
   ["Start over", /\$\("restart-flow"\).*?abandonRecoveryFlow\(\)/s],
   ["beforeunload", /beforeunload[\s\S]*?abandonRecoveryFlow\(\)/],
@@ -137,4 +136,109 @@ test("address search consumes the shared transient-secret event", () => {
   const addressSearch = fs.readFileSync("gui/src/address-search.js", "utf8");
   assert.match(addressSearch, /argos:clear-transient-secrets/);
   assert.match(addressSearch, /argos:clear-transient-secrets[\s\S]*?clearSecrets\(\)/);
+});
+
+function startScanHarness({ fail = true, wallet = true, keys = true } = {}) {
+  const h = lifecycleHarness();
+  const context = h.context;
+  context.state.scanHandle = null;
+  context.state.scanAuthorityGeneration = 1;
+  context.state.matchedRecovery = null;
+  context.seedInput = h.elements.get("seed-input");
+  context.seedInput.value = !wallet && !keys ? "seed phrase for scan" : "";
+  if (!wallet) context.walletFile = null;
+  const values = {
+    "destination-input": "fixture-destination", "network-select": "mainnet",
+    "data-dir": "/unmarked-old-dir", "sweep-memo": "", "max-fee-zec": "",
+    "birthday-height": "1528061", "lightwalletd-url": "http://127.0.0.1:1",
+    "scan-label": "retry", "gap-limit": "20", "accounts-range": "1",
+  };
+  for (const [id, value] of Object.entries(values)) h.elements.set(id, element(value));
+  for (const id of ["auto-gap-limit", "start-scan", "sapling-key-addresses"])
+    h.elements.set(id, element(""));
+  context.hasSaplingScanKeys = () => keys;
+  context.scanKeySourceConflict = () => null;
+  context.shouldShowTransparentRange = () => false;
+  context.scanBirthdayFromForm = () => 1528061;
+  context.confirmationSourcesFromForm = () => [];
+  context.defaultScanLabel = () => "retry";
+  context.saplingScanKeyLines = () => [h.elements.get("sapling-scan-keys").value];
+  context.showScanWarning = () => {};
+  context.scanWarningVariant = () => "shielded";
+  context.goTo = () => {};
+  context.startProgressListeners = async () => {};
+  context.setStatus = (id, message) => { h.lastStatus = message; };
+  context.scheduleWalletReviewExpiry = () => h.calls.push("scheduled-expiry");
+  context.walletReviewExpiryTimer = wallet ? 123 : null;
+  h.fail = fail;
+  context.invoke = async (command, args) => {
+    if (command === "validate_address") return { destination_ok: true };
+    assert.equal(command, wallet || keys ? "start_scan_from_wallet_file" : "start_scan");
+    h.submitted = args;
+    if (h.fail) throw new Error("choose a new empty directory");
+    return { id: "accepted" };
+  };
+  const start = source.indexOf('$(' + '"start-scan").addEventListener("click"');
+  const body = source.indexOf("async () => {", start);
+  const end = source.indexOf("\n});\n", body);
+  h.run = vm.runInContext(`(${source.slice(body, end + 2)})`, context);
+  return h;
+}
+
+test("failed wallet scan start preserves passphrase, pasted keys and original expiry for retry", async () => {
+  const h = startScanHarness();
+  await h.run();
+  assert.match(h.lastStatus, /choose a new empty directory/);
+  assert.equal(h.context.walletFile.passphrase, "wallet-secret");
+  assert.equal(h.elements.get("wallet-passphrase").value, "secret");
+  assert.equal(h.elements.get("sapling-scan-keys").value, "secret");
+  assert.equal(h.elements.get("sprout-scan-keys").value, "secret");
+  assert.equal(h.calls.includes("wallet-expiry"), false, "failed start must retain existing expiry");
+  assert.equal(h.calls.includes("scheduled-expiry"), false, "retry must not extend wallet review");
+  assert.equal(h.elements.get("seed-input").value, "");
+  assert.equal(h.elements.get("seed-visibility").checked, false);
+  assert.equal(h.elements.get("start-scan").disabled, false);
+});
+
+test("failed pasted-key-only scan retains keys with a bounded expiry", async () => {
+  const h = startScanHarness({ wallet: false });
+  await h.run();
+  assert.equal(h.elements.get("sapling-scan-keys").value, "secret");
+  assert.equal(h.calls.includes("scheduled-expiry"), true);
+  assert.equal(h.calls.includes("wallet-expiry"), false);
+});
+
+test("accepted wallet scan start clears passphrase and pasted keys", async () => {
+  const h = startScanHarness({ fail: false });
+  await h.run();
+  assert.equal(h.context.state.scanHandle.id, "accepted");
+  assert.equal(h.context.walletFile.passphrase, null);
+  for (const id of ["wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys"])
+    assert.equal(h.elements.get(id).value, "", id);
+  assert.equal(h.calls.includes("wallet-expiry"), true);
+});
+
+
+test("correcting the directory after a rejected start retries with retained wallet credentials and keys", async () => {
+  const h = startScanHarness();
+  await h.run();
+  h.elements.get("data-dir").value = "/new-empty-dir";
+  h.fail = false;
+  await h.run();
+  assert.equal(h.context.state.scanHandle.id, "accepted");
+  assert.equal(h.submitted.config.data_dir, "/new-empty-dir");
+  assert.equal(h.submitted.config.passphrase, "wallet-secret");
+  assert.equal(h.submitted.config.sapling_keys[0], "secret");
+  assert.equal(h.context.walletFile.passphrase, null);
+  assert.equal(h.elements.get("sapling-scan-keys").value, "");
+});
+
+test("failed seed-only start still clears the seed and restores masking", async () => {
+  const h = startScanHarness({ wallet: false, keys: false });
+  await h.run();
+  assert.equal(h.submitted.config.seed, "seed phrase for scan");
+  assert.equal(h.elements.get("seed-input").value, "");
+  assert.equal(h.elements.get("seed-visibility").checked, false);
+  assert.equal(h.elements.get("seed-input").classList.contains("masked"), true);
+  assert.equal(h.calls.includes("scheduled-expiry"), false);
 });

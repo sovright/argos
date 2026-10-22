@@ -1017,6 +1017,45 @@ fn canonical_workspace_identity(root: &std::path::Path) -> ZeckResult<std::path:
     }
 }
 
+/// Choose a default without adopting or modifying an unmarked legacy directory.
+/// This is routing only: the selected location must still pass the normal
+/// create-time authority checks before any recovery operation uses it.
+/// Explicit user-selected directories must not go through this selector.
+pub fn default_recovery_data_dir(
+    legacy_default: &std::path::Path,
+    versioned_default: &std::path::Path,
+) -> ZeckResult<std::path::PathBuf> {
+    let inspect = |path: &std::path::Path| match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ZeckError::Storage(format!(
+            "inspecting default data directory {}: {err}",
+            path.display()
+        ))),
+    };
+    // Once selected, keep using the versioned location even if the user later
+    // moves the old directory. Its presence grants no authority by itself.
+    if inspect(versioned_default)?.is_some() {
+        return Ok(versioned_default.to_owned());
+    }
+    if let Some(metadata) = inspect(legacy_default)? {
+        // A symlink or non-directory must reach normal authentication and fail
+        // there; only an actual unmarked directory is a legacy-default case.
+        if metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && inspect(&legacy_default.join(crate::private_fs::PRIVATE_ARTIFACT_ROOT_MARKER))?
+                .is_none()
+        {
+            return Ok(versioned_default.to_owned());
+        }
+    }
+    Ok(legacy_default.to_owned())
+}
+
+fn recovery_data_dir_remediation() -> &'static str {
+    "Preserve the original directory and transaction evidence; choose a new empty directory path that does not already exist with --data-dir or the GUI Data directory setting, then rescan from the original seed or wallet file. Reconcile previously broadcast transactions before recovering those funds again."
+}
+
 /// Stable, cross-process exclusion for every workspace operation. It is
 /// separate from the broadcast journal lock because a sweep opens that lock
 /// after syncing and must not recursively acquire the same SQLite lock.
@@ -1024,8 +1063,9 @@ pub fn ensure_recovery_data_dir(data_dir: &std::path::Path) -> ZeckResult<()> {
     let container =
         crate::private_fs::ensure_private_artifact_container(data_dir).map_err(|err| {
             ZeckError::ScanNotReady(format!(
-                "recovery data directory {} has no authenticated create-time authority: {err}",
-                data_dir.display()
+                "recovery data directory {} has no authenticated create-time authority: {err}. {}",
+                data_dir.display(),
+                recovery_data_dir_remediation()
             ))
         })?;
     container.verify_current().map_err(|err| {
@@ -1094,8 +1134,8 @@ impl NetworkOperationGuard {
         let artifact_container = crate::private_fs::ensure_private_artifact_container(data_dir)
             .map_err(|err| {
                 ZeckError::ScanNotReady(format!(
-                    "network operation data directory {} has no authenticated create-time authority: {err}",
-                    data_dir.display()
+                    "network operation data directory {} has no authenticated create-time authority: {err}. {}",
+                    data_dir.display(), recovery_data_dir_remediation()
                 ))
             })?;
         let data_dir = artifact_container.path().to_path_buf();
@@ -7565,6 +7605,133 @@ mod propose_workspace_guard_tests {
     }
 
     #[tokio::test]
+    async fn start_scan_preserves_unmarked_v153_directory_with_actionable_refusal() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().join("workspace");
+        let legacy_wallet =
+            data_dir.join("mainnet/workspace-deadbeefdeadbeefdeadbeefdeadbeef/birthday-1528061/auto-gap-20/wallet.sqlite");
+        std::fs::create_dir_all(legacy_wallet.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(&legacy_wallet, b"v1.5.3 wallet evidence").unwrap();
+        let service = RecoveryService::new();
+        let error = service.start_scan(
+            ScanConfig {
+                birthday: 1_528_061, num_accounts: Some(1), gap_limit: 20,
+                transparent_scan: None, lightwalletd_url: "http://127.0.0.1:1".to_owned(),
+                confirmation_sources: Vec::new(), data_dir: data_dir.clone(),
+                network: ZeckNetwork::Mainnet, label: String::new(),
+            },
+            SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned()),
+        ).await.expect_err("an unmarked v1.5.3 workspace cannot acquire authority");
+        assert!(
+            error.to_string().contains("choose a new empty directory"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&legacy_wallet).unwrap(),
+            b"v1.5.3 wallet evidence"
+        );
+        assert!(!data_dir.join(".argos-private-artifact-root-v1").exists());
+        assert!(service.sessions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_default_selects_fresh_versioned_directory_for_start_scan() {
+        let tempdir = tempfile::tempdir().unwrap();
+        // Windows tempfile directories can inherit an administrator owner.
+        // Create the fixture's publication parent with current-user authority;
+        // keep both candidate data directories separate from that parent.
+        let publication = tempdir.path().join("publication");
+        crate::private_fs::create_private_dir_all(&publication).unwrap();
+        let legacy = publication.join("workspace");
+        let versioned = publication.join("workspace-v2");
+        let old_wallet =
+            legacy.join("mainnet/workspace-deadbeefdeadbeefdeadbeefdeadbeef/birthday-1528061/auto-gap-20/wallet.sqlite");
+        std::fs::create_dir_all(old_wallet.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(&old_wallet, b"v1.5.3 wallet evidence").unwrap();
+        assert!(
+            !versioned.exists(),
+            "the fresh data directory starts absent"
+        );
+        let selected = super::default_recovery_data_dir(&legacy, &versioned).unwrap();
+        assert_eq!(selected, versioned);
+        assert!(
+            !selected.exists(),
+            "default selection itself must be read-only"
+        );
+        let service = RecoveryService::new();
+        let handle = service.start_scan(
+            ScanConfig {
+                birthday: 1_528_061, num_accounts: Some(1), gap_limit: 20,
+                transparent_scan: None, lightwalletd_url: "http://127.0.0.1:1".to_owned(),
+                confirmation_sources: Vec::new(), data_dir: selected.clone(),
+                network: ZeckNetwork::Mainnet, label: String::new(),
+            },
+            SecretString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned()),
+        ).await.expect("the new default can acquire its own create-time authority");
+        let session = service.session(&handle).await.unwrap();
+        assert!(session
+            .workspace_root
+            .starts_with(selected.canonicalize().unwrap()));
+        assert!(selected.join(".argos-private-artifact-root-v1").exists());
+        assert_eq!(
+            std::fs::read(&old_wallet).unwrap(),
+            b"v1.5.3 wallet evidence"
+        );
+        assert!(!legacy.join(".argos-private-artifact-root-v1").exists());
+        service.cancel_scan(&handle).await.unwrap();
+    }
+
+    #[test]
+    fn default_selection_keeps_marked_locations_and_never_authenticates_by_marker_presence() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let legacy = tempdir.path().join("workspace");
+        let versioned = tempdir.path().join("workspace-v2");
+        assert_eq!(
+            super::default_recovery_data_dir(&legacy, &versioned).unwrap(),
+            legacy
+        );
+        super::ensure_recovery_data_dir(&legacy).unwrap();
+        assert_eq!(
+            super::default_recovery_data_dir(&legacy, &versioned).unwrap(),
+            legacy
+        );
+        // A malformed marker must fail authentication in the original location,
+        // rather than silently selecting another directory.
+        std::fs::write(legacy.join(".argos-private-artifact-root-v1"), b"malformed").unwrap();
+        assert_eq!(
+            super::default_recovery_data_dir(&legacy, &versioned).unwrap(),
+            legacy
+        );
+        assert!(super::ensure_recovery_data_dir(&legacy).is_err());
+        assert!(!versioned.exists());
+    }
+
+    #[test]
+    fn versioned_default_selection_is_stable_but_still_requires_authentication() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let legacy = tempdir.path().join("workspace");
+        let versioned = tempdir.path().join("workspace-v2");
+        // Even an existing empty directory is not granted create-time authority.
+        std::fs::create_dir(&versioned).unwrap();
+        assert_eq!(
+            super::default_recovery_data_dir(&legacy, &versioned).unwrap(),
+            versioned
+        );
+        assert!(super::ensure_recovery_data_dir(&versioned).is_err());
+        assert!(!legacy.exists());
+    }
+
+    #[tokio::test]
     async fn first_scan_creates_a_fresh_workspace_after_empty_cleanup_recovery() {
         let tempdir = tempfile::tempdir().unwrap();
         let service = RecoveryService::new();
@@ -9226,6 +9393,7 @@ mod propose_workspace_guard_tests {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle, root, txid) =
             completed_mined_session(&artifact_data_dir(&tempdir)).await;
+        let root = root.canonicalize().unwrap();
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let tombstone = root.with_file_name(format!(
             "{}.deleting-replay-generation-a",

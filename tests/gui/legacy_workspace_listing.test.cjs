@@ -80,7 +80,9 @@ test("legacy untrusted rows explain preservation and rescan without resume or me
   assert.match(text, /workspace is preserved/i);
   assert.match(text, /predates.*private-storage lineage/i);
   assert.match(text, /cannot be safely resumed/i);
-  assert.match(text, /archive.*Argos is stopped.*rescan/i);
+  assert.match(text, /choose a new empty.*data directory/i);
+  assert.match(text, /workspace-v2/);
+  assert.match(text, /rescan/i);
   assert.doesNotMatch(text, /must not be rendered/);
   assert.doesNotMatch(text, /3,200,000|3,300,000|3,280,000/);
   assert.equal(buttons.some((button) => button.textContent === "Resume"), false);

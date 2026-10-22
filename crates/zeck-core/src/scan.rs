@@ -1077,11 +1077,8 @@ async fn run_standalone_leg(
     Ok(true)
 }
 
-/// The standalone Sapling keys [`register_mixed_keys`] would register beside
-/// `hd_rows`: each standalone key once, skipping any that is one of the HD
-/// accounts' own Sapling keys. Shared with
-/// [`rebuild_for_mixed_keys_if_scanned`] so the rebuild decision and the
-/// registration cannot disagree about which accounts are new.
+/// Select each standalone Sapling key once, excluding keys already derived
+/// for the HD accounts. Rebuild detection and registration share this choice.
 fn select_mixed_sapling(
     hd_rows: &[TrackedAccount],
     keys: &argos_wallet_import::ImportedKeys,
@@ -1112,24 +1109,15 @@ fn select_mixed_sapling(
             selected.push((key_index, extsk));
         }
     }
+
     Ok(selected)
 }
 
-/// Before the standalone leg registers its Sapling keys as accounts, rebuild
-/// the wallet database if it has already scanned blocks and lacks any of
-/// them.
-///
-/// The leg runs after the HD gap loop has synced to the tip, so
-/// `register_mixed_keys`' `import_account_ufvk` would be the same
-/// consecutive `add_account` into a scanned database that
-/// [`prepare_scan_accounts`] avoids for HD accounts: a second standalone
-/// key fails with "the Sapling note commitment tree retains checkpoints
-/// both above and below height ...". The rebuilt database holds the HD
-/// accounts exactly as the gap loop imported them (same derivation, same
-/// birthday, same transparent receivers); `register_mixed_keys` then adds
-/// the standalone keys to it before anything is scanned. Standalone
-/// transparent keys alone never trigger this: attaching a receiver does not
-/// rewind the wallet.
+/// Register missing standalone Sapling accounts before any blocks are scanned.
+/// Consecutive account imports rewind a scanned wallet and can leave its note
+/// commitment tree checkpoints inconsistent. A rebuild preserves the HD account
+/// set and receiver configuration; registration then adds every standalone key.
+/// Standalone transparent receivers do not rewind the wallet.
 async fn rebuild_for_mixed_keys_if_scanned(
     leg: &StandaloneLeg<'_>,
     keys: &argos_wallet_import::ImportedKeys,
@@ -1167,8 +1155,6 @@ async fn rebuild_for_mixed_keys_if_scanned(
             return Ok(());
         }
     }
-    // The selection is recomputed when registration starts. Do not retain a
-    // second secret-bearing copy across the potentially long wallet rebuild.
     drop(selected);
 
     let transparent_account = legacy_transparent_account_key_from_seed(network, leg.seed)?;
@@ -1221,6 +1207,7 @@ async fn register_mixed_keys(
                 .copied()
         })
         .collect();
+
     let resolved = imported_transparent_keys(keys)?;
     let mut selected_transparent = Vec::new();
     for (key_index, key) in keys.transparent.iter().enumerate() {
@@ -1955,9 +1942,10 @@ enum AccountPreparation {
 /// in tests only above the NU6.3 activation height, where commitment tree
 /// anchor retention is active; see
 /// `upstream_consecutive_import_into_a_scanned_wallet_reports_corruption`.)
-/// In that case a fresh database is built with every account imported before any block
-/// is scanned, and atomically swapped in. That costs nothing over the old
-/// path: each rewind already requeued the whole range from the birthday.
+/// In that case a fresh database is built in memory with every account imported
+/// before any block is scanned, and transactionally copied into the live database.
+/// That costs nothing over the old path: each rewind already requeued the whole
+/// range from the birthday.
 ///
 /// This also covers a resumed workspace whose earlier run died partway
 /// through such an extension: whatever accounts it holds, a scanned
@@ -2007,9 +1995,9 @@ async fn prepare_scan_accounts(
     Ok(AccountPreparation::Rebuilt)
 }
 
-/// Replace the workspace's wallet database with a fresh one holding exactly
-/// the HD `accounts`, imported before any block is scanned, and make
-/// `tracked_accounts` describe them.
+/// Build exactly the HD account set in memory and transactionally install it
+/// without changing the authenticated live database object. Account IDs belong
+/// to the rebuilt contents, so the tracked set must be replaced after commit.
 async fn rebuild_wallet_db(
     workspace: &RecoveryWorkspace,
     network: crate::models::ZeckNetwork,
@@ -2039,9 +2027,8 @@ async fn rebuild_wallet_db(
     Ok(())
 }
 
-/// How the HD scan attaches transparent receivers: the configured index
-/// range, or the legacy ZecWallet Lite receiver. One function so the gap
-/// loop and the standalone leg's rebuild cannot import differently.
+/// Use the same transparent receiver mode for HD gap extensions and the
+/// standalone leg's reconstruction of those HD accounts.
 fn hd_transparent_import_mode<'a>(
     transparent_scan: Option<&'a crate::models::TransparentScanConfig>,
     transparent_account: &'a zcash_transparent::keys::AccountPrivKey,
@@ -5890,7 +5877,6 @@ mod tests {
             assert_holds_accounts(&scanned, 6);
             assert_eq!(scanned.state.lock().await.tracked_accounts.len(), 6);
         }
-
         /// Review on #279: the user's actual resume. An earlier run imported
         /// one extension account into the scanned database and failed on
         /// the next. The resumed first pass reuses that database and really

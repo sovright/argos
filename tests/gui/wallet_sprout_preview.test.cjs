@@ -235,8 +235,12 @@ test("a successful wallet inspection expires frontend passphrase and review auth
   assert.equal(h.peek("walletFile.passphrase"), "wallet secret");
   assert.equal(h.peek("walletFile.reviewId"), "review:/fixture/encrypted.dat");
 
+  h.$("sapling-scan-keys").value = "pasted Sapling secret";
+  h.$("sprout-scan-keys").value = "pasted Sprout secret";
   h.fireTimer(timerId);
 
+  assert.equal(h.$("sapling-scan-keys").value, "");
+  assert.equal(h.$("sprout-scan-keys").value, "");
   assert.equal(h.$("wallet-passphrase").value, "");
   assert.equal(h.peek("walletFile"), null);
   assert.equal(h.peek("sproutPreviewWallet"), null);
@@ -437,8 +441,8 @@ test("wallet source and endpoint edits revoke the reviewed proposal", async () =
   }
 });
 
-test("network and data directory edits hide wallet Sprout evidence until reinspection", async () => {
-  for (const id of ["network-select", "data-dir"]) {
+test("network edits forget the wallet and hide Sprout evidence until reinspection", async () => {
+  for (const id of ["network-select"]) {
     const h = harness();
     await h.open("/fixture/wallet.dat");
     assert.equal(h.$("wallet-summary").hidden, false);
@@ -453,6 +457,35 @@ test("network and data directory edits hide wallet Sprout evidence until reinspe
     assert.equal(h.$("sprout-sweep-spent-status").textContent, "", id);
     assert.equal(h.$("wallet-path").value, "/fixture/wallet.dat", id);
   }
+});
+
+test("data directory edits retain scan credentials and expiry while revoking stale Sprout evidence", async () => {
+  const calls = [];
+  const h = harness((command, args, fallback) => { calls.push({ command, args }); return fallback(); });
+  await h.open("/fixture/wallet.dat", "retry secret");
+  const [timerId] = [...h.timers.keys()];
+  const proposal = h.peek("walletSproutReview.proposal_id");
+  h.$("sapling-scan-keys").value = "pasted retry key";
+  h.edit("data-dir", "/new-empty-directory");
+  assert.equal(h.peek("walletFile?.passphrase"), "retry secret");
+  assert.equal(h.peek("walletFile?.reviewId"), "review:/fixture/wallet.dat");
+  assert.equal(h.$("wallet-passphrase").value, "retry secret");
+  assert.equal(h.$("sapling-scan-keys").value, "pasted retry key");
+  assert.equal(h.timers.get(timerId).cleared, false);
+  assert.equal(h.$("wallet-summary").hidden, true);
+  assert.equal(h.$("wallet-sprout-sweep").hidden, true);
+  assert.equal(h.$("wallet-next").disabled, true);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+  assert.equal(h.$("sprout-sweep-plan").textContent, "");
+  assert.equal(h.$("sprout-sweep-spent-status").textContent, "");
+  assert.equal(h.peek("walletSproutReview"), null);
+  assert.ok(calls.some(({ command, args }) => command === "release_sprout_proposal" && args.proposalId === proposal));
+  await h.sweepConfirmed();
+  assert.equal(calls.some(({ command }) => command === "execute_wallet_sprout_sweep"), false);
+  h.fireTimer(timerId);
+  assert.equal(h.peek("walletFile"), null);
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.$("sapling-scan-keys").value, "");
 });
 
 test("first wallet open displays its Sprout preview with reviewed authority", async () => {

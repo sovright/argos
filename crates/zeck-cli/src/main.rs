@@ -25,7 +25,7 @@ use argos_core::{
 use argos_core::{
     p2p::wire::P2pNetwork, sprout_recovery::SpentEvidence, sprout_scan_cost::SproutScanCost,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
 use indicatif::{ProgressBar, ProgressStyle};
 use secrecy::{ExposeSecret, Secret, SecretString};
@@ -85,6 +85,9 @@ struct Cli {
     /// Directory for wallet database and block cache.
     #[arg(long, global = true, default_value = "./argos_data")]
     data_dir: PathBuf,
+
+    #[arg(skip)]
+    data_dir_explicit: bool,
 
     /// lightwalletd gRPC endpoint(s). Comma-separated URLs are tried in order.
     /// Each must be https://, or http:// to localhost. The default is a
@@ -202,7 +205,10 @@ where
     T: Into<OsString>,
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-    let mut cli = Cli::try_parse_from(args.iter().cloned())?;
+    let matches = Cli::command().try_get_matches_from(args.iter().cloned())?;
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    cli.data_dir_explicit =
+        matches.value_source("data_dir") == Some(clap::parser::ValueSource::CommandLine);
     let mut sources = Vec::new();
     let mut index = 1;
     while index < args.len() {
@@ -2631,7 +2637,7 @@ fn install_regtest_params_if_requested() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|err| err.exit());
+    let mut cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|err| err.exit());
     if let Some(requested) = cli.scan_batch_size {
         let used = argos_core::scan::set_sync_batch_size(requested);
         if used != requested {
@@ -2643,6 +2649,20 @@ async fn main() -> Result<()> {
     refuse_unconsumed_birthday_skip(&cli)?;
 
     install_regtest_params_if_requested()?;
+
+    if !cli.data_dir_explicit {
+        let selected = argos_core::service::default_recovery_data_dir(
+            &cli.data_dir,
+            Path::new("./argos_data_v2"),
+        )?;
+        if selected != cli.data_dir {
+            eprintln!(
+                "Your previous default data directory is preserved. Argos now uses {}; rescan from your original seed or wallet file. Reconcile previously broadcast transactions before recovering those funds again.",
+                selected.display()
+            );
+        }
+        cli.data_dir = selected;
+    }
 
     // Gate the network/funds-moving commands on Terms of Service acceptance.
     // `show-keys` is purely local key derivation and is intentionally ungated.
@@ -4698,6 +4718,20 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["argos", "scan"]).unwrap();
         assert_eq!(cli.scan_batch_size, None, "unset keeps the default");
+    }
+
+    #[test]
+    fn explicit_data_directory_is_distinguished_from_the_implicit_default() {
+        assert!(!parse_cli_from(["argos", "scan"]).unwrap().data_dir_explicit);
+        for args in [
+            vec!["argos", "--data-dir", "./argos_data", "scan"],
+            vec!["argos", "scan", "--data-dir", "./argos_data"],
+            vec!["argos", "scan", "--data-dir=./argos_data"],
+        ] {
+            let cli = parse_cli_from(args).unwrap();
+            assert!(cli.data_dir_explicit);
+            assert_eq!(cli.data_dir, PathBuf::from("./argos_data"));
+        }
     }
 
     #[test]

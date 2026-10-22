@@ -274,6 +274,99 @@ pub(crate) fn private_data_dir_child_names(data_dir: &Path) -> io::Result<Vec<Os
     container.child_names()
 }
 
+/// Read-only, bounded diagnostics for a legacy journal. These bytes are never
+/// artifact authority and must not be used to authorize a spend or cleanup.
+pub(crate) fn read_direct_legacy_journal_diagnostic(
+    data_dir: &Path,
+    retained_root: Option<&PrivateArtifactRootLease>,
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    require_direct_child(data_dir, path)?;
+    let container;
+    let (authority, parent) = if let Some(root) = retained_root {
+        if root.path.parent() != Some(data_dir) {
+            return Err(invalid_lineage(
+                "legacy diagnostic does not belong to the retained data directory",
+            ));
+        }
+        root.verify_retained_current()?;
+        (root, &root.publication_parent)
+    } else {
+        let publication =
+            open_publication_parent(data_dir.parent().ok_or_else(|| {
+                invalid_lineage("legacy diagnostic data directory has no parent")
+            })?)?;
+        let directory = open_child_directory_for_identity(&publication, data_dir)?;
+        // A diagnostic must not create storage or activate a Pending Windows
+        // registry record; only already-active container authority is usable.
+        container = verify_private_artifact_root_from_handles_with_recovery(
+            data_dir,
+            private_artifact_container_purpose(),
+            publication,
+            directory,
+            false,
+        )?;
+        container.verify_retained_current()?;
+        (&container, &container.root)
+    };
+    let mut file = open_child_file_for_authority(parent, path)?;
+    verify_single_link_diagnostic_file(&file)?;
+    let identity = private_object_id(&file)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy diagnostic exceeds its maximum size",
+        ));
+    }
+    let current = open_child_file_for_bound_identity(parent, path)?;
+    verify_single_link_diagnostic_file(&current)?;
+    verify_single_link_diagnostic_file(&file)?;
+    if private_object_id(&current)? != identity || private_object_id(&file)? != identity {
+        return Err(invalid_lineage(
+            "legacy journal changed while reading diagnostic evidence",
+        ));
+    }
+    authority.verify_retained_current()?;
+    Ok(bytes)
+}
+
+fn verify_single_link_diagnostic_file(file: &File) -> io::Result<()> {
+    validate_private_file(file)?;
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata()?.nlink()
+    };
+    #[cfg(windows)]
+    let links = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        u64::from(information.nNumberOfLinks)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let links = 0;
+    if links != 1 {
+        return Err(invalid_lineage(
+            "legacy diagnostic must name a single-link regular file",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn discover_private_artifact_roots(
     data_dir: &Path,
 ) -> io::Result<Vec<PrivateArtifactRootLease>> {
@@ -385,16 +478,21 @@ impl PrivateArtifactDomain {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PrivateArtifactState {
+    Empty,
     Pending {
         generation: [u8; 16],
         candidate: String,
         old: Option<PrivateObjectId>,
+        #[serde(default)]
+        old_generation: Option<[u8; 16]>,
     },
     Created {
         generation: [u8; 16],
         candidate: String,
         object: PrivateObjectId,
         old: Option<PrivateObjectId>,
+        #[serde(default)]
+        old_generation: Option<[u8; 16]>,
     },
     Replacing {
         generation: [u8; 16],
@@ -597,6 +695,7 @@ impl PrivateArtifactAccess {
         };
         access.verify_authority_object()?;
         let _ = access.current_record()?;
+        access.rollback_incomplete_checkpoint_save()?;
         Ok(access)
     }
 
@@ -700,7 +799,11 @@ impl PrivateArtifactAccess {
         &self,
     ) -> io::Result<Option<(Vec<u8>, PrivateObjectId)>> {
         match self.current_record()? {
-            None => {
+            None
+            | Some(PrivateArtifactAuthorityRecord {
+                state: PrivateArtifactState::Empty,
+                ..
+            }) => {
                 if self.namespace.child_exists(&self.artifact)? {
                     Err(invalid_lineage(
                         "existing private artifact predates create-time authority; preserved unchanged",
@@ -820,7 +923,7 @@ impl PrivateArtifactAccess {
         &self,
     ) -> io::Result<Option<(File, [u8; 16], PrivateObjectId)>> {
         match self.current_state()? {
-            None => {
+            None | Some(PrivateArtifactState::Empty) => {
                 if self.namespace.child_exists(&self.artifact)? {
                     Err(invalid_lineage(
                         "existing private artifact predates create-time authority; preserved unchanged",
@@ -911,6 +1014,7 @@ impl PrivateArtifactAccess {
                     generation,
                     candidate: candidate.clone(),
                     old: None,
+                    old_generation: None,
                 })?;
                 let mut file =
                     create_child_file_read_append(self.namespace.parent(), &self.artifact)?;
@@ -922,6 +1026,7 @@ impl PrivateArtifactAccess {
                     candidate,
                     object: object.clone(),
                     old: None,
+                    old_generation: None,
                 })?;
                 let (anchor, state) = self.current_authority()?.ok_or_else(|| {
                     invalid_lineage("new artifact authority disappeared before its first byte")
@@ -1052,7 +1157,123 @@ impl PrivateArtifactAccess {
         })
     }
 
+    /// Roll back a save that never durably declared its bytes complete. The
+    /// existing generation remains canonical until Replacing is recorded.
+    /// Pending has no candidate identity, so an orphan at its random name is
+    /// preserved without reading or deleting it. Created can remove only its
+    /// exact recorded candidate. Neither state can adopt a replaced old file.
+    fn rollback_incomplete_checkpoint_save(&self) -> io::Result<()> {
+        if self.domain != PrivateArtifactDomain::Checkpoint {
+            return Ok(());
+        }
+        let (candidate, candidate_id, old, old_generation) = match self.current_state()? {
+            Some(PrivateArtifactState::Pending {
+                candidate,
+                old,
+                old_generation,
+                ..
+            }) => (candidate, None, old, old_generation),
+            Some(PrivateArtifactState::Created {
+                candidate,
+                object,
+                old,
+                old_generation,
+                ..
+            }) => (candidate, Some(object), old, old_generation),
+            _ => return Ok(()),
+        };
+        let candidate_path = self.root.path.join(&candidate);
+        self.namespace.require_child(&candidate_path)?;
+        let prefix = format!(
+            ".{}.candidate-",
+            self.artifact
+                .file_name()
+                .expect("artifact has a name")
+                .to_string_lossy()
+        );
+        if !candidate.starts_with(&prefix) {
+            return Err(invalid_lineage(
+                "interrupted checkpoint has an invalid candidate name",
+            ));
+        }
+        let restored = match (old, old_generation) {
+            (Some(object), Some(generation)) => PrivateArtifactState::Active { generation, object },
+            (None, None) => PrivateArtifactState::Empty,
+            _ => return Err(invalid_lineage(
+                "interrupted checkpoint lacks its previous generation; preserve it for explicit recovery",
+            )),
+        };
+        // Keep the old file retained while removing the candidate and restoring
+        // authority. Its generation is never reminted during rollback.
+        let previous = match &restored {
+            PrivateArtifactState::Active { object, .. } => {
+                let file = open_child_file_for_removal(self.namespace.parent(), &self.artifact)?;
+                if private_object_id(&file)? != *object {
+                    return Err(invalid_lineage(
+                        "previous checkpoint changed during interrupted save",
+                    ));
+                }
+                Some(file)
+            }
+            _ => {
+                if self.namespace.child_exists(&self.artifact)? {
+                    return Err(invalid_lineage(
+                        "first checkpoint save has an unexpected canonical object",
+                    ));
+                }
+                None
+            }
+        };
+        if let Some(expected) = candidate_id {
+            match open_child_file_for_removal(self.namespace.parent(), &candidate_path) {
+                Ok(file) => {
+                    if private_object_id(&file)? != expected {
+                        return Err(invalid_lineage(
+                            "interrupted checkpoint candidate was replaced",
+                        ));
+                    }
+                    self.namespace
+                        .remove_open_child(&candidate_path, file, &expected)?;
+                }
+                // A crash can occur after exact unlink but before state restore.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.namespace.sync_parent()?;
+        self.verify_authority_object()?;
+        self.append_state(restored)?;
+        drop(previous);
+        Ok(())
+    }
+
     pub(crate) fn replace_child(&self, bytes: &[u8]) -> io::Result<()> {
+        self.replace_child_with_observer(bytes, |_| Ok(()))
+    }
+
+    fn replace_child_with_observer(
+        &self,
+        bytes: &[u8],
+        after_stage: impl FnMut(&str) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.rollback_incomplete_checkpoint_save()?;
+        match self.replace_child_inner(bytes, after_stage) {
+            Ok(()) => Ok(()),
+            Err(error) => match self.rollback_incomplete_checkpoint_save() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(io::Error::new(
+                    rollback.kind(),
+                    format!("{error}; interrupted checkpoint rollback refused: {rollback}"),
+                )),
+            },
+        }
+    }
+
+    fn replace_child_inner(
+        &self,
+        bytes: &[u8],
+        mut after_stage: impl FnMut(&str) -> io::Result<()>,
+    ) -> io::Result<()> {
         let current = self.current_state()?;
         if let Some(PrivateArtifactState::Replacing {
             generation,
@@ -1065,12 +1286,14 @@ impl PrivateArtifactAccess {
         {
             self.finish_replacing(generation, &candidate, &object, len, &sha256, old.as_ref())?;
         }
-        let old = match self.current_state()? {
-            None => None,
-            Some(PrivateArtifactState::Active { object, .. }) => Some(object),
+        let (old, old_generation) = match self.current_state()? {
+            None | Some(PrivateArtifactState::Empty) => (None, None),
+            Some(PrivateArtifactState::Active { object, generation }) => {
+                (Some(object), Some(generation))
+            }
             // A caller that owns the normal checkpoint-save path is the
             // explicit start of a new scan generation after retirement.
-            Some(PrivateArtifactState::Retired { .. }) => None,
+            Some(PrivateArtifactState::Retired { .. }) => (None, None),
             Some(state) => {
                 return Err(invalid_lineage(format!(
                 "{} artifact replacement is interrupted in state {state:?}; preserved unchanged",
@@ -1096,9 +1319,12 @@ impl PrivateArtifactAccess {
             generation,
             candidate: candidate.clone(),
             old: old.clone(),
+            old_generation,
         })?;
+        after_stage("pending")?;
         let candidate_path = self.root.path.join(&candidate);
         let mut file = create_child_file_read_append(self.namespace.parent(), &candidate_path)?;
+        after_stage("candidate_created")?;
         file.sync_all()?;
         self.namespace.sync_parent()?;
         let object = private_object_id(&file)?;
@@ -1107,7 +1333,9 @@ impl PrivateArtifactAccess {
             candidate: candidate.clone(),
             object: object.clone(),
             old: old.clone(),
+            old_generation,
         })?;
+        after_stage("created")?;
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
@@ -1117,6 +1345,7 @@ impl PrivateArtifactAccess {
             ));
         }
         drop(file);
+        after_stage("written")?;
         let len = bytes.len() as u64;
         let sha256 = sha2::Sha256::digest(bytes).into();
         self.append_state(PrivateArtifactState::Replacing {
@@ -1306,6 +1535,7 @@ impl PrivateArtifactAccess {
                     generation,
                     candidate: candidate.clone(),
                     old: None,
+                    old_generation: None,
                 })?;
                 let mut file =
                     create_child_file_read_append(self.namespace.parent(), &self.artifact)?;
@@ -1317,6 +1547,7 @@ impl PrivateArtifactAccess {
                     candidate,
                     object: object.clone(),
                     old: None,
+                    old_generation: None,
                 })?;
                 after_created(&file, &object)?;
                 file.write_all(suffix)?;
@@ -1505,8 +1736,8 @@ pub(crate) struct RetainedWorkspaceDirectory {
 }
 
 /// Exact authority for removing a throwaway shielded-probe workspace. The
-/// registry remains Active until the exact private root has been removed and
-/// its publication parent synced; only then is the per-probe authority retired.
+/// registry remains Pending or Active until the exact private root has been
+/// removed and its publication parent synced; only then is its authority retired.
 #[derive(Debug)]
 pub(crate) struct EphemeralProbeCleanup {
     publication_parent: File,
@@ -3013,6 +3244,7 @@ fn activate_or_verify_windows_artifact_root(
     context: &[u8],
     record: &PrivateArtifactRootRecord,
     objects: WindowsArtifactRootObjects,
+    recover_pending: bool,
 ) -> io::Result<()> {
     let context_hash = windows_lineage::context_hash(context);
     let mut authority = windows_lineage::read_artifact_authority(&context_hash)?
@@ -3026,7 +3258,9 @@ fn activate_or_verify_windows_artifact_root(
         ));
     }
     match &authority.state {
-        WindowsArtifactRootState::Pending { generation } if generation == &record.generation => {
+        WindowsArtifactRootState::Pending { generation }
+            if recover_pending && generation == &record.generation =>
+        {
             authority.state = WindowsArtifactRootState::Active {
                 generation: *generation,
                 objects,
@@ -3064,6 +3298,22 @@ fn verify_private_artifact_root_from_handles(
     purpose: &[u8],
     publication_parent: File,
     root: File,
+) -> io::Result<PrivateArtifactRootLease> {
+    verify_private_artifact_root_from_handles_with_recovery(
+        private_root,
+        purpose,
+        publication_parent,
+        root,
+        true,
+    )
+}
+
+fn verify_private_artifact_root_from_handles_with_recovery(
+    private_root: &Path,
+    purpose: &[u8],
+    publication_parent: File,
+    root: File,
+    _recover_pending: bool,
 ) -> io::Result<PrivateArtifactRootLease> {
     let context = private_artifact_root_context(private_root, purpose)?;
     #[cfg(windows)]
@@ -3126,6 +3376,7 @@ fn verify_private_artifact_root_from_handles(
             marker: marker_id.clone(),
             bound_objects: record.bound_objects.clone(),
         },
+        _recover_pending,
     )?;
     Ok(PrivateArtifactRootLease {
         publication_parent,
@@ -4195,12 +4446,17 @@ impl EphemeralProbeRegistration {
             )
         })?;
         let parent = open_publication_parent(parent_path)?;
+        Self::acquire_from_parent(&parent, private_root)
+    }
+
+    fn acquire_from_parent(parent: &File, private_root: &Path) -> io::Result<Self> {
         let path = ephemeral_probe_registration_path(private_root)?;
-        let file = open_child_file_for_lock(&parent, &path)?;
+        let file = open_child_file_for_lock(parent, &path)?;
         let id = private_object_id(&file)?;
         lock_exclusive(&file)?;
-        sync_private_directory(&parent)?;
-        Ok(Self { file, id, path })
+        let registration = Self { file, id, path };
+        sync_private_directory(parent)?;
+        Ok(registration)
     }
 
     fn verify(&self, private_root: &Path) -> io::Result<()> {
@@ -4210,6 +4466,28 @@ impl EphemeralProbeRegistration {
             return Err(invalid_lineage("ephemeral probe live registration changed"));
         }
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EphemeralProbeRegistration {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::{Storage::FileSystem::UnlockFileEx, System::IO::OVERLAPPED};
+
+        // Pair lock_exclusive's exact range before closing this synchronous
+        // handle. File drop still closes it if explicit unlock fails, and its
+        // no-delete-sharing protection remains in force until that close.
+        let mut overlapped = OVERLAPPED::default();
+        let _ = unsafe {
+            UnlockFileEx(
+                self.file.as_raw_handle(),
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
     }
 }
 
@@ -4381,8 +4659,9 @@ pub(crate) fn begin_ephemeral_probe_cleanup(
         &namespace_parent.join(".argos-ephemeral-probe-cleanup.lock"),
     )?;
     let retained_leaf = retain_private_workspace_for_cleanup(&namespace, leaf, database)?;
-    let binding =
-        inspect_private_workspace_cleanup_binding(private_root, &retained_leaf, database)?;
+    // A probe may fail before SQLite activation. Its authenticated preparation
+    // marker still binds the exact objects and generation of that Pending root.
+    let binding = inspect_prepared_ephemeral_probe_binding(private_root, &retained_leaf, database)?;
 
     let publication_parent_path = private_root.parent().ok_or_else(|| {
         io::Error::new(
@@ -4454,7 +4733,7 @@ impl EphemeralProbeCleanup {
         )?;
 
         #[cfg(windows)]
-        let (context_hash, _lineage_guard) = verify_active_ephemeral_probe_authority(
+        let (context_hash, _lineage_guard) = verify_ephemeral_probe_cleanup_authority(
             &self.private_root,
             &self.database,
             &self.binding,
@@ -4468,6 +4747,10 @@ impl EphemeralProbeCleanup {
             &self.private_root_directory,
             &self.private_root_id,
         )?;
+        // Windows completes the verified delete disposition when the retained
+        // directory handle closes. Keep the parent, registration, SQLite-open
+        // gate, and lineage mutex held while confirming durable absence.
+        drop(self.private_root_directory);
         sync_private_directory(&self.publication_parent)?;
         if parent_child_names(&self.publication_parent, &self.publication_parent_path)?
             .iter()
@@ -4525,39 +4808,7 @@ fn read_ephemeral_probe_cleanup_marker(
 }
 
 #[cfg(windows)]
-fn verify_active_ephemeral_probe_authority(
-    private_root: &Path,
-    database: &Path,
-    binding: &PrivateWorkspaceCleanupBinding,
-) -> io::Result<([u8; 32], windows_acl::LineageMutex)> {
-    let context = sqlite_lineage_context_paths(private_root, database)?;
-    let context_hash = windows_lineage::context_hash(&context);
-    let guard = windows_lineage::lock(&context_hash)?;
-    let authority = windows_lineage::read_authority(&context_hash)?
-        .ok_or_else(|| invalid_lineage("ephemeral probe Windows lineage authority is missing"))?;
-    let anchor_id = binding
-        .anchor_id
-        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no anchor"))?;
-    let generation = binding
-        .generation
-        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no generation"))?;
-    require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
-    match authority.state {
-        WindowsLineageState::Active {
-            generation: current,
-            objects,
-        } if current == generation && objects == windows_objects_from_cleanup_binding(binding) => {}
-        _ => {
-            return Err(invalid_lineage(
-                "ephemeral probe cleanup requires the exact Active authority",
-            ));
-        }
-    }
-    Ok((context_hash, guard))
-}
-
-#[cfg(windows)]
-fn verify_stale_ephemeral_probe_authority(
+fn verify_ephemeral_probe_cleanup_authority(
     private_root: &Path,
     database: &Path,
     binding: &PrivateWorkspaceCleanupBinding,
@@ -4584,7 +4835,7 @@ fn verify_stale_ephemeral_probe_authority(
         } if current == generation && objects == windows_objects_from_cleanup_binding(binding) => {}
         _ => {
             return Err(invalid_lineage(
-                "stale ephemeral probe marker does not match Pending or Active authority",
+                "ephemeral probe marker does not match Pending or Active authority",
             ));
         }
     }
@@ -4603,7 +4854,7 @@ fn remove_ephemeral_probe_cleanup_marker(
         ));
     }
     remove_open_child_file(publication_parent, marker_path, marker, marker_id)?;
-    publication_parent.sync_all()
+    sync_private_directory(publication_parent)
 }
 
 /// Resume an authenticated ephemeral-probe cleanup marker left by a crash.
@@ -4612,7 +4863,13 @@ fn remove_ephemeral_probe_cleanup_marker(
 pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Result<()> {
     let (publication_parent, publication_parent_path, marker_id, record) =
         read_ephemeral_probe_cleanup_marker(marker_path)?;
-    let _registration = match EphemeralProbeRegistration::acquire(&record.private_root) {
+    // Reuse the authenticated marker's retained parent. On Windows, reopening
+    // our own DELETE-capable, no-delete-share parent would look like a live
+    // registration's sharing conflict and silently skip stale recovery.
+    let _registration = match EphemeralProbeRegistration::acquire_from_parent(
+        &publication_parent,
+        &record.private_root,
+    ) {
         Ok(registration) => registration,
         Err(error) if ephemeral_probe_lock_is_contended(&error) => return Ok(()),
         Err(error) => return Err(error),
@@ -4631,7 +4888,7 @@ pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Re
 
     #[cfg(windows)]
     let (context_hash, _lineage_guard, retire_authority) = if root_exists {
-        let (context_hash, guard) = verify_stale_ephemeral_probe_authority(
+        let (context_hash, guard) = verify_ephemeral_probe_cleanup_authority(
             &record.private_root,
             &record.database,
             &record.binding,
@@ -4694,6 +4951,7 @@ pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Re
             &private_root_directory,
             &private_root_id,
         )?;
+        drop(private_root_directory);
         sync_private_directory(&publication_parent)?;
     }
     if parent_child_names(&publication_parent, &publication_parent_path)?
@@ -5973,12 +6231,16 @@ mod unix_private {
 
         pub(super) const ACL_TYPE_EXTENDED: i32 = 0x0000_0100;
         pub(super) const ACL_FIRST_ENTRY: i32 = 0;
+        pub(super) const ACL_NEXT_ENTRY: i32 = -1;
+        pub(super) const ACL_EXTENDED_DENY: i32 = 2;
 
         unsafe extern "C" {
             pub(super) fn acl_init(count: i32) -> *mut c_void;
             pub(super) fn acl_free(object: *mut c_void) -> i32;
             pub(super) fn acl_set_fd_np(fd: i32, acl: *mut c_void, acl_type: i32) -> i32;
             pub(super) fn acl_get_fd_np(fd: i32, acl_type: i32) -> *mut c_void;
+            pub(super) fn acl_valid(acl: *mut c_void) -> i32;
+            pub(super) fn acl_get_tag_type(entry: *mut c_void, tag: *mut i32) -> i32;
             pub(super) fn acl_get_entry(
                 acl: *mut c_void,
                 entry_id: i32,
@@ -6002,6 +6264,11 @@ mod unix_private {
 
     #[cfg(target_os = "macos")]
     pub(super) fn verify_no_extended_acl(file: &File) -> io::Result<()> {
+        verify_macos_acl(file, false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_macos_acl(file: &File, allow_deny_only: bool) -> io::Result<()> {
         let acl =
             unsafe { macos_acl::acl_get_fd_np(file.as_raw_fd(), macos_acl::ACL_TYPE_EXTENDED) };
         if acl.is_null() {
@@ -6012,19 +6279,40 @@ mod unix_private {
                 Err(error)
             };
         }
-        let mut entry = std::ptr::null_mut();
-        let result =
-            unsafe { macos_acl::acl_get_entry(acl, macos_acl::ACL_FIRST_ENTRY, &mut entry) };
+        let result = (|| {
+            if unsafe { macos_acl::acl_valid(acl) } != 0 {
+                return Err(last_error());
+            }
+            let mut entry = std::ptr::null_mut();
+            let mut selector = macos_acl::ACL_FIRST_ENTRY;
+            loop {
+                if unsafe { macos_acl::acl_get_entry(acl, selector, &mut entry) } != 0 {
+                    let error = last_error();
+                    // Darwin returns EINVAL when the iterator passes the last
+                    // entry. The ACL was validated above and is an owned copy.
+                    return if error.raw_os_error() == Some(libc::EINVAL) {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    };
+                }
+                let mut tag = 0;
+                if unsafe { macos_acl::acl_get_tag_type(entry, &mut tag) } != 0 {
+                    return Err(last_error());
+                }
+                if !allow_deny_only || tag != macos_acl::ACL_EXTENDED_DENY {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "private object retained an extended macOS ACL grant",
+                    ));
+                }
+                selector = macos_acl::ACL_NEXT_ENTRY;
+            }
+        })();
         unsafe {
             macos_acl::acl_free(acl);
         }
-        match result {
-            0 => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private object retained an extended macOS ACL",
-            )),
-            _ => Err(last_error()),
-        }
+        result
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -6073,6 +6361,12 @@ mod unix_private {
     }
 
     pub(super) fn verify_no_extended_directory_acl(directory: &File) -> io::Result<()> {
+        // Publication parents may have macOS's standard deny-delete ACE.
+        // Denials grant no access; private objects themselves still require an
+        // empty ACL and newly created descendants have inherited ACLs cleared.
+        #[cfg(target_os = "macos")]
+        verify_macos_acl(directory, true)?;
+        #[cfg(not(target_os = "macos"))]
         verify_no_extended_acl(directory)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         verify_absent_posix_acl_xattr(directory, b"system.posix_acl_default\0", "default")?;
@@ -7862,15 +8156,119 @@ mod windows_acl {
     }
 
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let mut encoded = OsStr::new(path).encode_wide().collect::<Vec<_>>();
+        use std::path::{Component, Prefix};
+
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
         if encoded.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "private path contains a NUL character",
             ));
         }
-        encoded.push(0);
-        Ok(encoded)
+        // Explicit verbatim/NT/device paths already select their namespace.
+        // Keep their separators and dot components exactly as supplied.
+        let explicit_namespace = encoded.starts_with(&[92, 92, 63, 92])
+            || encoded.starts_with(&[92, 63, 63, 92])
+            || matches!(path.components().next(), Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::DeviceNS(_)));
+        if explicit_namespace {
+            encoded.push(0);
+            return Ok(encoded);
+        }
+
+        // On Windows absolute uses GetFullPathNameW: normalize relative,
+        // drive-relative, rooted and slash/dot components before opting out of
+        // Win32 parsing. It does not access the filesystem or follow reparse
+        // points. All pinned-parent, no-reparse, identity and DACL checks remain
+        // at their existing call sites. Never canonicalize a creation target.
+        let absolute = std::path::absolute(path)?;
+        encoded = absolute.as_os_str().encode_wide().collect();
+        let prefix = match absolute.components().next() {
+            Some(Component::Prefix(prefix)) => prefix.kind(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private path did not resolve to an absolute Windows path",
+                ));
+            }
+        };
+        let mut extended = match prefix {
+            Prefix::Disk(_) => r"\\?\".encode_utf16().collect::<Vec<_>>(),
+            Prefix::UNC(_, _) => {
+                // GetFullPathNameW has normalized both leading separators.
+                encoded.drain(..2);
+                r"\\?\UNC\".encode_utf16().collect()
+            }
+            // GetFullPathNameW can resolve a DOS device name to \\.\NAME.
+            Prefix::DeviceNS(_)
+            | Prefix::Verbatim(_)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::VerbatimUNC(_, _) => Vec::new(),
+        };
+        extended.extend_from_slice(&encoded);
+        extended.push(0);
+        Ok(extended)
+    }
+
+    #[cfg(test)]
+    mod path_tests {
+        use super::*;
+
+        #[test]
+        fn windows_native_paths_normalize_disk_unc_and_preserve_explicit_namespaces() {
+            for (input, expected) in [
+                (r"C:\argos\missing\..\wallet", r"\\?\C:\argos\wallet"),
+                (
+                    r"\\server\share\missing\..\wallet",
+                    r"\\?\UNC\server\share\wallet",
+                ),
+                (r"\\?\C:\argos\..\wallet", r"\\?\C:\argos\..\wallet"),
+                (
+                    r"\\?\UNC\server\share\..\wallet",
+                    r"\\?\UNC\server\share\..\wallet",
+                ),
+                (r"\\.\pipe\argos", r"\\.\pipe\argos"),
+                (r"\??\C:\argos\wallet", r"\??\C:\argos\wallet"),
+            ] {
+                let actual = wide(Path::new(input)).unwrap();
+                let expected = expected.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{input}");
+            }
+        }
+
+        #[test]
+        fn windows_native_relative_paths_keep_win32_resolution_and_reject_nuls() {
+            // Windows defines the current-drive/current-directory semantics.
+            // Compare the normalized name to that OS contract after stripping
+            // only our extended prefix; never resolve filesystem identities.
+            let current = std::env::current_dir().unwrap();
+            let drive = match current.components().next().unwrap() {
+                std::path::Component::Prefix(prefix) => match prefix.kind() {
+                    std::path::Prefix::Disk(drive) | std::path::Prefix::VerbatimDisk(drive) => {
+                        drive
+                    }
+                    _ => panic!("the native test runner requires a drive current directory"),
+                },
+                _ => panic!("the native test runner requires a drive current directory"),
+            };
+            let drive_relative = format!("{}:argos-relative-child", char::from(drive));
+            for input in [
+                r".\argos-relative-child",
+                r"\argos-rooted-child",
+                &drive_relative,
+            ] {
+                let expected = std::path::absolute(input).unwrap();
+                let actual = wide(Path::new(input)).unwrap();
+                let actual = std::ffi::OsString::from_wide(&actual[..actual.len() - 1]);
+                let actual = actual.to_string_lossy();
+                assert!(actual.starts_with(r"\\?\"));
+                assert_eq!(&actual[4..], expected.to_string_lossy(), "{input}");
+            }
+            assert_eq!(
+                wide(Path::new("bad\0path")).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     fn nt_error(status: i32) -> io::Error {
@@ -9299,7 +9697,10 @@ mod windows_acl {
     pub(super) fn open_directory_for_cleanup_authority(path: &Path) -> io::Result<std::fs::File> {
         let directory = open_directory_with_share(
             path,
-            DELETE | READ_CONTROL,
+            // SQLite retains this exact handle for the later cleanup handoff.
+            // Cleanup must enumerate its children and durably flush changes,
+            // in addition to renaming and deleting the retained directory.
+            DELETE | FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
         )?;
         harden(&directory, true)?;
@@ -9646,6 +10047,413 @@ mod tests {
     }
 
     #[test]
+    fn direct_legacy_diagnostic_is_bounded_and_leaves_evidence_unchanged() {
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("data");
+        let purpose = b"legacy-diagnostic";
+        let root =
+            ensure_private_artifact_root(&private_artifact_root_path(&data_dir, purpose), purpose)
+                .unwrap();
+        let path = data_dir.join("sprout-sweep-legacy.journal");
+        write_private_file(&path, b"untrusted transaction history").unwrap();
+        for retained in [None, Some(&root)] {
+            assert_eq!(
+                read_direct_legacy_journal_diagnostic(&data_dir, retained, &path, 128).unwrap(),
+                b"untrusted transaction history"
+            );
+            assert!(read_direct_legacy_journal_diagnostic(&data_dir, retained, &path, 4).is_err());
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"untrusted transaction history");
+    }
+
+    #[test]
+    fn direct_legacy_diagnostic_does_not_create_a_missing_data_directory() {
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("absent-data");
+        assert!(read_direct_legacy_journal_diagnostic(
+            &data_dir,
+            None,
+            &data_dir.join("sprout-sweep-old.journal"),
+            128,
+        )
+        .is_err());
+        assert!(!data_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_legacy_diagnostic_refuses_a_replaced_retained_parent() {
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("data");
+        let purpose = b"legacy-diagnostic-parent";
+        let root =
+            ensure_private_artifact_root(&private_artifact_root_path(&data_dir, purpose), purpose)
+                .unwrap();
+        fs::rename(&data_dir, publication.join("original-data")).unwrap();
+        create_private_dir_all(&data_dir).unwrap();
+        let path = data_dir.join("sprout-sweep-old.journal");
+        write_private_file(&path, b"replacement sentinel").unwrap();
+        assert!(read_direct_legacy_journal_diagnostic(&data_dir, Some(&root), &path, 128).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"replacement sentinel");
+    }
+
+    #[test]
+    fn direct_legacy_diagnostic_refuses_hardlinked_file() {
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("data");
+        ensure_private_artifact_container(&data_dir).unwrap();
+        let sentinel = publication.join("sentinel");
+        write_private_file(&sentinel, b"preserve sentinel").unwrap();
+        let path = data_dir.join("sprout-sweep-legacy.journal");
+        fs::hard_link(&sentinel, &path).unwrap();
+        assert!(read_direct_legacy_journal_diagnostic(&data_dir, None, &path, 128).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve sentinel");
+        assert_eq!(fs::read(&path).unwrap(), b"preserve sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_legacy_diagnostic_refuses_links_and_permissive_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (_outer, publication) = private_publication_parent();
+        let data_dir = publication.join("data");
+        ensure_private_artifact_container(&data_dir).unwrap();
+        let sentinel = publication.join("sentinel");
+        write_private_file(&sentinel, b"preserve sentinel").unwrap();
+        let path = data_dir.join("sprout-sweep-legacy.journal");
+        symlink(&sentinel, &path).unwrap();
+        assert!(read_direct_legacy_journal_diagnostic(&data_dir, None, &path, 128).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&sentinel, &path).unwrap();
+        assert!(read_direct_legacy_journal_diagnostic(&data_dir, None, &path, 128).is_err());
+        fs::remove_file(&path).unwrap();
+        write_private_file(&path, b"permissive evidence").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_direct_legacy_journal_diagnostic(&data_dir, None, &path, 128).is_err());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve sentinel");
+    }
+
+    #[test]
+    fn checkpoint_interrupted_save_restores_previous_generation_on_restart() {
+        for stage in ["pending", "candidate_created", "created", "written"] {
+            for has_previous in [false, true] {
+                let (_outer, publication) = private_publication_parent();
+                let purpose = b"interrupted-production-checkpoint";
+                let root = private_artifact_root_path(&publication.join("data"), purpose);
+                let artifact = root.join("checkpoint");
+                let access = PrivateArtifactAccess::acquire(
+                    &root,
+                    purpose,
+                    PrivateArtifactDomain::Checkpoint,
+                    &artifact,
+                )
+                .unwrap();
+                if has_previous {
+                    access.replace_child(b"previous checkpoint").unwrap();
+                }
+                let previous = access.current_state().unwrap();
+                let anchor = access
+                    .current_authority()
+                    .unwrap()
+                    .map(|(anchor, _)| anchor);
+                let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = access.replace_child_with_observer(b"new checkpoint", |at| {
+                        if at == stage {
+                            if stage == "written" {
+                                let candidate = match access.current_state().unwrap().unwrap() {
+                                    PrivateArtifactState::Created { candidate, .. } => {
+                                        root.join(candidate)
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                let file =
+                                    open_child_file_for_lock(access.namespace.parent(), &candidate)
+                                        .unwrap();
+                                file.set_len(3).unwrap();
+                                file.sync_all().unwrap();
+                            }
+                            panic!("injected checkpoint crash at {stage}");
+                        }
+                        Ok(())
+                    });
+                }));
+                assert!(crash.is_err());
+                let crashed_anchor = access.current_authority().unwrap().unwrap().0;
+                let candidate = match access.current_state().unwrap().unwrap() {
+                    PrivateArtifactState::Pending { candidate, .. }
+                    | PrivateArtifactState::Created { candidate, .. } => root.join(candidate),
+                    state => panic!("unexpected crash state: {state:?}"),
+                };
+                if stage == "candidate_created" {
+                    write_private_file(&candidate, b"unbound sentinel").unwrap();
+                }
+                drop(access);
+                let resumed = PrivateArtifactAccess::acquire(
+                    &root,
+                    purpose,
+                    PrivateArtifactDomain::Checkpoint,
+                    &artifact,
+                )
+                .unwrap();
+                let recovered = resumed
+                    .open_active_child()
+                    .expect("resume interrupted save");
+                assert_eq!(recovered.is_some(), has_previous, "{stage}");
+                drop(recovered);
+                if has_previous {
+                    assert_eq!(resumed.current_state().unwrap(), previous);
+                    assert_eq!(fs::read(&artifact).unwrap(), b"previous checkpoint");
+                } else {
+                    assert!(!artifact.exists());
+                }
+                assert_eq!(
+                    resumed.current_authority().unwrap().unwrap().0,
+                    crashed_anchor
+                );
+                if let Some(anchor) = anchor {
+                    assert_eq!(anchor, crashed_anchor);
+                }
+                // The Pending candidate has not acquired object authority yet.
+                // It must be preserved, rather than deleting an unbound name.
+                assert_eq!(candidate.exists(), stage == "candidate_created");
+                if stage == "candidate_created" {
+                    assert_eq!(fs::read(&candidate).unwrap(), b"unbound sentinel");
+                }
+                resumed.replace_child(b"retry checkpoint").unwrap();
+                assert_eq!(fs::read(&artifact).unwrap(), b"retry checkpoint");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_interrupted_save_refuses_replaced_old_or_candidate() {
+        for replace_old in [false, true] {
+            let (_outer, publication) = private_publication_parent();
+            let purpose = b"replaced-interrupted-checkpoint";
+            let root = private_artifact_root_path(&publication.join("data"), purpose);
+            let artifact = root.join("checkpoint");
+            let access = PrivateArtifactAccess::acquire(
+                &root,
+                purpose,
+                PrivateArtifactDomain::Checkpoint,
+                &artifact,
+            )
+            .unwrap();
+            access.replace_child(b"previous checkpoint").unwrap();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = access.replace_child_with_observer(b"new checkpoint", |stage| {
+                    if stage == "created" {
+                        panic!("injected crash");
+                    }
+                    Ok(())
+                });
+            }));
+            let crashed = access.current_state().unwrap();
+            let candidate = match crashed.clone().unwrap() {
+                PrivateArtifactState::Created { candidate, .. } => root.join(candidate),
+                _ => unreachable!(),
+            };
+            let replaced = if replace_old { &artifact } else { &candidate };
+            fs::rename(replaced, root.join("original-object")).unwrap();
+            write_private_file(replaced, b"replacement sentinel").unwrap();
+            drop(access);
+            let reopened = PrivateArtifactAccess::acquire(
+                &root,
+                purpose,
+                PrivateArtifactDomain::Checkpoint,
+                &artifact,
+            );
+            match reopened {
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
+                Ok(access) => assert!(access.open_active_child().is_err()),
+            }
+            assert_eq!(fs::read(replaced).unwrap(), b"replacement sentinel");
+            assert!(candidate.exists());
+            assert!(artifact.exists());
+        }
+    }
+
+    #[test]
+    fn checkpoint_interrupted_rollback_resumes_after_candidate_unlink() {
+        let (_outer, publication) = private_publication_parent();
+        let purpose = b"rollback-after-unlink";
+        let root = private_artifact_root_path(&publication.join("data"), purpose);
+        let artifact = root.join("checkpoint");
+        let access = PrivateArtifactAccess::acquire(
+            &root,
+            purpose,
+            PrivateArtifactDomain::Checkpoint,
+            &artifact,
+        )
+        .unwrap();
+        access.replace_child(b"previous checkpoint").unwrap();
+        let previous = access.current_state().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = access.replace_child_with_observer(b"new checkpoint", |stage| {
+                if stage == "created" {
+                    panic!("injected crash");
+                }
+                Ok(())
+            });
+        }));
+        let (candidate, object) = match access.current_state().unwrap().unwrap() {
+            PrivateArtifactState::Created {
+                candidate, object, ..
+            } => (root.join(candidate), object),
+            _ => unreachable!(),
+        };
+        let file = open_child_file_for_removal(access.namespace.parent(), &candidate).unwrap();
+        access
+            .namespace
+            .remove_open_child(&candidate, file, &object)
+            .unwrap();
+        access.namespace.sync_parent().unwrap();
+        drop(access);
+        let resumed = PrivateArtifactAccess::acquire(
+            &root,
+            purpose,
+            PrivateArtifactDomain::Checkpoint,
+            &artifact,
+        )
+        .unwrap();
+        assert_eq!(resumed.current_state().unwrap(), previous);
+        assert_eq!(fs::read(&artifact).unwrap(), b"previous checkpoint");
+        assert!(!candidate.exists());
+    }
+
+    #[test]
+    fn checkpoint_interrupted_legacy_save_without_generation_fails_closed() {
+        let (_outer, publication) = private_publication_parent();
+        let purpose = b"legacy-interrupted-save";
+        let root = private_artifact_root_path(&publication.join("data"), purpose);
+        let artifact = root.join("checkpoint");
+        let access = PrivateArtifactAccess::acquire(
+            &root,
+            purpose,
+            PrivateArtifactDomain::Checkpoint,
+            &artifact,
+        )
+        .unwrap();
+        access.replace_child(b"previous checkpoint").unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = access.replace_child_with_observer(b"new checkpoint", |stage| {
+                if stage == "created" {
+                    panic!("injected crash");
+                }
+                Ok(())
+            });
+        }));
+        let mut state = access.current_state().unwrap().unwrap();
+        let candidate = match &mut state {
+            PrivateArtifactState::Created {
+                candidate,
+                old_generation,
+                ..
+            } => {
+                *old_generation = None;
+                root.join(candidate)
+            }
+            _ => unreachable!(),
+        };
+        access.append_state(state).unwrap();
+        drop(access);
+        let error = PrivateArtifactAccess::acquire(
+            &root,
+            purpose,
+            PrivateArtifactDomain::Checkpoint,
+            &artifact,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("previous generation"));
+        assert_eq!(fs::read(&artifact).unwrap(), b"previous checkpoint");
+        assert!(candidate.exists());
+    }
+
+    #[test]
+    fn checkpoint_save_error_rolls_back_before_returning() {
+        for stage in ["pending", "candidate_created", "created", "written"] {
+            let (_outer, publication) = private_publication_parent();
+            let purpose = b"failed-production-checkpoint";
+            let root = private_artifact_root_path(&publication.join("data"), purpose);
+            let artifact = root.join("checkpoint");
+            let access = PrivateArtifactAccess::acquire(
+                &root,
+                purpose,
+                PrivateArtifactDomain::Checkpoint,
+                &artifact,
+            )
+            .unwrap();
+            access.replace_child(b"previous checkpoint").unwrap();
+            let previous = access.current_state().unwrap();
+            let error = access
+                .replace_child_with_observer(b"new checkpoint", |at| {
+                    if at == stage {
+                        Err(io::Error::other("injected disk failure"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .expect_err("fault must be returned");
+            assert!(error.to_string().contains("injected disk failure"));
+            assert_eq!(access.current_state().unwrap(), previous, "{stage}");
+            assert_eq!(
+                access.read_optional_child_version().unwrap().unwrap().0,
+                b"previous checkpoint"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_publication_parent_accepts_deny_only_acl_without_modifying_it() {
+        use std::process::Command;
+        let (_outer, publication) = private_publication_parent();
+        assert!(Command::new("chmod")
+            .args(["+a", "everyone deny delete"])
+            .arg(&publication)
+            .status()
+            .unwrap()
+            .success());
+        let before = Command::new("ls")
+            .args(["-lde"])
+            .arg(&publication)
+            .output()
+            .unwrap()
+            .stdout;
+        let root = private_artifact_root_path(&publication.join("data"), b"deny-parent");
+        ensure_private_artifact_root(&root, b"deny-parent")
+            .expect("a deny-only ACL does not grant access");
+        let after = Command::new("ls")
+            .args(["-lde"])
+            .arg(&publication)
+            .output()
+            .unwrap()
+            .stdout;
+        // ls's first line includes directory size and timestamps; compare ACL entries.
+        assert_eq!(
+            String::from_utf8_lossy(&before)
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>(),
+            String::from_utf8_lossy(&after)
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+        );
+        assert!(Command::new("chmod")
+            .arg("-N")
+            .arg(&publication)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
     fn artifact_replacement_records_exact_generation_before_publication() {
         let (_outer, publication) = private_publication_parent();
         let purpose = b"mainnet\0full-fingerprint";
@@ -9745,6 +10553,7 @@ mod tests {
                     generation,
                     candidate: format!("candidate-{index}"),
                     old: None,
+                    old_generation: None,
                 })
                 .unwrap();
         }
@@ -9771,6 +10580,7 @@ mod tests {
                 generation: [1; 16],
                 candidate: "first".into(),
                 old: None,
+                old_generation: None,
             })
             .unwrap();
         access
@@ -9778,6 +10588,7 @@ mod tests {
                 generation: [2; 16],
                 candidate: "second".into(),
                 old: None,
+                old_generation: None,
             })
             .unwrap();
 
@@ -9887,6 +10698,74 @@ mod tests {
 
         assert_eq!(fs::read(checkpoint).unwrap(), b"second");
         assert_eq!(fs::read(journal).unwrap(), b"header\n");
+    }
+
+    #[test]
+    fn prepared_probe_cleanup_requires_exact_objects_before_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp
+            .path()
+            .join(format!("zeck_probe_{}", uuid::Uuid::new_v4()));
+        create_private_dir_all(&probe).unwrap();
+        let private_root = probe.join("mainnet/workspace-test");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+        let registration =
+            prepare_ephemeral_probe_workspace(&private_root, &leaf, &database).unwrap();
+
+        // Preparation deliberately precedes activation and all secret writes.
+        let cleanup =
+            begin_ephemeral_probe_cleanup(registration, &private_root, &leaf, &database).unwrap();
+        cleanup.remove_exact_private_root_and_retire().unwrap();
+        assert!(!private_root.exists());
+    }
+
+    #[test]
+    fn prepared_probe_cleanup_rejects_a_replaced_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp
+            .path()
+            .join(format!("zeck_probe_{}", uuid::Uuid::new_v4()));
+        create_private_dir_all(&probe).unwrap();
+        let private_root = probe.join("mainnet/workspace-test");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+        let registration =
+            prepare_ephemeral_probe_workspace(&private_root, &leaf, &database).unwrap();
+        let saved = leaf.join("original.sqlite");
+        fs::rename(&database, &saved).unwrap();
+        write_private_file(&database, b"replacement must survive").unwrap();
+
+        assert!(
+            begin_ephemeral_probe_cleanup(registration, &private_root, &leaf, &database).is_err()
+        );
+        assert_eq!(fs::read(&database).unwrap(), b"replacement must survive");
+        assert!(saved.exists());
+        assert!(private_root.exists());
+    }
+
+    #[test]
+    fn stale_prepared_probe_registration_is_released_and_discovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp
+            .path()
+            .join(format!("zeck_probe_{}", uuid::Uuid::new_v4()));
+        create_private_dir_all(&probe).unwrap();
+        assert!(ephemeral_probe_container_owned_by_current_user(&probe).unwrap());
+        let private_root = probe.join("mainnet/workspace-test");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+        let registration =
+            prepare_ephemeral_probe_workspace(&private_root, &leaf, &database).unwrap();
+        let contended = EphemeralProbeRegistration::acquire(&private_root).unwrap_err();
+        assert!(ephemeral_probe_lock_is_contended(&contended), "{contended}");
+        drop(registration);
+        let reacquired = EphemeralProbeRegistration::acquire(&private_root)
+            .expect("a dropped live registration must not hide a stale probe");
+        drop(reacquired);
+
+        cleanup_stale_ephemeral_probes(temp.path()).unwrap();
+        assert!(!private_root.exists());
     }
 
     #[test]
@@ -10110,6 +10989,72 @@ mod tests {
 
         lease.remove_child_directory_all(&tombstone).unwrap();
 
+        assert!(!tombstone.exists());
+        assert_eq!(fs::read(sibling.join("sentinel")).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn retained_sqlite_authority_can_enumerate_sync_and_delete_its_workspace() {
+        let (_outer, publication) = private_publication_parent();
+        let private_root = publication.join("workspace-private-root");
+        let workspace = private_root.join("birthday-1/scope");
+        let database = workspace.join("wallet.sqlite");
+        let root = ensure_private_workspace_lineage(&private_root, &workspace, &database).unwrap();
+        create_private_dir_all(&workspace.join("nested")).unwrap();
+        write_private_file(&workspace.join("nested/secret"), b"delete me").unwrap();
+        let parent = workspace.parent().unwrap();
+        let sibling = parent.join("sibling");
+        create_private_dir_all(&sibling).unwrap();
+        write_private_file(&sibling.join("sentinel"), b"must survive").unwrap();
+        let namespace = NamespaceLease::acquire(parent, &parent.join("cleanup.lock")).unwrap();
+        let tombstone = parent.join("scope.deleting-test");
+        #[cfg(windows)]
+        let registry_key = fs::canonicalize(&database).unwrap();
+        #[cfg(windows)]
+        assert!(
+            trusted_sqlite_authorities()
+                .lock()
+                .unwrap()
+                .authorities
+                .contains_key(&registry_key),
+            "exercise the cached handle handoff, not the fallback mutation opener"
+        );
+
+        let retained =
+            retain_private_workspace_for_cleanup(&namespace, &workspace, &database).unwrap();
+        #[cfg(windows)]
+        {
+            let registry = trusted_sqlite_authorities().lock().unwrap();
+            assert!(!registry.authorities.contains_key(&registry_key));
+            assert!(registry.cleanup_held.contains(&registry_key));
+            assert!(
+                fs::rename(&workspace, parent.join("stolen")).is_err(),
+                "retained cleanup authority must continue to deny delete sharing"
+            );
+        }
+        assert!(
+            parent_child_names(&retained.directory, &workspace)
+                .unwrap()
+                .contains(&OsString::from("nested")),
+            "cached authority must enumerate its exact directory"
+        );
+        sync_private_directory(&retained.directory)
+            .expect("cached authority must durably sync cleanup");
+        let binding =
+            inspect_private_workspace_cleanup_binding(&private_root, &retained, &database).unwrap();
+        revoke_private_workspace_lineage(&private_root, &retained, &database, [0x35; 16], &binding)
+            .unwrap();
+        namespace
+            .rename_retained_workspace_directory(&workspace, &tombstone, &retained)
+            .unwrap();
+        #[cfg(windows)]
+        assert!(fs::rename(&tombstone, parent.join("stolen")).is_err());
+        namespace
+            .remove_retained_workspace_directory_all(&tombstone, &retained)
+            .unwrap();
+        drop(retained);
+        drop(root);
+        assert!(!workspace.exists());
         assert!(!tombstone.exists());
         assert_eq!(fs::read(sibling.join("sentinel")).unwrap(), b"must survive");
     }
@@ -11508,6 +12453,53 @@ mod windows_tests {
             super::windows_acl::verify_current(&replacement, true).is_err(),
             "the substituted directory must not be hardened"
         );
+    }
+
+    #[test]
+    fn windows_private_artifact_publication_supports_paths_beyond_max_path() {
+        use std::os::windows::ffi::OsStrExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let mut data_dir = temp.path().join("user-selected-recovery-location");
+        while data_dir.as_os_str().encode_wide().count() <= 280 {
+            data_dir.push("nested-recovery-data-directory");
+        }
+        data_dir.push("workspace-v2");
+        assert!(!data_dir.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        assert!(!data_dir.exists());
+        let container = ensure_private_artifact_container(&data_dir)
+            .expect("publish an authenticated container through a long unprefixed path");
+        container.verify_current().unwrap();
+        let container_id = private_object_id(&container.root).unwrap();
+        // A cold acquisition must follow the previous phase's lease release:
+        // Windows intentionally forbids a second DELETE-capable parent lease.
+        drop(container);
+        let purpose = b"long-path-artifact";
+        let root_path = private_artifact_root_path(&data_dir, purpose);
+        let root = ensure_private_artifact_root(&root_path, purpose)
+            .expect("publish the longer staged artifact root");
+        root.verify_current().unwrap();
+        let root_id = private_object_id(&root.root).unwrap();
+        drop(root);
+        let report = root_path.join("private-report.txt");
+        write_private_file(&report, b"private").expect("create a private file past MAX_PATH");
+        assert_eq!(fs::read(&report).unwrap(), b"private");
+        let reopened_file = windows_acl::open_file_for_identity(&report)
+            .expect("identity-only CreateFileW also supports the long path");
+        drop(reopened_file);
+        let reopened = ensure_private_artifact_root(&root_path, purpose)
+            .expect("reopen the same authenticated long-path root");
+        reopened.verify_current().unwrap();
+        assert_eq!(private_object_id(&reopened.root).unwrap(), root_id);
+        drop(reopened);
+        let reused = root_path.join("untrusted-report.txt");
+        fs::write(&reused, b"preserve").unwrap();
+        write_private_file(&reused, b"replacement")
+            .expect_err("extended paths must not weaken exact reused-file DACL checks");
+        assert_eq!(fs::read(&reused).unwrap(), b"preserve");
+        let reopened = ensure_private_artifact_container(&data_dir)
+            .expect("reopen the same authenticated long-path container");
+        reopened.verify_current().unwrap();
+        assert_eq!(private_object_id(&reopened.root).unwrap(), container_id);
     }
 
     #[test]

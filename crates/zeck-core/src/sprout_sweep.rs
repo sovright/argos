@@ -1290,9 +1290,9 @@ fn valid_for_exact_retry(observation: &TxObservation, expiry: u32) -> bool {
             .any(|item| item.tip_height.is_some())
 }
 
-/// A transition to the record's current state whose observation reports
-/// the same thing as the stored one. Appending it would only record a newer
-/// tip, and doing so on every pass grows the journal without bound.
+/// Suppress unchanged observations after retaining the two matching mature
+/// canonical rounds required for cleanup. Maturity transitions and changes to
+/// the canonical block must reach the durable journal before deduplication.
 fn repeats_record(
     entry: &SproutJournalEntry,
     state: TxLifecycleState,
@@ -1302,6 +1302,7 @@ fn repeats_record(
         && entry.observation.as_ref().is_some_and(|stored| {
             stored.state == observation.state && stored.mined_height == observation.mined_height
         })
+        && (state != TxLifecycleState::Mined || entry.mined_observation_is_redundant(observation))
 }
 
 pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
@@ -1352,6 +1353,9 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
         let observation = match observer.observe(network, entry.txid(), expiry).await {
             Ok(observation) => observation,
             Err(err) => {
+                if entry.state == TxLifecycleState::Mined {
+                    journal.invalidate_cleanup_evidence(&mut snapshot, entry.txid())?;
+                }
                 if entry.state == TxLifecycleState::SubmissionUnknown {
                     unknown_observation_errors.push(format!("{}: {err}", entry.txid()));
                     unresolved_unknown = true;
@@ -1376,6 +1380,12 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                 fresh_safe_to_discard.insert(entry.txid());
             }
             continue;
+        }
+        // A weaker round interrupts finality even when it cannot displace a
+        // previously established mined lifecycle fact. Never let two canonical
+        // sightings bridge single-source, contested or unavailable evidence.
+        if entry.state == TxLifecycleState::Mined {
+            journal.invalidate_cleanup_evidence(&mut snapshot, entry.txid())?;
         }
         if observation.has_single_source_mined_evidence() {
             // Preserve a previously corroborated result. Otherwise record
@@ -2206,7 +2216,14 @@ mod tests {
     #[test]
     fn first_run_with_no_artifact_root_has_no_interrupted_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("recovery-data");
+        let data_dir = artifact_data_dir(dir.path());
+        // Own the publication parent explicitly, without creating the data
+        // directory or granting authority to a preexisting artifact root.
+        crate::private_fs::create_private_dir_all(data_dir.parent().unwrap()).unwrap();
+        assert!(
+            !data_dir.exists(),
+            "the first-run data directory starts absent"
+        );
         let keys = [[0x42; 32]];
         let checkpoint = crate::sprout_scan_run::checkpoint_path_for_network(
             &data_dir,
@@ -2258,6 +2275,205 @@ mod tests {
             crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap(),
             replacement
         );
+    }
+
+    #[test]
+    fn production_reconcile_preserves_two_mature_rounds_before_checkpoint_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let scenarios: &[&[(u32, u8)]] = &[
+            &[(101, 1), (102, 1)],
+            &[(101, 1), (101, 1)],
+            &[(100, 1), (101, 1), (102, 1)],
+            &[(101, 1), (102, 2), (103, 2)],
+            &[(101, 1), (100, 1), (101, 1), (102, 1)],
+        ];
+        for rounds in scenarios {
+            let dir = tempfile::tempdir().unwrap();
+            let (checkpoint, mut journal, generation) = checkpoint_fixture(dir.path());
+            let note = lifecycle_note(1_000_000, 5);
+            let checkpoint_bytes = std::fs::read(&checkpoint).unwrap();
+            let authority = prepare_scan_checkpoint_authority(
+                &checkpoint,
+                &generation,
+                &mut journal,
+                std::slice::from_ref(&note),
+                crate::ZeckNetwork::Mainnet,
+            )
+            .unwrap();
+            let transaction = fixture_transaction(704, 200);
+            seed_entry(&journal, &note, &transaction, TxLifecycleState::Pending);
+            for (round, (tip, block_hash)) in rounds.iter().enumerate() {
+                let mut node = LifecycleNode::accepted(*tip, 0);
+                let mut observation = mined(transaction.expiry_height, 1, *tip);
+                for evidence in &mut observation.evidence {
+                    evidence.block_hash = Some(vec![*block_hash; 32]);
+                }
+                let mut observer =
+                    LifecycleObserver::new([(transaction.txid, observation.clone())]);
+                let reconciliation = runtime
+                    .block_on(reconcile_sprout_journal(
+                        &journal,
+                        journal.load_or_migrate().unwrap(),
+                        &mut node,
+                        &mut observer,
+                        crate::ZeckNetwork::Mainnet,
+                    ))
+                    .unwrap();
+                if round + 1 == rounds.len() {
+                    // Once the pair is durable, later identical mature rounds
+                    // must not keep growing the journal.
+                    let length = std::fs::metadata(journal.path()).unwrap().len();
+                    let mut observer = LifecycleObserver::new([(transaction.txid, observation)]);
+                    runtime
+                        .block_on(reconcile_sprout_journal(
+                            &journal,
+                            journal.load_or_migrate().unwrap(),
+                            &mut node,
+                            &mut observer,
+                            crate::ZeckNetwork::Mainnet,
+                        ))
+                        .unwrap();
+                    assert_eq!(std::fs::metadata(journal.path()).unwrap().len(), length);
+                }
+                let cleanup = finalize_scan_checkpoint(
+                    &authority,
+                    &journal,
+                    crate::ZeckNetwork::Mainnet,
+                    reconciliation
+                        .fresh_safe_to_discard
+                        .contains(&transaction.txid),
+                )
+                .unwrap();
+                if round + 1 < rounds.len() {
+                    assert!(
+                        matches!(cleanup, ScanCheckpointCleanup::Retained(_)),
+                        "{cleanup:?}"
+                    );
+                    assert_eq!(std::fs::read(&checkpoint).unwrap(), checkpoint_bytes);
+                    assert_eq!(authority.generation(), &generation);
+                } else {
+                    assert_eq!(cleanup, ScanCheckpointCleanup::Removed);
+                    assert!(!checkpoint.exists());
+                    assert!(journal
+                        .load_or_migrate()
+                        .unwrap()
+                        .checkpoint_was_discarded(&generation));
+                }
+                assert!(node.sent.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn production_cleanup_requires_two_mature_rounds_after_weaker_evidence_or_errors() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let interruptions = [
+            Some(mined_by_one_source(Some(200), 2, 102)),
+            Some(contested(Some(200), 1, 102)),
+            Some(unavailable_without_tip(Some(200))),
+            None,
+        ];
+        for interruption in interruptions {
+            let dir = tempfile::tempdir().unwrap();
+            let (checkpoint, mut journal, generation) = checkpoint_fixture(dir.path());
+            let checkpoint_bytes = std::fs::read(&checkpoint).unwrap();
+            let note = lifecycle_note(1_000_000, 6);
+            let authority = prepare_scan_checkpoint_authority(
+                &checkpoint,
+                &generation,
+                &mut journal,
+                std::slice::from_ref(&note),
+                crate::ZeckNetwork::Mainnet,
+            )
+            .unwrap();
+            let transaction = fixture_transaction(705, 200);
+            seed_entry(&journal, &note, &transaction, TxLifecycleState::Pending);
+            for round in 0..4 {
+                let observation = if round == 1 {
+                    interruption.clone()
+                } else {
+                    Some(mined(Some(200), 1, 101 + round))
+                };
+                let mut node = LifecycleNode::accepted(101 + round, 0);
+                let mut observer = LifecycleObserver::new(
+                    observation
+                        .clone()
+                        .map(|observation| (transaction.txid, observation)),
+                );
+                if observation.is_none() {
+                    observer.failing.push(transaction.txid);
+                }
+                let reconciliation = runtime
+                    .block_on(reconcile_sprout_journal(
+                        &journal,
+                        journal.load_or_migrate().unwrap(),
+                        &mut node,
+                        &mut observer,
+                        crate::ZeckNetwork::Mainnet,
+                    ))
+                    .unwrap();
+                if round == 1 {
+                    let length = std::fs::metadata(journal.path()).unwrap().len();
+                    let mut observer = LifecycleObserver::new(
+                        observation
+                            .clone()
+                            .map(|observation| (transaction.txid, observation)),
+                    );
+                    if observation.is_none() {
+                        observer.failing.push(transaction.txid);
+                    }
+                    runtime
+                        .block_on(reconcile_sprout_journal(
+                            &journal,
+                            journal.load_or_migrate().unwrap(),
+                            &mut node,
+                            &mut observer,
+                            crate::ZeckNetwork::Mainnet,
+                        ))
+                        .unwrap();
+                    assert_eq!(
+                        std::fs::metadata(journal.path()).unwrap().len(),
+                        length,
+                        "repeated interruption must not grow the journal"
+                    );
+                }
+                let durable = journal.load_or_migrate().unwrap();
+                let entry = durable.entry_for_txid(transaction.txid).unwrap();
+                assert_eq!(entry.state, TxLifecycleState::Mined);
+                assert!(entry
+                    .observation
+                    .as_ref()
+                    .unwrap()
+                    .has_canonical_mined_evidence());
+                assert_eq!(
+                    entry.transaction.as_ref().unwrap().raw_tx,
+                    transaction.raw_tx
+                );
+                assert_eq!(entry.last_submission, Some(SubmissionDisposition::Accepted));
+                assert!(node.sent.is_empty());
+                let cleanup = finalize_scan_checkpoint(
+                    &authority,
+                    &journal,
+                    crate::ZeckNetwork::Mainnet,
+                    reconciliation
+                        .fresh_safe_to_discard
+                        .contains(&transaction.txid),
+                )
+                .unwrap();
+                if round < 3 {
+                    assert!(matches!(cleanup, ScanCheckpointCleanup::Retained(_)),
+                        "round {round} must retain after interruption {interruption:?}: {cleanup:?}");
+                    assert_eq!(std::fs::read(&checkpoint).unwrap(), checkpoint_bytes);
+                } else {
+                    assert_eq!(cleanup, ScanCheckpointCleanup::Removed);
+                    assert!(!checkpoint.exists());
+                }
+            }
+        }
     }
 
     #[test]

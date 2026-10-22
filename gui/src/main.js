@@ -449,6 +449,10 @@ function scheduleWalletReviewExpiry() {
     // The generation guard prevents an old callback from revoking newer state.
     if (generation !== walletReviewExpiryGeneration) return;
     walletReviewExpiryTimer = null;
+    for (const id of ["sapling-scan-keys", "sprout-scan-keys"]) {
+      const input = $(id);
+      if (input) input.value = "";
+    }
     forgetLoadedWalletFile();
     setStatus("wallet-status", "Wallet review expired. Open the wallet file again.", "error");
   }, WALLET_REVIEW_EXPIRY_MS);
@@ -2019,9 +2023,24 @@ for (const id of ["network-select", "data-dir"]) {
     $(id)?.addEventListener(event, () => {
       // Inspection and its spendable balance used these settings. Require a
       // fresh read before showing any wallet-derived Sprout evidence again.
-      const path = $("wallet-path").value;
-      forgetLoadedWalletFile();
-      $("wallet-path").value = path;
+      if (id === "data-dir") {
+        // A directory correction must retain the immutable wallet source and
+        // its original expiry for retry. All derived evidence and proposals
+        // are invalidated by the listeners above and hidden until reinspection.
+        ++walletOpenGeneration;
+        $("wallet-open").disabled = false;
+        sproutPreviewWallet = null;
+        $("wallet-summary").hidden = true;
+        $("wallet-sprout-sweep").hidden = true;
+        $("wallet-next").disabled = true;
+        for (const field of ["sprout-sweep-plan", "sprout-sweep-pool", "sprout-sweep-params", "sprout-sweep-spent-status", "sprout-sweep-status"]) {
+          $(field).textContent = "";
+        }
+      } else {
+        const path = $("wallet-path").value;
+        forgetLoadedWalletFile();
+        $("wallet-path").value = path;
+      }
     });
   }
 }
@@ -2752,13 +2771,21 @@ go back and provide one.",
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
     }
     setStatus("config-status", `✗ ${err}`, "error");
-    clearTransientSecrets();
+    // A rejected start has not accepted these secrets. Keep the wallet
+    // passphrase and pasted keys available for a corrected-directory retry,
+    // without extending an existing wallet review deadline.
+    if (walletReviewExpiryTimer === null && (walletFile || hasTypedSaplingKeys)) scheduleWalletReviewExpiry();
     $("start-scan").disabled = false;
   } finally {
     // Clear the seed phrase from the DOM regardless of whether start_scan
     // succeeded; on failure the user can retype, and a successful scan no
-    // longer needs the cleartext phrase visible.
-    if (generation === state.scanAuthorityGeneration) clearTransientSecrets();
+    // longer needs the cleartext phrase visible. Wallet/key inputs are
+    // cleared only after acceptance, abandonment, or their review expiry.
+    if (generation === state.scanAuthorityGeneration) {
+      seedInput.value = "";
+      $("seed-visibility").checked = false;
+      seedInput.classList.add("masked");
+    }
   }
 });
 
@@ -4337,7 +4364,9 @@ function buildSessionRow(row, onDismiss) {
     guidance.className = "session-meta";
     guidance.textContent =
       "This workspace is preserved, but it predates private-storage lineage and cannot be safely resumed. " +
-      "Archive it while Argos is stopped, then start a new recovery and rescan.";
+      "Keep the original directory and wallet file. Choose a new empty data directory on the recovery settings screen " +
+      "(the upgraded default is workspace-v2), then start a new recovery and rescan. " +
+      "Reconcile any previously broadcast transactions before recovering those funds again.";
     info.appendChild(guidance);
     li.appendChild(info);
 
@@ -4618,7 +4647,16 @@ goTo("welcome");
 invoke("default_data_dir")
   .then((dir) => {
     state.defaultDataDir = dir || null;
-    if (dir && !$("data-dir").value.trim()) $("data-dir").value = dir;
+    if (dir && !$("data-dir").value.trim()) {
+      $("data-dir").value = dir;
+      if (/(?:^|[/\\])workspace-v2$/.test(dir)) {
+        const notice = document.createElement("small");
+        notice.className = "muted";
+        notice.textContent = `Your previous default workspace is preserved. Argos now uses ${dir}; ` +
+          "rescan from your original seed or wallet file. Reconcile any previously broadcast transactions before recovering those funds again.";
+        $("data-dir").insertAdjacentElement("afterend", notice);
+      }
+    }
   })
   .catch(() => {
     // Non-fatal: user can always type a path manually.
