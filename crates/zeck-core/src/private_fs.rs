@@ -2831,7 +2831,7 @@ fn open_publication_parent_identity(path: &Path) -> io::Result<File> {
     return open_publication_parent(path);
     #[cfg(windows)]
     {
-        let parent = windows_acl::open_directory_for_identity(path)?;
+        let parent = windows_acl::open_directory_for_publication_identity(path)?;
         windows_acl::verify_publication_parent(&parent)?;
         return Ok(parent);
     }
@@ -9154,6 +9154,23 @@ mod windows_acl {
         options
             .read(true)
             .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let directory = options.open(path)?;
+        directory_identity(&directory)?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_directory_for_publication_identity(
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            // Publication handoff validates the owner and DACL through this
+            // bridge handle before releasing the delete-capable handle.
+            // GetSecurityInfo requires READ_CONTROL for that validation.
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let directory = options.open(path)?;
