@@ -47,6 +47,7 @@ pub mod sprout_sweep_journal;
 // Direct p2p access. Sprout notes are invisible to lightwalletd -- compact
 // blocks carry no JoinSplits -- so finding one needs full blocks.
 pub mod p2p;
+pub mod private_fs;
 pub mod reconciliation;
 // What a Sprout scan costs in time, bandwidth and disk, and the wording
 // that tells the user -- shared so the CLI and GUI cannot drift apart.

@@ -1,8 +1,7 @@
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -2605,21 +2604,7 @@ pub async fn save_recovery_report(
 /// protected too (audit Suggestion 3). Windows has no mode bits; there it is a
 /// plain create+truncate write. The caller owns the symlink/regular-file guard.
 fn write_private_report(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    argos_core::private_fs::write_private_file(path, contents)
 }
 
 /// Recursive-delete the on-disk recovery workspace for a completed scan.
@@ -2671,7 +2656,7 @@ fn resolve_report_path(workspace_dir: &Path, requested: &str) -> Result<PathBuf,
     // mkdir for absolute user-supplied paths — those must already exist so the
     // canonicalize-and-prefix-check below can guard against escapes.
     if !parent.exists() && parent.starts_with(&workspace_root) {
-        fs::create_dir_all(parent)
+        argos_core::private_fs::create_private_dir_all(parent)
             .map_err(|err| format!("creating {}: {err}", parent.display()))?;
     }
 
@@ -2680,6 +2665,8 @@ fn resolve_report_path(workspace_dir: &Path, requested: &str) -> Result<PathBuf,
     if !canonical_parent.starts_with(&workspace_root) {
         return Err("report path must stay inside the recovery workspace".to_owned());
     }
+    argos_core::private_fs::harden_private_directory(&canonical_parent)
+        .map_err(|err| format!("securing {}: {err}", canonical_parent.display()))?;
     let file_name = candidate
         .file_name()
         .filter(|file_name| !file_name.is_empty())

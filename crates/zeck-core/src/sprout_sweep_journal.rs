@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, OpenOptions},
+    fs,
     io::{Cursor, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -21,6 +21,7 @@ use crate::{
     },
     error::{ZeckError, ZeckResult},
     models::ZeckNetwork,
+    private_fs::{open_private_file, PrivateOpenMode},
     sprout_scan_run::{full_key_set_fingerprint, key_set_fingerprint},
 };
 
@@ -53,32 +54,14 @@ pub(crate) fn with_sweep_journal_lock<T>(
     let mut name = path.as_os_str().to_os_string();
     name.push(".lock.sqlite");
     let lock_path = PathBuf::from(name);
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
-        options.open(&lock_path).map_err(|err| {
+    drop(
+        open_private_file(&lock_path, PrivateOpenMode::Append).map_err(|err| {
             journal_error(format!(
                 "opening sweep journal lock {}: {err}",
                 lock_path.display()
             ))
-        })?;
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            journal_error(format!(
-                "securing sweep journal lock {}: {err}",
-                lock_path.display()
-            ))
-        })?;
-    }
-    #[cfg(not(unix))]
-    options.open(&lock_path).map_err(|err| {
-        journal_error(format!(
-            "opening sweep journal lock {}: {err}",
-            lock_path.display()
-        ))
-    })?;
+        })?,
+    );
     let connection = rusqlite::Connection::open(&lock_path).map_err(|err| {
         journal_error(format!(
             "opening sweep journal lock {}: {err}",
@@ -659,9 +642,7 @@ impl SweepJournal {
                 .rposition(|byte| *byte == b'\n')
                 .expect("header was terminated")
                 + 1;
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&self.path)
+            let file = open_private_file(&self.path, PrivateOpenMode::Append)
                 .map_err(|err| journal_error(format!("opening torn journal: {err}")))?;
             file.set_len(complete_len as u64)
                 .and_then(|_| file.sync_all())
@@ -725,15 +706,7 @@ impl SweepJournal {
             .ok_or_else(|| journal_error("journal has no parent"))?;
         let temporary = parent.join(format!(".sprout-sweep-migrate-{}", uuid::Uuid::new_v4()));
         let result = (|| {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(&temporary)
+            let mut file = open_private_file(&temporary, PrivateOpenMode::CreateNew)
                 .map_err(|err| journal_error(format!("creating migration file: {err}")))?;
             file.write_all(bytes)
                 .and_then(|_| file.sync_all())
@@ -760,15 +733,7 @@ impl SweepJournal {
 
     fn append_unlocked(&self, record: &SproutJournalRecord) -> ZeckResult<()> {
         let missing = !self.path.exists();
-        let mut options = OpenOptions::new();
-        options.append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&self.path)
+        let mut file = open_private_file(&self.path, PrivateOpenMode::Append)
             .map_err(|err| journal_error(format!("opening journal: {err}")))?;
         if missing
             || file

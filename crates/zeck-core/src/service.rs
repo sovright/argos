@@ -907,16 +907,11 @@ fn create_cleanup_marker(
     }
 
     let path = cleanup_marker_path(root)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).map_err(|err| {
-        ZeckError::Storage(format!("creating cleanup marker {}: {err}", path.display()))
-    })?;
+    let mut file =
+        crate::private_fs::open_private_file(&path, crate::private_fs::PrivateOpenMode::CreateNew)
+            .map_err(|err| {
+                ZeckError::Storage(format!("creating cleanup marker {}: {err}", path.display()))
+            })?;
     let payload = serde_json::json!({
         "workspace": root,
         "tombstone": tombstone,
@@ -1085,43 +1080,19 @@ impl NetworkOperationGuard {
     ) -> ZeckResult<Self> {
         let data_dir = canonical_workspace_identity(data_dir)?;
         let network_root = network_registry_root(&data_dir, network)?;
-        std::fs::create_dir_all(&network_root).map_err(|err| {
+        crate::private_fs::create_private_dir_all(&network_root).map_err(|err| {
             ZeckError::Storage(format!(
                 "creating network registry {}: {err}",
                 network_root.display()
             ))
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&network_root, std::fs::Permissions::from_mode(0o700))
-                .map_err(|err| {
-                    ZeckError::Storage(format!(
-                        "securing network registry {}: {err}",
-                        network_root.display()
-                    ))
-                })?;
-        }
         let path = network_root.join(".workspace-operations.sqlite");
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options.open(&path).map_err(|err| {
-            ZeckError::Storage(format!("opening workspace lock {}: {err}", path.display()))
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |err| {
-                    ZeckError::Storage(format!("securing workspace lock {}: {err}", path.display()))
-                },
-            )?;
-        }
+        drop(
+            crate::private_fs::open_private_file(&path, crate::private_fs::PrivateOpenMode::Append)
+                .map_err(|err| {
+                    ZeckError::Storage(format!("opening workspace lock {}: {err}", path.display()))
+                })?,
+        );
         let connection = rusqlite::Connection::open(&path).map_err(|err| {
             ZeckError::Storage(format!("opening workspace lock {}: {err}", path.display()))
         })?;

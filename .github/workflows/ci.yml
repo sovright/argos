@@ -71,7 +71,15 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: cargo check (workspace)
+        if: matrix.label == 'ARM64'
         run: cargo check --workspace --target ${{ matrix.target }}
+
+      - name: private filesystem tests (x64)
+        if: matrix.label == 'x64'
+        run: |
+          cargo test -p argos-core private_fs --target x86_64-pc-windows-msvc
+          cargo test -p argos-core private_fs::windows_tests::windows_reused_private_objects_have_only_owner_and_system_access --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-gui write_private_report --target x86_64-pc-windows-msvc
 
   test:
     name: Cargo test

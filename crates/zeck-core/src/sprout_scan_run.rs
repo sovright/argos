@@ -2277,7 +2277,23 @@ pub fn save_checkpoint(
     path: &Path,
 ) -> ZeckResult<()> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if parent.exists() {
+            if !parent.is_dir() {
+                return Err(ZeckError::TransactionBuild(format!(
+                    "checkpoint parent {} is not a directory",
+                    parent.display()
+                )));
+            }
+        } else {
+            // A directory Argos creates for this checkpoint is private from
+            // birth. Do not chmod an existing user-selected data directory.
+            crate::private_fs::create_private_dir_all(parent).map_err(|err| {
+                ZeckError::TransactionBuild(format!(
+                    "creating private checkpoint directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
     }
     // Written to a temporary file and renamed, so an interrupt during the
     // write cannot leave a half-written checkpoint where a good one was —
@@ -2296,6 +2312,16 @@ pub fn save_checkpoint(
         let _ = std::fs::remove_file(&tmp);
     }
     result?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!(
+                    "syncing checkpoint directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+    }
     Ok(())
 }
 
@@ -2341,16 +2367,11 @@ const fn legacy_scan_end(network: P2pNetwork) -> Option<u32> {
 /// world-readable between creation and a later chmod.
 fn write_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(|err| {
-        ZeckError::TransactionBuild(format!("creating {}: {err}", path.display()))
-    })?;
+    let mut file =
+        crate::private_fs::open_private_file(path, crate::private_fs::PrivateOpenMode::CreateNew)
+            .map_err(|err| {
+            ZeckError::TransactionBuild(format!("creating {}: {err}", path.display()))
+        })?;
     // Flushed to disk before the caller renames it into place, so a power
     // loss cannot leave the new name pointing at bytes never written.
     if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {

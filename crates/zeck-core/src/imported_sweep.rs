@@ -671,21 +671,13 @@ fn open_imported_broadcast_log(
     runtime: &crate::models::RuntimeScanConfig,
 ) -> ZeckResult<DurableBroadcastLog> {
     let path = crate::service::network_broadcast_log_path(&runtime.data_dir, runtime.network)?;
-    std::fs::create_dir_all(path.parent().expect("registry log has a parent")).map_err(|err| {
-        ZeckError::Storage(format!(
-            "creating network broadcast registry {}: {err}",
-            path.display()
-        ))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            path.parent().expect("registry log has a parent"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .map_err(|err| ZeckError::Storage(format!("securing network broadcast registry: {err}")))?;
-    }
+    crate::private_fs::create_private_dir_all(path.parent().expect("registry log has a parent"))
+        .map_err(|err| {
+            ZeckError::Storage(format!(
+                "creating network broadcast registry {}: {err}",
+                path.display()
+            ))
+        })?;
     let log = DurableBroadcastLog::open(path)?;
     if let Some(txid) = log.blocking_submission() {
         return Err(ZeckError::Broadcast(format!(

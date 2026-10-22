@@ -17,6 +17,7 @@ use crate::{
     error::{ZeckError, ZeckResult},
     key_source::{KeySource, SeedKeySource},
     models::{RuntimeScanConfig, TransparentScanConfig, ZeckNetwork},
+    private_fs::{self, PrivateOpenMode},
 };
 
 /// Filename for the per-workspace session metadata sidecar. Lives next to
@@ -321,50 +322,26 @@ fn derive_workspace_id(
 }
 
 fn create_private_dir_all(path: &Path) -> ZeckResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-
-        // mode(0o700) only applies to dirs created during this call; pre-
-        // existing parents keep their mode. We explicitly tighten the
-        // wallet-private subtree separately via tighten_private_perms.
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)
-            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
-    }
-
-    Ok(())
+    private_fs::create_private_dir_all(path)
+        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))
 }
 
 #[allow(unused_variables)]
 fn tighten_private_perms(private_root: &Path, leaf: &Path) -> ZeckResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut current = leaf.to_path_buf();
-        loop {
-            fs::set_permissions(&current, fs::Permissions::from_mode(0o700)).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "setting private permissions on {}: {err}",
-                    current.display()
-                ))
-            })?;
-            if current == private_root {
-                break;
-            }
-            match current.parent() {
-                Some(parent) => current = parent.to_path_buf(),
-                None => break,
-            }
+    let mut current = leaf.to_path_buf();
+    loop {
+        private_fs::harden_private_directory(&current).map_err(|err| {
+            ZeckError::Storage(format!(
+                "setting private permissions on {}: {err}",
+                current.display()
+            ))
+        })?;
+        if current == private_root {
+            break;
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
         }
     }
 
@@ -372,59 +349,18 @@ fn tighten_private_perms(private_root: &Path, leaf: &Path) -> ZeckResult<()> {
 }
 
 fn set_private_file_permissions(path: &Path) -> ZeckResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            ZeckError::Storage(format!(
-                "setting private permissions on {}: {err}",
-                path.display()
-            ))
-        })?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-
-    Ok(())
-}
-
-/// Create (or truncate) `path` and write `bytes`, restricting the file to
-/// `0o600` at creation time on Unix via `OpenOptions::mode`. This keeps
-/// file-level protection in place independent of the parent directory's
-/// mode (audit Suggestion 3). On non-Unix platforms there is no mode-bit
-/// equivalent, so this degrades to a plain create-truncate write and the
-/// `0o700` parent directory remains the sole protection.
-fn write_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
-    use std::io::Write;
-
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options
-        .open(path)
-        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
-    // `OpenOptions::mode` only constrains newly-created files. If this path
-    // already existed with looser permissions, tighten it before writing fresh
-    // sensitive contents into the truncated file.
-    set_private_file_permissions(path)?;
-    file.write_all(bytes)
-        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", path.display())))?;
-
-    // Keep the final mode tight even if a platform/filesystem changes metadata
-    // during the write.
-    set_private_file_permissions(path)?;
-
-    Ok(())
+    let file = private_fs::open_private_file(path, PrivateOpenMode::Append).map_err(|err| {
+        ZeckError::Storage(format!(
+            "setting private permissions on {}: {err}",
+            path.display()
+        ))
+    })?;
+    private_fs::harden_private_file(&file).map_err(|err| {
+        ZeckError::Storage(format!(
+            "setting private permissions on {}: {err}",
+            path.display()
+        ))
+    })
 }
 
 /// Append one complete JSONL event and make it durable before reporting success.
@@ -432,32 +368,10 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
 pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     use std::io::Write;
 
-    let mut options = fs::OpenOptions::new();
-    options.append(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let (mut file, created) = match options.open(path) {
-        Ok(file) => (file, true),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = fs::OpenOptions::new()
-                .append(true)
-                .open(path)
-                .map_err(|err| {
-                    ZeckError::Storage(format!("opening {} for append: {err}", path.display()))
-                })?;
-            (file, false)
-        }
-        Err(err) => {
-            return Err(ZeckError::Storage(format!(
-                "creating {}: {err}",
-                path.display()
-            )))
-        }
-    };
-    set_private_file_permissions(path)?;
+    let created = !path.exists();
+    let mut file = private_fs::open_private_file(path, PrivateOpenMode::Append).map_err(|err| {
+        ZeckError::Storage(format!("opening {} for append: {err}", path.display()))
+    })?;
     file.write_all(bytes)
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.flush())
@@ -497,6 +411,12 @@ const WALLET_DB_BUSY_TIMEOUT_SECS: u64 = 5;
 /// `synchronous=FULL`, no busy timeout). All production opens of `wallet.sqlite`
 /// should come through [`open_wallet_db`] instead.
 fn open_tuned_wallet_connection(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
+    // SQLite may create or initialize the database as part of open. Establish
+    // the private file policy before it can write the first header byte.
+    drop(
+        private_fs::open_private_file(path, PrivateOpenMode::Append)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+    );
     let conn = rusqlite::Connection::open(path)?;
     // `WalletDb::from_connection` requires the array module to be loaded.
     rusqlite::vtab::array::load_module(&conn)?;
@@ -621,22 +541,14 @@ fn session_path(workspace_root: &Path) -> PathBuf {
 /// Atomic write: write to `<path>.tmp` then rename. Best-effort guarantee
 /// that a crash mid-write does not leave a half-written sidecar.
 pub fn write_session_metadata(workspace_root: &Path, meta: &SessionMetadata) -> ZeckResult<()> {
-    fs::create_dir_all(workspace_root).map_err(|err| {
+    private_fs::create_private_dir_all(workspace_root).map_err(|err| {
         ZeckError::Storage(format!("creating {}: {err}", workspace_root.display()))
     })?;
     let final_path = session_path(workspace_root);
-    let tmp_path = workspace_root.join(format!("{SESSION_FILE_NAME}.tmp"));
     let bytes =
         serde_json::to_vec_pretty(meta).map_err(|err| ZeckError::Serialization(err.to_string()))?;
-    write_private_file(&tmp_path, &bytes)?;
-    fs::rename(&tmp_path, &final_path).map_err(|err| {
-        ZeckError::Storage(format!(
-            "renaming {} -> {}: {err}",
-            tmp_path.display(),
-            final_path.display(),
-        ))
-    })?;
-    Ok(())
+    private_fs::write_private_file_atomic(&final_path, &bytes)
+        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", final_path.display())))
 }
 
 /// Read the sidecar at `workspace_root/session.json`. Returns `Ok(None)` if

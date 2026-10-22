@@ -1,8 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    fs::OpenOptions,
-    io::{Cursor, Write},
+    io::Cursor,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -21,6 +20,7 @@ use zcash_protocol::consensus::BranchId;
 use crate::{
     error::{ZeckError, ZeckResult},
     models::{canonical_confirmation_operator_id, normalized_confirmation_authority},
+    private_fs::{open_private_file, write_private_file_atomic, PrivateOpenMode},
     workspace::append_private_file,
 };
 
@@ -37,40 +37,8 @@ struct LegacyImportManifest {
 }
 
 fn atomic_replace_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ZeckError::Storage(format!("{} has no parent directory", path.display())))?;
-    let temp = parent.join(format!(
-        ".{}.import-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("log"),
-        uuid::Uuid::new_v4()
-    ));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp)
-            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", temp.display())))?;
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", temp.display())))?;
-        fs::rename(&temp, path)
-            .map_err(|err| ZeckError::Storage(format!("replacing {}: {err}", path.display())))?;
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", parent.display())))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
+    write_private_file_atomic(path, bytes)
+        .map_err(|err| ZeckError::Storage(format!("replacing {}: {err}", path.display())))
 }
 
 /// The lock lives beside the workspace, so renaming or deleting that
@@ -695,32 +663,14 @@ impl DurableBroadcastLog {
     pub fn open(path: impl AsRef<Path>) -> ZeckResult<Self> {
         let path = path.as_ref().to_path_buf();
         let lock_path = broadcast_lock_path(&path)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            options.mode(0o600);
-            options.open(&lock_path).map_err(|err| {
+        drop(
+            open_private_file(&lock_path, PrivateOpenMode::Append).map_err(|err| {
                 ZeckError::Storage(format!(
                     "opening broadcast lock {}: {err}",
                     lock_path.display()
                 ))
-            })?;
-            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "securing broadcast lock {}: {err}",
-                    lock_path.display()
-                ))
-            })?;
-        }
-        #[cfg(not(unix))]
-        options.open(&lock_path).map_err(|err| {
-            ZeckError::Storage(format!(
-                "opening broadcast lock {}: {err}",
-                lock_path.display()
-            ))
-        })?;
+            })?,
+        );
         let process_lock = rusqlite::Connection::open(&lock_path).map_err(|err| {
             ZeckError::Storage(format!(
                 "opening broadcast lock {}: {err}",
