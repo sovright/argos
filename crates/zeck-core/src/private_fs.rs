@@ -235,6 +235,25 @@ impl NamespaceLease {
         Ok(names)
     }
 
+    pub(crate) fn child_exists(&self, path: &Path) -> io::Result<bool> {
+        self.require_child(path)?;
+        let name = path.file_name().expect("direct children have a file name");
+        Ok(self
+            .child_names()?
+            .iter()
+            .any(|candidate| candidate == name))
+    }
+
+    pub(crate) fn remove_child_exact(&self, path: &Path) -> io::Result<()> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        let file = open_child_file_for_removal(&self.parent, path)?;
+        let expected = private_object_id(&file)?;
+        self.remove_open_child(path, &file, &expected)?;
+        self.parent.sync_all()?;
+        self.verify_current()
+    }
+
     pub(crate) fn remove_open_child(
         &self,
         path: &Path,
@@ -244,6 +263,54 @@ impl NamespaceLease {
         self.require_child(path)?;
         self.verify_current()?;
         remove_open_child_file(&self.parent, path, file, expected_id)?;
+        self.verify_current()
+    }
+
+    pub(crate) fn rename_child_directory(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.rename_child_directory_with_observer(from, to, || Ok(()))
+    }
+
+    fn rename_child_directory_with_observer(
+        &self,
+        from: &Path,
+        to: &Path,
+        after_open: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.require_child(from)?;
+        self.require_child(to)?;
+        self.verify_current()?;
+        let directory = open_child_directory_for_mutation(&self.parent, from)?;
+        let expected = private_object_id(&directory)?;
+        after_open()?;
+        self.verify_current()?;
+        verify_open_child_directory(&self.parent, from, &directory, &expected)?;
+        rename_open_child_directory(&self.parent, from, to, &directory)?;
+        self.parent.sync_all()?;
+        verify_open_child_directory(&self.parent, to, &directory, &expected)?;
+        self.verify_current()
+    }
+
+    pub(crate) fn remove_child_directory_all(&self, path: &Path) -> io::Result<()> {
+        self.remove_child_directory_all_with_observer(path, || Ok(()))
+    }
+
+    fn remove_child_directory_all_with_observer(
+        &self,
+        path: &Path,
+        after_open: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        let directory = open_child_directory_for_mutation(&self.parent, path)?;
+        let expected = private_object_id(&directory)?;
+        after_open()?;
+        self.verify_current()?;
+        verify_open_child_directory(&self.parent, path, &directory, &expected)?;
+        remove_open_directory_contents(&directory)?;
+        directory.sync_all()?;
+        verify_open_child_directory(&self.parent, path, &directory, &expected)?;
+        remove_open_child_directory(&self.parent, path, &directory, &expected)?;
+        self.parent.sync_all()?;
         self.verify_current()
     }
 
@@ -306,6 +373,25 @@ impl NamespaceLease {
             lock_path: self.lock_path.clone(),
             lock_id: self.lock_id.clone(),
         })
+    }
+}
+
+fn open_child_file_for_removal(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_child_file(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_child_for_mutation(parent, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact private child removal is unsupported on this platform",
+        ))
     }
 }
 
@@ -794,6 +880,143 @@ pub(crate) fn rename_child_file(parent: &File, from: &Path, to: &Path) -> io::Re
             let _ = parent;
             fs::rename(from, to)
         }
+    }
+}
+
+fn open_child_directory_for_mutation(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_child_directory_for_mutation(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_child_directory_for_mutation(parent, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private directory mutation is unsupported on this platform",
+        ))
+    }
+}
+
+fn verify_open_child_directory(
+    parent: &File,
+    path: &Path,
+    directory: &File,
+    expected: &PrivateObjectId,
+) -> io::Result<()> {
+    if &private_object_id(directory)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "retained private directory changed",
+        ));
+    }
+    let current = open_child_directory_for_identity(parent, path)?;
+    if private_object_id(&current)? != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private directory path changed before mutation",
+        ));
+    }
+    Ok(())
+}
+
+fn open_child_directory_for_identity(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_child_directory_for_mutation(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_child_directory_for_identity(parent, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private directory identity is unsupported on this platform",
+        ))
+    }
+}
+
+fn rename_open_child_directory(
+    parent: &File,
+    from: &Path,
+    to: &Path,
+    directory: &File,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = directory;
+        unix_private::rename_child_directory_noreplace(parent, from, to)
+    }
+    #[cfg(windows)]
+    {
+        let _ = from;
+        windows_acl::move_file(directory, parent, to, false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, from, to, directory);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private directory rename is unsupported on this platform",
+        ))
+    }
+}
+
+fn remove_open_directory_contents(directory: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix_private::remove_open_directory_contents(directory)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::remove_open_directory_contents(directory)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = directory;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private recursive directory removal is unsupported on this platform",
+        ))
+    }
+}
+
+fn remove_open_child_directory(
+    parent: &File,
+    path: &Path,
+    directory: &File,
+    expected: &PrivateObjectId,
+) -> io::Result<()> {
+    if &private_object_id(directory)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "retained private directory changed before deletion",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        verify_open_child_directory(parent, path, directory, expected)?;
+        unix_private::remove_child_directory(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (parent, path);
+        windows_acl::delete_open_file(directory)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact private directory deletion is unsupported on this platform",
+        ))
     }
 }
 
@@ -1691,6 +1914,186 @@ mod unix_private {
         Ok(removed)
     }
 
+    pub(super) fn open_child_directory_for_mutation(
+        parent: &File,
+        path: &Path,
+    ) -> io::Result<File> {
+        let name = c_string(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private directory has no name")
+            })?,
+            "private directory name",
+        )?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let directory = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private directory is not owned by the current user",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn open_recursive_entry(parent: &File, name: &OsStr) -> io::Result<(File, bool, FileIdentity)> {
+        let name = c_string(name, "private directory entry")?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let entry = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = entry.metadata()?;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private directory entry is not owned by the current user",
+            ));
+        }
+        let is_directory = metadata.is_dir();
+        if !is_directory && !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private recursive deletion refuses symlinks and special files",
+            ));
+        }
+        let identity = file_identity(&metadata);
+        if entry_identity(parent.as_raw_fd(), &name)? != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private directory entry changed while it was opened",
+            ));
+        }
+        Ok((entry, is_directory, identity))
+    }
+
+    pub(super) fn remove_open_directory_contents(directory: &File) -> io::Result<()> {
+        let names = directory_names(directory)?;
+        for name in names {
+            let c_name = c_string(&name, "private directory entry")?;
+            let (entry, is_directory, expected) = open_recursive_entry(directory, &name)?;
+            if is_directory {
+                remove_open_directory_contents(&entry)?;
+                entry.sync_all()?;
+            }
+            if entry_identity(directory.as_raw_fd(), &c_name)? != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private directory entry changed before deletion",
+                ));
+            }
+            let flags = if is_directory { libc::AT_REMOVEDIR } else { 0 };
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), c_name.as_ptr(), flags) } != 0 {
+                return Err(last_error());
+            }
+            directory.sync_all()?;
+        }
+        if !directory_names(directory)?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "private directory changed during recursive deletion",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn rename_child_directory_noreplace(
+        parent: &File,
+        from: &Path,
+        to: &Path,
+    ) -> io::Result<()> {
+        let from = c_string(
+            from.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private source has no name")
+            })?,
+            "private source name",
+        )?;
+        let to = c_string(
+            to.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private destination has no name",
+                )
+            })?,
+            "private destination name",
+        )?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let result = unsafe {
+            libc::renameat2(
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_vendor = "apple")]
+        let result = unsafe {
+            libc::renameatx_np(
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        let result = {
+            match entry_identity(parent.as_raw_fd(), &to) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "private destination already exists",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            unsafe {
+                libc::renameat(
+                    parent.as_raw_fd(),
+                    from.as_ptr(),
+                    parent.as_raw_fd(),
+                    to.as_ptr(),
+                )
+            }
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
+    }
+
+    pub(super) fn remove_child_directory(parent: &File, path: &Path) -> io::Result<()> {
+        let name = c_string(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private directory has no name")
+            })?,
+            "private directory name",
+        )?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
+    }
+
     pub(super) fn remove_child_file(parent: &File, path: &Path) -> io::Result<()> {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
@@ -2082,7 +2485,7 @@ mod windows_acl {
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
             FileDirectoryInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE,
-            FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
             FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
         },
     };
@@ -2169,6 +2572,26 @@ mod windows_acl {
         disposition: u32,
         security_descriptor: *const core::ffi::c_void,
     ) -> io::Result<std::fs::File> {
+        nt_open_child_with_options(
+            parent,
+            path,
+            desired_access,
+            share_access,
+            disposition,
+            security_descriptor,
+            FILE_NON_DIRECTORY_FILE,
+        )
+    }
+
+    fn nt_open_child_with_options(
+        parent: &std::fs::File,
+        path: &Path,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        security_descriptor: *const core::ffi::c_void,
+        type_options: u32,
+    ) -> io::Result<std::fs::File> {
         let mut name = relative_name(path)?;
         let unicode = UNICODE_STRING {
             Length: u16::try_from(name.len() * mem::size_of::<u16>()).map_err(|_| {
@@ -2205,7 +2628,7 @@ mod windows_acl {
                 FILE_ATTRIBUTE_NORMAL,
                 share_access,
                 disposition,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                type_options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 ptr::null(),
                 0,
             )
@@ -2329,6 +2752,146 @@ mod windows_acl {
         }
         names.sort();
         Ok(names)
+    }
+
+    fn file_information(file: &std::fs::File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) }
+            == 0
+        {
+            return Err(last_error());
+        }
+        Ok(information)
+    }
+
+    fn validate_recursive_entry(file: &std::fs::File) -> io::Result<bool> {
+        let information = file_information(file)?;
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private recursive deletion refuses reparse points",
+            ));
+        }
+        Ok(information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0)
+    }
+
+    pub(super) fn open_child_directory_for_mutation(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let directory = nt_open_child_with_options(
+            parent,
+            path,
+            DELETE | FILE_GENERIC_READ | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            ptr::null(),
+            FILE_DIRECTORY_FILE,
+        )?;
+        if !validate_recursive_entry(&directory)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace entry is not a directory",
+            ));
+        }
+        Ok(directory)
+    }
+
+    pub(super) fn open_child_directory_for_identity(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let directory = nt_open_child_with_options(
+            parent,
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            ptr::null(),
+            FILE_DIRECTORY_FILE,
+        )?;
+        if !validate_recursive_entry(&directory)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace entry is not a directory",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn open_recursive_entry(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<(std::fs::File, bool)> {
+        let entry = nt_open_child_with_options(
+            parent,
+            path,
+            DELETE | FILE_GENERIC_READ | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            ptr::null(),
+            0,
+        )?;
+        let is_directory = validate_recursive_entry(&entry)?;
+        Ok((entry, is_directory))
+    }
+
+    fn reopen_recursive_entry_for_identity(
+        parent: &std::fs::File,
+        path: &Path,
+        is_directory: bool,
+    ) -> io::Result<std::fs::File> {
+        let entry = nt_open_child_with_options(
+            parent,
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            ptr::null(),
+            if is_directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                FILE_NON_DIRECTORY_FILE
+            },
+        )?;
+        if validate_recursive_entry(&entry)? != is_directory {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private directory entry type changed before deletion",
+            ));
+        }
+        Ok(entry)
+    }
+
+    pub(super) fn remove_open_directory_contents(directory: &std::fs::File) -> io::Result<()> {
+        let names = child_names(directory, Path::new("."))?;
+        for name in names {
+            let path = PathBuf::from(&name);
+            let (entry, is_directory) = open_recursive_entry(directory, &path)?;
+            let expected = super::private_object_id(&entry)?;
+            if is_directory {
+                remove_open_directory_contents(&entry)?;
+                entry.sync_all()?;
+            }
+            let current = reopen_recursive_entry_for_identity(directory, &path, is_directory)?;
+            if super::private_object_id(&current)? != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private directory entry changed before deletion",
+                ));
+            }
+            delete_open_file(&entry)?;
+            drop(current);
+            drop(entry);
+            directory.sync_all()?;
+        }
+        if !child_names(directory, Path::new("."))?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "private directory changed during recursive deletion",
+            ));
+        }
+        Ok(())
     }
 
     struct PrivateSecurity {
@@ -3015,6 +3578,180 @@ mod tests {
         );
         assert!(!child.exists());
         assert_eq!(fs::read(displaced.join("journal")).unwrap(), b"secret\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_directory_rename_refuses_parent_replacement_without_touching_either_tree() {
+        let outer = tempfile::tempdir().unwrap();
+        let parent = outer.path().join("network");
+        fs::create_dir(&parent).unwrap();
+        let workspace = parent.join("wallet");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("secret"), b"original").unwrap();
+        let lease = NamespaceLease::acquire(&parent, &parent.join("cleanup.lock")).unwrap();
+        let detached = outer.path().join("detached-network");
+        let tombstone = parent.join("wallet.deleting-test");
+
+        let error = lease
+            .rename_child_directory_with_observer(&workspace, &tombstone, || {
+                fs::rename(&parent, &detached)?;
+                fs::create_dir(&parent)?;
+                fs::create_dir(parent.join("wallet"))?;
+                fs::write(parent.join("wallet/sentinel"), b"replacement")?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read(parent.join("wallet/sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(detached.join("wallet/secret")).unwrap(),
+            b"original"
+        );
+        assert!(!parent.join("wallet.deleting-test").exists());
+        assert!(!detached.join("wallet.deleting-test").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_directory_rename_refuses_substituted_child() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("wallet");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("secret"), b"original").unwrap();
+        let displaced = parent.path().join("displaced-wallet");
+        let tombstone = parent.path().join("wallet.deleting-test");
+        let lease =
+            NamespaceLease::acquire(parent.path(), &parent.path().join("cleanup.lock")).unwrap();
+
+        let error = lease
+            .rename_child_directory_with_observer(&workspace, &tombstone, || {
+                fs::rename(&workspace, &displaced)?;
+                fs::create_dir(&workspace)?;
+                fs::write(workspace.join("sentinel"), b"replacement")?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read(workspace.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(fs::read(displaced.join("secret")).unwrap(), b"original");
+        assert!(!tombstone.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_workspace_removal_refuses_substituted_tombstone() {
+        let parent = tempfile::tempdir().unwrap();
+        let tombstone = parent.path().join("wallet.deleting-test");
+        fs::create_dir(&tombstone).unwrap();
+        fs::create_dir(tombstone.join("nested")).unwrap();
+        fs::write(tombstone.join("nested/secret"), b"original").unwrap();
+        let displaced = parent.path().join("displaced-tombstone");
+        let lease =
+            NamespaceLease::acquire(parent.path(), &parent.path().join("cleanup.lock")).unwrap();
+
+        let error = lease
+            .remove_child_directory_all_with_observer(&tombstone, || {
+                fs::rename(&tombstone, &displaced)?;
+                fs::create_dir(&tombstone)?;
+                fs::write(tombstone.join("sentinel"), b"replacement")?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read(tombstone.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(displaced.join("nested/secret")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_workspace_removal_refuses_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let tombstone = parent.path().join("wallet.deleting-test");
+        fs::create_dir(&tombstone).unwrap();
+        let target = parent.path().join("outside-secret");
+        fs::write(&target, b"must survive").unwrap();
+        symlink(&target, tombstone.join("link")).unwrap();
+        let lease =
+            NamespaceLease::acquire(parent.path(), &parent.path().join("cleanup.lock")).unwrap();
+
+        let error = lease
+            .remove_child_directory_all(&tombstone)
+            .expect_err("recursive deletion must refuse symlinks");
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ) || error.kind() == io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"must survive");
+        assert!(tombstone.join("link").exists());
+    }
+
+    #[test]
+    fn recursive_workspace_removal_deletes_only_the_retained_tree() {
+        let parent = tempfile::tempdir().unwrap();
+        let tombstone = parent.path().join("wallet.deleting-test");
+        fs::create_dir(&tombstone).unwrap();
+        fs::create_dir(tombstone.join("nested")).unwrap();
+        fs::write(tombstone.join("nested/secret"), b"delete me").unwrap();
+        let sibling = parent.path().join("sibling");
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("sentinel"), b"must survive").unwrap();
+        let lease =
+            NamespaceLease::acquire(parent.path(), &parent.path().join("cleanup.lock")).unwrap();
+
+        lease.remove_child_directory_all(&tombstone).unwrap();
+
+        assert!(!tombstone.exists());
+        assert_eq!(fs::read(sibling.join("sentinel")).unwrap(), b"must survive");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_cleanup_uses_retained_directory_handles() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("wallet");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(workspace.join("nested")).unwrap();
+        fs::write(workspace.join("nested/secret"), b"delete me").unwrap();
+        let tombstone = parent.path().join("wallet.deleting-test");
+        let lease =
+            NamespaceLease::acquire(parent.path(), &parent.path().join("cleanup.lock")).unwrap();
+
+        lease
+            .rename_child_directory_with_observer(&workspace, &tombstone, || {
+                assert!(fs::rename(&workspace, parent.path().join("stolen")).is_err());
+                Ok(())
+            })
+            .unwrap();
+        lease
+            .remove_child_directory_all_with_observer(&tombstone, || {
+                assert!(fs::rename(&tombstone, parent.path().join("stolen")).is_err());
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!workspace.exists());
+        assert!(!tombstone.exists());
     }
 
     #[test]

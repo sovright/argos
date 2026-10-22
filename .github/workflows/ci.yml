@@ -78,6 +78,7 @@ jobs:
         if: matrix.label == 'x64'
         run: |
           cargo test -p argos-core private_fs --target x86_64-pc-windows-msvc
+          cargo test -p argos-core private_fs::tests::windows_workspace_cleanup_uses_retained_directory_handles --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core private_fs::windows_tests::windows_reused_private_objects_have_only_owner_and_system_access --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core checkpoint_lease_serializes_replacement_and_cleanup_authority --target x86_64-pc-windows-msvc
           cargo test -p argos-core windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts --target x86_64-pc-windows-msvc

@@ -831,6 +831,84 @@ fn cleanup_marker_path(root: &std::path::Path) -> ZeckResult<std::path::PathBuf>
     Ok(root.with_file_name(marker))
 }
 
+const WORKSPACE_CLEANUP_LOCK_FILE: &str = ".workspace-cleanup.lock";
+
+struct WorkspaceCleanupAuthority {
+    namespace: crate::private_fs::NamespaceLease,
+}
+
+impl WorkspaceCleanupAuthority {
+    fn acquire(root: &std::path::Path) -> ZeckResult<Self> {
+        let parent = root.parent().ok_or_else(|| {
+            ZeckError::Storage(format!("workspace {} has no parent", root.display()))
+        })?;
+        let lock = parent.join(WORKSPACE_CLEANUP_LOCK_FILE);
+        let namespace =
+            crate::private_fs::NamespaceLease::acquire(parent, &lock).map_err(|err| {
+                ZeckError::ScanNotReady(format!(
+                    "workspace cleanup namespace {} is in use: {err}",
+                    parent.display()
+                ))
+            })?;
+        namespace.require_child(root).map_err(|err| {
+            ZeckError::Storage(format!(
+                "invalid workspace cleanup path {}: {err}",
+                root.display()
+            ))
+        })?;
+        Ok(Self { namespace })
+    }
+
+    fn exists(&self, path: &std::path::Path) -> ZeckResult<bool> {
+        self.namespace.child_exists(path).map_err(|err| {
+            ZeckError::Storage(format!("checking cleanup object {}: {err}", path.display()))
+        })
+    }
+
+    fn rename_directory(&self, from: &std::path::Path, to: &std::path::Path) -> ZeckResult<()> {
+        self.namespace
+            .rename_child_directory(from, to)
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "renaming cleanup directory {} to {}: {err}",
+                    from.display(),
+                    to.display()
+                ))
+            })
+    }
+
+    fn remove_directory_all(&self, path: &std::path::Path) -> ZeckResult<()> {
+        self.namespace
+            .remove_child_directory_all(path)
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "deleting cleanup directory {}: {err}",
+                    path.display()
+                ))
+            })
+    }
+
+    fn read_marker(&self, path: &std::path::Path) -> ZeckResult<Vec<u8>> {
+        self.namespace.read_child(path).map_err(|err| {
+            ZeckError::Storage(format!("reading cleanup marker {}: {err}", path.display()))
+        })
+    }
+
+    fn create_marker(&self, path: &std::path::Path, payload: &[u8]) -> ZeckResult<()> {
+        self.namespace
+            .append_child_if_unchanged(path, None, payload)
+            .map_err(|err| {
+                ZeckError::Storage(format!("creating cleanup marker {}: {err}", path.display()))
+            })
+    }
+
+    fn remove_marker(&self, path: &std::path::Path) -> ZeckResult<()> {
+        self.namespace.remove_child_exact(path).map_err(|err| {
+            ZeckError::Storage(format!("clearing cleanup marker {}: {err}", path.display()))
+        })
+    }
+}
+
 fn refuse_interrupted_cleanup(root: &std::path::Path) -> ZeckResult<()> {
     let marker = cleanup_marker_path(root)?;
     if marker.exists() {
@@ -876,6 +954,7 @@ fn refuse_interrupted_cleanup(root: &std::path::Path) -> ZeckResult<()> {
 }
 
 fn create_cleanup_marker(
+    authority: &WorkspaceCleanupAuthority,
     root: &std::path::Path,
     tombstone: &std::path::Path,
     broadcast_log: &DurableBroadcastLog,
@@ -883,7 +962,6 @@ fn create_cleanup_marker(
     local_journal_exists: bool,
 ) -> ZeckResult<()> {
     use sha2::{Digest, Sha256};
-    use std::io::Write;
 
     let records = broadcast_log.records();
     let mut receipts = Vec::new();
@@ -907,35 +985,13 @@ fn create_cleanup_marker(
     }
 
     let path = cleanup_marker_path(root)?;
-    let mut file =
-        crate::private_fs::open_private_file(&path, crate::private_fs::PrivateOpenMode::CreateNew)
-            .map_err(|err| {
-                ZeckError::Storage(format!("creating cleanup marker {}: {err}", path.display()))
-            })?;
     let payload = serde_json::json!({
         "workspace": root,
         "tombstone": tombstone,
         "receipts": receipts,
         "local_journal_exists": local_journal_exists,
     });
-    file.write_all(payload.to_string().as_bytes())
-        .map_err(|err| {
-            ZeckError::Storage(format!("writing cleanup marker {}: {err}", path.display()))
-        })?;
-    file.sync_all().map_err(|err| {
-        ZeckError::Storage(format!("syncing cleanup marker {}: {err}", path.display()))
-    })?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| {
-                ZeckError::Storage(format!(
-                    "syncing cleanup marker parent {}: {err}",
-                    parent.display()
-                ))
-            })?;
-    }
-    Ok(())
+    authority.create_marker(&path, payload.to_string().as_bytes())
 }
 
 /// Resolve a crash between renaming and removing a workspace. This restores
@@ -948,7 +1004,19 @@ fn recover_interrupted_cleanup(
     use sha2::{Digest, Sha256};
 
     let marker = cleanup_marker_path(root)?;
-    if !marker.exists() {
+    let parent = root
+        .parent()
+        .ok_or_else(|| ZeckError::Storage(format!("workspace {} has no parent", root.display())))?;
+    // A marker and its tombstone are direct siblings of the workspace. If
+    // that parent has never existed, there is no cleanup generation to
+    // recover. Do not create the wallet-specific hierarchy merely to check.
+    if !parent.exists() {
+        return Ok(());
+    }
+    operation_lock.verify()?;
+    let authority = WorkspaceCleanupAuthority::acquire(root)?;
+    operation_lock.verify()?;
+    if !authority.exists(&marker)? {
         return refuse_interrupted_cleanup(root);
     }
     let manual = |why: &str| {
@@ -957,7 +1025,9 @@ fn recover_interrupted_cleanup(
             marker.display()
         ))
     };
-    let bytes = std::fs::read(&marker).map_err(|_| manual("cannot read cleanup marker"))?;
+    let bytes = authority
+        .read_marker(&marker)
+        .map_err(|_| manual("cannot read cleanup marker"))?;
     let payload: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| manual("invalid cleanup marker"))?;
     if payload.get("workspace").and_then(|value| value.as_str()) != root.to_str() {
@@ -1006,14 +1076,21 @@ fn recover_interrupted_cleanup(
             Ok((txid.to_owned(), digest.to_owned()))
         })
         .collect::<ZeckResult<Vec<_>>>()?;
-    if root.exists() && tombstone.exists() {
+    let root_exists = authority
+        .exists(root)
+        .map_err(|_| manual("cannot inspect workspace"))?;
+    let tombstone_exists = authority
+        .exists(&tombstone)
+        .map_err(|_| manual("cannot inspect tombstone"))?;
+    if root_exists && tombstone_exists {
         return Err(manual("both original workspace and tombstone exist"));
     }
-    if !root.exists() {
-        if !tombstone.is_dir() || tombstone.is_symlink() {
+    if !root_exists {
+        if !tombstone_exists {
             return Err(manual("surviving tombstone is missing or unsafe"));
         }
-        std::fs::rename(&tombstone, root)
+        authority
+            .rename_directory(&tombstone, root)
             .map_err(|_| manual("cannot restore surviving tombstone"))?;
     }
     if !root.is_dir() || root.is_symlink() {
@@ -1042,26 +1119,16 @@ fn recover_interrupted_cleanup(
     // Newer outcome receipts live only in the global registry and need not
     // also appear in an older imported prefix.
     drop(registry);
-    clear_cleanup_marker(root)?;
+    clear_cleanup_marker(&authority, root)?;
     refuse_interrupted_cleanup(root)
 }
 
-fn clear_cleanup_marker(root: &std::path::Path) -> ZeckResult<()> {
+fn clear_cleanup_marker(
+    authority: &WorkspaceCleanupAuthority,
+    root: &std::path::Path,
+) -> ZeckResult<()> {
     let path = cleanup_marker_path(root)?;
-    std::fs::remove_file(&path).map_err(|err| {
-        ZeckError::Storage(format!("clearing cleanup marker {}: {err}", path.display()))
-    })?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| {
-                ZeckError::Storage(format!(
-                    "syncing cleanup marker parent {}: {err}",
-                    parent.display()
-                ))
-            })?;
-    }
-    Ok(())
+    authority.remove_marker(&path)
 }
 
 /// Stable, cross-process exclusion for every workspace operation. It is
@@ -2517,6 +2584,8 @@ impl RecoveryService {
             })?;
         let _operation_lock =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
+        let cleanup_authority = WorkspaceCleanupAuthority::acquire(&session.workspace_root)?;
+        _operation_lock.verify()?;
         if !self
             .sessions
             .read()
@@ -2540,24 +2609,19 @@ impl RecoveryService {
             // state. `RecoveryWorkspace` paths then refer to the actual
             // wallet and journal, rather than a fresh empty original path.
             if remaining != session.workspace_root {
-                if session.workspace_root.exists() {
+                if cleanup_authority.exists(&session.workspace_root)? {
                     return Err(ZeckError::Storage(format!(
                         "cannot retry deletion while both {} and {} exist",
                         session.workspace_root.display(),
                         remaining.display()
                     )));
                 }
-                std::fs::rename(&remaining, &session.workspace_root).map_err(|err| {
-                    ZeckError::Storage(format!(
-                        "restoring workspace {} for deletion retry: {err}",
-                        remaining.display()
-                    ))
-                })?;
+                cleanup_authority.rename_directory(&remaining, &session.workspace_root)?;
                 self.cleanup_retry.lock().await.insert(
                     session.workspace_root.clone(),
                     session.workspace_root.clone(),
                 );
-            } else if !remaining.exists() {
+            } else if !cleanup_authority.exists(&remaining)? {
                 return Err(ZeckError::Storage(format!(
                     "cannot retry deletion because workspace {} is missing",
                     remaining.display()
@@ -2672,7 +2736,7 @@ impl RecoveryService {
         }
 
         let workspace_root = session.workspace_root.clone();
-        if workspace_root.exists() {
+        if cleanup_authority.exists(&workspace_root)? {
             let tombstone = workspace_root.with_file_name(format!(
                 "{}.deleting-{}",
                 workspace_root
@@ -2681,8 +2745,9 @@ impl RecoveryService {
                     .unwrap_or("workspace"),
                 uuid::Uuid::new_v4(),
             ));
-            if !cleanup_marker_path(&workspace_root)?.exists() {
+            if !cleanup_authority.exists(&cleanup_marker_path(&workspace_root)?)? {
                 create_cleanup_marker(
+                    &cleanup_authority,
                     &workspace_root,
                     &tombstone,
                     &broadcast_log,
@@ -2690,7 +2755,7 @@ impl RecoveryService {
                     local_journal_exists,
                 )?;
             }
-            if let Err(err) = std::fs::rename(&workspace_root, &tombstone) {
+            if let Err(err) = cleanup_authority.rename_directory(&workspace_root, &tombstone) {
                 self.cleanup_retry
                     .lock()
                     .await
@@ -2700,8 +2765,11 @@ impl RecoveryService {
                     workspace_root.display()
                 )));
             }
-            if let Err(err) = std::fs::remove_dir_all(&tombstone) {
-                let remaining = if std::fs::rename(&tombstone, &workspace_root).is_ok() {
+            if let Err(err) = cleanup_authority.remove_directory_all(&tombstone) {
+                let remaining = if cleanup_authority
+                    .rename_directory(&tombstone, &workspace_root)
+                    .is_ok()
+                {
                     workspace_root.clone()
                 } else {
                     tombstone.clone()
@@ -2717,8 +2785,8 @@ impl RecoveryService {
             }
         }
 
-        if cleanup_marker_path(&workspace_root)?.exists() {
-            if let Err(err) = clear_cleanup_marker(&workspace_root) {
+        if cleanup_authority.exists(&cleanup_marker_path(&workspace_root)?)? {
+            if let Err(err) = clear_cleanup_marker(&cleanup_authority, &workspace_root) {
                 self.cleanup_retry
                     .lock()
                     .await
@@ -7904,6 +7972,40 @@ mod propose_workspace_guard_tests {
         }
     }
 
+    #[tokio::test]
+    async fn first_scan_creates_a_fresh_workspace_after_empty_cleanup_recovery() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let service = RecoveryService::new();
+        let handle = service
+            .start_scan(
+                ScanConfig {
+                    birthday: 1_528_061,
+                    num_accounts: None,
+                    gap_limit: 20,
+                    transparent_scan: None,
+                    lightwalletd_url: "https://127.0.0.1:1".to_owned(),
+                    confirmation_sources: Vec::new(),
+                    data_dir: tempdir.path().to_owned(),
+                    network: ZeckNetwork::Mainnet,
+                    label: String::new(),
+                },
+                SecretString::new(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                        .to_owned(),
+                ),
+            )
+            .await
+            .expect("a missing wallet-specific parent means there is no cleanup to recover");
+        let root = service
+            .session(&handle)
+            .await
+            .unwrap()
+            .workspace_root
+            .clone();
+        assert!(root.exists());
+        service.cancel_scan(&handle).await.unwrap();
+    }
+
     /// A completed session, built the way `begin_scan_session` leaves the
     /// workspace: initialized, with no account registered in it.
     async fn completed_session(
@@ -8570,6 +8672,36 @@ mod propose_workspace_guard_tests {
             .await
             .insert(handle.id.clone(), mined_outcome(txid.to_string()));
         (service, handle, root, txid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_marker_deletion_refuses_replaced_workspace_parent() {
+        let outer = tempfile::tempdir().unwrap();
+        let parent = outer.path().join("network");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("wallet");
+        std::fs::create_dir(&root).unwrap();
+        let marker = super::cleanup_marker_path(&root).unwrap();
+        let authority = WorkspaceCleanupAuthority::acquire(&root).unwrap();
+        authority
+            .create_marker(&marker, b"original marker")
+            .unwrap();
+
+        let detached = outer.path().join("detached-network");
+        std::fs::rename(&parent, &detached).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&marker, b"replacement marker").unwrap();
+
+        let error = authority
+            .remove_marker(&marker)
+            .expect_err("a replaced workspace parent must revoke marker deletion authority");
+        assert!(error.to_string().contains("replaced"), "{error}");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"replacement marker");
+        assert_eq!(
+            std::fs::read(detached.join(marker.file_name().unwrap())).unwrap(),
+            b"original marker"
+        );
     }
 
     #[tokio::test]
