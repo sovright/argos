@@ -84,6 +84,7 @@ jobs:
           cargo test -p argos-core windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts --target x86_64-pc-windows-msvc
           cargo test -p argos-core windows_relative_primitives_never_touch_a_recreated_ancestor_tree --target x86_64-pc-windows-msvc
           cargo test -p argos-core windows_checkpoint_quarantine_uses_exact_open_handle_rename_and_delete --target x86_64-pc-windows-msvc
+          cargo test -p argos-core sprout_sweep_journal::tests::cleanup_restart_restores_a_surviving_exact_quarantine --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core windows_journal_authority_denies_sidecar_replacement_and_second_writer --target x86_64-pc-windows-msvc
           cargo test -p argos-core retained_registry_handles_deny_parent_and_sidecar_replacement --target x86_64-pc-windows-msvc
           cargo test -p argos-core separate_connection_lock_blocks_migration_and_append --target x86_64-pc-windows-msvc

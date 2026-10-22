@@ -2,7 +2,8 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    io::Cursor,
+    fs::File,
+    io::{Cursor, Read, Seek},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -10,8 +11,10 @@ use std::{
 use argos_wallet_import::keys::JsOutPoint;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::BranchId;
+use zeroize::Zeroizing;
 
 use crate::{
     broadcast::{
@@ -52,6 +55,129 @@ fn outpoint(id: SproutNoteId) -> JsOutPoint {
 
 fn journal_error(message: impl Into<String>) -> ZeckError {
     ZeckError::Storage(message.into())
+}
+
+fn checkpoint_discard_prefix(path: &Path) -> ZeckResult<String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| journal_error("checkpoint path has no file name"))?;
+    Ok(format!(
+        ".argos-checkpoint-discard-{:x}-",
+        Sha256::digest(name.as_encoded_bytes())
+    ))
+}
+
+fn checkpoint_discard_quarantines(
+    namespace: &NamespaceLease,
+    checkpoint: &Path,
+) -> ZeckResult<Vec<PathBuf>> {
+    let prefix = checkpoint_discard_prefix(checkpoint)?;
+    Ok(namespace
+        .child_names()
+        .map_err(|err| journal_error(format!("reading checkpoint quarantine names: {err}")))?
+        .into_iter()
+        .filter(|name| {
+            name.to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        })
+        .map(|name| namespace.parent_path().join(name))
+        .collect())
+}
+
+fn hash_checkpoint_handle(file: &File, path: &Path) -> ZeckResult<(u64, [u8; 32])> {
+    let mut reader = file;
+    reader
+        .rewind()
+        .map_err(|err| journal_error(format!("seeking checkpoint {}: {err}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = Zeroizing::new([0u8; 64 * 1024]);
+    let mut len = 0u64;
+    loop {
+        let read = reader.read(&mut *buffer).map_err(|err| {
+            journal_error(format!("reading checkpoint {}: {err}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        len = len
+            .checked_add(read as u64)
+            .ok_or_else(|| journal_error("checkpoint length overflow"))?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((len, hasher.finalize().into()))
+}
+
+fn retained_quarantine_generation(
+    namespace: &NamespaceLease,
+    path: &Path,
+) -> ZeckResult<(File, CheckpointGeneration)> {
+    namespace
+        .require_child(path)
+        .and_then(|()| namespace.verify_current())
+        .map_err(|err| journal_error(format!("verifying checkpoint quarantine: {err}")))?;
+    let file = crate::private_fs::open_child_file_for_removal(namespace.parent(), path).map_err(
+        |err| {
+            journal_error(format!(
+                "opening checkpoint quarantine {}: {err}",
+                path.display()
+            ))
+        },
+    )?;
+    let before = file.metadata().map_err(|err| {
+        journal_error(format!(
+            "inspecting checkpoint quarantine {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !before.is_file() {
+        return Err(journal_error(format!(
+            "checkpoint quarantine {} is not a regular file",
+            path.display()
+        )));
+    }
+    let before_object = crate::private_fs::private_object_id(&file).map_err(|err| {
+        journal_error(format!(
+            "reading checkpoint quarantine identity {}: {err}",
+            path.display()
+        ))
+    })?;
+    let (len, sha256) = hash_checkpoint_handle(&file, path)?;
+    let (verified_len, verified_sha256) = hash_checkpoint_handle(&file, path)?;
+    let after = file.metadata().map_err(|err| {
+        journal_error(format!(
+            "rechecking checkpoint quarantine {}: {err}",
+            path.display()
+        ))
+    })?;
+    let after_object = crate::private_fs::private_object_id(&file).map_err(|err| {
+        journal_error(format!(
+            "rechecking checkpoint quarantine identity {}: {err}",
+            path.display()
+        ))
+    })?;
+    namespace.verify_current().map_err(|err| {
+        journal_error(format!("rechecking checkpoint quarantine namespace: {err}"))
+    })?;
+    if before.len() != after.len()
+        || before.len() != len
+        || len != verified_len
+        || sha256 != verified_sha256
+        || before_object != after_object
+    {
+        return Err(journal_error(format!(
+            "checkpoint quarantine {} changed while it was reviewed",
+            path.display()
+        )));
+    }
+    Ok((
+        file,
+        CheckpointGeneration {
+            len,
+            sha256,
+            object: after_object,
+        },
+    ))
 }
 
 /// The lock inode is stable across the v1-to-v2 rename. Both the temporary
@@ -1442,10 +1568,12 @@ impl SweepJournal {
         })
     }
 
-    /// Resume only cleanup that already crossed the durable discard marker.
-    /// This path is usable after the checkpoint itself has been quarantined
-    /// or deleted, so a crash cannot strand the journal between start and
-    /// completion or require reconstructing authority from an absent secret.
+    /// Reconcile cleanup that already crossed the durable discard marker.
+    /// A surviving canonical generation is retained, and an exact deletion
+    /// quarantine is restored: observations recorded before arbitrary
+    /// downtime never authorize a restart-time deletion. Completion is
+    /// idempotent only after the manifested generation is already absent from
+    /// both the canonical path and every deletion quarantine.
     pub fn resume_checkpoint_cleanup(
         &self,
         lease: &crate::sprout_scan_run::CheckpointLease,
@@ -1473,9 +1601,53 @@ impl SweepJournal {
             if !snapshot.checkpoint_manifests.contains_key(generation) {
                 return Err(journal_error("discard marker has no checkpoint manifest"));
             }
-            let replacement_present = lease
-                .generation_if_present(checkpoint)?
-                .is_some_and(|current| &current != generation);
+            let current_generation = lease.generation_if_present(checkpoint)?;
+            if current_generation.as_ref() == Some(generation) {
+                return Ok(Some(CheckpointCleanupResult::Retain {
+                    reason: "the exact checkpoint generation survived restart; fresh reconciliation and review are required before cleanup".into(),
+                }));
+            }
+            let replacement_present = current_generation.is_some();
+            let quarantine_paths = checkpoint_discard_quarantines(namespace, checkpoint)?;
+            let mut matching_quarantine = None;
+            let mut unexpected_quarantine = false;
+            for quarantine in quarantine_paths {
+                let (file, current) = retained_quarantine_generation(namespace, &quarantine)?;
+                if &current == generation {
+                    if matching_quarantine.is_some() {
+                        return Ok(Some(CheckpointCleanupResult::Retain {
+                            reason: "multiple exact checkpoint deletion quarantines survived restart; all were preserved for manual review".into(),
+                        }));
+                    }
+                    matching_quarantine = Some((quarantine, file, current));
+                } else {
+                    unexpected_quarantine = true;
+                }
+            }
+            if let Some((quarantine, file, current)) = matching_quarantine {
+                if replacement_present {
+                    return Ok(Some(CheckpointCleanupResult::Retain {
+                        reason: "a replacement checkpoint and the old exact deletion quarantine both survived restart; both were preserved for manual review".into(),
+                    }));
+                }
+                namespace
+                    .rename_open_child(&quarantine, checkpoint, &file, &current.object)
+                    .and_then(|()| namespace.sync_parent())
+                    .map_err(|err| {
+                        journal_error(format!(
+                            "restoring exact checkpoint quarantine {}: {err}",
+                            quarantine.display()
+                        ))
+                    })?;
+                return Ok(Some(CheckpointCleanupResult::Retain {
+                    reason: "the exact checkpoint deletion quarantine was restored after restart; fresh reconciliation and review are required before cleanup".into(),
+                }));
+            }
+            if unexpected_quarantine {
+                return Ok(Some(CheckpointCleanupResult::Retain {
+                    reason: "an unexpected checkpoint deletion quarantine survived restart and was preserved for manual review".into(),
+                }));
+            }
             let current_source_notes = snapshot
                 .entries()
                 .map(|entry| note_id(&entry.outpoint))
@@ -2237,6 +2409,206 @@ mod tests {
             )
             .unwrap();
         assert!(restored.ready_for_new_plan(&outpoint()));
+    }
+
+    #[test]
+    fn cleanup_restart_never_deletes_a_surviving_generation_from_stale_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
+        let original = std::fs::read(&checkpoint).unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+
+        // Crash after the durable start marker but before the checkpoint is
+        // quarantined. The chain may reorg during arbitrary downtime, so the
+        // pre-crash observations cannot authorize deletion after restart.
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        crate::sprout_scan_run::fail_checkpoint_discard(&checkpoint);
+        journal
+            .finalize_checkpoint_cleanup(&lease, &generation, &checkpoint)
+            .expect_err("the injected pre-quarantine crash must interrupt cleanup");
+        drop(lease);
+
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        let result = journal
+            .resume_checkpoint_cleanup(&lease, &checkpoint)
+            .unwrap();
+        assert!(matches!(
+            result,
+            Some(CheckpointCleanupResult::Retain { ref reason })
+                if reason.contains("fresh reconciliation")
+        ));
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), original);
+        assert_eq!(lease.generation(&checkpoint).unwrap(), generation);
+        drop(lease);
+
+        let restored = journal.load_or_migrate().unwrap();
+        assert!(restored.discard_started.contains(&generation));
+        assert!(!restored.discarded_checkpoints.contains(&generation));
+    }
+
+    #[test]
+    fn cleanup_restart_restores_a_surviving_exact_quarantine() {
+        use sha2::Digest as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
+        let original = std::fs::read(&checkpoint).unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        journal
+            .mutate(
+                &mut snapshot,
+                SproutJournalRecord::CheckpointDiscardStarted {
+                    source_fingerprint: journal.source_fingerprint().to_owned(),
+                    generation: generation.clone(),
+                    reorg_window: SPROUT_REORG_WINDOW as u32,
+                },
+            )
+            .unwrap();
+
+        // Simulate a crash after the exact checkpoint was renamed into its
+        // deletion quarantine but before that retained handle was unlinked.
+        let name = checkpoint.file_name().unwrap();
+        let prefix = format!(
+            ".argos-checkpoint-discard-{:x}-",
+            sha2::Sha256::digest(name.as_encoded_bytes())
+        );
+        let quarantine = dir.path().join(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        std::fs::rename(&checkpoint, &quarantine).unwrap();
+
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        let result = journal
+            .resume_checkpoint_cleanup(&lease, &checkpoint)
+            .unwrap();
+        assert!(matches!(
+            result,
+            Some(CheckpointCleanupResult::Retain { ref reason })
+                if reason.contains("restored") && reason.contains("fresh reconciliation")
+        ));
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), original);
+        assert_eq!(lease.generation(&checkpoint).unwrap(), generation);
+        assert!(!quarantine.exists());
+        drop(lease);
+
+        let restored = journal.load_or_migrate().unwrap();
+        assert!(restored.discard_started.contains(&generation));
+        assert!(!restored.discarded_checkpoints.contains(&generation));
+    }
+
+    #[test]
+    fn cleanup_restart_preserves_replacement_and_old_exact_quarantine() {
+        use sha2::Digest as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
+        let old_generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &old_generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        journal
+            .mutate(
+                &mut snapshot,
+                SproutJournalRecord::CheckpointDiscardStarted {
+                    source_fingerprint: journal.source_fingerprint().to_owned(),
+                    generation: old_generation.clone(),
+                    reorg_window: SPROUT_REORG_WINDOW as u32,
+                },
+            )
+            .unwrap();
+
+        let name = checkpoint.file_name().unwrap();
+        let prefix = format!(
+            ".argos-checkpoint-discard-{:x}-",
+            sha2::Sha256::digest(name.as_encoded_bytes())
+        );
+        let quarantine = dir.path().join(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        std::fs::rename(&checkpoint, &quarantine).unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"replacement checkpoint").unwrap();
+
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        let result = journal
+            .resume_checkpoint_cleanup(&lease, &checkpoint)
+            .unwrap();
+        assert!(matches!(
+            result,
+            Some(CheckpointCleanupResult::Retain { ref reason })
+                if reason.contains("replacement") && reason.contains("quarantine")
+        ));
+        assert_eq!(
+            std::fs::read(&checkpoint).unwrap(),
+            b"replacement checkpoint"
+        );
+        assert_eq!(std::fs::read(&quarantine).unwrap(), b"checkpoint-a");
+        drop(lease);
+
+        let restored = journal.load_or_migrate().unwrap();
+        assert!(restored.discard_started.contains(&old_generation));
+        assert!(!restored.discarded_checkpoints.contains(&old_generation));
     }
 
     #[test]
