@@ -37,8 +37,8 @@ async fn a_scan_finds_a_note_it_was_never_told_about() {
     assert_eq!(mined["height"].as_u64(), Some(shield_height));
 
     // ── Now scan, knowing only the spending key ───────────────────────────
-    let dir = std::env::temp_dir().join("argos-scan-e2e");
-    let _ = std::fs::remove_dir_all(&dir);
+    let private_parent = tempfile::tempdir().expect("private scan parent");
+    let dir = private_parent.path().join("argos-scan-e2e");
     let checkpoint =
         sprout_scan_run::checkpoint_path_for_network(&dir, &[a_sk], P2pNetwork::Regtest);
 
@@ -139,8 +139,9 @@ async fn a_scan_finds_a_note_it_was_never_told_about() {
     // which is why it is only ever derived from dated keys.
     let shield_height = u32::try_from(shield_height).expect("regtest height fits u32");
     for (bound, expect_found) in [(shield_height, true), (shield_height + 1, false)] {
-        let dir = std::env::temp_dir().join(format!("argos-scan-e2e-bound-{bound}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = private_parent
+            .path()
+            .join(format!("argos-scan-e2e-bound-{bound}"));
         let checkpoint =
             sprout_scan_run::checkpoint_path_for_network(&dir, &[a_sk], P2pNetwork::Regtest);
         let bounded = sprout_scan_run::run_sprout_scan_with_decrypt_from(
