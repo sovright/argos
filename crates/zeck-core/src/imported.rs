@@ -389,8 +389,8 @@ mod tests {
         let records = bdb::walk(&bytes).expect("fixture must walk").records;
         let mut stored: std::collections::HashSet<TransparentAddress> =
             std::collections::HashSet::new();
-        for (raw_key, _) in &records {
-            let Some(rec) = parse_record_key(raw_key) else {
+        for record in &records {
+            let Some(rec) = parse_record_key(&record.key) else {
                 continue;
             };
             if rec.record_type != "key" {

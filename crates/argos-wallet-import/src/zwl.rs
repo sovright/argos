@@ -84,9 +84,10 @@
 //! not establish compatibility with every historical wallet layout.
 
 use bip0039::{English, Mnemonic};
-use crypto_secretbox::{aead::Aead, KeyInit, Nonce as SecretboxNonce, XSalsa20Poly1305};
+use crypto_secretbox::{aead::AeadInPlace, KeyInit, Nonce as SecretboxNonce, XSalsa20Poly1305};
 use secrecy::{ExposeSecret, Secret, SecretString};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::{
     error::{ImportDiagnostic, ImportError},
@@ -95,6 +96,8 @@ use crate::{
         merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
         SaplingKey, TransparentKey,
     },
+    secret_bytes::SecretArray,
+    SecretBytes,
 };
 
 /// Highest `external_version` this parser accepts. `zwl-lib`'s writer
@@ -159,25 +162,44 @@ fn locked_key(record_type: &str, provenance: Provenance) -> ImportDiagnostic {
 /// passphrase bytes. See the module docs for why that is worth flagging.
 /// The result is the one `secretbox` key for the whole wallet: it seals the
 /// seed and every imported key alike (`Keys::encrypt` in `zwl-lib`).
+/// Both explicit digest arrays are held by zeroizing owners. The `sha2`
+/// hasher's internal state and compiler-created register or stack copies are
+/// outside the explicit zeroization guarantees available here.
 fn wallet_key(passphrase: &SecretString) -> Secret<[u8; 32]> {
-    let first = Sha256::digest(passphrase.expose_secret().as_bytes());
-    Secret::new(Sha256::digest(first).into())
+    let first = Zeroizing::new(<[u8; 32]>::from(Sha256::digest(
+        passphrase.expose_secret().as_bytes(),
+    )));
+    let second = Zeroizing::new(<[u8; 32]>::from(Sha256::digest(first.as_slice())));
+    Secret::new(*second)
 }
 
 /// Open one `secretbox` sealed under the wallet key. `Err(())` on any
 /// failure — a malformed nonce or a Poly1305 authentication failure alike.
-/// The plaintext is wrapped at once so it is scrubbed when dropped.
-fn open_sealed(
-    key: &Secret<[u8; 32]>,
-    nonce: &[u8],
-    ciphertext: &[u8],
-) -> Result<Secret<Vec<u8>>, ()> {
+/// The ciphertext is placed in its zeroizing owner before decryption writes
+/// the first plaintext byte. The authenticated body is decrypted in place,
+/// then copied into its exact-size final owner while the scratch owner remains
+/// responsible for erasing the first plaintext copy.
+fn open_sealed(key: &Secret<[u8; 32]>, nonce: &[u8], ciphertext: &[u8]) -> Result<SecretBytes, ()> {
     let nonce_bytes: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| ())?;
+    open_sealed_owned(key, nonce_bytes, SecretBytes::copy_from_slice(ciphertext))
+}
+
+fn open_sealed_owned(
+    key: &Secret<[u8; 32]>,
+    nonce_bytes: [u8; NONCE_LEN],
+    mut scratch: SecretBytes,
+) -> Result<SecretBytes, ()> {
     let cipher = XSalsa20Poly1305::new(&(*key.expose_secret()).into());
+    let tag_len = crypto_secretbox::Tag::default().len();
+    if scratch.len() < tag_len {
+        return Err(());
+    }
+    let (tag_bytes, body) = scratch.as_mut_slice().split_at_mut(tag_len);
+    let tag = crypto_secretbox::Tag::clone_from_slice(tag_bytes);
     cipher
-        .decrypt(&SecretboxNonce::from(nonce_bytes), ciphertext)
-        .map(Secret::new)
-        .map_err(|_| ())
+        .decrypt_in_place_detached(&SecretboxNonce::from(nonce_bytes), b"", body, &tag)
+        .map_err(|_| ())?;
+    Ok(SecretBytes::copy_from_slice(body))
 }
 
 /// Decrypt `enc_seed` into raw BIP-39 entropy.
@@ -189,14 +211,12 @@ fn decrypt_seed(
     enc_seed: &[u8; ENC_SEED_LEN],
     nonce: &[u8],
     key: &Secret<[u8; 32]>,
-) -> Result<Secret<[u8; SEED_LEN]>, ()> {
+) -> Result<SecretBytes, ()> {
     let plaintext = open_sealed(key, nonce, enc_seed)?;
-    let entropy: [u8; SEED_LEN] = plaintext
-        .expose_secret()
-        .as_slice()
-        .try_into()
-        .map_err(|_| ())?;
-    Ok(Secret::new(entropy))
+    if plaintext.len() != SEED_LEN {
+        return Err(());
+    }
+    Ok(plaintext)
 }
 
 /// Minimal, bounds-checked cursor over attacker-controlled bytes.
@@ -330,7 +350,7 @@ struct KeysHeader {
     encrypted: bool,
     enc_seed: [u8; ENC_SEED_LEN],
     nonce: Vec<u8>,
-    seed: [u8; SEED_LEN],
+    seed: SecretBytes,
 }
 
 fn read_keys_header(cur: &mut Cursor) -> ZwlReadResult<KeysHeader> {
@@ -342,7 +362,7 @@ fn read_keys_header(cur: &mut Cursor) -> ZwlReadResult<KeysHeader> {
     };
     let enc_seed = cur.array::<ENC_SEED_LEN>("enc_seed")?;
     let nonce = cur.vector_bytes("nonce")?;
-    let seed = cur.array::<SEED_LEN>("seed")?;
+    let seed = SecretBytes::copy_from_slice(cur.take(SEED_LEN, "seed")?);
     Ok(KeysHeader {
         keys_version,
         encrypted,
@@ -401,18 +421,31 @@ fn sealed(enc_key: Option<Vec<u8>>, nonce: Option<Vec<u8>>) -> Option<SealedKey>
 fn open_standalone<const N: usize>(
     sealed: Option<SealedKey>,
     key: Option<&Secret<[u8; 32]>>,
-) -> Option<Result<Secret<[u8; N]>, ()>> {
+) -> Option<Result<SecretArray<N>, ()>> {
     let (sealed, key) = (sealed?, key?);
     Some(
         open_sealed(key, &sealed.nonce, &sealed.enc_key).and_then(|plain| {
-            let bytes: [u8; N] = plain
-                .expose_secret()
-                .as_slice()
-                .try_into()
-                .map_err(|_| ())?;
-            Ok(Secret::new(bytes))
+            Ok(SecretArray::new(
+                plain.as_slice().try_into().map_err(|_| ())?,
+            ))
         }),
     )
+}
+
+fn recover_zkey(
+    secret: SecretArray<EXTSK_LEN>,
+    extfvk: &[u8],
+    provenance: Provenance,
+) -> ZKeyEntry {
+    if identity::sapling_matches_extfvk(secret.as_slice(), extfvk) {
+        ZKeyEntry::Recovered(SaplingKey {
+            extsk: secret.into_secret_vec(),
+            provenance,
+            created_at: None,
+        })
+    } else {
+        ZKeyEntry::Mismatch
+    }
 }
 
 /// Read one `WalletZKey`, with its HD index when it has one. Field order
@@ -426,7 +459,9 @@ fn read_zkey(
     cur.u8("zkey")?;
     let keytype = cur.u32_le("zkey")?;
     cur.u8("zkey")?;
-    let extsk = cur.optional("zkey", |c| c.array::<EXTSK_LEN>("zkey"))?;
+    let extsk = cur.optional("zkey", |c| {
+        c.array::<EXTSK_LEN>("zkey").map(SecretArray::new)
+    })?;
     let extfvk = cur.take(EXTFVK_LEN, "zkey")?;
     let hdkey_num = cur.optional("zkey", |c| c.u32_le("zkey"))?;
     let enc_key = cur.optional("zkey", |c| c.vector_bytes("zkey"))?;
@@ -444,23 +479,11 @@ fn read_zkey(
     };
     let hd_index = hdkey_num.filter(|_| provenance == Provenance::HdDerived);
 
-    let recovered = |bytes: &[u8]| {
-        if identity::sapling_matches_extfvk(bytes, extfvk) {
-            ZKeyEntry::Recovered(SaplingKey {
-                extsk: Secret::new(bytes.to_vec()),
-                provenance,
-                // ZWL stores no per-key creation time.
-                created_at: None,
-            })
-        } else {
-            ZKeyEntry::Mismatch
-        }
-    };
     let entry = match extsk {
-        Some(bytes) => recovered(&bytes),
+        Some(secret) => recover_zkey(secret, extfvk, provenance),
         None if provenance == Provenance::Standalone => {
             match open_standalone::<EXTSK_LEN>(sealed, key) {
-                Some(Ok(bytes)) => recovered(bytes.expose_secret()),
+                Some(Ok(secret)) => recover_zkey(secret, extfvk, provenance),
                 Some(Err(())) => ZKeyEntry::DecryptionFailed,
                 None => ZKeyEntry::Locked(provenance),
             }
@@ -477,6 +500,27 @@ enum TKeyEntry {
     Mismatch,
 }
 
+fn recover_tkey(
+    secret: SecretArray<TRANSPARENT_SECRET_LEN>,
+    address: &[u8],
+    provenance: Provenance,
+) -> TKeyEntry {
+    match std::str::from_utf8(address)
+        .ok()
+        .and_then(|s| identity::transparent_matches_address(secret.as_array(), s).ok())
+    {
+        Some(network) => TKeyEntry::Recovered(
+            TransparentKey {
+                secret: secret.into_secret(),
+                provenance,
+                created_at: None,
+            },
+            network,
+        ),
+        None => TKeyEntry::Mismatch,
+    }
+}
+
 /// Read one `WalletTKey` in the post-version-20 shape, with its HD index
 /// when it has one. Field order confirmed against `WalletTKey::read` in
 /// `zingolabs/zwl-lib`'s `lib/src/lightwallet/wallettkey.rs`.
@@ -487,7 +531,10 @@ fn read_tkey(
     cur.u8("tkey")?;
     let keytype = cur.u32_le("tkey")?;
     cur.u8("tkey")?;
-    let key = cur.optional("tkey", |c| c.array::<TRANSPARENT_SECRET_LEN>("tkey"))?;
+    let key = cur.optional("tkey", |c| {
+        c.array::<TRANSPARENT_SECRET_LEN>("tkey")
+            .map(SecretArray::new)
+    })?;
     let address = cur.zwl_string()?;
     let hdkey_num = cur.optional("tkey", |c| c.u32_le("tkey"))?;
     let enc_key = cur.optional("tkey", |c| c.vector_bytes("tkey"))?;
@@ -501,26 +548,11 @@ fn read_tkey(
     };
     let hd_index = hdkey_num.filter(|_| provenance == Provenance::HdDerived);
 
-    let recovered =
-        |secret: Secret<[u8; TRANSPARENT_SECRET_LEN]>| match std::str::from_utf8(address)
-            .ok()
-            .and_then(|s| identity::transparent_matches_address(secret.expose_secret(), s).ok())
-        {
-            Some(network) => TKeyEntry::Recovered(
-                TransparentKey {
-                    secret,
-                    provenance,
-                    created_at: None,
-                },
-                network,
-            ),
-            None => TKeyEntry::Mismatch,
-        };
     let entry = match key {
-        Some(secret) => recovered(Secret::new(secret)),
+        Some(secret) => recover_tkey(secret, address, provenance),
         None if provenance == Provenance::Standalone => {
             match open_standalone::<TRANSPARENT_SECRET_LEN>(sealed, wallet_key) {
-                Some(Ok(secret)) => recovered(secret),
+                Some(Ok(secret)) => recover_tkey(secret, address, provenance),
                 Some(Err(())) => TKeyEntry::DecryptionFailed,
                 None => TKeyEntry::Locked(provenance),
             }
@@ -1086,15 +1118,13 @@ pub fn import_zwl(
         };
         let key = wallet_key(pass);
         match decrypt_seed(&header.enc_seed, &header.nonce, &key) {
-            Ok(entropy) => {
-                match Mnemonic::<English>::from_entropy(entropy.expose_secret().to_vec()) {
-                    Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
-                    Err(_) => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
-                        record_type: "zwl-seed".to_owned(),
-                        reason: "decrypted seed is not a valid BIP-39 entropy length".to_owned(),
-                    }),
-                }
-            }
+            Ok(entropy) => match Mnemonic::<English>::from_entropy(entropy.as_slice().to_vec()) {
+                Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
+                Err(_) => out.diagnostics.push(ImportDiagnostic::DecryptionFailed {
+                    record_type: "zwl-seed".to_owned(),
+                    reason: "decrypted seed is not a valid BIP-39 entropy length".to_owned(),
+                }),
+            },
             // Authentication failure on the seed is fatal, not a
             // per-record diagnostic: it means the passphrase is wrong for
             // the whole wallet, the same contract zcashd's
@@ -1103,7 +1133,7 @@ pub fn import_zwl(
         }
         wallet_key_for_records = Some(key);
     } else {
-        match Mnemonic::<English>::from_entropy(header.seed.to_vec()) {
+        match Mnemonic::<English>::from_entropy(header.seed.as_slice().to_vec()) {
             Ok(mnemonic) => out.mnemonic = Some(SecretString::new(mnemonic.into_phrase())),
             // All 32-byte values are valid BIP-39 entropy. Retain a
             // non-complete result if that library invariant ever changes.
@@ -1162,6 +1192,103 @@ fn damage(err: ZwlReadError) -> ImportDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto_secretbox::aead::Aead;
+
+    #[test]
+    fn wallet_key_matches_double_sha256_without_exposing_the_digest() {
+        let passphrase = SecretString::new("correct horse battery staple".to_owned());
+        let expected: [u8; 32] =
+            Sha256::digest(Sha256::digest(passphrase.expose_secret().as_bytes())).into();
+
+        let key = wallet_key(&passphrase);
+
+        assert_eq!(key.expose_secret(), &expected);
+        assert!(!format!("{key:?}").contains(&format!("{expected:?}")));
+    }
+
+    #[test]
+    fn truncated_zkey_after_plaintext_secret_drops_secret_owner() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let mut bytes = zkey_hd(0x11);
+        bytes.truncate(1 + 4 + 1 + 1 + EXTSK_LEN);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = crate::secret_bytes::SecretArray::<EXTSK_LEN>::test_with_drop_probe(
+            Arc::clone(&dropped),
+            || read_zkey(&mut Cursor::new(&bytes), None),
+        );
+        assert!(result.is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn truncated_tkey_after_plaintext_secret_drops_secret_owner() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let mut bytes = tkey_hd(0x21);
+        bytes.truncate(1 + 4 + 1 + 1 + TRANSPARENT_SECRET_LEN);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result =
+            crate::secret_bytes::SecretArray::<TRANSPARENT_SECRET_LEN>::test_with_drop_probe(
+                Arc::clone(&dropped),
+                || read_tkey(&mut Cursor::new(&bytes), None),
+            );
+        assert!(result.is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mismatched_zwl_secrets_drop_their_temporary_owners() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let sapling_dropped = Arc::new(AtomicBool::new(false));
+        let encoded = zkey_hd(0x11);
+        let valid_extsk: [u8; EXTSK_LEN] = encoded[1 + 4 + 1 + 1..1 + 4 + 1 + 1 + EXTSK_LEN]
+            .try_into()
+            .unwrap();
+        let sapling = crate::secret_bytes::SecretArray::with_drop_probe(
+            valid_extsk,
+            Arc::clone(&sapling_dropped),
+        );
+        assert!(matches!(
+            recover_zkey(sapling, &[0u8; EXTFVK_LEN], Provenance::Standalone),
+            ZKeyEntry::Mismatch
+        ));
+        assert!(sapling_dropped.load(Ordering::SeqCst));
+
+        let transparent_dropped = Arc::new(AtomicBool::new(false));
+        let transparent = crate::secret_bytes::SecretArray::with_drop_probe(
+            [0xA5; TRANSPARENT_SECRET_LEN],
+            Arc::clone(&transparent_dropped),
+        );
+        assert!(matches!(
+            recover_tkey(transparent, b"not an address", Provenance::Standalone),
+            TKeyEntry::Mismatch
+        ));
+        assert!(transparent_dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn sealed_authentication_error_drops_zeroizing_scratch() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let probe = Arc::new(AtomicBool::new(false));
+        let scratch = SecretBytes::with_drop_probe(vec![0xA5; 32], Arc::clone(&probe));
+        assert!(open_sealed_owned(&Secret::new([0u8; 32]), [0u8; NONCE_LEN], scratch).is_err());
+        assert!(probe.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn network_from_upstream_writer_fixtures() {

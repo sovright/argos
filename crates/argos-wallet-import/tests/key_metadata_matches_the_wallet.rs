@@ -26,7 +26,7 @@ const FIXTURE_PASSPHRASE: &str = "argos-test-passphrase";
 const PLAUSIBLE_FROM: i64 = 1_767_225_600; // 2026-01-01
 const PLAUSIBLE_TO: i64 = 1_798_761_600; // 2027-01-01
 
-fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn load(fixture: &str) -> Vec<argos_wallet_import::bdb::RawRecord> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
     bdb::walk(&bytes)
@@ -42,15 +42,18 @@ fn import(fixture: &str) -> ImportedKeys {
 
 /// Every metadata record of one type, keyed by its record-key remainder,
 /// with `nCreateTime` read directly from bytes 4..12 of the value.
-fn stored_times(pairs: &[(Vec<u8>, Vec<u8>)], record_type: &str) -> HashMap<Vec<u8>, i64> {
+fn stored_times(
+    pairs: &[argos_wallet_import::bdb::RawRecord],
+    record_type: &str,
+) -> HashMap<Vec<u8>, i64> {
     pairs
         .iter()
-        .filter_map(|(raw_key, value)| {
-            let rec = zcashd::parse_record_key(raw_key)?;
+        .filter_map(|record| {
+            let rec = zcashd::parse_record_key(&record.key)?;
             (rec.record_type == record_type).then(|| {
                 (
                     rec.rest,
-                    i64::from_le_bytes(value[4..12].try_into().unwrap()),
+                    i64::from_le_bytes(record.value()[4..12].try_into().unwrap()),
                 )
             })
         })

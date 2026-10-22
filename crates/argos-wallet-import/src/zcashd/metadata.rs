@@ -109,11 +109,13 @@ impl KeyMetadataIndex {
     /// be the true one, and picking the later time could hide notes, so the
     /// key is left undated whatever the two records say.
     pub fn build(
-        pairs: &[(Vec<u8>, Vec<u8>)],
+        pairs: &[crate::bdb::RawRecord],
         mut diagnostics: Option<&mut Vec<ImportDiagnostic>>,
     ) -> Self {
         let mut index = Self::default();
-        for (raw_key, value) in pairs {
+        for record in pairs {
+            let raw_key = &record.key;
+            let value = record.value();
             let Some(rec) = crate::zcashd::records::parse_record_key(raw_key) else {
                 continue;
             };
@@ -247,11 +249,11 @@ mod tests {
         v
     }
 
-    fn record(kind: &str, key_rest: &[u8], value: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    fn record(kind: &str, key_rest: &[u8], value: Vec<u8>) -> crate::bdb::RawRecord {
         let mut k = vec![kind.len() as u8];
         k.extend_from_slice(kind.as_bytes());
         k.extend_from_slice(key_rest);
-        (k, value)
+        crate::bdb::RawRecord::new(k, value)
     }
 
     #[test]
@@ -382,7 +384,7 @@ mod tests {
         }
     }
 
-    fn hd_of(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<(MetadataKind, Vec<u8>, HdData)> {
+    fn hd_of(pairs: &[crate::bdb::RawRecord]) -> Vec<(MetadataKind, Vec<u8>, HdData)> {
         let mut v: Vec<_> = KeyMetadataIndex::build(pairs, None)
             .hd_keys()
             .map(|(k, id, hd)| (k, id.to_vec(), hd.clone()))

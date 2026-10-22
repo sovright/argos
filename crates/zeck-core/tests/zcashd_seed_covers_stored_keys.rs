@@ -25,20 +25,20 @@ fn fixture(name: &str) -> Vec<u8> {
 
 /// The value of the wallet's `record_type` record, read straight from the
 /// file rather than through the code under test.
-fn record(bytes: &[u8], record_type: &str) -> Option<Vec<u8>> {
+fn record(bytes: &[u8], record_type: &str) -> Option<bdb::RawRecord> {
     bdb::walk(bytes)
         .unwrap()
         .records
         .into_iter()
-        .find(|(k, _)| parse_record_key(k).is_some_and(|r| r.record_type == record_type))
-        .map(|(_, v)| v)
+        .find(|record| parse_record_key(&record.key).is_some_and(|r| r.record_type == record_type))
 }
 
 /// Read the phrase from the plaintext record rather than through the code
 /// under test, which deliberately never exposes it.
 fn seed_of(name: &str, bytes: &[u8]) -> [u8; 64] {
-    let value = record(bytes, "mnemonicphrase")
+    let record = record(bytes, "mnemonicphrase")
         .unwrap_or_else(|| panic!("{name}: no plaintext mnemonicphrase record"));
+    let value = record.value();
     // u32 language, then a one-byte CompactSize (every phrase is < 253 bytes).
     let phrase = std::str::from_utf8(&value[5..]).unwrap();
     Mnemonic::<English>::from_phrase(phrase)
@@ -56,8 +56,9 @@ struct Counters {
 /// Layout: u32 version | fp(32) | i64 create_time | u32 account_counter |
 /// u32 legacy_t_external | u32 legacy_t_internal | u32 legacy_sapling | bool.
 fn counters_of(name: &str, bytes: &[u8]) -> Counters {
-    let value = record(bytes, "mnemonichdchain")
+    let record = record(bytes, "mnemonichdchain")
         .unwrap_or_else(|| panic!("{name}: no mnemonichdchain record"));
+    let value = record.value();
     assert_eq!(value.len(), 61, "{name}: unexpected mnemonichdchain length");
     let u32_at = |at: usize| u32::from_le_bytes(value[at..at + 4].try_into().unwrap());
     Counters {

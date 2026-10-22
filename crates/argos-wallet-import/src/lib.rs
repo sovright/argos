@@ -30,12 +30,14 @@ pub mod bdb;
 pub mod error;
 mod identity;
 pub mod keys;
+mod secret_bytes;
 pub mod sniff;
 pub mod zcashd;
 pub mod zwl;
 
 pub use error::{ImportDiagnostic, ImportError};
 pub use keys::{EmbeddedNetwork, ImportCoverage, ImportedKeys, Provenance, SaplingKey};
+pub use secret_bytes::SecretBytes;
 pub use sniff::{sniff, WalletFormat};
 
 use secrecy::SecretString;

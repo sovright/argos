@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -191,6 +192,7 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
+ "zeroize",
  "zip32",
 ]
 
@@ -224,6 +226,7 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "secrecy",
+ "serde",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
@@ -232,6 +235,7 @@ dependencies = [
  "zcash_address",
  "zcash_protocol",
  "zcash_transparent",
+ "zeroize",
 ]
 
 [[package]]
@@ -7781,6 +7785,7 @@ checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
 dependencies = [
  "curve25519-dalek",
  "rand_core 0.6.4",
+ "zeroize",
 ]
 
 [[package]]

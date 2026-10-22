@@ -86,7 +86,7 @@ enum Chain {
 /// that merely existed, but could not be read or decrypted, let an
 /// unreadable key pass for a recovered one.
 pub fn assess_seed(
-    pairs: &[(Vec<u8>, Vec<u8>)],
+    pairs: &[crate::bdb::RawRecord],
     master: Option<&MasterKey>,
     recovered: &RecoveredKeyIds,
     out: &mut ImportedKeys,
@@ -101,7 +101,9 @@ pub fn assess_seed(
         metadata: KeyMetadataIndex::build(pairs, None),
     };
     let mut pre_5_0_seed = None;
-    for (raw_key, value) in pairs {
+    for record in pairs {
+        let raw_key = &record.key;
+        let value = record.value();
         let Some(rec) = parse_record_key(raw_key) else {
             continue;
         };
@@ -109,9 +111,9 @@ pub fn assess_seed(
             kind @ ("hdseed" | "chdseed") => {
                 pre_5_0_seed.get_or_insert(kind.to_owned());
             }
-            "mnemonicphrase" => records.plain.push((rec.rest, value.as_slice())),
-            "cmnemonicphrase" => records.crypted.push((rec.rest, value.as_slice())),
-            "mnemonichdchain" => records.chain = Some(value.as_slice()),
+            "mnemonicphrase" => records.plain.push((rec.rest, value)),
+            "cmnemonicphrase" => records.crypted.push((rec.rest, value)),
+            "mnemonichdchain" => records.chain = Some(value),
             _ => {}
         }
     }
@@ -356,8 +358,8 @@ fn verify_record(
         let ct = value.get(consumed..end).ok_or("ciphertext is truncated")?;
         let mut iv = [0u8; 16];
         iv.copy_from_slice(fp.get(..16).ok_or("fingerprint is truncated")?);
-        decrypted = Zeroizing(decrypt(master, iv, ct).ok_or("ciphertext did not decrypt")?);
-        decrypted.0.as_slice()
+        decrypted = decrypt(master, iv, ct).ok_or("ciphertext did not decrypt")?;
+        decrypted.as_slice()
     } else {
         value
     };
@@ -501,15 +503,6 @@ fn parse_chain(value: &[u8]) -> Result<HdChain, String> {
     })
 }
 
-/// Scrubs a decrypted seed record on every exit path.
-struct Zeroizing(Vec<u8>);
-
-impl Drop for Zeroizing {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,25 +514,25 @@ mod tests {
     };
     use secrecy::SecretString;
 
-    fn pairs(name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn pairs(name: &str) -> Vec<crate::bdb::RawRecord> {
         bdb::walk(&std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap())
             .unwrap()
             .records
     }
 
-    fn master(pairs: &[(Vec<u8>, Vec<u8>)]) -> MasterKey {
+    fn master(pairs: &[crate::bdb::RawRecord]) -> MasterKey {
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         derive_master_key(&pass, &find_mkey(pairs).unwrap()).unwrap()
     }
 
-    fn is(record_type: &str) -> impl Fn(&(Vec<u8>, Vec<u8>)) -> bool + '_ {
-        move |(k, _)| parse_record_key(k).is_some_and(|r| r.record_type == record_type)
+    fn is(record_type: &str) -> impl Fn(&crate::bdb::RawRecord) -> bool + '_ {
+        move |record| parse_record_key(&record.key).is_some_and(|r| r.record_type == record_type)
     }
 
     /// Run this module over `pairs`, with only its own diagnostics in the
     /// result. The collectors run first, into a scratch result, because a
     /// derived key counts as present only if they actually recovered it.
-    fn assess(pairs: &[(Vec<u8>, Vec<u8>)], master: Option<&MasterKey>) -> ImportedKeys {
+    fn assess(pairs: &[crate::bdb::RawRecord], master: Option<&MasterKey>) -> ImportedKeys {
         let mut scratch = ImportedKeys::default();
         let mut recovered = crate::zcashd::collect_plaintext(pairs, &mut scratch);
         if let Some(master) = master {
@@ -556,22 +549,27 @@ mod tests {
 
     /// The record key after the record type, for records of `record_type`
     /// whose metadata names a legacy-account keypath matching `path_suffix`.
-    fn keys_at(pairs: &[(Vec<u8>, Vec<u8>)], meta_type: &str, path_suffix: &str) -> Vec<Vec<u8>> {
+    fn keys_at(
+        pairs: &[crate::bdb::RawRecord],
+        meta_type: &str,
+        path_suffix: &str,
+    ) -> Vec<Vec<u8>> {
         pairs
             .iter()
-            .filter_map(|(k, v)| {
-                let r = parse_record_key(k)?;
-                (r.record_type == meta_type && String::from_utf8_lossy(v).contains(path_suffix))
-                    .then_some(r.rest)
+            .filter_map(|record| {
+                let r = parse_record_key(&record.key)?;
+                (r.record_type == meta_type
+                    && String::from_utf8_lossy(record.value()).contains(path_suffix))
+                .then_some(r.rest)
             })
             .collect()
     }
 
-    fn record(kind: &str, rest: &[u8], value: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn record(kind: &str, rest: &[u8], value: &[u8]) -> crate::bdb::RawRecord {
         let mut k = vec![kind.len() as u8];
         k.extend_from_slice(kind.as_bytes());
         k.extend_from_slice(rest);
-        (k, value.to_vec())
+        crate::bdb::RawRecord::new(k, value.to_vec())
     }
 
     fn only_diagnostic(out: &ImportedKeys) -> &ImportDiagnostic {
@@ -594,7 +592,8 @@ mod tests {
     #[test]
     fn a_seed_under_the_wrong_fingerprint_is_not_verified() {
         let mut p = pairs("modern-plaintext");
-        for (k, _) in p.iter_mut().filter(|r| is("mnemonicphrase")(r)) {
+        for record in p.iter_mut().filter(|r| is("mnemonicphrase")(r)) {
+            let k = &mut record.key;
             *k.last_mut().unwrap() ^= 1;
         }
         let out = assess(&p, None);
@@ -609,7 +608,8 @@ mod tests {
     #[test]
     fn a_tampered_phrase_is_not_verified() {
         let mut p = pairs("modern-plaintext");
-        for (_, v) in p.iter_mut().filter(|r| is("mnemonicphrase")(r)) {
+        for record in p.iter_mut().filter(|r| is("mnemonicphrase")(r)) {
+            let v = record.test_value_vec_mut();
             // Swap two letters inside the phrase: still UTF-8, no longer the
             // seed the fingerprint names (and almost surely a bad checksum).
             v.swap(6, 7);
@@ -622,7 +622,8 @@ mod tests {
     #[test]
     fn a_chain_for_a_different_seed_is_not_trusted() {
         let mut p = pairs("modern-plaintext");
-        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+        for record in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            let v = record.test_value_vec_mut();
             v[4] ^= 1; // first byte of the chain's seed fingerprint
         }
         let out = assess(&p, None);
@@ -636,7 +637,8 @@ mod tests {
     #[test]
     fn unified_accounts_are_reported_by_count() {
         let mut p = pairs("modern-plaintext");
-        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+        for record in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            let v = record.test_value_vec_mut();
             v[44] = 2; // account_counter, after version(4) + fp(32) + time(8)
         }
         let out = assess(&p, None);
@@ -662,8 +664,9 @@ mod tests {
             .take(4)
             .collect();
         assert_eq!(lost.len(), 4);
-        p.retain(|(k, _)| {
-            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
+        p.retain(|record| {
+            parse_record_key(&record.key)
+                .is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
         });
         for i in 0..4u8 {
             let mut pubkey = vec![33u8, 0x02];
@@ -700,8 +703,9 @@ mod tests {
             .into_iter()
             .next()
             .expect("a change key");
-        p.retain(|(k, _)| {
-            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && r.rest == lost))
+        p.retain(|record| {
+            parse_record_key(&record.key)
+                .is_none_or(|r| !(r.record_type == "key" && r.rest == lost))
         });
         let out = assess(&p, None);
         let missing: Vec<_> = out
@@ -755,8 +759,10 @@ mod tests {
     fn a_decryption_failure_is_not_hidden_behind_a_bad_plaintext_copy() {
         let mut p = pairs("modern-encrypted");
         let m = master(&p);
-        for (k, v) in p.iter_mut() {
-            match parse_record_key(k).map(|r| r.record_type) {
+        for record in p.iter_mut() {
+            let record_type = parse_record_key(&record.key).map(|r| r.record_type);
+            let v = record.value_mut();
+            match record_type {
                 Some(t) if t == "cmnemonicphrase" => *v.last_mut().unwrap() ^= 0xFF,
                 Some(t) if t == "mnemonicphrase" => v.swap(6, 7),
                 _ => {}
@@ -779,7 +785,8 @@ mod tests {
     #[test]
     fn the_chain_record_is_read_by_version_not_by_exact_length() {
         let mut bumped = pairs("modern-plaintext");
-        for (_, v) in bumped.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+        for record in bumped.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            let v = record.test_value_vec_mut();
             v[0] = 2;
         }
         let out = assess(&bumped, None);
@@ -793,7 +800,8 @@ mod tests {
         );
 
         let mut extended = pairs("modern-plaintext");
-        for (_, v) in extended.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+        for record in extended.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            let v = record.test_value_vec_mut();
             v.extend_from_slice(&[0u8; 8]);
         }
         let out = assess(&extended, None);
@@ -814,7 +822,8 @@ mod tests {
         ];
         for (what, mutate) in plain_cases {
             let mut p = pairs("modern-plaintext");
-            for (_, v) in p.iter_mut().filter(|r| is("mnemonicphrase")(r)) {
+            for record in p.iter_mut().filter(|r| is("mnemonicphrase")(r)) {
+                let v = record.test_value_vec_mut();
                 mutate(v);
             }
             let out = assess(&p, None);
@@ -834,7 +843,8 @@ mod tests {
             let mut p = pairs("modern-encrypted");
             let m = master(&p);
             p.retain(|r| !is("mnemonicphrase")(r));
-            for (_, v) in p.iter_mut().filter(|r| is("cmnemonicphrase")(r)) {
+            for record in p.iter_mut().filter(|r| is("cmnemonicphrase")(r)) {
+                let v = record.test_value_vec_mut();
                 mutate(v);
             }
             let out = assess(&p, Some(&m));
@@ -860,7 +870,7 @@ mod tests {
             let mut k = vec![kind.len() as u8];
             k.extend_from_slice(kind.as_bytes());
             k.extend_from_slice(&[0x01; 32]);
-            let out = assess(&[(k, vec![0x02; 40])], None);
+            let out = assess(&[crate::bdb::RawRecord::new(k, vec![0x02; 40])], None);
             assert!(matches!(
                 only_diagnostic(&out),
                 ImportDiagnostic::UnrecoveredSeed { record_type, .. } if record_type == kind
@@ -902,8 +912,9 @@ mod tests {
             .collect();
         assert_eq!(lost.len(), 10);
         p.retain(|r| !is("sapzkey")(r));
-        p.retain(|(k, _)| {
-            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
+        p.retain(|record| {
+            parse_record_key(&record.key)
+                .is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
         });
         let out = assess(&p, None);
         assert_ne!(out.coverage(), ImportCoverage::Complete);
@@ -933,8 +944,9 @@ mod tests {
             .take(10)
             .collect();
         assert_eq!(lost.len(), 10);
-        p.retain(|(k, _)| {
-            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
+        p.retain(|record| {
+            parse_record_key(&record.key)
+                .is_none_or(|r| !(r.record_type == "key" && lost.contains(&r.rest)))
         });
         let out = assess(&p, None);
         assert!(!out.seed_verified);
@@ -958,10 +970,10 @@ mod tests {
         let mut p = pairs("modern-plaintext");
         p.retain(|r| !is("mnemonicphrase")(r) && !is("mnemonichdchain")(r));
         let before = p.len();
-        p.retain(|(k, v)| {
-            parse_record_key(k).is_none_or(|r| {
+        p.retain(|record| {
+            parse_record_key(&record.key).is_none_or(|r| {
                 !matches!(r.record_type.as_str(), "keymeta" | "sapzkeymeta")
-                    || !String::from_utf8_lossy(v).contains("/2147483647'/")
+                    || !String::from_utf8_lossy(record.value()).contains("/2147483647'/")
             })
         });
         // The fixture's chain counts 104 derived keys (2 external, 101
@@ -977,7 +989,8 @@ mod tests {
     #[test]
     fn a_huge_counter_is_not_walked() {
         let mut p = pairs("modern-plaintext");
-        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+        for record in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            let v = record.test_value_vec_mut();
             v[48..60].fill(0xFF);
         }
         let started = std::time::Instant::now();
@@ -1010,11 +1023,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("a change key");
-        for (k, v) in p.iter_mut() {
-            let Some(r) = parse_record_key(k) else {
-                continue;
-            };
-            if r.record_type == "keymeta" && r.rest == target {
+        for record in p.iter_mut() {
+            let matches = parse_record_key(&record.key)
+                .is_some_and(|r| r.record_type == "keymeta" && r.rest == target);
+            if matches {
+                let v = record.value_mut();
                 // version(4) + create_time(8) + CompactSize(len) + keypath,
                 // then the seed fingerprint.
                 let fp_at = 12 + 1 + usize::from(v[12]);
@@ -1070,8 +1083,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("a change key");
-        for (k, v) in p.iter_mut() {
-            if parse_record_key(k).is_some_and(|r| r.record_type == "keymeta" && r.rest == target) {
+        for record in p.iter_mut() {
+            let matches = parse_record_key(&record.key)
+                .is_some_and(|r| r.record_type == "keymeta" && r.rest == target);
+            if matches {
+                let v = record.value_mut();
                 v[..4].copy_from_slice(&(-1i32).to_le_bytes());
             }
         }
@@ -1098,14 +1114,15 @@ mod tests {
         let (kept, lost) = (change[0].clone(), change[1].clone());
         let lost_meta = p
             .iter()
-            .find_map(|(k, v)| {
-                parse_record_key(k)
+            .find_map(|record| {
+                parse_record_key(&record.key)
                     .is_some_and(|r| r.record_type == "keymeta" && r.rest == lost)
-                    .then(|| v.clone())
+                    .then(|| record.value().to_vec())
             })
             .unwrap();
-        p.retain(|(k, _)| {
-            parse_record_key(k).is_none_or(|r| !(r.record_type == "key" && r.rest == lost))
+        p.retain(|record| {
+            parse_record_key(&record.key)
+                .is_none_or(|r| !(r.record_type == "key" && r.rest == lost))
         });
         p.push(record("keymeta", &kept, &lost_meta));
         let out = assess(&p, None);
@@ -1127,7 +1144,8 @@ mod tests {
     fn an_unreadable_chain_without_a_phrase_does_not_claim_the_seed_decoded() {
         let mut p = pairs("modern-plaintext");
         p.retain(|r| !is("mnemonicphrase")(r));
-        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+        for record in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            let v = record.test_value_vec_mut();
             v[0] = 2;
         }
         let out = assess(&p, None);
@@ -1150,7 +1168,8 @@ mod tests {
 
         // With a phrase that does verify, the same chain still says so.
         let mut p = pairs("modern-plaintext");
-        for (_, v) in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+        for record in p.iter_mut().filter(|r| is("mnemonichdchain")(r)) {
+            let v = record.test_value_vec_mut();
             v[0] = 2;
         }
         let out = assess(&p, None);

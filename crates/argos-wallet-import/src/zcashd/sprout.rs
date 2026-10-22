@@ -430,8 +430,10 @@ pub fn parse_js_description(
     read_joinsplit(&mut cursor, use_groth, txid, js_index)
 }
 
-pub fn collect_sprout_notes(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) {
-    for (raw_key, value) in pairs {
+pub fn collect_sprout_notes(pairs: &[crate::bdb::RawRecord], out: &mut ImportedKeys) {
+    for record in pairs {
+        let raw_key = &record.key;
+        let value = record.value();
         let Some(rec) = parse_record_key(raw_key) else {
             continue;
         };
@@ -476,6 +478,10 @@ fn is_v5_or_later(value: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn raw(key: Vec<u8>, value: Vec<u8>) -> crate::bdb::RawRecord {
+        crate::bdb::RawRecord::new(key, value)
+    }
+
     #[test]
     fn parsing_the_golden_wallet_fabricates_no_notes() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
@@ -513,8 +519,8 @@ mod tests {
         let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mut tx_count = 0;
         let mut out = ImportedKeys::default();
-        for (raw_key, value) in &pairs {
-            let Some(rec) = parse_record_key(raw_key) else {
+        for record in &pairs {
+            let Some(rec) = parse_record_key(&record.key) else {
                 continue;
             };
             if rec.record_type != "tx" {
@@ -524,7 +530,7 @@ mod tests {
             let txid = <[u8; 32]>::try_from(rec.rest.as_slice())
                 .expect("a tx record key is \"tx\" || txid");
             assert!(
-                extract_sprout_notes(value, txid, &mut out).is_some(),
+                extract_sprout_notes(record.value(), txid, &mut out).is_some(),
                 "a real tx record failed to parse structurally"
             );
         }
@@ -605,7 +611,7 @@ mod tests {
         key.extend_from_slice(&[0x11; 32]); // txid, as every real key carries
 
         let mut out = ImportedKeys::default();
-        collect_sprout_notes(&[(key, value)], &mut out);
+        collect_sprout_notes(&[raw(key, value)], &mut out);
 
         assert_eq!(out.sprout_notes.len(), 2);
         assert_eq!(out.sprout_notes[0].address, [0x77; 64]);
@@ -671,7 +677,7 @@ mod tests {
         key.extend_from_slice(&[0x22; 32]); // txid, as every real key carries
 
         let mut out = ImportedKeys::default();
-        collect_sprout_notes(&[(key, value)], &mut out);
+        collect_sprout_notes(&[raw(key, value)], &mut out);
 
         assert_eq!(
             out.sprout_notes.len(),
@@ -684,7 +690,7 @@ mod tests {
 
     #[test]
     fn malformed_note_data_does_not_abort_collection() {
-        let pairs = vec![(vec![2u8, b't', b'x'], vec![0x00])];
+        let pairs = vec![raw(vec![2u8, b't', b'x'], vec![0x00])];
         let mut out = ImportedKeys::default();
         collect_sprout_notes(&pairs, &mut out);
         // No panic, no fatal error. Diagnostics may or may not be added.
@@ -824,7 +830,7 @@ mod tests {
         key.extend_from_slice(&[0x33; 32]);
 
         let mut out = ImportedKeys::default();
-        collect_sprout_notes(&[(key, value)], &mut out);
+        collect_sprout_notes(&[raw(key, value)], &mut out);
 
         assert_eq!(out.sprout_joinsplits.len(), 2, "both JoinSplits captured");
         for (i, js) in out.sprout_joinsplits.iter().enumerate() {
@@ -882,7 +888,7 @@ mod tests {
         key.extend_from_slice(&[0x44; 32]);
 
         let mut out = ImportedKeys::default();
-        collect_sprout_notes(&[(key, value)], &mut out);
+        collect_sprout_notes(&[raw(key, value)], &mut out);
 
         assert!(
             out.sprout_joinsplits.is_empty(),
@@ -910,7 +916,7 @@ mod tests {
         txid: [u8; 32],
         hash_block: [u8; 32],
         n_index: i32,
-    ) -> (Vec<u8>, Vec<u8>) {
+    ) -> crate::bdb::RawRecord {
         let mut value = Vec::new();
         value.extend_from_slice(&0x8000_0004u32.to_le_bytes());
         value.extend_from_slice(&[0x89, 0xBB, 0x09, 0x00]);
@@ -934,7 +940,7 @@ mod tests {
         let mut key = vec![2u8];
         key.extend_from_slice(b"tx");
         key.extend_from_slice(&txid);
-        (key, value)
+        raw(key, value)
     }
 
     /// zcashd writes a transaction before relaying it and fills in
@@ -965,7 +971,7 @@ mod tests {
         key.extend_from_slice(&[0x45; 32]);
 
         let mut out = ImportedKeys::default();
-        collect_sprout_notes(&[(key, value)], &mut out);
+        collect_sprout_notes(&[raw(key, value)], &mut out);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 

@@ -20,7 +20,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 const FIXTURE_PASSPHRASE: &str = "argos-test-passphrase";
 
-fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn load(fixture: &str) -> Vec<argos_wallet_import::bdb::RawRecord> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
     bdb::walk(&bytes)
@@ -33,11 +33,14 @@ fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// the wallet file independently of `collect_encrypted`/`collect_plaintext`
 /// so it is a genuine external check, not a restatement of the code under
 /// test.
-fn stored_pubkeys(pairs: &[(Vec<u8>, Vec<u8>)], record_type: &str) -> Vec<Vec<u8>> {
+fn stored_pubkeys(
+    pairs: &[argos_wallet_import::bdb::RawRecord],
+    record_type: &str,
+) -> Vec<Vec<u8>> {
     pairs
         .iter()
-        .filter_map(|(raw_key, _)| {
-            let rec = zcashd::parse_record_key(raw_key)?;
+        .filter_map(|record| {
+            let rec = zcashd::parse_record_key(&record.key)?;
             if rec.record_type != record_type {
                 return None;
             }
@@ -168,11 +171,12 @@ fn hex_pubkey(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn mutate_first_pubkey(pairs: &mut [(Vec<u8>, Vec<u8>)], kind: &str) {
-    let (raw_key, _) = pairs
+fn mutate_first_pubkey(pairs: &mut [argos_wallet_import::bdb::RawRecord], kind: &str) {
+    let record = pairs
         .iter_mut()
-        .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == kind))
+        .find(|record| zcashd::parse_record_key(&record.key).is_some_and(|r| r.record_type == kind))
         .unwrap();
+    let raw_key = &mut record.key;
     let rest_start = 1 + kind.len();
     let (len, prefix) = zcashd::compact_size(&raw_key[rest_start..]).unwrap();
     assert!(len == 33 || len == 65);

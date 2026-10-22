@@ -23,8 +23,10 @@ zcash_protocol.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+serde.workspace = true
 tempfile.workspace = true
 # Already `[dependencies]`, repeated here because integration tests link
 # only against this crate's public API plus its dev-dependencies. Used to

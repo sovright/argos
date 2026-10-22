@@ -11,7 +11,7 @@ rust-version = "1.88"
 repository = "https://github.com/sovright/argos"
 
 [workspace.dependencies]
-aes = "0.8.4"
+aes = { version = "0.8.4", features = ["zeroize"] }
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 bip0039 = "0.14.0"
@@ -21,7 +21,7 @@ equihash = "0.3"
 blake2b_simd = "1.0.4"
 # Curve25519 scalar multiplication for Sprout note decryption (the key
 # agreement in protocol §5.5). No other crate in the tree provides it.
-x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets"] }
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = "0.10.1"
 # JoinSplit signatures. ed25519-zebra rather than ed25519-dalek: Zcash
 # consensus requires ZIP 215 verification semantics, which this implements and
@@ -35,7 +35,7 @@ bls12_381 = "0.8"
 # already in the tree via zcash_transparent.
 zcash_script = "0.4.3"
 base64 = "0.22"
-cbc = { version = "0.1.2", features = ["alloc"] }
+cbc = { version = "0.1.2", features = ["alloc", "zeroize"] }
 clap = { version = "4.5.53", features = ["derive"] }
 crypto_secretbox = "0.1.1"
 dialoguer = "0.12.0"
@@ -57,6 +57,7 @@ rusqlite = "0.37.0"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 secp256k1 = "0.29.1"
 secrecy = "0.8.0"
+zeroize = { version = "1.8.2", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tauri = { version = "~2.11.6" }
