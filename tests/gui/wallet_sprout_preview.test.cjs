@@ -1307,7 +1307,7 @@ test("deep reorg notice names the preserved checkpoint and source wallet", async
   assert.match(h.$("wallet-sprout-accounting").children[0].textContent, /sprout-scan-456\.checkpoint/);
 });
 
-test("the review shows its verification warning and execute shows its report's", async () => {
+test("preview shows its fresh verification warning and execute shows a newer one", async () => {
   const previewNotice = "Preview: checkpoint verification is unavailable; use wallet-file evidence.";
   const executeNotice = "Execute: checkpoint changed after preview; use wallet-file evidence.";
   const calls = [];

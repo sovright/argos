@@ -2277,12 +2277,17 @@ $("sweep-memo").addEventListener("input", () => {
   counter.style.color = bytes > 512 ? "var(--danger)" : "";
 });
 
-$("auto-gap-limit").addEventListener("change", () => {
+// Gap scanning sends `gap_limit` (from #gap-limit) and no account count; a
+// fixed scan sends the slider's count. So the gap row belongs to gap mode and
+// the slider to fixed mode — each control is live only when it is sent.
+function syncAccountScanControls() {
   const auto = $("auto-gap-limit").checked;
-  $("gap-limit-row").style.display = auto ? "none" : "block";
-  $("accounts-range").disabled = !auto;
+  $("gap-limit-row").style.display = auto ? "block" : "none";
+  $("accounts-range").disabled = auto;
   $("accounts-range-value").style.opacity = auto ? "0.4" : "1";
-});
+}
+
+$("auto-gap-limit").addEventListener("change", syncAccountScanControls);
 
 // Approximate mainnet chain tip and scan rate for time estimates
 const APPROX_CHAIN_TIP = 2_730_000;
@@ -4605,8 +4610,7 @@ $("confirmation-sources").addEventListener("input", () => {
   } catch (_) {}
 });
 renderSproutScanPanel();
-$("gap-limit-row").style.display = $("auto-gap-limit").checked ? "none" : "block";
-$("accounts-range").disabled = !$("auto-gap-limit").checked;
+syncAccountScanControls();
 $("scan-label").value = defaultScanLabel();
 $("scan-label").placeholder = defaultScanLabel();
 goTo("welcome");

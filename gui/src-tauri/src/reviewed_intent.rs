@@ -20,13 +20,17 @@
 //!   to review a result without retaining abandoned keys for the process life.
 //! - at most [`MAX_SCAN_SESSIONS`] scans and [`MAX_PROPOSALS`] proposals.
 //!
-//! Scan-key buffers are wiped when their final owner drops. The store and its
-//! worker share that owner so cancellation cannot wipe keys while the worker
-//! is still using them.
+//! Held key buffers are wiped on drop: a scan session and a wallet proposal's
+//! execute-time verification keys use [`SecretSproutKeys`], while
+//! `SpendableSproutNote` zeroizes its `a_sk` and note secrets in its own
+//! `Drop`. The store and a running worker share a scan's owner, so cancellation
+//! cannot wipe keys while the worker is still using them.
 //!
-//! This is process-memory hygiene, not process isolation. Rust may copy fixed
-//! arrays through registers or stack temporaries, and zeroization cannot
-//! protect swap, core dumps, DMA, or a process that is already compromised.
+//! This is best-effort process-memory hygiene, not process isolation. Copies
+//! made earlier (decoding buffers, a `Vec` reallocation, registers, stack
+//! temporaries, and wallet-import types that are not all zeroizing) are not
+//! reached, and zeroization cannot protect swap, core dumps, DMA, or an
+//! already-compromised process.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -280,17 +284,15 @@ pub struct SproutSweepIntent {
     pub lightwalletd_url: String,
     pub confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     pub journal: SweepJournal,
+    /// Execute-time authority for re-verifying a wallet proposal's saved scan
+    /// through the peers used at review. The current verdict replaces the
+    /// review-time verdict, and its keys are wiped when the proposal drops.
     pub wallet_checkpoint: Option<WalletCheckpointAuthority>,
     pub checkpoint_authority: Option<argos_core::sprout_sweep::ScanCheckpointAuthority>,
     pub _checkpoint_reservation: Option<CheckpointReservation>,
     /// Set when the catch-up scan behind a scan-derived proposal could not
     /// confirm the chain tip; it leads the sweep report's warnings.
     pub tip_warning: Option<String>,
-    /// A wallet proposal's verdict from verifying its saved scan against
-    /// live headers at review time (#272). It ends the sweep report's
-    /// warnings and is appended to a sweep error. Execution also re-verifies
-    /// canonical spends before it uses the reviewed notes.
-    pub chain_notice: Option<String>,
     /// Set when the scan panel's peer field was malformed at review time.
     /// The review degrades to a warning, but execution refuses the proposal.
     pub peer_error: Option<String>,
@@ -1109,7 +1111,6 @@ mod tests {
                     checkpoint_authority: None,
                     _checkpoint_reservation: None,
                     tip_warning: None,
-                    chain_notice: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -1199,7 +1200,6 @@ mod tests {
                     checkpoint_authority: None,
                     _checkpoint_reservation: None,
                     tip_warning: None,
-                    chain_notice: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -1267,7 +1267,6 @@ mod tests {
                     checkpoint_authority: None,
                     _checkpoint_reservation: None,
                     tip_warning: None,
-                    chain_notice: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -1641,7 +1640,6 @@ mod tests {
                     checkpoint_authority: None,
                     _checkpoint_reservation: Some(reservation),
                     tip_warning: None,
-                    chain_notice: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
