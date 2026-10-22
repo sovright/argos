@@ -2871,7 +2871,17 @@ fn verify_private_workspace_lineage_from_handles(
 ) -> io::Result<PrivateRootLineageLease> {
     let publication_parent_id = private_object_id(publication_parent)?;
     let id = private_object_id(&root)?;
+    #[cfg(all(test, windows))]
+    eprintln!(
+        "workspace-lineage-verify {}: identities read",
+        private_root.display()
+    );
     let current = open_child_directory_for_identity(publication_parent, private_root)?;
+    #[cfg(all(test, windows))]
+    eprintln!(
+        "workspace-lineage-verify {}: identity reopened",
+        private_root.display()
+    );
     if private_object_id(&current)? != id {
         return Err(invalid_lineage(
             "private workspace root is no longer the retained publication-parent child",
@@ -2884,6 +2894,11 @@ fn verify_private_workspace_lineage_from_handles(
             private_root.display()
         ))
     })?;
+    #[cfg(all(test, windows))]
+    eprintln!(
+        "workspace-lineage-verify {}: marker read",
+        private_root.display()
+    );
     let record: PrivateRootLineageRecord = decode_lineage_record(LineageRecordKind::Root, &bytes)
         .map_err(|error| {
         invalid_lineage(format!(
@@ -2903,8 +2918,19 @@ fn verify_private_workspace_lineage_from_handles(
             private_root.display()
         )));
     }
+    #[cfg(all(test, windows))]
+    eprintln!(
+        "workspace-lineage-verify {}: record matched",
+        private_root.display()
+    );
+    let publication_parent = publication_parent.try_clone()?;
+    #[cfg(all(test, windows))]
+    eprintln!(
+        "workspace-lineage-verify {}: parent cloned",
+        private_root.display()
+    );
     Ok(PrivateRootLineageLease {
-        publication_parent: publication_parent.try_clone()?,
+        publication_parent,
         root,
         path: private_root.to_path_buf(),
         context_path: private_root.to_path_buf(),
@@ -8144,19 +8170,13 @@ mod windows_acl {
             ptr::null(),
             FILE_DIRECTORY_FILE,
         )?;
-        #[cfg(test)]
-        eprintln!("workspace-root-authority {}: opened", path.display());
         if !validate_recursive_entry(&directory)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "private workspace entry is not a directory",
             ));
         }
-        #[cfg(test)]
-        eprintln!("workspace-root-authority {}: validated", path.display());
         PrivateSecurity::new(true)?.verify(&directory)?;
-        #[cfg(test)]
-        eprintln!("workspace-root-authority {}: ACL verified", path.display());
         Ok(directory)
     }
 
