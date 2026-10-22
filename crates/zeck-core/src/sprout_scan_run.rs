@@ -109,7 +109,9 @@ use crate::{
         pool::{connect_to_any_except, PoolError, PEER_RECONNECT_DELAY},
         wire::P2pNetwork,
     },
-    sprout_scan::{ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner},
+    sprout_scan::{
+        CheckpointError, ScanCursor, SproutScanCheckpoint, SproutScanResult, SproutScanner,
+    },
 };
 use zcash_protocol::consensus::BranchId;
 
@@ -301,12 +303,13 @@ fn load_checkpoint(
         _ => (None, bytes),
     };
     let checkpoint = SproutScanCheckpoint::from_bytes(body);
-    let resumed = SproutScanner::resume(&checkpoint).map_err(|err| {
-        ZeckError::TransactionBuild(format!(
+    let resumed = SproutScanner::resume(&checkpoint).map_err(|err| match err {
+        CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(checkpoint_file),
+        _ => ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} could not be read ({err}). Delete it to \
              start a fresh scan, or restore a good copy — it holds hours of work.",
             checkpoint_file.display()
-        ))
+        )),
     })?;
 
     // The checkpoint must be for *these* keys. The default path is
@@ -340,6 +343,16 @@ fn load_checkpoint(
         )));
     }
     Ok(Some(resumed))
+}
+
+fn legacy_checkpoint_error(path: &Path) -> ZeckError {
+    ZeckError::TransactionBuild(format!(
+        "the scan checkpoint at {} predates Sprout block-body authentication and cannot \
+         be trusted for resume or spend evidence. Preserve this file and the original \
+         spending-key source; start a fresh scan in a new data directory or move this \
+         checkpoint aside first.",
+        path.display()
+    ))
 }
 
 /// A resumed scan asked to decrypt blocks its checkpoint walked past
@@ -534,18 +547,20 @@ pub fn lookup_chain_spends(
     let [NETWORK_TAGGED, tag, body @ ..] = bytes.as_slice() else {
         return Err(ZeckError::TransactionBuild(format!(
             "the scan checkpoint at {} does not record its network, so its spends \
-             cannot be trusted for this one. It was written by an older Argos; running \
-             the scan again updates it.",
+             cannot be trusted for this one. Preserve the file and the original \
+             spending-key source; start a fresh scan in a new data directory or \
+             move this checkpoint aside first.",
             path.display()
         )));
     };
     let evidence =
         crate::sprout_scan::read_chain_evidence(&SproutScanCheckpoint::from_bytes(body.to_vec()))
-            .map_err(|err| {
-            ZeckError::TransactionBuild(format!(
+            .map_err(|err| match err {
+            CheckpointError::UnauthenticatedLegacy => legacy_checkpoint_error(&path),
+            _ => ZeckError::TransactionBuild(format!(
                 "the scan checkpoint at {} could not be read ({err}).",
                 path.display()
-            ))
+            )),
         })?;
     if evidence.spending_keys != scan_key_set(spending_keys, &[]) {
         return Err(ZeckError::TransactionBuild(format!(
@@ -1211,44 +1226,16 @@ pub async fn run_sprout_scan_with_decrypt_from(
         // assembles the page in the order the headers came in and treats a
         // missing block as a hard error, because a short page still looks
         // well-formed and would land every later commitment at the wrong
-        // position. Re-deriving a hash list and a lookup map here only undid
-        // that work.
-        for (hash, block) in &page {
-            // A pinned block must be the block we were handed. This is what
-            // makes a fabricated chain pointless: cheap forged headers link
-            // to each other fine, but they cannot reproduce a real mainnet
-            // hash at a real height without doing the work. Checked against
-            // this block's own height, before the counter advances — the
-            // checkpoints are keyed by true heights (genesis = 0).
-            let expected = crate::p2p::wire::checkpoint_at(network, height).or(tip_anchor
-                .filter(|anchor| anchor.height == height)
-                .map(|anchor| anchor.hash));
-            if let Some(expected) = expected {
-                if *hash != expected {
-                    return Err(ZeckError::Broadcast(format!(
-                        "the chain this peer served does not match Zcash at height \
-                         {height}. It is serving a different or fabricated chain, so the \
-                         scan stops rather than search it. Re-run to pick another peer, \
-                         or pass --peer with a node you trust."
-                    )));
-                }
-            }
-
-            // The branch id is only consulted for pre-v5 transactions, whose
-            // encoding it does not change; v5 carries its own. Sprout
-            // JoinSplits exist only in v2-v4, before and after Canopy alike.
-            let joinsplits = joinsplits_in_block(block, BranchId::Canopy).map_err(|err| {
-                ZeckError::TransactionBuild(format!("block at height {height}: {err}"))
-            })?;
-
-            scanner
-                .scan_block_at(&joinsplits, *hash, height)
-                .map_err(|err| {
-                    ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
-                })?;
-            since_checkpoint += 1;
-            height += 1;
-        }
+        // position.
+        consume_page(
+            &mut scanner,
+            &page,
+            &mut height,
+            network,
+            tip_anchor,
+            checkpoint_file,
+        )?;
+        since_checkpoint += page.len() as u64;
 
         if since_checkpoint >= CHECKPOINT_EVERY {
             save_checkpoint(&scanner, network, checkpoint_file)?;
@@ -1281,8 +1268,64 @@ pub async fn run_sprout_scan_with_decrypt_from(
         .map_err(|err| ZeckError::TransactionBuild(format!("finishing the scan: {err}")))
 }
 
-/// One page of blocks, in chain order.
-type Page = Vec<([u8; 32], Vec<u8>)>;
+/// Check one page against the pinned checkpoints and the [`TipAnchor`], then
+/// scan it, advancing `height` past it.
+///
+/// Every hash in the page is checked before any block of it is scanned. A
+/// pinned block must be the block we were handed: cheap forged headers link
+/// to each other fine, but they cannot reproduce a real mainnet hash at a
+/// real height without doing the work. The checkpoints are keyed by true
+/// heights (genesis = 0), so each block is checked at its own height.
+///
+/// On a mismatch the scan stops — fail closed — but saves first, and the
+/// state it saves ends at the last block of the previous page. Checking the
+/// whole page up front is what makes that possible: no block of the
+/// mismatching page, including those before the mismatch (they came from the
+/// same peer, and the forgery may begin anywhere in the page), has reached
+/// the scanner when it is saved. Without the save a mismatch lost up to a
+/// page of work, despite the message telling the user to re-run.
+fn consume_page(
+    scanner: &mut SproutScanner,
+    page: &Page,
+    height: &mut u32,
+    network: P2pNetwork,
+    tip_anchor: Option<TipAnchor>,
+    checkpoint_file: &Path,
+) -> ZeckResult<()> {
+    for (offset, (hash, _)) in page.iter().enumerate() {
+        let at = *height + offset as u32;
+        let expected = crate::p2p::wire::checkpoint_at(network, at).or(tip_anchor
+            .filter(|anchor| anchor.height == at)
+            .map(|anchor| anchor.hash));
+        if expected.is_some_and(|expected| *hash != expected) {
+            save_before_stopping(scanner, network, checkpoint_file);
+            let saved = match scanner.cursor() {
+                Some(cursor) => format!("Progress up to height {} is saved.", cursor.last_height),
+                None => "Nothing had been scanned yet.".to_owned(),
+            };
+            return Err(ZeckError::Broadcast(format!(
+                "the chain this peer served does not match Zcash at height {at}. It is \
+                 serving a different or fabricated chain, so the scan stops rather than \
+                 search it. {saved} Re-run to pick another peer, or pass --peer with a \
+                 node you trust."
+            )));
+        }
+    }
+
+    for (hash, joinsplits) in page {
+        scanner
+            .scan_block_at(joinsplits, *hash, *height)
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!("scanning height {height}: {err}"))
+            })?;
+        *height += 1;
+    }
+    Ok(())
+}
+
+/// One page of blocks, in chain order: each block's hash and the JoinSplits
+/// of its authenticated body.
+type Page = Vec<([u8; 32], Vec<argos_wallet_import::keys::SproutJoinSplit>)>;
 
 /// The producer half of the scan: everything needed to pull validated pages
 /// from the network, and nothing about what is done with them.
@@ -1426,7 +1469,10 @@ impl PageFetcher {
     /// again" — the caller loops. An empty page means the chain tip was
     /// reached (see `empty_reply_is_chain_tip`). Every check that decides
     /// whether a page may be scanned at all lives here: proof of work,
-    /// continuity with the locator, and the internal linkage of the page.
+    /// continuity with the locator, the internal linkage of the page, and
+    /// each body's authentication against its header
+    /// ([`Self::authenticate_page`]). A failure of any of them is charged to
+    /// the serving peer and the page refetched from another.
     ///
     /// What deliberately does *not* live here is anything positional —
     /// checkpoint comparison and the tree append stay with the consumer, keyed
@@ -1517,11 +1563,24 @@ impl PageFetcher {
                 .await;
         }
         let hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
-        let mut blocks = match self.peer.get_blocks(&hashes).await {
+        let blocks = match self.peer.get_blocks(&hashes).await {
             Ok(b) => b,
             Err(err) => return self.on_request_failure(err, height).await,
         };
+        self.authenticate_page(&hashes, blocks, height).await
+    }
 
+    /// Turn the bodies fetched for `hashes` into a page, or reject them.
+    ///
+    /// `hashes` come from headers that have already passed proof of work and
+    /// linkage; `blocks` are what the peer sent for them, keyed by the hash
+    /// recomputed from each block's own header bytes.
+    async fn authenticate_page(
+        &mut self,
+        hashes: &[[u8; 32]],
+        mut blocks: std::collections::HashMap<[u8; 32], Vec<u8>>,
+        height: u32,
+    ) -> ZeckResult<Option<Page>> {
         // Assembled in header order, so the consumer receives the page already
         // in chain order and never has to trust the peer's reply order.
         //
@@ -1539,7 +1598,35 @@ impl PageFetcher {
                     height + offset as u32
                 )));
             };
-            page.push((*hash, block));
+            // The body must be the one the authenticated header commits to:
+            // every declared transaction parsed, nothing trailing, and the
+            // txid Merkle root equal to the header's. A body that fails is
+            // the serving peer's fault — the header and so the hash we asked
+            // for are already proven — so it is handled like any other bad
+            // reply: rotate, charge the budget, and fetch this same page
+            // again from the next peer (the locator has not moved). Fail
+            // closed: nothing reaches the consumer unless this returned `Ok`.
+            //
+            // The branch id is only consulted for pre-v5 transactions, whose
+            // encoding it does not change; v5 carries its own. Sprout
+            // JoinSplits exist only in v2-v4, before and after Canopy alike.
+            let joinsplits = match joinsplits_in_block(&block, BranchId::Canopy) {
+                Ok(joinsplits) => joinsplits,
+                Err(err) => {
+                    let at = height + offset as u32;
+                    return self
+                        .rotate(format!(
+                            "{} attempts in a row to fetch blocks from height {height} failed; \
+                             the most recent served a body for the block at height {at} that \
+                             does not match its header ({err}). The scan never uses an \
+                             unauthenticated block, so it stops here. Progress is saved; \
+                             re-run to pick other peers, or pass --peer with a node you trust.",
+                            self.empty_replies + 1
+                        ))
+                        .await;
+                }
+            };
+            page.push((*hash, joinsplits));
         }
 
         self.locator = *hashes.last().expect("non-empty");
@@ -2113,6 +2200,144 @@ mod tests {
         assert!(waits_rx.try_recv().is_err(), "and not announced as silence");
     }
 
+    /// A peer that completes the handshake on its first connection only, and
+    /// drops every later one before the handshake: once rotated away from,
+    /// it cannot be chosen again, so the test knows which peer comes next.
+    async fn one_connection_only_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(answer_handshake_only(stream));
+            }
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        addr
+    }
+
+    /// An honest block, and the same header over a substituted body: the
+    /// header (and so the block hash the peer was asked for) is unchanged,
+    /// only the transactions differ.
+    fn honest_and_forged_block() -> ([u8; 32], Vec<u8>, Vec<u8>) {
+        use crate::p2p::block::test_support::{legacy_test_transaction, test_block};
+        let honest_tx = legacy_test_transaction(1);
+        let forged_tx = legacy_test_transaction(2);
+        let honest = test_block(std::slice::from_ref(&honest_tx));
+        let mut forged = honest[..honest.len() - honest_tx.len()].to_vec();
+        forged.extend_from_slice(&forged_tx);
+        let hash = crate::p2p::block::block_hash(&honest).unwrap();
+        assert_eq!(crate::p2p::block::block_hash(&forged).unwrap(), hash);
+        (hash, honest, forged)
+    }
+
+    fn fetcher_on(peer: Peer, peers: Vec<String>) -> PageFetcher {
+        let (waits, _rx) = tokio::sync::mpsc::unbounded_channel();
+        PageFetcher {
+            peer,
+            locator: [7; 32],
+            empty_replies: 0,
+            fetched: 10,
+            floor: 0,
+            network: P2pNetwork::Regtest,
+            peers,
+            silent: Vec::new(),
+            silence_exclusion: PEER_RECONNECT_DELAY,
+            waits,
+        }
+    }
+
+    /// Review of #265: a body that fails authentication used to abort the
+    /// whole scan from the consumer, with no other peer tried. It is the
+    /// serving peer's failure: rotate away, charge the budget, and fetch the
+    /// same page again from the next peer — never scanning the forged body.
+    #[tokio::test]
+    async fn a_peer_serving_a_forged_body_is_rotated_away_and_the_page_refetched() {
+        let bad = one_connection_only_peer().await;
+        let good = silent_peer().await;
+        let first = connect_peer(P2pNetwork::Regtest, std::slice::from_ref(&bad), &[], |_| {})
+            .await
+            .unwrap();
+        let mut fetcher = fetcher_on(first, vec![bad.clone(), good.clone()]);
+        let (hash, honest, forged) = honest_and_forged_block();
+
+        let outcome = fetcher
+            .authenticate_page(
+                &[hash],
+                std::collections::HashMap::from([(hash, forged)]),
+                10,
+            )
+            .await
+            .expect("one forged body is within the budget");
+        assert!(outcome.is_none(), "the forged page is not handed on");
+        assert_eq!(fetcher.peer.dialled_as(), good, "rotated to the other peer");
+        assert_eq!(fetcher.empty_replies, 1, "charged against the budget");
+        assert!(fetcher.silent.is_empty(), "a forged body is not silence");
+        assert_eq!(fetcher.locator, [7; 32], "the same page is asked for again");
+
+        let page = fetcher
+            .authenticate_page(
+                &[hash],
+                std::collections::HashMap::from([(hash, honest)]),
+                10,
+            )
+            .await
+            .expect("the honest body authenticates")
+            .expect("and is a page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, hash);
+        assert!(
+            page[0].1.is_empty(),
+            "a coinbase-only block has no JoinSplits"
+        );
+        assert_eq!(fetcher.locator, hash, "the scan moves on past the page");
+        assert_eq!(
+            fetcher.empty_replies, 0,
+            "a delivered page resets the budget"
+        );
+    }
+
+    /// With no honest peer to be had, the budget still ends the scan, with
+    /// an error saying what to do.
+    #[tokio::test]
+    async fn forged_bodies_from_every_peer_exhaust_the_budget() {
+        let peer = silent_peer().await;
+        let first = connect_peer(
+            P2pNetwork::Regtest,
+            std::slice::from_ref(&peer),
+            &[],
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let mut fetcher = fetcher_on(first, vec![peer]);
+        let (hash, _, forged) = honest_and_forged_block();
+
+        let mut attempts = 0u32;
+        let err = loop {
+            attempts += 1;
+            match fetcher
+                .authenticate_page(
+                    &[hash],
+                    std::collections::HashMap::from([(hash, forged.clone())]),
+                    10,
+                )
+                .await
+            {
+                Ok(None) => continue,
+                Ok(Some(_)) => panic!("a forged body must never be handed on"),
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(attempts, MAX_EMPTY_REPLIES + 1);
+        let text = err.to_string();
+        assert!(text.contains("height 10"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert!(text.contains("re-run"), "{text}");
+        assert_eq!(fetcher.locator, [7; 32]);
+    }
+
     #[test]
     fn a_silent_peer_notice_says_why_and_what_happens_next() {
         let named = PeerWait {
@@ -2489,6 +2714,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_legacy_covering_scan_is_reported_but_not_used() {
+        for legacy in [2u8, 3] {
+            let dir = ScratchDir::new(&format!("legacy-superset-v{legacy}"));
+            let (a, b) = ([0x31; 32], [0x32; 32]);
+            let path = write_scan(&dir.0, &[a, b], 3_000_000, true);
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
+
+            let (chain, notice) = chain_spends_for_wallet(&dir.0, P2pNetwork::Mainnet, &[a]);
+            assert!(chain.is_none(), "v{legacy}");
+            let notice = notice.expect("old covering scan must be reported");
+            assert!(notice.contains("fresh scan"), "{notice}");
+            assert!(notice.contains(&path.display().to_string()), "{notice}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
+    }
+
     /// #240 finding 9, remaining half: opening a wallet asks for the scan
     /// twice (inspection, then preview). The second is served from memory
     /// until the file changes.
@@ -2657,6 +2901,46 @@ mod tests {
         assert!(chain.nullifiers.contains_key(&[0x99; 32]));
         assert!(chain.nullifiers.contains_key(&[0x72; 32]));
         assert_eq!(chain.scanned_to, 2_000_000);
+    }
+
+    #[test]
+    fn a_legacy_checkpoint_cannot_resume_a_scan() {
+        // v3 matters most: it is the decrypt-from layout already on main,
+        // written before bodies were authenticated.
+        for legacy in [2u8, 3] {
+            let dir = ScratchDir::new(&format!("legacy-resume-v{legacy}"));
+            let keys = [[0x11; 32]];
+            let path = checkpoint_path(&dir.0, &keys);
+            save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
+
+            let err = match load_checkpoint(&path, P2pNetwork::Mainnet, &keys) {
+                Err(err) => err,
+                Ok(_) => panic!("v{legacy} state predates body authentication"),
+            };
+            assert!(err.to_string().contains("fresh scan"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
+    }
+
+    #[test]
+    fn a_legacy_checkpoint_cannot_answer_wallet_file_spends() {
+        for legacy in [2u8, 3] {
+            let dir = ScratchDir::new(&format!("legacy-spends-v{legacy}"));
+            let keys = [[0x11; 32]];
+            let path = checkpoint_path(&dir.0, &keys);
+            save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+            let mut old_bytes = std::fs::read(&path).unwrap();
+            old_bytes[2] = legacy;
+            std::fs::write(&path, &old_bytes).unwrap();
+
+            let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
+                .expect_err("pre-v4 nullifiers predate body authentication");
+            assert!(err.to_string().contains("fresh scan"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        }
     }
 
     /// Kristi, #240 #10: the revealing txid is carried to the caller, so a
@@ -3044,5 +3328,109 @@ mod tests {
         // The file is kept: it is still a valid scan under its own bound.
         assert!(path.exists());
         discard_checkpoint(&path);
+    }
+
+    /// Review of #265, round 2: a hash mismatch against a pinned checkpoint
+    /// or the [`TipAnchor`] used to return without saving, losing up to a
+    /// page of work. It must still stop — fail closed — but first save what
+    /// was consumed before the mismatching page, and none of that page.
+    #[test]
+    fn a_hash_mismatch_saves_progress_before_the_page_and_none_of_it() {
+        let dir = ScratchDir::new("mismatch-save");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut scanner = SproutScanner::new(&keys);
+        let mut height = 1u32;
+
+        // An anchor further up, so the first page is checked against nothing
+        // and consumed. Nothing is saved yet: the page is under
+        // CHECKPOINT_EVERY.
+        let anchor = TipAnchor {
+            height: 5,
+            hash: [0xAA; 32],
+        };
+        let good: Page = vec![
+            ([1; 32], Vec::new()),
+            ([2; 32], Vec::new()),
+            ([3; 32], Vec::new()),
+        ];
+        consume_page(
+            &mut scanner,
+            &good,
+            &mut height,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &path,
+        )
+        .expect("an unanchored page is consumed");
+        assert_eq!(height, 4);
+        assert!(!path.exists(), "no checkpoint is due yet");
+
+        // The next page disagrees with the anchor at height 5. Height 4,
+        // before it in the same page, is from the same peer and is not kept.
+        let forged: Page = vec![
+            ([4; 32], Vec::new()),
+            ([5; 32], Vec::new()),
+            ([6; 32], Vec::new()),
+        ];
+        let err = consume_page(
+            &mut scanner,
+            &forged,
+            &mut height,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &path,
+        )
+        .expect_err("a mismatch stops the scan");
+        let text = err.to_string();
+        assert!(text.contains("height 5"), "{text}");
+        assert!(text.contains("Re-run"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert!(text.contains("saved"), "{text}");
+        assert_eq!(height, 4, "the scan does not advance into the forged page");
+
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+            .expect("the checkpoint loads")
+            .expect("progress before the forged page was saved");
+        let cursor = saved.cursor().expect("a cursor");
+        assert_eq!(
+            cursor.last_height, 3,
+            "up to the last block before the page"
+        );
+        assert_eq!(cursor.last_block_hash, [3; 32]);
+        assert!(
+            !saved.is_complete(),
+            "a stopped scan never reads as complete"
+        );
+    }
+
+    /// A mismatch on the first page of a fresh scan has nothing before it to
+    /// save, and must not claim "progress up to height 0".
+    #[test]
+    fn a_mismatch_on_the_first_page_does_not_claim_progress() {
+        let dir = ScratchDir::new("mismatch-first-page");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        let mut scanner = SproutScanner::new(&keys);
+        let mut height = 1u32;
+        let anchor = TipAnchor {
+            height: 1,
+            hash: [0xAA; 32],
+        };
+        let forged: Page = vec![([1; 32], Vec::new())];
+        let text = consume_page(
+            &mut scanner,
+            &forged,
+            &mut height,
+            P2pNetwork::Regtest,
+            Some(anchor),
+            &path,
+        )
+        .expect_err("a mismatch stops the scan")
+        .to_string();
+        assert!(!text.contains("height 0"), "{text}");
+        assert!(text.contains("Nothing had been scanned yet"), "{text}");
+        assert!(text.contains("--peer"), "{text}");
+        assert_eq!(height, 1);
     }
 }

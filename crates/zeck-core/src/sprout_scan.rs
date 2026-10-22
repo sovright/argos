@@ -130,8 +130,8 @@ pub struct SproutScanner {
     tree: IncrementalMerkleTree,
     pending: Vec<PendingNote>,
     /// Every nullifier seen, to tell a live note from a spent one, with the
-    /// transaction that revealed it. `None` only for nullifiers restored from
-    /// a version-1 checkpoint, which did not record it.
+    /// transaction that revealed it. `None` only in the version-1 layout,
+    /// which did not record it and is no longer resumed.
     spent: HashMap<[u8; 32], Option<[u8; 32]>>,
     progress: SproutScanProgress,
     cursor: ScanCursor,
@@ -467,21 +467,32 @@ pub struct SproutScanCheckpoint {
 /// no visible error.
 ///
 /// Version 2 records the revealing txid with each nullifier and a trailing
-/// completion byte. Version 1 is still read — a scan measured in hours must
-/// survive an upgrade mid-way — with no txids and `complete = false`.
+/// completion byte.
 ///
 /// Version 3 appends the decrypt-from bound: a flag byte, then the height as
-/// a u64 when set. Versions 1 and 2 read as no bound, which is what they
-/// were scanned under.
-const CHECKPOINT_VERSION: u8 = 3;
+/// a u64 when set.
+///
+/// Version 4 has exactly the version-3 layout, and records that every block
+/// body was authenticated against its header (transaction Merkle root) before
+/// this state was saved. Versions 1 to 3 predate that check and may contain a
+/// poisoned tree or nullifier set: only their key headers are read (so a
+/// covering file can still be reported), and they are refused for resume and
+/// for spend evidence. A user holding one must start a fresh scan, which also
+/// re-derives any decrypt-from bound.
+const CHECKPOINT_VERSION: u8 = 4;
 
-/// The oldest layout still read.
+/// The oldest layout whose header is still parsed. Layouts older than
+/// [`CHECKPOINT_VERSION`] are read only far enough to recover their key set
+/// ([`read_spending_keys`]); resume and spend evidence refuse them with
+/// [`CheckpointError::UnauthenticatedLegacy`].
 const OLDEST_READABLE_VERSION: u8 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
     #[error("this checkpoint was written by a different version of Argos and cannot be resumed")]
     WrongVersion,
+    #[error("this checkpoint predates Sprout block-body authentication")]
+    UnauthenticatedLegacy,
     #[error("the checkpoint file is corrupt or truncated")]
     Corrupt,
     #[error(transparent)]
@@ -548,6 +559,7 @@ pub fn read_chain_evidence(
 ) -> Result<ChainEvidence, CheckpointError> {
     let mut r = codec::Reader::new(checkpoint.as_bytes());
     let version = read_version(&mut r)?;
+    require_authenticated_version(version)?;
     r.bytes().ok_or(CheckpointError::Corrupt)?; // tree
 
     let key_count = r.u64().ok_or(CheckpointError::Corrupt)?;
@@ -597,6 +609,14 @@ fn read_version(r: &mut codec::Reader<'_>) -> Result<u8, CheckpointError> {
         Some(v) if (OLDEST_READABLE_VERSION..=CHECKPOINT_VERSION).contains(&v) => Ok(v),
         Some(_) => Err(CheckpointError::WrongVersion),
         None => Err(CheckpointError::Corrupt),
+    }
+}
+
+fn require_authenticated_version(version: u8) -> Result<(), CheckpointError> {
+    if version == CHECKPOINT_VERSION {
+        Ok(())
+    } else {
+        Err(CheckpointError::UnauthenticatedLegacy)
     }
 }
 
@@ -694,8 +714,9 @@ impl SproutScanner {
         self.encode(CHECKPOINT_VERSION)
     }
 
-    /// Write the given layout. Only the current one is written outside
-    /// tests; version 1 exists so its reader stays tested.
+    /// Write the given layout. Only [`CHECKPOINT_VERSION`] (4, body-authenticated)
+    /// is written outside tests; older layouts are generated to test that
+    /// they are refused.
     fn encode(&self, version: u8) -> SproutScanCheckpoint {
         use codec::{put_bytes, put_u64};
 
@@ -769,6 +790,7 @@ impl SproutScanner {
     pub fn resume(checkpoint: &SproutScanCheckpoint) -> Result<Self, CheckpointError> {
         let mut r = codec::Reader::new(checkpoint.as_bytes());
         let version = read_version(&mut r)?;
+        require_authenticated_version(version)?;
 
         let tree = IncrementalMerkleTree::parse(r.bytes().ok_or(CheckpointError::Corrupt)?)?;
 
@@ -1183,8 +1205,9 @@ mod tests {
         scanner.scan_block(&[js]).expect("scan");
         let anchor = scanner.anchor();
 
-        let resumed =
-            SproutScanner::resume(&scanner.checkpoint()).expect("an empty result must resume");
+        let checkpoint = scanner.checkpoint();
+        assert_eq!(checkpoint.as_bytes()[0], CHECKPOINT_VERSION);
+        let resumed = SproutScanner::resume(&checkpoint).expect("an empty result must resume");
         assert_eq!(resumed.anchor(), anchor);
         assert_eq!(resumed.progress(), scanner.progress());
     }
@@ -1296,10 +1319,10 @@ mod tests {
         assert_eq!(resumed.spent_nullifiers(), scanner.spent_nullifiers());
     }
 
-    /// A real user has a version-1 checkpoint mid-scan. It must still load
-    /// and resume: its nullifiers without txids, and not marked complete.
+    /// Legacy keys remain discoverable for covering-file detection, but
+    /// pre-authentication scan state cannot supply a tree or spend verdict.
     #[test]
-    fn a_version_1_checkpoint_still_resumes() {
+    fn a_version_1_checkpoint_is_not_scan_or_spend_evidence() {
         let a_sk = [0x42u8; 32];
         let (js, _) = joinsplit_paying(&a_sk, 1_000, 0, 70);
         let mut scanner = SproutScanner::new(&[a_sk]);
@@ -1308,19 +1331,32 @@ mod tests {
 
         let v1 = scanner.encode(1);
         assert_eq!(v1.as_bytes()[0], 1);
-        let resumed = SproutScanner::resume(&v1).expect("a v1 checkpoint resumes");
-        assert_eq!(resumed.cursor(), scanner.cursor());
-        assert_eq!(resumed.progress(), scanner.progress());
-        assert!(
-            !resumed.is_complete(),
-            "v1 recorded no completion, so none is claimed"
-        );
-        assert_eq!(resumed.spent_nullifiers().get(&[71u8; 32]), Some(&None));
-        assert_eq!(resumed.spent_nullifiers().len(), 2);
+        assert_eq!(read_spending_keys(v1.as_bytes()).unwrap(), vec![a_sk]);
+        assert!(matches!(
+            SproutScanner::resume(&v1),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v1),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+    }
 
-        let evidence = read_chain_evidence(&v1).expect("v1 reads as evidence");
-        assert!(!evidence.complete);
-        assert_eq!(evidence.spent.get(&[71u8; 32]), Some(&None));
+    #[test]
+    fn a_version_2_checkpoint_is_not_scan_or_spend_evidence() {
+        let a_sk = [0x42u8; 32];
+        let mut scanner = SproutScanner::new(&[a_sk]);
+        scanner.scan_block_at(&[], [0xAB; 32], 9).expect("scan");
+        let v2 = scanner.encode(2);
+        assert_eq!(read_spending_keys(v2.as_bytes()).unwrap(), vec![a_sk]);
+        assert!(matches!(
+            SproutScanner::resume(&v2),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
+        assert!(matches!(
+            read_chain_evidence(&v2),
+            Err(CheckpointError::UnauthenticatedLegacy)
+        ));
     }
 
     /// Kristi, #240 #3: a scan that died early left a valid checkpoint
@@ -1484,12 +1520,26 @@ mod tests {
         let resumed = SproutScanner::resume(&none.checkpoint()).expect("resume");
         assert_eq!(resumed.decrypt_from_height(), None);
 
-        // Older layouts never skipped anything.
-        for version in [1, 2] {
+        // Older layouts, the bound-carrying v3 included, predate body
+        // authentication: neither the bound nor anything else in them is
+        // trusted, from either reader.
+        for version in [1, 2, 3] {
             let old = scanner.encode(version);
-            let resumed = SproutScanner::resume(&old).expect("an old checkpoint resumes");
-            assert_eq!(resumed.decrypt_from_height(), None, "v{version}");
-            assert_eq!(read_chain_evidence(&old).unwrap().decrypt_from_height, None);
+            assert!(
+                matches!(
+                    SproutScanner::resume(&old),
+                    Err(CheckpointError::UnauthenticatedLegacy)
+                ),
+                "v{version}"
+            );
+            assert!(
+                matches!(
+                    read_chain_evidence(&old),
+                    Err(CheckpointError::UnauthenticatedLegacy)
+                ),
+                "v{version}"
+            );
+            assert_eq!(read_spending_keys(old.as_bytes()).unwrap(), vec![a_sk]);
         }
 
         // A damaged bound is corruption, not "no bound".
