@@ -2295,34 +2295,15 @@ pub fn save_checkpoint(
             })?;
         }
     }
-    // Written to a temporary file and renamed, so an interrupt during the
-    // write cannot leave a half-written checkpoint where a good one was —
-    // that would turn a recoverable pause into a restart from genesis.
-    // A unique, create-new sibling keeps separate scan processes from
-    // removing or renaming each other's partially written checkpoints.
+    // Written to a private create-new sibling, synced, and renamed while a
+    // platform-correct parent-directory handle stays open. An interrupt
+    // cannot leave a half-written checkpoint where a good one was, and a
+    // Windows directory is never opened as an ordinary file after mutation.
     remove_stale_temp_files(path);
-    let tmp = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
     let mut bytes = vec![NETWORK_TAGGED, network_tag(network)];
     bytes.extend_from_slice(scanner.checkpoint().as_bytes());
-    write_private(&tmp, &bytes)?;
-    let result = std::fs::rename(&tmp, path).map_err(|err| {
-        ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}"))
-    });
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| {
-                ZeckError::TransactionBuild(format!(
-                    "syncing checkpoint directory {}: {err}",
-                    parent.display()
-                ))
-            })?;
-    }
-    Ok(())
+    crate::private_fs::write_private_file_atomic(path, &bytes)
+        .map_err(|err| ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}")))
 }
 
 /// Save on the way out of a failed scan, so the saved-progress claim in its
@@ -2361,27 +2342,6 @@ const fn legacy_scan_end(network: P2pNetwork) -> Option<u32> {
         P2pNetwork::Testnet => Some(1_028_500),
         P2pNetwork::Regtest => None,
     }
-}
-
-/// Create at 0600 and write, so a spend-capable file is never briefly
-/// world-readable between creation and a later chmod.
-fn write_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
-    use std::io::Write;
-    let mut file =
-        crate::private_fs::open_private_file(path, crate::private_fs::PrivateOpenMode::CreateNew)
-            .map_err(|err| {
-            ZeckError::TransactionBuild(format!("creating {}: {err}", path.display()))
-        })?;
-    // Flushed to disk before the caller renames it into place, so a power
-    // loss cannot leave the new name pointing at bytes never written.
-    if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(ZeckError::TransactionBuild(format!(
-            "writing the scan checkpoint: {err}"
-        )));
-    }
-    Ok(())
 }
 
 /// Delete a checkpoint and any abandoned temporary siblings.
@@ -3311,6 +3271,30 @@ mod tests {
                 .unwrap()
                 .last_height,
             3
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_checkpoint_replace_syncs_its_private_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private-checkpoints");
+        crate::private_fs::create_private_dir_all(&dir).unwrap();
+        let path = checkpoint_path(&dir, &[[0x11; 32]]);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let mut replacement = reorg_scanner();
+        replacement
+            .scan_block_at(&[joinsplit_revealing([0xFA; 32])], [4; 32], 4)
+            .unwrap();
+        save_checkpoint(&replacement, P2pNetwork::Regtest, &path).unwrap();
+        assert_eq!(
+            load_checkpoint(&path, P2pNetwork::Regtest, &[[0x11; 32]])
+                .unwrap()
+                .unwrap()
+                .cursor()
+                .unwrap()
+                .last_height,
+            4
         );
     }
 

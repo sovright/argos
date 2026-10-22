@@ -209,7 +209,7 @@ fn private_temporary(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("private");
-    path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()))
+    path.with_file_name(format!("{name}.{}.tmp", uuid::Uuid::new_v4()))
 }
 
 #[cfg(windows)]
@@ -228,8 +228,8 @@ mod windows_acl {
 
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
-            ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+            CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
+            INVALID_HANDLE_VALUE,
         },
         Security::{
             AclSizeInformation, AddAccessAllowedAceEx,
@@ -243,10 +243,12 @@ mod windows_acl {
             SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
-            CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ALL_ACCESS, FILE_APPEND_DATA,
-            FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
-            WRITE_DAC,
+            CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            CREATE_NEW, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            READ_CONTROL, WRITE_DAC,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -578,17 +580,89 @@ mod windows_acl {
         Ok(file)
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FileIdentity {
+        volume: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+
+    fn directory_identity(directory: &std::fs::File) -> io::Result<FileIdentity> {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe {
+            GetFileInformationByHandle(directory.as_raw_handle() as HANDLE, &mut information)
+        } == 0
+        {
+            return Err(last_error());
+        }
+        if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private directory must be a non-reparse directory",
+            ));
+        }
+        Ok(FileIdentity {
+            volume: information.dwVolumeSerialNumber,
+            index_high: information.nFileIndexHigh,
+            index_low: information.nFileIndexLow,
+        })
+    }
+
+    fn ensure_same_directory(
+        expected: FileIdentity,
+        actual: &std::fs::File,
+        description: &str,
+    ) -> io::Result<()> {
+        if directory_identity(actual)? != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("private directory {description} changed during creation"),
+            ));
+        }
+        Ok(())
+    }
+
     fn create_directory(path: &Path) -> io::Result<()> {
+        create_directory_with_observer(path, |_| Ok(()))
+    }
+
+    pub(super) fn create_directory_with_observer(
+        path: &Path,
+        observer: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private directory has no parent",
+            )
+        })?;
+        let pinned_parent = open_directory(parent, READ_CONTROL)?;
+        let parent_identity = directory_identity(&pinned_parent)?;
         let security = PrivateSecurity::new(true)?;
         let path_wide = wide(path)?;
         if unsafe { CreateDirectoryW(path_wide.as_ptr(), security.attributes()) } == 0 {
             return Err(last_error());
         }
+        observer(path)?;
+        let current_parent = open_directory(parent, READ_CONTROL)?;
+        ensure_same_directory(parent_identity, &current_parent, "parent")?;
         let directory = open_directory(path, READ_CONTROL | WRITE_DAC)?;
-        security.verify(&directory)
+        let directory_identity = directory_identity(&directory)?;
+        security.verify(&directory)?;
+        let current_directory = open_directory(path, READ_CONTROL)?;
+        ensure_same_directory(directory_identity, &current_directory, "path")
     }
 
     pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
+        create_dir_all_with_before_create(path, |_| Ok(()))
+    }
+
+    pub(super) fn create_dir_all_with_before_create(
+        path: &Path,
+        mut before_create: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -605,42 +679,31 @@ mod windows_acl {
                 )
             })?;
         }
-        for directory in missing.iter().rev() {
-            match create_directory(directory) {
-                Ok(()) => {}
-                Err(err)
-                    if err
-                        .raw_os_error()
-                        .map(|code| code as u32)
-                        .is_some_and(|code| {
-                            code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS
-                        }) =>
-                {
-                    harden_directory(directory)?;
-                }
-                Err(err) => return Err(err),
-            }
+        if missing.is_empty() {
+            return harden_directory(&path);
         }
-        harden_directory(&path)
+        for directory in missing.iter().rev() {
+            before_create(directory)?;
+            // A path that appears after the missing-component walk belongs
+            // to a racing process. Never accept or harden that object: its
+            // creator can retain a handle with broader rights.
+            create_directory(directory)?;
+        }
+        Ok(())
     }
 
     fn open_directory(path: &Path, access: u32) -> io::Result<std::fs::File> {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
-            .access_mode(access)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-        options.open(path)
+            .access_mode(access | FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let directory = options.open(path)?;
+        directory_identity(&directory)?;
+        Ok(directory)
     }
 
     pub(super) fn harden_directory(path: &Path) -> io::Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private directory must not be a symlink or non-directory",
-            ));
-        }
         let directory = open_directory(path, READ_CONTROL | WRITE_DAC)?;
         harden(&directory, true)
     }
@@ -944,6 +1007,75 @@ mod windows_tests {
             .open(&path)
             .unwrap();
         unsafe { assert_private_acl(&file, false) };
+    }
+
+    #[test]
+    fn windows_directory_creation_collision_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("colliding-private");
+        let err = super::windows_acl::create_dir_all_with_before_create(&path, |candidate| {
+            fs::create_dir(candidate)?;
+            let directory = OpenOptions::new()
+                .read(true)
+                .access_mode(READ_CONTROL | WRITE_DAC)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(candidate)?;
+            unsafe { set_world_access(&directory, true) };
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            err.raw_os_error()
+                .map(|code| code as u32)
+                .is_some_and(|code| {
+                    code == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS
+                        || code == windows_sys::Win32::Foundation::ERROR_FILE_EXISTS
+                }),
+            "unexpected collision error: {err}"
+        );
+        let directory = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        assert!(
+            super::windows_acl::verify_current(&directory, true).is_err(),
+            "a raced-in directory must not be accepted or hardened"
+        );
+    }
+
+    #[test]
+    fn windows_directory_creation_detects_parent_substitution_before_hardening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let moved_parent = tmp.path().join("moved-parent");
+        create_private_dir_all(&parent).unwrap();
+        let path = parent.join("private");
+        let err = super::windows_acl::create_directory_with_observer(&path, |_| {
+            fs::rename(&parent, &moved_parent)?;
+            fs::create_dir(&parent)?;
+            fs::create_dir(&path)?;
+            let replacement = OpenOptions::new()
+                .read(true)
+                .access_mode(READ_CONTROL | WRITE_DAC)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&path)?;
+            unsafe { set_world_access(&replacement, true) };
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let replacement = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        assert!(
+            super::windows_acl::verify_current(&replacement, true).is_err(),
+            "the substituted directory must not be hardened"
+        );
     }
 
     #[test]
