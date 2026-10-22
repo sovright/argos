@@ -610,11 +610,13 @@ mod unix_private {
 
     fn open_cleanup_directory(parent: &File) -> io::Result<File> {
         let name = c_string(OsStr::new(CLEANUP_DIRECTORY_NAME), "cleanup directory name")?;
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
+        if !created {
             let error = last_error();
             if error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(error);
             }
+            return open_staging_directory(parent.as_raw_fd(), &name);
         }
         let directory = open_owned_directory(parent.as_raw_fd(), &name)?;
         remove_extended_acl(&directory)?;
@@ -1071,6 +1073,54 @@ mod unix_private {
             assert!(
                 !removable.exists(),
                 "one hostile candidate prevented cleanup of another secret"
+            );
+        }
+
+        #[test]
+        fn cleanup_directory_collision_is_never_hardened_in_place() {
+            let tmp = tempfile::tempdir().unwrap();
+            let collision = tmp.path().join(CLEANUP_DIRECTORY_NAME);
+            fs::create_dir(&collision).unwrap();
+            fs::set_permissions(&collision, fs::Permissions::from_mode(0o750)).unwrap();
+            fs::write(collision.join("owner-data"), b"must survive").unwrap();
+            let parent = open_directory(tmp.path()).unwrap();
+
+            let error = open_cleanup_directory(&parent).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(collision.metadata().unwrap().mode() & 0o777, 0o750);
+            assert_eq!(
+                fs::read(collision.join("owner-data")).unwrap(),
+                b"must survive"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn cleanup_directory_collision_keeps_its_existing_acl() {
+            use std::process::Command;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let collision = tmp.path().join(CLEANUP_DIRECTORY_NAME);
+            fs::create_dir(&collision).unwrap();
+            fs::set_permissions(&collision, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(Command::new("chmod")
+                .arg("+a")
+                .arg("everyone allow read,search,list")
+                .arg(&collision)
+                .status()
+                .unwrap()
+                .success());
+            let parent = open_directory(tmp.path()).unwrap();
+            let name =
+                c_string(OsStr::new(CLEANUP_DIRECTORY_NAME), "cleanup directory name").unwrap();
+            let collision_handle = open_owned_directory(parent.as_raw_fd(), &name).unwrap();
+            assert!(verify_no_extended_acl(&collision_handle).is_err());
+
+            assert!(open_cleanup_directory(&parent).is_err());
+            assert!(
+                verify_no_extended_acl(&collision_handle).is_err(),
+                "collision ACL was changed before cleanup failed"
             );
         }
     }
