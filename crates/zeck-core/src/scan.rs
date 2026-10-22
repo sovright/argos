@@ -755,13 +755,8 @@ async fn run_recovery_scan_inner(
             }
         }
 
-        let import_mode = match &config.transparent_scan {
-            Some(range) => TransparentImportMode::Range {
-                account: &transparent_account,
-                config: range,
-            },
-            None => TransparentImportMode::Legacy(&transparent_account),
-        };
+        let import_mode =
+            hd_transparent_import_mode(config.transparent_scan.as_ref(), &transparent_account);
         // On a gap extension the wallet database has already scanned to the
         // tip, so this rebuilds it with every account rather than importing
         // the new ones into it (see `prepare_scan_accounts`).
@@ -1054,6 +1049,7 @@ async fn run_standalone_leg(
     } else {
         leg.hd_birthday
     };
+    rebuild_for_mixed_keys_if_scanned(&leg, keys).await?;
     if !register_mixed_keys(
         leg.state,
         leg.workspace,
@@ -1077,6 +1073,121 @@ async fn run_standalone_leg(
     Ok(true)
 }
 
+/// The standalone Sapling keys [`register_mixed_keys`] would register beside
+/// `hd_rows`: each standalone key once, skipping any that is one of the HD
+/// accounts' own Sapling keys. Shared with
+/// [`rebuild_for_mixed_keys_if_scanned`] so the rebuild decision and the
+/// registration cannot disagree about which accounts are new.
+fn select_mixed_sapling(
+    hd_rows: &[TrackedAccount],
+    keys: &argos_wallet_import::ImportedKeys,
+    seed: &[u8; 64],
+    network: crate::models::ZeckNetwork,
+) -> ZeckResult<Vec<(usize, sapling_crypto::zip32::ExtendedSpendingKey)>> {
+    use crate::imported::parse_sapling_extsk;
+    use argos_wallet_import::Provenance;
+
+    let mut sapling_seen = std::collections::HashSet::new();
+    for row in hd_rows {
+        if let TrackedSpendAuthority::Hd { zip32_index } = row.spend_authority {
+            let index = AccountId::try_from(zip32_index).map_err(|_| {
+                ZeckError::InvalidConfig(format!("account index {zip32_index} is out of range"))
+            })?;
+            let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), index);
+            sapling_seen.insert(extsk.to_diversifiable_full_viewing_key().to_bytes());
+        }
+    }
+    let mut selected = Vec::new();
+    for (key_index, key) in keys.sapling.iter().enumerate() {
+        if key.provenance != Provenance::Standalone {
+            continue;
+        }
+        let extsk = parse_sapling_extsk(key.extsk.expose_secret())?;
+        let identity = extsk.to_diversifiable_full_viewing_key().to_bytes();
+        if sapling_seen.insert(identity) {
+            selected.push((key_index, extsk));
+        }
+    }
+    Ok(selected)
+}
+
+/// Before the standalone leg registers its Sapling keys as accounts, rebuild
+/// the wallet database if it has already scanned blocks and lacks any of
+/// them.
+///
+/// The leg runs after the HD gap loop has synced to the tip, so
+/// `register_mixed_keys`' `import_account_ufvk` would be the same
+/// consecutive `add_account` into a scanned database that
+/// [`prepare_scan_accounts`] avoids for HD accounts: a second standalone
+/// key fails with "the Sapling note commitment tree retains checkpoints
+/// both above and below height ...". The rebuilt database holds the HD
+/// accounts exactly as the gap loop imported them (same derivation, same
+/// birthday, same transparent receivers); `register_mixed_keys` then adds
+/// the standalone keys to it before anything is scanned. Standalone
+/// transparent keys alone never trigger this: attaching a receiver does not
+/// rewind the wallet.
+async fn rebuild_for_mixed_keys_if_scanned(
+    leg: &StandaloneLeg<'_>,
+    keys: &argos_wallet_import::ImportedKeys,
+) -> ZeckResult<()> {
+    let network = leg.config.network;
+    let hd_rows = leg.state.lock().await.tracked_accounts.clone();
+    let selected = select_mixed_sapling(&hd_rows, keys, leg.seed, network)?;
+    if selected.is_empty() {
+        return Ok(());
+    }
+    {
+        let wallet_db = open_wallet_db(leg.workspace.wallet_db_path(), consensus_network(network))?;
+        let scanned = wallet_db
+            .block_max_scanned()
+            .map_err(|err| ZeckError::Wallet(format!("reading the highest scanned block: {err}")))?
+            .is_some();
+        if !scanned {
+            return Ok(());
+        }
+        let mut missing = false;
+        for (_, extsk) in &selected {
+            let ufvk = crate::imported::sapling_ufvk(extsk)?;
+            if wallet_db
+                .get_account_for_ufvk(&ufvk)
+                .map_err(|err| {
+                    ZeckError::Wallet(format!("looking up mixed imported account: {err}"))
+                })?
+                .is_none()
+            {
+                missing = true;
+                break;
+            }
+        }
+        if !missing {
+            return Ok(());
+        }
+    }
+
+    let transparent_account = legacy_transparent_account_key_from_seed(network, leg.seed)?;
+    let hd_accounts = derive_scan_accounts(
+        leg.seed,
+        network,
+        leg.hd_accounts,
+        leg.config.transparent_scan.as_ref(),
+    )?;
+    rebuild_wallet_db(
+        leg.workspace,
+        network,
+        leg.seed,
+        leg.hd_birthday,
+        &hd_transparent_import_mode(leg.config.transparent_scan.as_ref(), &transparent_account),
+        &hd_accounts,
+        leg.state,
+    )
+    .await?;
+    info!(
+        "rebuilt the wallet database with accounts 0 through {} before registering standalone keys",
+        leg.hd_accounts.saturating_sub(1)
+    );
+    Ok(())
+}
+
 /// Register independently imported keys after the HD gap has been resolved.
 /// This keeps the HD search boundary independent of funds in standalone keys
 /// while giving both authorities one wallet database and one final sync.
@@ -1089,22 +1200,11 @@ async fn register_mixed_keys(
     network: crate::models::ZeckNetwork,
     hd_count: u32,
 ) -> ZeckResult<bool> {
-    use crate::imported::{
-        imported_account_display, imported_transparent_keys, parse_sapling_extsk, sapling_ufvk,
-    };
+    use crate::imported::{imported_account_display, imported_transparent_keys, sapling_ufvk};
     use argos_wallet_import::Provenance;
 
     let hd_rows = state.lock().await.tracked_accounts.clone();
-    let mut sapling_seen = std::collections::HashSet::new();
-    for row in &hd_rows {
-        if let TrackedSpendAuthority::Hd { zip32_index } = row.spend_authority {
-            let index = AccountId::try_from(zip32_index).map_err(|_| {
-                ZeckError::InvalidConfig(format!("account index {zip32_index} is out of range"))
-            })?;
-            let extsk = zcash_keys::keys::sapling::spending_key(seed, network.coin_type(), index);
-            sapling_seen.insert(extsk.to_diversifiable_full_viewing_key().to_bytes());
-        }
-    }
+    let selected_sapling = select_mixed_sapling(&hd_rows, keys, seed, network)?;
     let mut transparent_seen: std::collections::HashSet<TransparentAddress> = hd_rows
         .iter()
         .flat_map(|row| {
@@ -1114,18 +1214,6 @@ async fn register_mixed_keys(
                 .copied()
         })
         .collect();
-    let mut selected_sapling = Vec::new();
-    for (key_index, key) in keys.sapling.iter().enumerate() {
-        if key.provenance != Provenance::Standalone {
-            continue;
-        }
-        let extsk = parse_sapling_extsk(key.extsk.expose_secret())?;
-        let identity = extsk.to_diversifiable_full_viewing_key().to_bytes();
-        if sapling_seen.insert(identity) {
-            selected_sapling.push((key_index, extsk));
-        }
-    }
-
     let resolved = imported_transparent_keys(keys)?;
     let mut selected_transparent = Vec::new();
     for (key_index, key) in keys.transparent.iter().enumerate() {
@@ -1896,9 +1984,8 @@ async fn prepare_scan_accounts(
         return Ok(AccountPreparation::Imported);
     }
 
-    let rebuilt = workspace.begin_wallet_db_rebuild(network, seed)?;
-    let tracked = import_accounts_into(
-        &rebuilt,
+    rebuild_wallet_db(
+        workspace,
         network,
         seed,
         birthday,
@@ -1907,11 +1994,55 @@ async fn prepare_scan_accounts(
         state,
     )
     .await?;
-    workspace.commit_wallet_db_rebuild(&rebuilt)?;
+    Ok(AccountPreparation::Rebuilt)
+}
+
+/// Replace the workspace's wallet database with a fresh one holding exactly
+/// the HD `accounts`, imported before any block is scanned, and make
+/// `tracked_accounts` describe them.
+async fn rebuild_wallet_db(
+    workspace: &RecoveryWorkspace,
+    network: crate::models::ZeckNetwork,
+    seed: &[u8; 64],
+    birthday: &AccountBirthday,
+    transparent_mode: &TransparentImportMode<'_>,
+    accounts: &[DerivedAccount],
+    state: &SharedScanTaskState,
+) -> ZeckResult<()> {
+    // Dropped on any early return below (a failed import, or the scan
+    // cancelled mid-import), which deletes the half-built database.
+    let rebuilt = workspace.begin_wallet_db_rebuild(network, seed)?;
+    let tracked = import_accounts_into(
+        rebuilt.path(),
+        network,
+        seed,
+        birthday,
+        transparent_mode,
+        accounts,
+        state,
+    )
+    .await?;
+    workspace.commit_wallet_db_rebuild(rebuilt)?;
     // Account ids are per-database, so every previously tracked id now
     // points at nothing. Replace, never extend.
     state.lock().await.tracked_accounts = tracked;
-    Ok(AccountPreparation::Rebuilt)
+    Ok(())
+}
+
+/// How the HD scan attaches transparent receivers: the configured index
+/// range, or the legacy ZecWallet Lite receiver. One function so the gap
+/// loop and the standalone leg's rebuild cannot import differently.
+fn hd_transparent_import_mode<'a>(
+    transparent_scan: Option<&'a crate::models::TransparentScanConfig>,
+    transparent_account: &'a zcash_transparent::keys::AccountPrivKey,
+) -> TransparentImportMode<'a> {
+    match transparent_scan {
+        Some(range) => TransparentImportMode::Range {
+            account: transparent_account,
+            config: range,
+        },
+        None => TransparentImportMode::Legacy(transparent_account),
+    }
 }
 
 /// True when the wallet database at `path` has scanned at least one block
@@ -5637,6 +5768,317 @@ mod tests {
             );
             assert_holds_accounts(&scanned, 6);
             assert_eq!(scanned.state.lock().await.tracked_accounts.len(), 6);
+        }
+
+        /// Review on #279: the user's actual resume. An earlier run imported
+        /// one extension account into the scanned database and failed on
+        /// the next. The resumed first pass reuses that database and really
+        /// syncs it (including the requeue the stray import left), and only
+        /// then does the extension rebuild it, which must still work.
+        #[tokio::test]
+        async fn resume_syncs_the_half_extended_wallet_before_rebuilding_it() {
+            let scanned = scanned_workspace().await;
+            import_accounts(
+                &scanned.workspace,
+                ZeckNetwork::Mainnet,
+                scanned.seed(),
+                &divergence_birthday(),
+                &scanned.transparent_account,
+                &scanned.accounts[2..3],
+                &scanned.state,
+            )
+            .await
+            .expect("the first import into a scanned wallet succeeds upstream");
+
+            // Fresh process: nothing tracked yet.
+            scanned.state.lock().await.tracked_accounts.clear();
+            assert_eq!(
+                scanned.prepare(2, 0).await.unwrap(),
+                AccountPreparation::Imported
+            );
+            scan_fake_chain(
+                scanned.workspace.wallet_db_path(),
+                DIVERGENCE_START,
+                DIVERGENCE_BLOCKS,
+                100,
+                &divergence_activity,
+            )
+            .await;
+            let tip = BlockHeight::from_u32(DIVERGENCE_START + DIVERGENCE_BLOCKS - 1);
+            assert_eq!(
+                scanned
+                    .wallet_db()
+                    .block_max_scanned()
+                    .unwrap()
+                    .map(|m| m.block_height()),
+                Some(tip),
+                "the resumed first pass syncs the reused database to the tip"
+            );
+            assert_holds_accounts(&scanned, 3);
+
+            assert_eq!(
+                scanned.prepare(6, 2).await.expect("resumed extension"),
+                AccountPreparation::Rebuilt
+            );
+            assert_holds_accounts(&scanned, 6);
+            assert!(scanned.wallet_db().block_max_scanned().unwrap().is_none());
+            let tracked = scanned.state.lock().await.tracked_accounts.clone();
+            let indices: Vec<u32> = tracked.iter().map(|t| t.derived.index).collect();
+            assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+
+            scan_fake_chain(
+                scanned.workspace.wallet_db_path(),
+                DIVERGENCE_START,
+                DIVERGENCE_BLOCKS,
+                100,
+                &divergence_activity,
+            )
+            .await;
+            assert_eq!(
+                scanned
+                    .wallet_db()
+                    .block_max_scanned()
+                    .unwrap()
+                    .map(|m| m.block_height()),
+                Some(tip)
+            );
+        }
+
+        /// Review nit 3 on #279: a rebuild abandoned partway (here, the scan
+        /// is cancelled while the accounts are being imported) deletes the
+        /// half-built database, which holds viewing keys, and leaves the
+        /// live one exactly as it was.
+        #[tokio::test]
+        async fn a_cancelled_rebuild_leaves_no_rebuild_file_and_keeps_the_old_wallet() {
+            let scanned = scanned_workspace().await;
+            let before = scanned
+                .wallet_db()
+                .block_max_scanned()
+                .unwrap()
+                .map(|m| m.block_height());
+            assert!(before.is_some());
+            scanned
+                .state
+                .lock()
+                .await
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let range = crate::models::TransparentScanConfig {
+                index_start: 0,
+                index_count: 1,
+                include_change: false,
+            };
+            let err = prepare_scan_accounts(
+                &scanned.workspace,
+                ZeckNetwork::Mainnet,
+                scanned.seed(),
+                &divergence_birthday(),
+                TransparentImportMode::Range {
+                    account: &scanned.transparent_account,
+                    config: &range,
+                },
+                &scanned.accounts[..6],
+                2,
+                &scanned.state,
+            )
+            .await
+            .expect_err("a cancelled rebuild must not commit");
+            assert!(
+                matches!(err, crate::error::ZeckError::Cancelled),
+                "unexpected failure: {err}"
+            );
+            let leftovers: Vec<_> = std::fs::read_dir(scanned.workspace.root())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("rebuild"))
+                .collect();
+            assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+            assert_holds_accounts(&scanned, 2);
+            assert_eq!(
+                scanned
+                    .wallet_db()
+                    .block_max_scanned()
+                    .unwrap()
+                    .map(|m| m.block_height()),
+                before
+            );
+        }
+
+        /// A Combined source (seed plus standalone Sapling keys) registers
+        /// its standalone keys only after the HD gap is resolved, so by then
+        /// the wallet database has scanned to the tip, often after a gap
+        /// extension that already rebuilt it. Registering two standalone
+        /// accounts into that scanned database is the same consecutive
+        /// `add_account` that corrupts a gap extension, so the standalone leg
+        /// must rebuild too, and the rebuild must carry both the HD accounts
+        /// and every standalone account.
+        #[tokio::test]
+        async fn a_mixed_rebuild_after_gap_extension_keeps_the_standalone_accounts() {
+            use crate::imported::{parse_sapling_extsk, sapling_ufvk};
+            use crate::key_source::ImportedKeySource;
+            use secrecy::ExposeSecret as _;
+
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut config = test_config(tempdir.path().to_owned());
+            config.birthday = DIVERGENCE_START;
+            config.num_accounts = None;
+            let keys = argos_wallet_import::ImportedKeys {
+                mnemonic: Some(test_seed_phrase()),
+                sapling: vec![standalone_sapling(0x61), standalone_sapling(0x62)],
+                // At the HD birthday, so the leg registers with `hd_birthday`.
+                birthday_height: Some(DIVERGENCE_START),
+                ..Default::default()
+            };
+            let standalone_ufvks: Vec<_> = keys
+                .sapling
+                .iter()
+                .map(|key| sapling_ufvk(&parse_sapling_extsk(key.extsk.expose_secret()).unwrap()))
+                .collect::<Result<_, _>>()
+                .unwrap();
+            config.key_source = Arc::new(ImportedKeySource::new(keys));
+            let seed = config.key_source.wallet_seed().unwrap().unwrap();
+            let workspace = RecoveryWorkspace::from_runtime(&config).unwrap();
+            workspace
+                .initialize_from_source(config.network, config.key_source.as_ref())
+                .unwrap();
+            let accounts = derive_accounts_from_seed(&seed, config.network, 6).unwrap();
+            let t_account =
+                legacy_transparent_account_key_from_seed(config.network, &seed).unwrap();
+            let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
+            let hd_birthday = divergence_birthday();
+            let prepare = |target: usize, new_from: usize| {
+                prepare_scan_accounts(
+                    &workspace,
+                    config.network,
+                    &seed,
+                    &hd_birthday,
+                    TransparentImportMode::Legacy(&t_account),
+                    &accounts[..target],
+                    new_from,
+                    &state,
+                )
+            };
+            let activity: &dyn Fn(u32) -> (u32, u32) = &divergence_activity;
+            let scan = || {
+                scan_fake_chain(
+                    workspace.wallet_db_path(),
+                    DIVERGENCE_START,
+                    DIVERGENCE_BLOCKS,
+                    100,
+                    activity,
+                )
+            };
+            let db = || {
+                open_wallet_db(
+                    workspace.wallet_db_path(),
+                    consensus_network(config.network),
+                )
+                .unwrap()
+            };
+
+            // The HD gap loop: first batch, scan, extend (rebuild), scan.
+            assert_eq!(prepare(2, 0).await.unwrap(), AccountPreparation::Imported);
+            scan().await;
+            assert_eq!(prepare(6, 2).await.unwrap(), AccountPreparation::Rebuilt);
+            scan().await;
+            assert!(
+                db().block_max_scanned().unwrap().is_some(),
+                "the standalone leg must start from a scanned database or this proves nothing"
+            );
+
+            let mut chain = RecordingChain::default();
+            let ran = super::super::run_standalone_leg(
+                super::super::StandaloneLeg {
+                    state: &state,
+                    workspace: &workspace,
+                    config: &config,
+                    seed: &seed,
+                    hd_birthday: &hd_birthday,
+                    hd_start: DIVERGENCE_START,
+                    sapling_floor: 419_201,
+                    hd_accounts: 6,
+                },
+                &mut chain,
+            )
+            .await
+            .expect("registering standalone keys after a scan must not corrupt the database");
+            assert!(ran);
+            assert_eq!(chain.synced_from, vec![DIVERGENCE_START]);
+
+            let db_now = db();
+            assert!(
+                db_now.block_max_scanned().unwrap().is_none(),
+                "standalone accounts must be registered into a rebuilt, unscanned database"
+            );
+            let db_ids = db_now.get_account_ids().unwrap();
+            assert_eq!(db_ids.len(), 8, "6 HD accounts plus 2 standalone accounts");
+            let fingerprint = zip32::fingerprint::SeedFingerprint::from_seed(&seed).unwrap();
+            for account in &accounts {
+                let derivation = zcash_client_backend::data_api::Zip32Derivation::new(
+                    fingerprint,
+                    zip32::AccountId::try_from(account.index).unwrap(),
+                );
+                assert!(
+                    db_now.get_derived_account(&derivation).unwrap().is_some(),
+                    "HD account {} lost in the rebuild",
+                    account.index
+                );
+            }
+            for (index, ufvk) in standalone_ufvks.iter().enumerate() {
+                assert!(
+                    db_now.get_account_for_ufvk(ufvk).unwrap().is_some(),
+                    "standalone key {index} lost in the rebuild"
+                );
+            }
+
+            let guard = state.lock().await;
+            assert_eq!(guard.standalone_sapling_indices, vec![0, 1]);
+            let hd: Vec<u32> = guard
+                .tracked_accounts
+                .iter()
+                .filter_map(|row| match row.spend_authority {
+                    TrackedSpendAuthority::Hd { zip32_index } => Some(zip32_index),
+                    TrackedSpendAuthority::ImportedSapling { .. } => None,
+                })
+                .collect();
+            assert_eq!(hd, vec![0, 1, 2, 3, 4, 5]);
+            let standalone: Vec<_> = guard
+                .tracked_accounts
+                .iter()
+                .filter_map(|row| match row.spend_authority {
+                    TrackedSpendAuthority::ImportedSapling {
+                        key_index,
+                        wallet_account_id,
+                    } => Some((key_index, wallet_account_id)),
+                    TrackedSpendAuthority::Hd { .. } => None,
+                })
+                .collect();
+            assert_eq!(standalone.len(), 2);
+            for (key_index, wallet_account_id) in &standalone {
+                assert_eq!(
+                    db_now
+                        .get_account_for_ufvk(&standalone_ufvks[*key_index])
+                        .unwrap()
+                        .map(|account| account.id()),
+                    Some(*wallet_account_id),
+                    "tracked standalone account {key_index} must point into the live database"
+                );
+            }
+            for row in &guard.tracked_accounts {
+                assert!(db_ids.contains(&row.wallet_account_id), "stale tracked id");
+            }
+            drop(guard);
+            drop(db_now);
+
+            // The rebuilt database rescans to the tip.
+            scan().await;
+            assert_eq!(
+                db().block_max_scanned().unwrap().map(|m| m.block_height()),
+                Some(BlockHeight::from_u32(
+                    DIVERGENCE_START + DIVERGENCE_BLOCKS - 1
+                ))
+            );
         }
     }
 
