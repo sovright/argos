@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::Cursor,
+    fs::OpenOptions,
+    io::{Cursor, Seek, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -76,7 +77,10 @@ fn broadcast_lock_path(path: &Path) -> ZeckResult<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TxObservationState {
+    /// An independent pair of operators agree on the block and height.
     Mined,
+    /// Block evidence from one operator only, with no source disagreeing.
+    MinedSingleSource,
     PresentUnmined,
     Absent,
     Reorged,
@@ -104,6 +108,22 @@ pub struct TxObservation {
     pub evidence: Vec<EndpointTxEvidence>,
 }
 
+/// Blocks past a transaction's expiry height before one source's report of
+/// absence (from chain and mempool) is enough to mark it Expired.
+///
+/// An expired transaction can never be mined. A server that lies about the
+/// absence can therefore at worst lead the user to rebuild a transaction
+/// that spends the same inputs, and consensus rejects whichever of the two
+/// arrives second; the destination is fixed by the reviewed request, so no
+/// value can be redirected. The margin absorbs ordinary tip skew and a short
+/// reorg around the expiry height, which is why a single configured source
+/// suffices.
+pub const EXPIRY_MARGIN_BLOCKS: u32 = 20;
+
+/// Confirmations a corroborated (independent-pair) Mined transaction needs
+/// before Argos tells the user the source keys may be discarded.
+pub const MIN_DISCARD_CONFIRMATIONS: u32 = 10;
+
 fn independent_evidence_sources(a: &EndpointTxEvidence, b: &EndpointTxEvidence) -> bool {
     let a_operator = canonical_confirmation_operator_id(&a.operator_id, &a.endpoint);
     let b_operator = canonical_confirmation_operator_id(&b.operator_id, &b.endpoint);
@@ -129,19 +149,63 @@ fn has_independent_pair(evidence: &[&EndpointTxEvidence]) -> bool {
 }
 
 impl TxObservation {
+    /// Corroborated mining: an independent pair agree, and the evidence
+    /// re-derives the same state and height.
     pub fn has_canonical_mined_evidence(&self) -> bool {
-        self.state == TxObservationState::Mined
-            && self.mined_height.is_some()
-            && observe_transaction(self.evidence.clone(), self.expiry_height).mined_height
-                == self.mined_height
+        self.state == TxObservationState::Mined && self.rederives_own_state()
     }
 
-    /// Expiry needs independent absence after the transaction's expiry height.
+    /// Mining reported by one operator only. Resolved for continuing a
+    /// recovery, never for telling the user to discard the source keys.
+    pub fn has_single_source_mined_evidence(&self) -> bool {
+        self.state == TxObservationState::MinedSingleSource && self.rederives_own_state()
+    }
+
+    pub fn state_is_mined(&self) -> bool {
+        matches!(
+            self.state,
+            TxObservationState::Mined | TxObservationState::MinedSingleSource
+        )
+    }
+
+    fn rederives_own_state(&self) -> bool {
+        let recomputed = observe_transaction(self.evidence.clone(), self.expiry_height);
+        self.mined_height.is_some()
+            && recomputed.state == self.state
+            && recomputed.mined_height == self.mined_height
+    }
+
+    /// Confirmations of a mined transaction according to the least advanced
+    /// source that reported its block.
+    pub fn confirmations(&self) -> Option<u32> {
+        let height = self.mined_height?;
+        self.evidence
+            .iter()
+            .filter(|item| item.tx_in_block && item.reported_height == Some(height))
+            .filter_map(|item| item.tip_height)
+            .map(|tip| tip.saturating_sub(height).saturating_add(1))
+            .min()
+    }
+
+    /// Corroborated, and deep enough that a reorg is no longer a practical
+    /// concern. Only this permits a "safe to discard the source" message.
+    pub fn is_safe_to_discard(&self) -> bool {
+        self.has_canonical_mined_evidence()
+            && self
+                .confirmations()
+                .is_some_and(|depth| depth >= MIN_DISCARD_CONFIRMATIONS)
+    }
+
+    /// Any configured source reporting the transaction absent from chain and
+    /// mempool at a tip strictly above `expiry_height + EXPIRY_MARGIN_BLOCKS`,
+    /// with no source reporting it present. See [`EXPIRY_MARGIN_BLOCKS`] for
+    /// why one source suffices. An expiry height of zero means the
+    /// transaction never expires.
     pub fn is_expired(&self) -> bool {
         if self.state != TxObservationState::Absent || self.mined_height.is_some() {
             return false;
         }
-        let Some(expiry_height) = self.expiry_height else {
+        let Some(expiry_height) = self.expiry_height.filter(|height| *height != 0) else {
             return false;
         };
         if self.evidence.iter().any(|item| {
@@ -149,15 +213,11 @@ impl TxObservation {
         }) {
             return false;
         }
-        let absent_after_expiry = self
-            .evidence
-            .iter()
-            .filter(|item| {
-                !item.operator_id.trim().is_empty()
-                    && item.tip_height.is_some_and(|tip| tip > expiry_height)
-            })
-            .collect::<Vec<_>>();
-        has_independent_pair(&absent_after_expiry)
+        let threshold = expiry_height.saturating_add(EXPIRY_MARGIN_BLOCKS);
+        self.evidence.iter().any(|item| {
+            normalized_confirmation_authority(&item.endpoint).is_some()
+                && item.tip_height.is_some_and(|tip| tip > threshold)
+        })
     }
 }
 
@@ -229,6 +289,11 @@ pub fn observe_transaction(
     if reported_heights.len() > 1 {
         contested = true;
     }
+    // One source's orphan sentinel against sources that still place the
+    // transaction in a block is a disagreement, not a positive reorg.
+    if reorged && !claims.is_empty() {
+        contested = true;
+    }
     let (state, mined_height) = if contested {
         (TxObservationState::Contested, None)
     } else if reorged {
@@ -238,11 +303,16 @@ pub fn observe_transaction(
             TxObservationState::Mined,
             claims.first().and_then(|item| item.reported_height),
         )
+    } else if !claims.is_empty() {
+        (
+            TxObservationState::MinedSingleSource,
+            claims.first().and_then(|item| item.reported_height),
+        )
     } else if claimed_height {
         (TxObservationState::Unavailable, None)
     } else if present_unmined {
         (TxObservationState::PresentUnmined, None)
-    } else if has_independent_pair(&absent_sources) {
+    } else if !absent_sources.is_empty() {
         (TxObservationState::Absent, None)
     } else {
         (TxObservationState::Unavailable, None)
@@ -491,7 +561,7 @@ where
     store.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)?;
     let disposition = match tokio::time::timeout(
         deadline.min(Duration::from_secs(30)),
-        network.send_raw(persisted.prepared.raw_tx),
+        network.send_raw(persisted.prepared.raw_tx.clone()),
     )
     .await
     {
@@ -500,12 +570,22 @@ where
     };
     let state = match disposition {
         SubmissionDisposition::Accepted => TxLifecycleState::Pending,
+        // A definite consensus rejection resolves the record: a new review may
+        // start, and these bytes are never resent automatically. A primary
+        // that forwards the bytes and then fabricates the rejection can at
+        // worst cause a rebuilt transaction that conflicts on the same inputs
+        // and is rejected by consensus; the destination is fixed.
+        SubmissionDisposition::DeterministicRejection { .. }
+            if rejection_can_be_definitive(&persisted) =>
+        {
+            TxLifecycleState::Rejected
+        }
+        SubmissionDisposition::DeterministicRejection { .. } => TxLifecycleState::SubmissionUnknown,
         SubmissionDisposition::AmbiguousTransport
         | SubmissionDisposition::AlreadyKnown
-        | SubmissionDisposition::RetryableRejection { .. }
-        | SubmissionDisposition::DeterministicRejection { .. } => {
-            // A primary may forward the bytes and then fabricate a rejection.
-            // Only an independent observation can discharge the fee risk.
+        | SubmissionDisposition::RetryableRejection { .. } => {
+            // A lost reply or an inconclusive refusal stays blocking until an
+            // observation resolves whether the transaction reached the network.
             TxLifecycleState::SubmissionUnknown
         }
     };
@@ -542,6 +622,11 @@ enum BroadcastLogEvent {
         state: TxLifecycleState,
         submission: Option<SubmissionDisposition>,
         observation: Option<TxObservation>,
+        /// Written by submitters that treat a deterministic node rejection as
+        /// final. Older journal entries lack it and replay a Rejected record
+        /// conservatively as SubmissionUnknown.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        definitive_rejection: bool,
     },
 }
 
@@ -611,14 +696,39 @@ pub(crate) struct LegacyBroadcastGuards {
 }
 
 impl DurableBroadcastLog {
-    /// Any unresolved submission must be reconciled before a fresh sweep can
-    /// construct or submit another transaction.
+    /// Any unresolved submission must be reconciled before a fresh review or
+    /// execution can start. Mined (by any operator), Expired, and Rejected
+    /// records are resolved.
     pub fn blocking_submission(&self) -> Option<TxId> {
         self.latest.iter().find_map(|(txid, persisted)| {
             (persisted.state == TxLifecycleState::SubmissionUnknown
                 || persisted.state == TxLifecycleState::Pending)
                 .then_some(*txid)
         })
+    }
+
+    /// Within one reviewed execution, later legs spend disjoint reviewed
+    /// inputs, so an earlier leg that was accepted (Pending) does not stop
+    /// them. Only an outcome that is not yet known -- a lost reply, or a
+    /// retryable refusal -- blocks the next submission.
+    pub fn blocking_next_leg(&self) -> Option<TxId> {
+        self.latest.iter().find_map(|(txid, persisted)| {
+            (persisted.state == TxLifecycleState::SubmissionUnknown
+                || (persisted.state == TxLifecycleState::Pending
+                    && matches!(
+                        persisted.last_submission,
+                        Some(SubmissionDisposition::RetryableRejection { .. })
+                    )))
+            .then_some(*txid)
+        })
+    }
+
+    /// Prepared bytes that never reached a submission attempt (a crash
+    /// between persisting and sending).
+    pub fn has_not_submitted(&self) -> bool {
+        self.latest
+            .values()
+            .any(|record| record.state == TxLifecycleState::NotSubmitted)
     }
 
     pub fn has_unresolved_history(&self) -> bool {
@@ -1011,12 +1121,7 @@ impl DurableBroadcastLog {
         self.latest.clear();
         let path = self.path.clone();
         let bytes = self.read_path(&path)?.unwrap_or_default();
-        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-            return Err(ZeckError::Storage(format!(
-                "incomplete broadcast log at {}: final event has no newline",
-                path.display()
-            )));
-        }
+        let bytes = self.repair_unterminated_tail(bytes)?;
         if bytes.is_empty() {
             return Ok(());
         }
@@ -1050,6 +1155,92 @@ impl DurableBroadcastLog {
             self.apply_event(event, true)?;
         }
         Ok(())
+    }
+
+    /// A crash can leave the final event without its newline. Events are
+    /// appended as one buffer and acknowledged only after a sync, so:
+    ///
+    /// - a final fragment that does not parse as an event was never
+    ///   acknowledged; standalone logs truncate it away so the earlier synced
+    ///   state stands. Namespace-held logs refuse it until the namespace can
+    ///   perform an exact replacement transition;
+    /// - a final event that parses was fully written; its newline is added so
+    ///   the next append starts on a clean line.
+    ///
+    /// Any unparseable line before the last still refuses the journal.
+    /// Runs only under the exclusive journal lock held by `open`.
+    fn repair_unterminated_tail(&mut self, mut bytes: Vec<u8>) -> ZeckResult<Vec<u8>> {
+        if bytes.is_empty() || bytes.ends_with(b"\n") {
+            return Ok(bytes);
+        }
+        let tail_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let complete = serde_json::from_slice::<BroadcastLogEvent>(&bytes[tail_start..]).is_ok();
+        if let Some(namespace) = &self.namespace {
+            if !complete {
+                return Err(ZeckError::Storage(format!(
+                    "incomplete broadcast log at {}: the retained private namespace cannot discard a torn final event without an exact replacement transition",
+                    self.path.display()
+                )));
+            }
+            let (current, object_id) = namespace.read_child_version(&self.path).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "reading {} before tail repair: {err}",
+                    self.path.display()
+                ))
+            })?;
+            if current != bytes {
+                return Err(ZeckError::Storage(format!(
+                    "broadcast log {} changed before tail repair",
+                    self.path.display()
+                )));
+            }
+            namespace
+                .append_child_if_unchanged(&self.path, Some((&object_id, &current)), b"\n")
+                .map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "terminating final event in {}: {err}",
+                        self.path.display()
+                    ))
+                })?;
+            self.verify_namespace()?;
+            bytes.push(b'\n');
+            return Ok(bytes);
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|err| {
+                ZeckError::Storage(format!("opening {} for repair: {err}", self.path.display()))
+            })?;
+        let repaired = if complete {
+            let mut file = file;
+            file.seek(std::io::SeekFrom::End(0))
+                .and_then(|_| file.write_all(b"\n"))
+                .and_then(|_| file.sync_all())
+                .map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "terminating final event in {}: {err}",
+                        self.path.display()
+                    ))
+                })?;
+            bytes.push(b'\n');
+            bytes
+        } else {
+            file.set_len(tail_start as u64)
+                .and_then(|_| file.sync_all())
+                .map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "dropping torn final event in {}: {err}",
+                        self.path.display()
+                    ))
+                })?;
+            bytes.truncate(tail_start);
+            bytes
+        };
+        Ok(repaired)
     }
 
     fn append_event(&mut self, event: BroadcastLogEvent) -> ZeckResult<()> {
@@ -1196,6 +1387,7 @@ impl DurableBroadcastLog {
                 state,
                 submission,
                 observation,
+                definitive_rejection,
                 ..
             } => {
                 let txid = TxId::from_bytes(txid);
@@ -1213,6 +1405,7 @@ impl DurableBroadcastLog {
                 )?;
                 let existing = self.latest.get_mut(&txid).expect("checked above");
                 existing.state = if legacy_replay
+                    && !definitive_rejection
                     && state == TxLifecycleState::Rejected
                     && matches!(
                         submission.as_ref(),
@@ -1234,6 +1427,23 @@ impl DurableBroadcastLog {
     }
 }
 
+/// A rejection is final only for bytes that no earlier reply or observation
+/// ever placed on the network. Once a node accepted them, or a source saw
+/// them, a later rejection (for example of a resend) proves nothing.
+fn rejection_can_be_definitive(existing: &PersistedTransaction) -> bool {
+    !matches!(
+        existing.last_submission,
+        Some(SubmissionDisposition::Accepted | SubmissionDisposition::AlreadyKnown)
+    ) && !existing.observation.as_ref().is_some_and(|item| {
+        matches!(
+            item.state,
+            TxObservationState::Mined
+                | TxObservationState::MinedSingleSource
+                | TxObservationState::PresentUnmined
+        )
+    })
+}
+
 pub(crate) fn validate_transition(
     existing: &PersistedTransaction,
     state: TxLifecycleState,
@@ -1252,7 +1462,10 @@ pub(crate) fn validate_transition(
         TxLifecycleState::SubmissionUnknown => {
             !matches!(
                 existing.state,
-                TxLifecycleState::Mined | TxLifecycleState::Rejected | TxLifecycleState::Expired
+                TxLifecycleState::Mined
+                    | TxLifecycleState::MinedSingleSource
+                    | TxLifecycleState::Rejected
+                    | TxLifecycleState::Expired
             ) && observation.is_none()
                 && matches!(
                     submission,
@@ -1284,15 +1497,14 @@ pub(crate) fn validate_transition(
                             | TxObservationState::Unavailable
                     )
                 );
-            let mined_reorg = existing.state == TxLifecycleState::Mined
+            // Only a positive observation demotes a mined record: a reorg
+            // sentinel or absence from a source, or the transaction seen back
+            // in a mempool. A timeout (Unavailable) or a disagreement
+            // (Contested) leaves it mined.
+            let mined_reorg = existing.state.is_mined()
                 && (matches!(
                     observation.map(|item| &item.state),
-                    Some(
-                        TxObservationState::Reorged
-                            | TxObservationState::Contested
-                            | TxObservationState::Absent
-                            | TxObservationState::Unavailable
-                    )
+                    Some(TxObservationState::Reorged | TxObservationState::Absent)
                 ) || (positive_presence
                     && matches!(
                         observation.map(|item| &item.state),
@@ -1335,9 +1547,9 @@ pub(crate) fn validate_transition(
                 )
                 && !matches!(
                     effective_observation.map(|item| &item.state),
-                    Some(TxObservationState::Mined)
+                    Some(TxObservationState::Mined | TxObservationState::MinedSingleSource)
                 )
-                && (existing.state != TxLifecycleState::Mined || mined_reorg)
+                && (!existing.state.is_mined() || mined_reorg)
                 && !matches!(
                     existing.state,
                     TxLifecycleState::Rejected | TxLifecycleState::Expired
@@ -1356,6 +1568,32 @@ pub(crate) fn validate_transition(
                     Some(SubmissionDisposition::DeterministicRejection { .. })
                 )
         }
+        TxLifecycleState::MinedSingleSource => {
+            observation
+                .or(existing.observation.as_ref())
+                .is_some_and(TxObservation::has_single_source_mined_evidence)
+                && !matches!(
+                    existing.state,
+                    TxLifecycleState::Mined
+                        | TxLifecycleState::Rejected
+                        | TxLifecycleState::Expired
+                )
+                && !matches!(
+                    submission,
+                    Some(SubmissionDisposition::DeterministicRejection { .. })
+                )
+        }
+        TxLifecycleState::Rejected if !legacy_replay => {
+            // Only the reply to the submission that just went out, and only
+            // when nothing ever showed the bytes reaching the network.
+            existing.state == TxLifecycleState::SubmissionUnknown
+                && matches!(
+                    submission,
+                    Some(SubmissionDisposition::DeterministicRejection { .. })
+                )
+                && observation.is_none()
+                && rejection_can_be_definitive(existing)
+        }
         TxLifecycleState::Rejected => {
             legacy_replay
                 && matches!(
@@ -1364,13 +1602,15 @@ pub(crate) fn validate_transition(
                 )
                 && !matches!(
                     existing.state,
-                    TxLifecycleState::Mined | TxLifecycleState::Expired
+                    TxLifecycleState::Mined
+                        | TxLifecycleState::MinedSingleSource
+                        | TxLifecycleState::Expired
                 )
                 && !matches!(
                     observation
                         .or(existing.observation.as_ref())
                         .map(|item| &item.state),
-                    Some(TxObservationState::Mined)
+                    Some(TxObservationState::Mined | TxObservationState::MinedSingleSource)
                 )
         }
         TxLifecycleState::Expired => {
@@ -1449,6 +1689,7 @@ impl BroadcastStore for DurableBroadcastLog {
             state,
             submission: submission.cloned(),
             observation: observation.cloned(),
+            definitive_rejection: state == TxLifecycleState::Rejected,
         })
     }
 
@@ -1625,6 +1866,7 @@ mod tests {
             txid: tx.txid.into(),
             state: TxLifecycleState::Pending,
             submission: None,
+            definitive_rejection: false,
             observation: Some(TxObservation {
                 state: TxObservationState::Absent,
                 mined_height: None,
@@ -1727,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_post_io_rejected_replays_as_unknown_and_new_rejected_is_refused() {
+    fn legacy_post_io_rejected_replays_as_unknown_and_new_rejected_is_final() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
         let tx = fixture();
@@ -1774,8 +2016,48 @@ mod tests {
         fresh
             .transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
             .unwrap();
-        let before = fs::read(&fresh_path).unwrap();
-        assert!(fresh
+        fresh
+            .transition(
+                tx.txid,
+                TxLifecycleState::Rejected,
+                Some(&SubmissionDisposition::DeterministicRejection {
+                    code: -26,
+                    reason: "invalid proof".to_owned(),
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(fresh.blocking_submission(), None);
+        assert!(!fresh.has_unresolved_history());
+        drop(fresh);
+        // Written by the current submitter, so replay keeps it final rather
+        // than demoting it like the legacy entry above.
+        let fresh_reopened = DurableBroadcastLog::open(&fresh_path).unwrap();
+        assert_eq!(
+            fresh_reopened.latest(tx.txid).unwrap().state,
+            TxLifecycleState::Rejected
+        );
+        assert!(!fresh_reopened.has_unresolved_history());
+    }
+
+    #[test]
+    fn rejection_after_acceptance_is_not_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("accepted.jsonl")).unwrap();
+        let tx = fixture();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        log.transition(
+            tx.txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        assert!(log
             .transition(
                 tx.txid,
                 TxLifecycleState::Rejected,
@@ -1786,7 +2068,6 @@ mod tests {
                 None,
             )
             .is_err());
-        assert_eq!(fs::read(&fresh_path).unwrap(), before);
     }
 
     #[test]
@@ -1952,6 +2233,7 @@ mod tests {
             txid: tx.txid.into(),
             state: TxLifecycleState::Pending,
             submission: None,
+            definitive_rejection: false,
             observation: Some(TxObservation {
                 state: TxObservationState::Unavailable,
                 mined_height: None,
@@ -2208,16 +2490,16 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn hostile_deterministic_reply_keeps_prepared_bytes_unknown_and_blocks_followup() {
+    async fn deterministic_rejection_is_resolved_without_resend() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
         let mut store = DurableBroadcastLog::open(&path).unwrap();
         let tx = fixture();
-        struct HostileSubmitter {
+        struct RejectingSubmitter {
             sent: Vec<Vec<u8>>,
         }
         #[async_trait::async_trait]
-        impl TxSubmitter for HostileSubmitter {
+        impl TxSubmitter for RejectingSubmitter {
             async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
                 self.sent.push(raw);
                 Ok(SendResponse {
@@ -2226,26 +2508,37 @@ mod tests {
                 })
             }
         }
-        let mut node = HostileSubmitter { sent: vec![] };
+        let mut node = RejectingSubmitter { sent: vec![] };
         let result =
             submit_prepared_transaction(&mut store, &mut node, tx.clone(), Duration::from_secs(30))
                 .await
                 .unwrap();
+        // Exactly one send: no automatic resend after a definite rejection.
         assert_eq!(node.sent, vec![tx.raw_tx.clone()]);
-        assert_eq!(result.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(result.state, TxLifecycleState::Rejected);
         assert!(matches!(
             result.disposition,
             SubmissionDisposition::DeterministicRejection { .. }
         ));
-        assert!(result.blocks_followup_submission());
-        assert!(result.state.fee_is_at_risk());
+        assert!(!result.blocks_followup_submission());
+        assert!(!result.state.fee_is_at_risk());
         assert_eq!(result.fee_zatoshis, tx.fee_zatoshis);
-        assert_eq!(store.blocking_submission(), Some(tx.txid));
+        // Resolved: a fresh review may start.
+        assert_eq!(store.blocking_submission(), None);
+        assert!(!store.has_unresolved_history());
+        // And the stored bytes are never eligible for an explicit resend.
+        assert!(
+            resubmit_prepared_transaction(&mut store, &mut node, &tx, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(node.sent.len(), 1);
         drop(store);
         let reopened = DurableBroadcastLog::open(&path).unwrap();
         let saved = reopened.latest(tx.txid).unwrap();
         assert_eq!(saved.prepared.raw_tx, tx.raw_tx);
-        assert_eq!(saved.state, TxLifecycleState::SubmissionUnknown);
+        assert_eq!(saved.state, TxLifecycleState::Rejected);
+        assert!(!reopened.has_unresolved_history());
     }
     #[tokio::test]
     async fn duplicate_response_remains_unknown_until_observed() {
@@ -2667,17 +2960,85 @@ mod tests {
         );
         drop(log);
 
+        let synced = fs::read(&path).unwrap();
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(br#"{"schema_version":1,"kind":"state_changed""#)
             .unwrap();
         file.sync_all().unwrap();
-        let before = fs::read(&path).unwrap();
 
-        assert!(matches!(
-            DurableBroadcastLog::open(&path),
-            Err(crate::ZeckError::Storage(_))
-        ));
-        assert_eq!(fs::read(&path).unwrap(), before);
+        // A torn, unparseable final fragment was never acknowledged: it is
+        // dropped instead of refusing the journal forever, and it cannot
+        // upgrade the last synced state.
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(
+            log.latest(txid).unwrap().state,
+            TxLifecycleState::NotSubmitted
+        );
+        assert_eq!(fs::read(&path).unwrap(), synced);
+        // Later appends land on a clean line boundary.
+        log.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        drop(log);
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .latest(txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[test]
+    fn complete_final_event_without_newline_is_kept_and_terminated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        drop(log);
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, &bytes).unwrap();
+
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        assert_eq!(
+            log.latest(tx.txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+        log.transition(
+            tx.txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+        drop(log);
+        assert_eq!(
+            DurableBroadcastLog::open(&path)
+                .unwrap()
+                .latest(tx.txid)
+                .unwrap()
+                .state,
+            TxLifecycleState::Pending
+        );
+    }
+
+    #[test]
+    fn corrupt_middle_line_still_refuses_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = fixture();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        drop(log);
+        let mut bytes = b"{not json}\n".to_vec();
+        bytes.extend(fs::read(&path).unwrap());
+        fs::write(&path, &bytes).unwrap();
+        assert!(DurableBroadcastLog::open(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
@@ -2876,7 +3237,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_needs_two_distinct_absent_operators_beyond_stored_height() {
+    fn expiry_needs_one_absent_source_beyond_the_expiry_margin() {
         let absent = |operator_id: &str, tip_height, tx_in_block| EndpointTxEvidence {
             operator_id: operator_id.to_owned(),
             endpoint: format!("https://{operator_id}.example"),
@@ -2885,23 +3246,77 @@ mod tests {
             block_hash: None,
             tx_in_block,
         };
+        let margin_tip = 100 + EXPIRY_MARGIN_BLOCKS;
         let mut observation = TxObservation {
             state: TxObservationState::Absent,
             mined_height: None,
             expiry_height: Some(100),
-            primary_tip: Some(101),
-            secondary_tip: Some(101),
-            evidence: vec![absent("one", 101, false), absent("one", 101, false)],
+            primary_tip: Some(margin_tip),
+            secondary_tip: None,
+            evidence: vec![absent("one", margin_tip, false)],
         };
+        // At the margin is not past it.
         assert!(!observation.is_expired());
-        observation.evidence[1].operator_id = "two".to_owned();
-        observation.evidence[1].endpoint = "https://two.example".to_owned();
-        observation.evidence[1].tip_height = Some(100);
-        assert!(!observation.is_expired());
-        observation.evidence[1].tip_height = Some(101);
+        // One configured source past the margin suffices.
+        observation.evidence[0].tip_height = Some(margin_tip + 1);
         assert!(observation.is_expired());
-        observation.evidence[1].tx_in_block = true;
+        // Unlabelled (custom primary) sources count as configured sources.
+        observation.evidence[0].operator_id = String::new();
+        assert!(observation.is_expired());
+        // Any presence claim defeats expiry.
+        observation.evidence[0].tx_in_block = true;
         assert!(!observation.is_expired());
+        observation.evidence[0].tx_in_block = false;
+        // An unusable endpoint is not a source.
+        observation.evidence[0].endpoint.clear();
+        assert!(!observation.is_expired());
+    }
+
+    #[test]
+    fn zero_expiry_height_never_expires() {
+        let observation = TxObservation {
+            state: TxObservationState::Absent,
+            mined_height: None,
+            expiry_height: Some(0),
+            primary_tip: Some(u32::MAX),
+            secondary_tip: Some(u32::MAX),
+            evidence: ["one", "two"]
+                .into_iter()
+                .map(|id| EndpointTxEvidence {
+                    operator_id: id.to_owned(),
+                    endpoint: format!("https://{id}.example"),
+                    tip_height: Some(u32::MAX),
+                    reported_height: None,
+                    block_hash: None,
+                    tx_in_block: false,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            observe_transaction(observation.evidence.clone(), Some(0)).state,
+            TxObservationState::Absent
+        );
+        assert!(!observation.is_expired());
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("never.jsonl")).unwrap();
+        let txid = TxId::from_bytes([77; 32]);
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![77],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(0),
+        })
+        .unwrap();
+        log.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        assert!(log
+            .transition(txid, TxLifecycleState::Expired, None, Some(&observation))
+            .is_err());
+        assert_eq!(
+            crate::reconciliation::record_observation(&mut log, txid, &observation).unwrap(),
+            TxLifecycleState::SubmissionUnknown
+        );
+        assert_eq!(log.blocking_submission(), Some(txid));
     }
 
     fn confirmation_evidence(
@@ -2921,7 +3336,7 @@ mod tests {
     }
 
     #[test]
-    fn one_reported_height_is_not_canonical_mined() {
+    fn one_reported_height_is_single_source_not_canonical_mined() {
         let observation = observe_transaction(
             vec![confirmation_evidence(
                 "one",
@@ -2931,8 +3346,54 @@ mod tests {
             )],
             Some(130),
         );
-        assert_eq!(observation.state, TxObservationState::Unavailable);
-        assert_eq!(observation.mined_height, None);
+        assert_eq!(observation.state, TxObservationState::MinedSingleSource);
+        assert_eq!(observation.mined_height, Some(100));
+        assert!(observation.has_single_source_mined_evidence());
+        assert!(!observation.has_canonical_mined_evidence());
+        assert!(!observation.is_safe_to_discard());
+    }
+
+    #[test]
+    fn one_orphan_sentinel_against_an_agreeing_pair_is_contested() {
+        let observation = observe_transaction(
+            vec![
+                confirmation_evidence("one", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("two", Some(100), Some(&[1; 32]), true),
+                confirmation_evidence("three", Some(u32::MAX), None, false),
+            ],
+            Some(130),
+        );
+        assert_eq!(observation.state, TxObservationState::Contested);
+    }
+
+    #[test]
+    fn safe_to_discard_needs_corroboration_and_depth() {
+        let at_tip = |operator: &str, tip: u32| {
+            let mut item = confirmation_evidence(operator, Some(100), Some(&[1; 32]), true);
+            item.tip_height = Some(tip);
+            item
+        };
+        let shallow = observe_transaction(
+            vec![
+                // A block at height 100 seen from tip 100 has one confirmation.
+                at_tip("one", 100 + MIN_DISCARD_CONFIRMATIONS - 2),
+                at_tip("two", 140),
+            ],
+            Some(130),
+        );
+        assert!(shallow.has_canonical_mined_evidence());
+        assert_eq!(shallow.confirmations(), Some(MIN_DISCARD_CONFIRMATIONS - 1));
+        assert!(!shallow.is_safe_to_discard());
+        let deep = observe_transaction(
+            vec![
+                at_tip("one", 100 + MIN_DISCARD_CONFIRMATIONS - 1),
+                at_tip("two", 140),
+            ],
+            Some(130),
+        );
+        assert!(deep.is_safe_to_discard());
+        let single = observe_transaction(vec![at_tip("one", 200)], Some(130));
+        assert!(!single.is_safe_to_discard());
     }
 
     #[test]
@@ -2975,7 +3436,7 @@ mod tests {
             ],
             Some(130),
         );
-        assert_eq!(observation.state, TxObservationState::Unavailable);
+        assert_eq!(observation.state, TxObservationState::MinedSingleSource);
     }
 
     #[test]
@@ -3084,7 +3545,7 @@ mod tests {
             ],
             Some(130),
         );
-        assert_eq!(observation.state, TxObservationState::Unavailable);
+        assert_eq!(observation.state, TxObservationState::MinedSingleSource);
     }
 
     #[test]
@@ -3092,14 +3553,10 @@ mod tests {
         let mut second = confirmation_evidence(" one ", None, None, false);
         second.endpoint = "https://other.example".to_owned();
         let evidence = vec![confirmation_evidence("one", None, None, false), second];
-        let observation = observe_transaction(evidence.clone(), Some(100));
-        assert_ne!(observation.state, TxObservationState::Absent);
-        let forged = TxObservation {
-            state: TxObservationState::Absent,
-            evidence,
-            ..observation
-        };
-        assert!(!forged.is_expired());
+        // Both tips sit exactly at expiry + margin: absent, not yet expired.
+        let observation = observe_transaction(evidence, Some(120 - EXPIRY_MARGIN_BLOCKS));
+        assert_eq!(observation.state, TxObservationState::Absent);
+        assert!(!observation.is_expired());
     }
 
     #[test]
@@ -3152,13 +3609,7 @@ mod tests {
         assert_ne!(mined.state, TxObservationState::Mined);
         let mut invalid_absent = confirmation_evidence("two", None, None, false);
         invalid_absent.endpoint.clear();
-        let absent = observe_transaction(
-            vec![
-                confirmation_evidence("one", None, None, false),
-                invalid_absent,
-            ],
-            Some(100),
-        );
+        let absent = observe_transaction(vec![invalid_absent], Some(10));
         assert_ne!(absent.state, TxObservationState::Absent);
         let forged = TxObservation {
             state: TxObservationState::Absent,
@@ -3299,9 +3750,10 @@ mod tests {
             secondary_tip: Some(120),
             evidence: vec![first, second],
         };
+        // Tips at exactly expiry + margin are not past it.
         assert!(!observation.is_expired());
         let reduced = observe_transaction(observation.evidence.clone(), observation.expiry_height);
-        assert_ne!(reduced.state, TxObservationState::Absent);
+        assert_eq!(reduced.state, TxObservationState::Absent);
         assert!(reduced
             .evidence
             .iter()
@@ -3372,7 +3824,7 @@ mod tests {
             .map(|id| EndpointTxEvidence {
                 operator_id: id.to_owned(),
                 endpoint: format!("https://{id}.example"),
-                tip_height: Some(101),
+                tip_height: Some(101 + EXPIRY_MARGIN_BLOCKS),
                 reported_height: None,
                 block_hash: None,
                 tx_in_block: false,
@@ -3382,8 +3834,8 @@ mod tests {
             state: TxObservationState::Absent,
             mined_height: None,
             expiry_height: Some(99),
-            primary_tip: Some(101),
-            secondary_tip: Some(101),
+            primary_tip: Some(101 + EXPIRY_MARGIN_BLOCKS),
+            secondary_tip: Some(101 + EXPIRY_MARGIN_BLOCKS),
             evidence,
         };
         assert!(matches!(

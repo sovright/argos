@@ -102,6 +102,19 @@ pub struct SpendableSproutNote {
     pub(crate) drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// Wipes the spend-authorising fields: `a_sk`, the note plaintext, and the
+/// authentication path needed to spend it. Public chain identifiers remain.
+impl Zeroize for SpendableSproutNote {
+    fn zeroize(&mut self) {
+        self.a_sk.zeroize();
+        self.note.rho.zeroize();
+        self.note.r.zeroize();
+        self.note.value.zeroize();
+        self.note.memo.zeroize();
+        self.witness_path.zeroize();
+    }
+}
+
 impl core::fmt::Debug for SpendableSproutNote {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // `a_sk` and the note's `r`/`rho` are spending material.
@@ -116,8 +129,7 @@ impl core::fmt::Debug for SpendableSproutNote {
 
 impl Drop for SpendableSproutNote {
     fn drop(&mut self) {
-        self.a_sk.zeroize();
-        self.witness_path.zeroize();
+        self.zeroize();
         #[cfg(test)]
         if let Some(probe) = &self.drop_probe {
             probe.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -837,6 +849,44 @@ mod tests {
         recovered.nothing_left_to_sweep(&inventory)
     }
 
+    fn spendable(a_sk: [u8; 32]) -> SpendableSproutNote {
+        SpendableSproutNote {
+            note: SproutNotePlaintext {
+                value: 100_000,
+                rho: [0x11; 32],
+                r: [0x22; 32],
+                memo: [0x33; 512],
+            },
+            a_sk,
+            address: SproutPaymentAddress::from_spending_key(&a_sk),
+            commitment: [0x44; 32],
+            anchor: [0x55; 32],
+            witness_path: vec![0x66; 966],
+            outpoint: JsOutPoint {
+                txid: [0x77; 32],
+                js_index: 0,
+                output_index: 0,
+            },
+            drop_probe: None,
+        }
+    }
+
+    /// A reviewed proposal or scan holds these for minutes to hours; the
+    /// spend-authorising fields are wiped when one is dropped (`Drop` calls
+    /// exactly this). Non-secret fields are left for diagnostics.
+    #[test]
+    fn a_spendable_note_wipes_its_spending_material() {
+        use zeroize::Zeroize;
+        let mut note = spendable([0x42; 32]);
+        note.zeroize();
+        assert_eq!(note.a_sk, [0; 32]);
+        assert_eq!(note.note.rho, [0; 32]);
+        assert_eq!(note.note.r, [0; 32]);
+        assert_eq!(note.note.memo, [0; 512]);
+        assert_eq!(note.note.value, 0);
+        assert_eq!(note.commitment, [0x44; 32], "not secret; kept");
+    }
+
     /// Build a wallet holding one real, self-consistent Sprout note: the
     /// ciphertext is produced by the encryption path, so decryption here is
     /// checked against a genuine encryption rather than a canned blob.
@@ -1510,7 +1560,11 @@ mod tests {
                         .append_transition(&mut snapshot, tx.txid, state, None, Some(&observation))
                         .unwrap();
                 } else if state == TxLifecycleState::Expired {
-                    let observation = inventory_observation(false, None, 141);
+                    let observation = inventory_observation(
+                        false,
+                        None,
+                        140 + crate::broadcast::EXPIRY_MARGIN_BLOCKS + 1,
+                    );
                     journal
                         .append_transition(&mut snapshot, tx.txid, state, None, Some(&observation))
                         .unwrap();

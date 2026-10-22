@@ -100,7 +100,7 @@ pub fn sha256_compress(block: &[u8; 64]) -> [u8; 32] {
         core::slice::from_ref(GenericArray::from_slice(block)),
     );
     let mut out = [0u8; 32];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(state.iter()) {
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state.iter()) {
         chunk.copy_from_slice(&word.to_be_bytes());
     }
     out

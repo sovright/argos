@@ -575,9 +575,16 @@ fn inspect_wallet_distinguishes_locked_hd_and_standalone_keys() {
         "{}",
         String::from_utf8_lossy(&hd_out.stderr)
     );
+    // The seed is recovered, so a locked HD key is one of its own accounts:
+    // not reported as locked, and coverage stays complete (round-2 item D
+    // on #275).
     let hd_shown = String::from_utf8_lossy(&hd_out.stdout);
     assert!(
-        hd_shown.contains("recover the wallet seed to recreate it"),
+        !hd_shown.contains("recover the wallet seed to recreate it"),
+        "{hd_shown}"
+    );
+    assert!(
+        hd_shown.contains("Every record that can hold a key was read."),
         "{hd_shown}"
     );
 
@@ -594,7 +601,7 @@ fn inspect_wallet_distinguishes_locked_hd_and_standalone_keys() {
     );
     let shown = String::from_utf8_lossy(&out.stdout);
     assert!(
-        shown.contains("recover the wallet seed to recreate it"),
+        !shown.contains("recover the wallet seed to recreate it"),
         "{shown}"
     );
     assert!(

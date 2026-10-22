@@ -1804,18 +1804,21 @@ mod tests {
 
     fn confirmed_absence(expiry_height: u32) -> TxObservation {
         use crate::broadcast::{EndpointTxEvidence, TxObservationState};
+        let confirmed_tip = expiry_height
+            .saturating_add(crate::broadcast::EXPIRY_MARGIN_BLOCKS)
+            .saturating_add(1);
         TxObservation {
             state: TxObservationState::Absent,
             mined_height: None,
             expiry_height: Some(expiry_height),
-            primary_tip: Some(expiry_height + 1),
-            secondary_tip: Some(expiry_height + 1),
+            primary_tip: Some(confirmed_tip),
+            secondary_tip: Some(confirmed_tip),
             evidence: ["a", "b"]
                 .into_iter()
                 .map(|label| EndpointTxEvidence {
                     operator_id: label.to_owned(),
                     endpoint: format!("https://{label}.example"),
-                    tip_height: Some(expiry_height + 1),
+                    tip_height: Some(confirmed_tip),
                     reported_height: None,
                     block_hash: None,
                     tx_in_block: false,
@@ -2969,7 +2972,6 @@ mod tests {
 
     #[test]
     fn expired_note_replacement_does_not_alias_the_old_txid() {
-        use crate::broadcast::{EndpointTxEvidence, TxObservationState};
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let first = fixture();
@@ -2980,24 +2982,7 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&first)
             .unwrap();
-        let absence = TxObservation {
-            state: TxObservationState::Absent,
-            mined_height: None,
-            expiry_height: first.expiry_height,
-            primary_tip: Some(101),
-            secondary_tip: Some(101),
-            evidence: ["a", "b"]
-                .into_iter()
-                .map(|label| EndpointTxEvidence {
-                    operator_id: label.to_owned(),
-                    endpoint: format!("https://{label}.example"),
-                    tip_height: Some(101),
-                    reported_height: None,
-                    block_hash: None,
-                    tx_in_block: false,
-                })
-                .collect(),
-        };
+        let absence = confirmed_absence(first.expiry_height.unwrap());
         journal
             .append_transition(
                 &mut snapshot,

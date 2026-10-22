@@ -1194,6 +1194,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             TxLifecycleState::SubmissionUnknown
                 | TxLifecycleState::Pending
                 | TxLifecycleState::Mined
+                | TxLifecycleState::MinedSingleSource
         ) {
             continue;
         }
@@ -1222,6 +1223,21 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                 Some(&observation),
             )?;
             freshly_observed_mined.insert(entry.txid());
+            continue;
+        }
+        if observation.has_single_source_mined_evidence() {
+            // Preserve a previously corroborated result. Otherwise record
+            // the one-operator result so later legs may continue without
+            // presenting it as independent finality to the operator.
+            if entry.state != TxLifecycleState::Mined {
+                journal.append_transition(
+                    &mut snapshot,
+                    entry.txid(),
+                    TxLifecycleState::MinedSingleSource,
+                    None,
+                    Some(&observation),
+                )?;
+            }
             continue;
         }
         if observation.state == TxObservationState::PresentUnmined {
@@ -1280,7 +1296,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
                 transaction.txid
             ))
         })?;
-        let mined_was_displaced = entry.state == TxLifecycleState::Mined
+        let mined_was_displaced = entry.state.is_mined()
             && matches!(
                 observation.state,
                 TxObservationState::Absent | TxObservationState::Reorged
@@ -1312,9 +1328,7 @@ pub(crate) async fn reconcile_sprout_journal<S: TxSubmitter, O: TxObserver>(
             }
             retries.push((entry.outpoint, value_zatoshis, transaction));
         } else {
-            if entry.state == TxLifecycleState::Pending
-                || (entry.state == TxLifecycleState::Mined && !mined_was_displaced)
-            {
+            if entry.state == TxLifecycleState::Pending {
                 journal.append_transition(
                     &mut snapshot,
                     entry.txid(),
@@ -1723,7 +1737,9 @@ fn refresh_outcome(
             TxLifecycleState::Mined => {
                 outcome.mined_zatoshis = outcome.mined_zatoshis.saturating_add(value)
             }
-            TxLifecycleState::Pending => {
+            // One confirmation operator is not independent mining evidence;
+            // keep the value in flight until a second authority agrees.
+            TxLifecycleState::Pending | TxLifecycleState::MinedSingleSource => {
                 outcome.pending_zatoshis = outcome.pending_zatoshis.saturating_add(value)
             }
             TxLifecycleState::NotSubmitted | TxLifecycleState::SubmissionUnknown => {
@@ -2522,8 +2538,29 @@ mod tests {
         )
     }
 
+    fn mined_by_one_source(
+        expiry: Option<u32>,
+        height: u32,
+        tip: u32,
+    ) -> crate::broadcast::TxObservation {
+        crate::broadcast::observe_transaction(
+            vec![endpoint("alpha", tip, Some(height), true)],
+            expiry,
+        )
+    }
+
     fn unavailable(expiry: Option<u32>, tip: u32) -> crate::broadcast::TxObservation {
         crate::broadcast::observe_transaction(vec![endpoint("alpha", tip, None, false)], expiry)
+    }
+
+    fn unavailable_without_tip(expiry: Option<u32>) -> crate::broadcast::TxObservation {
+        crate::broadcast::observe_transaction(Vec::new(), expiry)
+    }
+
+    fn first_expired_tip(expiry: u32) -> u32 {
+        expiry
+            .saturating_add(crate::broadcast::EXPIRY_MARGIN_BLOCKS)
+            .saturating_add(1)
     }
 
     fn contested(expiry: Option<u32>, height: u32, tip: u32) -> crate::broadcast::TxObservation {
@@ -2702,6 +2739,45 @@ mod tests {
         );
         assert_eq!(outcome.mined_zatoshis, 0);
         assert_eq!(outcome.pending_zatoshis, 1_000_000 - SPROUT_SWEEP_FEE);
+    }
+
+    #[test]
+    fn single_source_mining_remains_pending_value_until_corroborated() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 71);
+        let tx = fixture_transaction(710, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &tx,
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+        let mut node = LifecycleNode::accepted(150, 0);
+        let observation = mined_by_one_source(tx.expiry_height, 110, 150);
+        assert_eq!(
+            observation.state,
+            crate::broadcast::TxObservationState::MinedSingleSource
+        );
+        let mut observer = LifecycleObserver::new([(tx.txid, observation)]);
+
+        let (outcome, builds, raw) = run_lifecycle(
+            std::slice::from_ref(&note),
+            &mut node,
+            &mut observer,
+            &journal,
+            711,
+        );
+
+        assert_eq!(builds, 0);
+        assert!(raw.is_empty() && node.sent.is_empty());
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::MinedSingleSource
+        );
+        assert_eq!(outcome.mined_zatoshis, 0);
+        assert_eq!(outcome.pending_zatoshis, note.note.value - SPROUT_SWEEP_FEE);
+        assert!(!outcome.fresh_all_mined);
     }
 
     #[test]
@@ -3147,8 +3223,11 @@ mod tests {
             &old,
             crate::broadcast::TxLifecycleState::Pending,
         );
-        let mut node = LifecycleNode::accepted(150, 1);
-        let mut observer = LifecycleObserver::new([(old.txid, absent(Some(140), 141))]);
+        let expired_tip = first_expired_tip(140);
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
+        let expired_absence = absent(Some(140), expired_tip);
+        assert!(expired_absence.is_expired());
+        let mut observer = LifecycleObserver::new([(old.txid, expired_absence)]);
         let (_, builds, raw) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 71);
         assert_eq!(builds, 1);
         assert_eq!(node.sent, raw);
@@ -3178,21 +3257,30 @@ mod tests {
     }
 
     #[test]
-    fn primary_deterministic_reply_remains_unknown_and_stops_later_notes() {
+    fn deterministic_rejection_allows_the_next_reviewed_note() {
         let dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(dir.path());
         let notes = [lifecycle_note(1_000_000, 20), lifecycle_note(2_000_000, 21)];
         let mut node = LifecycleNode::reply(120, -26, "invalid proof");
+        node.replies
+            .push_back(Ok(zcash_client_backend::proto::service::SendResponse {
+                error_code: 0,
+                error_message: String::new(),
+            }));
         let mut observer = LifecycleObserver::default();
         let (outcome, builds, raw) = run_lifecycle(&notes, &mut node, &mut observer, &journal, 82);
-        assert_eq!(builds, 1);
+        assert_eq!(builds, 2);
         assert_eq!(node.sent, raw);
-        assert_eq!(node.sent.len(), 1);
+        assert_eq!(node.sent.len(), 2);
         assert_eq!(
             outcome.transactions[0].state,
-            crate::broadcast::TxLifecycleState::SubmissionUnknown
+            crate::broadcast::TxLifecycleState::Rejected
         );
-        assert!(outcome.error.is_some());
+        assert_eq!(
+            outcome.transactions[1].state,
+            crate::broadcast::TxLifecycleState::Pending
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
     }
 
     #[test]
@@ -3273,16 +3361,18 @@ mod tests {
         assert!(raw.is_empty());
         assert_eq!(node.sent, vec![old.raw_tx.clone()]);
 
-        let mut node = LifecycleNode::accepted(150, 1);
-        let mut observer = LifecycleObserver::new([(old.txid, absent(Some(140), 141))]);
-        let (_, builds, raw) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 122);
-        assert_eq!(builds, 1);
+        let expired_tip = first_expired_tip(140);
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
+        let mut observer = LifecycleObserver::new([(old.txid, absent(Some(140), expired_tip))]);
+        let (outcome, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &journal, 122);
+        assert_eq!(builds, 1, "{:?}", outcome.error);
         assert_eq!(node.sent, raw);
         assert_ne!(node.sent[0], old.raw_tx);
     }
 
     #[test]
-    fn reorged_mined_transaction_expires_only_from_two_absences_past_expiry() {
+    fn reorged_mined_transaction_expires_only_from_absence_past_the_margin() {
         let dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(dir.path());
         let note = lifecycle_note(1_000_000, 33);
@@ -3293,12 +3383,13 @@ mod tests {
             &old,
             crate::broadcast::TxLifecycleState::Mined,
         );
-        let observation = reorged_with_absent_sources(old.expiry_height, 141, 2);
+        let expired_tip = first_expired_tip(140);
+        let observation = reorged_with_absent_sources(old.expiry_height, expired_tip, 1);
         assert_eq!(
             observation.state,
             crate::broadcast::TxObservationState::Reorged
         );
-        let mut node = LifecycleNode::accepted(150, 1);
+        let mut node = LifecycleNode::accepted(expired_tip, 1);
         let mut observer = LifecycleObserver::new([(old.txid, observation)]);
 
         let (_, builds, raw) = run_lifecycle(
@@ -3324,9 +3415,9 @@ mod tests {
             &old,
             crate::broadcast::TxLifecycleState::Mined,
         );
-        let one_source = reorged_with_absent_sources(old.expiry_height, 141, 1);
-        let mut node = LifecycleNode::accepted(150, 0);
-        let mut observer = LifecycleObserver::new([(old.txid, one_source)]);
+        let no_absence = reorged_with_absent_sources(old.expiry_height, expired_tip, 0);
+        let mut node = LifecycleNode::accepted(expired_tip, 0);
+        let mut observer = LifecycleObserver::new([(old.txid, no_absence)]);
         let (_, builds, raw) =
             run_lifecycle(&[note], &mut node, &mut observer, &one_source_journal, 332);
         assert_eq!(builds, 0);
@@ -3424,11 +3515,13 @@ mod tests {
     }
 
     #[test]
-    fn stored_mined_contested_or_unavailable_is_durably_downgraded() {
-        for (offset, fresh_observation) in
-            [unavailable(Some(140), 150), contested(Some(140), 110, 150)]
-                .into_iter()
-                .enumerate()
+    fn stored_mined_contested_or_unavailable_is_not_downgraded() {
+        for (offset, fresh_observation) in [
+            unavailable_without_tip(Some(140)),
+            contested(Some(140), 110, 150),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let dir = tempfile::tempdir().unwrap();
             let journal = lifecycle_journal(dir.path());
@@ -3453,12 +3546,13 @@ mod tests {
 
             assert_eq!(builds, 0);
             assert!(raw.is_empty() && node.sent.is_empty());
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
             assert!(!outcome.fresh_all_mined);
-            assert_eq!(outcome.mined_zatoshis, 0);
-            assert_eq!(outcome.pending_zatoshis, note.note.value - SPROUT_SWEEP_FEE);
+            assert_eq!(outcome.mined_zatoshis, note.note.value - SPROUT_SWEEP_FEE);
+            assert_eq!(outcome.pending_zatoshis, 0);
             assert_eq!(
                 outcome.transactions[0].state,
-                crate::broadcast::TxLifecycleState::Pending
+                crate::broadcast::TxLifecycleState::Mined
             );
             assert_eq!(
                 journal
@@ -3467,7 +3561,7 @@ mod tests {
                     .entry_for_txid(tx.txid)
                     .unwrap()
                     .state,
-                crate::broadcast::TxLifecycleState::Pending
+                crate::broadcast::TxLifecycleState::Mined
             );
         }
     }

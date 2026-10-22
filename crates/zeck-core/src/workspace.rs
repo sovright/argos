@@ -508,8 +508,12 @@ pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     let mut file = private_fs::open_private_file(path, PrivateOpenMode::Append).map_err(|err| {
         ZeckError::Storage(format!("opening {} for append: {err}", path.display()))
     })?;
-    file.write_all(bytes)
-        .and_then(|_| file.write_all(b"\n"))
+    // One buffer, one write: the event and its terminator are never split
+    // across separate writes.
+    let mut line = Vec::with_capacity(bytes.len() + 1);
+    line.extend_from_slice(bytes);
+    line.push(b'\n');
+    file.write_all(&line)
         .and_then(|_| file.flush())
         .and_then(|_| file.sync_all())
         .map_err(|err| {
@@ -1371,6 +1375,15 @@ mod tests {
     use crate::derivation::mnemonic_seed;
     use crate::key_source::ImportedKeySource;
     use crate::models::RuntimeScanConfig;
+
+    #[test]
+    fn append_private_file_writes_whole_terminated_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        super::append_private_file(&path, br#"{"a":1}"#).unwrap();
+        super::append_private_file(&path, br#"{"b":2}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}\n{\"b\":2}\n");
+    }
 
     fn private_test_directory(tempdir: &tempfile::TempDir) -> PathBuf {
         let private_root = tempdir.path().join("private-root");

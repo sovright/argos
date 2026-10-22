@@ -31,3 +31,4 @@ argos-core = { path = "../../crates/zeck-core" }
 
 [dev-dependencies]
 tauri = { workspace = true, features = ["test"] }
+zcash_primitives.workspace = true
