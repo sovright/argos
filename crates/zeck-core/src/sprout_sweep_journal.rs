@@ -292,6 +292,10 @@ enum SproutJournalRecord {
         submission: Option<SubmissionDisposition>,
         observation: Option<TxObservation>,
     },
+    /// Narrows cleanup authority without replacing the known lifecycle fact.
+    CleanupEvidenceInvalidated {
+        txid: String,
+    },
     LegacyAccepted {
         note_id: SproutNoteId,
         txid: String,
@@ -358,13 +362,30 @@ pub struct SproutJournalEntry {
     pub state: TxLifecycleState,
     pub last_submission: Option<SubmissionDisposition>,
     pub observation: Option<TxObservation>,
-    /// Every independently reduced reconciliation observation, retained so a
-    /// first mined sighting can never erase the checkpoint by itself.
+    /// Observations in the current uninterrupted cleanup-evidence run. An
+    /// invalidation clears this run, while earlier records remain on disk.
     pub observations: Vec<TxObservation>,
     pub legacy_expiry_bound: Option<u32>,
 }
 
 impl SproutJournalEntry {
+    /// A mature observation becomes redundant only after the same canonical
+    /// block has been durably observed in two mature reconciliation rounds.
+    /// Record maturity regressions too, so old evidence cannot bridge them.
+    pub(crate) fn mined_observation_is_redundant(&self, observation: &TxObservation) -> bool {
+        let signature = mature_mined_signature(observation);
+        if signature.is_none() {
+            return self
+                .observation
+                .as_ref()
+                .and_then(mature_mined_signature)
+                .is_none();
+        }
+        let mut latest = self.observations.iter().rev();
+        latest.next().and_then(mature_mined_signature) == signature
+            && latest.next().and_then(mature_mined_signature) == signature
+    }
+
     pub fn txid(&self) -> TxId {
         self.transaction
             .as_ref()
@@ -683,6 +704,22 @@ impl SproutJournalSnapshot {
                 }
                 Ok(())
             }
+            SproutJournalRecord::CleanupEvidenceInvalidated { txid } => {
+                let txid = decode_txid(&txid)?;
+                let id = self.by_txid.get(&txid).ok_or_else(|| {
+                    journal_error("cleanup evidence invalidation before preparation")
+                })?;
+                let entry = self.by_note.get_mut(id).expect("indexed note exists");
+                if entry.state != TxLifecycleState::Mined {
+                    return Err(journal_error(
+                        "cleanup evidence invalidation requires a recorded mined fact",
+                    ));
+                }
+                // Keep lifecycle, displayed canonical evidence and exact retry
+                // bytes. Only the authority to discard recovery material resets.
+                entry.observations.clear();
+                Ok(())
+            }
             SproutJournalRecord::LegacyAccepted { note_id, txid } => {
                 let txid = decode_txid(&txid)?;
                 if self
@@ -931,6 +968,49 @@ pub struct JournalNoteContext {
     pub value_zatoshis: u64,
 }
 
+/// Extract only syntactically valid transaction IDs from known legacy record
+/// shapes. These are investigation leads, never authenticated spend history.
+fn legacy_recorded_txids(bytes: &[u8]) -> Option<BTreeSet<String>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut txids = BTreeSet::new();
+    for line in text.lines() {
+        let candidate = if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+            match record.get("record").and_then(serde_json::Value::as_str) {
+                Some("prepared" | "checkpoint_tombstone") => record
+                    .get("transaction")
+                    .and_then(|transaction| transaction.get("txid"))
+                    .and_then(serde_json::Value::as_str),
+                Some(
+                    "transition"
+                    | "legacy_accepted"
+                    | "legacy_expiry_bound"
+                    | "cleanup_evidence_invalidated",
+                ) => record.get("txid").and_then(serde_json::Value::as_str),
+                _ => None,
+            }
+            .map(str::to_owned)
+        } else {
+            let fields = line.split_whitespace().take(3).collect::<Vec<_>>();
+            if fields.len() != 2 {
+                continue;
+            }
+            let note = fields[0].split(':').take(4).collect::<Vec<_>>();
+            if note.len() != 3
+                || decode_txid(note[0]).is_err()
+                || note[1].parse::<u64>().is_err()
+                || !matches!(note[2].parse::<u8>(), Ok(0 | 1))
+            {
+                continue;
+            }
+            Some(fields[1].to_owned())
+        };
+        if let Some(txid) = candidate.and_then(|candidate| decode_txid(&candidate).ok()) {
+            txids.insert(txid.to_string());
+        }
+    }
+    Some(txids)
+}
+
 #[derive(Debug)]
 pub struct SweepJournal {
     data_dir: PathBuf,
@@ -1030,16 +1110,44 @@ impl SweepJournal {
                 self.data_dir.display()
             ))
         })?;
+        let mut names = names;
+        names.sort();
+        let mut diagnostics = Vec::new();
         for name in names {
             let text = name.to_string_lossy();
             if text.starts_with("sprout-sweep-") && text.ends_with(".journal") {
-                return Err(journal_error(format!(
-                    "legacy direct Sprout journal {} has no create-time artifact authority and may contain broadcast or ambiguous transaction history; it was preserved unchanged. Reconcile and preserve its authenticated history before any further sweep",
-                    self.data_dir.join(name).display()
-                )));
+                let path = self.data_dir.join(name);
+                // Legacy contents have no create-time authority. Read only a
+                // bounded, pinned, no-follow private file for diagnostics; no
+                // bytes enter the lifecycle snapshot or submission path.
+                const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024 * 1024;
+                let diagnostic = match crate::private_fs::read_direct_legacy_journal_diagnostic(
+                    &self.data_dir,
+                    retained_root,
+                    &path,
+                    MAX_DIAGNOSTIC_BYTES,
+                ) {
+                    Ok(bytes) => match legacy_recorded_txids(&bytes) {
+                        Some(txids) if !txids.is_empty() => format!(
+                            "read-only diagnostic, syntactically valid recorded txids (untrusted): {}",
+                            txids.into_iter().collect::<Vec<_>>().join(", ")
+                        ),
+                        _ => "read-only diagnostic found no valid recorded txids; manual inspection of the original history is required".to_owned(),
+                    },
+                    Err(error) => format!(
+                        "read-only diagnostic unavailable: {error}; inspect the original history manually without following links or substituting another file"
+                    ),
+                };
+                diagnostics.push(format!("{}: {diagnostic}", path.display()));
             }
         }
-        Ok(())
+        if diagnostics.is_empty() {
+            return Ok(());
+        }
+        Err(journal_error(format!(
+            "legacy direct Sprout journal history lacks create-time authority and blocks sweeping; files preserved unchanged. {}. IDs are untrusted and may be incomplete. Independently reconcile every txid and all ambiguous history; not-found alone is not settlement. After every possible spend is independently settled, preserve a private backup, move the listed journals outside this data directory, and rescan the original wallet or keys before sweeping",
+            diagnostics.join("; ")
+        )))
     }
 
     pub(crate) fn bind_checkpoint_namespace(
@@ -1369,11 +1477,36 @@ impl SweepJournal {
         with_sweep_journal_lock(&self.path, Some(access.namespace()), |namespace| {
             let mut durable = self.load_or_migrate_unlocked(namespace, &access)?;
             *snapshot = durable.clone();
+            // Decide under the journal lock using fresh durable state, so a
+            // stale caller cannot skip invalidating newly appended evidence.
+            let redundant_invalidation = match &record {
+                SproutJournalRecord::CleanupEvidenceInvalidated { txid } => durable
+                    .entry_for_txid(decode_txid(txid)?)
+                    .is_some_and(|entry| entry.observations.is_empty()),
+                _ => false,
+            };
             durable.apply(record.clone(), &self.source_fingerprint)?;
-            self.append_unlocked(namespace, &access, &record)?;
+            if !redundant_invalidation {
+                self.append_unlocked(namespace, &access, &record)?;
+            }
             *snapshot = durable;
             Ok(())
         })
+    }
+
+    /// Durably interrupt cleanup eligibility while preserving the known mined
+    /// lifecycle fact. Repeating an already-invalidated round does not append.
+    pub(crate) fn invalidate_cleanup_evidence(
+        &self,
+        snapshot: &mut SproutJournalSnapshot,
+        txid: TxId,
+    ) -> ZeckResult<()> {
+        self.mutate(
+            snapshot,
+            SproutJournalRecord::CleanupEvidenceInvalidated {
+                txid: txid.to_string(),
+            },
+        )
     }
 
     pub fn append_transition(
@@ -1942,6 +2075,76 @@ mod tests {
         assert!(journal.root.exists());
     }
 
+    #[test]
+    fn direct_legacy_refusal_lists_txids_and_safe_manual_reconciliation_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        journal.load_or_migrate().unwrap();
+        let legacy = journal
+            .data_dir()
+            .join("sprout-sweep-deadbeefdeadbeef.journal");
+        let v1_txid = "ab".repeat(32);
+        let json_txid = "cd".repeat(32);
+        let bytes = format!(
+            "{}:0:1 {v1_txid}\n{{\"record\":\"prepared\",\"transaction\":{{\"txid\":\"{json_txid}\",\"raw_tx\":\"private-linkable-bytes\"}}}}\n{{\"record\":\"transition\",\"txid\":\"{json_txid}\"}}\n{{\"record\":\"transition\",\"txid\":\"not-a-txid\"}}\nunrecognized history\n",
+            "ef".repeat(32)
+        );
+        crate::private_fs::write_private_file(&legacy, bytes.as_bytes()).unwrap();
+        let sibling = journal
+            .data_dir()
+            .join("sprout-sweep-feedfeedfeedfeed.journal");
+        let sibling_txid = "12".repeat(32);
+        let sibling_bytes = format!("{}:1:0 {sibling_txid}\n", "34".repeat(32));
+        crate::private_fs::write_private_file(&sibling, sibling_bytes.as_bytes()).unwrap();
+
+        let error = journal.load_or_migrate().unwrap_err().to_string();
+
+        assert!(error.contains(&sibling_txid), "{error}");
+        assert!(error.contains(&v1_txid), "{error}");
+        assert!(error.contains(&json_txid), "{error}");
+        assert_eq!(error.matches(&json_txid).count(), 1, "{error}");
+        assert!(!error.contains("private-linkable-bytes"));
+        assert!(!error.contains("not-a-txid"));
+        assert!(error.contains("untrusted"), "{error}");
+        assert!(error.contains("independently"), "{error}");
+        assert!(error.contains("move"), "{error}");
+        assert!(error.contains("ambiguous"), "{error}");
+        assert_eq!(std::fs::read(&legacy).unwrap(), bytes.as_bytes());
+        assert_eq!(std::fs::read(&sibling).unwrap(), sibling_bytes.as_bytes());
+        assert!(!journal.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_legacy_diagnostics_do_not_follow_symlinks_or_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        journal.load_or_migrate().unwrap();
+        let target = journal.data_dir().join("not-journal");
+        let txid = "aa".repeat(32);
+        let bytes = format!("{}:0:0 {txid}\n", "bb".repeat(32));
+        crate::private_fs::write_private_file(&target, bytes.as_bytes()).unwrap();
+        let legacy = journal
+            .data_dir()
+            .join("sprout-sweep-deadbeefdeadbeef.journal");
+        for hardlink in [false, true] {
+            if hardlink {
+                std::fs::hard_link(&target, &legacy).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&target, &legacy).unwrap();
+            }
+            let error = journal.load_or_migrate().unwrap_err().to_string();
+            assert!(error.contains("legacy direct Sprout journal"), "{error}");
+            assert!(error.contains("diagnostic"), "{error}");
+            assert!(
+                !error.contains(&txid),
+                "must not read a linked replacement: {error}"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), bytes.as_bytes());
+            std::fs::remove_file(&legacy).unwrap();
+        }
+    }
+
     fn checkpoint_generation(_dir: &Path, label: &[u8]) -> CheckpointGeneration {
         use sha2::Digest as _;
 
@@ -1995,6 +2198,91 @@ mod tests {
                 .collect(),
             Some(100),
         )
+    }
+
+    #[test]
+    fn cleanup_evidence_invalidation_records_decode_without_demoting_mined_history() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, 100, 0x11);
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::Mined,
+                Some(&SubmissionDisposition::Accepted),
+                Some(&mature),
+            )
+            .unwrap();
+        let original = std::fs::read(journal.path()).unwrap();
+        let invalidation = format!(
+            "{{\"record\":\"cleanup_evidence_invalidated\",\"txid\":\"{}\"}}\n",
+            transaction.txid
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        // Replay repeated durable markers to pin decoder idempotency.
+        file.write_all(invalidation.as_bytes()).unwrap();
+        file.write_all(invalidation.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let restored = journal.load_or_migrate().unwrap();
+        let entry = restored.entry_for_txid(transaction.txid).unwrap();
+        assert!(entry.observations.is_empty());
+        assert_eq!(entry.state, TxLifecycleState::Mined);
+        assert_eq!(entry.observation.as_ref(), Some(&mature));
+        assert_eq!(entry.transaction.as_ref(), Some(&transaction));
+        assert_eq!(entry.last_submission, Some(SubmissionDisposition::Accepted));
+        assert!(!restored.ready_for_new_plan(&context().outpoint));
+        assert!(std::fs::read(journal.path())
+            .unwrap()
+            .starts_with(&original));
+    }
+
+    #[test]
+    fn cleanup_evidence_invalidation_refuses_unknown_or_unmined_transactions() {
+        use std::io::Write as _;
+        for unknown_txid in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = journal(dir.path());
+            let mut snapshot = journal.load_or_migrate().unwrap();
+            let transaction = fixture();
+            journal
+                .scoped_store(context(), &mut snapshot)
+                .persist_prepared(&transaction)
+                .unwrap();
+            let txid = if unknown_txid {
+                TxId::from_bytes([0xff; 32])
+            } else {
+                transaction.txid
+            };
+            let invalidation =
+                format!("{{\"record\":\"cleanup_evidence_invalidated\",\"txid\":\"{txid}\"}}\n");
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(journal.path())
+                .unwrap();
+            file.write_all(invalidation.as_bytes()).unwrap();
+            drop(file);
+            let error = journal.load_or_migrate().unwrap_err().to_string();
+            assert!(
+                error.contains(if unknown_txid {
+                    "invalidation before preparation"
+                } else {
+                    "invalidation requires a recorded mined fact"
+                }),
+                "{error}"
+            );
+        }
     }
 
     #[test]

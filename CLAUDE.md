@@ -18,7 +18,7 @@ Long syncs against public lightwalletd endpoints will regularly receive HTTP/2 G
 ### Tauri frontend
 - Uses `withGlobalTauri: true` — access Tauri APIs via `window.__TAURI__.core.invoke` and `window.__TAURI__.event.listen`, NOT bare ES module imports
 - No bundler — `<script src="./main.js">` not `type="module"`
-- Default data directory is resolved at runtime via `default_data_dir` Tauri command (maps to `AppDataDir/workspace`). Do NOT write workspace files inside `src-tauri/` or the Tauri dev watcher will trigger a rebuild mid-scan
+- Default data directory is resolved at runtime via `default_data_dir` Tauri command (`AppDataDir/workspace`, or `workspace-v2` when the old default is unmarked and must be preserved). Do NOT write workspace files inside `src-tauri/` or the Tauri dev watcher will trigger a rebuild mid-scan
 
 ### Scan architecture
 

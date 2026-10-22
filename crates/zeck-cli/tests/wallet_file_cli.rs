@@ -112,6 +112,76 @@ fn wallet_network_mismatch_stops_before_lightwalletd() {
     );
 }
 
+/// v1.5.3 used an ordinary, unmarked data directory. Default selection must
+/// preserve it and create a distinct authenticated directory without any RPC.
+#[test]
+fn legacy_default_data_directory_selects_versioned_default_without_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("argos_data");
+    let wallet =
+        legacy.join("mainnet/workspace-deadbeefdeadbeefdeadbeefdeadbeef/birthday-1528061/auto-gap-20/wallet.sqlite");
+    std::fs::create_dir_all(wallet.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(&wallet, b"v1.5.3 wallet evidence").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_argos"));
+    command
+        .current_dir(dir.path())
+        .args([
+            "--accept-tos",
+            "--lightwalletd-url",
+            "http://127.0.0.1:1",
+            "reconcile",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = spawn_argos(&mut command).wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No stored transactions"));
+    assert!(
+        stderr.contains("argos_data_v2") && stderr.contains("rescan"),
+        "{stderr}"
+    );
+    assert!(dir
+        .path()
+        .join("argos_data_v2/.argos-private-artifact-root-v1")
+        .exists());
+    assert_eq!(std::fs::read(&wallet).unwrap(), b"v1.5.3 wallet evidence");
+    assert!(!legacy.join(".argos-private-artifact-root-v1").exists());
+}
+
+#[test]
+fn explicitly_selected_legacy_default_requires_new_empty_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("argos_data");
+    std::fs::create_dir(&legacy).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(legacy.join("wallet.sqlite"), b"preserve me").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_argos"));
+    command
+        .current_dir(dir.path())
+        .args(["--data-dir=./argos_data", "--accept-tos", "reconcile"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = spawn_argos(&mut command).wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("choose a new empty directory"), "{stderr}");
+    assert!(!dir.path().join("argos_data_v2").exists());
+    assert_eq!(
+        std::fs::read(legacy.join("wallet.sqlite")).unwrap(),
+        b"preserve me"
+    );
+}
+
 #[test]
 fn reconcile_empty_registry_needs_no_wallet_or_network_probe() {
     let dir = tempfile::tempdir().unwrap();

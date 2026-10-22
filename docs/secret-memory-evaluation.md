@@ -46,11 +46,14 @@ Argos now uses best-effort zeroization for the secret owners it controls:
   before the final shared owner drops, and expiration atomically removes
   proposals tied to an expired scan; and
 - the WebView clears seed, passphrase, and pasted-key controls once a scan
-  accepts them; when a scan finishes, fails, or is cancelled; after Sprout
+  accepts them; when a running scan finishes, fails, or is cancelled; after Sprout
   execution; on **Forget this file**, abandonment to the welcome screen,
   **Start over**, resume-modal close, and window close. Ordinary navigation
   does not clear active state, and a wallet-inspection error deliberately keeps
-  the passphrase for retry. Late responses are generation-bound and cannot
+  the passphrase for retry. A rejected scan start also preserves passphrase
+  and pasted-key inputs until the existing 29-minute review deadline; changing
+  the data directory invalidates derived scan/proposal evidence without
+  extending that deadline. Late responses are generation-bound and cannot
   restore cleared frontend authority.
 
 These measures shorten ordinary plaintext residency; they are not proof that

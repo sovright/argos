@@ -71,7 +71,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: cargo check (workspace)
-        if: matrix.label == 'ARM64'
         run: cargo check --workspace --target ${{ matrix.target }}
 
       - name: private filesystem tests (x64)
@@ -97,20 +96,15 @@ jobs:
           & $exact -Package argos-core -TestName private_fs::windows_tests::windows_reused_read_append_keeps_exclusive_handle_through_write
           & $exact -Package argos-core -TestName private_fs::windows_tests::windows_recursive_cleanup_refuses_permissive_nested_child
           & $exact -Package argos-core -TestName private_fs::windows_tests::windows_reuse_refuses_permissive_directory_with_security_only_handle
-          cargo test -p argos-core checkpoint_lease_serializes_replacement_and_cleanup_authority --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p argos-core windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $exact -Package argos-core -TestName sprout_scan_run::tests::checkpoint_lease_serializes_replacement_and_cleanup_authority
+          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts
           & $exact -Package argos-core -TestName private_fs::windows_tests::windows_namespace_append_create_and_reuse_keep_retained_identity
-          cargo test -p argos-core windows_relative_primitives_never_touch_a_recreated_ancestor_tree --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p argos-core windows_checkpoint_quarantine_uses_exact_open_handle_rename_and_delete --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p argos-core windows_journal_authority_denies_sidecar_replacement_and_second_writer --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p argos-core retained_registry_handles_deny_parent_and_sidecar_replacement --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_relative_primitives_never_touch_a_recreated_ancestor_tree
+          & $exact -Package argos-core -TestName private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse
+          & $exact -Package argos-core -TestName sprout_sweep_journal::tests::windows_journal_authority_denies_sidecar_replacement_and_second_writer
+          & $exact -Package argos-core -TestName service::network_namespace_tests::retained_registry_handles_deny_parent_and_sidecar_replacement
           & $exact -Package argos-core -TestName sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle
+          & $exact -Package argos-core -TestName workspace::tests::append_private_file_writes_whole_terminated_lines
           & $exact -Package argos-core -TestName workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader
           & $exact -Package argos-core -TestName workspace::tests::runtime_read_only_connection_preserves_private_wal_sidecars
           & $exact -Package argos-core -TestName workspace::tests::busy_wallet_rebuild_times_out_without_changing_the_live_database
@@ -129,6 +123,9 @@ jobs:
           & $exact -Package argos-core -TestName birthday::tests::stale_probe_scan_skips_registered_live_probe
           & $exact -Package argos-gui -TestName commands::tests::windows_write_private_report_creates_private_and_refuses_untrusted_reuse
           & $exact -Package argos-gui -TestName commands::tests::fresh_gui_workspace_is_authenticated_before_sprout_work_starts
+          & $exact -Package argos-gui -TestName commands::tests::legacy_gui_default_selects_versioned_directory_and_keeps_legacy_rows_visible
+          & $exact -Package argos-gui -TestName commands::tests::execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent
+          & $exact -Package argos-gui -TestName commands::tests::the_sweep_step_runs_only_after_verification_passes
 
       - name: private artifact authority and sweep safety tests (x64)
         if: matrix.label == 'x64'
@@ -147,6 +144,13 @@ jobs:
             'private_fs::tests::artifact_authority_is_durable_before_the_first_secret_byte'
             'private_fs::tests::existing_unbound_artifact_is_refused_without_read_or_mutation'
             'private_fs::tests::artifact_replacement_records_exact_generation_before_publication'
+            'private_fs::tests::checkpoint_interrupted_save_restores_previous_generation_on_restart'
+            'private_fs::tests::checkpoint_save_error_rolls_back_before_returning'
+            'private_fs::tests::checkpoint_interrupted_rollback_resumes_after_candidate_unlink'
+            'private_fs::tests::checkpoint_interrupted_legacy_save_without_generation_fails_closed'
+            'private_fs::tests::direct_legacy_diagnostic_is_bounded_and_leaves_evidence_unchanged'
+            'private_fs::tests::direct_legacy_diagnostic_does_not_create_a_missing_data_directory'
+            'private_fs::tests::direct_legacy_diagnostic_refuses_hardlinked_file'
             'private_fs::tests::windows_artifact_domains_cold_verify_before_retaining_their_bound_locks'
             'private_fs::tests::windows_artifact_registry_prevents_root_rollback_or_remint'
             'private_fs::tests::torn_newest_authority_slot_falls_back_to_previous_durable_state'
@@ -163,6 +167,10 @@ jobs:
             'sprout_sweep_journal::tests::cleanup_restart_completes_old_generation_without_deleting_replacement'
             'sprout_sweep::tests::first_run_with_no_artifact_root_has_no_interrupted_cleanup'
             'sprout_sweep::tests::production_restart_completes_a_crash_after_unlink_before_completion'
+            'sprout_sweep::tests::production_reconcile_preserves_two_mature_rounds_before_checkpoint_cleanup'
+            'sprout_sweep::tests::production_cleanup_requires_two_mature_rounds_after_weaker_evidence_or_errors'
+            'service::propose_workspace_guard_tests::start_scan_preserves_unmarked_v153_directory_with_actionable_refusal'
+            'service::propose_workspace_guard_tests::legacy_default_selects_fresh_versioned_directory_for_start_scan'
             'service::network_namespace_tests::network_guard_creates_and_reopens_only_an_authenticated_absent_data_dir'
             'service::network_namespace_tests::network_guard_refuses_a_preexisting_unmarked_data_dir_unchanged'
             'service::network_namespace_tests::retained_registry_handles_deny_parent_and_sidecar_replacement'
@@ -191,14 +199,27 @@ jobs:
 
       - name: Stable private namespace and exact cleanup tests
         run: |
-          cargo test -p argos-core first_append_after_parent_swap_never_writes_the_replacement_namespace
-          cargo test -p argos-core cleanup_enumerates_the_pinned_parent_after_a_path_swap
-          cargo test -p argos-core replaced_sidecar_cannot_start_a_writer_or_delete_its_staging
-          cargo test -p argos-core replaced_parent_namespace_cannot_redirect_old_cleanup
-          cargo test -p argos-core quarantine_swap_after_verification_preserves_the_sentinel
-          cargo test -p argos-core registry_log_refuses_replaced_parent_without_touching_replacement
-          cargo test -p argos-core registry_log_refuses_replaced_sidecar_without_touching_registry
-          cargo test -p argos-core separate_connection_lock_blocks_load_and_append
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::first_append_after_parent_swap_never_writes_the_replacement_namespace
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::unix_private::race_tests::cleanup_enumerates_the_pinned_parent_after_a_path_swap
+          bash scripts/run-exact-cargo-test.sh argos-core sprout_scan_run::tests::replaced_sidecar_cannot_start_a_writer_or_delete_its_staging
+          bash scripts/run-exact-cargo-test.sh argos-core sprout_scan_run::tests::replaced_parent_namespace_cannot_redirect_old_cleanup
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::unix_private::race_tests::final_cleanup_never_unlinks_an_object_swapped_after_identity_check
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse
+          bash scripts/run-exact-cargo-test.sh argos-core service::network_namespace_tests::registry_log_refuses_replaced_parent_without_touching_replacement
+          bash scripts/run-exact-cargo-test.sh argos-core service::network_namespace_tests::registry_log_refuses_replaced_sidecar_without_touching_registry
+          bash scripts/run-exact-cargo-test.sh argos-core sprout_sweep_journal::tests::separate_connection_lock_blocks_load_and_append
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_save_restores_previous_generation_on_restart
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_save_error_rolls_back_before_returning
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_save_refuses_replaced_old_or_candidate
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_rollback_resumes_after_candidate_unlink
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::checkpoint_interrupted_legacy_save_without_generation_fails_closed
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::macos_publication_parent_accepts_deny_only_acl_without_modifying_it
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::macos_publication_parent_rejects_extended_acl_before_staging
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::direct_legacy_diagnostic_is_bounded_and_leaves_evidence_unchanged
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::direct_legacy_diagnostic_does_not_create_a_missing_data_directory
+          bash scripts/run-exact-cargo-test.sh argos-core private_fs::tests::direct_legacy_diagnostic_refuses_hardlinked_file
+          bash scripts/run-exact-cargo-test.sh argos-core sprout_sweep::tests::production_reconcile_preserves_two_mature_rounds_before_checkpoint_cleanup
+          bash scripts/run-exact-cargo-test.sh argos-core sprout_sweep::tests::production_cleanup_requires_two_mature_rounds_after_weaker_evidence_or_errors
 
   test:
     name: Cargo test
