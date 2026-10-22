@@ -1062,7 +1062,8 @@ async fn register_mixed_keys(
     hd_count: u32,
 ) -> ZeckResult<bool> {
     use crate::imported::{
-        imported_account_display, imported_transparent_keys, parse_sapling_extsk, sapling_ufvk,
+        imported_account_display, imported_transparent_keys, sapling_ufvk,
+        ImportedSaplingSpendingKey,
     };
     use argos_wallet_import::Provenance;
 
@@ -1091,8 +1092,8 @@ async fn register_mixed_keys(
         if key.provenance != Provenance::Standalone {
             continue;
         }
-        let extsk = parse_sapling_extsk(key.extsk.expose_secret())?;
-        let identity = extsk.to_diversifiable_full_viewing_key().to_bytes();
+        let extsk = ImportedSaplingSpendingKey::from_serialized(key.extsk.expose_secret())?;
+        let identity = extsk.full_viewing_key_identity()?;
         if sapling_seen.insert(identity) {
             selected_sapling.push((key_index, extsk));
         }
@@ -1114,7 +1115,7 @@ async fn register_mixed_keys(
     let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), consensus_network(network))?;
     let mut imported_rows = Vec::new();
     for (ordinal, (key_index, extsk)) in selected_sapling.iter().enumerate() {
-        let ufvk = sapling_ufvk(extsk)?;
+        let ufvk = extsk.with_parsed(sapling_ufvk)?;
         let wallet_account_id = if let Some(existing) = wallet_db
             .get_account_for_ufvk(&ufvk)
             .map_err(|err| ZeckError::Wallet(format!("looking up mixed imported account: {err}")))?
@@ -1140,7 +1141,8 @@ async fn register_mixed_keys(
                     ZeckError::Internal("mixed account index overflowed".to_owned())
                 })?)
                 .ok_or_else(|| ZeckError::Internal("mixed account index overflowed".to_owned()))?;
-        let display = imported_account_display(display_index, extsk, None, network)?;
+        let display = extsk
+            .with_parsed(|parsed| imported_account_display(display_index, parsed, None, network))?;
         imported_rows.push(TrackedAccount {
             wallet_account_id,
             derived: display,
@@ -1169,7 +1171,7 @@ async fn register_mixed_keys(
     for &key_index in &selected_transparent {
         let key = &resolved[key_index];
         if !existing.contains_key(&key.address) {
-            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &key.secret);
+            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, key.secret_key());
             wallet_db
                 .import_standalone_transparent_pubkey(anchor_id, pubkey)
                 .map_err(|err| {
@@ -1551,12 +1553,14 @@ async fn run_imported_scan(
         let Some(extsk) = account.sapling_extsk.as_ref() else {
             continue;
         };
-        let display = imported_account_display(
-            index,
-            extsk,
-            account.transparent_addresses.first(),
-            config.network,
-        )?;
+        let display = extsk.with_parsed(|parsed| {
+            imported_account_display(
+                index,
+                parsed,
+                account.transparent_addresses.first(),
+                config.network,
+            )
+        })?;
         displays.push(display.clone());
         tracked.push(TrackedAccount {
             wallet_account_id: account.wallet_account_id,
@@ -2341,11 +2345,8 @@ pub(crate) async fn refresh_scan_progress(
     // balances, so accounts that received and fully spent funds would appear
     // inactive.  Querying the raw sqlite tables lets us detect any note that was
     // ever received, which is the correct signal for gap-limit decisions.
-    let raw_conn = Connection::open_with_flags(
-        workspace.wallet_db_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|err| {
+    let raw_conn = crate::workspace::open_wallet_connection_read_only(workspace.wallet_db_path())
+        .map_err(|err| {
         ZeckError::Storage(format!("opening wallet database for activity check: {err}"))
     })?;
     raw_conn
@@ -3011,13 +3012,10 @@ fn duplicate_wallet_output_ownership(conn: &Connection) -> Result<bool, rusqlite
 /// Recheck persisted ownership immediately before quoting and executing a
 /// combined sweep, including after a completed scan has been resumed.
 pub(crate) fn validate_wallet_output_identities(workspace: &RecoveryWorkspace) -> ZeckResult<()> {
-    let conn = Connection::open_with_flags(
-        workspace.wallet_db_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|err| {
-        ZeckError::Storage(format!("opening wallet database for identity check: {err}"))
-    })?;
+    let conn = crate::workspace::open_wallet_connection_read_only(workspace.wallet_db_path())
+        .map_err(|err| {
+            ZeckError::Storage(format!("opening wallet database for identity check: {err}"))
+        })?;
     if duplicate_wallet_output_ownership(&conn)
         .map_err(|err| ZeckError::Storage(format!("checking wallet output identities: {err}")))?
     {

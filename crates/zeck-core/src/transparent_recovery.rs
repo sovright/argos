@@ -639,7 +639,7 @@ where
     let mut signing_set = TransparentSigningSet::new();
     let mut pubkey_for_address = std::collections::HashMap::new();
     for key in keys {
-        let pubkey = signing_set.add_key(key.secret);
+        let pubkey = signing_set.add_key(key.signing_key_copy());
         pubkey_for_address.insert(key.address, pubkey);
     }
 
@@ -1256,9 +1256,9 @@ mod sweep_tests {
     #[test]
     fn standalone_log_identity_uses_sorted_public_addresses_only() {
         let dir = tempfile::tempdir().unwrap();
-        let make = |secret: u8, address: u8| ImportedTransparentKey {
-            secret: secp256k1::SecretKey::from_slice(&[secret; 32]).unwrap(),
-            address: tests_support::addr(address),
+        let make = |secret: u8, address: u8| {
+            let mut secret = secp256k1::SecretKey::from_slice(&[secret; 32]).unwrap();
+            ImportedTransparentKey::new(&mut secret, tests_support::addr(address))
         };
         let first = standalone_broadcast_log_path(
             dir.path(),

@@ -1047,6 +1047,18 @@ pub async fn cancel_scan(state: State<'_, AppState>, handle: ScanHandle) -> Resu
         .map_err(|err| err.to_string())
 }
 
+/// Release all in-memory authority for a recovery scan. Unlike cancellation,
+/// this also removes completed sessions and waits for any running worker to
+/// stop before the final key owner is dropped.
+#[tauri::command]
+pub async fn release_scan(state: State<'_, AppState>, handle: ScanHandle) -> Result<(), String> {
+    state
+        .service
+        .release_scan(&handle)
+        .await
+        .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub async fn reconcile_sweep(
     app: AppHandle,
@@ -2939,6 +2951,8 @@ pub struct SessionRow {
     pub last_run_at_epoch_seconds: Option<i64>,
     pub match_coordinates: Option<argos_core::MatchCoordinates>,
     pub transparent_scan: Option<argos_core::TransparentScanConfig>,
+    pub requires_rescan: bool,
+    pub legacy_untrusted: bool,
 }
 
 impl From<IncompleteSession> for SessionRow {
@@ -2953,13 +2967,15 @@ impl From<IncompleteSession> for SessionRow {
             last_run_at_epoch_seconds: s.last_run_at_epoch_seconds,
             match_coordinates: s.match_coordinates,
             transparent_scan: s.transparent_scan,
+            requires_rescan: s.requires_rescan,
+            legacy_untrusted: s.legacy_untrusted,
         }
     }
 }
 
-/// List any workspaces under `data_dir` that have an incomplete or missing
-/// session sidecar. Called on GUI launch so the user can pick up where
-/// they left off without re-entering all their scan parameters.
+/// List resumable incomplete workspaces and preserved legacy workspaces that
+/// require a fresh scan. Called on GUI launch so the user gets explicit,
+/// non-resumable remediation guidance for untrusted storage.
 #[tauri::command]
 pub async fn list_incomplete_sessions(
     app: AppHandle,

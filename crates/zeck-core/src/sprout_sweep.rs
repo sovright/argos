@@ -1885,14 +1885,14 @@ mod tests {
     fn stale_scan_generation_cannot_manifest_or_delete_a_replacement_with_an_extra_note() {
         let dir = tempfile::tempdir().unwrap();
         let checkpoint = dir.path().join("scan.checkpoint");
-        std::fs::write(&checkpoint, b"scan result with one note").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"scan result with one note").unwrap();
         let reviewed = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         let mut journal =
             SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
         let stale_note = lifecycle_note(1_000_000, 1);
 
         let replacement = dir.path().join("replacement.checkpoint");
-        std::fs::write(
+        crate::private_fs::write_private_file(
             &replacement,
             b"new scan result with one extra recovered note",
         )
@@ -1922,7 +1922,7 @@ mod tests {
     fn production_restart_completes_a_crash_after_unlink_before_completion() {
         let dir = tempfile::tempdir().unwrap();
         let checkpoint = dir.path().join("scan.checkpoint");
-        std::fs::write(&checkpoint, b"spend-capable checkpoint").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"spend-capable checkpoint").unwrap();
         let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         let mut journal =
             SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
@@ -1986,7 +1986,7 @@ mod tests {
     fn a_new_current_journal_entry_after_prepare_retains_the_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let checkpoint = dir.path().join("scan.checkpoint");
-        std::fs::write(&checkpoint, b"spend-capable checkpoint").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"spend-capable checkpoint").unwrap();
         let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         let mut journal =
             SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
@@ -2713,7 +2713,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let current = lifecycle_journal(dir.path());
         let malformed = dir.path().join("sprout-sweep-deadbeefdeadbeef.journal");
-        std::fs::write(&malformed, b"{not valid json}\n").unwrap();
+        crate::private_fs::write_private_file(&malformed, b"{not valid json}\n").unwrap();
         let note = lifecycle_note(1_000_000, 202);
         let mut node = LifecycleNode::accepted(100, 1);
         let mut observer = LifecycleObserver::default();
@@ -2738,7 +2738,7 @@ mod tests {
             crate::ZeckNetwork::Mainnet,
         );
         let legacy = format!("{}:0:0 {}\n", "cb".repeat(32), "33".repeat(32));
-        std::fs::write(sibling.path(), legacy.as_bytes()).unwrap();
+        crate::private_fs::write_private_file(sibling.path(), legacy.as_bytes()).unwrap();
         let note = lifecycle_note(1_000_000, 0xcb);
         let mut node = LifecycleNode::accepted(100, 1);
         let mut observer = LifecycleObserver::default();
@@ -3394,12 +3394,13 @@ mod tests {
             .rev()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        std::fs::write(
+        crate::private_fs::write_private_file(
             journal.path(),
             format!(
                 "{note_txid}:{}:{} {legacy_txid}\n",
                 note.outpoint.js_index, note.outpoint.output_index
-            ),
+            )
+            .as_bytes(),
         )
         .unwrap();
         let mut node = LifecycleNode::accepted(100, 0);
@@ -3457,12 +3458,13 @@ mod tests {
             .rev()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        std::fs::write(
+        crate::private_fs::write_private_file(
             journal.path(),
             format!(
                 "{note_txid}:{}:{} {legacy_txid}\n",
                 note.outpoint.js_index, note.outpoint.output_index
-            ),
+            )
+            .as_bytes(),
         )
         .unwrap();
         let observation = crate::broadcast::observe_transaction(

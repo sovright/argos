@@ -79,15 +79,40 @@ jobs:
         run: |
           cargo test -p argos-core private_fs --target x86_64-pc-windows-msvc
           cargo test -p argos-core private_fs::tests::windows_workspace_cleanup_uses_retained_directory_handles --target x86_64-pc-windows-msvc -- --exact
-          cargo test -p argos-core private_fs::windows_tests::windows_reused_private_objects_have_only_owner_and_system_access --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_reused_permissive_objects_fail_closed_without_repair --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_owner_verifier_rejects_a_foreign_owner_sid --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_foreign_owner_verification_never_repairs_the_dacl --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_reuse_refuses_permissive_file_with_security_only_handle --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_relative_reuse_refuses_permissive_child_with_security_only_handle --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_authority_reads_and_retains_reject_permissive_sensitive_children --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_authority_reads_refuse_preheld_data_handles --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_checkpoint_generation_refuses_a_permissive_dacl --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_private_directory_authority_retains_no_delete_share --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_sqlite_preflight_refuses_a_preheld_data_handle --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_existing_private_root_reserves_pending_before_a_second_leaf --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_lineage_mutex_uses_global_private_hashed_name --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_reused_read_append_keeps_exclusive_handle_through_write --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_recursive_cleanup_refuses_permissive_nested_child --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core private_fs::windows_tests::windows_reuse_refuses_permissive_directory_with_security_only_handle --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core checkpoint_lease_serializes_replacement_and_cleanup_authority --target x86_64-pc-windows-msvc
           cargo test -p argos-core windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts --target x86_64-pc-windows-msvc
+          cargo test -p argos-core private_fs::windows_tests::windows_namespace_append_create_and_reuse_keep_retained_identity --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core windows_relative_primitives_never_touch_a_recreated_ancestor_tree --target x86_64-pc-windows-msvc
           cargo test -p argos-core windows_checkpoint_quarantine_uses_exact_open_handle_rename_and_delete --target x86_64-pc-windows-msvc
           cargo test -p argos-core sprout_sweep_journal::tests::cleanup_restart_restores_a_surviving_exact_quarantine --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core windows_journal_authority_denies_sidecar_replacement_and_second_writer --target x86_64-pc-windows-msvc
           cargo test -p argos-core retained_registry_handles_deny_parent_and_sidecar_replacement --target x86_64-pc-windows-msvc
+          cargo test -p argos-core sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core service::propose_workspace_guard_tests::restart_restores_tombstone_and_requires_new_scan_before_deletion --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-core separate_connection_lock_blocks_migration_and_append --target x86_64-pc-windows-msvc
+          cargo test -p argos-core birthday::tests::probe_guard_retires_active_authority_before_removing_container --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core birthday::tests::probe_guard_cleans_active_authority_during_unwind --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_marker_before_secret --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_secret_write --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core birthday::tests::stale_probe_scan_skips_registered_live_probe --target x86_64-pc-windows-msvc -- --exact
           cargo test -p argos-gui write_private_report --target x86_64-pc-windows-msvc
 
   check-macos-private-authority:

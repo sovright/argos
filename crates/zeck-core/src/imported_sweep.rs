@@ -613,23 +613,25 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
         let built = {
             let mut wallet_db =
                 crate::workspace::open_wallet_db(self.workspace.wallet_db_path(), self.params)?;
-            build_imported_sapling_sweep_reviewed(
-                &mut wallet_db,
-                &self.params,
-                account.wallet_account_id,
-                extsk,
-                self.recipient,
-                self.prover,
-                self.max_fee_zatoshis,
-                prior_fee_zatoshis,
-                self.reviewed_sapling_fees
-                    .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0)),
-                if let Some(plan) = self.planned {
-                    plan.sapling.get(&account.wallet_account_id)
-                } else {
-                    None
-                },
-            )
+            extsk.with_parsed(|parsed| {
+                build_imported_sapling_sweep_reviewed(
+                    &mut wallet_db,
+                    &self.params,
+                    account.wallet_account_id,
+                    parsed,
+                    self.recipient,
+                    self.prover,
+                    self.max_fee_zatoshis,
+                    prior_fee_zatoshis,
+                    self.reviewed_sapling_fees
+                        .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0)),
+                    if let Some(plan) = self.planned {
+                        plan.sapling.get(&account.wallet_account_id)
+                    } else {
+                        None
+                    },
+                )
+            })
         };
         let tx = match built {
             Ok(tx) => tx,
@@ -840,21 +842,15 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
         if may_start_transparent_leg(&outcome) && !transparent_indices.is_empty() &&
             planned.is_none_or(|plan| plan.transparent.is_some()) {
             let all_keys = crate::imported::imported_transparent_keys(keys)?;
+            let mut available = all_keys.into_iter().map(Some).collect::<Vec<_>>();
             let selected = transparent_indices
                 .iter()
                 .map(|index| {
-                    all_keys.get(*index).ok_or_else(|| {
+                    available.get_mut(*index).and_then(Option::take).ok_or_else(|| {
                         ZeckError::Wallet(format!("standalone transparent key {index} is missing"))
                     })
                 })
                 .collect::<ZeckResult<Vec<_>>>()?;
-            let selected = selected
-                .into_iter()
-                .map(|key| crate::imported::ImportedTransparentKey {
-                    secret: key.secret,
-                    address: key.address,
-                })
-                .collect::<Vec<_>>();
             if let Some(swept) = crate::transparent_recovery::sweep_transparent_only_reviewed(
                 &mut log,
                 &selected,
@@ -1053,7 +1049,7 @@ async fn sweep_imported_sapling_leg(
                 let key = keys.sapling.get(key_index).ok_or_else(|| {
                     ZeckError::Wallet(format!("standalone Sapling key {key_index} is missing"))
                 })?;
-                let extsk = crate::imported::parse_sapling_extsk(
+                let extsk = crate::imported::ImportedSaplingSpendingKey::from_serialized(
                     secrecy::ExposeSecret::expose_secret(&key.extsk),
                 )?;
                 Ok((
@@ -1122,7 +1118,8 @@ fn unique_registered_accounts(
         let identity = account
             .sapling_extsk
             .as_ref()
-            .map(|key| key.to_diversifiable_full_viewing_key().to_bytes());
+            .map(crate::imported::ImportedSaplingSpendingKey::full_viewing_key_identity)
+            .transpose()?;
         if let Some(previous) = seen.get(&account.wallet_account_id) {
             if previous != &identity {
                 return Err(ZeckError::Wallet(
@@ -1336,7 +1333,11 @@ mod registered_account_dedup_tests {
 
     #[test]
     fn duplicate_registered_sapling_uuid_is_swept_once() {
-        let extsk = || sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let extsk = || {
+            let parsed = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+            crate::imported::ImportedSaplingSpendingKey::from_serialized(&parsed.to_bytes())
+                .expect("fixture key")
+        };
         let make_account = || crate::imported::ImportedWalletAccount {
             wallet_account_id: AccountUuid::default(),
             sapling_extsk: Some(extsk()),

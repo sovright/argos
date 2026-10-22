@@ -1650,14 +1650,15 @@ mod tests {
             .rev()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        std::fs::write(
+        crate::private_fs::write_private_file(
             journal.path(),
             format!(
                 "{note_txid}:{}:{} {}\n",
                 outpoint.js_index,
                 outpoint.output_index,
                 "ab".repeat(32)
-            ),
+            )
+            .as_bytes(),
         )
         .unwrap();
         let snapshot = journal.load_or_migrate().unwrap();

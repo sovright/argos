@@ -160,8 +160,8 @@ pub struct CheckpointGeneration {
 
 /// Cross-process lease for a checkpoint path.
 ///
-/// The lock is taken on the exact private sidecar handle we opened and
-/// hardened. We retain that handle, its object identity, and the parent
+/// The lock is taken on the exact private sidecar handle we created privately
+/// or verified without repair. We retain that handle, its object identity, and the parent
 /// directory handle for the lease lifetime. Every authority-sensitive use
 /// verifies that the path still names both retained objects, so replacing a
 /// locked sidecar cannot create a second authority that the first one fails
@@ -226,7 +226,7 @@ impl CheckpointLease {
 
     fn open_child(&self, path: &Path) -> ZeckResult<Option<fs::File>> {
         self.child_path(path)?;
-        match crate::private_fs::open_child_file(self.namespace.parent(), path) {
+        match crate::private_fs::open_child_file_for_removal(self.namespace.parent(), path) {
             Ok(file) => Ok(Some(file)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(ZeckError::TransactionBuild(format!(
@@ -265,16 +265,24 @@ impl CheckpointLease {
             })
     }
 
-    fn rename_child(&self, from: &Path, to: &Path) -> ZeckResult<()> {
+    fn rename_open_child(
+        &self,
+        from: &Path,
+        to: &Path,
+        file: &fs::File,
+        expected: &CheckpointObjectId,
+    ) -> ZeckResult<()> {
         self.child_path(from)?;
         self.child_path(to)?;
-        crate::private_fs::rename_child_file(self.namespace.parent(), from, to).map_err(|err| {
-            ZeckError::TransactionBuild(format!(
-                "renaming checkpoint child {} to {}: {err}",
-                from.display(),
-                to.display()
-            ))
-        })
+        self.namespace
+            .rename_open_child(from, to, file, expected)
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!(
+                    "renaming exact checkpoint child {} to {}: {err}",
+                    from.display(),
+                    to.display()
+                ))
+            })
     }
 
     fn child_names(&self) -> ZeckResult<Vec<std::ffi::OsString>> {
@@ -360,8 +368,9 @@ fn checkpoint_generation_with_post_read(
     path: &Path,
     post_read: impl FnOnce(),
 ) -> ZeckResult<CheckpointGeneration> {
-    let file = fs::File::open(path).map_err(|err| {
-        ZeckError::TransactionBuild(format!("opening checkpoint {}: {err}", path.display()))
+    let lease = CheckpointLease::acquire(path)?;
+    let file = lease.open_child(path)?.ok_or_else(|| {
+        ZeckError::ScanNotReady(format!("checkpoint {} is absent", path.display()))
     })?;
     checkpoint_generation_from_handle_with_post_read(&file, path, post_read)
 }
@@ -844,14 +853,18 @@ pub fn saved_decrypt_from(
 /// failure — permissions, I/O, a directory in its place — is an error, so a
 /// scan that ran for hours never reads as one that never ran.
 fn read_checkpoint_file(path: &Path) -> ZeckResult<Option<Zeroizing<Vec<u8>>>> {
-    match fs::File::open(path) {
-        Ok(mut file) => read_checkpoint_handle(&mut file, path).map(Some),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(ZeckError::TransactionBuild(format!(
-            "reading the scan checkpoint at {}: {err}",
-            path.display()
-        ))),
-    }
+    let lease = CheckpointLease::acquire(path)?;
+    read_checkpoint_file_while_leased(&lease, path)
+}
+
+fn read_checkpoint_file_while_leased(
+    lease: &CheckpointLease,
+    path: &Path,
+) -> ZeckResult<Option<Zeroizing<Vec<u8>>>> {
+    let Some(mut file) = lease.open_child(path)? else {
+        return Ok(None);
+    };
+    read_checkpoint_handle(&mut file, path).map(Some)
 }
 
 /// What a scan checkpoint says about spends on chain, for the wallet-file
@@ -1049,7 +1062,11 @@ fn scans_covering(
         if !(name.starts_with("sprout-scan-") && name.ends_with(".checkpoint")) {
             continue;
         }
-        let Ok(mut file) = std::fs::File::open(entry.path()) else {
+        let path = entry.path();
+        let Ok(lease) = CheckpointLease::acquire(&path) else {
+            continue;
+        };
+        let Ok(Some(mut file)) = lease.open_child(&path) else {
             continue;
         };
         let Ok(head) = read_secret_prefix(&mut file, HEADER_READ_LIMIT as usize) else {
@@ -2821,7 +2838,7 @@ pub(crate) fn fail_checkpoint_discard(path: &Path) {
 
 pub fn discard_checkpoint(path: &Path) -> ZeckResult<CheckpointDiscard> {
     let lease = CheckpointLease::acquire(path)?;
-    match checkpoint_generation(path) {
+    match lease.generation(path) {
         Ok(generation) => discard_checkpoint_generation_while_leased(&lease, path, &generation),
         Err(_) if !path.exists() => {
             let removed = discard_checkpoint_temporaries(&lease, path)?;
@@ -2940,14 +2957,10 @@ fn discard_checkpoint_generation_while_leased_with_observers(
     after_generation_check();
     lease.verify_for(path)?;
     let quarantine = checkpoint_discard_quarantine(path)?;
-    lease.rename_child(path, &quarantine)?;
-    lease.sync_parent()?;
-    let moved_file = lease.open_child(&quarantine)?.ok_or_else(|| {
-        ZeckError::ScanNotReady("checkpoint quarantine disappeared before verification".into())
-    })?;
-    let moved = checkpoint_generation_from_handle(&moved_file, &quarantine)?;
+    lease.rename_open_child(path, &quarantine, &file, &current.object)?;
+    let moved = checkpoint_generation_from_handle(&file, &quarantine)?;
     if &moved != expected {
-        restore_unexpected_checkpoint(lease, &quarantine, path)?;
+        lease.rename_open_child(&quarantine, path, &file, &moved.object)?;
         return Err(ZeckError::ScanNotReady(format!(
             "checkpoint {} was replaced at the deletion boundary; the replacement was preserved",
             path.display()
@@ -2959,7 +2972,7 @@ fn discard_checkpoint_generation_while_leased_with_observers(
     // recheck immediately before unlinkat. The namespace lease excludes all
     // cooperating writers; a hostile same-UID process can still race the
     // final open-to-unlink syscall gap, which is surfaced as a platform limit.
-    lease.remove_open_child(&quarantine, &moved_file, &moved.object)?;
+    lease.remove_open_child(&quarantine, &file, &moved.object)?;
     removed = true;
     lease.sync_parent()?;
     Ok(if removed {
@@ -3029,24 +3042,6 @@ fn discard_matching_checkpoint_quarantines(
         removed = true;
     }
     Ok((removed, unexpected))
-}
-
-fn restore_unexpected_checkpoint(
-    lease: &CheckpointLease,
-    quarantine: &Path,
-    path: &Path,
-) -> ZeckResult<()> {
-    match lease.rename_child(quarantine, path) {
-        Ok(()) => lease.sync_parent(),
-        Err(ZeckError::TransactionBuild(ref message)) if message.contains("exists") => {
-            Err(ZeckError::ScanNotReady(format!(
-                "a replacement checkpoint already exists at {}; preserved the raced object at {}",
-                path.display(),
-                quarantine.display()
-            )))
-        }
-        Err(err) => Err(err),
-    }
 }
 
 /// How old a unique temp sibling must be before it is taken for a crashed
@@ -4020,10 +4015,10 @@ mod tests {
     fn checkpoint_generation_rejects_identical_byte_replacement() {
         let dir = ScratchDir::new("checkpoint-generation-replacement");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"same checkpoint bytes").unwrap();
+        crate::private_fs::write_private_file(&path, b"same checkpoint bytes").unwrap();
         let first = checkpoint_generation(&path).unwrap();
         let replacement = dir.0.join("replacement");
-        std::fs::write(&replacement, b"same checkpoint bytes").unwrap();
+        crate::private_fs::write_private_file(&replacement, b"same checkpoint bytes").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         let second = checkpoint_generation(&path).unwrap();
         assert_eq!(first.len, second.len);
@@ -4031,17 +4026,70 @@ mod tests {
         assert_ne!(first.object, second.object);
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_generation_rejects_same_length_in_place_mutation_during_review() {
         let dir = ScratchDir::new("checkpoint-generation-in-place-race");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"first checkpoint bytes").unwrap();
+        crate::private_fs::write_private_file(&path, b"first checkpoint bytes").unwrap();
         let err = checkpoint_generation_with_post_read(&path, || {
             std::fs::write(&path, b"other checkpoint bytes").unwrap();
         })
         .expect_err("an in-place mutation during the review must be rejected")
         .to_string();
         assert!(err.contains("changed while it was reviewed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_authority_reads_refuse_a_permissive_file_without_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = ScratchDir::new("checkpoint-permissive-read");
+        let keys = [[0x11; 32], [0x22; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(checkpoint_generation(&path).is_err());
+        assert!(read_checkpoint_file(&path).is_err());
+        assert!(scans_covering(&dir.0, P2pNetwork::Regtest, &[[0x11; 32]]).is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_checkpoint_reads_refuse_a_preheld_data_handle() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        let dir = ScratchDir::new("checkpoint-preheld-data-handle");
+        let path = dir.0.join("scan.checkpoint");
+        crate::private_fs::write_private_file(&path, b"spending-key checkpoint").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+
+        assert!(checkpoint_generation(&path).is_err());
+        assert!(read_checkpoint_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"spending-key checkpoint");
+        drop(held);
+        checkpoint_generation(&path).unwrap();
+        assert_eq!(
+            read_checkpoint_file(&path).unwrap().unwrap().as_slice(),
+            b"spending-key checkpoint"
+        );
     }
 
     #[test]
@@ -4062,7 +4110,7 @@ mod tests {
     fn replaced_lease_sidecar_revokes_old_cleanup_authority() {
         let dir = ScratchDir::new("checkpoint-lease-replaced-sidecar");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"reviewed checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
         let old_generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
         let sidecar = checkpoint_lease_path(&path);
@@ -4074,7 +4122,7 @@ mod tests {
             "the retained parent namespace lock must reject a replacement sidecar"
         );
         let replacement = dir.0.join("replacement.checkpoint");
-        std::fs::write(&replacement, b"newer checkpoint").unwrap();
+        crate::private_fs::write_private_file(&replacement, b"newer checkpoint").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
 
         let err = discard_checkpoint_generation_while_leased(&old, &path, &old_generation)
@@ -4085,7 +4133,7 @@ mod tests {
 
         drop(old);
         let current = CheckpointLease::acquire(&path).unwrap();
-        let current_generation = checkpoint_generation(&path).unwrap();
+        let current_generation = current.generation(&path).unwrap();
         assert_eq!(
             discard_checkpoint_generation_while_leased(&current, &path, &current_generation)
                 .unwrap(),
@@ -4100,7 +4148,7 @@ mod tests {
 
         let dir = ScratchDir::new("checkpoint-sidecar-staging-race");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"reviewed checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
         let sidecar = checkpoint_lease_path(&path);
@@ -4131,16 +4179,16 @@ mod tests {
     fn replaced_parent_namespace_cannot_redirect_old_cleanup() {
         let root = ScratchDir::new("checkpoint-parent-replacement");
         let parent = root.0.join("active");
-        std::fs::create_dir(&parent).unwrap();
+        crate::private_fs::create_private_dir_all(&parent).unwrap();
         let path = parent.join("scan.checkpoint");
-        std::fs::write(&path, b"old checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"old checkpoint").unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
 
         let displaced = root.0.join("displaced");
         std::fs::rename(&parent, &displaced).unwrap();
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::write(&path, b"new checkpoint").unwrap();
+        crate::private_fs::create_private_dir_all(&parent).unwrap();
+        crate::private_fs::write_private_file(&path, b"new checkpoint").unwrap();
         let current = CheckpointLease::acquire(&path).unwrap();
 
         assert!(discard_checkpoint_generation_while_leased(&old, &path, &generation).is_err());
@@ -4157,7 +4205,7 @@ mod tests {
     fn sidecar_and_generation_swap_at_final_delete_boundary_preserves_new_checkpoint() {
         let dir = ScratchDir::new("checkpoint-final-delete-race");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"reviewed checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
         let sidecar = checkpoint_lease_path(&path);
@@ -4172,7 +4220,7 @@ mod tests {
             || {
                 std::fs::rename(&sidecar, &displaced).unwrap();
                 replacement_lease_refused = CheckpointLease::acquire(&path).is_err();
-                std::fs::write(&replacement, b"newer checkpoint").unwrap();
+                crate::private_fs::write_private_file(&replacement, b"newer checkpoint").unwrap();
                 std::fs::rename(&replacement, &path).unwrap();
             },
         )
@@ -4184,7 +4232,7 @@ mod tests {
 
         drop(old);
         let current = CheckpointLease::acquire(&path).unwrap();
-        let current_generation = checkpoint_generation(&path).unwrap();
+        let current_generation = current.generation(&path).unwrap();
         assert_eq!(
             discard_checkpoint_generation_while_leased(&current, &path, &current_generation)
                 .unwrap(),
@@ -4193,10 +4241,10 @@ mod tests {
     }
 
     #[test]
-    fn generation_swap_at_exact_delete_boundary_is_quarantined_and_restored() {
+    fn generation_swap_at_exact_delete_boundary_is_preserved_before_quarantine() {
         let dir = ScratchDir::new("checkpoint-exact-delete-race");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"reviewed checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let lease = CheckpointLease::acquire(&path).unwrap();
         let replacement = dir.0.join("replacement.checkpoint");
@@ -4206,13 +4254,13 @@ mod tests {
             &path,
             &generation,
             || {
-                std::fs::write(&replacement, b"newer checkpoint").unwrap();
+                crate::private_fs::write_private_file(&replacement, b"newer checkpoint").unwrap();
                 std::fs::rename(&replacement, &path).unwrap();
             },
         )
         .expect_err("exact-object deletion must reject the raced generation")
         .to_string();
-        assert!(err.contains("replacement was preserved"), "{err}");
+        assert!(err.contains("path changed before rename"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"newer checkpoint");
         assert!(checkpoint_discard_quarantines(&lease, &path)
             .unwrap()
@@ -4224,7 +4272,7 @@ mod tests {
     fn quarantine_swap_after_verification_preserves_the_sentinel() {
         let dir = ScratchDir::new("checkpoint-quarantine-delete-race");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"reviewed checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let lease = CheckpointLease::acquire(&path).unwrap();
         let displaced = dir.0.join("verified-quarantine");
@@ -4236,7 +4284,7 @@ mod tests {
             || {},
             |quarantine| {
                 std::fs::rename(quarantine, &displaced).unwrap();
-                std::fs::write(quarantine, b"sentinel replacement").unwrap();
+                crate::private_fs::write_private_file(quarantine, b"sentinel replacement").unwrap();
             },
         )
         .expect_err("the final identity check must reject a substituted quarantine")
@@ -4257,7 +4305,7 @@ mod tests {
     fn windows_checkpoint_quarantine_uses_exact_open_handle_rename_and_delete() {
         let dir = ScratchDir::new("checkpoint-windows-exact-delete");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"reviewed checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let lease = CheckpointLease::acquire(&path).unwrap();
         let displaced = dir.0.join("must-not-move-open-quarantine");
@@ -4289,13 +4337,13 @@ mod tests {
     fn exact_delete_restart_removes_only_the_manifested_quarantine() {
         let dir = ScratchDir::new("checkpoint-exact-delete-restart");
         let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"reviewed checkpoint").unwrap();
+        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let lease = CheckpointLease::acquire(&path).unwrap();
         let quarantine = checkpoint_discard_quarantine(&path).unwrap();
         std::fs::rename(&path, &quarantine).unwrap();
         let unrelated = checkpoint_discard_quarantine(&path).unwrap();
-        std::fs::write(&unrelated, b"different generation").unwrap();
+        crate::private_fs::write_private_file(&unrelated, b"different generation").unwrap();
 
         let err = discard_checkpoint_generation_while_leased(&lease, &path, &generation)
             .expect_err("an unmanifested quarantine must block completion")
@@ -4371,7 +4419,7 @@ mod tests {
         let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
         let temp = |label: &str| {
             let tmp = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
-            std::fs::write(&tmp, label).unwrap();
+            crate::private_fs::write_private_file(&tmp, label.as_bytes()).unwrap();
             tmp
         };
         let age = |tmp: &Path| {
@@ -4547,7 +4595,7 @@ mod tests {
             let path = checkpoint_path(&dir.0, &keys);
             let mut file = vec![NETWORK_TAGGED, network_tag(P2pNetwork::Regtest)];
             file.extend_from_slice(&body);
-            std::fs::write(&path, &file).unwrap();
+            crate::private_fs::write_private_file(&path, &file).unwrap();
             let mut verifier = FakeCursorVerifier {
                 response: Some(CanonicalContinuation::Current {
                     chain_has_more: false,
@@ -5828,12 +5876,15 @@ mod tests {
         let keys = [[0x14; 32]];
         // A directory where the file should be: reading it fails, and not
         // with NotFound. Portable, unlike a permission bit root ignores.
-        std::fs::create_dir_all(checkpoint_path(&dir.0, &keys)).unwrap();
+        let path = checkpoint_path(&dir.0, &keys);
+        crate::private_fs::create_private_dir_all(&path).unwrap();
 
         let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
             .expect_err("an unreadable checkpoint must be reported");
         assert!(
-            err.to_string().contains("reading the scan checkpoint"),
+            err.to_string()
+                .contains("private file must be a regular file")
+                && err.to_string().contains(&path.display().to_string()),
             "{err}"
         );
     }
@@ -5865,7 +5916,11 @@ mod tests {
         let dir = ScratchDir::new("untagged");
         let keys = [[0x15; 32]];
         let path = checkpoint_path(&dir.0, &keys);
-        std::fs::write(&path, scanned(&keys, [0x99; 32], 5).checkpoint().as_bytes()).unwrap();
+        crate::private_fs::write_private_file(
+            &path,
+            scanned(&keys, [0x99; 32], 5).checkpoint().as_bytes(),
+        )
+        .unwrap();
 
         let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
             .expect_err("no network recorded, so no verdict");
@@ -5967,10 +6022,9 @@ mod tests {
         scanner
             .scan_block_at(&[], [0xCD; 32], 1_046_399)
             .expect("an empty block");
-        let dir = std::env::temp_dir().join("argos-scan-legacy-network-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("legacy.checkpoint");
-        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
+        let dir = ScratchDir::new("legacy-network-test");
+        let path = dir.0.join("legacy.checkpoint");
+        crate::private_fs::write_private_file(&path, scanner.checkpoint().as_bytes()).unwrap();
 
         let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Testnet, &[], None, &path, |_| {})
             .await
@@ -5990,12 +6044,11 @@ mod tests {
             .scan_block_at(&[], [0xCD; 32], 1_046_399)
             .expect("an empty block");
 
-        let dir = std::env::temp_dir().join("argos-scan-canopy-resume-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("canopy.checkpoint");
+        let dir = ScratchDir::new("canopy-resume-test");
+        let path = dir.0.join("canopy.checkpoint");
         // Written as every existing checkpoint was — before files recorded
         // their network — because those are the scans this must continue.
-        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
+        crate::private_fs::write_private_file(&path, scanner.checkpoint().as_bytes()).unwrap();
 
         // Nothing listens on the only peer offered, so a run that goes on
         // to fetch can only still be waiting for a connection — or fail
@@ -6038,10 +6091,9 @@ mod tests {
     /// silently discarded — six hours of work is worth a question.
     #[tokio::test]
     async fn a_corrupt_checkpoint_is_reported_not_discarded() {
-        let dir = std::env::temp_dir().join("argos-scan-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("corrupt.checkpoint");
-        std::fs::write(&path, b"not a checkpoint").unwrap();
+        let dir = ScratchDir::new("corrupt");
+        let path = dir.0.join("corrupt.checkpoint");
+        crate::private_fs::write_private_file(&path, b"not a checkpoint").unwrap();
 
         let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Regtest, &[], None, &path, |_| {})
             .await
@@ -6051,7 +6103,6 @@ mod tests {
             text.contains("could not be read") && text.contains("Delete it"),
             "the message must say what happened and what to do: {text}"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     // ── decrypt-from bound across a resume ───────────────────────────────────

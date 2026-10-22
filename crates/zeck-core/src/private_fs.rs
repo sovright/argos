@@ -13,6 +13,307 @@ pub enum PrivateObjectId {
     Windows { volume_serial: u32, file_index: u64 },
 }
 
+pub(crate) const PRIVATE_ROOT_LINEAGE_FILE_NAME: &str = ".argos-private-root-v1";
+
+const PRIVATE_ROOT_LINEAGE_SCHEMA_VERSION: u32 = 1;
+const PRIVATE_SQLITE_LINEAGE_SCHEMA_VERSION: u32 = 1;
+const PRIVATE_ROOT_STAGING_TAG: &str = ".argos-staging-";
+const EPHEMERAL_PROBE_CLEANUP_SCHEMA_VERSION: u32 = 1;
+const EPHEMERAL_PROBE_CLEANUP_MARKER_SUFFIX: &str = ".argos-ephemeral-cleanup-v1";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PrivateRootLineageRecord {
+    schema_version: u32,
+    publication_parent: PrivateObjectId,
+    private_root: PrivateObjectId,
+    marker: PrivateObjectId,
+    context: Vec<u8>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PrivateSqliteLineageRecord {
+    schema_version: u32,
+    private_root: PrivateObjectId,
+    parent: PrivateObjectId,
+    database: PrivateObjectId,
+    marker: PrivateObjectId,
+    context: Vec<u8>,
+    #[cfg(windows)]
+    generation: [u8; 16],
+    #[cfg(windows)]
+    anchor_id: [u8; 16],
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EphemeralProbeCleanupRecord {
+    schema_version: u32,
+    private_root: std::path::PathBuf,
+    database: std::path::PathBuf,
+    binding: PrivateWorkspaceCleanupBinding,
+    marker: PrivateObjectId,
+}
+
+#[derive(Clone, Copy)]
+enum LineageRecordKind {
+    PrivateRoot,
+    PrivateSqlite,
+    #[cfg(windows)]
+    CleanupMarker,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WindowsLineageObjects {
+    publication_parent: PrivateObjectId,
+    private_root: PrivateObjectId,
+    root_marker: PrivateObjectId,
+    sqlite_parent: PrivateObjectId,
+    database: PrivateObjectId,
+    sqlite_marker: PrivateObjectId,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum WindowsLineageState {
+    Pending {
+        generation: [u8; 16],
+    },
+    Active {
+        generation: [u8; 16],
+        objects: WindowsLineageObjects,
+    },
+    Revoked {
+        retired_generation: [u8; 16],
+        cleanup_id: [u8; 16],
+        objects: WindowsLineageObjects,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WindowsLineageAuthorityRecord {
+    schema_version: u32,
+    context_hash: [u8; 32],
+    anchor_id: [u8; 16],
+    state: WindowsLineageState,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TrustedSqliteIdentity {
+    canonical_path: std::path::PathBuf,
+    publication_parent: PrivateObjectId,
+    private_root: PrivateObjectId,
+    parent: PrivateObjectId,
+    database: PrivateObjectId,
+    marker: PrivateObjectId,
+    anchor_id: [u8; 16],
+    generation: [u8; 16],
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct TrustedSqliteAuthority {
+    identity: TrustedSqliteIdentity,
+    _root: File,
+    _parent: File,
+    database: File,
+    marker: File,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct TrustedSqliteRegistry {
+    authorities: std::collections::HashMap<std::path::PathBuf, TrustedSqliteAuthority>,
+    cleanup_held: std::collections::HashSet<std::path::PathBuf>,
+}
+
+/// An exact workspace-leaf handle retained across cleanup marker creation,
+/// Windows lineage revocation, rename, and recursive removal.
+#[derive(Debug)]
+pub(crate) struct RetainedWorkspaceDirectory {
+    directory: File,
+    id: PrivateObjectId,
+    cleanup_hold: Option<SqliteCleanupHold>,
+}
+
+/// Exact authority for removing a throwaway shielded-probe workspace. The
+/// registry remains Active until the exact private root has been removed and
+/// its publication parent synced; only then is the per-probe authority retired.
+#[derive(Debug)]
+pub(crate) struct EphemeralProbeCleanup {
+    publication_parent: File,
+    publication_parent_path: std::path::PathBuf,
+    private_root: std::path::PathBuf,
+    private_root_directory: File,
+    private_root_id: PrivateObjectId,
+    marker_path: std::path::PathBuf,
+    marker_id: PrivateObjectId,
+    #[cfg(windows)]
+    database: std::path::PathBuf,
+    binding: PrivateWorkspaceCleanupBinding,
+    cleanup_hold: Option<SqliteCleanupHold>,
+    _registration: EphemeralProbeRegistration,
+}
+
+/// A process-held, exact private file lock proving that an authenticated probe
+/// marker belongs to a live probe and must be skipped by stale recovery.
+#[derive(Debug)]
+pub(crate) struct EphemeralProbeRegistration {
+    file: File,
+    id: PrivateObjectId,
+    path: std::path::PathBuf,
+}
+
+#[derive(Debug)]
+struct SqliteCleanupHold {
+    #[cfg(windows)]
+    registry_key: std::path::PathBuf,
+    #[cfg(windows)]
+    _open_guard: PrivateSqliteOpenGuard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PrivateWorkspaceCleanupBinding {
+    pub(crate) publication_parent: PrivateObjectId,
+    pub(crate) private_root: PrivateObjectId,
+    pub(crate) root_marker: PrivateObjectId,
+    pub(crate) workspace: PrivateObjectId,
+    pub(crate) database: PrivateObjectId,
+    pub(crate) database_marker: PrivateObjectId,
+    pub(crate) anchor_id: Option<[u8; 16]>,
+    pub(crate) generation: Option<[u8; 16]>,
+}
+
+impl RetainedWorkspaceDirectory {
+    pub(crate) fn id(&self) -> &PrivateObjectId {
+        &self.id
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PrivateSqliteOpenGuard {
+    #[cfg(windows)]
+    key: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+fn sqlite_open_gates() -> &'static (
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    std::sync::Condvar,
+) {
+    static GATES: std::sync::OnceLock<(
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+        std::sync::Condvar,
+    )> = std::sync::OnceLock::new();
+    GATES.get_or_init(|| {
+        (
+            std::sync::Mutex::new(std::collections::HashSet::new()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+pub(crate) fn lock_private_sqlite_open(path: &Path) -> io::Result<PrivateSqliteOpenGuard> {
+    #[cfg(windows)]
+    {
+        let key = fs::canonicalize(path)?;
+        let (mutex, changed) = sqlite_open_gates();
+        let mut held = mutex
+            .lock()
+            .map_err(|_| io::Error::other("private SQLite open gate is poisoned"))?;
+        while held.contains(&key) {
+            held = changed
+                .wait(held)
+                .map_err(|_| io::Error::other("private SQLite open gate is poisoned"))?;
+        }
+        held.insert(key.clone());
+        Ok(PrivateSqliteOpenGuard { key })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(PrivateSqliteOpenGuard {})
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PrivateSqliteOpenGuard {
+    fn drop(&mut self) {
+        let (mutex, changed) = sqlite_open_gates();
+        if let Ok(mut held) = mutex.lock() {
+            held.remove(&self.key);
+            changed.notify_all();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SqliteCleanupHold {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = trusted_sqlite_authorities().lock() {
+            registry.cleanup_held.remove(&self.registry_key);
+        }
+    }
+}
+
+/// Retained proof that a wallet-private root was created by the private-first
+/// policy. Existing unmarked roots are never blessed in place.
+#[derive(Debug)]
+pub(crate) struct PrivateRootLineageLease {
+    root: File,
+    path: std::path::PathBuf,
+    context_path: std::path::PathBuf,
+    id: PrivateObjectId,
+    publication_parent_id: PrivateObjectId,
+    root_marker_id: PrivateObjectId,
+}
+
+impl PrivateRootLineageLease {
+    pub(crate) fn id(&self) -> &PrivateObjectId {
+        &self.id
+    }
+
+    pub(crate) fn verify_current(&self) -> io::Result<()> {
+        if private_object_id(&self.root)? != self.id {
+            return Err(invalid_lineage("retained private workspace root changed"));
+        }
+        let parent_path = self.path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private workspace root has no parent",
+            )
+        })?;
+        let parent = open_publication_parent(parent_path)?;
+        if private_object_id(&parent)? != self.publication_parent_id {
+            return Err(invalid_lineage(
+                "workspace publication parent changed after lineage verification",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let current = unix_private::open_directory(&self.path)?;
+            unix_private::verify_private_directory(&current)?;
+            if private_object_id(&current)? != self.id {
+                return Err(invalid_lineage(
+                    "private workspace root path no longer names the retained object",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn contextualize(&self, path: &Path) -> io::Result<std::path::PathBuf> {
+        let relative = path.strip_prefix(&self.path).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private lineage child is outside its retained root",
+            )
+        })?;
+        Ok(self.context_path.join(relative))
+    }
+}
+
 pub(crate) fn private_object_id(file: &File) -> io::Result<PrivateObjectId> {
     #[cfg(unix)]
     {
@@ -159,10 +460,27 @@ impl NamespaceLease {
         self.read_child_version(path).map(|(bytes, _)| bytes)
     }
 
+    pub(crate) fn read_child_bounded(&self, path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        let file = open_child_file_for_authority(&self.parent, path)?;
+        let mut bytes = Vec::new();
+        file.take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private metadata exceeds its maximum size",
+            ));
+        }
+        self.verify_current()?;
+        Ok(bytes)
+    }
+
     pub(crate) fn read_child_version(&self, path: &Path) -> io::Result<(Vec<u8>, PrivateObjectId)> {
         self.require_child(path)?;
         self.verify_current()?;
-        let mut file = open_child_file(&self.parent, path)?;
+        let mut file = open_child_file_for_authority(&self.parent, path)?;
         let identity = private_object_id(&file)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -215,8 +533,11 @@ impl NamespaceLease {
         file.write_all(suffix)?;
         file.flush()?;
         file.sync_all()?;
-        let current_path = open_child_file(&self.parent, path)?;
-        if private_object_id(&current_path)? != object_id {
+        #[cfg(unix)]
+        let final_id = private_object_id(&open_child_file(&self.parent, path)?)?;
+        #[cfg(windows)]
+        let final_id = private_object_id(&file)?;
+        if final_id != object_id {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "private child path changed during append",
@@ -266,10 +587,61 @@ impl NamespaceLease {
         self.verify_current()
     }
 
-    pub(crate) fn rename_child_directory(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.rename_child_directory_with_observer(from, to, || Ok(()))
+    pub(crate) fn rename_open_child(
+        &self,
+        from: &Path,
+        to: &Path,
+        file: &File,
+        expected_id: &PrivateObjectId,
+    ) -> io::Result<()> {
+        self.require_child(from)?;
+        self.require_child(to)?;
+        self.verify_current()?;
+        if private_object_id(file)? != *expected_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained private child changed before rename",
+            ));
+        }
+        rename_open_child_file(&self.parent, from, to, file, expected_id)?;
+        self.parent.sync_all()?;
+        #[cfg(unix)]
+        {
+            let current = open_child_file_for_identity(&self.parent, to)?;
+            if private_object_id(&current)? != *expected_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private child destination changed after rename",
+                ));
+            }
+        }
+        #[cfg(windows)]
+        if private_object_id(file)? != *expected_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained private child changed after rename",
+            ));
+        }
+        self.verify_current()
     }
 
+    pub(crate) fn rename_retained_workspace_directory(
+        &self,
+        from: &Path,
+        to: &Path,
+        retained: &RetainedWorkspaceDirectory,
+    ) -> io::Result<()> {
+        self.require_child(from)?;
+        self.require_child(to)?;
+        self.verify_current()?;
+        verify_open_child_directory(&self.parent, from, &retained.directory, &retained.id)?;
+        rename_open_child_directory(&self.parent, from, to, &retained.directory)?;
+        self.parent.sync_all()?;
+        verify_open_child_directory(&self.parent, to, &retained.directory, &retained.id)?;
+        self.verify_current()
+    }
+
+    #[cfg(test)]
     fn rename_child_directory_with_observer(
         &self,
         from: &Path,
@@ -290,10 +662,28 @@ impl NamespaceLease {
         self.verify_current()
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_child_directory_all(&self, path: &Path) -> io::Result<()> {
         self.remove_child_directory_all_with_observer(path, || Ok(()))
     }
 
+    pub(crate) fn remove_retained_workspace_directory_all(
+        &self,
+        path: &Path,
+        retained: &RetainedWorkspaceDirectory,
+    ) -> io::Result<()> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        verify_open_child_directory(&self.parent, path, &retained.directory, &retained.id)?;
+        remove_open_directory_contents(&retained.directory)?;
+        retained.directory.sync_all()?;
+        verify_open_child_directory(&self.parent, path, &retained.directory, &retained.id)?;
+        remove_open_child_directory(&self.parent, path, &retained.directory, &retained.id)?;
+        self.parent.sync_all()?;
+        self.verify_current()
+    }
+
+    #[cfg(test)]
     fn remove_child_directory_all_with_observer(
         &self,
         path: &Path,
@@ -333,7 +723,7 @@ impl NamespaceLease {
     pub(crate) fn retain_child(&self, path: &Path) -> io::Result<RetainedNamespaceChild> {
         self.require_child(path)?;
         self.verify_current()?;
-        let file = open_child_file(&self.parent, path)?;
+        let file = open_child_file_for_authority(&self.parent, path)?;
         let id = private_object_id(&file)?;
         let child = RetainedNamespaceChild {
             namespace: self.try_clone_authority()?,
@@ -376,7 +766,65 @@ impl NamespaceLease {
     }
 }
 
-fn open_child_file_for_removal(parent: &File, path: &Path) -> io::Result<File> {
+pub(crate) fn open_child_file_for_authority(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_child_file(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_child_file_exclusive(parent, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private authority reads are unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn open_child_file_for_identity(parent: &File, path: &Path) -> io::Result<File> {
+    unix_private::open_child_file(parent, path)
+}
+
+fn rename_open_child_file(
+    parent: &File,
+    from: &Path,
+    to: &Path,
+    file: &File,
+    expected_id: &PrivateObjectId,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let current = unix_private::open_child_file(parent, from)?;
+        if private_object_id(&current)? != *expected_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private child path changed before rename",
+            ));
+        }
+        let _ = file;
+        unix_private::rename_child_file(parent, from, to)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (from, expected_id);
+        windows_acl::move_file(file, parent, to, false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, from, to, file, expected_id);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact private child rename is unsupported on this platform",
+        ))
+    }
+}
+
+pub(crate) fn open_child_file_for_removal(parent: &File, path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         unix_private::open_child_file(parent, path)
@@ -424,7 +872,11 @@ impl RetainedNamespaceChild {
                 "retained namespace child changed",
             ));
         }
+        #[cfg(unix)]
         let current = open_child_file(self.namespace.parent(), &self.path)?;
+        #[cfg(windows)]
+        let current =
+            windows_acl::open_child_file_for_identity(self.namespace.parent(), &self.path)?;
         if private_object_id(&current)? != self.id {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -555,7 +1007,7 @@ pub enum PrivateOpenMode {
     CreateNew,
 }
 
-/// Create `path` and tighten the leaf directory before it is used.
+/// Create the path privately, or verify that an existing leaf is already private.
 pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -579,15 +1031,676 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Remove inherited/broad access from an existing private directory.
+fn create_private_identity_record(
+    parent: &File,
+    path: &Path,
+    build: impl FnOnce(&PrivateObjectId) -> io::Result<Vec<u8>>,
+) -> io::Result<PrivateObjectId> {
+    let mut file = create_child_file_read_append(parent, path)?;
+    let id = private_object_id(&file)?;
+    let result = (|| {
+        let bytes = build(&id)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        parent.sync_all()
+    })();
+    if let Err(error) = result {
+        drop(file);
+        let _ = remove_child_file(parent, path);
+        return Err(error);
+    }
+    Ok(id)
+}
+
+fn append_lineage_context_component(bytes: &mut Vec<u8>, value: &std::ffi::OsStr) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let encoded = value.encode_wide().collect::<Vec<_>>();
+        bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        for unit in encoded {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let encoded = value.as_bytes();
+        bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(encoded);
+    }
+}
+
+fn private_root_lineage_context(private_root: &Path) -> io::Result<Vec<u8>> {
+    let parent = private_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private workspace root has no parent",
+        )
+    })?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let root_name = private_root.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private workspace root has no name",
+        )
+    })?;
+    let mut context = b"argos/private-root-lineage/context/v1".to_vec();
+    append_lineage_context_component(&mut context, canonical_parent.as_os_str());
+    append_lineage_context_component(&mut context, root_name);
+    Ok(context)
+}
+
+fn sqlite_lineage_context(root: &PrivateRootLineageLease, database: &Path) -> io::Result<Vec<u8>> {
+    let expected_database = root.contextualize(database)?;
+    sqlite_lineage_context_paths(&root.context_path, &expected_database)
+}
+
+fn sqlite_lineage_context_paths(private_root: &Path, database: &Path) -> io::Result<Vec<u8>> {
+    let relative = database
+        .strip_prefix(private_root)
+        .map_err(io::Error::other)?;
+    let mut context = private_root_lineage_context(private_root)?;
+    context.extend_from_slice(b"argos/private-sqlite-lineage/context/v1");
+    append_lineage_context_component(&mut context, relative.as_os_str());
+    Ok(context)
+}
+
+#[cfg(windows)]
+fn require_windows_authority_header(
+    authority: &WindowsLineageAuthorityRecord,
+    context_hash: &[u8; 32],
+    anchor_id: &[u8; 16],
+) -> io::Result<()> {
+    if authority.schema_version != 1
+        || authority.context_hash != *context_hash
+        || authority.anchor_id != *anchor_id
+    {
+        return Err(invalid_lineage(
+            "Windows private lineage registry authority does not match this workspace",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_windows_lineage_creation(context: &[u8]) -> io::Result<([u8; 16], [u8; 16])> {
+    let context_hash = windows_lineage::context_hash(context);
+    let authority = windows_lineage::read_authority(&context_hash)?;
+    match authority {
+        None => {
+            let anchor_id = uuid::Uuid::new_v4().into_bytes();
+            let generation = uuid::Uuid::new_v4().into_bytes();
+            windows_lineage::write_authority(
+                &context_hash,
+                &WindowsLineageAuthorityRecord {
+                    schema_version: 1,
+                    context_hash,
+                    anchor_id,
+                    state: WindowsLineageState::Pending { generation },
+                },
+            )?;
+            Ok((anchor_id, generation))
+        }
+        Some(authority) => match authority.state {
+            WindowsLineageState::Pending { generation } => {
+                require_windows_authority_header(
+                    &authority,
+                    &context_hash,
+                    &authority.anchor_id,
+                )?;
+                Ok((authority.anchor_id, generation))
+            }
+            WindowsLineageState::Revoked { .. } => Err(invalid_lineage(
+                "Windows private lineage authority is revoked; start an explicitly confirmed new recovery after cleanup completes",
+            )),
+            WindowsLineageState::Active { .. } => Err(invalid_lineage(
+                "Windows private lineage authority is active but the workspace root is absent; manual recovery is required",
+            )),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn activate_or_verify_windows_sqlite_authority(
+    context: &[u8],
+    record: &PrivateSqliteLineageRecord,
+    objects: WindowsLineageObjects,
+) -> io::Result<()> {
+    let context_hash = windows_lineage::context_hash(context);
+    let _guard = windows_lineage::lock(&context_hash)?;
+    let mut authority = windows_lineage::read_authority(&context_hash)?
+        .ok_or_else(|| invalid_lineage("Windows private lineage registry authority is missing"))?;
+    require_windows_authority_header(&authority, &context_hash, &record.anchor_id)?;
+    if record.context != context {
+        return Err(invalid_lineage(
+            "Windows SQLite marker generation does not match the private root authority",
+        ));
+    }
+    match &authority.state {
+        WindowsLineageState::Pending { generation } if generation == &record.generation => {
+            authority.state = WindowsLineageState::Active {
+                generation: *generation,
+                objects,
+            };
+            windows_lineage::write_authority(&context_hash, &authority)?;
+        }
+        WindowsLineageState::Active {
+            generation,
+            objects: expected,
+        } if generation == &record.generation && expected == &objects => {}
+        WindowsLineageState::Revoked { .. } => {
+            return Err(invalid_lineage(
+                "Windows private lineage authority was revoked before workspace cleanup",
+            ));
+        }
+        _ => {
+            return Err(invalid_lineage(
+                "Windows private lineage authority does not match the exact SQLite objects",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn encode_lineage_record<T: serde::Serialize>(
+    kind: LineageRecordKind,
+    record: &T,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+    #[cfg(windows)]
+    {
+        use zeroize::Zeroize as _;
+        let protected = windows_lineage::protect(kind, &bytes);
+        bytes.zeroize();
+        protected
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = kind;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+fn decode_lineage_record<T: serde::de::DeserializeOwned>(
+    kind: LineageRecordKind,
+    bytes: &[u8],
+) -> io::Result<T> {
+    #[cfg(windows)]
+    let plaintext = windows_lineage::unprotect(kind, bytes)?;
+    #[cfg(not(windows))]
+    let plaintext = {
+        let _ = kind;
+        bytes
+    };
+    #[cfg(windows)]
+    let plaintext = plaintext.as_slice();
+    serde_json::from_slice(plaintext)
+        .map_err(|error| invalid_lineage(format!("private lineage record is invalid: {error}")))
+}
+
+pub(crate) fn protect_cleanup_marker(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        windows_lineage::protect(LineageRecordKind::CleanupMarker, bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(bytes.to_vec())
+    }
+}
+
+pub(crate) fn unprotect_cleanup_marker(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        windows_lineage::unprotect(LineageRecordKind::CleanupMarker, bytes)
+            .map(|plaintext| plaintext.to_vec())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(bytes.to_vec())
+    }
+}
+
+fn encode_ephemeral_probe_cleanup_record(
+    record: &EphemeralProbeCleanupRecord,
+) -> io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    return encode_lineage_record(LineageRecordKind::CleanupMarker, record);
+    #[cfg(not(windows))]
+    {
+        let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+fn decode_ephemeral_probe_cleanup_record(bytes: &[u8]) -> io::Result<EphemeralProbeCleanupRecord> {
+    #[cfg(windows)]
+    return decode_lineage_record(LineageRecordKind::CleanupMarker, bytes);
+    #[cfg(not(windows))]
+    serde_json::from_slice(bytes).map_err(|error| {
+        invalid_lineage(format!(
+            "ephemeral probe cleanup marker is invalid: {error}"
+        ))
+    })
+}
+
+fn read_private_child_bytes(parent: &File, path: &Path) -> io::Result<(Vec<u8>, PrivateObjectId)> {
+    let mut file = open_child_file_for_authority(parent, path)?;
+    let id = private_object_id(&file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, id))
+}
+
+fn read_private_lineage_child_bytes(
+    parent: &File,
+    path: &Path,
+) -> io::Result<(Vec<u8>, PrivateObjectId)> {
+    #[cfg(unix)]
+    let mut file = unix_private::open_child_file(parent, path)?;
+    #[cfg(windows)]
+    let mut file = windows_acl::open_child_file(parent, path)?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private lineage reads are unsupported on this platform",
+    ));
+    let id = private_object_id(&file)?;
+    const MAX_LINEAGE_RECORD_BYTES: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_LINEAGE_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LINEAGE_RECORD_BYTES {
+        return Err(invalid_lineage(
+            "private lineage record exceeds the bounded metadata size",
+        ));
+    }
+    Ok((bytes, id))
+}
+
+pub(crate) fn read_private_child_file(parent: &File, path: &Path) -> io::Result<Vec<u8>> {
+    read_private_child_bytes(parent, path).map(|(bytes, _)| bytes)
+}
+
+fn invalid_lineage(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message.into())
+}
+
+fn open_publication_parent(path: &Path) -> io::Result<File> {
+    let parent = open_parent_lease_handle(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = parent.metadata()?;
+        let mode = metadata.mode() & 0o7777;
+        if metadata.uid() != unsafe { libc::geteuid() } || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(invalid_lineage(
+                "workspace publication parent must be current-user-owned and not non-sticky group/world writable",
+            ));
+        }
+        unix_private::verify_no_extended_directory_acl(&parent)?;
+    }
+    #[cfg(windows)]
+    windows_acl::verify_publication_parent(&parent)?;
+    Ok(parent)
+}
+
+pub(crate) fn verify_private_workspace_lineage(
+    private_root: &Path,
+) -> io::Result<PrivateRootLineageLease> {
+    let publication_parent_path = private_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private workspace root has no parent",
+        )
+    })?;
+    let publication_parent = open_publication_parent(publication_parent_path)?;
+    let publication_parent_id = private_object_id(&publication_parent)?;
+    let root = open_private_directory_lease(private_root)?;
+    let id = private_object_id(&root)?;
+    let marker = private_root.join(PRIVATE_ROOT_LINEAGE_FILE_NAME);
+    let (bytes, marker_id) = read_private_lineage_child_bytes(&root, &marker).map_err(|error| {
+        invalid_lineage(format!(
+            "private workspace root {} has no valid create-time lineage marker: {error}; replace the legacy root while Argos is stopped",
+            private_root.display()
+        ))
+    })?;
+    let record: PrivateRootLineageRecord =
+        decode_lineage_record(LineageRecordKind::PrivateRoot, &bytes).map_err(|error| {
+            invalid_lineage(format!(
+                "private workspace root {} has an invalid lineage marker: {error}",
+                private_root.display()
+            ))
+        })?;
+    let context = private_root_lineage_context(private_root)?;
+    if record.schema_version != PRIVATE_ROOT_LINEAGE_SCHEMA_VERSION
+        || record.publication_parent != publication_parent_id
+        || record.private_root != id
+        || record.marker != marker_id
+        || record.context != context
+    {
+        return Err(invalid_lineage(format!(
+            "private workspace root {} lineage does not match the exact directory object",
+            private_root.display()
+        )));
+    }
+    Ok(PrivateRootLineageLease {
+        root,
+        path: private_root.to_path_buf(),
+        context_path: private_root.to_path_buf(),
+        id,
+        publication_parent_id,
+        root_marker_id: marker_id,
+    })
+}
+
+fn sqlite_lineage_path(database: &Path) -> io::Result<std::path::PathBuf> {
+    let name = database.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SQLite database has no file name",
+        )
+    })?;
+    let mut marker = name.to_os_string();
+    marker.push(".argos-private-v1");
+    Ok(database.with_file_name(marker))
+}
+
+fn sqlite_sidecar_paths(database: &Path) -> [std::path::PathBuf; 3] {
+    ["-journal", "-wal", "-shm"].map(|suffix| {
+        let mut sidecar = database.as_os_str().to_owned();
+        sidecar.push(suffix);
+        std::path::PathBuf::from(sidecar)
+    })
+}
+
+fn child_names_set(
+    parent: &File,
+    parent_path: &Path,
+) -> io::Result<std::collections::HashSet<OsString>> {
+    Ok(parent_child_names(parent, parent_path)?
+        .into_iter()
+        .collect())
+}
+
+fn ensure_private_sqlite_lineage(
+    root: &PrivateRootLineageLease,
+    parent: &File,
+    parent_path: &Path,
+    database: &Path,
+) -> io::Result<()> {
+    let marker = sqlite_lineage_path(database)?;
+    let database_name = database.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SQLite database has no file name",
+        )
+    })?;
+    let marker_name = marker
+        .file_name()
+        .expect("marker is a sibling of the database");
+    let names = child_names_set(parent, parent_path)?;
+    let database_exists = names.contains(database_name);
+    let marker_exists = names.contains(marker_name);
+
+    if !database_exists {
+        let sidecar_exists = sqlite_sidecar_paths(database)
+            .iter()
+            .filter_map(|path| path.file_name())
+            .any(|name| names.contains(name));
+        if marker_exists || sidecar_exists {
+            return Err(invalid_lineage(format!(
+                "private SQLite lineage for {} is incomplete; archive and recreate this workspace while Argos is stopped",
+                database.display()
+            )));
+        }
+        let context = sqlite_lineage_context(root, database)?;
+        #[cfg(windows)]
+        let context_hash = windows_lineage::context_hash(&context);
+        #[cfg(windows)]
+        let _lineage_guard = windows_lineage::lock(&context_hash)?;
+        #[cfg(windows)]
+        let (anchor_id, generation) = prepare_windows_lineage_creation(&context)?;
+        let database_file = create_child_file_read_append(parent, database)?;
+        database_file.sync_all()?;
+        let database_id = private_object_id(&database_file)?;
+        let parent_id = private_object_id(parent)?;
+        create_private_identity_record(parent, &marker, |marker_id| {
+            let record = PrivateSqliteLineageRecord {
+                schema_version: PRIVATE_SQLITE_LINEAGE_SCHEMA_VERSION,
+                private_root: root.id.clone(),
+                parent: parent_id,
+                database: database_id,
+                marker: marker_id.clone(),
+                context,
+                #[cfg(windows)]
+                generation,
+                #[cfg(windows)]
+                anchor_id,
+            };
+            encode_lineage_record(LineageRecordKind::PrivateSqlite, &record)
+        })?;
+        parent.sync_all()?;
+        return Ok(());
+    }
+    if !marker_exists {
+        return Err(invalid_lineage(format!(
+            "existing SQLite database {} predates create-time lineage; archive and recreate this workspace while Argos is stopped",
+            database.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn reserve_windows_sqlite_creation_before_leaf(
+    root: &PrivateRootLineageLease,
+    leaf: &Path,
+    database: &Path,
+) -> io::Result<()> {
+    let context = sqlite_lineage_context(root, database)?;
+    let context_hash = windows_lineage::context_hash(&context);
+    let _guard = windows_lineage::lock(&context_hash)?;
+    let authority = windows_lineage::read_authority(&context_hash)?;
+    let leaf_exists = match fs::symlink_metadata(leaf) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    match authority {
+        None if leaf_exists => Err(invalid_lineage(
+            "existing workspace leaf has no Windows private lineage authority",
+        )),
+        None => {
+            let _ = prepare_windows_lineage_creation(&context)?;
+            Ok(())
+        }
+        Some(authority) => {
+            require_windows_authority_header(&authority, &context_hash, &authority.anchor_id)?;
+            match authority.state {
+                WindowsLineageState::Pending { .. } => Ok(()),
+                WindowsLineageState::Active { .. } if leaf_exists => Ok(()),
+                WindowsLineageState::Active { .. } => Err(invalid_lineage(
+                    "active Windows private lineage workspace is missing; manual recovery is required",
+                )),
+                WindowsLineageState::Revoked { .. } => Err(invalid_lineage(
+                    "Windows private lineage is revoked; cleanup reconciliation is required before recreation",
+                )),
+            }
+        }
+    }
+}
+
+fn initialize_staged_private_root(
+    staging_root: &Path,
+    staging_leaf: &Path,
+    staging_database: &Path,
+    context_root: &Path,
+    publication_parent_id: &PrivateObjectId,
+) -> io::Result<PrivateObjectId> {
+    create_private_dir_all(staging_leaf)?;
+    let root = open_private_directory_lease(staging_root)?;
+    let root_id = private_object_id(&root)?;
+    let marker = staging_root.join(PRIVATE_ROOT_LINEAGE_FILE_NAME);
+    let context = private_root_lineage_context(context_root)?;
+    let root_marker_id = create_private_identity_record(&root, &marker, |marker_id| {
+        let record = PrivateRootLineageRecord {
+            schema_version: PRIVATE_ROOT_LINEAGE_SCHEMA_VERSION,
+            publication_parent: publication_parent_id.clone(),
+            private_root: root_id.clone(),
+            marker: marker_id.clone(),
+            context,
+        };
+        encode_lineage_record(LineageRecordKind::PrivateRoot, &record)
+    })?;
+    #[cfg(not(windows))]
+    let _ = &root_marker_id;
+    let lineage = PrivateRootLineageLease {
+        root,
+        path: staging_root.to_path_buf(),
+        context_path: context_root.to_path_buf(),
+        id: root_id.clone(),
+        publication_parent_id: publication_parent_id.clone(),
+        root_marker_id,
+    };
+    let leaf = open_private_directory_lease(staging_leaf)?;
+    ensure_private_sqlite_lineage(&lineage, &leaf, staging_leaf, staging_database)?;
+    leaf.sync_all()?;
+    lineage.root.sync_all()?;
+    Ok(root_id)
+}
+
+/// Publish a fresh wallet-private root with its empty database and lineage
+/// fully synced, or require an existing root to carry exact create-time
+/// lineage. A failed staging or publish attempt never blesses the final path.
+fn ensure_private_workspace_lineage_impl(
+    private_root: &Path,
+    leaf: &Path,
+    database: &Path,
+    activate_sqlite: bool,
+) -> io::Result<PrivateRootLineageLease> {
+    if !leaf.starts_with(private_root) || database.parent() != Some(leaf) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private workspace database must be a direct child beneath its private root",
+        ));
+    }
+    match fs::symlink_metadata(private_root) {
+        Ok(_) => {
+            let lineage = verify_private_workspace_lineage(private_root)?;
+            #[cfg(windows)]
+            reserve_windows_sqlite_creation_before_leaf(&lineage, leaf, database)?;
+            create_private_dir_all(leaf)?;
+            let leaf_handle = open_private_sqlite_parent(leaf)?;
+            ensure_private_sqlite_lineage(&lineage, &leaf_handle, leaf, database)?;
+            if activate_sqlite {
+                ensure_private_sqlite_file(&lineage, &leaf_handle, leaf, database)?;
+            }
+            Ok(lineage)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let publish_parent = private_root.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private root has no parent")
+            })?;
+            fs::create_dir_all(publish_parent)?;
+            #[cfg(windows)]
+            let sqlite_context = sqlite_lineage_context_paths(private_root, database)?;
+            #[cfg(windows)]
+            let context_hash = windows_lineage::context_hash(&sqlite_context);
+            #[cfg(windows)]
+            let _lineage_guard = windows_lineage::lock(&context_hash)?;
+            let publication_parent = open_publication_parent(publish_parent)?;
+            let publication_parent_id = private_object_id(&publication_parent)?;
+            let names = child_names_set(&publication_parent, publish_parent)?;
+            if names.contains(private_root.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private root has no file name")
+            })?) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "private workspace root appeared during staged publication; retry",
+                ));
+            }
+            #[cfg(windows)]
+            let _reserved_generation = prepare_windows_lineage_creation(&sqlite_context)?;
+            let destination_name = private_root.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private root has no file name")
+            })?;
+            let staging_name = format!(
+                ".{}{}{}",
+                destination_name.to_string_lossy(),
+                PRIVATE_ROOT_STAGING_TAG,
+                uuid::Uuid::new_v4()
+            );
+            let staging_root = publish_parent.join(staging_name);
+            let leaf_relative = leaf.strip_prefix(private_root).map_err(io::Error::other)?;
+            let database_relative = database
+                .strip_prefix(private_root)
+                .map_err(io::Error::other)?;
+            let staging_leaf = staging_root.join(leaf_relative);
+            let staging_database = staging_root.join(database_relative);
+            let staged_id = initialize_staged_private_root(
+                &staging_root,
+                &staging_leaf,
+                &staging_database,
+                private_root,
+                &publication_parent_id,
+            )?;
+            let staging = open_child_directory_for_mutation(&publication_parent, &staging_root)?;
+            if private_object_id(&staging)? != staged_id {
+                return Err(invalid_lineage(
+                    "private staging root changed before publication",
+                ));
+            }
+            rename_open_child_directory(
+                &publication_parent,
+                &staging_root,
+                private_root,
+                &staging,
+            )?;
+            publication_parent.sync_all()?;
+            let current_parent = open_publication_parent(publish_parent)?;
+            if private_object_id(&current_parent)? != publication_parent_id {
+                return Err(invalid_lineage(
+                    "workspace publication parent changed during publication",
+                ));
+            }
+            let verified = verify_private_workspace_lineage(private_root)?;
+            if verified.id != staged_id {
+                return Err(invalid_lineage(
+                    "private workspace root changed during staged publication",
+                ));
+            }
+            let leaf_handle = open_private_sqlite_parent(leaf)?;
+            ensure_private_sqlite_lineage(&verified, &leaf_handle, leaf, database)?;
+            if activate_sqlite {
+                ensure_private_sqlite_file(&verified, &leaf_handle, leaf, database)?;
+            }
+            Ok(verified)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn ensure_private_workspace_lineage(
+    private_root: &Path,
+    leaf: &Path,
+    database: &Path,
+) -> io::Result<PrivateRootLineageLease> {
+    ensure_private_workspace_lineage_impl(private_root, leaf, database, true)
+}
+
+/// Verify that a private directory has the exact required access controls.
 pub fn harden_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let directory = unix_private::open_directory(path)?;
-        unix_private::remove_extended_acl(&directory)?;
-        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
-        unix_private::verify_no_extended_acl(&directory)
+        unix_private::verify_private_directory(&directory)
     }
     #[cfg(windows)]
     {
@@ -600,14 +1713,15 @@ pub fn harden_private_directory(path: &Path) -> io::Result<()> {
     ))
 }
 
-/// Tighten the object addressed by an already-open handle.
+/// Verify that an already-open object has the exact required access controls.
+///
+/// Reused objects are never repaired in place: changing a mode or DACL cannot
+/// revoke a stale handle held by another process. Creation establishes private
+/// access before bytes are written, then this function verifies it.
 pub fn harden_private_file(file: &File) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        unix_private::remove_extended_acl(file)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        unix_private::verify_no_extended_acl(file)
+        unix_private::verify_private_file(file)
     }
     #[cfg(windows)]
     {
@@ -647,7 +1761,7 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
         };
         let data_access = match mode {
             PrivateOpenMode::Append => FILE_APPEND_DATA,
@@ -656,7 +1770,7 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
             }
             PrivateOpenMode::Truncate | PrivateOpenMode::CreateNew => FILE_GENERIC_WRITE,
         };
-        options.access_mode(data_access | READ_CONTROL | WRITE_DAC);
+        options.access_mode(data_access | READ_CONTROL);
         if matches!(
             mode,
             PrivateOpenMode::ReadWriteLock | PrivateOpenMode::ReadWriteAppend
@@ -689,7 +1803,11 @@ fn open_private_file_with(
         Err(err)
             if err.kind() == io::ErrorKind::AlreadyExists && mode != PrivateOpenMode::CreateNew =>
         {
-            (options_for(mode, false).open(path)?, false)
+            #[cfg(windows)]
+            let file = windows_acl::open_existing_private_file(path, mode)?;
+            #[cfg(not(windows))]
+            let file = options_for(mode, false).open(path)?;
+            (file, false)
         }
         Err(err) => return Err(err),
     };
@@ -701,8 +1819,8 @@ fn open_private_file_with(
         }
         return Err(err);
     }
-    // Never request truncation in OpenOptions: reused files must be hardened
-    // successfully before their old contents are destroyed.
+    // Never request truncation in OpenOptions: reused files must pass exact
+    // access-control verification before their old contents are destroyed.
     if mode == PrivateOpenMode::Truncate {
         file.set_len(0)?;
     }
@@ -732,9 +1850,1390 @@ fn validate_private_file(file: &File) -> io::Result<()> {
     ))
 }
 
-/// Open a private file, establishing its ACL/mode before truncation or writes.
+/// Create a file with private access, or exact-verify a reused file before use.
 pub fn open_private_file(path: &Path, mode: PrivateOpenMode) -> io::Result<File> {
     open_private_file_with(path, mode, harden_private_file)
+}
+
+fn open_sqlite_file_shared(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    return unix_private::open_child_file(parent, path);
+    #[cfg(windows)]
+    return windows_acl::open_child_file_for_identity(parent, path);
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private SQLite verification is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn trusted_sqlite_authorities() -> &'static std::sync::Mutex<TrustedSqliteRegistry> {
+    static AUTHORITIES: std::sync::OnceLock<std::sync::Mutex<TrustedSqliteRegistry>> =
+        std::sync::OnceLock::new();
+    AUTHORITIES.get_or_init(|| std::sync::Mutex::new(TrustedSqliteRegistry::default()))
+}
+
+/// Revalidate the create-time root/database lineage before SQLite can parse a
+/// byte. On Windows the first open of each exact object in this process uses a
+/// share-zero preflight; later writer/progress connections are allowed only for
+/// the same revalidated root, parent, database, and marker identities.
+pub(crate) fn ensure_private_sqlite_file(
+    root: &PrivateRootLineageLease,
+    parent: &File,
+    parent_path: &Path,
+    path: &Path,
+) -> io::Result<()> {
+    if path.parent() != Some(parent_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private SQLite database must be a direct child of its retained parent",
+        ));
+    }
+    root.verify_current()?;
+    let parent_id = private_object_id(parent)?;
+    let marker_path = sqlite_lineage_path(path)?;
+    let (marker_bytes, marker_id) = read_private_lineage_child_bytes(parent, &marker_path)?;
+    let record: PrivateSqliteLineageRecord =
+        decode_lineage_record(LineageRecordKind::PrivateSqlite, &marker_bytes).map_err(
+            |error| {
+                invalid_lineage(format!(
+                    "private SQLite lineage marker {} is invalid: {error}",
+                    marker_path.display()
+                ))
+            },
+        )?;
+    let database = open_sqlite_file_shared(parent, path)?;
+    let database_id = private_object_id(&database)?;
+    let context = sqlite_lineage_context(root, path)?;
+    if record.schema_version != PRIVATE_SQLITE_LINEAGE_SCHEMA_VERSION
+        || record.private_root != *root.id()
+        || record.parent != parent_id
+        || record.database != database_id
+        || record.marker != marker_id
+        || record.context != context
+    {
+        return Err(invalid_lineage(format!(
+            "private SQLite lineage for {} does not match the exact filesystem objects",
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    activate_or_verify_windows_sqlite_authority(
+        &context,
+        &record,
+        WindowsLineageObjects {
+            publication_parent: root.publication_parent_id.clone(),
+            private_root: root.id.clone(),
+            root_marker: root.root_marker_id.clone(),
+            sqlite_parent: parent_id.clone(),
+            database: database_id.clone(),
+            sqlite_marker: marker_id.clone(),
+        },
+    )?;
+    drop(database);
+
+    #[cfg(windows)]
+    {
+        let canonical_path = fs::canonicalize(path)?;
+        let identity = TrustedSqliteIdentity {
+            canonical_path: canonical_path.clone(),
+            publication_parent: root.publication_parent_id.clone(),
+            private_root: root.id().clone(),
+            parent: parent_id,
+            database: database_id,
+            marker: marker_id,
+            anchor_id: record.anchor_id,
+            generation: record.generation,
+        };
+        let mut trusted = trusted_sqlite_authorities()
+            .lock()
+            .map_err(|_| io::Error::other("private SQLite authority registry is poisoned"))?;
+        if trusted.cleanup_held.contains(&canonical_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "private SQLite workspace cleanup is in progress",
+            ));
+        }
+        if let Some(authority) = trusted.authorities.get(&canonical_path) {
+            if authority.identity != identity
+                || private_object_id(&authority._root)? != identity.private_root
+                || private_object_id(&authority._parent)? != identity.parent
+                || private_object_id(&authority.database)? != identity.database
+                || private_object_id(&authority.marker)? != identity.marker
+            {
+                return Err(invalid_lineage(
+                    "cached private SQLite authority no longer matches the exact objects",
+                ));
+            }
+        } else {
+            let exclusive = windows_acl::open_child_file_exclusive(parent, path)?;
+            if private_object_id(&exclusive)? != identity.database {
+                return Err(invalid_lineage(
+                    "private SQLite database changed during exclusive preflight",
+                ));
+            }
+            drop(exclusive);
+            let retained_root = windows_acl::open_directory_for_authority(&root.path)?;
+            if private_object_id(&retained_root)? != identity.private_root {
+                return Err(invalid_lineage(
+                    "private workspace root changed before authority retention",
+                ));
+            }
+            let retained_parent = windows_acl::open_directory_for_cleanup_authority(parent_path)?;
+            if private_object_id(&retained_parent)? != identity.parent {
+                return Err(invalid_lineage(
+                    "private SQLite parent changed before authority retention",
+                ));
+            }
+            let database = windows_acl::open_child_file_for_retained_authority(parent, path)?;
+            let marker = windows_acl::open_child_file_for_retained_authority(parent, &marker_path)?;
+            let authority = TrustedSqliteAuthority {
+                identity,
+                _root: retained_root,
+                _parent: retained_parent,
+                database,
+                marker,
+            };
+            trusted.authorities.insert(canonical_path, authority);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = marker_id;
+    root.verify_current()?;
+    Ok(())
+}
+
+/// Atomically remove the process-local SQLite authority from general use and
+/// retain the exact workspace directory handle that authority reviewed. The
+/// registry marks the database cleanup-held before releasing its mutex, so a
+/// concurrent same-process opener cannot repopulate authority before rename.
+pub(crate) fn retain_private_workspace_for_cleanup(
+    namespace: &NamespaceLease,
+    leaf: &Path,
+    database: &Path,
+) -> io::Result<RetainedWorkspaceDirectory> {
+    namespace.require_child(leaf)?;
+    if database.parent() != Some(leaf) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cleanup database must be a direct child of the workspace",
+        ));
+    }
+    namespace.verify_current()?;
+
+    #[cfg(windows)]
+    {
+        let open_guard = lock_private_sqlite_open(database)?;
+        let registry_key = fs::canonicalize(database)?;
+        let authority = {
+            let mut registry = trusted_sqlite_authorities()
+                .lock()
+                .map_err(|_| io::Error::other("private SQLite authority registry is poisoned"))?;
+            if !registry.cleanup_held.insert(registry_key.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "private SQLite workspace cleanup is already in progress",
+                ));
+            }
+            registry.authorities.remove(&registry_key)
+        };
+
+        let result = (|| {
+            let (directory, id) = if let Some(authority) = authority {
+                if authority.identity.canonical_path != registry_key {
+                    return Err(invalid_lineage(
+                        "cached private SQLite authority has a different path",
+                    ));
+                }
+                let id = authority.identity.parent.clone();
+                let TrustedSqliteAuthority {
+                    _parent: directory,
+                    _root,
+                    database,
+                    marker,
+                    ..
+                } = authority;
+                drop((_root, database, marker));
+                (directory, id)
+            } else {
+                let directory = open_child_directory_for_mutation(namespace.parent(), leaf)?;
+                let id = private_object_id(&directory)?;
+                (directory, id)
+            };
+            verify_open_child_directory(namespace.parent(), leaf, &directory, &id)?;
+            namespace.verify_current()?;
+            Ok(RetainedWorkspaceDirectory {
+                directory,
+                id,
+                cleanup_hold: Some(SqliteCleanupHold {
+                    registry_key: registry_key.clone(),
+                    _open_guard: open_guard,
+                }),
+            })
+        })();
+        if result.is_err() {
+            if let Ok(mut registry) = trusted_sqlite_authorities().lock() {
+                registry.cleanup_held.remove(&registry_key);
+            }
+        }
+        return result;
+    }
+
+    #[cfg(unix)]
+    {
+        let directory = open_child_directory_for_mutation(namespace.parent(), leaf)?;
+        unix_private::verify_private_directory(&directory)?;
+        let id = private_object_id(&directory)?;
+        verify_open_child_directory(namespace.parent(), leaf, &directory, &id)?;
+        namespace.verify_current()?;
+        Ok(RetainedWorkspaceDirectory {
+            directory,
+            id,
+            cleanup_hold: None,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (namespace, leaf, database);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "retained private workspace cleanup is unsupported on this platform",
+        ))
+    }
+}
+
+fn ephemeral_probe_cleanup_marker_path(private_root: &Path) -> io::Result<std::path::PathBuf> {
+    let parent = private_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe private root has no publication parent",
+        )
+    })?;
+    let root_name = private_root.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe private root has no name",
+        )
+    })?;
+    let mut marker_name = OsString::from(".");
+    marker_name.push(root_name);
+    marker_name.push(EPHEMERAL_PROBE_CLEANUP_MARKER_SUFFIX);
+    Ok(parent.join(marker_name))
+}
+
+fn ephemeral_probe_registration_path(private_root: &Path) -> io::Result<std::path::PathBuf> {
+    let marker = ephemeral_probe_cleanup_marker_path(private_root)?;
+    let mut name = marker
+        .file_name()
+        .expect("cleanup markers always have a name")
+        .to_os_string();
+    name.push(".lock");
+    Ok(marker.with_file_name(name))
+}
+
+impl EphemeralProbeRegistration {
+    fn acquire(private_root: &Path) -> io::Result<Self> {
+        let parent_path = private_root.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ephemeral probe private root has no publication parent",
+            )
+        })?;
+        let parent = open_publication_parent(parent_path)?;
+        let path = ephemeral_probe_registration_path(private_root)?;
+        let file = open_child_file_for_lock(&parent, &path)?;
+        let id = private_object_id(&file)?;
+        lock_exclusive(&file)?;
+        parent.sync_all()?;
+        Ok(Self { file, id, path })
+    }
+
+    fn verify(&self, private_root: &Path) -> io::Result<()> {
+        if self.path != ephemeral_probe_registration_path(private_root)?
+            || private_object_id(&self.file)? != self.id
+        {
+            return Err(invalid_lineage("ephemeral probe live registration changed"));
+        }
+        Ok(())
+    }
+}
+
+fn ephemeral_probe_lock_is_contended(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    return error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+        return matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_LOCK_VIOLATION as i32
+                    || code == ERROR_SHARING_VIOLATION as i32
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn hold_stale_ephemeral_probe_sqlite(database: &Path) -> io::Result<Option<SqliteCleanupHold>> {
+    let registry_key = match fs::canonicalize(database) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let open_guard = lock_private_sqlite_open(database)?;
+    let authority = {
+        let mut registry = trusted_sqlite_authorities()
+            .lock()
+            .map_err(|_| io::Error::other("private SQLite authority registry is poisoned"))?;
+        if !registry.cleanup_held.insert(registry_key.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "private SQLite workspace cleanup is already in progress",
+            ));
+        }
+        registry.authorities.remove(&registry_key)
+    };
+    drop(authority);
+    Ok(Some(SqliteCleanupHold {
+        registry_key,
+        _open_guard: open_guard,
+    }))
+}
+
+fn validate_ephemeral_probe_cleanup_record(
+    record: &EphemeralProbeCleanupRecord,
+    marker_id: &PrivateObjectId,
+    private_root: &Path,
+    database: &Path,
+    binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<()> {
+    if record.schema_version != EPHEMERAL_PROBE_CLEANUP_SCHEMA_VERSION
+        || &record.marker != marker_id
+        || record.private_root != private_root
+        || record.database != database
+        || &record.binding != binding
+    {
+        return Err(invalid_lineage(
+            "ephemeral probe cleanup marker does not match the exact workspace objects",
+        ));
+    }
+    Ok(())
+}
+
+fn publish_ephemeral_probe_cleanup_marker(
+    publication_parent: &File,
+    private_root: &Path,
+    database: &Path,
+    binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<(std::path::PathBuf, PrivateObjectId)> {
+    let marker_path = ephemeral_probe_cleanup_marker_path(private_root)?;
+    let marker_id =
+        match create_private_identity_record(publication_parent, &marker_path, |marker_id| {
+            encode_ephemeral_probe_cleanup_record(&EphemeralProbeCleanupRecord {
+                schema_version: EPHEMERAL_PROBE_CLEANUP_SCHEMA_VERSION,
+                private_root: private_root.to_path_buf(),
+                database: database.to_path_buf(),
+                binding: binding.clone(),
+                marker: marker_id.clone(),
+            })
+        }) {
+            Ok(id) => id,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let (bytes, id) =
+                    read_private_lineage_child_bytes(publication_parent, &marker_path)?;
+                let record = decode_ephemeral_probe_cleanup_record(&bytes)?;
+                validate_ephemeral_probe_cleanup_record(
+                    &record,
+                    &id,
+                    private_root,
+                    database,
+                    binding,
+                )?;
+                id
+            }
+            Err(error) => return Err(error),
+        };
+    publication_parent.sync_all()?;
+    Ok((marker_path, marker_id))
+}
+
+/// Establish empty private lineage and durably publish authenticated cleanup
+/// authority before a probe writes seed-derived material to SQLite.
+pub(crate) fn prepare_ephemeral_probe_workspace(
+    private_root: &Path,
+    leaf: &Path,
+    database: &Path,
+) -> io::Result<EphemeralProbeRegistration> {
+    let publication_parent_path = private_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe private root has no publication parent",
+        )
+    })?;
+    fs::create_dir_all(publication_parent_path)?;
+    let registration = EphemeralProbeRegistration::acquire(private_root)?;
+    ensure_private_workspace_lineage_impl(private_root, leaf, database, false)?;
+    let directory = open_private_sqlite_parent(leaf)?;
+    let id = private_object_id(&directory)?;
+    let retained = RetainedWorkspaceDirectory {
+        directory,
+        id,
+        cleanup_hold: None,
+    };
+    let binding = inspect_prepared_ephemeral_probe_binding(private_root, &retained, database)?;
+    let publication_parent = open_publication_parent(publication_parent_path)?;
+    if private_object_id(&publication_parent)? != binding.publication_parent {
+        return Err(invalid_lineage(
+            "ephemeral probe publication parent changed before marker publication",
+        ));
+    }
+    publish_ephemeral_probe_cleanup_marker(&publication_parent, private_root, database, &binding)?;
+    Ok(registration)
+}
+
+/// Begin exact cleanup of a throwaway probe workspace. This publishes a
+/// private, authenticated cleanup marker before releasing the retained SQLite
+/// leaf handles. The returned token keeps same-process SQLite opens blocked
+/// until cleanup either finishes or fails.
+pub(crate) fn begin_ephemeral_probe_cleanup(
+    registration: EphemeralProbeRegistration,
+    private_root: &Path,
+    leaf: &Path,
+    database: &Path,
+) -> io::Result<EphemeralProbeCleanup> {
+    registration.verify(private_root)?;
+    if !leaf.starts_with(private_root) || database.parent() != Some(leaf) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe database must be a direct child beneath its private root",
+        ));
+    }
+    let namespace_parent = leaf.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe workspace has no namespace parent",
+        )
+    })?;
+    let namespace = NamespaceLease::acquire(
+        namespace_parent,
+        &namespace_parent.join(".argos-ephemeral-probe-cleanup.lock"),
+    )?;
+    let retained_leaf = retain_private_workspace_for_cleanup(&namespace, leaf, database)?;
+    let binding =
+        inspect_private_workspace_cleanup_binding(private_root, &retained_leaf, database)?;
+
+    let publication_parent_path = private_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe private root has no publication parent",
+        )
+    })?;
+    let publication_parent = open_publication_parent(publication_parent_path)?;
+    if private_object_id(&publication_parent)? != binding.publication_parent {
+        return Err(invalid_lineage(
+            "ephemeral probe publication parent changed before cleanup",
+        ));
+    }
+    let private_root_directory =
+        open_child_directory_for_mutation(&publication_parent, private_root)?;
+    let private_root_id = private_object_id(&private_root_directory)?;
+    if private_root_id != binding.private_root {
+        return Err(invalid_lineage(
+            "ephemeral probe private root changed before cleanup",
+        ));
+    }
+
+    let (marker_path, marker_id) = publish_ephemeral_probe_cleanup_marker(
+        &publication_parent,
+        private_root,
+        database,
+        &binding,
+    )?;
+    let RetainedWorkspaceDirectory {
+        directory,
+        id: _,
+        cleanup_hold,
+    } = retained_leaf;
+    drop(directory);
+
+    Ok(EphemeralProbeCleanup {
+        publication_parent,
+        publication_parent_path: publication_parent_path.to_path_buf(),
+        private_root: private_root.to_path_buf(),
+        private_root_directory,
+        private_root_id,
+        marker_path,
+        marker_id,
+        #[cfg(windows)]
+        database: database.to_path_buf(),
+        binding,
+        cleanup_hold,
+        _registration: registration,
+    })
+}
+
+impl EphemeralProbeCleanup {
+    /// Remove the exact private root, durably publish its absence, and only
+    /// then retire the exact Windows per-probe registry authority.
+    pub(crate) fn remove_exact_private_root_and_retire(mut self) -> io::Result<()> {
+        if private_object_id(&self.publication_parent)? != self.binding.publication_parent
+            || private_object_id(&self.private_root_directory)? != self.private_root_id
+            || self.private_root_id != self.binding.private_root
+        {
+            return Err(invalid_lineage(
+                "ephemeral probe cleanup authority no longer matches its retained objects",
+            ));
+        }
+        verify_open_child_directory(
+            &self.publication_parent,
+            &self.private_root,
+            &self.private_root_directory,
+            &self.private_root_id,
+        )?;
+
+        #[cfg(windows)]
+        let (context_hash, _lineage_guard) = verify_active_ephemeral_probe_authority(
+            &self.private_root,
+            &self.database,
+            &self.binding,
+        )?;
+
+        remove_open_directory_contents(&self.private_root_directory)?;
+        self.private_root_directory.sync_all()?;
+        remove_open_child_directory(
+            &self.publication_parent,
+            &self.private_root,
+            &self.private_root_directory,
+            &self.private_root_id,
+        )?;
+        self.publication_parent.sync_all()?;
+        if parent_child_names(&self.publication_parent, &self.publication_parent_path)?
+            .iter()
+            .any(|name| Some(name.as_os_str()) == self.private_root.file_name())
+        {
+            return Err(invalid_lineage(
+                "ephemeral probe private root still exists after exact cleanup",
+            ));
+        }
+
+        #[cfg(windows)]
+        windows_lineage::delete_authority(&context_hash)?;
+
+        remove_ephemeral_probe_cleanup_marker(
+            &self.publication_parent,
+            &self.marker_path,
+            &self.marker_id,
+        )?;
+        self.cleanup_hold.take();
+        Ok(())
+    }
+}
+
+fn read_ephemeral_probe_cleanup_marker(
+    marker_path: &Path,
+) -> io::Result<(
+    File,
+    std::path::PathBuf,
+    PrivateObjectId,
+    EphemeralProbeCleanupRecord,
+)> {
+    let parent_path = marker_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe cleanup marker has no parent",
+        )
+    })?;
+    let parent = open_publication_parent(parent_path)?;
+    let (bytes, marker_id) = read_private_lineage_child_bytes(&parent, marker_path)?;
+    let record = decode_ephemeral_probe_cleanup_record(&bytes)?;
+    if record.schema_version != EPHEMERAL_PROBE_CLEANUP_SCHEMA_VERSION
+        || record.marker != marker_id
+        || record.private_root.parent() != Some(parent_path)
+        || ephemeral_probe_cleanup_marker_path(&record.private_root)? != marker_path
+        || record.database.parent().is_none()
+        || !record.database.starts_with(&record.private_root)
+        || record.binding.publication_parent != private_object_id(&parent)?
+        || record.binding.private_root == record.binding.workspace
+    {
+        return Err(invalid_lineage(
+            "ephemeral probe cleanup marker has invalid path or object bindings",
+        ));
+    }
+    Ok((parent, parent_path.to_path_buf(), marker_id, record))
+}
+
+#[cfg(windows)]
+fn verify_active_ephemeral_probe_authority(
+    private_root: &Path,
+    database: &Path,
+    binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<([u8; 32], windows_acl::LineageMutex)> {
+    let context = sqlite_lineage_context_paths(private_root, database)?;
+    let context_hash = windows_lineage::context_hash(&context);
+    let guard = windows_lineage::lock(&context_hash)?;
+    let authority = windows_lineage::read_authority(&context_hash)?
+        .ok_or_else(|| invalid_lineage("ephemeral probe Windows lineage authority is missing"))?;
+    let anchor_id = binding
+        .anchor_id
+        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no anchor"))?;
+    let generation = binding
+        .generation
+        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no generation"))?;
+    require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
+    match authority.state {
+        WindowsLineageState::Active {
+            generation: current,
+            objects,
+        } if current == generation && objects == windows_objects_from_cleanup_binding(binding) => {}
+        _ => {
+            return Err(invalid_lineage(
+                "ephemeral probe cleanup requires the exact Active authority",
+            ));
+        }
+    }
+    Ok((context_hash, guard))
+}
+
+#[cfg(windows)]
+fn verify_stale_ephemeral_probe_authority(
+    private_root: &Path,
+    database: &Path,
+    binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<([u8; 32], windows_acl::LineageMutex)> {
+    let context = sqlite_lineage_context_paths(private_root, database)?;
+    let context_hash = windows_lineage::context_hash(&context);
+    let guard = windows_lineage::lock(&context_hash)?;
+    let authority = windows_lineage::read_authority(&context_hash)?
+        .ok_or_else(|| invalid_lineage("ephemeral probe Windows lineage authority is missing"))?;
+    let anchor_id = binding
+        .anchor_id
+        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no anchor"))?;
+    let generation = binding
+        .generation
+        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no generation"))?;
+    require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
+    match authority.state {
+        WindowsLineageState::Pending {
+            generation: current,
+        } if current == generation => {}
+        WindowsLineageState::Active {
+            generation: current,
+            objects,
+        } if current == generation && objects == windows_objects_from_cleanup_binding(binding) => {}
+        _ => {
+            return Err(invalid_lineage(
+                "stale ephemeral probe marker does not match Pending or Active authority",
+            ));
+        }
+    }
+    Ok((context_hash, guard))
+}
+
+fn remove_ephemeral_probe_cleanup_marker(
+    publication_parent: &File,
+    marker_path: &Path,
+    marker_id: &PrivateObjectId,
+) -> io::Result<()> {
+    let marker = open_child_file_for_removal(publication_parent, marker_path)?;
+    if private_object_id(&marker)? != *marker_id {
+        return Err(invalid_lineage(
+            "ephemeral probe cleanup marker changed before retirement",
+        ));
+    }
+    remove_open_child_file(publication_parent, marker_path, &marker, marker_id)?;
+    publication_parent.sync_all()
+}
+
+/// Resume an authenticated ephemeral-probe cleanup marker left by a crash.
+/// A marker is only authority for the exact root and registry objects it binds;
+/// candidate names alone never authorize filesystem mutation.
+pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Result<()> {
+    let (publication_parent, publication_parent_path, marker_id, record) =
+        read_ephemeral_probe_cleanup_marker(marker_path)?;
+    let _registration = match EphemeralProbeRegistration::acquire(&record.private_root) {
+        Ok(registration) => registration,
+        Err(error) if ephemeral_probe_lock_is_contended(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    #[cfg(windows)]
+    let _cleanup_hold = hold_stale_ephemeral_probe_sqlite(&record.database)?;
+    let root_name = record.private_root.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ephemeral probe private root has no name",
+        )
+    })?;
+    let root_exists = parent_child_names(&publication_parent, &publication_parent_path)?
+        .iter()
+        .any(|name| name == root_name);
+
+    #[cfg(windows)]
+    let (context_hash, _lineage_guard, retire_authority) = if root_exists {
+        let (context_hash, guard) = verify_stale_ephemeral_probe_authority(
+            &record.private_root,
+            &record.database,
+            &record.binding,
+        )?;
+        (context_hash, guard, true)
+    } else {
+        let context = sqlite_lineage_context_paths(&record.private_root, &record.database)?;
+        let context_hash = windows_lineage::context_hash(&context);
+        let guard = windows_lineage::lock(&context_hash)?;
+        let authority = windows_lineage::read_authority(&context_hash)?;
+        let retire = match authority {
+            None => false,
+            Some(authority) => {
+                let anchor_id = record
+                    .binding
+                    .anchor_id
+                    .ok_or_else(|| invalid_lineage("ephemeral probe binding has no anchor"))?;
+                let generation = record
+                    .binding
+                    .generation
+                    .ok_or_else(|| invalid_lineage("ephemeral probe binding has no generation"))?;
+                require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
+                match authority.state {
+                    WindowsLineageState::Pending {
+                        generation: current,
+                    } if current == generation => true,
+                    WindowsLineageState::Active {
+                        generation: current,
+                        objects,
+                    } if current == generation
+                        && objects == windows_objects_from_cleanup_binding(&record.binding) =>
+                    {
+                        true
+                    }
+                    _ => {
+                        return Err(invalid_lineage(
+                            "stale ephemeral probe marker does not match its Windows authority",
+                        ));
+                    }
+                }
+            }
+        };
+        (context_hash, guard, retire)
+    };
+
+    if root_exists {
+        let private_root_directory =
+            open_child_directory_for_mutation(&publication_parent, &record.private_root)?;
+        let private_root_id = private_object_id(&private_root_directory)?;
+        if private_root_id != record.binding.private_root {
+            return Err(invalid_lineage(
+                "stale ephemeral probe marker names a different private root object",
+            ));
+        }
+        remove_open_directory_contents(&private_root_directory)?;
+        private_root_directory.sync_all()?;
+        remove_open_child_directory(
+            &publication_parent,
+            &record.private_root,
+            &private_root_directory,
+            &private_root_id,
+        )?;
+        publication_parent.sync_all()?;
+    }
+    if parent_child_names(&publication_parent, &publication_parent_path)?
+        .iter()
+        .any(|name| name == root_name)
+    {
+        return Err(invalid_lineage(
+            "stale ephemeral probe private root still exists after exact cleanup",
+        ));
+    }
+
+    #[cfg(windows)]
+    if retire_authority {
+        windows_lineage::delete_authority(&context_hash)?;
+    }
+    remove_ephemeral_probe_cleanup_marker(&publication_parent, marker_path, &marker_id)
+}
+
+fn ephemeral_probe_container_owned_by_current_user(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(metadata.file_type().is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() })
+    }
+    #[cfg(windows)]
+    return windows_acl::directory_owned_by_current_user(path);
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
+/// Find authenticated probe cleanup markers beneath UUID probe containers and
+/// finish them before starting another probe. Containers without a marker are
+/// left untouched, including any concurrently active probe.
+pub(crate) fn cleanup_stale_ephemeral_probes(temp_parent: &Path) -> io::Result<()> {
+    for container in fs::read_dir(temp_parent)? {
+        let container = container?;
+        let name = container.file_name();
+        let Some(candidate) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("zeck_probe_"))
+        else {
+            continue;
+        };
+        let Ok(uuid) = uuid::Uuid::parse_str(candidate) else {
+            continue;
+        };
+        if uuid.hyphenated().to_string() != candidate {
+            continue;
+        }
+        match ephemeral_probe_container_owned_by_current_user(&container.path()) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        }
+        let metadata = container.file_type()?;
+        if !metadata.is_dir() || metadata.is_symlink() {
+            continue;
+        }
+        for network_dir in fs::read_dir(container.path())? {
+            let network_dir = network_dir?;
+            let metadata = network_dir.file_type()?;
+            if !metadata.is_dir() || metadata.is_symlink() {
+                continue;
+            }
+            for marker in fs::read_dir(network_dir.path())? {
+                let marker = marker?;
+                let name = marker.file_name();
+                if name
+                    .to_string_lossy()
+                    .ends_with(EPHEMERAL_PROBE_CLEANUP_MARKER_SUFFIX)
+                {
+                    cleanup_stale_ephemeral_probe_marker(&marker.path())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Authorize a new recovery generation only after an earlier, durably revoked
+/// leaf has been fully removed. Ordinary workspace open never performs this
+/// transition.
+#[cfg(windows)]
+fn verify_workspace_absent_for_recreation(leaf: &Path, database: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(leaf) {
+        Ok(_) => {
+            return Err(invalid_lineage(
+                "workspace leaf already exists; missing or revoked authority cannot bless it",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for path in std::iter::once(database.to_path_buf())
+        .chain(std::iter::once(sqlite_lineage_path(database)?))
+        .chain(sqlite_sidecar_paths(database))
+    {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(invalid_lineage(format!(
+                    "revoked workspace artifact {} still exists",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let cleanup_parent = leaf.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "workspace leaf has no parent")
+    })?;
+    match open_private_directory_lease(cleanup_parent) {
+        Ok(parent) => {
+            let names = child_names_set(&parent, cleanup_parent)?;
+            let leaf_name = leaf.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "workspace leaf has no name")
+            })?;
+            let marker = {
+                let mut marker = leaf_name.to_os_string();
+                marker.push(".cleanup-pending.json");
+                marker
+            };
+            let tombstone_prefix = format!("{}.deleting-", leaf_name.to_string_lossy());
+            if names.contains(&marker)
+                || names
+                    .iter()
+                    .any(|name| name.to_string_lossy().starts_with(&tombstone_prefix))
+            {
+                return Err(invalid_lineage(
+                    "workspace cleanup marker or tombstone still exists; cleanup must finish before a new recovery",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+pub(crate) fn authorize_private_workspace_recreation(
+    private_root: &Path,
+    leaf: &Path,
+    database: &Path,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        if !private_root.exists() {
+            return Ok(());
+        }
+        let root = verify_private_workspace_lineage(private_root)?;
+        let context = sqlite_lineage_context(&root, database)?;
+        let context_hash = windows_lineage::context_hash(&context);
+        let _guard = windows_lineage::lock(&context_hash)?;
+        let Some(mut authority) = windows_lineage::read_authority(&context_hash)? else {
+            verify_workspace_absent_for_recreation(leaf, database)?;
+            let _ = prepare_windows_lineage_creation(&context)?;
+            return Ok(());
+        };
+        require_windows_authority_header(&authority, &context_hash, &authority.anchor_id)?;
+        let revoked_objects = match &authority.state {
+            WindowsLineageState::Revoked { objects, .. } => objects,
+            WindowsLineageState::Pending { .. } => return Ok(()),
+            WindowsLineageState::Active { .. } => {
+                return match fs::symlink_metadata(leaf) {
+                    Ok(_) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Err(invalid_lineage(
+                        "active Windows private lineage workspace is missing; manual recovery is required",
+                    )),
+                    Err(error) => Err(error),
+                };
+            }
+        };
+        if revoked_objects.publication_parent != root.publication_parent_id
+            || revoked_objects.private_root != root.id
+            || revoked_objects.root_marker != root.root_marker_id
+        {
+            return Err(invalid_lineage(
+                "revoked Windows lineage does not match the retained private root",
+            ));
+        }
+        verify_workspace_absent_for_recreation(leaf, database)?;
+        let generation = uuid::Uuid::new_v4().into_bytes();
+        authority.state = WindowsLineageState::Pending { generation };
+        windows_lineage::write_authority(&context_hash, &authority)?;
+    }
+    #[cfg(not(windows))]
+    let _ = (private_root, leaf, database);
+    Ok(())
+}
+
+/// Durably revoke a Windows leaf/DB generation before its retained directory
+/// handle is renamed for cleanup. Repeating the same cleanup ID is idempotent.
+fn inspect_private_workspace_cleanup_binding_filesystem(
+    private_root: &Path,
+    retained_leaf: &RetainedWorkspaceDirectory,
+    database: &Path,
+) -> io::Result<PrivateWorkspaceCleanupBinding> {
+    let root = verify_private_workspace_lineage(private_root)?;
+    if database.parent().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private SQLite database has no workspace parent",
+        ));
+    }
+    #[cfg(unix)]
+    unix_private::verify_private_directory(&retained_leaf.directory)?;
+    #[cfg(windows)]
+    windows_acl::validate_private_directory(&retained_leaf.directory)?;
+    if private_object_id(&retained_leaf.directory)? != retained_leaf.id {
+        return Err(invalid_lineage(
+            "retained workspace changed before cleanup binding inspection",
+        ));
+    }
+    let marker_path = sqlite_lineage_path(database)?;
+    let (marker_bytes, marker_id) =
+        read_private_lineage_child_bytes(&retained_leaf.directory, &marker_path)?;
+    let record: PrivateSqliteLineageRecord =
+        decode_lineage_record(LineageRecordKind::PrivateSqlite, &marker_bytes)?;
+    let database_file = open_sqlite_file_shared(&retained_leaf.directory, database)?;
+    let database_id = private_object_id(&database_file)?;
+    let context = sqlite_lineage_context(&root, database)?;
+    if record.schema_version != PRIVATE_SQLITE_LINEAGE_SCHEMA_VERSION
+        || record.private_root != root.id
+        || record.parent != retained_leaf.id
+        || record.database != database_id
+        || record.marker != marker_id
+        || record.context != context
+    {
+        return Err(invalid_lineage(
+            "cleanup binding does not match the exact private workspace objects",
+        ));
+    }
+
+    let binding = PrivateWorkspaceCleanupBinding {
+        publication_parent: root.publication_parent_id.clone(),
+        private_root: root.id.clone(),
+        root_marker: root.root_marker_id.clone(),
+        workspace: retained_leaf.id.clone(),
+        database: database_id,
+        database_marker: marker_id,
+        #[cfg(windows)]
+        anchor_id: Some(record.anchor_id),
+        #[cfg(not(windows))]
+        anchor_id: None,
+        #[cfg(windows)]
+        generation: Some(record.generation),
+        #[cfg(not(windows))]
+        generation: None,
+    };
+
+    let _ = context;
+    Ok(binding)
+}
+
+fn inspect_prepared_ephemeral_probe_binding(
+    private_root: &Path,
+    retained_leaf: &RetainedWorkspaceDirectory,
+    database: &Path,
+) -> io::Result<PrivateWorkspaceCleanupBinding> {
+    let binding = inspect_private_workspace_cleanup_binding_filesystem(
+        private_root,
+        retained_leaf,
+        database,
+    )?;
+    #[cfg(windows)]
+    {
+        let root = verify_private_workspace_lineage(private_root)?;
+        let context = sqlite_lineage_context(&root, database)?;
+        let context_hash = windows_lineage::context_hash(&context);
+        let _guard = windows_lineage::lock(&context_hash)?;
+        let authority = windows_lineage::read_authority(&context_hash)?.ok_or_else(|| {
+            invalid_lineage("prepared ephemeral probe Windows authority is missing")
+        })?;
+        let anchor_id = binding
+            .anchor_id
+            .ok_or_else(|| invalid_lineage("prepared probe binding has no anchor"))?;
+        let generation = binding
+            .generation
+            .ok_or_else(|| invalid_lineage("prepared probe binding has no generation"))?;
+        require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
+        match authority.state {
+            WindowsLineageState::Pending {
+                generation: current,
+            } if current == generation => {}
+            WindowsLineageState::Active {
+                generation: current,
+                objects,
+            } if current == generation
+                && objects == windows_objects_from_cleanup_binding(&binding) => {}
+            _ => {
+                return Err(invalid_lineage(
+                    "prepared ephemeral probe authority is neither exact Pending nor Active",
+                ));
+            }
+        }
+    }
+    Ok(binding)
+}
+
+#[cfg(windows)]
+fn windows_objects_from_cleanup_binding(
+    binding: &PrivateWorkspaceCleanupBinding,
+) -> WindowsLineageObjects {
+    WindowsLineageObjects {
+        publication_parent: binding.publication_parent.clone(),
+        private_root: binding.private_root.clone(),
+        root_marker: binding.root_marker.clone(),
+        sqlite_parent: binding.workspace.clone(),
+        database: binding.database.clone(),
+        sqlite_marker: binding.database_marker.clone(),
+    }
+}
+
+pub(crate) fn inspect_private_workspace_cleanup_binding(
+    private_root: &Path,
+    retained_leaf: &RetainedWorkspaceDirectory,
+    database: &Path,
+) -> io::Result<PrivateWorkspaceCleanupBinding> {
+    let binding = inspect_private_workspace_cleanup_binding_filesystem(
+        private_root,
+        retained_leaf,
+        database,
+    )?;
+    #[cfg(windows)]
+    {
+        let root = verify_private_workspace_lineage(private_root)?;
+        let context = sqlite_lineage_context(&root, database)?;
+        let context_hash = windows_lineage::context_hash(&context);
+        let _guard = windows_lineage::lock(&context_hash)?;
+        let authority = windows_lineage::read_authority(&context_hash)?.ok_or_else(|| {
+            invalid_lineage("Windows private lineage registry authority is missing")
+        })?;
+        let anchor_id = binding
+            .anchor_id
+            .ok_or_else(|| invalid_lineage("cleanup binding has no Windows anchor"))?;
+        let generation = binding
+            .generation
+            .ok_or_else(|| invalid_lineage("cleanup binding has no Windows generation"))?;
+        require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
+        match authority.state {
+            WindowsLineageState::Active {
+                generation: current,
+                objects,
+            } if current == generation
+                && objects == windows_objects_from_cleanup_binding(&binding) => {}
+            _ => {
+                return Err(invalid_lineage(
+                    "Windows private lineage is not Active for the exact cleanup objects",
+                ));
+            }
+        }
+    }
+    Ok(binding)
+}
+
+pub(crate) fn revoke_private_workspace_lineage(
+    private_root: &Path,
+    retained_leaf: &RetainedWorkspaceDirectory,
+    database: &Path,
+    cleanup_id: [u8; 16],
+    expected_binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let current_binding = inspect_private_workspace_cleanup_binding_filesystem(
+            private_root,
+            retained_leaf,
+            database,
+        )?;
+        if &current_binding != expected_binding {
+            return Err(invalid_lineage(
+                "private workspace changed after cleanup marker publication",
+            ));
+        }
+        let root = verify_private_workspace_lineage(private_root)?;
+        windows_acl::validate_private_directory(&retained_leaf.directory)?;
+        let parent = &retained_leaf.directory;
+        let marker_path = sqlite_lineage_path(database)?;
+        let (marker_bytes, marker_id) = read_private_lineage_child_bytes(parent, &marker_path)?;
+        let record: PrivateSqliteLineageRecord =
+            decode_lineage_record(LineageRecordKind::PrivateSqlite, &marker_bytes)?;
+        let database_file = open_sqlite_file_shared(parent, database)?;
+        let context = sqlite_lineage_context(&root, database)?;
+        let objects = WindowsLineageObjects {
+            publication_parent: root.publication_parent_id.clone(),
+            private_root: root.id.clone(),
+            root_marker: root.root_marker_id.clone(),
+            sqlite_parent: private_object_id(parent)?,
+            database: private_object_id(&database_file)?,
+            sqlite_marker: marker_id,
+        };
+        if record.schema_version != PRIVATE_SQLITE_LINEAGE_SCHEMA_VERSION
+            || record.private_root != root.id
+            || record.parent != objects.sqlite_parent
+            || record.database != objects.database
+            || record.marker != objects.sqlite_marker
+            || record.context != context
+        {
+            return Err(invalid_lineage(
+                "cannot revoke a SQLite lineage that does not match the exact workspace objects",
+            ));
+        }
+        let context_hash = windows_lineage::context_hash(&context);
+        let _guard = windows_lineage::lock(&context_hash)?;
+        let mut authority = windows_lineage::read_authority(&context_hash)?.ok_or_else(|| {
+            invalid_lineage("Windows private lineage registry authority is missing")
+        })?;
+        require_windows_authority_header(&authority, &context_hash, &record.anchor_id)?;
+        match &authority.state {
+            WindowsLineageState::Active {
+                generation,
+                objects: expected,
+            } if generation == &record.generation && expected == &objects => {
+                authority.state = WindowsLineageState::Revoked {
+                    retired_generation: record.generation,
+                    cleanup_id,
+                    objects,
+                };
+                windows_lineage::write_authority(&context_hash, &authority)?;
+            }
+            WindowsLineageState::Revoked {
+                retired_generation,
+                cleanup_id: expected_cleanup,
+                objects: expected,
+            } if retired_generation == &record.generation
+                && expected_cleanup == &cleanup_id
+                && expected == &objects => {}
+            _ => {
+                return Err(invalid_lineage(
+                    "Windows private lineage authority cannot be revoked from its current state",
+                ));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let current_binding =
+            inspect_private_workspace_cleanup_binding(private_root, retained_leaf, database)?;
+        if &current_binding != expected_binding {
+            return Err(invalid_lineage(
+                "private workspace changed after cleanup marker publication",
+            ));
+        }
+        let _ = cleanup_id;
+    }
+    Ok(())
+}
+
+/// Reconcile a crash-stopped cleanup whose exact workspace survived. The
+/// marker's cleanup ID and complete object binding must match the durable
+/// Revoked record before the same generation can return to Active.
+pub(crate) fn reconcile_private_workspace_cleanup(
+    private_root: &Path,
+    retained_leaf: &RetainedWorkspaceDirectory,
+    database: &Path,
+    cleanup_id: [u8; 16],
+    expected_binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<()> {
+    let current = inspect_private_workspace_cleanup_binding_filesystem(
+        private_root,
+        retained_leaf,
+        database,
+    )?;
+    if &current != expected_binding {
+        return Err(invalid_lineage(
+            "surviving cleanup workspace does not match its exact marker binding",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let root = verify_private_workspace_lineage(private_root)?;
+        let context = sqlite_lineage_context(&root, database)?;
+        let context_hash = windows_lineage::context_hash(&context);
+        let _guard = windows_lineage::lock(&context_hash)?;
+        let mut authority = windows_lineage::read_authority(&context_hash)?.ok_or_else(|| {
+            invalid_lineage("Windows private lineage registry authority is missing")
+        })?;
+        let anchor_id = expected_binding
+            .anchor_id
+            .ok_or_else(|| invalid_lineage("cleanup binding has no Windows anchor"))?;
+        let generation = expected_binding
+            .generation
+            .ok_or_else(|| invalid_lineage("cleanup binding has no Windows generation"))?;
+        let objects = windows_objects_from_cleanup_binding(expected_binding);
+        require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
+        match &authority.state {
+            WindowsLineageState::Active {
+                generation: current,
+                objects: current_objects,
+            } if current == &generation && current_objects == &objects => {}
+            WindowsLineageState::Revoked {
+                retired_generation,
+                cleanup_id: current_cleanup,
+                objects: current_objects,
+            } if retired_generation == &generation
+                && current_cleanup == &cleanup_id
+                && current_objects == &objects =>
+            {
+                authority.state = WindowsLineageState::Active {
+                    generation,
+                    objects,
+                };
+                windows_lineage::write_authority(&context_hash, &authority)?;
+            }
+            _ => {
+                return Err(invalid_lineage(
+                    "cleanup marker does not match the Active or Revoked Windows authority",
+                ));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = cleanup_id;
+    Ok(())
+}
+
+pub(crate) fn verify_surviving_private_workspace_cleanup(
+    private_root: &Path,
+    retained_leaf: &RetainedWorkspaceDirectory,
+    database: &Path,
+    expected_binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<()> {
+    let current = inspect_private_workspace_cleanup_binding_filesystem(
+        private_root,
+        retained_leaf,
+        database,
+    )?;
+    if &current != expected_binding {
+        return Err(invalid_lineage(
+            "surviving cleanup workspace does not match its exact marker binding",
+        ));
+    }
+    Ok(())
+}
+
+/// Verify the terminal crash state where the exact workspace was fully
+/// removed after durable revocation but before its cleanup marker was cleared.
+pub(crate) fn verify_completed_private_workspace_cleanup(
+    private_root: &Path,
+    database: &Path,
+    cleanup_id: [u8; 16],
+    expected_binding: &PrivateWorkspaceCleanupBinding,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let root = verify_private_workspace_lineage(private_root)?;
+        let context = sqlite_lineage_context(&root, database)?;
+        let context_hash = windows_lineage::context_hash(&context);
+        let _guard = windows_lineage::lock(&context_hash)?;
+        let authority = windows_lineage::read_authority(&context_hash)?.ok_or_else(|| {
+            invalid_lineage("Windows private lineage registry authority is missing")
+        })?;
+        let anchor_id = expected_binding
+            .anchor_id
+            .ok_or_else(|| invalid_lineage("cleanup binding has no Windows anchor"))?;
+        let generation = expected_binding
+            .generation
+            .ok_or_else(|| invalid_lineage("cleanup binding has no Windows generation"))?;
+        require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
+        match authority.state {
+            WindowsLineageState::Revoked {
+                retired_generation,
+                cleanup_id: current_cleanup,
+                objects,
+            } if retired_generation == generation
+                && current_cleanup == cleanup_id
+                && objects == windows_objects_from_cleanup_binding(expected_binding) => {}
+            _ => {
+                return Err(invalid_lineage(
+                    "completed cleanup does not match its durable Revoked authority",
+                ));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (private_root, database, cleanup_id, expected_binding);
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+fn forget_sqlite_authority_for_test(path: &Path) {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        let mut registry = trusted_sqlite_authorities().lock().unwrap();
+        registry.authorities.remove(&canonical);
+        registry.cleanup_held.remove(&canonical);
+    }
 }
 
 /// Replace a private file in place after applying permissions to its handle.
@@ -863,6 +3362,7 @@ pub(crate) fn remove_child_file(parent: &File, path: &Path) -> io::Result<()> {
 }
 
 /// Rename direct children through a retained parent directory handle.
+#[cfg(all(test, windows))]
 pub(crate) fn rename_child_file(parent: &File, from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -1259,6 +3759,75 @@ pub(crate) fn open_parent_lease_handle(parent: &Path) -> io::Result<File> {
     ))
 }
 
+/// Retain a directory handle that prevents Windows pathname replacement and
+/// verify that the directory is already private. Unix retains the exact
+/// directory object; same-user namespace replacement remains outside the
+/// documented trust boundary.
+pub(crate) fn open_private_directory_lease(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let directory = open_parent_lease_handle(path)?;
+    #[cfg(windows)]
+    let directory = windows_acl::open_directory_for_authority(path)?;
+    #[cfg(unix)]
+    unix_private::verify_private_directory(&directory)?;
+    #[cfg(windows)]
+    windows_acl::harden(&directory, true)?;
+    Ok(directory)
+}
+
+/// Open an exact-private SQLite parent without requesting delete authority and
+/// while sharing delete. Windows keeps a separate retained delete-capable
+/// authority handle in the process registry; transient writer/progress opens
+/// must coexist with that handle.
+pub(crate) fn open_private_sqlite_parent(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        let directory = unix_private::open_directory(path)?;
+        unix_private::verify_private_directory(&directory)?;
+        Ok(directory)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_directory_for_sqlite(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private SQLite directories are unsupported on this platform",
+        ))
+    }
+}
+
+/// Verify an existing sensitive child through its already verified parent.
+pub(crate) fn verify_private_child_file(parent: &File, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return unix_private::verify_child_private_file(parent, path);
+    #[cfg(windows)]
+    return windows_acl::verify_child_private_file_shared(parent, path);
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private child verification is unsupported on this platform",
+    ))
+}
+
+/// Normalize a child proven absent before a trusted library created it while
+/// `parent` stayed retained and exact-private. This narrow creation exception
+/// must never be used to repair an object that existed before the operation.
+pub(crate) fn secure_new_private_child_file(parent: &File, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return unix_private::secure_new_child_private_file(parent, path);
+    #[cfg(windows)]
+    return windows_acl::secure_new_child_private_file(parent, path);
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private child creation hardening is unsupported on this platform",
+    ))
+}
+
 fn open_parent_identity_handle(parent: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -1359,30 +3928,6 @@ mod unix_private {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) fn remove_extended_acl(file: &File) -> io::Result<()> {
-        let acl = unsafe { macos_acl::acl_init(1) };
-        if acl.is_null() {
-            return Err(last_error());
-        }
-        let result = unsafe {
-            macos_acl::acl_set_fd_np(file.as_raw_fd(), acl, macos_acl::ACL_TYPE_EXTENDED)
-        };
-        unsafe {
-            macos_acl::acl_free(acl);
-        }
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(last_error())
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub(super) fn remove_extended_acl(_file: &File) -> io::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
     pub(super) fn verify_no_extended_acl(file: &File) -> io::Result<()> {
         let acl =
             unsafe { macos_acl::acl_get_fd_np(file.as_raw_fd(), macos_acl::ACL_TYPE_EXTENDED) };
@@ -1409,9 +3954,172 @@ mod unix_private {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn verify_no_extended_acl(file: &File) -> io::Result<()> {
+        verify_absent_posix_acl_xattr(file, b"system.posix_acl_access\0", "access")
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
     pub(super) fn verify_no_extended_acl(_file: &File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private ACL verification is unsupported on this Unix platform",
+        ))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn verify_absent_posix_acl_xattr(
+        file: &File,
+        name: &'static [u8],
+        description: &str,
+    ) -> io::Result<()> {
+        debug_assert_eq!(name.last(), Some(&0));
+        let size = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr().cast(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size >= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("private object retained a POSIX {description} ACL"),
+            ));
+        }
+        let error = last_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENODATA) | Some(libc::EOPNOTSUPP)
+        ) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    pub(super) fn verify_no_extended_directory_acl(directory: &File) -> io::Result<()> {
+        verify_no_extended_acl(directory)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        verify_absent_posix_acl_xattr(directory, b"system.posix_acl_default\0", "default")?;
         Ok(())
+    }
+
+    fn verify_private_access(file: &File, expected_mode: u32, description: &str) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != expected_mode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "private {description} must be owned by the current user with mode {expected_mode:o}"
+                ),
+            ));
+        }
+        verify_no_extended_acl(file)
+    }
+
+    pub(super) fn verify_private_file(file: &File) -> io::Result<()> {
+        verify_private_access(file, 0o600, "file")
+    }
+
+    pub(super) fn verify_private_directory(directory: &File) -> io::Result<()> {
+        verify_private_access(directory, 0o700, "directory")?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        verify_absent_posix_acl_xattr(directory, b"system.posix_acl_default\0", "default")?;
+        Ok(())
+    }
+
+    fn open_child_file_for_verification(parent: &File, path: &Path) -> io::Result<File> {
+        let name = c_string(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
+            })?,
+            "private child name",
+        )?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_private_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn verify_child_private_file(parent: &File, path: &Path) -> io::Result<()> {
+        verify_private_file(&open_child_file_for_verification(parent, path)?)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn remove_extended_acl_from_new(file: &File) -> io::Result<()> {
+        let acl = unsafe { macos_acl::acl_init(1) };
+        if acl.is_null() {
+            return Err(last_error());
+        }
+        let result = unsafe {
+            macos_acl::acl_set_fd_np(file.as_raw_fd(), acl, macos_acl::ACL_TYPE_EXTENDED)
+        };
+        unsafe {
+            macos_acl::acl_free(acl);
+        }
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn remove_extended_acl_from_new(file: &File) -> io::Result<()> {
+        let result = unsafe {
+            libc::fremovexattr(
+                file.as_raw_fd(),
+                b"system.posix_acl_access\0".as_ptr().cast(),
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = last_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENODATA) | Some(libc::EOPNOTSUPP)
+        ) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    fn remove_extended_acl_from_new(_file: &File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private ACL creation hardening is unsupported on this Unix platform",
+        ))
+    }
+
+    pub(super) fn secure_new_child_private_file(parent: &File, path: &Path) -> io::Result<()> {
+        let file = open_child_file_for_verification(parent, path)?;
+        if verify_private_file(&file).is_ok() {
+            return Ok(());
+        }
+        if file.metadata()?.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "new private child is not owned by the current user",
+            ));
+        }
+        remove_extended_acl_from_new(&file)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        verify_private_file(&file)
     }
 
     pub(super) fn open_directory(path: &Path) -> io::Result<File> {
@@ -1476,16 +4184,8 @@ mod unix_private {
                     "private staging directory was substituted during creation",
                 ));
             }
-            remove_extended_acl(&directory)?;
-            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+            verify_private_directory(&directory)?;
             let metadata = directory.metadata()?;
-            if metadata.mode() & 0o777 != 0o700 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "private staging directory permissions were not established",
-                ));
-            }
-            verify_no_extended_acl(&directory)?;
             return Ok((
                 directory,
                 c_name,
@@ -1571,18 +4271,13 @@ mod unix_private {
                 "private directory is not owned by the current user",
             ));
         }
+        verify_private_directory(&directory)?;
         Ok(directory)
     }
 
     fn open_staging_directory(parent: RawFd, name: &CString) -> io::Result<File> {
         let directory = open_owned_directory(parent, name)?;
-        if directory.metadata()?.mode() & 0o777 != 0o700 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private staging directory is not owner-only",
-            ));
-        }
-        verify_no_extended_acl(&directory)?;
+        verify_private_directory(&directory)?;
         Ok(directory)
     }
 
@@ -1597,15 +4292,7 @@ mod unix_private {
             return open_staging_directory(parent.as_raw_fd(), &name);
         }
         let directory = open_owned_directory(parent.as_raw_fd(), &name)?;
-        remove_extended_acl(&directory)?;
-        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
-        if directory.metadata()?.mode() & 0o777 != 0o700 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private cleanup directory permissions were not established",
-            ));
-        }
-        verify_no_extended_acl(&directory)?;
+        verify_private_directory(&directory)?;
         Ok(directory)
     }
 
@@ -1972,6 +4659,11 @@ mod unix_private {
                 "private recursive deletion refuses symlinks and special files",
             ));
         }
+        if is_directory {
+            verify_private_directory(&entry)?;
+        } else {
+            verify_private_file(&entry)?;
+        }
         let identity = file_identity(&metadata);
         if entry_identity(parent.as_raw_fd(), &name)? != identity {
             return Err(io::Error::new(
@@ -2156,6 +4848,7 @@ mod unix_private {
         }
         let file = unsafe { File::from_raw_fd(descriptor) };
         validate_private_file(&file)?;
+        verify_private_file(&file)?;
         Ok(file)
     }
 
@@ -2211,8 +4904,18 @@ mod unix_private {
             return Err(last_error());
         }
         let file = unsafe { File::from_raw_fd(descriptor) };
-        validate_private_file(&file)?;
-        harden_private_file(&file)?;
+        if let Err(error) = validate_private_file(&file).and_then(|_| harden_private_file(&file)) {
+            if let Ok(metadata) = file.metadata() {
+                let expected = file_identity(&metadata);
+                if entry_identity(parent.as_raw_fd(), &name).is_ok_and(|actual| actual == expected)
+                {
+                    unsafe {
+                        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
+                    }
+                }
+            }
+            return Err(error);
+        }
         Ok(file)
     }
 
@@ -2223,24 +4926,49 @@ mod unix_private {
             })?,
             "private child name",
         )?;
-        let descriptor = unsafe {
+        let mut created = true;
+        let mut descriptor = unsafe {
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
                 libc::O_RDWR
                     | libc::O_CREAT
+                    | libc::O_EXCL
                     | libc::O_NOFOLLOW
                     | libc::O_NONBLOCK
                     | libc::O_CLOEXEC,
                 0o600,
             )
         };
+        if descriptor < 0 && last_error().kind() == io::ErrorKind::AlreadyExists {
+            created = false;
+            descriptor = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+        }
         if descriptor < 0 {
             return Err(last_error());
         }
         let file = unsafe { File::from_raw_fd(descriptor) };
-        validate_private_file(&file)?;
-        harden_private_file(&file)?;
+        if let Err(error) = validate_private_file(&file).and_then(|_| harden_private_file(&file)) {
+            if created {
+                if let Ok(metadata) = file.metadata() {
+                    let expected = file_identity(&metadata);
+                    if entry_identity(parent.as_raw_fd(), &name)
+                        .is_ok_and(|actual| actual == expected)
+                    {
+                        unsafe {
+                            libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
+                        }
+                    }
+                }
+            }
+            return Err(error);
+        }
         Ok(file)
     }
 
@@ -2445,6 +5173,10 @@ mod unix_private {
             let collision = tmp.path().join(CLEANUP_DIRECTORY_NAME);
             fs::create_dir(&collision).unwrap();
             fs::set_permissions(&collision, fs::Permissions::from_mode(0o700)).unwrap();
+            let parent = open_directory(tmp.path()).unwrap();
+            let name =
+                c_string(OsStr::new(CLEANUP_DIRECTORY_NAME), "cleanup directory name").unwrap();
+            let collision_handle = open_owned_directory(parent.as_raw_fd(), &name).unwrap();
             assert!(Command::new("chmod")
                 .arg("+a")
                 .arg("everyone allow read,search,list")
@@ -2452,10 +5184,6 @@ mod unix_private {
                 .status()
                 .unwrap()
                 .success());
-            let parent = open_directory(tmp.path()).unwrap();
-            let name =
-                c_string(OsStr::new(CLEANUP_DIRECTORY_NAME), "cleanup directory name").unwrap();
-            let collision_handle = open_owned_directory(parent.as_raw_fd(), &name).unwrap();
             assert!(verify_no_extended_acl(&collision_handle).is_err());
 
             assert!(open_cleanup_directory(&parent).is_err());
@@ -2464,6 +5192,344 @@ mod unix_private {
                 "collision ACL was changed before cleanup failed"
             );
         }
+    }
+}
+
+#[cfg(windows)]
+mod windows_lineage {
+    use super::{LineageRecordKind, WindowsLineageAuthorityRecord};
+    use sha2::{Digest as _, Sha256};
+    use std::{ffi::OsStr, io, os::windows::ffi::OsStrExt as _, ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::{
+            LocalFree, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+        },
+        Security::Cryptography::{
+            CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        },
+        System::Registry::{
+            RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegFlushKey, RegOpenKeyExW,
+            RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+            KEY_SET_VALUE, KEY_WOW64_64KEY, REG_BINARY, REG_OPTION_NON_VOLATILE,
+        },
+    };
+    use zeroize::{Zeroize as _, Zeroizing};
+
+    const PRIVATE_ROOT_ENTROPY: &[u8] = b"argos/private-root-lineage/dpapi/v1";
+    const PRIVATE_SQLITE_ENTROPY: &[u8] = b"argos/private-sqlite-lineage/dpapi/v1";
+    const CLEANUP_MARKER_ENTROPY: &[u8] = b"argos/workspace-cleanup-marker/dpapi/v1";
+    const REGISTRY_AUTHORITY_ENTROPY: &[u8] = b"argos/private-lineage-registry/dpapi/v1";
+    const REGISTRY_KEY: &str = "Software\\Argos\\WalletRescue\\PrivateRootAuthority\\v1";
+    const MAX_REGISTRY_AUTHORITY_BYTES: u32 = 64 * 1024;
+
+    struct LocalBlob {
+        blob: CRYPT_INTEGER_BLOB,
+        secret: bool,
+    }
+
+    impl LocalBlob {
+        fn new(secret: bool) -> Self {
+            Self {
+                blob: CRYPT_INTEGER_BLOB {
+                    cbData: 0,
+                    pbData: ptr::null_mut(),
+                },
+                secret,
+            }
+        }
+
+        fn to_vec(&self) -> io::Result<Vec<u8>> {
+            if self.blob.cbData == 0 {
+                return Ok(Vec::new());
+            }
+            if self.blob.pbData.is_null() {
+                return Err(io::Error::other("DPAPI returned a null output buffer"));
+            }
+            Ok(unsafe {
+                slice::from_raw_parts(self.blob.pbData, self.blob.cbData as usize).to_vec()
+            })
+        }
+    }
+
+    impl Drop for LocalBlob {
+        fn drop(&mut self) {
+            if self.blob.pbData.is_null() {
+                return;
+            }
+            if self.secret && self.blob.cbData != 0 {
+                unsafe {
+                    slice::from_raw_parts_mut(self.blob.pbData, self.blob.cbData as usize)
+                        .zeroize();
+                }
+            }
+            unsafe {
+                LocalFree(self.blob.pbData.cast());
+            }
+        }
+    }
+
+    fn entropy(kind: LineageRecordKind) -> &'static [u8] {
+        match kind {
+            LineageRecordKind::PrivateRoot => PRIVATE_ROOT_ENTROPY,
+            LineageRecordKind::PrivateSqlite => PRIVATE_SQLITE_ENTROPY,
+            LineageRecordKind::CleanupMarker => CLEANUP_MARKER_ENTROPY,
+        }
+    }
+
+    fn registry_entropy(context_hash: &[u8; 32]) -> Vec<u8> {
+        let mut entropy = REGISTRY_AUTHORITY_ENTROPY.to_vec();
+        entropy.extend_from_slice(context_hash);
+        entropy
+    }
+
+    fn input_blob(bytes: &[u8]) -> io::Result<CRYPT_INTEGER_BLOB> {
+        Ok(CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(bytes.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "DPAPI input is too large")
+            })?,
+            pbData: bytes.as_ptr().cast_mut(),
+        })
+    }
+
+    fn protect_with_entropy(plaintext: &[u8], entropy: &[u8]) -> io::Result<Vec<u8>> {
+        let input = input_blob(plaintext)?;
+        let entropy = input_blob(entropy)?;
+        let mut output = LocalBlob::new(false);
+        if unsafe {
+            CryptProtectData(
+                &input,
+                ptr::null(),
+                &entropy,
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output.blob,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        output.to_vec()
+    }
+
+    pub(super) fn protect(kind: LineageRecordKind, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+        protect_with_entropy(plaintext, entropy(kind))
+    }
+
+    fn unprotect_with_entropy(ciphertext: &[u8], entropy: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+        let input = input_blob(ciphertext)?;
+        let entropy = input_blob(entropy)?;
+        let mut output = LocalBlob::new(true);
+        if unsafe {
+            CryptUnprotectData(
+                &input,
+                ptr::null_mut(),
+                &entropy,
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output.blob,
+            )
+        } == 0
+        {
+            return Err(super::invalid_lineage(format!(
+                "Windows DPAPI rejected private lineage authority: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(Zeroizing::new(output.to_vec()?))
+    }
+
+    pub(super) fn unprotect(
+        kind: LineageRecordKind,
+        ciphertext: &[u8],
+    ) -> io::Result<Zeroizing<Vec<u8>>> {
+        unprotect_with_entropy(ciphertext, entropy(kind))
+    }
+
+    struct RegKey(HKEY);
+
+    impl Drop for RegKey {
+        fn drop(&mut self) {
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    pub(super) fn context_hash(context: &[u8]) -> [u8; 32] {
+        Sha256::digest(context).into()
+    }
+
+    fn value_name(context_hash: &[u8; 32]) -> String {
+        let mut name = String::from("w-");
+        for byte in context_hash {
+            use std::fmt::Write as _;
+            write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        name
+    }
+
+    pub(super) fn mutex_name(context_hash: &[u8; 32]) -> String {
+        format!(
+            "Global\\ArgosWalletRescue-Lineage-{}",
+            value_name(context_hash)
+        )
+    }
+
+    pub(super) fn lock(context_hash: &[u8; 32]) -> io::Result<super::windows_acl::LineageMutex> {
+        let name = mutex_name(context_hash);
+        super::windows_acl::acquire_lineage_mutex(&name)
+    }
+
+    fn open_registry_key(write: bool) -> io::Result<Option<RegKey>> {
+        let subkey = wide(REGISTRY_KEY);
+        let mut key = ptr::null_mut();
+        let access = KEY_QUERY_VALUE | KEY_WOW64_64KEY | if write { KEY_SET_VALUE } else { 0 };
+        let status = if write {
+            unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    0,
+                    ptr::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    access,
+                    ptr::null(),
+                    &mut key,
+                    ptr::null_mut(),
+                )
+            }
+        } else {
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key) }
+        };
+        if !write && matches!(status, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(Some(RegKey(key)))
+    }
+
+    pub(super) fn read_authority(
+        context_hash: &[u8; 32],
+    ) -> io::Result<Option<WindowsLineageAuthorityRecord>> {
+        let Some(key) = open_registry_key(false)? else {
+            return Ok(None);
+        };
+        let name = wide(&value_name(context_hash));
+        let mut value_type = 0;
+        let mut length = 0;
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                name.as_ptr(),
+                ptr::null(),
+                &mut value_type,
+                ptr::null_mut(),
+                &mut length,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        if value_type != REG_BINARY || length == 0 || length > MAX_REGISTRY_AUTHORITY_BYTES {
+            return Err(super::invalid_lineage(
+                "Windows private lineage registry authority has an invalid type or size",
+            ));
+        }
+        for _ in 0..2 {
+            let mut bytes = vec![0u8; length as usize];
+            let mut actual = length;
+            let status = unsafe {
+                RegQueryValueExW(
+                    key.0,
+                    name.as_ptr(),
+                    ptr::null(),
+                    &mut value_type,
+                    bytes.as_mut_ptr(),
+                    &mut actual,
+                )
+            };
+            if status == ERROR_MORE_DATA && actual <= MAX_REGISTRY_AUTHORITY_BYTES {
+                length = actual;
+                continue;
+            }
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            bytes.truncate(actual as usize);
+            let entropy = registry_entropy(context_hash);
+            let plaintext = unprotect_with_entropy(&bytes, &entropy)?;
+            let record = serde_json::from_slice(&plaintext).map_err(|error| {
+                super::invalid_lineage(format!(
+                    "Windows private lineage registry authority is invalid: {error}"
+                ))
+            })?;
+            return Ok(Some(record));
+        }
+        Err(super::invalid_lineage(
+            "Windows private lineage registry authority changed during bounded read",
+        ))
+    }
+
+    pub(super) fn write_authority(
+        context_hash: &[u8; 32],
+        record: &WindowsLineageAuthorityRecord,
+    ) -> io::Result<()> {
+        let mut plaintext = serde_json::to_vec(record).map_err(io::Error::other)?;
+        let entropy = registry_entropy(context_hash);
+        let protected = protect_with_entropy(&plaintext, &entropy);
+        plaintext.zeroize();
+        let protected = protected?;
+        let key = open_registry_key(true)?.expect("write opens or creates the registry key");
+        let name = wide(&value_name(context_hash));
+        let length = u32::try_from(protected.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registry authority is too large",
+            )
+        })?;
+        let status = unsafe {
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_BINARY,
+                protected.as_ptr(),
+                length,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let status = unsafe { RegFlushKey(key.0) };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_authority(context_hash: &[u8; 32]) -> io::Result<()> {
+        let key = open_registry_key(true)?.expect("write opens or creates the registry key");
+        let name = wide(&value_name(context_hash));
+        let status = unsafe { RegDeleteValueW(key.0, name.as_ptr()) };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let status = unsafe { RegFlushKey(key.0) };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
     }
 }
 
@@ -2492,40 +5558,88 @@ mod windows_acl {
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
-            INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, STATUS_BUFFER_OVERFLOW,
-            STATUS_NO_MORE_FILES, UNICODE_STRING,
+            CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL,
+            GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
+            STATUS_BUFFER_OVERFLOW, STATUS_NO_MORE_FILES, UNICODE_STRING, WAIT_ABANDONED,
+            WAIT_OBJECT_0,
         },
         Security::{
             AclSizeInformation, AddAccessAllowedAceEx,
-            Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT},
+            Authorization::{
+                GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
+            },
             CreateWellKnownSid, EqualSid, GetAce, GetAclInformation, GetLengthSid,
             GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl,
             InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-            TokenUser, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
-            ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-            OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
-            SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+            SetSecurityDescriptorOwner, TokenUser, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL,
+            ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+            OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE,
+            SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
             CreateDirectoryW, CreateFileW, FileDispositionInfo, FileRenameInfo,
             GetFileInformationByHandle, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-            CREATE_NEW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+            CREATE_NEW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS,
+            FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
             FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
             FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+            WRITE_OWNER,
         },
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+        System::Threading::{
+            CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
+            INFINITE,
+        },
     };
 
     const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
     struct OwnedHandle(HANDLE);
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
             unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub(super) struct LineageMutex(OwnedHandle);
+
+    impl Drop for LineageMutex {
+        fn drop(&mut self) {
+            unsafe {
+                ReleaseMutex(self.0 .0);
+            }
+        }
+    }
+
+    pub(super) fn acquire_lineage_mutex(name: &str) -> io::Result<LineageMutex> {
+        let mut wide_name = OsStr::new(name).encode_wide().collect::<Vec<_>>();
+        if wide_name.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private lineage mutex name contains a NUL character",
+            ));
+        }
+        wide_name.push(0);
+        let security = PrivateSecurity::new(false)?;
+        let handle = unsafe { CreateMutexW(security.attributes(), 0, wide_name.as_ptr()) };
+        if handle.is_null() {
+            return Err(last_error());
+        }
+        let handle = OwnedHandle(handle);
+        verify_handle(
+            handle.0,
+            SE_KERNEL_OBJECT,
+            false,
+            security.user_sid,
+            security.system_sid,
+        )?;
+        match unsafe { WaitForSingleObject(handle.0, INFINITE) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(LineageMutex(handle)),
+            _ => Err(last_error()),
         }
     }
 
@@ -2657,7 +5771,80 @@ mod windows_acl {
             ptr::null(),
         )?;
         validate_private_file(&file)?;
+        PrivateSecurity::new(false)?.verify(&file)?;
         Ok(file)
+    }
+
+    pub(super) fn open_child_file_exclusive(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let file = nt_open_child(parent, path, FILE_GENERIC_READ, 0, FILE_OPEN, ptr::null())?;
+        validate_private_file(&file)?;
+        PrivateSecurity::new(false)?.verify(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_child_file_for_identity(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let file = nt_open_child(
+            parent,
+            path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            ptr::null(),
+        )?;
+        validate_private_file(&file)?;
+        PrivateSecurity::new(false)?.verify(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_child_file_for_retained_authority(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let file = nt_open_child(
+            parent,
+            path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            ptr::null(),
+        )?;
+        validate_private_file(&file)?;
+        PrivateSecurity::new(false)?.verify(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn verify_child_private_file_shared(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<()> {
+        drop(open_child_file_for_identity(parent, path)?);
+        Ok(())
+    }
+
+    pub(super) fn secure_new_child_private_file(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<()> {
+        let file = nt_open_child(
+            parent,
+            path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            ptr::null(),
+        )?;
+        validate_private_file(&file)?;
+        let security = PrivateSecurity::new(false)?;
+        if security.verify(&file).is_ok() {
+            return Ok(());
+        }
+        secure_new_child_dacl(&file, &security)
     }
 
     pub(super) fn open_child_private(
@@ -2794,6 +5981,7 @@ mod windows_acl {
                 "private workspace entry is not a directory",
             ));
         }
+        PrivateSecurity::new(true)?.verify(&directory)?;
         Ok(directory)
     }
 
@@ -2816,6 +6004,7 @@ mod windows_acl {
                 "private workspace entry is not a directory",
             ));
         }
+        PrivateSecurity::new(true)?.verify(&directory)?;
         Ok(directory)
     }
 
@@ -2833,6 +6022,7 @@ mod windows_acl {
             0,
         )?;
         let is_directory = validate_recursive_entry(&entry)?;
+        PrivateSecurity::new(is_directory)?.verify(&entry)?;
         Ok((entry, is_directory))
     }
 
@@ -2860,6 +6050,7 @@ mod windows_acl {
                 "private directory entry type changed before deletion",
             ));
         }
+        PrivateSecurity::new(is_directory)?.verify(&entry)?;
         Ok(entry)
     }
 
@@ -2948,6 +6139,11 @@ mod windows_acl {
                         SE_DACL_PROTECTED,
                         SE_DACL_PROTECTED,
                     ) == 0
+                    || SetSecurityDescriptorOwner(
+                        (&mut *descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                        user_sid,
+                        0,
+                    ) == 0
                 {
                     return Err(last_error());
                 }
@@ -3028,8 +6224,161 @@ mod windows_acl {
 
     pub(super) fn harden(file: &std::fs::File, directory: bool) -> io::Result<()> {
         let security = PrivateSecurity::new(directory)?;
+        security.verify(file)
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_for_expected_owner_test(
+        file: &std::fs::File,
+        directory: bool,
+        expected_owner: PSID,
+    ) -> io::Result<()> {
+        let security = PrivateSecurity::new(directory)?;
+        verify(file, directory, expected_owner, security.system_sid)
+    }
+
+    pub(super) fn require_current_owner_sid(owner_sid: PSID, user_sid: PSID) -> io::Result<()> {
+        if owner_sid.is_null() || unsafe { EqualSid(owner_sid, user_sid) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private object is not owned by the current user",
+            ));
+        }
+        Ok(())
+    }
+
+    struct OwnedLocalDescriptor(*mut core::ffi::c_void);
+    impl Drop for OwnedLocalDescriptor {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    fn verify_owner(file: &std::fs::File, user_sid: PSID) -> io::Result<()> {
         unsafe {
-            let status = SetSecurityInfo(
+            let mut owner = ptr::null_mut();
+            let mut descriptor = ptr::null_mut();
+            let status = GetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            );
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            let _descriptor = OwnedLocalDescriptor(descriptor);
+            require_current_owner_sid(owner, user_sid)
+        }
+    }
+
+    pub(super) fn directory_owned_by_current_user(path: &Path) -> io::Result<bool> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let directory = options.open(path)?;
+        if !validate_recursive_entry(&directory)? {
+            return Ok(false);
+        }
+        let security = PrivateSecurity::new(true)?;
+        match verify_owner(&directory, security.user_sid) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn verify_publication_parent(directory: &std::fs::File) -> io::Result<()> {
+        unsafe {
+            let security = PrivateSecurity::new(true)?;
+            let mut owner = ptr::null_mut();
+            let mut dacl = ptr::null_mut();
+            let mut descriptor = ptr::null_mut();
+            let status = GetSecurityInfo(
+                directory.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            );
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            let _descriptor = OwnedLocalDescriptor(descriptor);
+            require_current_owner_sid(owner, security.user_sid)?;
+            if dacl.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "workspace publication parent DACL is absent",
+                ));
+            }
+            let mut info = ACL_SIZE_INFORMATION::default();
+            if GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            ) == 0
+            {
+                return Err(last_error());
+            }
+            let dangerous = FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_DELETE_CHILD
+                | FILE_GENERIC_WRITE
+                | GENERIC_WRITE
+                | GENERIC_ALL
+                | DELETE
+                | WRITE_DAC
+                | WRITE_OWNER;
+            for index in 0..info.AceCount {
+                let mut raw = ptr::null_mut();
+                if GetAce(dacl, index, &mut raw) == 0 {
+                    return Err(last_error());
+                }
+                let ace = &*(raw.cast::<ACCESS_ALLOWED_ACE>());
+                if ace.Header.AceType == ACCESS_DENIED_ACE_TYPE {
+                    continue;
+                }
+                if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "workspace publication parent contains an unsupported ACE type",
+                    ));
+                }
+                let sid: PSID = (&ace.SidStart as *const u32).cast_mut().cast();
+                if EqualSid(sid, security.user_sid) == 0
+                    && EqualSid(sid, security.system_sid) == 0
+                    && ace.Mask & dangerous != 0
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "workspace publication parent grants create/delete authority to a non-owner",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn secure_new_child_dacl(file: &std::fs::File, security: &PrivateSecurity) -> io::Result<()> {
+        // This mutation is permitted only for a child proven absent before a
+        // trusted library created it under a retained exact-private parent.
+        // Owner verification prevents the exception from taking over a
+        // substituted foreign-owned object.
+        verify_owner(file, security.user_sid)?;
+        let status = unsafe {
+            SetSecurityInfo(
                 file.as_raw_handle() as HANDLE,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
@@ -3037,10 +6386,10 @@ mod windows_acl {
                 ptr::null_mut(),
                 security._acl.as_ptr().cast(),
                 ptr::null(),
-            );
-            if status != ERROR_SUCCESS {
-                return Err(io::Error::from_raw_os_error(status as i32));
-            }
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
         }
         security.verify(file)
     }
@@ -3051,14 +6400,31 @@ mod windows_acl {
         user_sid: PSID,
         system_sid: PSID,
     ) -> io::Result<()> {
+        verify_handle(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            directory,
+            user_sid,
+            system_sid,
+        )
+    }
+
+    fn verify_handle(
+        handle: HANDLE,
+        object_type: SE_OBJECT_TYPE,
+        directory: bool,
+        user_sid: PSID,
+        system_sid: PSID,
+    ) -> io::Result<()> {
         unsafe {
+            let mut owner = ptr::null_mut();
             let mut dacl = ptr::null_mut();
             let mut descriptor = ptr::null_mut();
             let status = GetSecurityInfo(
-                file.as_raw_handle() as HANDLE,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                handle,
+                object_type,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
                 ptr::null_mut(),
@@ -3067,13 +6433,8 @@ mod windows_acl {
             if status != ERROR_SUCCESS {
                 return Err(io::Error::from_raw_os_error(status as i32));
             }
-            struct Descriptor(*mut core::ffi::c_void);
-            impl Drop for Descriptor {
-                fn drop(&mut self) {
-                    unsafe { LocalFree(self.0) };
-                }
-            }
-            let _descriptor = Descriptor(descriptor);
+            let _descriptor = OwnedLocalDescriptor(descriptor);
+            require_current_owner_sid(owner, user_sid)?;
             if dacl.is_null() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -3178,8 +6539,7 @@ mod windows_acl {
                 FILE_GENERIC_WRITE
             }
         } | DELETE
-            | READ_CONTROL
-            | WRITE_DAC;
+            | READ_CONTROL;
         let share = if matches!(
             mode,
             super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend
@@ -3197,10 +6557,18 @@ mod windows_acl {
                         && !create_only
                         && mode != super::PrivateOpenMode::CreateNew =>
                 {
-                    (
-                        nt_open_child(parent, path, access, share, FILE_OPEN, ptr::null())?,
-                        false,
-                    )
+                    let exclusive = nt_open_child(parent, path, access, 0, FILE_OPEN, ptr::null())?;
+                    validate_private_file(&exclusive)?;
+                    security.verify(&exclusive)?;
+                    if mode == super::PrivateOpenMode::ReadWriteLock {
+                        drop(exclusive);
+                        let shared =
+                            nt_open_child(parent, path, access, share, FILE_OPEN, ptr::null())?;
+                        security.verify(&shared)?;
+                        (shared, false)
+                    } else {
+                        (exclusive, false)
+                    }
                 }
                 Err(err) => return Err(err),
             };
@@ -3208,7 +6576,7 @@ mod windows_acl {
             if created {
                 security.verify(&file)
             } else {
-                super::harden_private_file(&file)
+                security.verify(&file)
             }
         });
         if let Err(err) = secured {
@@ -3251,7 +6619,7 @@ mod windows_acl {
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                access | DELETE | READ_CONTROL | WRITE_DAC,
+                access | DELETE | READ_CONTROL,
                 share,
                 security.attributes(),
                 CREATE_NEW,
@@ -3269,6 +6637,27 @@ mod windows_acl {
             return Err(err);
         }
         Ok(file)
+    }
+
+    pub(super) fn open_existing_private_file(
+        path: &Path,
+        mode: super::PrivateOpenMode,
+    ) -> io::Result<std::fs::File> {
+        let mut exclusive_options = super::options_for(mode, false);
+        exclusive_options.share_mode(0);
+        let exclusive = exclusive_options.open(path)?;
+        validate_private_file(&exclusive)?;
+        let security = PrivateSecurity::new(false)?;
+        security.verify(&exclusive)?;
+        if mode == super::PrivateOpenMode::ReadWriteLock {
+            drop(exclusive);
+            let shared = super::options_for(mode, false).open(path)?;
+            validate_private_file(&shared)?;
+            security.verify(&shared)?;
+            Ok(shared)
+        } else {
+            Ok(exclusive)
+        }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3360,11 +6749,12 @@ mod windows_acl {
             parent,
             path,
             DELETE | FILE_GENERIC_READ | READ_CONTROL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
             FILE_OPEN,
             ptr::null(),
         )?;
         validate_private_file(&file)?;
+        PrivateSecurity::new(false)?.verify(&file)?;
         Ok(file)
     }
 
@@ -3450,7 +6840,7 @@ mod windows_acl {
         observer(path)?;
         let current_parent = open_directory(parent, READ_CONTROL)?;
         ensure_same_directory(parent_identity, &current_parent, "parent")?;
-        let directory = open_directory(path, READ_CONTROL | WRITE_DAC)?;
+        let directory = open_directory(path, READ_CONTROL)?;
         let directory_identity = directory_identity(&directory)?;
         security.verify(&directory)?;
         let current_directory = open_directory(path, READ_CONTROL)?;
@@ -3495,10 +6885,23 @@ mod windows_acl {
     }
 
     fn open_directory(path: &Path, access: u32) -> io::Result<std::fs::File> {
+        open_directory_with_share(
+            path,
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+    }
+
+    fn open_directory_with_share(
+        path: &Path,
+        access: u32,
+        share: u32,
+    ) -> io::Result<std::fs::File> {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
             .access_mode(access | FILE_READ_ATTRIBUTES)
+            .share_mode(share)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let directory = options.open(path)?;
         directory_identity(&directory)?;
@@ -3506,7 +6909,7 @@ mod windows_acl {
     }
 
     pub(super) fn harden_directory(path: &Path) -> io::Result<()> {
-        let directory = open_directory(path, READ_CONTROL | WRITE_DAC)?;
+        let directory = open_directory_with_share(path, READ_CONTROL, 0)?;
         harden(&directory, true)
     }
 
@@ -3515,18 +6918,47 @@ mod windows_acl {
         PrivateSecurity::new(directory)?.verify(file)
     }
 
+    pub(super) fn validate_private_directory(file: &std::fs::File) -> io::Result<()> {
+        directory_identity(file)?;
+        PrivateSecurity::new(true)?.verify(file)
+    }
+
     pub(super) fn open_directory_for_sync(path: &Path) -> io::Result<std::fs::File> {
-        open_directory(
+        open_directory(path, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL)
+    }
+
+    pub(super) fn open_directory_for_authority(path: &Path) -> io::Result<std::fs::File> {
+        let directory =
+            open_directory_with_share(path, READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+        harden(&directory, true)?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_directory_for_cleanup_authority(path: &Path) -> io::Result<std::fs::File> {
+        let directory = open_directory_with_share(
             path,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
-        )
+            DELETE | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?;
+        harden(&directory, true)?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_directory_for_sqlite(path: &Path) -> io::Result<std::fs::File> {
+        let directory = open_directory_with_share(
+            path,
+            READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        harden(&directory, true)?;
+        Ok(directory)
     }
 
     pub(super) fn open_directory_for_lease(path: &Path) -> io::Result<std::fs::File> {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
-            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let directory = options.open(path)?;
@@ -3550,6 +6982,58 @@ mod windows_acl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_probe_scan_ignores_noncanonical_candidate_names() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "zeck_probe_not-a-uuid",
+            "zeck_probe_550E8400-E29B-41D4-A716-446655440000",
+            "zeck_probe_550e8400e29b41d4a716446655440000",
+        ] {
+            let candidate = temp.path().join(name);
+            fs::create_dir(&candidate).unwrap();
+            fs::write(candidate.join("must-survive"), b"untrusted candidate").unwrap();
+        }
+
+        cleanup_stale_ephemeral_probes(temp.path()).unwrap();
+
+        for entry in fs::read_dir(temp.path()).unwrap() {
+            assert!(entry.unwrap().path().join("must-survive").exists());
+        }
+    }
+
+    #[test]
+    fn existing_private_root_without_lineage_is_refused_without_minting_a_marker() {
+        let outer = tempfile::tempdir().unwrap();
+        let private_root = outer.path().join("workspace-private-root");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+        create_private_dir_all(&leaf).unwrap();
+
+        let error = ensure_private_workspace_lineage(&private_root, &leaf, &database)
+            .expect_err("an existing unmarked private root must be treated as legacy");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!private_root.join(PRIVATE_ROOT_LINEAGE_FILE_NAME).exists());
+        assert!(leaf.is_dir());
+    }
+
+    #[test]
+    fn fresh_private_root_gets_create_only_identity_lineage() {
+        let outer = tempfile::tempdir().unwrap();
+        let private_root = outer.path().join("workspace-private-root");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+
+        ensure_private_workspace_lineage(&private_root, &leaf, &database).unwrap();
+        let first = verify_private_workspace_lineage(&private_root).unwrap();
+        ensure_private_workspace_lineage(&private_root, &leaf, &database).unwrap();
+        let second = verify_private_workspace_lineage(&private_root).unwrap();
+
+        assert_eq!(first.id(), second.id());
+        assert!(leaf.is_dir());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3651,7 +7135,7 @@ mod tests {
     fn recursive_workspace_removal_refuses_substituted_tombstone() {
         let parent = tempfile::tempdir().unwrap();
         let tombstone = parent.path().join("wallet.deleting-test");
-        fs::create_dir(&tombstone).unwrap();
+        create_private_dir_all(&tombstone).unwrap();
         fs::create_dir(tombstone.join("nested")).unwrap();
         fs::write(tombstone.join("nested/secret"), b"original").unwrap();
         let displaced = parent.path().join("displaced-tombstone");
@@ -3710,9 +7194,8 @@ mod tests {
     fn recursive_workspace_removal_deletes_only_the_retained_tree() {
         let parent = tempfile::tempdir().unwrap();
         let tombstone = parent.path().join("wallet.deleting-test");
-        fs::create_dir(&tombstone).unwrap();
-        fs::create_dir(tombstone.join("nested")).unwrap();
-        fs::write(tombstone.join("nested/secret"), b"delete me").unwrap();
+        create_private_dir_all(&tombstone.join("nested")).unwrap();
+        write_private_file(&tombstone.join("nested/secret"), b"delete me").unwrap();
         let sibling = parent.path().join("sibling");
         fs::create_dir(&sibling).unwrap();
         fs::write(sibling.join("sentinel"), b"must survive").unwrap();
@@ -3782,6 +7265,178 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(open_private_file(&link, PrivateOpenMode::Truncate).is_err());
         assert_eq!(fs::read(target).unwrap(), b"must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_private_file_rejects_insecure_mode_before_truncate() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkpoint");
+        fs::write(&path, b"must survive").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = open_private_file(&path, PrivateOpenMode::Truncate)
+            .expect_err("insecure reused file must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), b"must survive");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_private_directory_rejects_insecure_mode_without_repair() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error =
+            create_private_dir_all(&path).expect_err("insecure reused directory must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_reads_and_retains_reject_permissive_sensitive_children() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let outer = tempfile::tempdir().unwrap();
+        let parent = outer.path().join("private");
+        create_private_dir_all(&parent).unwrap();
+        let lease = NamespaceLease::acquire(&parent, &parent.join("authority.lock")).unwrap();
+
+        for name in ["journal", "checkpoint", "registry"] {
+            let path = parent.join(name);
+            fs::write(&path, b"attacker-controlled").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+            assert_eq!(
+                lease.read_child(&path).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                lease.retain_child(&path).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"attacker-controlled");
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o644);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn set_posix_acl_xattr(file: &File, name: &[u8], entries: &[(u16, u16, u32)]) {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in entries {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        assert_eq!(name.last(), Some(&0));
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr().cast(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            },
+            0,
+            "setting POSIX ACL xattr: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_reused_private_file_rejects_posix_access_acl() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkpoint");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        set_posix_acl_xattr(
+            &file,
+            b"system.posix_acl_access\0",
+            &[
+                (0x01, 0x06, u32::MAX),
+                (0x02, 0x04, unsafe { libc::geteuid() }.saturating_add(1)),
+                (0x04, 0, u32::MAX),
+                (0x10, 0x04, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ],
+        );
+        drop(file);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = open_private_file(&path, PrivateOpenMode::Append)
+            .expect_err("POSIX access ACL must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_reused_private_directory_rejects_posix_default_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(&path).unwrap();
+        set_posix_acl_xattr(
+            &directory,
+            b"system.posix_acl_default\0",
+            &[
+                (0x01, 0x07, u32::MAX),
+                (0x04, 0, u32::MAX),
+                (0x10, 0, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ],
+        );
+        drop(directory);
+
+        let error = create_private_dir_all(&path).expect_err("POSIX default ACL must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_publication_parent_rejects_posix_acl_before_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = File::open(tmp.path()).unwrap();
+        set_posix_acl_xattr(
+            &parent,
+            b"system.posix_acl_access\0",
+            &[
+                (0x01, 0x07, u32::MAX),
+                (0x04, 0, u32::MAX),
+                (0x10, 0, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ],
+        );
+        let private_root = tmp.path().join("workspace-private-root");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+
+        let error = ensure_private_workspace_lineage(&private_root, &leaf, &database)
+            .expect_err("publication parent ACL must fail before staging");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!private_root.exists());
     }
 
     #[cfg(unix)]
@@ -3864,8 +7519,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn atomic_private_objects_drop_inherited_macos_acls_before_use() {
-        use std::{cell::RefCell, process::Command};
+    fn atomic_private_objects_reject_inherited_macos_acls_before_use() {
+        use std::process::Command;
 
         fn has_extended_acl(path: &Path) -> bool {
             let output = Command::new("ls").arg("-lde").arg(path).output().unwrap();
@@ -3891,24 +7546,16 @@ mod tests {
         assert!(has_extended_acl(tmp.path()));
 
         let path = tmp.path().join("checkpoint");
-        let staging_path = RefCell::new(None);
-        write_private_file_atomic_with_observer(&path, b"spend-capable", |staging| {
-            *staging_path.borrow_mut() = Some(staging.to_path_buf());
-            assert!(
-                !has_extended_acl(staging),
-                "the staging directory retained an inherited macOS ACL"
-            );
-            assert!(
-                !has_extended_acl(&staging.join("artifact")),
-                "the staged artifact retained an inherited macOS ACL"
-            );
-            Ok(())
-        })
-        .unwrap();
-        assert!(!has_extended_acl(&path));
+        let error = write_private_file_atomic(&path, b"spend-capable")
+            .expect_err("an inherited ACL must fail before secret bytes are written");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path.exists());
         assert!(
-            !staging_path.borrow().as_ref().unwrap().exists(),
-            "the private staging directory was not cleaned up"
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| entry.file_name() != "artifact"),
+            "no secret artifact was created under an insecure inherited ACL"
         );
     }
 
@@ -3935,6 +7582,29 @@ mod tests {
 
         assert!(super::unix_private::verify_no_extended_acl(&child).is_err());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_publication_parent_rejects_extended_acl_before_staging() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(Command::new("chmod")
+            .arg("+a")
+            .arg("everyone allow list,search,add_file,add_subdirectory,delete_child")
+            .arg(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        let private_root = tmp.path().join("workspace-private-root");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+
+        let error = ensure_private_workspace_lineage(&private_root, &leaf, &database)
+            .expect_err("publication parent ACL must fail before staging");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!private_root.exists());
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -3946,7 +7616,10 @@ mod windows_tests {
         ptr,
     };
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE},
+        Foundation::{
+            CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION,
+            ERROR_SUCCESS, HANDLE,
+        },
         Security::{
             AclSizeInformation, AddAccessAllowedAceEx,
             Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT},
@@ -3954,13 +7627,13 @@ mod windows_tests {
             GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, TokenUser,
             WinBuiltinUsersSid, WinLocalSystemSid, WinWorldSid, ACCESS_ALLOWED_ACE, ACL,
             ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-            OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE,
-            SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+            OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            PSID, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
             CreateSymbolicLinkW, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE, READ_CONTROL, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
-            WRITE_DAC,
+            FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+            SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, WRITE_DAC,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -4043,20 +7716,27 @@ mod windows_tests {
         let (_system_bytes, system) = well_known(WinLocalSystemSid);
         let (_world_bytes, world) = well_known(WinWorldSid);
         let (_users_bytes, users) = well_known(WinBuiltinUsersSid);
+        let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
         assert_eq!(
             GetSecurityInfo(
                 file.as_raw_handle() as HANDLE,
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
                 ptr::null_mut(),
                 &mut descriptor,
             ),
             ERROR_SUCCESS
+        );
+        assert_ne!(owner, ptr::null_mut());
+        assert_ne!(
+            EqualSid(owner, user),
+            0,
+            "private object owner must be the current token user"
         );
         let mut control = 0;
         let mut revision = 0;
@@ -4109,8 +7789,388 @@ mod windows_tests {
         LocalFree(descriptor);
     }
 
+    unsafe fn assert_world_access_is_still_present(file: &File) {
+        let (_world_bytes, world) = well_known(WinWorldSid);
+        let mut dacl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        assert_eq!(
+            GetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            ),
+            ERROR_SUCCESS
+        );
+        let mut info = ACL_SIZE_INFORMATION::default();
+        assert_ne!(
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            ),
+            0
+        );
+        let mut found = false;
+        for index in 0..info.AceCount {
+            let mut raw = ptr::null_mut();
+            assert_ne!(GetAce(dacl, index, &mut raw), 0);
+            let ace = &*(raw.cast::<ACCESS_ALLOWED_ACE>());
+            let sid = (&ace.SidStart as *const u32).cast_mut().cast();
+            found |= EqualSid(sid, world) != 0;
+        }
+        assert!(found, "reuse verification must not rewrite the DACL");
+        LocalFree(descriptor);
+    }
+
     #[test]
-    fn windows_reused_private_objects_have_only_owner_and_system_access() {
+    fn windows_owner_verifier_rejects_a_foreign_owner_sid() {
+        let (_user_bytes, user) = unsafe { token_user() };
+        let (_system_bytes, system) = unsafe { well_known(WinLocalSystemSid) };
+        let error = super::windows_acl::require_current_owner_sid(system, user)
+            .expect_err("a foreign owner must not be accepted as a private object");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        super::windows_acl::require_current_owner_sid(user, user).unwrap();
+    }
+
+    #[test]
+    fn windows_foreign_owner_verification_never_repairs_the_dacl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("foreign-owned-secret");
+        fs::write(&path, b"must survive").unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .open(&path)
+            .unwrap();
+        unsafe { set_world_access(&file, false) };
+        let (_system_bytes, system) = unsafe { well_known(WinLocalSystemSid) };
+
+        let error = super::windows_acl::verify_for_expected_owner_test(&file, false, system)
+            .expect_err("foreign ownership must fail without DACL repair or truncation");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), b"must survive");
+        unsafe { assert_world_access_is_still_present(&file) };
+    }
+
+    #[test]
+    fn windows_reuse_refuses_permissive_file_with_security_only_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("preopened-secret");
+        fs::write(&path, b"must survive").unwrap();
+        let attacker = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        unsafe { set_world_access(&attacker, false) };
+
+        let error = open_private_file(&path, PrivateOpenMode::Truncate)
+            .expect_err("a permissive reused file must fail before truncation");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"must survive");
+        unsafe { assert_world_access_is_still_present(&attacker) };
+        drop(attacker);
+
+        assert!(open_private_file(&path, PrivateOpenMode::Truncate).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn windows_relative_reuse_refuses_permissive_child_with_security_only_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("private");
+        create_private_dir_all(&parent_path).unwrap();
+        let parent = super::windows_acl::open_directory_for_lease(&parent_path).unwrap();
+        let path = parent_path.join("journal");
+        fs::write(&path, b"must survive").unwrap();
+        let attacker = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        unsafe { set_world_access(&attacker, false) };
+
+        let error =
+            super::windows_acl::open_child_private(&parent, &path, PrivateOpenMode::Truncate)
+                .expect_err("relative reused child must verify its existing DACL");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"must survive");
+        unsafe { assert_world_access_is_still_present(&attacker) };
+    }
+
+    #[test]
+    fn windows_authority_reads_and_retains_reject_permissive_sensitive_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("private");
+        create_private_dir_all(&parent_path).unwrap();
+        let lease =
+            NamespaceLease::acquire(&parent_path, &parent_path.join("authority.lock")).unwrap();
+
+        for name in ["journal", "checkpoint", "registry"] {
+            let path = parent_path.join(name);
+            fs::write(&path, b"attacker-controlled").unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .access_mode(READ_CONTROL | WRITE_DAC)
+                .open(&path)
+                .unwrap();
+            unsafe { set_world_access(&file, false) };
+
+            assert_eq!(
+                lease.read_child(&path).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                lease.retain_child(&path).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"attacker-controlled");
+            unsafe { assert_world_access_is_still_present(&file) };
+        }
+    }
+
+    #[test]
+    fn windows_authority_reads_refuse_preheld_data_handles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("private");
+        create_private_dir_all(&parent_path).unwrap();
+        let lease =
+            NamespaceLease::acquire(&parent_path, &parent_path.join("authority.lock")).unwrap();
+        let path = parent_path.join("journal");
+        write_private_file(&path, b"exact-private").unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+
+        for error in [
+            lease.read_child(&path).unwrap_err(),
+            lease.retain_child(&path).unwrap_err(),
+        ] {
+            assert_eq!(
+                error.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION as i32),
+                "{error}"
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"exact-private");
+        drop(held);
+        assert_eq!(lease.read_child(&path).unwrap(), b"exact-private");
+        let retained = lease.retain_child(&path).unwrap();
+        retained.verify_current().unwrap();
+    }
+
+    #[test]
+    fn windows_checkpoint_generation_refuses_a_permissive_dacl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("private");
+        create_private_dir_all(&parent).unwrap();
+        let path = parent.join("scan.checkpoint");
+        write_private_file(&path, b"spending-key checkpoint").unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .open(&path)
+            .unwrap();
+        unsafe { set_world_access(&file, false) };
+
+        let error = crate::sprout_scan_run::checkpoint_generation(&path)
+            .expect_err("a permissive checkpoint must be rejected before its bytes are read");
+
+        assert!(
+            error.to_string().contains("opening checkpoint child"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"spending-key checkpoint");
+        unsafe { assert_world_access_is_still_present(&file) };
+    }
+
+    #[test]
+    fn windows_private_directory_authority_retains_no_delete_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sqlite-parent");
+        create_private_dir_all(&path).unwrap();
+        let authority = open_private_directory_lease(&path).unwrap();
+        open_private_directory_lease(&path).unwrap();
+        assert!(fs::rename(&path, tmp.path().join("replaced")).is_err());
+        drop(authority);
+    }
+
+    #[test]
+    fn windows_sqlite_preflight_refuses_a_preheld_data_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let private_root = tmp.path().join("workspace-private-root");
+        let parent_path = private_root.join("birthday-1/scope");
+        let path = parent_path.join("wallet.sqlite");
+        let root = ensure_private_workspace_lineage(&private_root, &parent_path, &path).unwrap();
+        forget_sqlite_authority_for_test(&path);
+        let held = OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        let parent = open_private_sqlite_parent(&parent_path).unwrap();
+
+        let error = ensure_private_sqlite_file(&root, &parent, &parent_path, &path)
+            .expect_err("a preheld data handle must block SQLite preflight");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32),
+            "{error}"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        drop(held);
+        ensure_private_sqlite_file(&root, &parent, &parent_path, &path).unwrap();
+    }
+
+    #[test]
+    fn windows_existing_private_root_reserves_pending_before_a_second_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let private_root = tmp.path().join("workspace-private-root");
+        let first_leaf = private_root.join("birthday-1/scope-a");
+        let first_database = first_leaf.join("wallet.sqlite");
+        ensure_private_workspace_lineage(&private_root, &first_leaf, &first_database).unwrap();
+
+        let second_leaf = private_root.join("birthday-2/scope-b");
+        let second_database = second_leaf.join("wallet.sqlite");
+        ensure_private_workspace_lineage(&private_root, &second_leaf, &second_database).unwrap();
+
+        assert!(first_database.is_file());
+        assert!(second_database.is_file());
+        let root = verify_private_workspace_lineage(&private_root).unwrap();
+        let parent = open_private_sqlite_parent(&second_leaf).unwrap();
+        ensure_private_sqlite_file(&root, &parent, &second_leaf, &second_database).unwrap();
+    }
+
+    #[test]
+    fn windows_lineage_decoder_refuses_plaintext_json() {
+        let error = decode_lineage_record::<PrivateRootLineageRecord>(
+            LineageRecordKind::PrivateRoot,
+            br#"{"schema_version":1}"#,
+        )
+        .expect_err("Windows lineage must never accept an unauthenticated JSON fallback");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn windows_lineage_mutex_uses_global_private_hashed_name() {
+        let plaintext = format!(
+            r"C:\Users\Argos\private-workspace\{}\mainnet",
+            uuid::Uuid::new_v4()
+        );
+        let context_hash = super::windows_lineage::context_hash(plaintext.as_bytes());
+        let name = super::windows_lineage::mutex_name(&context_hash);
+
+        assert!(name.starts_with("Global\\ArgosWalletRescue-Lineage-w-"));
+        assert!(!name.contains(&plaintext));
+        assert_eq!(
+            name.len(),
+            "Global\\ArgosWalletRescue-Lineage-w-".len() + 64
+        );
+
+        // Acquisition also verifies that an existing object has the exact
+        // protected current-user plus LocalSystem DACL before trusting it.
+        let _guard = super::windows_lineage::lock(&context_hash).unwrap();
+    }
+
+    #[test]
+    fn windows_reused_read_append_keeps_exclusive_handle_through_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("private");
+        create_private_dir_all(&parent_path).unwrap();
+        let path = parent_path.join("journal");
+        write_private_file(&path, b"before").unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+
+        let error = open_private_file(&path, PrivateOpenMode::ReadWriteAppend)
+            .expect_err("preheld data handle must block exact journal append");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+        drop(held);
+
+        let mut journal = open_private_file(&path, PrivateOpenMode::ReadWriteAppend).unwrap();
+        journal.write_all(b"-after").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        assert_eq!(fs::read(&path).unwrap(), b"before-after");
+    }
+
+    #[test]
+    fn windows_recursive_cleanup_refuses_permissive_nested_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("private");
+        let tombstone = parent_path.join("workspace.deleting");
+        create_private_dir_all(&tombstone).unwrap();
+        let child = tombstone.join("checkpoint");
+        write_private_file(&child, b"must survive").unwrap();
+        let child_handle = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .open(&child)
+            .unwrap();
+        unsafe { set_world_access(&child_handle, false) };
+        let parent = super::windows_acl::open_directory_for_lease(&parent_path).unwrap();
+        let tombstone_handle =
+            super::windows_acl::open_child_directory_for_mutation(&parent, &tombstone).unwrap();
+
+        let error = super::windows_acl::remove_open_directory_contents(&tombstone_handle)
+            .expect_err("permissive nested child must stop recursive cleanup");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&child).unwrap(), b"must survive");
+        unsafe { assert_world_access_is_still_present(&child_handle) };
+        assert!(tombstone.exists());
+    }
+
+    #[test]
+    fn windows_reuse_refuses_permissive_directory_with_security_only_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("preopened-directory");
+        fs::create_dir(&path).unwrap();
+        let attacker = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&path)
+            .unwrap();
+        unsafe { set_world_access(&attacker, true) };
+
+        let error = create_private_dir_all(&path)
+            .expect_err("a permissive reused directory must fail without DACL repair");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        unsafe { assert_world_access_is_still_present(&attacker) };
+        drop(attacker);
+
+        assert!(create_private_dir_all(&path).is_err());
+    }
+
+    #[test]
+    fn windows_reused_permissive_objects_fail_closed_without_repair() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("private");
         fs::create_dir(&dir).unwrap();
@@ -4132,23 +8192,22 @@ mod windows_tests {
         unsafe { set_world_access(&permissive, false) };
         drop(permissive);
 
-        create_private_dir_all(&dir).unwrap();
-        drop(open_private_file(&path, PrivateOpenMode::Append).unwrap());
+        let directory_error =
+            create_private_dir_all(&dir).expect_err("permissive reused directory must fail closed");
+        let file_error = open_private_file(&path, PrivateOpenMode::Append)
+            .expect_err("permissive reused file must fail closed");
 
-        let directory = OpenOptions::new()
-            .read(true)
-            .access_mode(READ_CONTROL | WRITE_DAC)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&dir)
-            .unwrap();
-        let file = OpenOptions::new()
-            .read(true)
-            .access_mode(FILE_GENERIC_READ | READ_CONTROL | WRITE_DAC)
-            .open(&path)
-            .unwrap();
+        assert_eq!(directory_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(file_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
         unsafe {
-            assert_private_acl(&directory, true);
-            assert_private_acl(&file, false);
+            assert_world_access_is_still_present(&directory);
+            let file = OpenOptions::new()
+                .read(true)
+                .access_mode(READ_CONTROL)
+                .open(&path)
+                .unwrap();
+            assert_world_access_is_still_present(&file);
         }
     }
 
@@ -4157,6 +8216,13 @@ mod windows_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("new-private");
         create_private_dir_all(&dir).unwrap();
+        let directory = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir)
+            .unwrap();
+        unsafe { assert_private_acl(&directory, true) };
         let path = dir.join("checkpoint.tmp");
         let mut file = super::windows_acl::create_file_with_observer(
             &path,
@@ -4276,6 +8342,26 @@ mod windows_tests {
 
         assert!(!renamed.exists());
         assert!(!detached.exists());
+    }
+
+    #[test]
+    fn windows_namespace_append_create_and_reuse_keep_retained_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("private");
+        create_private_dir_all(&parent).unwrap();
+        let child = parent.join("journal");
+        let lease = NamespaceLease::acquire(&parent, &parent.join("journal.lock")).unwrap();
+
+        lease
+            .append_child_if_unchanged(&child, None, b"created")
+            .unwrap();
+        let (bytes, id) = lease.read_child_version(&child).unwrap();
+        assert_eq!(bytes, b"created");
+        lease
+            .append_child_if_unchanged(&child, Some((&id, &bytes)), b"-reused")
+            .unwrap();
+
+        assert_eq!(lease.read_child(&child).unwrap(), b"created-reused");
     }
 
     #[test]
@@ -4498,7 +8584,9 @@ mod windows_tests {
             .unwrap();
         unsafe { set_world_access(&file, false) };
         assert!(super::windows_acl::verify_current(&file, false).is_err());
-        harden_private_file(&file).unwrap();
-        super::windows_acl::verify_current(&file, false).unwrap();
+        let error = harden_private_file(&file)
+            .expect_err("verification must not repair a broad reused DACL");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        unsafe { assert_world_access_is_still_present(&file) };
     }
 }

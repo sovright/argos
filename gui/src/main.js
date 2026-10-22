@@ -460,10 +460,9 @@ function clearTransientSecrets({ abandonWallet = false } = {}) {
 }
 
 function abandonRecoveryFlow() {
-  const handle = state.scanHandle;
-  if (handle && !state.sweepExecutionPending) {
-    invoke("cancel_scan", { handle }).catch(() => {});
-  }
+  // `invalidateScanAuthority` releases every backend session after first
+  // invalidating late replies locally. Release waits for an active worker to
+  // stop before the backend drops its final key owner.
   invalidateScanAuthority();
   ++resumeGeneration;
   pendingResumeRow = null;
@@ -2639,8 +2638,8 @@ go back and provide one.",
     }
     if (generation !== state.scanAuthorityGeneration) {
       // The backend may have started scan A after its form was edited into B.
-      // It is no longer UI authority; ask it to stop without disturbing B.
-      invoke("cancel_scan", { handle }).catch(() => {});
+      // It is no longer UI authority; release it without disturbing B.
+      invoke("release_scan", { handle }).catch(() => {});
       if (matched && state.matchedRecovery === matched &&
           state.addressMatchRecoveryStartGeneration === generation) {
         state.addressMatchRecoveryLocked = false;
@@ -2977,6 +2976,8 @@ function canReturnToAddressMatches(progress, retainedSearchId) {
 function returnToAddressMatches() {
   const searchId = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
   if (!searchId) return;
+  const handle = state.scanHandle;
+  if (handle) invoke("release_scan", { handle }).catch(() => {});
   cleanupListeners();
   clearMatchedRecoveryUi();
   state.scanHandle = null;
@@ -3024,9 +3025,7 @@ function appendCell(tr, text) {
 }
 
 $("back-to-config").addEventListener("click", () => {
-  cleanupListeners();
-  invalidateSweepReview();
-  state.scanHandle = null;
+  invalidateScanAuthority();
   $("back-to-config").style.display = "none";
   $("start-scan").disabled = false;
   goTo("config");
@@ -3049,9 +3048,16 @@ $("cancel-scan").addEventListener("click", async () => {
 
 function invalidateScanAuthority() {
   state.scanAuthorityGeneration += 1;
+  const handles = [state.scanHandle, state.completedScanHandle]
+    .filter((handle, index, all) => handle &&
+      all.findIndex((candidate) => candidate?.id === handle.id) === index);
+  for (const handle of handles) {
+    invoke("release_scan", { handle }).catch(() => {});
+  }
   cleanupListeners();
   invalidateSweepReview();
   state.scanHandle = null;
+  state.completedScanHandle = null;
   state.lastProgress = null;
   state.scanConfig = null;
   state.savedReportPath = null;
@@ -4272,8 +4278,34 @@ function buildSessionRow(row, onDismiss) {
   const info = document.createElement("div");
   const labelEl = document.createElement("div");
   labelEl.className = "session-label";
-  labelEl.textContent = row.label || "(unlabeled scan)";
+  labelEl.textContent = row.legacy_untrusted || row.requires_rescan
+    ? "Legacy workspace — rescan required"
+    : row.label || "(unlabeled scan)";
   info.appendChild(labelEl);
+
+  if (row.legacy_untrusted || row.requires_rescan) {
+    const guidance = document.createElement("div");
+    guidance.className = "session-meta";
+    guidance.textContent =
+      "This workspace is preserved, but it predates private-storage lineage and cannot be safely resumed. " +
+      "Archive it while Argos is stopped, then start a new recovery and rescan.";
+    info.appendChild(guidance);
+    li.appendChild(info);
+
+    const actions = document.createElement("div");
+    actions.className = "session-actions";
+    const dismissBtn = document.createElement("button");
+    dismissBtn.className = "ghost";
+    dismissBtn.textContent = "Dismiss";
+    dismissBtn.title = "Dismiss from list";
+    dismissBtn.addEventListener("click", () => {
+      dismissSession(row.workspace_path, null);
+      onDismiss();
+    });
+    actions.appendChild(dismissBtn);
+    li.appendChild(actions);
+    return li;
+  }
 
   const synced = row.synced_to_height
     ? Number(row.synced_to_height).toLocaleString()
@@ -4480,7 +4512,7 @@ $("resume-confirm").addEventListener("click", async () => {
       },
     });
     if (!isCurrent()) {
-      await invoke("cancel_scan", { handle: resumed.handle }).catch(() => {});
+      await invoke("release_scan", { handle: resumed.handle }).catch(() => {});
       return;
     }
     resetRecoveryFlowState({ destination, memo, maxFeeZec });

@@ -94,7 +94,27 @@ test("abandoning a flow revokes every reviewed source and clears address-search 
   assert.ok(h.calls.includes("wallet-review"));
   assert.ok(h.calls.includes("sprout-source"));
   assert.ok(h.calls.includes("scan-authority"));
-  assert.ok(h.calls.some((entry) => Array.isArray(entry) && entry[0] === "cancel_scan"));
+});
+
+test("every scan-authority invalidation releases the backend secret owner", () => {
+  assert.match(
+    functionSource("invalidateScanAuthority"),
+    /invoke\("release_scan", \{ handle \}\)/,
+  );
+});
+
+test("orphaned start and resume replies release their backend sessions", () => {
+  const staleStartAt = source.indexOf("The backend may have started scan A");
+  const staleStart = source.slice(
+    staleStartAt,
+    source.indexOf("return;", staleStartAt),
+  );
+  assert.match(staleStart, /invoke\("release_scan", \{ handle \}\)/);
+  const staleResume = source.slice(
+    source.indexOf("if (!isCurrent())", source.indexOf('await invoke("resume_session"')),
+    source.indexOf("resetRecoveryFlowState", source.indexOf('await invoke("resume_session"')),
+  );
+  assert.match(staleResume, /invoke\("release_scan", \{ handle: resumed\.handle \}\)/);
 });
 
 for (const [edge, pattern] of [

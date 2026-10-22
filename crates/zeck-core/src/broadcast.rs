@@ -1868,7 +1868,7 @@ mod tests {
         drop(old);
         let source = fs::read(&old_path).unwrap();
         let first_line_end = source.iter().position(|byte| *byte == b'\n').unwrap() + 1;
-        fs::write(&registry_path, &source[..first_line_end]).unwrap();
+        crate::private_fs::write_private_file(&registry_path, &source[..first_line_end]).unwrap();
 
         let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
         registry.import_legacy_log(&old_path).unwrap();

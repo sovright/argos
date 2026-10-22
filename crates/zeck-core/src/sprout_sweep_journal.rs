@@ -1954,13 +1954,17 @@ mod tests {
         SweepJournal::for_keys(dir, &[[0x42; 32]], ZeckNetwork::Mainnet)
     }
 
+    fn write_private_fixture(path: &Path, bytes: impl AsRef<[u8]>) {
+        crate::private_fs::write_private_file(path, bytes.as_ref()).unwrap();
+    }
+
     fn legacy_line(sweep_txid: &str) -> String {
         format!("{}:3:1 {sweep_txid}\n", "42".repeat(32))
     }
 
     fn checkpoint_generation(dir: &Path, label: &[u8]) -> CheckpointGeneration {
         let path = dir.join("scan.checkpoint");
-        std::fs::write(&path, label).unwrap();
+        crate::private_fs::write_private_file(&path, label).unwrap();
         crate::sprout_scan_run::checkpoint_generation(&path).unwrap()
     }
 
@@ -2089,7 +2093,7 @@ mod tests {
 
         let path = dir.path().join("scan.checkpoint");
         let replacement = dir.path().join("replacement");
-        std::fs::write(&replacement, b"checkpoint-a").unwrap();
+        crate::private_fs::write_private_file(&replacement, b"checkpoint-a").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         let replaced = crate::sprout_scan_run::checkpoint_generation(&path).unwrap();
         assert_ne!(generation, replaced);
@@ -2256,7 +2260,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let transaction = fixture();
-        std::fs::write(journal.path(), legacy_line(&transaction.txid.to_string())).unwrap();
+        crate::private_fs::write_private_file(
+            journal.path(),
+            legacy_line(&transaction.txid.to_string()).as_bytes(),
+        )
+        .unwrap();
         let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
         let mut snapshot = journal.load_or_migrate().unwrap();
         journal
@@ -2615,7 +2623,7 @@ mod tests {
     fn cleanup_restart_after_unlink_commits_an_idempotent_tombstone() {
         let dir = tempfile::tempdir().unwrap();
         let checkpoint = dir.path().join("scan.checkpoint");
-        std::fs::write(&checkpoint, b"checkpoint-a").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
         let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         let journal = journal(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
@@ -2675,7 +2683,7 @@ mod tests {
     fn cleanup_restart_completes_old_generation_without_deleting_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let checkpoint = dir.path().join("scan.checkpoint");
-        std::fs::write(&checkpoint, b"checkpoint-a").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
         let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         let journal = journal(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
@@ -2709,7 +2717,8 @@ mod tests {
                 },
             )
             .unwrap();
-        std::fs::write(&checkpoint, b"replacement checkpoint source").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"replacement checkpoint source")
+            .unwrap();
         let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
 
         let result = journal
@@ -2740,7 +2749,7 @@ mod tests {
     fn a_post_cleanup_reorg_never_makes_the_discarded_source_ready() {
         let dir = tempfile::tempdir().unwrap();
         let checkpoint = dir.path().join("scan.checkpoint");
-        std::fs::write(&checkpoint, b"checkpoint-a").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
         let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         let journal = journal(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
@@ -2802,7 +2811,7 @@ mod tests {
             .unwrap();
         assert!(!snapshot.ready_for_new_plan(&outpoint()));
 
-        std::fs::write(&checkpoint, b"restored checkpoint source").unwrap();
+        crate::private_fs::write_private_file(&checkpoint, b"restored checkpoint source").unwrap();
         let restored_generation =
             crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         journal
@@ -3002,7 +3011,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let txid = fixture().txid;
-        std::fs::write(journal.path(), legacy_line(&txid.to_string())).unwrap();
+        write_private_fixture(journal.path(), legacy_line(&txid.to_string()));
         let snapshot = journal.load_or_migrate().unwrap();
         let entry = snapshot.entry_for_note(&outpoint()).unwrap();
         assert_eq!(entry.legacy_txid, Some(txid));
@@ -3064,7 +3073,7 @@ mod tests {
     fn v1_accepted_entry_waits_for_a_conservative_expiry_horizon() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        std::fs::write(journal.path(), legacy_line(&fixture().txid.to_string())).unwrap();
+        write_private_fixture(journal.path(), legacy_line(&fixture().txid.to_string()));
         let snapshot = journal.load_or_migrate().unwrap();
         let entry = snapshot.entry_for_note(&outpoint()).unwrap();
         assert_eq!(entry.state, TxLifecycleState::SubmissionUnknown);
@@ -3078,10 +3087,10 @@ mod tests {
         let journal = journal(dir.path());
         let txid = fixture().txid.to_string();
         let line = legacy_line(&txid);
-        std::fs::write(journal.path(), format!("{line}{line}")).unwrap();
+        write_private_fixture(journal.path(), format!("{line}{line}"));
         assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 1);
         let conflict = TxId::from_bytes([0x55; 32]).to_string();
-        std::fs::write(journal.path(), format!("{line}{}", legacy_line(&conflict))).unwrap();
+        write_private_fixture(journal.path(), format!("{line}{}", legacy_line(&conflict)));
         assert!(journal.load_or_migrate().is_err());
     }
 
@@ -3094,7 +3103,7 @@ mod tests {
             legacy_line(&fixture().txid.to_string()),
             legacy_line(&TxId::from_bytes([0x55; 32]).to_string())
         );
-        std::fs::write(journal.path(), &original).unwrap();
+        write_private_fixture(journal.path(), &original);
         assert!(journal.load_or_migrate().is_err());
         assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), original);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
@@ -3102,40 +3111,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn v1_migration_hardens_a_world_readable_file_before_append_only_upgrade() {
+    fn v1_migration_rejects_a_world_readable_file_without_repairing_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        std::fs::write(journal.path(), legacy_line(&fixture().txid.to_string())).unwrap();
+        let original = legacy_line(&fixture().txid.to_string());
+        write_private_fixture(journal.path(), &original);
         std::fs::set_permissions(journal.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
-        journal.load_or_migrate().unwrap();
+        let original_id =
+            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
+                .unwrap();
+        let error = journal.load_or_migrate().unwrap_err().to_string();
+        assert!(error.contains("mode 600"), "{error}");
+        assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), original);
+        assert_eq!(
+            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
+                .unwrap(),
+            original_id
+        );
         let mode = std::fs::metadata(journal.path())
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
-        let authority_path = std::path::PathBuf::from(format!("{}.lock", journal.path().display()));
-        let authority_mode = std::fs::metadata(authority_path)
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(authority_mode & 0o777, 0o600);
-        let lock_path =
-            std::path::PathBuf::from(format!("{}.lock.sqlite", journal.path().display()));
-        let lock_mode = std::fs::metadata(lock_path).unwrap().permissions().mode();
-        assert_eq!(lock_mode & 0o777, 0o600);
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]
     fn malformed_complete_line_blocks_broadcast() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        std::fs::write(
+        write_private_fixture(
             journal.path(),
             format!("{}not a record\n", legacy_line(&fixture().txid.to_string())),
-        )
-        .unwrap();
+        );
         assert!(journal.load_or_migrate().is_err());
     }
 
@@ -3324,9 +3332,10 @@ mod tests {
         use std::sync::mpsc;
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        std::fs::write(journal.path(), legacy_line(&fixture().txid.to_string())).unwrap();
+        write_private_fixture(journal.path(), legacy_line(&fixture().txid.to_string()));
         let lock_path =
             std::path::PathBuf::from(format!("{}.lock.sqlite", journal.path().display()));
+        crate::private_fs::write_private_file(&lock_path, b"").unwrap();
         let connection = rusqlite::Connection::open(&lock_path).unwrap();
         connection
             .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
@@ -3468,7 +3477,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let txid = fixture().txid;
-        std::fs::write(journal.path(), legacy_line(&txid.to_string())).unwrap();
+        write_private_fixture(journal.path(), legacy_line(&txid.to_string()));
         let mut snapshot = journal.load_or_migrate().unwrap();
         assert!(journal
             .append_legacy_expiry_bound(&mut snapshot, txid, 100, 101)
@@ -3491,7 +3500,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let original = legacy_line(&fixture().txid.to_string());
-        std::fs::write(journal.path(), &original).unwrap();
+        write_private_fixture(journal.path(), &original);
         let original_id =
             crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
                 .unwrap();

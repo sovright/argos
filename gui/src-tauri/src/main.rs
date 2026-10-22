@@ -46,6 +46,7 @@ fn main() {
             commands::start_scan_from_wallet_file,
             commands::get_scan_progress,
             commands::cancel_scan,
+            commands::release_scan,
             commands::reconcile_sweep,
             commands::retry_unknown_sweep,
             commands::propose_sweep,

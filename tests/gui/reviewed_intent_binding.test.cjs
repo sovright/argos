@@ -265,7 +265,8 @@ function flowHarness() {
     return elements.get(id);
   };
   const state = {
-    scanHandle: { id: "scan-old" }, scanAuthorityGeneration: 0,
+    scanHandle: { id: "scan-old" }, completedScanHandle: { id: "scan-old" },
+    scanAuthorityGeneration: 0,
     lastProgress: { phase: "complete" },
     sweepReview: review("old"), proposalGeneration: 4, proposalPending: false,
     sweepExecutionPending: false, destination: "zs-old", memo: "old memo",
@@ -437,6 +438,7 @@ test("source setting edits invalidate completed scan authority", () => {
     loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
     h.$(id).fire("input");
     assert.equal(h.state.scanHandle, null, `${id} retained the scan handle`);
+    assert.equal(h.state.completedScanHandle, null, `${id} retained the completed scan handle`);
     assert.equal(h.state.lastProgress, null, `${id} retained progress`);
     assert.equal(h.state.sweepReview, null, `${id} retained sweep review`);
     assert.equal(h.$("review-sweep").disabled, true, `${id} left review available`);
@@ -534,7 +536,7 @@ test("a start response after a source edit cannot install its old handle", async
     commands.push({ command, args });
     if (command === "validate_address") return { destination_ok: true };
     if (command === "start_scan") return oldStart.promise;
-    if (command === "cancel_scan") return null;
+    if (command === "release_scan") return null;
     throw new Error(`unexpected ${command}`);
   };
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
@@ -551,7 +553,8 @@ test("a start response after a source edit cannot install its old handle", async
   assert.equal(h.context.seedInput.value, "seed B");
   assert.equal(scanViews, 0);
   assert.equal(listeners, 0);
-  assert.equal(commands.filter((call) => call.command === "cancel_scan").length, 1);
+  assert.deepEqual(commands.filter((call) => call.command === "release_scan")
+    .map((call) => call.args.handle.id), ["scan-old", "scan-A"]);
 });
 
 test("a stale matched-start failure releases its address-search lock", async () => {
@@ -718,7 +721,7 @@ for (const outcome of ["resolved", "rejected"]) {
     assert.equal(h.state.scanHandle.id, "scan-old");
     assert.equal(h.$("resume-modal").hidden, true);
     assert.doesNotMatch(h.$("resume-modal-status").textContent, /stale failure/);
-    assert.equal(h.calls.filter((call) => call.command === "cancel_scan").length,
+    assert.equal(h.calls.filter((call) => call.command === "release_scan").length,
       outcome === "resolved" ? 1 : 0);
   });
 }
@@ -732,7 +735,7 @@ test("a newer resume keeps its handle when an older resume finishes later", asyn
     h.calls.push({ command, args });
     if (command === "validate_address") return { destination_ok: true };
     if (command === "resume_session") return ++attempts === 1 ? older.promise : newer.promise;
-    if (command === "cancel_scan" || command === "get_scan_progress") return null;
+    if (command === "release_scan" || command === "get_scan_progress") return null;
     throw new Error(`unexpected ${command}`);
   };
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
@@ -760,8 +763,8 @@ test("a newer resume keeps its handle when an older resume finishes later", asyn
   await first;
   assert.equal(h.state.scanHandle.id, "newer");
   assert.equal(h.state.scanConfig.data_dir, "/newer");
-  assert.deepEqual(h.calls.filter((call) => call.command === "cancel_scan")
-    .map((call) => call.args.handle.id), ["older"]);
+  assert.deepEqual(h.calls.filter((call) => call.command === "release_scan")
+    .map((call) => call.args.handle.id), ["scan-old", "older"]);
 });
 
 test("start over still drops the loaded wallet", () => {

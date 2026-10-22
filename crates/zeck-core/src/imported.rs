@@ -12,7 +12,7 @@
 //! is account-id driven and accepts raw per-pool keys, which is what makes
 //! this work at all; see `docs/` for the full argument.
 
-use argos_wallet_import::ImportedKeys;
+use argos_wallet_import::{ImportedKeys, SecretBytes};
 use rand_core::OsRng;
 use secrecy::ExposeSecret;
 use zcash_address::unified::{Encoding, Fvk, Ufvk};
@@ -49,6 +49,71 @@ pub fn parse_sapling_extsk(bytes: &[u8]) -> ZeckResult<ExtendedSpendingKey> {
     }
     ExtendedSpendingKey::from_bytes(bytes)
         .map_err(|err| ZeckError::Import(format!("malformed Sapling spending key: {err:?}")))
+}
+
+/// Long-lived ownership for a serialized imported Sapling spending key.
+///
+/// `sapling-crypto` 0.7's parsed [`ExtendedSpendingKey`] has no zeroizing
+/// destructor. Keeping the serialized form in [`SecretBytes`] ensures that
+/// the retained owner is scrubbed on drop and confines parsed values to the
+/// smallest callback scope supported by the upstream API. The callback's
+/// parsed value remains subject to that upstream version's limitation.
+pub struct ImportedSaplingSpendingKey {
+    serialized: Option<SecretBytes>,
+    #[cfg(test)]
+    drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl zeroize::ZeroizeOnDrop for ImportedSaplingSpendingKey {}
+
+impl Drop for ImportedSaplingSpendingKey {
+    fn drop(&mut self) {
+        // Take and drop the zeroizing owner before publishing the test-only
+        // release signal. This lets tests distinguish releasing this retained
+        // owner from wiping the parser-owned source buffer.
+        drop(self.serialized.take());
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl ImportedSaplingSpendingKey {
+    /// Validate and take a separate zeroizing copy of a serialized key.
+    pub fn from_serialized(bytes: &[u8]) -> ZeckResult<Self> {
+        // Validate before retaining a second owner. The parsed validation
+        // value is intentionally short-lived; sapling-crypto 0.7 does not
+        // expose a sound way to scrub its opaque representation.
+        parse_sapling_extsk(bytes)?;
+        Ok(Self {
+            serialized: Some(SecretBytes::new(bytes.to_vec())),
+            #[cfg(test)]
+            drop_probe: None,
+        })
+    }
+
+    /// Parse only for the duration of `f`; never expose a parsed key that a
+    /// caller could retain for the lifetime of a scan or sweep.
+    pub(crate) fn with_parsed<T>(
+        &self,
+        f: impl FnOnce(&ExtendedSpendingKey) -> ZeckResult<T>,
+    ) -> ZeckResult<T> {
+        let serialized = self.serialized.as_ref().ok_or_else(|| {
+            ZeckError::Internal("imported Sapling key owner was already released".to_owned())
+        })?;
+        let parsed = parse_sapling_extsk(serialized.as_slice())?;
+        f(&parsed)
+    }
+
+    pub(crate) fn full_viewing_key_identity(&self) -> ZeckResult<[u8; 128]> {
+        self.with_parsed(|key| Ok(key.to_diversifiable_full_viewing_key().to_bytes()))
+    }
+
+    #[cfg(test)]
+    fn set_drop_probe(&mut self, probe: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.drop_probe = Some(probe);
+    }
 }
 
 /// Build a Sapling-only unified full viewing key for an imported key.
@@ -122,8 +187,77 @@ const NO_ORCHARD: &str = "n/a (imported wallet has no Orchard key)";
 /// lightwalletd is queried by address, and the builder signs by key, so
 /// every step needs both halves together.
 pub struct ImportedTransparentKey {
-    pub secret: secp256k1::SecretKey,
+    secret: ImportedTransparentSecret,
     pub address: TransparentAddress,
+}
+
+/// Non-cloneable owner for a parsed transparent spending key.
+struct ImportedTransparentSecret {
+    key: secp256k1::SecretKey,
+    #[cfg(test)]
+    drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for ImportedTransparentSecret {
+    fn drop(&mut self) {
+        self.key.non_secure_erase();
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            // rust-secp256k1 deliberately overwrites a SecretKey with the
+            // valid scalar [1; 32], rather than an invalid all-zero scalar.
+            debug_assert_eq!(self.key.as_ref(), &[1; 32]);
+            probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl ImportedTransparentKey {
+    pub(crate) fn new(secret: &mut secp256k1::SecretKey, address: TransparentAddress) -> Self {
+        let owner = Self {
+            secret: ImportedTransparentSecret {
+                key: *secret,
+                #[cfg(test)]
+                drop_probe: None,
+            },
+            address,
+        };
+        // The upstream type is Copy, so moving it cannot transfer unique
+        // ownership. Scrub the parsed caller local after making the single
+        // retained application-owned copy.
+        secret.non_secure_erase();
+        owner
+    }
+
+    /// Borrow the sole retained parsed owner for public-key derivation.
+    pub fn secret_key(&self) -> &secp256k1::SecretKey {
+        &self.secret.key
+    }
+
+    /// Make the copy required by upstream's by-value transparent signer.
+    ///
+    /// `TransparentSigningSet` owns this copy and does not expose a way to
+    /// scrub it in the currently pinned release. Keep the signing set scoped
+    /// to one transaction build.
+    pub(crate) fn signing_key_copy(&self) -> secp256k1::SecretKey {
+        self.secret.key
+    }
+
+    #[cfg(test)]
+    fn with_drop_probe(
+        secret: &mut secp256k1::SecretKey,
+        address: TransparentAddress,
+        probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let owner = Self {
+            secret: ImportedTransparentSecret {
+                key: *secret,
+                drop_probe: Some(probe),
+            },
+            address,
+        };
+        secret.non_secure_erase();
+        owner
+    }
 }
 
 impl std::fmt::Debug for ImportedTransparentKey {
@@ -147,13 +281,13 @@ pub fn imported_transparent_keys(keys: &ImportedKeys) -> ZeckResult<Vec<Imported
     keys.transparent
         .iter()
         .map(|key| {
-            let secret = secp256k1::SecretKey::from_slice(key.secret.expose_secret())
+            let mut secret = secp256k1::SecretKey::from_slice(key.secret.expose_secret())
                 .map_err(|err| ZeckError::Import(format!("malformed transparent key: {err}")))?;
             let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
-            Ok(ImportedTransparentKey {
-                secret,
-                address: TransparentAddress::from_pubkey(&pubkey),
-            })
+            Ok(ImportedTransparentKey::new(
+                &mut secret,
+                TransparentAddress::from_pubkey(&pubkey),
+            ))
         })
         .collect()
 }
@@ -179,7 +313,7 @@ pub struct ImportedWalletAccount {
     pub wallet_account_id: AccountUuid,
     /// `None` for the account that exists solely to anchor transparent
     /// keys (see `register_imported_accounts`).
-    pub sapling_extsk: Option<ExtendedSpendingKey>,
+    pub sapling_extsk: Option<ImportedSaplingSpendingKey>,
     pub transparent_addresses: Vec<TransparentAddress>,
 }
 
@@ -231,8 +365,8 @@ pub fn register_imported_accounts(
 
     let mut accounts = Vec::with_capacity(keys.sapling.len());
     for (index, key) in keys.sapling.iter().enumerate() {
-        let extsk = parse_sapling_extsk(key.extsk.expose_secret())?;
-        let ufvk = sapling_ufvk(&extsk)?;
+        let extsk = ImportedSaplingSpendingKey::from_serialized(key.extsk.expose_secret())?;
+        let ufvk = extsk.with_parsed(sapling_ufvk)?;
 
         let wallet_account_id = match wallet_db
             .get_account_for_ufvk(&ufvk)
@@ -275,7 +409,7 @@ pub fn register_imported_accounts(
         .map_err(|err| ZeckError::Wallet(format!("loading transparent receivers: {err}")))?;
 
     for imported in imported_transparent_keys(keys)? {
-        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &imported.secret);
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, imported.secret_key());
         let address = imported.address;
 
         if !existing.contains_key(&address) {
@@ -294,6 +428,61 @@ pub fn register_imported_accounts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_key_owners_have_bounded_zeroizing_lifetimes() {
+        use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<ImportedSaplingSpendingKey>();
+        assert!(std::mem::needs_drop::<ImportedSaplingSpendingKey>());
+        assert!(std::mem::needs_drop::<ImportedTransparentKey>());
+
+        let parsed = fixture_sapling_extsk();
+        let mut original = Zeroizing::new(parsed.to_bytes());
+        let mut retained = ImportedSaplingSpendingKey::from_serialized(original.as_slice())
+            .expect("serialized fixture key");
+        let retained_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        retained.set_drop_probe(std::sync::Arc::clone(&retained_released));
+
+        // Wiping the parser-owned buffer must not invalidate the separately
+        // owned sweep key. This distinguishes the two zeroizing owners.
+        original.zeroize();
+        assert_eq!(&*original, &[0; EXTSK_LEN]);
+        assert!(!retained_released.load(std::sync::atomic::Ordering::SeqCst));
+        retained
+            .with_parsed(|key| {
+                assert_eq!(key.to_bytes(), parsed.to_bytes());
+                Ok(())
+            })
+            .expect("retained owner still parses");
+        drop(retained);
+        assert!(retained_released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn transparent_owner_erases_its_parsed_key_on_drop() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let mut secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).expect("valid fixture key");
+        let address = TransparentAddress::from_pubkey(&secp256k1::PublicKey::from_secret_key(
+            &secp256k1::Secp256k1::signing_only(),
+            &secret,
+        ));
+        let probe = Arc::new(AtomicBool::new(false));
+        let owner =
+            ImportedTransparentKey::with_drop_probe(&mut secret, address, Arc::clone(&probe));
+        assert_eq!(
+            secret.as_ref(),
+            &[1; 32],
+            "constructor must scrub caller local"
+        );
+        drop(owner);
+        assert!(probe.load(Ordering::SeqCst));
+    }
 
     /// A real Sapling key, recovered by our own parser from a wallet file a
     /// real zcashd wrote.
@@ -517,7 +706,11 @@ mod db_tests {
     /// point: an imported wallet has none, and `init_wallet_db` must
     /// accept that for any of this to be reachable in production.
     fn seedless_wallet_db(dir: &std::path::Path) -> ArgosWalletDb {
-        let path = dir.join("wallet.sqlite");
+        let private_root = dir.join("private-wallet");
+        let leaf = private_root.join("birthday-test/scope-test");
+        let path = leaf.join("wallet.sqlite");
+        crate::private_fs::ensure_private_workspace_lineage(&private_root, &leaf, &path)
+            .expect("private wallet lineage");
         let mut db = open_wallet_db(&path, consensus_network(ZeckNetwork::Mainnet))
             .expect("wallet db should open");
         init_wallet_db(&mut db, None).expect("a seedless wallet db must initialize");

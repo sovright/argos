@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use rusqlite::Connection;
 use secrecy::{ExposeSecret, SecretString};
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -1019,6 +1018,12 @@ where
 {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    crate::private_fs::cleanup_stale_ephemeral_probes(&std::env::temp_dir()).map_err(|err| {
+        ZeckError::Storage(format!(
+            "finishing an authenticated stale birthday probe cleanup: {err}"
+        ))
+    })?;
+
     on_progress("Connecting to lightwalletd…");
     let (mut client, primary_endpoint, chain_info) =
         probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
@@ -1092,8 +1097,7 @@ where
             network,
             probe_height,
         )
-        .await
-        .unwrap_or(false);
+        .await?;
 
         if found {
             // Set birthday to the PREVIOUS probe year so we don't miss any
@@ -1250,20 +1254,87 @@ struct ShieldedProbeKeys<'a> {
     sapling_floor: u32,
 }
 
-/// RAII guard that removes a probe's temporary directory on drop.
+#[derive(Debug)]
+struct ProbeWorkspaceAuthority {
+    private_root: std::path::PathBuf,
+    root: std::path::PathBuf,
+    database: std::path::PathBuf,
+}
+
+/// RAII guard that retires a probe's private authority before removing its
+/// temporary directory.
 ///
 /// The probe workspace imports a viewing key into a throwaway `wallet.sqlite`.
-/// Without this guard the directory would only be cleaned up on the success
-/// path, leaving the viewing-key-bearing database behind on any early `?`
-/// return, panic, or unwind. Cleanup is best-effort: errors are ignored
-/// because there is no meaningful recovery while tearing down a probe.
+/// Cleanup pins and removes the exact private root, durably syncs that removal,
+/// and only then retires its per-probe Windows authority. The outer UUID
+/// container is removed only after the secret-bearing root is gone.
 struct ProbeDirGuard {
     path: std::path::PathBuf,
+    workspace: Option<ProbeWorkspaceAuthority>,
+    registration: Option<crate::private_fs::EphemeralProbeRegistration>,
+    authority_retired: bool,
+    cleaned: bool,
+}
+
+impl ProbeDirGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            workspace: None,
+            registration: None,
+            authority_retired: false,
+            cleaned: false,
+        }
+    }
+
+    fn arm(&mut self, workspace: &RecoveryWorkspace) {
+        self.workspace = Some(ProbeWorkspaceAuthority {
+            private_root: workspace.private_root().to_owned(),
+            root: workspace.root().to_owned(),
+            database: workspace.wallet_db_path().to_owned(),
+        });
+    }
+
+    fn register(&mut self, registration: crate::private_fs::EphemeralProbeRegistration) {
+        self.registration = Some(registration);
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if !self.authority_retired {
+            if let Some(workspace) = self.workspace.as_ref() {
+                let registration = self.registration.take().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "ephemeral probe cleanup has no live registration",
+                    )
+                })?;
+                crate::private_fs::begin_ephemeral_probe_cleanup(
+                    registration,
+                    &workspace.private_root,
+                    &workspace.root,
+                    &workspace.database,
+                )?
+                .remove_exact_private_root_and_retire()?;
+            }
+            self.authority_retired = true;
+        }
+
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.cleaned = true;
+        Ok(())
+    }
 }
 
 impl Drop for ProbeDirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = self.cleanup();
     }
 }
 
@@ -1285,9 +1356,7 @@ async fn probe_shielded_window(
     let probe_dir = std::env::temp_dir().join(format!("zeck_probe_{}", Uuid::new_v4()));
     // Guard ensures the probe directory (and its viewing-key-bearing wallet DB)
     // is removed on every exit path, not just the success path below.
-    let _probe_dir_guard = ProbeDirGuard {
-        path: probe_dir.clone(),
-    };
+    let mut probe_dir_guard = ProbeDirGuard::new(probe_dir.clone());
     let effective_height = probe_height.max(sapling_floor.saturating_add(1));
 
     let probe_config = RuntimeScanConfig {
@@ -1306,55 +1375,93 @@ async fn probe_shielded_window(
     };
 
     let workspace = RecoveryWorkspace::from_runtime(&probe_config)?;
-    workspace.initialize(network, seed)?;
+    probe_dir_guard.arm(&workspace);
+    let registration = match crate::private_fs::prepare_ephemeral_probe_workspace(
+        workspace.private_root(),
+        workspace.root(),
+        workspace.wallet_db_path(),
+    ) {
+        Ok(registration) => registration,
+        Err(err) => {
+            let primary = ZeckError::Storage(format!(
+                "preparing authenticated birthday probe workspace {}: {err}",
+                workspace.root().display()
+            ));
+            return finish_probe_cleanup(Err(primary), &mut probe_dir_guard, &probe_dir);
+        }
+    };
+    probe_dir_guard.register(registration);
+    let probe_result = async {
+        workspace.initialize(network, seed)?;
 
-    let treestate = client
-        .get_tree_state(BlockId {
-            height: u64::from(effective_height.saturating_sub(1)),
-            hash: vec![],
-        })
+        let treestate = client
+            .get_tree_state(BlockId {
+                height: u64::from(effective_height.saturating_sub(1)),
+                hash: vec![],
+            })
+            .await
+            .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
+            .into_inner();
+
+        let account_birthday = AccountBirthday::from_treestate(treestate, None).map_err(|_| {
+            ZeckError::Wallet("constructing probe account birthday from treestate".to_owned())
+        })?;
+
+        import_probe_account(
+            &workspace,
+            network,
+            seed,
+            &account_birthday,
+            transparent_account,
+        )?;
+
+        let net = consensus_network(network);
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+            run_wallet_sync(&workspace, &net, client),
+        )
         .await
-        .map_err(|err| ZeckError::Lightwalletd(err.to_string()))?
-        .into_inner();
+        .is_err();
 
-    let account_birthday = AccountBirthday::from_treestate(treestate, None).map_err(|_| {
-        ZeckError::Wallet("constructing probe account birthday from treestate".to_owned())
-    })?;
+        if timed_out {
+            // Reconnect so the next probe starts with a clean channel.
+            if let Ok((new_client, _, _)) = probe_lightwalletd_endpoints(lightwalletd_url).await {
+                *client = new_client;
+            }
+        }
 
-    import_probe_account(
-        &workspace,
-        network,
-        seed,
-        &account_birthday,
-        transparent_account,
-    )?;
+        check_probe_activity(workspace.wallet_db_path())
+    }
+    .await;
+    drop(workspace);
+    finish_probe_cleanup(probe_result, &mut probe_dir_guard, &probe_dir)
+}
 
-    let net = consensus_network(network);
-    let timed_out = tokio::time::timeout(
-        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
-        run_wallet_sync(&workspace, &net, client),
-    )
-    .await
-    .is_err();
-
-    if timed_out {
-        // Reconnect so the next probe starts with a clean channel.
-        if let Ok((new_client, _, _)) = probe_lightwalletd_endpoints(lightwalletd_url).await {
-            *client = new_client;
+fn finish_probe_cleanup<T>(
+    probe_result: ZeckResult<T>,
+    guard: &mut ProbeDirGuard,
+    probe_dir: &std::path::Path,
+) -> ZeckResult<T> {
+    match guard.cleanup() {
+        Ok(()) => probe_result,
+        Err(cleanup_error) => {
+            let primary = match probe_result {
+                Ok(_) => String::new(),
+                Err(error) => format!("probe failed first: {error}; "),
+            };
+            Err(ZeckError::Storage(format!(
+                "{primary}retiring birthday probe workspace {} also failed: {cleanup_error}; authenticated stale cleanup will retry before the next probe",
+                probe_dir.display()
+            )))
         }
     }
-
-    let has_activity = check_probe_activity(workspace.wallet_db_path()).unwrap_or(false);
-    // `_probe_dir_guard` removes the temporary directory when it drops here.
-    Ok(has_activity)
 }
 
 fn check_probe_activity(wallet_db_path: &std::path::Path) -> ZeckResult<bool> {
-    let conn = Connection::open_with_flags(
-        wallet_db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|err| ZeckError::Storage(format!("opening probe wallet for activity check: {err}")))?;
+    let conn =
+        crate::workspace::open_wallet_connection_read_only(wallet_db_path).map_err(|err| {
+            ZeckError::Storage(format!("opening probe wallet for activity check: {err}"))
+        })?;
 
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sapling_received_notes)
@@ -1369,6 +1476,120 @@ fn check_probe_activity(wallet_db_path: &std::path::Path) -> ZeckResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn armed_probe_guard(container: &std::path::Path) -> (ProbeDirGuard, std::path::PathBuf) {
+        let probe_dir = container.join(format!("zeck_probe_{}", Uuid::new_v4()));
+        crate::private_fs::create_private_dir_all(&probe_dir).unwrap();
+        let private_root = probe_dir.join("mainnet/workspace-test");
+        let root = private_root.join("birthday-1/auto-gap-1");
+        let database = root.join("wallet.sqlite");
+        let registration =
+            crate::private_fs::prepare_ephemeral_probe_workspace(&private_root, &root, &database)
+                .unwrap();
+        let mut guard = ProbeDirGuard::new(probe_dir.clone());
+        guard.workspace = Some(ProbeWorkspaceAuthority {
+            private_root,
+            root,
+            database,
+        });
+        guard.registration = Some(registration);
+        (guard, probe_dir)
+    }
+
+    #[test]
+    fn unarmed_probe_guard_removes_private_container() {
+        let container = tempfile::tempdir().unwrap();
+        let probe_dir = container
+            .path()
+            .join(format!("zeck_probe_{}", Uuid::new_v4()));
+        crate::private_fs::create_private_dir_all(&probe_dir).unwrap();
+
+        drop(ProbeDirGuard::new(probe_dir.clone()));
+
+        assert!(!probe_dir.exists());
+    }
+
+    #[test]
+    fn probe_activity_check_errors_are_not_treated_as_no_activity() {
+        let container = tempfile::tempdir().unwrap();
+        let missing = container.path().join("missing-wallet.sqlite");
+
+        assert!(check_probe_activity(&missing).is_err());
+    }
+
+    #[test]
+    fn probe_guard_retires_active_authority_before_removing_container() {
+        let container = tempfile::tempdir().unwrap();
+        let (mut guard, probe_dir) = armed_probe_guard(container.path());
+        let private_root = guard.workspace.as_ref().unwrap().private_root.clone();
+
+        guard.cleanup().unwrap();
+
+        assert!(!private_root.exists());
+        assert!(!probe_dir.exists());
+        guard.cleanup().unwrap();
+    }
+
+    #[test]
+    fn probe_guard_cleans_active_authority_during_unwind() {
+        let container = tempfile::tempdir().unwrap();
+        let probe_dir = std::cell::RefCell::new(None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (guard, path) = armed_probe_guard(container.path());
+            *probe_dir.borrow_mut() = Some(path);
+            let _guard = guard;
+            panic!("exercise ephemeral probe cleanup during unwind");
+        }));
+
+        assert!(result.is_err());
+        assert!(!probe_dir.borrow().as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn authenticated_stale_probe_cleanup_recovers_crash_after_marker_before_secret() {
+        let container = tempfile::tempdir().unwrap();
+        let (mut guard, probe_dir) = armed_probe_guard(container.path());
+        let private_root = guard.workspace.as_ref().unwrap().private_root.clone();
+        drop(guard.registration.take());
+
+        crate::private_fs::cleanup_stale_ephemeral_probes(container.path()).unwrap();
+
+        assert!(!private_root.exists());
+        guard.authority_retired = true;
+        guard.cleanup().unwrap();
+        assert!(!probe_dir.exists());
+    }
+
+    #[test]
+    fn authenticated_stale_probe_cleanup_recovers_crash_after_secret_write() {
+        let container = tempfile::tempdir().unwrap();
+        let (mut guard, probe_dir) = armed_probe_guard(container.path());
+        let workspace = guard.workspace.as_ref().unwrap();
+        let private_root = workspace.private_root.clone();
+        let database = workspace.database.clone();
+        std::fs::write(&database, b"seed-derived probe state").unwrap();
+        drop(guard.registration.take());
+
+        crate::private_fs::cleanup_stale_ephemeral_probes(container.path()).unwrap();
+
+        assert!(!database.exists());
+        assert!(!private_root.exists());
+        guard.authority_retired = true;
+        guard.cleanup().unwrap();
+        assert!(!probe_dir.exists());
+    }
+
+    #[test]
+    fn stale_probe_scan_skips_registered_live_probe() {
+        let container = tempfile::tempdir().unwrap();
+        let (mut guard, _) = armed_probe_guard(container.path());
+        let private_root = guard.workspace.as_ref().unwrap().private_root.clone();
+
+        crate::private_fs::cleanup_stale_ephemeral_probes(container.path()).unwrap();
+
+        assert!(private_root.exists());
+        guard.cleanup().unwrap();
+    }
 
     #[test]
     fn late_birthday_caution_warns_and_dates_on_mainnet() {
