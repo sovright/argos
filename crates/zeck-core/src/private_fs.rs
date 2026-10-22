@@ -86,20 +86,25 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_APPEND_DATA, FILE_GENERIC_WRITE, READ_CONTROL, WRITE_DAC,
+            FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, READ_CONTROL,
+            WRITE_DAC,
         };
         let data_access = if mode == PrivateOpenMode::Append {
             FILE_APPEND_DATA
         } else {
             FILE_GENERIC_WRITE
         };
-        options.access_mode(data_access | READ_CONTROL | WRITE_DAC);
+        options
+            .access_mode(data_access | READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options
 }
@@ -130,7 +135,7 @@ fn open_private_file_with(
         Err(err) => return Err(err),
     };
 
-    if let Err(err) = harden(&file) {
+    if let Err(err) = validate_private_file(&file).and_then(|_| harden(&file)) {
         drop(file);
         if created {
             let _ = fs::remove_file(path);
@@ -143,6 +148,29 @@ fn open_private_file_with(
         file.set_len(0)?;
     }
     Ok(file)
+}
+
+fn validate_private_file(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if file.metadata()?.file_type().is_file() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file must be a regular file",
+            ))
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::validate_private_file(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private filesystem permissions are unsupported on this platform",
+    ))
 }
 
 /// Open a private file, establishing its ACL/mode before truncation or writes.
@@ -160,12 +188,21 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Atomically replace `path` using a create-new private sibling.
 pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_private_file_atomic_with_observer(path, bytes, |_| Ok(()))
+}
+
+fn write_private_file_atomic_with_observer(
+    path: &Path,
+    bytes: &[u8],
+    before_replace: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
     let temporary = private_temporary(path);
+    let mut file = open_private_file(&temporary, PrivateOpenMode::CreateNew)?;
+    let mut replaced = false;
     let result = (|| {
-        let mut file = open_private_file(&temporary, PrivateOpenMode::CreateNew)?;
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
@@ -174,18 +211,46 @@ pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         // replacement into a reported failure.
         let parent_sync = open_parent_sync_handle(parent)?;
         parent_sync.sync_all()?;
-        // The create-new handle was already hardened and verified. Windows
-        // creation grants FILE_SHARE_DELETE, so keep that exact verified
-        // object open across the rename instead of reopening by path.
-        fs::rename(&temporary, path)?;
+        before_replace(&temporary)?;
+        replace_open_private_file(&file, &temporary, path, &parent_sync)?;
+        replaced = true;
         parent_sync.sync_all()?;
-        drop(file);
         Ok(())
     })();
-    if result.is_err() {
+    if result.is_err() && !replaced {
+        #[cfg(windows)]
+        let _ = windows_acl::delete_open_file(&file);
+        #[cfg(not(windows))]
         let _ = fs::remove_file(&temporary);
     }
+    drop(file);
     result
+}
+
+fn replace_open_private_file(
+    file: &File,
+    temporary: &Path,
+    path: &Path,
+    parent: &File,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = (file, parent);
+        fs::rename(temporary, path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = temporary;
+        windows_acl::replace_file(file, parent, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, temporary, path, parent);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic private replacement is unsupported on this platform",
+        ))
+    }
 }
 
 fn open_parent_sync_handle(parent: &Path) -> io::Result<File> {
@@ -243,12 +308,13 @@ mod windows_acl {
             SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
-            CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-            CREATE_NEW, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            READ_CONTROL, WRITE_DAC,
+            CreateDirectoryW, CreateFileW, FileDispositionInfo, FileRenameInfo,
+            GetFileInformationByHandle, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            CREATE_NEW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -560,7 +626,7 @@ mod windows_acl {
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                access | READ_CONTROL | WRITE_DAC,
+                access | DELETE | READ_CONTROL | WRITE_DAC,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 security.attributes(),
                 CREATE_NEW,
@@ -585,6 +651,71 @@ mod windows_acl {
         volume: u32,
         index_high: u32,
         index_low: u32,
+    }
+
+    pub(super) fn validate_private_file(file: &std::fs::File) -> io::Result<()> {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) }
+            == 0
+        {
+            return Err(last_error());
+        }
+        if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file must be a regular non-reparse file",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn replace_file(
+        file: &std::fs::File,
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<()> {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private file has no name")
+        })?;
+        let name = name.encode_wide().collect::<Vec<_>>();
+        let header_len = mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let buffer_len = header_len + name.len() * mem::size_of::<u16>();
+        let mut buffer = vec![0usize; buffer_len.div_ceil(mem::size_of::<usize>())];
+        let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*rename).Anonymous.ReplaceIfExists = true;
+            (*rename).RootDirectory = parent.as_raw_handle() as HANDLE;
+            (*rename).FileNameLength = (name.len() * mem::size_of::<u16>()) as u32;
+            ptr::copy_nonoverlapping(name.as_ptr(), (*rename).FileName.as_mut_ptr(), name.len());
+            if SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileRenameInfo,
+                rename.cast(),
+                buffer_len as u32,
+            ) == 0
+            {
+                return Err(last_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_open_file(file: &std::fs::File) -> io::Result<()> {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        Ok(())
     }
 
     fn directory_identity(directory: &std::fs::File) -> io::Result<FileIdentity> {
@@ -739,6 +870,20 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(fs::read(&path).unwrap(), b"must survive");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_private_file_refuses_a_symlink_before_truncate() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("wallet.dat");
+        let link = tmp.path().join("report.json");
+        fs::write(&target, b"must survive").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(open_private_file(&link, PrivateOpenMode::Truncate).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"must survive");
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -762,8 +907,9 @@ mod windows_tests {
             SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
-            FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            READ_CONTROL, WRITE_DAC,
+            CreateSymbolicLinkW, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE, READ_CONTROL, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            WRITE_DAC,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -1007,6 +1153,63 @@ mod windows_tests {
             .open(&path)
             .unwrap();
         unsafe { assert_private_acl(&file, false) };
+    }
+
+    #[test]
+    fn windows_atomic_replace_renames_the_verified_handle_after_name_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private");
+        create_private_dir_all(&dir).unwrap();
+        let path = dir.join("checkpoint");
+        let swapped_name = std::cell::RefCell::new(None);
+        write_private_file_atomic_with_observer(&path, b"verified secret", |temporary| {
+            let moved = dir.join("moved-verified-temp");
+            fs::rename(temporary, &moved)?;
+            fs::write(temporary, b"attacker replacement")?;
+            *swapped_name.borrow_mut() = Some(temporary.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"verified secret");
+        assert_eq!(
+            fs::read(swapped_name.into_inner().unwrap()).unwrap(),
+            b"attacker replacement"
+        );
+    }
+
+    #[test]
+    fn windows_reused_private_file_refuses_a_symlink_before_truncate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("wallet.dat");
+        let link = tmp.path().join("report.json");
+        fs::write(&target, b"must survive").unwrap();
+        let wide = |path: &Path| {
+            use std::os::windows::ffi::OsStrExt;
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>()
+        };
+        let link_wide = wide(&link);
+        let target_wide = wide(&target);
+        let created = unsafe {
+            CreateSymbolicLinkW(
+                link_wide.as_ptr(),
+                target_wide.as_ptr(),
+                SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            )
+        };
+        if !created {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32)
+            {
+                return;
+            }
+            panic!("creating test symlink: {err}");
+        }
+        assert!(open_private_file(&link, PrivateOpenMode::Truncate).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"must survive");
     }
 
     #[test]

@@ -157,6 +157,7 @@ dependencies = [
  "ed25519-zebra",
  "equihash",
  "keepawake",
+ "libc",
  "orchard",
  "pczt",
  "prost",
