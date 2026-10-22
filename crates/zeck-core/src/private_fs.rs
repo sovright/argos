@@ -3,7 +3,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 /// How [`open_private_file`] may change the target.
@@ -196,9 +196,34 @@ fn write_private_file_atomic_with_observer(
     bytes: &[u8],
     before_replace: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix_private::write_atomic(path, bytes, before_replace)
+    }
+    #[cfg(windows)]
+    {
+        write_private_file_atomic_windows(path, bytes, before_replace)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, bytes, before_replace);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic private replacement is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn write_private_file_atomic_windows(
+    path: &Path,
+    bytes: &[u8],
+    before_replace: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let temporary = private_temporary(path);
     let mut file = open_private_file(&temporary, PrivateOpenMode::CreateNew)?;
     let mut replaced = false;
@@ -212,7 +237,7 @@ fn write_private_file_atomic_with_observer(
         let parent_sync = open_parent_sync_handle(parent)?;
         parent_sync.sync_all()?;
         before_replace(&temporary)?;
-        replace_open_private_file(&file, &temporary, path, &parent_sync)?;
+        windows_acl::replace_file(&file, &parent_sync, path)?;
         replaced = true;
         parent_sync.sync_all()?;
         Ok(())
@@ -227,36 +252,10 @@ fn write_private_file_atomic_with_observer(
     result
 }
 
-fn replace_open_private_file(
-    file: &File,
-    temporary: &Path,
-    path: &Path,
-    parent: &File,
-) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let _ = (file, parent);
-        fs::rename(temporary, path)
-    }
-    #[cfg(windows)]
-    {
-        let _ = temporary;
-        windows_acl::replace_file(file, parent, path)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (file, temporary, path, parent);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "atomic private replacement is unsupported on this platform",
-        ))
-    }
-}
-
 fn open_parent_sync_handle(parent: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
-        File::open(parent)
+        unix_private::open_directory(parent)
     }
     #[cfg(windows)]
     {
@@ -269,12 +268,205 @@ fn open_parent_sync_handle(parent: &Path) -> io::Result<File> {
     ))
 }
 
-fn private_temporary(path: &Path) -> PathBuf {
+#[cfg(windows)]
+fn private_temporary(path: &Path) -> std::path::PathBuf {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("private");
     path.with_file_name(format!("{name}.{}.tmp", uuid::Uuid::new_v4()))
+}
+
+#[cfg(unix)]
+mod unix_private {
+    use super::{harden_private_file, validate_private_file};
+    use std::{
+        ffi::{CString, OsStr},
+        fs::{self, File},
+        io::{self, Write},
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, PermissionsExt},
+            io::{AsRawFd, FromRawFd, RawFd},
+        },
+        path::{Path, PathBuf},
+    };
+
+    const ARTIFACT_NAME: &str = "artifact";
+
+    fn c_string(value: &OsStr, description: &str) -> io::Result<CString> {
+        CString::new(value.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("private {description} contains a NUL character"),
+            )
+        })
+    }
+
+    fn last_error() -> io::Error {
+        io::Error::last_os_error()
+    }
+
+    pub(super) fn open_directory(path: &Path) -> io::Result<File> {
+        let path = c_string(path.as_os_str(), "directory path")?;
+        let descriptor = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let directory = unsafe { File::from_raw_fd(descriptor) };
+        if !directory.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private parent must be a directory",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn create_staging_directory(parent: &File) -> io::Result<(File, CString, PathBuf)> {
+        for _ in 0..16 {
+            let name = format!(".argos-private-{}", uuid::Uuid::new_v4());
+            let c_name = c_string(OsStr::new(&name), "staging name")?;
+            let created = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) };
+            if created != 0 {
+                let err = last_error();
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(err);
+            }
+            let descriptor = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                return Err(last_error());
+            }
+            let directory = unsafe { File::from_raw_fd(descriptor) };
+            let metadata = directory.metadata()?;
+            if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private staging directory was substituted during creation",
+                ));
+            }
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+            let metadata = directory.metadata()?;
+            if metadata.mode() & 0o777 != 0o700 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private staging directory permissions were not established",
+                ));
+            }
+            return Ok((directory, c_name, PathBuf::from(name)));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique private staging directory",
+        ))
+    }
+
+    fn create_artifact(directory: RawFd) -> io::Result<File> {
+        let name = c_string(OsStr::new(ARTIFACT_NAME), "artifact name")?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory,
+                name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_private_file(&file)?;
+        harden_private_file(&file)?;
+        Ok(file)
+    }
+
+    fn unlink_artifact(directory: RawFd) {
+        if let Ok(name) = c_string(OsStr::new(ARTIFACT_NAME), "artifact name") {
+            unsafe {
+                libc::unlinkat(directory, name.as_ptr(), 0);
+            }
+        }
+    }
+
+    fn remove_staging_entry(parent: RawFd, name: &CString) {
+        unsafe {
+            libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR);
+        }
+    }
+
+    pub(super) fn write_atomic(
+        path: &Path,
+        bytes: &[u8],
+        before_replace: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let destination = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private file has no name")
+        })?;
+        let destination = c_string(destination, "destination name")?;
+        let artifact = c_string(OsStr::new(ARTIFACT_NAME), "artifact name")?;
+        let parent = open_directory(parent_path)?;
+        parent.sync_all()?;
+        let (staging, staging_name, staging_relative) = create_staging_directory(&parent)?;
+        let exposed = parent_path.join(staging_relative);
+        let mut file = match create_artifact(staging.as_raw_fd()) {
+            Ok(file) => file,
+            Err(err) => {
+                remove_staging_entry(parent.as_raw_fd(), &staging_name);
+                return Err(err);
+            }
+        };
+        let mut replaced = false;
+        let result = (|| {
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            staging.sync_all()?;
+            before_replace(&exposed)?;
+            if unsafe {
+                libc::renameat(
+                    staging.as_raw_fd(),
+                    artifact.as_ptr(),
+                    parent.as_raw_fd(),
+                    destination.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(last_error());
+            }
+            replaced = true;
+            staging.sync_all()?;
+            parent.sync_all()
+        })();
+        if result.is_err() && !replaced {
+            unlink_artifact(staging.as_raw_fd());
+        }
+        drop(file);
+        drop(staging);
+        remove_staging_entry(parent.as_raw_fd(), &staging_name);
+        result
+    }
 }
 
 #[cfg(windows)]
@@ -883,6 +1075,26 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(open_private_file(&link, PrivateOpenMode::Truncate).is_err());
         assert_eq!(fs::read(target).unwrap(), b"must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_survives_exposed_entry_substitution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let path = tmp.path().join("checkpoint");
+        let moved = tmp.path().join("moved-private-entry");
+        write_private_file_atomic_with_observer(&path, b"verified secret", |exposed| {
+            assert!(exposed.is_dir(), "the exposed entry must contain no secret");
+            fs::rename(exposed, &moved)?;
+            fs::create_dir(exposed)?;
+            fs::write(exposed.join("artifact"), b"attacker replacement")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"verified secret");
     }
 }
 
