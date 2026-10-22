@@ -2148,7 +2148,10 @@ impl NamespaceLease {
             // The creation handle requests DELETE so a failed private-file
             // validation can remove a new child. SQLite deliberately omits
             // FILE_SHARE_DELETE, so retain the verified identity across a
-            // handoff to an attributes-only handle before SQLite reopens it.
+            // handoff to a read-data authority handle before SQLite reopens it.
+            // FILE_READ_DATA makes the missing FILE_SHARE_DELETE participate
+            // in Windows share accounting while remaining compatible with
+            // SQLite's FILE_SHARE_READ | FILE_SHARE_WRITE opens.
             let bridge = windows_acl::open_child_file_for_identity(&self.parent, path)?;
             if private_object_id(&bridge)? != id {
                 return Err(invalid_lineage(
@@ -7692,9 +7695,9 @@ mod windows_acl {
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
-            WRITE_OWNER,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL,
+            SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
         },
         System::Threading::{
             CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
@@ -7938,7 +7941,7 @@ mod windows_acl {
         let file = nt_open_child(
             parent,
             path,
-            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             FILE_OPEN,
             ptr::null(),
