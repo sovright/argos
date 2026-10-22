@@ -79,7 +79,42 @@ jobs:
         run: |
           cargo test -p argos-core private_fs --target x86_64-pc-windows-msvc
           cargo test -p argos-core private_fs::windows_tests::windows_reused_private_objects_have_only_owner_and_system_access --target x86_64-pc-windows-msvc -- --exact
+          cargo test -p argos-core checkpoint_lease_serializes_replacement_and_cleanup_authority --target x86_64-pc-windows-msvc
+          cargo test -p argos-core windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts --target x86_64-pc-windows-msvc
+          cargo test -p argos-core windows_relative_primitives_never_touch_a_recreated_ancestor_tree --target x86_64-pc-windows-msvc
+          cargo test -p argos-core windows_checkpoint_quarantine_uses_exact_open_handle_rename_and_delete --target x86_64-pc-windows-msvc
+          cargo test -p argos-core windows_journal_authority_denies_sidecar_replacement_and_second_writer --target x86_64-pc-windows-msvc
+          cargo test -p argos-core retained_registry_handles_deny_parent_and_sidecar_replacement --target x86_64-pc-windows-msvc
+          cargo test -p argos-core separate_connection_lock_blocks_migration_and_append --target x86_64-pc-windows-msvc
           cargo test -p argos-gui write_private_report --target x86_64-pc-windows-msvc
+
+  check-macos-private-authority:
+    name: Private authority tests (macOS)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Stable private namespace and exact cleanup tests
+        run: |
+          cargo test -p argos-core first_append_after_parent_swap_never_writes_the_replacement_namespace
+          cargo test -p argos-core cleanup_enumerates_the_pinned_parent_after_a_path_swap
+          cargo test -p argos-core replaced_sidecar_cannot_start_a_writer_or_delete_its_staging
+          cargo test -p argos-core replaced_parent_namespace_cannot_redirect_old_cleanup
+          cargo test -p argos-core quarantine_swap_after_verification_preserves_the_sentinel
+          cargo test -p argos-core registry_log_refuses_replaced_parent_without_touching_replacement
+          cargo test -p argos-core registry_log_refuses_replaced_sidecar_without_touching_registry
+          cargo test -p argos-core separate_connection_lock_blocks_migration_and_append
 
   test:
     name: Cargo test

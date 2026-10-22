@@ -1,10 +1,455 @@
 //! Fail-closed filesystem primitives for spend-capable recovery artifacts.
 
 use std::{
+    ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum PrivateObjectId {
+    Unix { device: u64, inode: u64 },
+    Windows { volume_serial: u32, file_index: u64 },
+}
+
+pub(crate) fn private_object_id(file: &File) -> io::Result<PrivateObjectId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        Ok(PrivateObjectId::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(PrivateObjectId::Windows {
+            volume_serial: information.dwVolumeSerialNumber,
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private object identity is unsupported on this platform",
+        ))
+    }
+}
+
+/// Stable authority over a private pathname namespace. The parent and lock
+/// objects remain open and identity-checked for the entire operation.
+#[derive(Debug)]
+pub(crate) struct NamespaceLease {
+    parent: File,
+    parent_path: std::path::PathBuf,
+    parent_id: PrivateObjectId,
+    lock_file: File,
+    lock_path: std::path::PathBuf,
+    lock_id: PrivateObjectId,
+}
+
+#[derive(Debug)]
+pub(crate) struct NamespaceChildLock<'a> {
+    namespace: &'a NamespaceLease,
+    file: File,
+    path: std::path::PathBuf,
+    id: PrivateObjectId,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetainedNamespaceChild {
+    namespace: NamespaceLease,
+    file: File,
+    path: std::path::PathBuf,
+    id: PrivateObjectId,
+}
+
+impl NamespaceLease {
+    pub(crate) fn acquire(parent_path: &Path, lock_path: &Path) -> io::Result<Self> {
+        require_direct_child(parent_path, lock_path)?;
+        let parent = open_parent_lease_handle(parent_path)?;
+        lock_parent_namespace(&parent)?;
+        let parent_id = private_object_id(&parent)?;
+        let lock_file = open_child_file_for_lock(&parent, lock_path)?;
+        parent.sync_all()?;
+        lock_exclusive(&lock_file)?;
+        let lock_id = private_object_id(&lock_file)?;
+        let lease = Self {
+            parent,
+            parent_path: parent_path.to_path_buf(),
+            parent_id,
+            lock_file,
+            lock_path: lock_path.to_path_buf(),
+            lock_id,
+        };
+        lease.verify_current()?;
+        Ok(lease)
+    }
+
+    pub(crate) fn verify_current(&self) -> io::Result<()> {
+        if private_object_id(&self.parent)? != self.parent_id
+            || private_object_id(&self.lock_file)? != self.lock_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained private namespace object changed",
+            ));
+        }
+        let current_parent = open_parent_identity_handle(&self.parent_path)?;
+        if private_object_id(&current_parent)? != self.parent_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private namespace parent was replaced while held",
+            ));
+        }
+        let current_lock = open_identity_file(&self.lock_path)?;
+        if private_object_id(&current_lock)? != self.lock_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private namespace lock was replaced while held",
+            ));
+        }
+        let current_parent = open_parent_identity_handle(&self.parent_path)?;
+        if private_object_id(&current_parent)? != self.parent_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private namespace parent changed while the lock was rechecked",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn parent(&self) -> &File {
+        &self.parent
+    }
+
+    pub(crate) fn parent_path(&self) -> &Path {
+        &self.parent_path
+    }
+
+    pub(crate) fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+
+    pub(crate) fn sync_parent(&self) -> io::Result<()> {
+        self.parent.sync_all()
+    }
+
+    pub(crate) fn require_child(&self, path: &Path) -> io::Result<()> {
+        require_direct_child(&self.parent_path, path)
+    }
+
+    pub(crate) fn read_child(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.read_child_version(path).map(|(bytes, _)| bytes)
+    }
+
+    pub(crate) fn read_child_version(&self, path: &Path) -> io::Result<(Vec<u8>, PrivateObjectId)> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        let mut file = open_child_file(&self.parent, path)?;
+        let identity = private_object_id(&file)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        self.verify_current()?;
+        Ok((bytes, identity))
+    }
+
+    pub(crate) fn append_child_if_unchanged(
+        &self,
+        path: &Path,
+        expected: Option<(&PrivateObjectId, &[u8])>,
+        suffix: &[u8],
+    ) -> io::Result<()> {
+        self.append_child_if_unchanged_with_observer(path, expected, suffix, || Ok(()))
+    }
+
+    fn append_child_if_unchanged_with_observer(
+        &self,
+        path: &Path,
+        expected: Option<(&PrivateObjectId, &[u8])>,
+        suffix: &[u8],
+        after_verify: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        after_verify()?;
+        let created = expected.is_none();
+        let mut file = match open_child_file_read_append(&self.parent, path) {
+            Ok(file) => file,
+            Err(err) if created && err.kind() == io::ErrorKind::NotFound => {
+                create_child_file_read_append(&self.parent, path)?
+            }
+            Err(err) => return Err(err),
+        };
+        let object_id = private_object_id(&file)?;
+        let mut current = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_end(&mut current)?;
+        match expected {
+            Some((expected_id, expected_bytes))
+                if expected_id == &object_id && expected_bytes == current => {}
+            None if current.is_empty() => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "private child changed before append",
+                ))
+            }
+        }
+        file.write_all(suffix)?;
+        file.flush()?;
+        file.sync_all()?;
+        let current_path = open_child_file(&self.parent, path)?;
+        if private_object_id(&current_path)? != object_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private child path changed during append",
+            ));
+        }
+        if created {
+            self.parent.sync_all()?;
+        }
+        self.verify_current()
+    }
+
+    pub(crate) fn child_names(&self) -> io::Result<Vec<OsString>> {
+        self.verify_current()?;
+        let names = parent_child_names(&self.parent, &self.parent_path)?;
+        self.verify_current()?;
+        Ok(names)
+    }
+
+    pub(crate) fn remove_open_child(
+        &self,
+        path: &Path,
+        file: &File,
+        expected_id: &PrivateObjectId,
+    ) -> io::Result<()> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        remove_open_child_file(&self.parent, path, file, expected_id)?;
+        self.verify_current()
+    }
+
+    pub(crate) fn acquire_child_lock(&self, path: &Path) -> io::Result<NamespaceChildLock<'_>> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        let file = open_child_file_for_lock(&self.parent, path)?;
+        lock_exclusive(&file)?;
+        let id = private_object_id(&file)?;
+        let child = NamespaceChildLock {
+            namespace: self,
+            file,
+            path: path.to_path_buf(),
+            id,
+        };
+        child.verify_current()?;
+        Ok(child)
+    }
+
+    pub(crate) fn retain_child(&self, path: &Path) -> io::Result<RetainedNamespaceChild> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        let file = open_child_file(&self.parent, path)?;
+        let id = private_object_id(&file)?;
+        let child = RetainedNamespaceChild {
+            namespace: self.try_clone_authority()?,
+            file,
+            path: path.to_path_buf(),
+            id,
+        };
+        child.verify_current()?;
+        Ok(child)
+    }
+
+    pub(crate) fn open_or_create_retained_child(
+        &self,
+        path: &Path,
+    ) -> io::Result<RetainedNamespaceChild> {
+        self.require_child(path)?;
+        self.verify_current()?;
+        let file = open_child_file_for_lock(&self.parent, path)?;
+        self.parent.sync_all()?;
+        let id = private_object_id(&file)?;
+        let child = RetainedNamespaceChild {
+            namespace: self.try_clone_authority()?,
+            file,
+            path: path.to_path_buf(),
+            id,
+        };
+        child.verify_current()?;
+        Ok(child)
+    }
+
+    pub(crate) fn try_clone_authority(&self) -> io::Result<Self> {
+        Ok(Self {
+            parent: self.parent.try_clone()?,
+            parent_path: self.parent_path.clone(),
+            parent_id: self.parent_id.clone(),
+            lock_file: self.lock_file.try_clone()?,
+            lock_path: self.lock_path.clone(),
+            lock_id: self.lock_id.clone(),
+        })
+    }
+}
+
+impl NamespaceChildLock<'_> {
+    pub(crate) fn verify_current(&self) -> io::Result<()> {
+        self.namespace.verify_current()?;
+        if private_object_id(&self.file)? != self.id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained namespace child lock changed",
+            ));
+        }
+        let current = open_child_file(self.namespace.parent(), &self.path)?;
+        if private_object_id(&current)? != self.id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "namespace child lock path was replaced while held",
+            ));
+        }
+        self.namespace.verify_current()
+    }
+}
+
+impl RetainedNamespaceChild {
+    pub(crate) fn verify_current(&self) -> io::Result<()> {
+        self.namespace.verify_current()?;
+        if private_object_id(&self.file)? != self.id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained namespace child changed",
+            ));
+        }
+        let current = open_child_file(self.namespace.parent(), &self.path)?;
+        if private_object_id(&current)? != self.id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retained namespace child path was replaced",
+            ));
+        }
+        self.namespace.verify_current()
+    }
+}
+
+fn require_direct_child(parent: &Path, child: &Path) -> io::Result<()> {
+    if child.parent() == Some(parent) && child.file_name().is_some() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "private namespace child {} is not directly inside {}",
+            child.display(),
+            parent.display()
+        ),
+    ))
+}
+
+fn open_identity_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        let file = options.open(path)?;
+        validate_private_file(&file)?;
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_file_for_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private file identity is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn lock_parent_namespace(file: &File) -> io::Result<()> {
+    lock_exclusive(file)
+}
+
+#[cfg(windows)]
+fn lock_parent_namespace(_file: &File) -> io::Result<()> {
+    // The directory handle denies FILE_SHARE_DELETE, which pins its name.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_parent_namespace(_file: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private namespace locks are unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_exclusive(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::{
+        Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY},
+        System::IO::OVERLAPPED,
+    };
+    let mut overlapped = OVERLAPPED::default();
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_exclusive(_file: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private namespace locks are unsupported on this platform",
+    ))
+}
 
 /// How [`open_private_file`] may change the target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +458,13 @@ pub enum PrivateOpenMode {
     Truncate,
     /// Tighten an existing object before appending to it.
     Append,
+    /// Open without truncation for an operating-system lock. On Windows this
+    /// grants the read/write access required by `LockFileEx` and deliberately
+    /// denies delete sharing so the locked pathname cannot be replaced.
+    ReadWriteLock,
+    /// Open without truncation for an exact-object append, with read access
+    /// so the caller can compare the retained bytes before writing.
+    ReadWriteAppend,
     /// Refuse an existing target. Useful for atomic-replacement temporaries.
     CreateNew,
 }
@@ -85,7 +537,16 @@ pub fn harden_private_file(file: &File) -> io::Result<()> {
 fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
     let mut options = OpenOptions::new();
     options.write(true).create_new(create_new);
-    if mode == PrivateOpenMode::Append {
+    if matches!(
+        mode,
+        PrivateOpenMode::ReadWriteLock | PrivateOpenMode::ReadWriteAppend
+    ) {
+        options.read(true);
+    }
+    if matches!(
+        mode,
+        PrivateOpenMode::Append | PrivateOpenMode::ReadWriteAppend
+    ) {
         options.append(true);
     }
     #[cfg(unix)]
@@ -99,17 +560,24 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, READ_CONTROL,
-            WRITE_DAC,
+            FILE_APPEND_DATA, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
         };
-        let data_access = if mode == PrivateOpenMode::Append {
-            FILE_APPEND_DATA
-        } else {
-            FILE_GENERIC_WRITE
+        let data_access = match mode {
+            PrivateOpenMode::Append => FILE_APPEND_DATA,
+            PrivateOpenMode::ReadWriteLock | PrivateOpenMode::ReadWriteAppend => {
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE
+            }
+            PrivateOpenMode::Truncate | PrivateOpenMode::CreateNew => FILE_GENERIC_WRITE,
         };
-        options
-            .access_mode(data_access | READ_CONTROL | WRITE_DAC)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.access_mode(data_access | READ_CONTROL | WRITE_DAC);
+        if matches!(
+            mode,
+            PrivateOpenMode::ReadWriteLock | PrivateOpenMode::ReadWriteAppend
+        ) {
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options
 }
@@ -117,7 +585,7 @@ fn options_for(mode: PrivateOpenMode, create_new: bool) -> OpenOptions {
 fn create_new_private_file(path: &Path, mode: PrivateOpenMode) -> io::Result<File> {
     #[cfg(windows)]
     {
-        windows_acl::create_file(path, mode == PrivateOpenMode::Append)
+        windows_acl::create_file(path, mode)
     }
     #[cfg(not(windows))]
     {
@@ -196,10 +664,34 @@ pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_private_file_atomic_with_observer(path, bytes, |_| Ok(()))
 }
 
+pub(crate) fn write_private_file_atomic_in_parent(
+    parent: &File,
+    path: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix_private::write_atomic_in_parent(parent, path, bytes, |_| Ok(()))
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        {
+            write_private_file_atomic_windows_in_parent(parent, path, bytes, |_| Ok(()))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = parent;
+            write_private_file_atomic(path, bytes)
+        }
+    }
+}
+
 /// Remove destination-scoped atomic staging left by a crashed writer once it
 /// is old enough that it cannot belong to an active write. The caller must
 /// serialize cleanup with every writer for `path`; age alone cannot prove a
 /// paused writer is inactive.
+#[cfg(test)]
 pub(crate) fn remove_stale_private_file_staging(
     path: &Path,
     minimum_age: std::time::Duration,
@@ -215,8 +707,23 @@ pub(crate) fn remove_stale_private_file_staging(
     }
 }
 
-/// Remove every safe, destination-scoped atomic staging directory for `path`.
-/// Callers must serialize this with writers for the same destination.
+pub(crate) fn remove_stale_private_file_staging_in_parent(
+    parent: &File,
+    path: &Path,
+    minimum_age: std::time::Duration,
+) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        unix_private::cleanup_staging_in_parent(parent, path, Some(minimum_age))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, path, minimum_age);
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn discard_private_file_staging(path: &Path) -> io::Result<bool> {
     #[cfg(unix)]
     {
@@ -226,6 +733,205 @@ pub(crate) fn discard_private_file_staging(path: &Path) -> io::Result<bool> {
     {
         let _ = path;
         Ok(false)
+    }
+}
+
+/// Remove destination-scoped staging through a parent handle retained by the
+/// caller's namespace lease. On Unix this never follows a replaced parent
+/// pathname; Windows pins the namespace with a non-delete-shared lock file.
+pub(crate) fn discard_private_file_staging_in_parent(
+    parent: &File,
+    path: &Path,
+) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        unix_private::cleanup_staging_in_parent(parent, path, None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, path);
+        Ok(false)
+    }
+}
+
+/// Remove one direct child through a retained parent directory handle.
+pub(crate) fn remove_child_file(parent: &File, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix_private::remove_child_file(parent, path)
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        {
+            let _ = parent;
+            let file = windows_acl::open_child_for_mutation(parent, path)?;
+            windows_acl::delete_open_file(&file)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = parent;
+            fs::remove_file(path)
+        }
+    }
+}
+
+/// Rename direct children through a retained parent directory handle.
+pub(crate) fn rename_child_file(parent: &File, from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix_private::rename_child_file(parent, from, to)
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        {
+            let file = windows_acl::open_child_for_mutation(parent, from)?;
+            windows_acl::replace_file(&file, parent, to)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = parent;
+            fs::rename(from, to)
+        }
+    }
+}
+
+fn remove_open_child_file(
+    parent: &File,
+    path: &Path,
+    file: &File,
+    expected_id: &PrivateObjectId,
+) -> io::Result<()> {
+    if &private_object_id(file)? != expected_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "retained private child changed before deletion",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let _ = (parent, path);
+        windows_acl::delete_open_file(file)
+    }
+    #[cfg(unix)]
+    {
+        let current = open_child_file(parent, path)?;
+        if private_object_id(&current)? != *expected_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private child path changed before deletion",
+            ));
+        }
+        unix_private::remove_child_file(parent, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact private child deletion is unsupported on this platform",
+        ))
+    }
+}
+
+pub(crate) fn open_child_file(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_child_file(parent, path)
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        {
+            windows_acl::open_child_file(parent, path)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = parent;
+            File::open(path)
+        }
+    }
+}
+
+fn open_child_file_read_append(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_child_file_read_append(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_child_private(parent, path, PrivateOpenMode::ReadWriteAppend)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private child append is unsupported on this platform",
+        ))
+    }
+}
+
+fn create_child_file_read_append(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::create_child_file_read_append(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::create_child_private(parent, path, PrivateOpenMode::ReadWriteAppend)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private child creation is unsupported on this platform",
+        ))
+    }
+}
+
+fn open_child_file_for_lock(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_child_file_for_lock(parent, path)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_child_private(parent, path, PrivateOpenMode::ReadWriteLock)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private child locks are unsupported on this platform",
+        ))
+    }
+}
+
+pub(crate) fn parent_child_names(parent: &File, parent_path: &Path) -> io::Result<Vec<OsString>> {
+    #[cfg(unix)]
+    {
+        let _ = parent_path;
+        unix_private::directory_names(parent)
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        {
+            windows_acl::child_names(parent, parent_path)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = parent;
+            let mut names = fs::read_dir(parent_path)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<io::Result<Vec<_>>>()?;
+            names.sort();
+            Ok(names)
+        }
     }
 }
 
@@ -262,22 +968,30 @@ fn write_private_file_atomic_windows(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let parent_sync = open_parent_lease_handle(parent)?;
+    write_private_file_atomic_windows_in_parent(&parent_sync, path, bytes, before_replace)
+}
+
+#[cfg(windows)]
+fn write_private_file_atomic_windows_in_parent(
+    parent: &File,
+    path: &Path,
+    bytes: &[u8],
+    before_replace: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let temporary = private_temporary(path);
-    let mut file = open_private_file(&temporary, PrivateOpenMode::CreateNew)?;
+    let mut file =
+        windows_acl::create_child_private(parent, &temporary, PrivateOpenMode::CreateNew)?;
     let mut replaced = false;
     let result = (|| {
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
-        // Preflight the platform-specific directory handle before changing
-        // the name. A bad Windows directory open must not turn a completed
-        // replacement into a reported failure.
-        let parent_sync = open_parent_sync_handle(parent)?;
-        parent_sync.sync_all()?;
+        parent.sync_all()?;
         before_replace(&temporary)?;
-        windows_acl::replace_file(&file, &parent_sync, path)?;
+        windows_acl::replace_file(&file, parent, path)?;
         replaced = true;
-        parent_sync.sync_all()?;
+        parent.sync_all()?;
         Ok(())
     })();
     if result.is_err() && !replaced {
@@ -290,7 +1004,7 @@ fn write_private_file_atomic_windows(
     result
 }
 
-fn open_parent_sync_handle(parent: &Path) -> io::Result<File> {
+pub(crate) fn open_parent_sync_handle(parent: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         unix_private::open_directory(parent)
@@ -304,6 +1018,47 @@ fn open_parent_sync_handle(parent: &Path) -> io::Result<File> {
         io::ErrorKind::Unsupported,
         "directory synchronization is unsupported on this platform",
     ))
+}
+
+pub(crate) fn open_parent_lease_handle(parent: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_directory(parent)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_directory_for_lease(parent)
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory leases are unsupported on this platform",
+    ))
+}
+
+fn open_parent_identity_handle(parent: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        unix_private::open_directory(parent)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::open_directory_for_identity(parent)
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory identity is unsupported on this platform",
+    ))
+}
+
+/// Durably record directory-entry removals or renames for a private artifact.
+pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    open_parent_sync_handle(parent)?.sync_all()
 }
 
 #[cfg(windows)]
@@ -736,8 +1491,18 @@ mod unix_private {
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    fn directory_names(directory: &File) -> io::Result<Vec<OsString>> {
-        let descriptor = unsafe { libc::dup(directory.as_raw_fd()) };
+    pub(super) fn directory_names(directory: &File) -> io::Result<Vec<OsString>> {
+        // `dup` shares the directory stream offset with later enumerations
+        // through this retained handle. Open `.` relative to the pinned
+        // directory so every pass starts at the first entry.
+        let dot = c_string(OsStr::new("."), "directory entry")?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
         if descriptor < 0 {
             return Err(last_error());
         }
@@ -780,7 +1545,7 @@ mod unix_private {
         target_os = "netbsd",
         target_os = "openbsd"
     )))]
-    fn directory_names(_directory: &File) -> io::Result<Vec<OsString>> {
+    pub(super) fn directory_names(_directory: &File) -> io::Result<Vec<OsString>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "private staging enumeration is unsupported on this Unix target",
@@ -838,6 +1603,7 @@ mod unix_private {
         remove_staging_entry(parent, &name, staging_identity)
     }
 
+    #[cfg(test)]
     pub(super) fn cleanup_staging(
         path: &Path,
         minimum_age: Option<std::time::Duration>,
@@ -845,6 +1611,7 @@ mod unix_private {
         cleanup_staging_with_observer(path, minimum_age, || Ok(()))
     }
 
+    #[cfg(test)]
     fn cleanup_staging_with_observer(
         path: &Path,
         minimum_age: Option<std::time::Duration>,
@@ -854,13 +1621,21 @@ mod unix_private {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let prefix = staging_prefix(path)?;
         let parent = open_directory(parent_path)?;
         after_parent_open()?;
+        cleanup_staging_in_parent(&parent, path, minimum_age)
+    }
+
+    pub(super) fn cleanup_staging_in_parent(
+        parent: &File,
+        path: &Path,
+        minimum_age: Option<std::time::Duration>,
+    ) -> io::Result<bool> {
+        let prefix = staging_prefix(path)?;
         let now = std::time::SystemTime::now();
         let mut removed = false;
         let mut errors = Vec::new();
-        for name in directory_names(&parent)? {
+        for name in directory_names(parent)? {
             let Some(name_text) = name.to_str() else {
                 continue;
             };
@@ -897,7 +1672,7 @@ mod unix_private {
             if !old_enough {
                 continue;
             }
-            match cleanup_candidate(&parent, &name, candidate) {
+            match cleanup_candidate(parent, &name, candidate) {
                 Ok(candidate_removed) => removed |= candidate_removed,
                 Err(error) => errors.push(format!("{}: {error}", name.to_string_lossy())),
             }
@@ -916,7 +1691,171 @@ mod unix_private {
         Ok(removed)
     }
 
+    pub(super) fn remove_child_file(parent: &File, path: &Path) -> io::Result<()> {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
+        })?;
+        let name = c_string(name, "private child name")?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
+    }
+
+    pub(super) fn rename_child_file(parent: &File, from: &Path, to: &Path) -> io::Result<()> {
+        let from = c_string(
+            from.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private source has no name")
+            })?,
+            "private source name",
+        )?;
+        let to = c_string(
+            to.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private destination has no name",
+                )
+            })?,
+            "private destination name",
+        )?;
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
+    }
+
+    pub(super) fn open_child_file(parent: &File, path: &Path) -> io::Result<File> {
+        let name = c_string(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
+            })?,
+            "private child name",
+        )?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_private_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_child_file_read_append(parent: &File, path: &Path) -> io::Result<File> {
+        let name = c_string(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
+            })?,
+            "private child name",
+        )?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_APPEND
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_private_file(&file)?;
+        harden_private_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn create_child_file_read_append(parent: &File, path: &Path) -> io::Result<File> {
+        let name = c_string(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
+            })?,
+            "private child name",
+        )?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_APPEND
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_private_file(&file)?;
+        harden_private_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_child_file_for_lock(parent: &File, path: &Path) -> io::Result<File> {
+        let name = c_string(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
+            })?,
+            "private child name",
+        )?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_private_file(&file)?;
+        harden_private_file(&file)?;
+        Ok(file)
+    }
+
     pub(super) fn write_atomic(
+        path: &Path,
+        bytes: &[u8],
+        before_replace: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = open_directory(parent_path)?;
+        write_atomic_in_parent(&parent, path, bytes, before_replace)
+    }
+
+    pub(super) fn write_atomic_in_parent(
+        parent: &File,
         path: &Path,
         bytes: &[u8],
         before_replace: impl FnOnce(&Path) -> io::Result<()>,
@@ -930,16 +1869,15 @@ mod unix_private {
         })?;
         let destination = c_string(destination, "destination name")?;
         let artifact = c_string(OsStr::new(ARTIFACT_NAME), "artifact name")?;
-        let parent = open_directory(parent_path)?;
         parent.sync_all()?;
         let prefix = staging_prefix(path)?;
         let (staging, staging_name, staging_relative, staging_identity) =
-            create_staging_directory(&parent, &prefix)?;
+            create_staging_directory(parent, &prefix)?;
         let exposed = parent_path.join(staging_relative);
         let mut file = match create_artifact(staging.as_raw_fd()) {
             Ok(file) => file,
             Err(err) => {
-                let _ = remove_staging_entry(&parent, &staging_name, staging_identity);
+                let _ = remove_staging_entry(parent, &staging_name, staging_identity);
                 return Err(err);
             }
         };
@@ -970,7 +1908,7 @@ mod unix_private {
         }
         drop(file);
         drop(staging);
-        let _ = remove_staging_entry(&parent, &staging_name, staging_identity);
+        let _ = remove_staging_entry(parent, &staging_name, staging_identity);
         result
     }
 
@@ -1132,7 +2070,7 @@ mod windows_acl {
         ffi::OsStr,
         io, mem,
         os::windows::{
-            ffi::OsStrExt,
+            ffi::{OsStrExt, OsStringExt},
             fs::OpenOptionsExt,
             io::{AsRawHandle, FromRawHandle},
         },
@@ -1140,10 +2078,20 @@ mod windows_acl {
         ptr,
     };
 
+    use windows_sys::Wdk::{
+        Foundation::OBJECT_ATTRIBUTES,
+        Storage::FileSystem::{
+            FileDirectoryInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE,
+            FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        },
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::{
         Foundation::{
             CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
-            INVALID_HANDLE_VALUE,
+            INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, STATUS_BUFFER_OVERFLOW,
+            STATUS_NO_MORE_FILES, UNICODE_STRING,
         },
         Security::{
             AclSizeInformation, AddAccessAllowedAceEx,
@@ -1163,7 +2111,7 @@ mod windows_acl {
             FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
             FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -1192,6 +2140,195 @@ mod windows_acl {
         }
         encoded.push(0);
         Ok(encoded)
+    }
+
+    fn nt_error(status: i32) -> io::Error {
+        let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
+        io::Error::from_raw_os_error(code as i32)
+    }
+
+    fn relative_name(path: &Path) -> io::Result<Vec<u16>> {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private child has no name")
+        })?;
+        let encoded = name.encode_wide().collect::<Vec<_>>();
+        if encoded.is_empty() || encoded.len() > usize::from(u16::MAX) / 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private child name is empty or too long",
+            ));
+        }
+        Ok(encoded)
+    }
+
+    fn nt_open_child(
+        parent: &std::fs::File,
+        path: &Path,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        security_descriptor: *const core::ffi::c_void,
+    ) -> io::Result<std::fs::File> {
+        let mut name = relative_name(path)?;
+        let unicode = UNICODE_STRING {
+            Length: u16::try_from(name.len() * mem::size_of::<u16>()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private child name is too long",
+                )
+            })?,
+            MaximumLength: u16::try_from(name.len() * mem::size_of::<u16>()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private child name is too long",
+                )
+            })?,
+            Buffer: name.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle() as HANDLE,
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: security_descriptor.cast(),
+            SecurityQualityOfService: ptr::null(),
+        };
+        let mut status_block = IO_STATUS_BLOCK::default();
+        let mut handle = INVALID_HANDLE_VALUE;
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                desired_access | SYNCHRONIZE,
+                &attributes,
+                &mut status_block,
+                ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share_access,
+                disposition,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            return Err(nt_error(status));
+        }
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::other(
+                "NtCreateFile succeeded without returning a child handle",
+            ));
+        }
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    pub(super) fn open_child_file(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let file = nt_open_child(
+            parent,
+            path,
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            ptr::null(),
+        )?;
+        validate_private_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_child_private(
+        parent: &std::fs::File,
+        path: &Path,
+        mode: super::PrivateOpenMode,
+    ) -> io::Result<std::fs::File> {
+        open_or_create_child_private(parent, path, mode, false)
+    }
+
+    pub(super) fn create_child_private(
+        parent: &std::fs::File,
+        path: &Path,
+        mode: super::PrivateOpenMode,
+    ) -> io::Result<std::fs::File> {
+        open_or_create_child_private(parent, path, mode, true)
+    }
+
+    pub(super) fn child_names(
+        parent: &std::fs::File,
+        _parent_path: &Path,
+    ) -> io::Result<Vec<std::ffi::OsString>> {
+        let mut names = Vec::new();
+        let mut restart = true;
+        loop {
+            let mut buffer = vec![0u64; 8192];
+            let mut status_block = IO_STATUS_BLOCK::default();
+            let status = unsafe {
+                NtQueryDirectoryFile(
+                    parent.as_raw_handle() as HANDLE,
+                    ptr::null_mut(),
+                    None,
+                    ptr::null(),
+                    &mut status_block,
+                    buffer.as_mut_ptr().cast(),
+                    u32::try_from(buffer.len() * mem::size_of::<u64>()).unwrap(),
+                    FileDirectoryInformation,
+                    false,
+                    ptr::null(),
+                    restart,
+                )
+            };
+            if status == STATUS_NO_MORE_FILES {
+                break;
+            }
+            if status < 0 && status != STATUS_BUFFER_OVERFLOW {
+                return Err(nt_error(status));
+            }
+            let available = status_block.Information;
+            if available == 0 {
+                break;
+            }
+            let mut offset = 0usize;
+            loop {
+                if offset + mem::size_of::<FILE_DIRECTORY_INFORMATION>() > available {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid Windows directory enumeration record",
+                    ));
+                }
+                let entry = unsafe {
+                    &*buffer
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<FILE_DIRECTORY_INFORMATION>()
+                };
+                let units = usize::try_from(entry.FileNameLength).unwrap() / mem::size_of::<u16>();
+                let value = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), units) };
+                if value != [b'.' as u16] && value != [b'.' as u16, b'.' as u16] {
+                    names.push(std::ffi::OsString::from_wide(value));
+                }
+                if entry.NextEntryOffset == 0 {
+                    break;
+                }
+                offset = offset
+                    .checked_add(entry.NextEntryOffset as usize)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "overflow in Windows directory enumeration",
+                        )
+                    })?;
+                if offset >= available {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Windows directory enumeration escaped its buffer",
+                    ));
+                }
+            }
+            restart = false;
+        }
+        names.sort();
+        Ok(names)
     }
 
     struct PrivateSecurity {
@@ -1455,28 +2592,104 @@ mod windows_acl {
         }
     }
 
-    pub(super) fn create_file(path: &Path, append: bool) -> io::Result<std::fs::File> {
-        create_file_with_observer(path, append, |_| Ok(()))
+    pub(super) fn create_file(
+        path: &Path,
+        mode: super::PrivateOpenMode,
+    ) -> io::Result<std::fs::File> {
+        create_file_with_observer(path, mode, |_| Ok(()))
+    }
+
+    fn open_or_create_child_private(
+        parent: &std::fs::File,
+        path: &Path,
+        mode: super::PrivateOpenMode,
+        create_only: bool,
+    ) -> io::Result<std::fs::File> {
+        let security = PrivateSecurity::new(false)?;
+        let access = match mode {
+            super::PrivateOpenMode::Append => FILE_APPEND_DATA,
+            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend => {
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE
+            }
+            super::PrivateOpenMode::Truncate | super::PrivateOpenMode::CreateNew => {
+                FILE_GENERIC_WRITE
+            }
+        } | DELETE
+            | READ_CONTROL
+            | WRITE_DAC;
+        let share = if matches!(
+            mode,
+            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend
+        ) {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        };
+        let descriptor = security.attributes.lpSecurityDescriptor.cast_const();
+        let (file, created) =
+            match nt_open_child(parent, path, access, share, FILE_CREATE, descriptor) {
+                Ok(file) => (file, true),
+                Err(err)
+                    if err.kind() == io::ErrorKind::AlreadyExists
+                        && !create_only
+                        && mode != super::PrivateOpenMode::CreateNew =>
+                {
+                    (
+                        nt_open_child(parent, path, access, share, FILE_OPEN, ptr::null())?,
+                        false,
+                    )
+                }
+                Err(err) => return Err(err),
+            };
+        let secured = validate_private_file(&file).and_then(|_| {
+            if created {
+                security.verify(&file)
+            } else {
+                super::harden_private_file(&file)
+            }
+        });
+        if let Err(err) = secured {
+            if created {
+                let _ = delete_open_file(&file);
+            }
+            return Err(err);
+        }
+        if mode == super::PrivateOpenMode::Truncate {
+            file.set_len(0)?;
+        }
+        Ok(file)
     }
 
     pub(super) fn create_file_with_observer(
         path: &Path,
-        append: bool,
+        mode: super::PrivateOpenMode,
         observer: impl FnOnce(&std::fs::File) -> io::Result<()>,
     ) -> io::Result<std::fs::File> {
         let security = PrivateSecurity::new(false)?;
         let path_buf = path.to_path_buf();
         let path = wide(path)?;
-        let access = if append {
-            FILE_APPEND_DATA
+        let access = match mode {
+            super::PrivateOpenMode::Append => FILE_APPEND_DATA,
+            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend => {
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE
+            }
+            super::PrivateOpenMode::Truncate | super::PrivateOpenMode::CreateNew => {
+                FILE_GENERIC_WRITE
+            }
+        };
+        let share = if matches!(
+            mode,
+            super::PrivateOpenMode::ReadWriteLock | super::PrivateOpenMode::ReadWriteAppend
+        ) {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
         } else {
-            FILE_GENERIC_WRITE
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
         };
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
                 access | DELETE | READ_CONTROL | WRITE_DAC,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                share,
                 security.attributes(),
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
@@ -1525,6 +2738,15 @@ mod windows_acl {
         parent: &std::fs::File,
         path: &Path,
     ) -> io::Result<()> {
+        move_file(file, parent, path, true)
+    }
+
+    pub(super) fn move_file(
+        file: &std::fs::File,
+        parent: &std::fs::File,
+        path: &Path,
+        replace: bool,
+    ) -> io::Result<()> {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "private file has no name")
         })?;
@@ -1534,7 +2756,7 @@ mod windows_acl {
         let mut buffer = vec![0usize; buffer_len.div_ceil(mem::size_of::<usize>())];
         let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         unsafe {
-            (*rename).Anonymous.ReplaceIfExists = true;
+            (*rename).Anonymous.ReplaceIfExists = replace;
             (*rename).RootDirectory = parent.as_raw_handle() as HANDLE;
             (*rename).FileNameLength = (name.len() * mem::size_of::<u16>()) as u32;
             ptr::copy_nonoverlapping(name.as_ptr(), (*rename).FileName.as_mut_ptr(), name.len());
@@ -1565,6 +2787,43 @@ mod windows_acl {
             return Err(last_error());
         }
         Ok(())
+    }
+
+    pub(super) fn open_child_for_mutation(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let file = nt_open_child(
+            parent,
+            path,
+            DELETE | FILE_GENERIC_READ | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            ptr::null(),
+        )?;
+        validate_private_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_file_for_identity(path: &Path) -> io::Result<std::fs::File> {
+        let path = wide(path)?;
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(last_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        validate_private_file(&file)?;
+        Ok(file)
     }
 
     fn directory_identity(directory: &std::fs::File) -> io::Result<FileIdentity> {
@@ -1688,6 +2947,7 @@ mod windows_acl {
         harden(&directory, true)
     }
 
+    #[cfg(test)]
     pub(super) fn verify_current(file: &std::fs::File, directory: bool) -> io::Result<()> {
         PrivateSecurity::new(directory)?.verify(file)
     }
@@ -1698,11 +2958,64 @@ mod windows_acl {
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
         )
     }
+
+    pub(super) fn open_directory_for_lease(path: &Path) -> io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let directory = options.open(path)?;
+        directory_identity(&directory)?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_directory_for_identity(path: &Path) -> io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let directory = options.open(path)?;
+        directory_identity(&directory)?;
+        Ok(directory)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn first_append_after_parent_swap_never_writes_the_replacement_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("active");
+        fs::create_dir(&parent).unwrap();
+        let child = parent.join("journal");
+        let lock = parent.join("journal.lock");
+        let lease = NamespaceLease::acquire(&parent, &lock).unwrap();
+        let displaced = root.path().join("displaced");
+
+        let error = lease
+            .append_child_if_unchanged_with_observer(&child, None, b"secret\n", || {
+                fs::rename(&parent, &displaced)?;
+                fs::create_dir(&parent)?;
+                fs::write(parent.join("sentinel"), b"replacement tree")?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read(parent.join("sentinel")).unwrap(),
+            b"replacement tree"
+        );
+        assert!(!child.exists());
+        assert_eq!(fs::read(displaced.join("journal")).unwrap(), b"secret\n");
+    }
 
     #[test]
     fn hardening_failure_occurs_before_truncate_or_write() {
@@ -2108,15 +3421,19 @@ mod windows_tests {
         let dir = tmp.path().join("new-private");
         create_private_dir_all(&dir).unwrap();
         let path = dir.join("checkpoint.tmp");
-        let mut file = super::windows_acl::create_file_with_observer(&path, false, |created| {
-            assert_eq!(
-                created.metadata()?.len(),
-                0,
-                "observer runs before any secret byte"
-            );
-            unsafe { assert_private_acl(created, false) };
-            Ok(())
-        })
+        let mut file = super::windows_acl::create_file_with_observer(
+            &path,
+            PrivateOpenMode::Truncate,
+            |created| {
+                assert_eq!(
+                    created.metadata()?.len(),
+                    0,
+                    "observer runs before any secret byte"
+                );
+                unsafe { assert_private_acl(created, false) };
+                Ok(())
+            },
+        )
         .unwrap();
         file.write_all(b"spend-capable checkpoint").unwrap();
         file.sync_all().unwrap();
@@ -2127,13 +3444,17 @@ mod windows_tests {
     fn windows_creation_verification_failure_precedes_secret_write() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("must-not-survive");
-        let err = super::windows_acl::create_file_with_observer(&path, false, |created| {
-            assert_eq!(created.metadata()?.len(), 0);
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "injected creation-time ACL verification failure",
-            ))
-        })
+        let err = super::windows_acl::create_file_with_observer(
+            &path,
+            PrivateOpenMode::Truncate,
+            |created| {
+                assert_eq!(created.metadata()?.len(), 0);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected creation-time ACL verification failure",
+                ))
+            },
+        )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(!path.exists(), "failed private creation must leave no file");
@@ -2176,6 +3497,152 @@ mod windows_tests {
             fs::read(swapped_name.into_inner().unwrap()).unwrap(),
             b"attacker replacement"
         );
+    }
+
+    #[test]
+    fn windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ancestor = tmp.path().join("authority");
+        let parent = ancestor.join("private");
+        create_private_dir_all(&parent).unwrap();
+        let child = parent.join("journal");
+        let renamed = parent.join("renamed-journal");
+        let lock = parent.join("journal.lock");
+        let lease = NamespaceLease::acquire(&parent, &lock).unwrap();
+        let detached = tmp.path().join("detached-authority");
+
+        assert!(
+            fs::rename(&ancestor, &detached).is_err(),
+            "an open retained parent must prevent an ancestor namespace rename on Windows"
+        );
+        lease
+            .append_child_if_unchanged(&child, None, b"first")
+            .unwrap();
+        let (bytes, id) = lease.read_child_version(&child).unwrap();
+        lease
+            .append_child_if_unchanged(&child, Some((&id, &bytes)), b"-second")
+            .unwrap();
+        assert!(lease
+            .child_names()
+            .unwrap()
+            .contains(&child.file_name().unwrap().to_owned()));
+
+        write_private_file_atomic_windows_in_parent(lease.parent(), &child, b"atomic", |_| {
+            assert!(fs::rename(&ancestor, &detached).is_err());
+            Ok(())
+        })
+        .unwrap();
+        rename_child_file(lease.parent(), &child, &renamed).unwrap();
+        let opened = open_child_file(lease.parent(), &renamed).unwrap();
+        let opened_id = private_object_id(&opened).unwrap();
+        remove_open_child_file(lease.parent(), &renamed, &opened, &opened_id).unwrap();
+
+        assert!(!renamed.exists());
+        assert!(!detached.exists());
+    }
+
+    #[test]
+    fn windows_relative_primitives_never_touch_a_recreated_ancestor_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ancestor = tmp.path().join("authority");
+        let parent = ancestor.join("private");
+        create_private_dir_all(&parent).unwrap();
+        let retained = open_parent_sync_handle(&parent).unwrap();
+        let detached_ancestor = tmp.path().join("detached-authority");
+        fs::rename(&ancestor, &detached_ancestor).unwrap();
+        create_private_dir_all(&parent).unwrap();
+
+        let replacement_sentinel = parent.join("sentinel");
+        fs::write(&replacement_sentinel, b"replacement tree").unwrap();
+        let child = parent.join("journal");
+        let mut created = super::windows_acl::create_child_private(
+            &retained,
+            &child,
+            PrivateOpenMode::ReadWriteAppend,
+        )
+        .unwrap();
+        created.write_all(b"created").unwrap();
+        created.sync_all().unwrap();
+        drop(created);
+        let mut existing = super::windows_acl::open_child_private(
+            &retained,
+            &child,
+            PrivateOpenMode::ReadWriteAppend,
+        )
+        .unwrap();
+        existing.write_all(b"-appended").unwrap();
+        existing.sync_all().unwrap();
+        drop(existing);
+        assert!(parent_child_names(&retained, &parent)
+            .unwrap()
+            .contains(&child.file_name().unwrap().to_owned()));
+
+        let truncated = parent.join("truncate-target");
+        {
+            let mut original = super::windows_acl::create_child_private(
+                &retained,
+                &truncated,
+                PrivateOpenMode::ReadWriteAppend,
+            )
+            .unwrap();
+            original.write_all(b"old bytes").unwrap();
+        }
+        fs::write(&truncated, b"replacement sentinel").unwrap();
+        let mut truncated_handle = super::windows_acl::open_child_private(
+            &retained,
+            &truncated,
+            PrivateOpenMode::Truncate,
+        )
+        .unwrap();
+        truncated_handle.write_all(b"detached replacement").unwrap();
+        truncated_handle.sync_all().unwrap();
+
+        let atomic = parent.join("atomic-target");
+        fs::write(&atomic, b"replacement atomic sentinel").unwrap();
+        write_private_file_atomic_windows_in_parent(&retained, &atomic, b"detached atomic", |_| {
+            assert_eq!(fs::read(&replacement_sentinel)?, b"replacement tree");
+            Ok(())
+        })
+        .unwrap();
+
+        let source = parent.join("source");
+        let renamed = parent.join("renamed");
+        let mut source_handle = super::windows_acl::create_child_private(
+            &retained,
+            &source,
+            PrivateOpenMode::ReadWriteAppend,
+        )
+        .unwrap();
+        source_handle.write_all(b"rename then delete").unwrap();
+        drop(source_handle);
+        rename_child_file(&retained, &source, &renamed).unwrap();
+        let opened = open_child_file(&retained, &renamed).unwrap();
+        let opened_id = private_object_id(&opened).unwrap();
+        remove_open_child_file(&retained, &renamed, &opened, &opened_id).unwrap();
+
+        let detached_parent = detached_ancestor.join("private");
+        assert_eq!(
+            fs::read(detached_parent.join("journal")).unwrap(),
+            b"created-appended"
+        );
+        assert_eq!(
+            fs::read(detached_parent.join("truncate-target")).unwrap(),
+            b"detached replacement"
+        );
+        assert_eq!(
+            fs::read(detached_parent.join("atomic-target")).unwrap(),
+            b"detached atomic"
+        );
+        assert!(!detached_parent.join("renamed").exists());
+        assert_eq!(
+            fs::read(&replacement_sentinel).unwrap(),
+            b"replacement tree"
+        );
+        assert_eq!(fs::read(&truncated).unwrap(), b"replacement sentinel");
+        assert_eq!(fs::read(&atomic).unwrap(), b"replacement atomic sentinel");
+        assert!(!child.exists());
+        assert!(!source.exists());
+        assert!(!renamed.exists());
     }
 
     #[test]

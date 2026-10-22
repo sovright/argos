@@ -668,17 +668,11 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
 }
 
 fn open_imported_broadcast_log(
-    runtime: &crate::models::RuntimeScanConfig,
+    registry_lease: &crate::service::NetworkRegistryLease,
 ) -> ZeckResult<DurableBroadcastLog> {
-    let path = crate::service::network_broadcast_log_path(&runtime.data_dir, runtime.network)?;
-    crate::private_fs::create_private_dir_all(path.parent().expect("registry log has a parent"))
-        .map_err(|err| {
-            ZeckError::Storage(format!(
-                "creating network broadcast registry {}: {err}",
-                path.display()
-            ))
-        })?;
-    let log = DurableBroadcastLog::open(path)?;
+    registry_lease.verify()?;
+    let log = registry_lease.reopen_broadcast_log()?;
+    registry_lease.verify()?;
     if let Some(txid) = log.blocking_submission() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep leg"
@@ -721,16 +715,35 @@ async fn sweep_imported_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
+    let operation_guard =
+        match crate::service::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network) {
+            Ok(guard) => guard,
+            Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+        };
+    let registry_lease = match operation_guard.registry_lease() {
+        Ok(lease) => lease,
+        Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+    };
     sweep_imported_wallet_reviewed(
         runtime,
         keys,
         destination,
         max_fee_zatoshis,
-        None,
-        None,
-        None,
+        ImportedSweepReview {
+            sapling_fees: None,
+            transparent_fee: None,
+            plan: None,
+            registry_lease: &registry_lease,
+        },
     )
     .await
+}
+
+pub(crate) struct ImportedSweepReview<'a> {
+    pub(crate) sapling_fees: Option<&'a std::collections::HashMap<AccountUuid, u64>>,
+    pub(crate) transparent_fee: Option<u64>,
+    pub(crate) plan: Option<&'a ImportedExecutionPlan>,
+    pub(crate) registry_lease: &'a crate::service::NetworkRegistryLease,
 }
 
 pub(crate) async fn sweep_imported_wallet_reviewed(
@@ -738,9 +751,7 @@ pub(crate) async fn sweep_imported_wallet_reviewed(
     keys: &argos_wallet_import::ImportedKeys,
     destination: &str,
     max_fee_zatoshis: Option<u64>,
-    reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
-    reviewed_transparent_fee: Option<u64>,
-    planned: Option<&ImportedExecutionPlan>,
+    review: ImportedSweepReview<'_>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome::default();
     let result = sweep_imported_wallet_into(
@@ -749,8 +760,7 @@ pub(crate) async fn sweep_imported_wallet_reviewed(
         destination,
         max_fee_zatoshis,
         &mut outcome,
-        (reviewed_sapling_fees, reviewed_transparent_fee),
-        planned,
+        review,
     )
     .await;
     (outcome, result)
@@ -769,6 +779,15 @@ async fn sweep_imported_filtered_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
+    let operation_guard =
+        match crate::service::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network) {
+            Ok(guard) => guard,
+            Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+        };
+    let registry_lease = match operation_guard.registry_lease() {
+        Ok(lease) => lease,
+        Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+    };
     sweep_imported_filtered_wallet_reviewed(
         runtime,
         keys,
@@ -780,6 +799,7 @@ async fn sweep_imported_filtered_wallet(
         None,
         None,
         None,
+        &registry_lease,
     )
     .await
 }
@@ -796,13 +816,14 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
     reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
     reviewed_transparent_fee: Option<u64>,
     planned: Option<&ImportedExecutionPlan>,
+    registry_lease: &crate::service::NetworkRegistryLease,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome {
         sapling_empty_display_index: sapling_accounts.first().map(|account| account.0),
         ..Default::default()
     };
     let result = async {
-        let mut log = open_imported_broadcast_log(runtime)?;
+        let mut log = open_imported_broadcast_log(registry_lease)?;
         sweep_imported_sapling_leg(
             runtime,
             keys,
@@ -885,15 +906,16 @@ async fn sweep_imported_wallet_into(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
     outcome: &mut ImportedSweepOutcome,
-    reviewed_fees: (
-        Option<&std::collections::HashMap<AccountUuid, u64>>,
-        Option<u64>,
-    ),
-    planned: Option<&ImportedExecutionPlan>,
+    review: ImportedSweepReview<'_>,
 ) -> ZeckResult<()> {
     use crate::imported::imported_transparent_keys;
-    let (reviewed_sapling_fees, reviewed_transparent_fee) = reviewed_fees;
-    let mut log = open_imported_broadcast_log(runtime)?;
+    let ImportedSweepReview {
+        sapling_fees: reviewed_sapling_fees,
+        transparent_fee: reviewed_transparent_fee,
+        plan: planned,
+        registry_lease,
+    } = review;
+    let mut log = open_imported_broadcast_log(registry_lease)?;
 
     // Sapling first. A definite failure may leave the independent transparent
     // pool spendable, but an uncertain or retryable submission blocks it.

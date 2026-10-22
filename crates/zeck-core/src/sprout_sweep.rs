@@ -641,6 +641,139 @@ pub struct SweepOptions<'a> {
     pub confirmation_sources: &'a [crate::models::ConfirmationEndpoint],
 }
 
+/// Exact spend-capable checkpoint object reserved from review through sweep
+/// finalization. The lease prevents a second Argos process from replacing or
+/// deleting the path while the reviewed proposal is live.
+pub struct ScanCheckpointAuthority {
+    path: PathBuf,
+    generation: crate::sprout_scan_run::CheckpointGeneration,
+    _lease: crate::sprout_scan_run::CheckpointLease,
+}
+
+impl ScanCheckpointAuthority {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn generation(&self) -> &crate::sprout_scan_run::CheckpointGeneration {
+        &self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanCheckpointCleanup {
+    Removed,
+    AlreadyAbsent,
+    Retained(String),
+}
+
+/// Complete a cleanup whose durable start marker survived a crash. This is
+/// intentionally separate from proposal authority: the checkpoint may
+/// already be absent, while the journal contains all exact authority needed
+/// to finish the one previously authorized generation.
+pub fn resume_interrupted_scan_checkpoint_cleanup(
+    checkpoint: &Path,
+    journal: &SweepJournal,
+    network: crate::ZeckNetwork,
+) -> ZeckResult<Option<ScanCheckpointCleanup>> {
+    let lease = crate::sprout_scan_run::CheckpointLease::acquire(checkpoint)?;
+    let data_dir = journal
+        .path()
+        .parent()
+        .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
+    let _network_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
+    Ok(
+        match journal.resume_checkpoint_cleanup(&lease, checkpoint)? {
+            None => None,
+            Some(crate::sprout_sweep_journal::CheckpointCleanupResult::Removed) => {
+                Some(ScanCheckpointCleanup::Removed)
+            }
+            Some(crate::sprout_sweep_journal::CheckpointCleanupResult::AlreadyAbsent) => {
+                Some(ScanCheckpointCleanup::AlreadyAbsent)
+            }
+            Some(crate::sprout_sweep_journal::CheckpointCleanupResult::Retain { reason }) => {
+                Some(ScanCheckpointCleanup::Retained(reason))
+            }
+        },
+    )
+}
+
+/// Reserve and durably manifest a scan checkpoint before any prepared
+/// transaction or submission can be recorded for this proposal.
+pub fn prepare_scan_checkpoint_authority(
+    checkpoint: &Path,
+    reviewed_generation: &crate::sprout_scan_run::CheckpointGeneration,
+    journal: &mut SweepJournal,
+    notes: &[SpendableSproutNote],
+    network: crate::ZeckNetwork,
+) -> ZeckResult<ScanCheckpointAuthority> {
+    let lease = crate::sprout_scan_run::CheckpointLease::acquire(checkpoint)?;
+    journal.bind_checkpoint_namespace(&lease)?;
+    let data_dir = journal
+        .path()
+        .parent()
+        .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
+    let _network_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
+    lease.verify_for(checkpoint)?;
+    let generation = lease.generation(checkpoint)?;
+    lease.verify_for(checkpoint)?;
+    if &generation != reviewed_generation {
+        return Err(ZeckError::ScanNotReady(format!(
+            "checkpoint {} changed after the scan result was produced; rerun the scan before reviewing a sweep",
+            checkpoint.display()
+        )));
+    }
+    let outpoints = notes.iter().map(|note| note.outpoint).collect::<Vec<_>>();
+    let mut snapshot = journal.load_scoped_snapshot(&outpoints)?;
+    let mut source_note_ids = outpoints
+        .iter()
+        .map(note_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    source_note_ids.extend(snapshot.entries().map(|entry| note_id(&entry.outpoint)));
+    journal.record_checkpoint_manifest_ids(&mut snapshot, &generation, source_note_ids.clone())?;
+    Ok(ScanCheckpointAuthority {
+        path: checkpoint.to_path_buf(),
+        generation,
+        _lease: lease,
+    })
+}
+
+/// Finalize deletion under the network, checkpoint and journal locks. The
+/// caller supplies the just-completed sweep verdict so historical journal
+/// state alone can never trigger cleanup.
+pub fn finalize_scan_checkpoint(
+    authority: &ScanCheckpointAuthority,
+    journal: &SweepJournal,
+    network: crate::ZeckNetwork,
+    fresh_all_mined: bool,
+) -> ZeckResult<ScanCheckpointCleanup> {
+    if !fresh_all_mined {
+        return Ok(ScanCheckpointCleanup::Retained(
+            "not every transaction was freshly observed mined".into(),
+        ));
+    }
+    let data_dir = journal
+        .path()
+        .parent()
+        .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
+    let _network_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
+    match journal.finalize_checkpoint_cleanup(
+        &authority._lease,
+        &authority.generation,
+        &authority.path,
+    )? {
+        crate::sprout_sweep_journal::CheckpointCleanupResult::Retain { reason } => {
+            Ok(ScanCheckpointCleanup::Retained(reason))
+        }
+        crate::sprout_sweep_journal::CheckpointCleanupResult::Removed => {
+            Ok(ScanCheckpointCleanup::Removed)
+        }
+        crate::sprout_sweep_journal::CheckpointCleanupResult::AlreadyAbsent => {
+            Ok(ScanCheckpointCleanup::AlreadyAbsent)
+        }
+    }
+}
+
 /// What the sweep needs from the network: the tip, and a way to broadcast.
 /// lightwalletd in production; a script in tests, so the loop's decisions —
 /// which refusals it carries on past, which stop it — are exercised rather
@@ -870,10 +1003,11 @@ pub fn classify_sprout_notes<'a>(
         match journal.entry_for_note(&note.outpoint) {
             None => inventory.ready.push(note),
             Some(entry)
-                if matches!(
-                    entry.state,
-                    TxLifecycleState::Expired | TxLifecycleState::Rejected
-                ) =>
+                if journal.ready_for_new_plan_with_restored_source(&note.outpoint)
+                    && matches!(
+                        entry.state,
+                        TxLifecycleState::Expired | TxLifecycleState::Rejected
+                    ) =>
             {
                 inventory.ready.push(note);
                 inventory.terminal.push(entry.clone());
@@ -1637,6 +1771,7 @@ pub fn note_is_consistent(note: &SpendableSproutNote) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcast::{BroadcastStore as _, SubmissionDisposition};
     use crate::sprout::SproutPaymentAddress;
     use argos_wallet_import::keys::JsOutPoint;
 
@@ -1741,6 +1876,176 @@ mod tests {
                 output_index: 0,
             },
         }
+    }
+
+    #[test]
+    fn stale_scan_generation_cannot_manifest_or_delete_a_replacement_with_an_extra_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        std::fs::write(&checkpoint, b"scan result with one note").unwrap();
+        let reviewed = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let mut journal =
+            SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
+        let stale_note = lifecycle_note(1_000_000, 1);
+
+        let replacement = dir.path().join("replacement.checkpoint");
+        std::fs::write(
+            &replacement,
+            b"new scan result with one extra recovered note",
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &checkpoint).unwrap();
+
+        let err = match prepare_scan_checkpoint_authority(
+            &checkpoint,
+            &reviewed,
+            &mut journal,
+            std::slice::from_ref(&stale_note),
+            crate::ZeckNetwork::Mainnet,
+        ) {
+            Ok(_) => panic!("a stale result must not bind the replacement generation"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("changed after the scan result"), "{err}");
+        let snapshot = journal.load_or_migrate().unwrap();
+        assert!(snapshot.checkpoint_manifest(&reviewed).is_none());
+        assert_eq!(
+            std::fs::read(&checkpoint).unwrap(),
+            b"new scan result with one extra recovered note"
+        );
+    }
+
+    #[test]
+    fn production_restart_completes_a_crash_after_unlink_before_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        std::fs::write(&checkpoint, b"spend-capable checkpoint").unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let mut journal =
+            SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
+        let note = lifecycle_note(1_000_000, 2);
+        let authority = prepare_scan_checkpoint_authority(
+            &checkpoint,
+            &generation,
+            &mut journal,
+            std::slice::from_ref(&note),
+            crate::ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let transaction = fixture_transaction(701, 200);
+        journal
+            .scoped_store(
+                crate::sprout_sweep_journal::JournalNoteContext {
+                    outpoint: note.outpoint,
+                    value_zatoshis: note.note.value,
+                },
+                &mut snapshot,
+            )
+            .persist_prepared(&transaction)
+            .unwrap();
+        let observation = mined(transaction.expiry_height, 1, 101);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&observation),
+                )
+                .unwrap();
+        }
+
+        crate::sprout_sweep_journal::fail_after_checkpoint_discard(&checkpoint);
+        let err = finalize_scan_checkpoint(&authority, &journal, crate::ZeckNetwork::Mainnet, true)
+            .expect_err("the injected crash boundary must interrupt completion")
+            .to_string();
+        assert!(err.contains("after checkpoint discard"), "{err}");
+        assert!(!checkpoint.exists());
+        drop(authority);
+
+        assert_eq!(
+            resume_interrupted_scan_checkpoint_cleanup(
+                &checkpoint,
+                &journal,
+                crate::ZeckNetwork::Mainnet
+            )
+            .unwrap(),
+            Some(ScanCheckpointCleanup::AlreadyAbsent)
+        );
+        let restored = journal.load_or_migrate().unwrap();
+        assert!(restored.checkpoint_was_discarded(&generation));
+        assert!(!restored.ready_for_new_plan(&note.outpoint));
+    }
+
+    #[test]
+    fn a_new_current_journal_entry_after_prepare_retains_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        std::fs::write(&checkpoint, b"spend-capable checkpoint").unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let mut journal =
+            SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
+        let first = lifecycle_note(1_000_000, 3);
+        let authority = prepare_scan_checkpoint_authority(
+            &checkpoint,
+            &generation,
+            &mut journal,
+            std::slice::from_ref(&first),
+            crate::ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let first_tx = fixture_transaction(702, 200);
+        journal
+            .scoped_store(
+                crate::sprout_sweep_journal::JournalNoteContext {
+                    outpoint: first.outpoint,
+                    value_zatoshis: first.note.value,
+                },
+                &mut snapshot,
+            )
+            .persist_prepared(&first_tx)
+            .unwrap();
+        let mature = mined(first_tx.expiry_height, 1, 101);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    first_tx.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+
+        let second = lifecycle_note(2_000_000, 4);
+        let second_tx = fixture_transaction(703, 210);
+        journal
+            .scoped_store(
+                crate::sprout_sweep_journal::JournalNoteContext {
+                    outpoint: second.outpoint,
+                    value_zatoshis: second.note.value,
+                },
+                &mut snapshot,
+            )
+            .persist_prepared(&second_tx)
+            .unwrap();
+
+        assert!(matches!(
+            finalize_scan_checkpoint(
+                &authority,
+                &journal,
+                crate::ZeckNetwork::Mainnet,
+                true
+            )
+            .unwrap(),
+            ScanCheckpointCleanup::Retained(reason)
+                if reason.contains("current checkpoint notes differ")
+        ));
+        assert!(checkpoint.exists());
     }
 
     /// The fee must count four actions, not three. A Sapling bundle pads to
@@ -2329,7 +2634,7 @@ mod tests {
     fn prepared_record_is_durable_before_send_is_invoked() {
         let dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(dir.path());
-        let inspect = journal.clone();
+        let inspect = lifecycle_journal(dir.path());
         let notes = [lifecycle_note(1_000_000, 2)];
         let mut node = LifecycleNode::accepted(100, 1);
         node.before_send = Some(Box::new(move |raw| {

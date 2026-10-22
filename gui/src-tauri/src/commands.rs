@@ -1373,6 +1373,8 @@ pub async fn propose_wallet_sprout_sweep(
             confirmation_sources,
             journal,
             wallet_checkpoint: Some(wallet_checkpoint),
+            checkpoint_authority: None,
+            _checkpoint_reservation: None,
             tip_warning: None,
         },
         plan,
@@ -1443,6 +1445,24 @@ async fn execute_reviewed_sprout_sweep(
     .map_err(|err| err.to_string())?;
 
     apply_sprout_tip_warning(&mut outcome, intent.tip_warning);
+    if let Some(authority) = &intent.checkpoint_authority {
+        match argos_core::sprout_sweep::finalize_scan_checkpoint(
+            authority,
+            &intent.journal,
+            intent.network,
+            outcome.fresh_all_mined,
+        ) {
+            Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::Removed)
+            | Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::AlreadyAbsent) => {}
+            Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::Retained(reason)) => {
+                outcome.fresh_all_mined = false;
+                outcome
+                    .warnings
+                    .push(format!("Checkpoint retained: {reason}."));
+            }
+            Err(err) => apply_checkpoint_cleanup_error(&mut outcome, &err),
+        }
+    }
     if let Some(warning) = fresh_checkpoint_warning {
         outcome.warnings.push(warning);
     }
@@ -1457,6 +1477,16 @@ fn apply_sprout_tip_warning(
         outcome.fresh_all_mined = false;
         outcome.warnings.insert(0, warning);
     }
+}
+
+fn apply_checkpoint_cleanup_error(
+    outcome: &mut argos_core::sprout_sweep::SproutSweepOutcome,
+    err: &dyn std::fmt::Display,
+) {
+    outcome.fresh_all_mined = false;
+    outcome
+        .warnings
+        .push(format!("Checkpoint cleanup failed: {err}"));
 }
 
 #[tauri::command]
@@ -2081,11 +2111,34 @@ pub async fn propose_sprout_scan_sweep(
     destination: String,
 ) -> Result<ReviewedSproutSweep, String> {
     ensure_tos_accepted(&app)?;
-    let (material, _checkpoint_reservation) =
+    let (material, checkpoint_reservation) =
         begin_sprout_catchup(&state.reviewed_intent, &scan_handle)?;
     // Checked before the catch-up: an address with no Sapling receiver or a
     // server address that cannot work should fail here, not after it.
     validate_sweep_request(&destination, material.network, &material.lightwalletd_url)?;
+    let dir = material
+        .checkpoint
+        .parent()
+        .ok_or("invalid Sprout checkpoint location")?;
+    let mut journal =
+        argos_core::sprout_sweep::SweepJournal::for_keys(dir, &material.keys, material.network);
+    if let Some(recovered) = argos_core::sprout_sweep::resume_interrupted_scan_checkpoint_cleanup(
+        &material.checkpoint,
+        &journal,
+        material.network,
+    )
+    .map_err(|err| err.to_string())?
+    {
+        return Err(match recovered {
+            argos_core::sprout_sweep::ScanCheckpointCleanup::Removed
+            | argos_core::sprout_sweep::ScanCheckpointCleanup::AlreadyAbsent => {
+                "Argos completed an interrupted cleanup of the prior Sprout checkpoint. Start a fresh scan before proposing another sweep.".to_owned()
+            }
+            argos_core::sprout_sweep::ScanCheckpointCleanup::Retained(reason) => {
+                format!("interrupted checkpoint cleanup was retained: {reason}")
+            }
+        });
+    }
     // The resume continues under the bound the scan actually used, read
     // from its checkpoint, never one supplied by the form: the birthday
     // there may have changed since the scan, and a lower one would make the
@@ -2131,12 +2184,6 @@ pub async fn propose_sprout_scan_sweep(
     )
     .await
     .map_err(|err| err.to_string())?;
-    let dir = material
-        .checkpoint
-        .parent()
-        .ok_or("invalid Sprout checkpoint location")?;
-    let journal =
-        argos_core::sprout_sweep::SweepJournal::for_keys(dir, &material.keys, material.network);
     let outpoints = result
         .notes
         .iter()
@@ -2157,6 +2204,17 @@ pub async fn propose_sprout_scan_sweep(
     if plan_empty {
         return Err("the saved scan found no unspent Sprout notes to sweep".into());
     }
+    let checkpoint_authority = argos_core::sprout_sweep::prepare_scan_checkpoint_authority(
+        &material.checkpoint,
+        result
+            .checkpoint_generation
+            .as_ref()
+            .ok_or("the completed scan did not return a checkpoint generation")?,
+        &mut journal,
+        &result.notes,
+        material.network,
+    )
+    .map_err(|err| err.to_string())?;
     state.reviewed_intent.insert_proposal(
         SproutSweepIntent {
             source: SproutIntentSource::Scan(scan_handle),
@@ -2167,6 +2225,8 @@ pub async fn propose_sprout_scan_sweep(
             confirmation_sources: material.confirmation_sources,
             journal,
             wallet_checkpoint: None,
+            checkpoint_authority: Some(checkpoint_authority),
+            _checkpoint_reservation: Some(checkpoint_reservation),
             tip_warning,
         },
         plan,
@@ -3964,6 +4024,8 @@ mod tests {
                         confirmation_sources: Vec::new(),
                         journal: test_sprout_journal(10),
                         wallet_checkpoint: None,
+                        checkpoint_authority: None,
+                        _checkpoint_reservation: None,
                         tip_warning: None,
                     },
                     SproutSweepPreviewData {
@@ -4235,6 +4297,22 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(report.warnings, vec!["journal"]);
+
+        let mut outcome = argos_core::sprout_sweep::SproutSweepOutcome {
+            fresh_all_mined: true,
+            ..Default::default()
+        };
+        apply_checkpoint_cleanup_error(&mut outcome, &"directory sync failed");
+        let report = sprout_sweep_report(outcome);
+        assert!(!report.fresh_all_mined);
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("Checkpoint cleanup failed")
+                && warning.contains("directory sync failed")
+        }));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning == SPROUT_KEEP_SOURCE_WARNING));
     }
 
     #[test]

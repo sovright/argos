@@ -1261,6 +1261,16 @@ fn apply_sprout_tip_warning(
     }
 }
 
+fn apply_checkpoint_cleanup_error(
+    outcome: &mut argos_core::sprout_sweep::SproutSweepOutcome,
+    err: &dyn std::fmt::Display,
+) {
+    outcome.fresh_all_mined = false;
+    outcome
+        .warnings
+        .push(format!("Checkpoint cleanup failed: {err}"));
+}
+
 /// Scan the chain for a set of Sprout keys, then optionally sweep what it finds.
 #[allow(clippy::too_many_arguments)]
 async fn scan_sprout(
@@ -1313,6 +1323,25 @@ async fn scan_sprout(
     let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
 
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
+    let mut journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys, network);
+    if let Some(recovered) = argos_core::sprout_sweep::resume_interrupted_scan_checkpoint_cleanup(
+        &checkpoint,
+        &journal,
+        network,
+    )? {
+        match recovered {
+            argos_core::sprout_sweep::ScanCheckpointCleanup::Removed
+            | argos_core::sprout_sweep::ScanCheckpointCleanup::AlreadyAbsent => {
+                println!(
+                    "Completed an interrupted cleanup of the prior Sprout scan checkpoint. Run the scan again to create a fresh source."
+                );
+                return Ok(());
+            }
+            argos_core::sprout_sweep::ScanCheckpointCleanup::Retained(reason) => {
+                anyhow::bail!("interrupted checkpoint cleanup was retained: {reason}")
+            }
+        }
+    }
     // Worded for what exists: nothing is written until the first
     // checkpoint, and a scan that has not started must not look saved.
     eprintln!(
@@ -1380,7 +1409,6 @@ async fn scan_sprout(
     println!("  Total             {}", format_zec(result.total_value()));
     println!();
 
-    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys, network);
     let outpoints = result
         .notes
         .iter()
@@ -1439,6 +1467,15 @@ async fn scan_sprout(
             .map(String::as_str)
             .collect::<Vec<_>>(),
     )?;
+    let checkpoint_authority = argos_core::sprout_sweep::prepare_scan_checkpoint_authority(
+        &checkpoint,
+        result.checkpoint_generation.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("the completed scan did not return a checkpoint generation")
+        })?,
+        &mut journal,
+        &result.notes,
+        network,
+    )?;
     let mut outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &result.notes,
         network,
@@ -1454,6 +1491,28 @@ async fn scan_sprout(
     )
     .await?;
     apply_sprout_tip_warning(&mut outcome, tip_warning);
+
+    let checkpoint_cleanup = argos_core::sprout_sweep::finalize_scan_checkpoint(
+        &checkpoint_authority,
+        &journal,
+        network,
+        outcome.fresh_all_mined,
+    );
+    match checkpoint_cleanup {
+        Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::Removed)
+        | Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::AlreadyAbsent) => {
+            println!("The fully mined scan checkpoint was removed.");
+        }
+        Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::Retained(reason)) => {
+            outcome.fresh_all_mined = false;
+            outcome
+                .warnings
+                .push(format!("Checkpoint retained: {reason}."));
+        }
+        Err(err) => {
+            apply_checkpoint_cleanup_error(&mut outcome, &err);
+        }
+    }
 
     print_sprout_transactions(&outcome);
     print_sprout_nu7_broadcast_warning(network, &outcome);
@@ -4195,6 +4254,14 @@ mod tests {
         apply_sprout_tip_warning(&mut outcome, Some("tip coverage is incomplete".to_owned()));
         assert!(!outcome.fresh_all_mined);
         assert_eq!(outcome.warnings, vec!["tip coverage is incomplete"]);
+
+        let err = anyhow::anyhow!("directory sync failed");
+        apply_checkpoint_cleanup_error(&mut outcome, &err);
+        assert!(!outcome.fresh_all_mined);
+        assert!(outcome.warnings.iter().any(|warning| {
+            warning.contains("Checkpoint cleanup failed")
+                && warning.contains("directory sync failed")
+        }));
     }
 
     #[test]

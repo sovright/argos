@@ -1069,14 +1069,53 @@ fn clear_cleanup_marker(root: &std::path::Path) -> ZeckResult<()> {
 /// after syncing and must not recursively acquire the same SQLite lock.
 pub struct NetworkOperationGuard {
     _connection: rusqlite::Connection,
+    namespace: crate::private_fs::NamespaceLease,
+    compatibility_lock: crate::private_fs::RetainedNamespaceChild,
+    compatibility_lock_path: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     network: crate::models::ZeckNetwork,
+}
+
+/// Retained authority for registry child operations after the compatibility
+/// SQLite guard has been acquired. This carries only retained file handles,
+/// so async sweep futures do not borrow the non-Sync SQLite connection.
+pub(crate) struct NetworkRegistryLease {
+    namespace: crate::private_fs::NamespaceLease,
+    compatibility_lock: crate::private_fs::RetainedNamespaceChild,
+    compatibility_lock_path: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    network: crate::models::ZeckNetwork,
+}
+
+impl NetworkRegistryLease {
+    pub(crate) fn verify(&self) -> ZeckResult<()> {
+        verify_network_lock_identity(&self.namespace, &self.compatibility_lock)
+    }
+
+    pub(crate) fn reopen_broadcast_log(&self) -> ZeckResult<DurableBroadcastLog> {
+        self.verify()?;
+        let registry = DurableBroadcastLog::open_in_namespace(
+            network_broadcast_log_path(&self.data_dir, self.network)?,
+            &self.namespace,
+            &self.compatibility_lock_path,
+        )?;
+        self.verify()?;
+        Ok(registry)
+    }
 }
 
 impl NetworkOperationGuard {
     pub fn acquire(
         data_dir: &std::path::Path,
         network: crate::models::ZeckNetwork,
+    ) -> ZeckResult<Self> {
+        Self::acquire_with_before_compatibility_create(data_dir, network, |_| {})
+    }
+
+    fn acquire_with_before_compatibility_create<F: FnOnce(&std::path::Path)>(
+        data_dir: &std::path::Path,
+        network: crate::models::ZeckNetwork,
+        before_compatibility_create: F,
     ) -> ZeckResult<Self> {
         let data_dir = canonical_workspace_identity(data_dir)?;
         let network_root = network_registry_root(&data_dir, network)?;
@@ -1086,16 +1125,35 @@ impl NetworkOperationGuard {
                 network_root.display()
             ))
         })?;
+        // Keep the stable namespace lease separate from SQLite's compatibility
+        // database. On macOS, flocking the SQLite file itself conflicts with
+        // SQLite's own fcntl locks even within this process.
+        let lease_path = network_root.join(".workspace-operations.lock");
+        let namespace = crate::private_fs::NamespaceLease::acquire(&network_root, &lease_path)
+            .map_err(|err| {
+                ZeckError::ScanNotReady(format!(
+                    "network registry {} is in use by another process: {err}",
+                    network_root.display()
+                ))
+            })?;
         let path = network_root.join(".workspace-operations.sqlite");
-        drop(
-            crate::private_fs::open_private_file(&path, crate::private_fs::PrivateOpenMode::Append)
-                .map_err(|err| {
-                    ZeckError::Storage(format!("opening workspace lock {}: {err}", path.display()))
-                })?,
-        );
-        let connection = rusqlite::Connection::open(&path).map_err(|err| {
+        before_compatibility_create(&path);
+        let compatibility_lock = namespace
+            .open_or_create_retained_child(&path)
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "opening anchored workspace lock {}: {err}",
+                    path.display()
+                ))
+            })?;
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|err| {
             ZeckError::Storage(format!("opening workspace lock {}: {err}", path.display()))
         })?;
+        verify_network_lock_identity(&namespace, &compatibility_lock)?;
         connection
             .busy_timeout(Duration::ZERO)
             .map_err(|err| ZeckError::Storage(format!("setting workspace lock timeout: {err}")))?;
@@ -1107,14 +1165,41 @@ impl NetworkOperationGuard {
                     network_root.display()
                 ))
             })?;
+        verify_network_lock_identity(&namespace, &compatibility_lock)?;
         Ok(Self {
             _connection: connection,
+            namespace,
+            compatibility_lock,
+            compatibility_lock_path: path,
             data_dir,
             network,
         })
     }
 
+    pub(crate) fn verify(&self) -> ZeckResult<()> {
+        verify_network_lock_identity(&self.namespace, &self.compatibility_lock)
+    }
+
+    pub(crate) fn registry_lease(&self) -> ZeckResult<NetworkRegistryLease> {
+        self.verify()?;
+        Ok(NetworkRegistryLease {
+            namespace: self.namespace.try_clone_authority().map_err(|err| {
+                ZeckError::Storage(format!("retaining network registry namespace: {err}"))
+            })?,
+            compatibility_lock: self
+                .namespace
+                .retain_child(&self.compatibility_lock_path)
+                .map_err(|err| {
+                    ZeckError::Storage(format!("retaining workspace compatibility lock: {err}"))
+                })?,
+            compatibility_lock_path: self.compatibility_lock_path.clone(),
+            data_dir: self.data_dir.clone(),
+            network: self.network,
+        })
+    }
+
     pub fn broadcast_log_path(&self) -> ZeckResult<std::path::PathBuf> {
+        self.verify()?;
         network_broadcast_log_path(&self.data_dir, self.network)
     }
 
@@ -1135,12 +1220,35 @@ impl NetworkOperationGuard {
         self.open_broadcast_log_with_current(Some(current_legacy_path))
     }
 
+    /// Reopen only the registry while this guard remains held. Execution
+    /// routes use this after the initial migration log has been converted
+    /// into retained legacy-source guards, so recursively locking those
+    /// sources would be both unnecessary and incorrect.
+    #[cfg(test)]
+    pub(crate) fn reopen_broadcast_log(&self) -> ZeckResult<DurableBroadcastLog> {
+        self.verify()?;
+        let registry = DurableBroadcastLog::open_in_namespace(
+            self.broadcast_log_path()?,
+            &self.namespace,
+            &self.compatibility_lock_path,
+        )?;
+        self.verify()?;
+        Ok(registry)
+    }
+
     fn open_broadcast_log_with_current(
         &self,
         current_legacy_path: Option<&std::path::Path>,
     ) -> ZeckResult<DurableBroadcastLog> {
-        let mut registry = DurableBroadcastLog::open(self.broadcast_log_path()?)?;
+        self.verify()?;
+        let mut registry = DurableBroadcastLog::open_in_namespace(
+            self.broadcast_log_path()?,
+            &self.namespace,
+            &self.compatibility_lock_path,
+        )?;
+        self.verify()?;
         let mut sources = discover_legacy_broadcast_logs(&self.data_dir, self.network)?;
+        self.verify()?;
         if let Some(current_legacy_path) = current_legacy_path {
             let parent = current_legacy_path.parent().ok_or_else(|| {
                 ZeckError::Storage(format!(
@@ -1156,18 +1264,199 @@ impl NetworkOperationGuard {
             })?;
             // Canonicalize the parent, not the file: the held-source check
             // must still see and reject a symlink at the JSONL path itself.
+            self.verify()?;
             sources.push(canonical_workspace_identity(parent)?.join(name));
+            self.verify()?;
         }
         sources.sort();
         sources.dedup();
         for path in sources {
+            self.verify()?;
             if path.is_file() {
                 registry.import_legacy_log(&path)?;
             } else {
                 registry.hold_legacy_source(&path)?;
             }
+            self.verify()?;
         }
+        self.verify()?;
         Ok(registry)
+    }
+}
+
+fn verify_network_lock_identity(
+    namespace: &crate::private_fs::NamespaceLease,
+    compatibility_lock: &crate::private_fs::RetainedNamespaceChild,
+) -> ZeckResult<()> {
+    namespace.verify_current().map_err(|err| {
+        ZeckError::ScanNotReady(format!("network registry namespace was replaced: {err}"))
+    })?;
+    compatibility_lock.verify_current().map_err(|err| {
+        ZeckError::ScanNotReady(format!("workspace lock path was replaced: {err}"))
+    })?;
+    namespace.verify_current().map_err(|err| {
+        ZeckError::ScanNotReady(format!(
+            "network registry namespace changed while its compatibility lock was checked: {err}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod network_namespace_tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::broadcast::{BroadcastStore, PreparedTransaction};
+    use crate::models::ZeckNetwork;
+    #[cfg(unix)]
+    use std::io::Write;
+
+    #[cfg(unix)]
+    fn prepared(byte: u8) -> PreparedTransaction {
+        PreparedTransaction {
+            txid: TxId::from_bytes([byte; 32]),
+            raw_tx: vec![byte],
+            fee_zatoshis: 10_000,
+            expiry_height: Some(100),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_log_refuses_replaced_parent_without_touching_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let mut log = guard.reopen_broadcast_log().unwrap();
+        let root = network_registry_root(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let detached = root.with_extension("detached");
+        std::fs::rename(&root, &detached).unwrap();
+        crate::private_fs::create_private_dir_all(&root).unwrap();
+        let sentinel = root.join("replacement-sentinel");
+        crate::private_fs::write_private_file(&sentinel, b"replacement-parent").unwrap();
+
+        let err = log
+            .persist_prepared(&prepared(201))
+            .expect_err("a retained registry must reject a replaced parent namespace");
+        assert!(err.to_string().contains("replaced"), "{err}");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"replacement-parent");
+        assert!(
+            !root
+                .join(crate::broadcast::BROADCAST_LOG_FILE_NAME)
+                .exists(),
+            "the replacement namespace must remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_compatibility_lock_creation_cannot_follow_a_replaced_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement_root = std::cell::RefCell::new(None);
+        let result = NetworkOperationGuard::acquire_with_before_compatibility_create(
+            dir.path(),
+            ZeckNetwork::Mainnet,
+            |sqlite_path| {
+                let root = sqlite_path.parent().unwrap().to_path_buf();
+                let detached = root.with_extension("detached-before-compatibility-create");
+                std::fs::rename(&root, &detached).unwrap();
+                crate::private_fs::create_private_dir_all(&root).unwrap();
+                crate::private_fs::write_private_file(
+                    &root.join("replacement-sentinel"),
+                    b"replacement-before-create",
+                )
+                .unwrap();
+                *replacement_root.borrow_mut() = Some(root);
+            },
+        );
+        let err = result
+            .err()
+            .expect("anchored compatibility creation must reject a replaced parent");
+        assert!(err.to_string().contains("replaced"), "{err}");
+        let root = replacement_root.into_inner().unwrap();
+        assert_eq!(
+            std::fs::read(root.join("replacement-sentinel")).unwrap(),
+            b"replacement-before-create"
+        );
+        assert!(!root.join(".workspace-operations.sqlite").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_log_refuses_replaced_sidecar_without_touching_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let mut log = guard.reopen_broadcast_log().unwrap();
+        let root = network_registry_root(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let lock_path = root.join(".workspace-operations.sqlite");
+        std::fs::remove_file(&lock_path).unwrap();
+        let mut replacement = crate::private_fs::open_private_file(
+            &lock_path,
+            crate::private_fs::PrivateOpenMode::Truncate,
+        )
+        .unwrap();
+        replacement.write_all(b"replacement-sidecar").unwrap();
+        replacement.sync_all().unwrap();
+
+        let second = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet)
+            .err()
+            .expect("the retained parent/authority lock must refuse a split-brain guard");
+        assert!(second.to_string().contains("in use"), "{second}");
+
+        let err = log
+            .persist_prepared(&prepared(202))
+            .expect_err("a retained registry must reject a replaced lock sidecar");
+        assert!(err.to_string().contains("replaced"), "{err}");
+        assert_eq!(std::fs::read(&lock_path).unwrap(), b"replacement-sidecar");
+        assert!(
+            !root
+                .join(crate::broadcast::BROADCAST_LOG_FILE_NAME)
+                .exists(),
+            "a revoked sidecar must prevent registry mutation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_log_refuses_replaced_data_directory_without_touching_either_tree() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("data");
+        crate::private_fs::create_private_dir_all(&data_dir).unwrap();
+        let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
+        let mut log = guard.reopen_broadcast_log().unwrap();
+        let detached_data = outer.path().join("detached-data");
+        std::fs::rename(&data_dir, &detached_data).unwrap();
+        let replacement_root = data_dir.join("mainnet/.broadcast-registry");
+        crate::private_fs::create_private_dir_all(&replacement_root).unwrap();
+        let sentinel = replacement_root.join("replacement-sentinel");
+        crate::private_fs::write_private_file(&sentinel, b"replacement-data-dir").unwrap();
+
+        let err = log
+            .persist_prepared(&prepared(203))
+            .expect_err("an ancestor replacement must revoke the old registry authority");
+        assert!(err.to_string().contains("replaced"), "{err}");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"replacement-data-dir");
+        assert!(!replacement_root
+            .join(crate::broadcast::BROADCAST_LOG_FILE_NAME)
+            .exists());
+        let detached_root = detached_data.join("mainnet/.broadcast-registry");
+        assert!(
+            !detached_root
+                .join(crate::broadcast::BROADCAST_LOG_FILE_NAME)
+                .exists(),
+            "revoked authority must not mutate its detached old tree"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_registry_handles_deny_parent_and_sidecar_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let root = network_registry_root(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let detached = root.with_extension("detached");
+        assert!(std::fs::rename(&root, &detached).is_err());
+        assert!(std::fs::remove_file(root.join(".workspace-operations.lock")).is_err());
+        assert!(std::fs::remove_file(root.join(".workspace-operations.sqlite")).is_err());
+        guard.verify().unwrap();
     }
 }
 
@@ -1890,6 +2179,7 @@ impl RecoveryService {
         // Per-leg signers reopen the registry. Release only that registry
         // lock, retaining every legacy source lock through the entire route.
         let _legacy_source_guards = global_log.into_legacy_source_guards();
+        let registry_lease = _operation_lock.registry_lease()?;
         if self
             .reconciliation_rescan_required
             .lock()
@@ -1921,7 +2211,12 @@ impl RecoveryService {
             ));
         }
         let outcome = self
-            .execute_sweep_locked(session, proposal_id, pause_between_broadcasts)
+            .execute_sweep_locked(
+                session,
+                proposal_id,
+                pause_between_broadcasts,
+                &registry_lease,
+            )
             .await;
         if let Ok(ref completed) = outcome {
             self.last_sweep_outcomes
@@ -1937,6 +2232,7 @@ impl RecoveryService {
         session: SharedScanSession,
         proposal_id: &SweepProposalId,
         pause_between_broadcasts: Option<std::time::Duration>,
+        registry_lease: &NetworkRegistryLease,
     ) -> ZeckResult<SweepOutcome> {
         // The token is consumed while holding only the in-memory store lock.
         // No wallet, proving, or network operation runs under this lock.
@@ -2087,6 +2383,7 @@ impl RecoveryService {
                     &request,
                     &backend_legs,
                     &exact_fees,
+                    registry_lease,
                 )
                 .await;
             }
@@ -2142,6 +2439,7 @@ impl RecoveryService {
                     Some(&reviewed_sapling_fees),
                     reviewed_transparent_fee,
                     Some(&imported_plan),
+                    registry_lease,
                 )
                 .await;
             let imported_fee = at_risk_fee_total(&imported.transactions)?;
@@ -2163,6 +2461,7 @@ impl RecoveryService {
                 backend_legs,
                 tracked_accounts,
                 exact_fees,
+                registry_lease,
             )
             .await;
             return merge_combined_sweep_outcomes(imported_outcome, hd_outcome);
@@ -2177,6 +2476,7 @@ impl RecoveryService {
             backend_legs,
             tracked_accounts,
             exact_fees,
+            registry_lease,
         )
         .await
     }
@@ -3487,6 +3787,7 @@ async fn execute_sweep_for_session(
     backend_legs: Vec<ExactSweepLeg>,
     tracked_accounts: Vec<TrackedAccount>,
     exact_fees: ExactLegFees,
+    registry_lease: &NetworkRegistryLease,
 ) -> ZeckResult<SweepOutcome> {
     let (runtime, workspace, progress) = {
         let guard = session.state.lock().await;
@@ -3496,10 +3797,7 @@ async fn execute_sweep_for_session(
             .ok_or_else(|| ZeckError::ScanNotReady("wallet workspace is unavailable".to_owned()))?;
         (session.runtime.clone(), workspace, guard.progress.clone())
     };
-    let mut broadcast_log = DurableBroadcastLog::open(network_broadcast_log_path(
-        &runtime.data_dir,
-        runtime.network,
-    )?)?;
+    let mut broadcast_log = registry_lease.reopen_broadcast_log()?;
     if let Some(txid) = broadcast_log.blocking_submission() {
         return Err(ZeckError::Broadcast(format!(
             "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before starting another sweep leg"
@@ -4690,6 +4988,7 @@ async fn sweep_imported_session(
     request: &SweepRequest,
     backend_legs: &[ExactSweepLeg],
     exact_fees: &ExactLegFees,
+    registry_lease: &NetworkRegistryLease,
 ) -> ZeckResult<SweepOutcome> {
     let reviewed_sapling_fees = exact_fees.imported_sapling_map();
     let reviewed_transparent_fee = exact_fees.0.get(&ExactFeeKey::DirectTransparent).copied();
@@ -4699,9 +4998,12 @@ async fn sweep_imported_session(
         keys,
         &request.destination,
         request.max_fee_zatoshis,
-        Some(&reviewed_sapling_fees),
-        reviewed_transparent_fee,
-        Some(&imported_plan),
+        crate::imported_sweep::ImportedSweepReview {
+            sapling_fees: Some(&reviewed_sapling_fees),
+            transparent_fee: reviewed_transparent_fee,
+            plan: Some(&imported_plan),
+            registry_lease,
+        },
     )
     .await;
 

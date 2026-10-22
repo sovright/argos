@@ -1,9 +1,8 @@
 //! Durable, versioned Sprout sweep transactions, keyed by note and source.
 
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::{Cursor, Write},
+    collections::{BTreeSet, HashMap, HashSet},
+    io::Cursor,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -21,13 +20,23 @@ use crate::{
     },
     error::{ZeckError, ZeckResult},
     models::ZeckNetwork,
-    private_fs::{open_private_file, PrivateOpenMode},
-    sprout_scan_run::{full_key_set_fingerprint, key_set_fingerprint},
+    private_fs::{NamespaceLease, PrivateObjectId},
+    sprout_scan::SPROUT_REORG_WINDOW,
+    sprout_scan_run::{full_key_set_fingerprint, key_set_fingerprint, CheckpointGeneration},
 };
 
-pub const SPROUT_SWEEP_JOURNAL_VERSION: u32 = 2;
+pub const SPROUT_SWEEP_JOURNAL_VERSION: u32 = 3;
 pub const SPROUT_EXPIRY_DELTA: u32 = 40;
 pub type SproutNoteId = ([u8; 32], u64, u8);
+
+#[cfg(test)]
+static FAIL_AFTER_CHECKPOINT_DISCARD: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_after_checkpoint_discard(path: &Path) {
+    *FAIL_AFTER_CHECKPOINT_DISCARD.lock().unwrap() = Some(path.to_path_buf());
+}
 
 pub fn note_id(outpoint: &JsOutPoint) -> SproutNoteId {
     (outpoint.txid, outpoint.js_index, outpoint.output_index)
@@ -49,23 +58,75 @@ fn journal_error(message: impl Into<String>) -> ZeckError {
 /// legacy writer and v2 journal take this same SQLite process lock.
 pub(crate) fn with_sweep_journal_lock<T>(
     path: &Path,
-    operation: impl FnOnce() -> ZeckResult<T>,
+    namespace: Option<&NamespaceLease>,
+    operation: impl FnOnce(&NamespaceLease) -> ZeckResult<T>,
 ) -> ZeckResult<T> {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".lock.sqlite");
-    let lock_path = PathBuf::from(name);
-    drop(
-        open_private_file(&lock_path, PrivateOpenMode::Append).map_err(|err| {
+    let mut sqlite_name = path.as_os_str().to_os_string();
+    sqlite_name.push(".lock.sqlite");
+    let sqlite_path = PathBuf::from(sqlite_name);
+    let mut authority_name = path.as_os_str().to_os_string();
+    authority_name.push(".lock");
+    let authority_path = PathBuf::from(authority_name);
+    let parent = path
+        .parent()
+        .ok_or_else(|| journal_error("Sprout journal lock has no parent"))?;
+    let owned_namespace;
+    let namespace = if let Some(namespace) = namespace {
+        if namespace.parent_path() != parent {
+            return Err(journal_error(format!(
+                "sweep journal {} is not bound to its retained namespace",
+                path.display()
+            )));
+        }
+        namespace
+    } else {
+        owned_namespace = crate::private_fs::NamespaceLease::acquire(parent, &authority_path)
+            .map_err(|err| {
+                journal_error(format!(
+                    "opening sweep journal namespace {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        &owned_namespace
+    };
+    namespace
+        .verify_current()
+        .map_err(|err| journal_error(format!("verifying sweep journal namespace: {err}")))?;
+    let child_lock = if namespace.lock_path() == authority_path {
+        None
+    } else {
+        Some(
+            namespace
+                .acquire_child_lock(&authority_path)
+                .map_err(|err| {
+                    journal_error(format!(
+                        "locking sweep journal sidecar {}: {err}",
+                        authority_path.display()
+                    ))
+                })?,
+        )
+    };
+    let sqlite_child = namespace
+        .open_or_create_retained_child(&sqlite_path)
+        .map_err(|err| {
             journal_error(format!(
-                "opening sweep journal lock {}: {err}",
-                lock_path.display()
+                "retaining sweep journal compatibility lock {}: {err}",
+                sqlite_path.display()
             ))
-        })?,
-    );
-    let connection = rusqlite::Connection::open(&lock_path).map_err(|err| {
+        })?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &sqlite_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .map_err(|err| {
         journal_error(format!(
             "opening sweep journal lock {}: {err}",
-            lock_path.display()
+            sqlite_path.display()
+        ))
+    })?;
+    sqlite_child.verify_current().map_err(|err| {
+        journal_error(format!(
+            "sweep journal compatibility lock changed while opening: {err}"
         ))
     })?;
     connection
@@ -76,9 +137,52 @@ pub(crate) fn with_sweep_journal_lock<T>(
         .map_err(|err| {
             journal_error(format!("sweep journal {} is in use: {err}", path.display()))
         })?;
-    let result = operation();
+    sqlite_child.verify_current().map_err(|err| {
+        journal_error(format!(
+            "sweep journal compatibility lock changed while locking: {err}"
+        ))
+    })?;
+    namespace.verify_current().map_err(|err| {
+        journal_error(format!(
+            "sweep journal namespace changed while locking: {err}"
+        ))
+    })?;
+    if let Some(child_lock) = child_lock.as_ref() {
+        child_lock.verify_current().map_err(|err| {
+            journal_error(format!(
+                "sweep journal sidecar changed while locking: {err}"
+            ))
+        })?;
+    }
+    let result = operation(namespace);
+    let verified = namespace.verify_current().map_err(|err| {
+        journal_error(format!(
+            "sweep journal namespace changed during operation: {err}"
+        ))
+    });
+    let child_verified = child_lock
+        .as_ref()
+        .map(|child_lock| {
+            child_lock.verify_current().map_err(|err| {
+                journal_error(format!(
+                    "sweep journal sidecar changed during operation: {err}"
+                ))
+            })
+        })
+        .transpose();
+    let sqlite_verified = sqlite_child.verify_current().map_err(|err| {
+        journal_error(format!(
+            "sweep journal compatibility lock changed during operation: {err}"
+        ))
+    });
     drop(connection);
-    result
+    match result {
+        Err(err) => Err(err),
+        Ok(value) => verified
+            .and(child_verified.map(|_| ()))
+            .and(sqlite_verified)
+            .map(|()| value),
+    }
 }
 
 fn validate_prepared(tx: &PreparedTransaction) -> ZeckResult<()> {
@@ -175,6 +279,51 @@ enum SproutJournalRecord {
         verified_tip: u32,
         expiry_bound: u32,
     },
+    CheckpointManifest {
+        source_fingerprint: String,
+        generation: CheckpointGeneration,
+        note_ids: BTreeSet<SproutNoteId>,
+    },
+    CheckpointDiscardStarted {
+        source_fingerprint: String,
+        generation: CheckpointGeneration,
+        reorg_window: u32,
+    },
+    CheckpointDiscarded {
+        source_fingerprint: String,
+        generation: CheckpointGeneration,
+    },
+    CheckpointTombstone {
+        source_fingerprint: String,
+        generation: CheckpointGeneration,
+        reorg_window: u32,
+        note_id: SproutNoteId,
+        value_zatoshis: u64,
+        transaction: JournalPreparedTransaction,
+        state: TxLifecycleState,
+        last_submission: Option<SubmissionDisposition>,
+        observations: Vec<TxObservation>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointManifest {
+    pub source_fingerprint: String,
+    pub generation: CheckpointGeneration,
+    pub note_ids: BTreeSet<SproutNoteId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointCleanupEligibility {
+    Eligible { mined_txids: Vec<String> },
+    Retain { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointCleanupResult {
+    Removed,
+    AlreadyAbsent,
+    Retain { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +336,9 @@ pub struct SproutJournalEntry {
     pub state: TxLifecycleState,
     pub last_submission: Option<SubmissionDisposition>,
     pub observation: Option<TxObservation>,
+    /// Every independently reduced reconciliation observation, retained so a
+    /// first mined sighting can never erase the checkpoint by itself.
+    pub observations: Vec<TxObservation>,
     pub legacy_expiry_bound: Option<u32>,
 }
 
@@ -206,6 +358,9 @@ pub struct SproutJournalSnapshot {
     by_txid: HashMap<TxId, SproutNoteId>,
     seen_transactions: HashMap<TxId, (SproutNoteId, u64, PreparedTransaction)>,
     order: Vec<SproutNoteId>,
+    checkpoint_manifests: HashMap<CheckpointGeneration, CheckpointManifest>,
+    discard_started: HashSet<CheckpointGeneration>,
+    discarded_checkpoints: HashSet<CheckpointGeneration>,
 }
 
 impl SproutJournalSnapshot {
@@ -226,6 +381,23 @@ impl SproutJournalSnapshot {
     }
 
     pub fn ready_for_new_plan(&self, outpoint: &JsOutPoint) -> bool {
+        let id = note_id(outpoint);
+        if self
+            .checkpoint_manifests
+            .iter()
+            .any(|(generation, manifest)| {
+                self.discarded_checkpoints.contains(generation) && manifest.note_ids.contains(&id)
+            })
+        {
+            return false;
+        }
+        self.ready_for_new_plan_with_restored_source(outpoint)
+    }
+
+    /// A caller holding the recovered spendable note is itself proof that
+    /// source authority was restored after checkpoint cleanup. The journal
+    /// alone deliberately cannot make this decision after a reorg.
+    pub fn ready_for_new_plan_with_restored_source(&self, outpoint: &JsOutPoint) -> bool {
         self.entry_for_note(outpoint).is_none_or(|entry| {
             matches!(
                 entry.state,
@@ -244,6 +416,80 @@ impl SproutJournalSnapshot {
                         .is_some_and(TxObservation::has_canonical_mined_evidence)
             })
         })
+    }
+
+    pub fn checkpoint_manifest(
+        &self,
+        generation: &CheckpointGeneration,
+    ) -> Option<&CheckpointManifest> {
+        self.checkpoint_manifests.get(generation)
+    }
+
+    pub fn checkpoint_was_discarded(&self, generation: &CheckpointGeneration) -> bool {
+        self.discarded_checkpoints.contains(generation)
+    }
+
+    /// A spend-capable checkpoint is discarded only after two separate
+    /// reconciliation rounds each carry a mature, independently administered
+    /// canonical mined pair for every source note. This deliberately exceeds
+    /// ordinary "mined" display semantics: the first sighting never deletes
+    /// the only recovery material.
+    pub fn checkpoint_cleanup_eligibility(
+        &self,
+        source_fingerprint: &str,
+        generation: &CheckpointGeneration,
+        current_source_notes: &BTreeSet<SproutNoteId>,
+    ) -> CheckpointCleanupEligibility {
+        let retain = |reason: &str| CheckpointCleanupEligibility::Retain {
+            reason: reason.to_owned(),
+        };
+        let Some(manifest) = self.checkpoint_manifests.get(generation) else {
+            return retain("the exact checkpoint generation has no durable manifest");
+        };
+        if manifest.source_fingerprint != source_fingerprint {
+            return retain("the checkpoint manifest belongs to another key source");
+        }
+        if manifest.note_ids.is_empty() {
+            return retain("the checkpoint manifest is empty");
+        }
+        if current_source_notes != &manifest.note_ids {
+            return retain("the current checkpoint notes differ from its durable manifest");
+        }
+        let mut txids = Vec::with_capacity(manifest.note_ids.len());
+        for id in &manifest.note_ids {
+            let Some(entry) = self.by_note.get(id) else {
+                return retain("a manifested checkpoint note has no journal entry");
+            };
+            if entry.source_fingerprint != source_fingerprint
+                || entry.state != TxLifecycleState::Mined
+            {
+                return retain("a manifested checkpoint note is not currently mined");
+            }
+            if entry.transaction.is_none() {
+                return retain(
+                    "a legacy acceptance has no prepared transaction and cannot authorize cleanup",
+                );
+            }
+            let newest = entry
+                .observations
+                .iter()
+                .rev()
+                .take(2)
+                .map(mature_mined_signature)
+                .collect::<Option<Vec<_>>>();
+            if newest
+                .as_ref()
+                .is_none_or(|rounds| rounds.len() != 2 || rounds[0] != rounds[1])
+            {
+                return retain(
+                    "canonical mining has not survived two mature reconciliation rounds",
+                );
+            }
+            txids.push(entry.txid().to_string());
+        }
+        txids.sort();
+        txids.dedup();
+        CheckpointCleanupEligibility::Eligible { mined_txids: txids }
     }
 
     fn apply(&mut self, record: SproutJournalRecord, fingerprint: &str) -> ZeckResult<()> {
@@ -312,6 +558,7 @@ impl SproutJournalSnapshot {
                         state: TxLifecycleState::NotSubmitted,
                         last_submission: None,
                         observation: None,
+                        observations: Vec::new(),
                         legacy_expiry_bound: None,
                     },
                 );
@@ -374,6 +621,7 @@ impl SproutJournalSnapshot {
                     entry.last_submission = Some(submission);
                 }
                 if let Some(observation) = observation {
+                    entry.observations.push(observation.clone());
                     entry.observation = Some(observation);
                 }
                 Ok(())
@@ -407,6 +655,7 @@ impl SproutJournalSnapshot {
                         state: TxLifecycleState::SubmissionUnknown,
                         last_submission: None,
                         observation: None,
+                        observations: Vec::new(),
                         legacy_expiry_bound: None,
                     },
                 );
@@ -434,8 +683,186 @@ impl SproutJournalSnapshot {
                 entry.legacy_expiry_bound = Some(expiry_bound);
                 Ok(())
             }
+            SproutJournalRecord::CheckpointManifest {
+                source_fingerprint,
+                generation,
+                note_ids,
+            } => {
+                if source_fingerprint != fingerprint || note_ids.is_empty() {
+                    return Err(journal_error(
+                        "checkpoint manifest is empty or belongs to another source",
+                    ));
+                }
+                let manifest = self
+                    .checkpoint_manifests
+                    .entry(generation.clone())
+                    .or_insert_with(|| CheckpointManifest {
+                        source_fingerprint: source_fingerprint.clone(),
+                        generation,
+                        note_ids: BTreeSet::new(),
+                    });
+                if manifest.source_fingerprint != source_fingerprint {
+                    return Err(journal_error("checkpoint manifest identity changed"));
+                }
+                // Records are monotonic: a later proposal may discover more
+                // notes, but can never remove an earlier source member.
+                manifest.note_ids.extend(note_ids);
+                Ok(())
+            }
+            SproutJournalRecord::CheckpointDiscardStarted {
+                source_fingerprint,
+                generation,
+                reorg_window,
+            } => {
+                if source_fingerprint != fingerprint
+                    || !self.checkpoint_manifests.contains_key(&generation)
+                    || reorg_window != u32::try_from(SPROUT_REORG_WINDOW).unwrap_or(u32::MAX)
+                {
+                    return Err(journal_error("checkpoint discard marker has no manifest"));
+                }
+                self.discard_started.insert(generation);
+                Ok(())
+            }
+            SproutJournalRecord::CheckpointDiscarded {
+                source_fingerprint,
+                generation,
+            } => {
+                if source_fingerprint != fingerprint || !self.discard_started.contains(&generation)
+                {
+                    return Err(journal_error(
+                        "checkpoint discard completion has no synced start marker",
+                    ));
+                }
+                self.discarded_checkpoints.insert(generation);
+                Ok(())
+            }
+            SproutJournalRecord::CheckpointTombstone {
+                source_fingerprint,
+                generation,
+                reorg_window,
+                note_id,
+                value_zatoshis,
+                transaction,
+                state,
+                last_submission,
+                observations,
+            } => {
+                let window = u32::try_from(SPROUT_REORG_WINDOW)
+                    .map_err(|_| journal_error("Sprout reorg window does not fit u32"))?;
+                if source_fingerprint != fingerprint
+                    || reorg_window != window
+                    || state != TxLifecycleState::Mined
+                    || !self.discard_started.contains(&generation)
+                    || !self
+                        .checkpoint_manifests
+                        .get(&generation)
+                        .is_some_and(|manifest| manifest.note_ids.contains(&note_id))
+                {
+                    return Err(journal_error("invalid checkpoint tombstone authority"));
+                }
+                let newest = observations
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(mature_mined_signature)
+                    .collect::<Option<Vec<_>>>();
+                if newest
+                    .as_ref()
+                    .is_none_or(|rounds| rounds.len() != 2 || rounds[0] != rounds[1])
+                {
+                    return Err(journal_error("checkpoint tombstone is not mature"));
+                }
+                let tx = transaction.into_prepared()?;
+                if self
+                    .by_txid
+                    .get(&tx.txid)
+                    .is_some_and(|existing| *existing != note_id)
+                {
+                    return Err(journal_error(
+                        "checkpoint tombstone conflicts with journal state",
+                    ));
+                }
+                if let Some(existing) = self.by_note.get(&note_id) {
+                    if existing.source_fingerprint != source_fingerprint
+                        || existing.transaction.as_ref() != Some(&tx)
+                        || existing.value_zatoshis != Some(value_zatoshis)
+                        || existing.state != state
+                        || existing.last_submission != last_submission
+                        || existing.observations != observations
+                    {
+                        return Err(journal_error(
+                            "checkpoint tombstone conflicts with journal state",
+                        ));
+                    }
+                    return Ok(());
+                }
+                self.seen_transactions
+                    .insert(tx.txid, (note_id, value_zatoshis, tx.clone()));
+                self.by_txid.insert(tx.txid, note_id);
+                self.order.push(note_id);
+                self.by_note.insert(
+                    note_id,
+                    SproutJournalEntry {
+                        outpoint: outpoint(note_id),
+                        source_fingerprint,
+                        transaction: Some(tx),
+                        legacy_txid: None,
+                        value_zatoshis: Some(value_zatoshis),
+                        state,
+                        last_submission,
+                        observation: observations.last().cloned(),
+                        observations,
+                        legacy_expiry_bound: None,
+                    },
+                );
+                Ok(())
+            }
         }
     }
+}
+
+fn mature_mined_signature(observation: &TxObservation) -> Option<(u32, Vec<u8>)> {
+    if !observation.has_canonical_mined_evidence() {
+        return None;
+    }
+    let height = observation.mined_height?;
+    let mature_tip = height.checked_add(u32::try_from(SPROUT_REORG_WINDOW).ok()?)?;
+    let claims = observation
+        .evidence
+        .iter()
+        .filter(|item| {
+            item.tx_in_block
+                && item.reported_height == Some(height)
+                && item.tip_height.is_some_and(|tip| tip >= mature_tip)
+                && item
+                    .block_hash
+                    .as_ref()
+                    .is_some_and(|hash| hash.len() == 32)
+        })
+        .collect::<Vec<_>>();
+    for (index, first) in claims.iter().enumerate() {
+        for second in claims.iter().skip(index + 1) {
+            let first_operator = crate::models::canonical_confirmation_operator_id(
+                &first.operator_id,
+                &first.endpoint,
+            );
+            let second_operator = crate::models::canonical_confirmation_operator_id(
+                &second.operator_id,
+                &second.endpoint,
+            );
+            let independent = !first_operator.is_empty()
+                && !second_operator.is_empty()
+                && first_operator != second_operator
+                && crate::models::normalized_confirmation_authority(&first.endpoint).is_some()
+                && crate::models::normalized_confirmation_authority(&second.endpoint).is_some()
+                && crate::models::normalized_confirmation_authority(&first.endpoint)
+                    != crate::models::normalized_confirmation_authority(&second.endpoint);
+            if independent && first.block_hash == second.block_hash {
+                return Some((height, first.block_hash.clone()?));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -444,11 +871,12 @@ pub struct JournalNoteContext {
     pub value_zatoshis: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SweepJournal {
     path: PathBuf,
     network: ZeckNetwork,
     source_fingerprint: String,
+    namespace: Option<std::sync::Weak<crate::private_fs::NamespaceLease>>,
 }
 
 impl SweepJournal {
@@ -458,11 +886,40 @@ impl SweepJournal {
             path: data_dir.join(format!("sprout-sweep-{short}.journal")),
             network,
             source_fingerprint: full_key_set_fingerprint(spending_keys),
+            namespace: None,
         }
+    }
+
+    pub(crate) fn bind_checkpoint_namespace(
+        &mut self,
+        lease: &crate::sprout_scan_run::CheckpointLease,
+    ) -> ZeckResult<()> {
+        let namespace = lease.clone_namespace();
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| journal_error("Sprout journal has no data directory"))?;
+        if namespace.parent_path() != parent {
+            return Err(journal_error(
+                "checkpoint authority does not bind the sweep journal namespace",
+            ));
+        }
+        self.namespace = Some(std::sync::Arc::downgrade(&namespace));
+        Ok(())
+    }
+
+    fn bound_namespace(
+        &self,
+    ) -> ZeckResult<Option<std::sync::Arc<crate::private_fs::NamespaceLease>>> {
+        Ok(self.namespace.as_ref().and_then(std::sync::Weak::upgrade))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn source_fingerprint(&self) -> &str {
+        &self.source_fingerprint
     }
 
     fn header(&self) -> SproutJournalRecord {
@@ -474,7 +931,10 @@ impl SweepJournal {
     }
 
     pub fn load_or_migrate(&self) -> ZeckResult<SproutJournalSnapshot> {
-        with_sweep_journal_lock(&self.path, || self.load_or_migrate_unlocked())
+        let namespace = self.bound_namespace()?;
+        with_sweep_journal_lock(&self.path, namespace.as_deref(), |namespace| {
+            self.load_or_migrate_unlocked(namespace)
+        })
     }
 
     /// Load this key set's journal and reject any sibling journal that also
@@ -487,29 +947,34 @@ impl SweepJournal {
         &self,
         invocation_outpoints: &[JsOutPoint],
     ) -> ZeckResult<SproutJournalSnapshot> {
-        let snapshot = self.load_or_migrate()?;
-        let mut protected = invocation_outpoints
-            .iter()
-            .map(note_id)
-            .collect::<HashSet<_>>();
-        protected.extend(snapshot.entries().map(|entry| note_id(&entry.outpoint)));
-        self.reject_overlapping_siblings(&protected)?;
-        Ok(snapshot)
+        let namespace = self.bound_namespace()?;
+        with_sweep_journal_lock(&self.path, namespace.as_deref(), |namespace| {
+            let snapshot = self.load_or_migrate_unlocked(namespace)?;
+            let mut protected = invocation_outpoints
+                .iter()
+                .map(note_id)
+                .collect::<HashSet<_>>();
+            protected.extend(snapshot.entries().map(|entry| note_id(&entry.outpoint)));
+            self.reject_overlapping_siblings(namespace, &protected)?;
+            Ok(snapshot)
+        })
     }
 
-    fn reject_overlapping_siblings(&self, protected: &HashSet<SproutNoteId>) -> ZeckResult<()> {
+    fn reject_overlapping_siblings(
+        &self,
+        namespace: &NamespaceLease,
+        protected: &HashSet<SproutNoteId>,
+    ) -> ZeckResult<()> {
         let parent = self
             .path
             .parent()
             .ok_or_else(|| journal_error("Sprout journal has no data directory"))?;
-        let mut siblings = fs::read_dir(parent)
+        let mut siblings = namespace
+            .child_names()
             .map_err(|err| journal_error(format!("reading {}: {err}", parent.display())))?
-            .map(|entry| {
-                entry
-                    .map(|entry| entry.path())
-                    .map_err(|err| journal_error(format!("reading {}: {err}", parent.display())))
-            })
-            .collect::<ZeckResult<Vec<_>>>()?;
+            .into_iter()
+            .map(|name| parent.join(name))
+            .collect::<Vec<_>>();
         siblings.sort();
 
         for path in siblings {
@@ -519,27 +984,15 @@ impl SweepJournal {
             let Some(short) = sibling_journal_short_name(&path)? else {
                 continue;
             };
-            let metadata = fs::symlink_metadata(&path).map_err(|err| {
+            let (network, sibling) = with_sweep_journal_lock(&path, Some(namespace), |namespace| {
+                inspect_sibling_journal(namespace, &path, &short)
+            })
+            .map_err(|err| {
                 journal_error(format!(
-                    "inspecting sibling journal {}: {err}",
+                    "cannot safely inspect sibling Sprout journal {}: {err}",
                     path.display()
                 ))
             })?;
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(journal_error(format!(
-                    "sibling Sprout journal {} is a symlink or irregular file; preserve the original key set and data dir and inspect it before sweeping",
-                    path.display()
-                )));
-            }
-            let (network, sibling) =
-                with_sweep_journal_lock(&path, || inspect_sibling_journal(&path, &short)).map_err(
-                    |err| {
-                        journal_error(format!(
-                            "cannot safely inspect sibling Sprout journal {}: {err}",
-                            path.display()
-                        ))
-                    },
-                )?;
             if network.is_some_and(|network| network != self.network) {
                 continue;
             }
@@ -566,9 +1019,12 @@ impl SweepJournal {
         Ok(())
     }
 
-    fn load_or_migrate_unlocked(&self) -> ZeckResult<SproutJournalSnapshot> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
+    fn load_or_migrate_unlocked(
+        &self,
+        namespace: &NamespaceLease,
+    ) -> ZeckResult<SproutJournalSnapshot> {
+        let (bytes, object_id) = match namespace.read_child_version(&self.path) {
+            Ok(version) => version,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(SproutJournalSnapshot::default())
             }
@@ -586,13 +1042,18 @@ impl SweepJournal {
             std::str::from_utf8(&bytes).map_err(|_| journal_error("journal is not UTF-8"))?;
         let first = text.lines().next().unwrap_or_default();
         if first.starts_with('{') {
-            self.load_v2(&bytes)
+            self.load_v2(namespace, &object_id, &bytes)
         } else {
-            self.migrate_v1(text)
+            self.migrate_v1(namespace, &object_id, text)
         }
     }
 
-    fn load_v2(&self, bytes: &[u8]) -> ZeckResult<SproutJournalSnapshot> {
+    fn load_v2(
+        &self,
+        namespace: &NamespaceLease,
+        object_id: &PrivateObjectId,
+        bytes: &[u8],
+    ) -> ZeckResult<SproutJournalSnapshot> {
         let mut complete = bytes.split(|byte| *byte == b'\n');
         let header = complete
             .next()
@@ -607,7 +1068,7 @@ impl SweepJournal {
                 version,
                 network,
                 source_fingerprint,
-            } if version == SPROUT_SWEEP_JOURNAL_VERSION
+            } if matches!(version, 2 | SPROUT_SWEEP_JOURNAL_VERSION)
                 && network == self.network
                 && source_fingerprint == self.source_fingerprint => {}
             _ => {
@@ -634,30 +1095,50 @@ impl SweepJournal {
             snapshot.apply(record, &self.source_fingerprint)?;
         }
         if !bytes.ends_with(b"\n") {
-            // A synced event always ends in a newline. Remove only the
-            // trailing unsynced bytes, so a later append cannot turn them
-            // into a malformed complete record or invent a transition.
-            let complete_len = bytes
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .expect("header was terminated")
-                + 1;
-            let file = open_private_file(&self.path, PrivateOpenMode::Append)
-                .map_err(|err| journal_error(format!("opening torn journal: {err}")))?;
-            file.set_len(complete_len as u64)
-                .and_then(|_| file.sync_all())
-                .map_err(|err| journal_error(format!("repairing torn journal: {err}")))?;
+            let _ = (namespace, object_id);
+            return Err(journal_error(
+                "journal has an incomplete trailing record; preserve it for review",
+            ));
         }
         Ok(snapshot)
     }
 
-    fn migrate_v1(&self, text: &str) -> ZeckResult<SproutJournalSnapshot> {
+    fn migrate_v1(
+        &self,
+        namespace: &NamespaceLease,
+        object_id: &PrivateObjectId,
+        text: &str,
+    ) -> ZeckResult<SproutJournalSnapshot> {
         if !text.ends_with('\n') {
             return Err(journal_error("unterminated legacy journal record"));
         }
         let mut snapshot = SproutJournalSnapshot::default();
-        let mut records = vec![self.header()];
+        let mut upgraded = false;
         for line in text.lines() {
+            if upgraded {
+                let record = serde_json::from_str::<SproutJournalRecord>(line).map_err(|err| {
+                    journal_error(format!("malformed upgraded journal record: {err}"))
+                })?;
+                snapshot.apply(record, &self.source_fingerprint)?;
+                continue;
+            }
+            if line.starts_with('{') {
+                match serde_json::from_str::<SproutJournalRecord>(line).map_err(|err| {
+                    journal_error(format!("invalid legacy upgrade delimiter: {err}"))
+                })? {
+                    SproutJournalRecord::Header {
+                        version: SPROUT_SWEEP_JOURNAL_VERSION,
+                        network,
+                        source_fingerprint,
+                    } if network == self.network
+                        && source_fingerprint == self.source_fingerprint =>
+                    {
+                        upgraded = true;
+                        continue;
+                    }
+                    _ => return Err(journal_error("invalid legacy upgrade delimiter")),
+                }
+            }
             let (note_text, txid) = line
                 .split_once(' ')
                 .ok_or_else(|| journal_error("malformed legacy journal line"))?;
@@ -684,80 +1165,58 @@ impl SweepJournal {
             let id = (decode_txid(tx)?.into(), js, output);
             let txid = decode_txid(txid)?.to_string();
             let record = SproutJournalRecord::LegacyAccepted { note_id: id, txid };
-            snapshot.apply(record.clone(), &self.source_fingerprint)?;
-            if !records.iter().any(|item| matches!(item, SproutJournalRecord::LegacyAccepted { note_id, .. } if *note_id == id)) {
-                records.push(record);
-            }
+            snapshot.apply(record, &self.source_fingerprint)?;
         }
-        let mut data = Vec::new();
-        for record in records {
-            serde_json::to_writer(&mut data, &record)
-                .map_err(|err| journal_error(format!("encoding journal: {err}")))?;
-            data.push(b'\n');
+        if !upgraded {
+            let mut delimiter = Vec::new();
+            serde_json::to_writer(&mut delimiter, &self.header())
+                .map_err(|err| journal_error(format!("encoding legacy upgrade: {err}")))?;
+            delimiter.push(b'\n');
+            namespace
+                .append_child_if_unchanged(
+                    &self.path,
+                    Some((object_id, text.as_bytes())),
+                    &delimiter,
+                )
+                .map_err(|err| journal_error(format!("syncing legacy upgrade: {err}")))?;
         }
-        self.atomic_replace_if_unchanged(text.as_bytes(), &data)?;
         Ok(snapshot)
     }
 
-    fn atomic_replace_if_unchanged(&self, expected: &[u8], bytes: &[u8]) -> ZeckResult<()> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| journal_error("journal has no parent"))?;
-        let temporary = parent.join(format!(".sprout-sweep-migrate-{}", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let mut file = open_private_file(&temporary, PrivateOpenMode::CreateNew)
-                .map_err(|err| journal_error(format!("creating migration file: {err}")))?;
-            file.write_all(bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|err| journal_error(format!("syncing migration file: {err}")))?;
-            if fs::read(&self.path)
-                .map_err(|err| journal_error(format!("rechecking legacy journal: {err}")))?
-                != expected
-            {
-                return Err(journal_error(
-                    "legacy journal changed during migration; retry after preserving the source",
-                ));
-            }
-            fs::rename(&temporary, &self.path)
-                .map_err(|err| journal_error(format!("replacing journal: {err}")))?;
-            fs::File::open(parent)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|err| journal_error(format!("syncing journal directory: {err}")))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
+    fn append_unlocked(
+        &self,
+        namespace: &NamespaceLease,
+        record: &SproutJournalRecord,
+    ) -> ZeckResult<()> {
+        let mut version = match namespace.read_child_version(&self.path) {
+            Ok((bytes, id)) => Some((bytes, id)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(journal_error(format!("opening journal: {err}"))),
+        };
+        let mut suffix = Vec::new();
+        if version.as_ref().is_none_or(|(bytes, _)| bytes.is_empty()) {
+            serde_json::to_writer(&mut suffix, &self.header())
+                .map_err(|err| journal_error(format!("writing journal header: {err}")))?;
+            suffix.push(b'\n');
         }
-        result
+        serde_json::to_writer(&mut suffix, record)
+            .map_err(|err| journal_error(format!("writing journal event: {err}")))?;
+        suffix.push(b'\n');
+        namespace
+            .append_child_if_unchanged(
+                &self.path,
+                version.as_mut().map(|(bytes, id)| (&*id, bytes.as_slice())),
+                &suffix,
+            )
+            .map_err(|err| journal_error(format!("syncing journal event: {err}")))
     }
 
-    fn append_unlocked(&self, record: &SproutJournalRecord) -> ZeckResult<()> {
-        let missing = !self.path.exists();
-        let mut file = open_private_file(&self.path, PrivateOpenMode::Append)
-            .map_err(|err| journal_error(format!("opening journal: {err}")))?;
-        if missing
-            || file
-                .metadata()
-                .map_err(|err| journal_error(format!("journal metadata: {err}")))?
-                .len()
-                == 0
-        {
-            serde_json::to_writer(&mut file, &self.header())
-                .map_err(|err| journal_error(format!("writing journal header: {err}")))?;
-            file.write_all(b"\n")
-                .and_then(|_| file.flush())
-                .and_then(|_| file.sync_all())
-                .map_err(|err| journal_error(format!("syncing journal header: {err}")))?;
-            fs::File::open(self.path.parent().expect("journal path has parent"))
-                .and_then(|dir| dir.sync_all())
-                .map_err(|err| journal_error(format!("syncing journal directory: {err}")))?;
-        }
-        serde_json::to_writer(&mut file, record)
-            .map_err(|err| journal_error(format!("writing journal event: {err}")))?;
-        file.write_all(b"\n")
-            .and_then(|_| file.flush())
-            .and_then(|_| file.sync_all())
-            .map_err(|err| journal_error(format!("syncing journal event: {err}")))
+    fn upgrade_header_unlocked(&self, namespace: &NamespaceLease) -> ZeckResult<()> {
+        // Both v2 headers and append-upgraded v1 journals remain physically
+        // unchanged. Their loaders already validated the durable prefix, and
+        // new v3 records make older readers fail closed without a rewrite.
+        let _ = namespace;
+        Ok(())
     }
 
     pub fn scoped_store<'a>(
@@ -777,14 +1236,16 @@ impl SweepJournal {
         snapshot: &mut SproutJournalSnapshot,
         record: SproutJournalRecord,
     ) -> ZeckResult<()> {
-        with_sweep_journal_lock(&self.path, || {
+        let namespace = self.bound_namespace()?;
+        with_sweep_journal_lock(&self.path, namespace.as_deref(), |namespace| {
             // The caller may have loaded before another process wrote.
             // Replay under the lock; only this current durable state can
             // authorize the next event.
-            let mut durable = self.load_or_migrate_unlocked()?;
+            let mut durable = self.load_or_migrate_unlocked(namespace)?;
             *snapshot = durable.clone();
             durable.apply(record.clone(), &self.source_fingerprint)?;
-            self.append_unlocked(&record)?;
+            self.upgrade_header_unlocked(namespace)?;
+            self.append_unlocked(namespace, &record)?;
             *snapshot = durable;
             Ok(())
         })
@@ -821,6 +1282,248 @@ impl SweepJournal {
         };
         self.mutate(snapshot, record)
     }
+
+    /// Durably bind an exact checkpoint object to every note it may recreate.
+    /// Repeated records only add members; they can never shrink a manifest.
+    pub fn record_checkpoint_manifest<'a>(
+        &self,
+        snapshot: &mut SproutJournalSnapshot,
+        generation: &CheckpointGeneration,
+        notes: impl IntoIterator<Item = &'a JsOutPoint>,
+    ) -> ZeckResult<()> {
+        let note_ids = notes.into_iter().map(note_id).collect::<BTreeSet<_>>();
+        self.record_checkpoint_manifest_ids(snapshot, generation, note_ids)
+    }
+
+    pub fn record_checkpoint_manifest_ids(
+        &self,
+        snapshot: &mut SproutJournalSnapshot,
+        generation: &CheckpointGeneration,
+        note_ids: BTreeSet<SproutNoteId>,
+    ) -> ZeckResult<()> {
+        if note_ids.is_empty() {
+            return Err(journal_error("checkpoint manifest cannot be empty"));
+        }
+        self.mutate(
+            snapshot,
+            SproutJournalRecord::CheckpointManifest {
+                source_fingerprint: self.source_fingerprint.clone(),
+                generation: generation.clone(),
+                note_ids,
+            },
+        )
+    }
+
+    fn compact_unlocked(
+        &self,
+        namespace: &NamespaceLease,
+        snapshot: &SproutJournalSnapshot,
+        generation: &CheckpointGeneration,
+    ) -> ZeckResult<()> {
+        let manifest = snapshot
+            .checkpoint_manifests
+            .get(generation)
+            .ok_or_else(|| journal_error("checkpoint has no manifest during compaction"))?;
+        let reorg_window = u32::try_from(SPROUT_REORG_WINDOW)
+            .map_err(|_| journal_error("Sprout reorg window does not fit u32"))?;
+        for note_id in &manifest.note_ids {
+            let entry = snapshot
+                .by_note
+                .get(note_id)
+                .ok_or_else(|| journal_error("manifest entry disappeared during compaction"))?;
+            let transaction = entry
+                .transaction
+                .as_ref()
+                .ok_or_else(|| journal_error("legacy entry cannot become a tombstone"))?;
+            let tombstone = SproutJournalRecord::CheckpointTombstone {
+                source_fingerprint: self.source_fingerprint.clone(),
+                generation: generation.clone(),
+                reorg_window,
+                note_id: *note_id,
+                value_zatoshis: entry
+                    .value_zatoshis
+                    .ok_or_else(|| journal_error("tombstone has no source value"))?,
+                transaction: JournalPreparedTransaction::from_prepared(transaction)?,
+                state: entry.state,
+                last_submission: entry.last_submission.clone(),
+                observations: entry.observations.clone(),
+            };
+            self.append_unlocked(namespace, &tombstone)?;
+        }
+        Ok(())
+    }
+
+    /// Make the final decision, marker, compaction and deletion one journal
+    /// critical section. The caller additionally holds the network guard and
+    /// checkpoint lease, giving a single lock order for all cleanup paths.
+    pub fn finalize_checkpoint_cleanup(
+        &self,
+        lease: &crate::sprout_scan_run::CheckpointLease,
+        generation: &CheckpointGeneration,
+        checkpoint: &Path,
+    ) -> ZeckResult<CheckpointCleanupResult> {
+        let namespace = lease.clone_namespace();
+        with_sweep_journal_lock(&self.path, Some(&namespace), |namespace| {
+            lease.verify_for(checkpoint)?;
+            let mut snapshot = self.load_or_migrate_unlocked(namespace)?;
+            match lease.generation_if_present(checkpoint)? {
+                Some(current) if &current != generation => {
+                    return Ok(CheckpointCleanupResult::Retain {
+                        reason: "the checkpoint generation changed after review".into(),
+                    })
+                }
+                Some(_) => {}
+                None if snapshot.discard_started.contains(generation) => {
+                    // A crash may have happened after unlink but before the
+                    // completion marker. The synced start marker and exact
+                    // generation authorize only idempotent finalization.
+                }
+                None => {
+                    return Err(journal_error(
+                        "checkpoint disappeared before cleanup was authorized",
+                    ))
+                }
+            }
+            let current_source_notes = snapshot
+                .entries()
+                .map(|entry| note_id(&entry.outpoint))
+                .collect::<BTreeSet<_>>();
+            match snapshot.checkpoint_cleanup_eligibility(
+                &self.source_fingerprint,
+                generation,
+                &current_source_notes,
+            ) {
+                CheckpointCleanupEligibility::Retain { reason } => {
+                    return Ok(CheckpointCleanupResult::Retain { reason })
+                }
+                CheckpointCleanupEligibility::Eligible { .. } => {}
+            }
+            if !snapshot.discard_started.contains(generation) {
+                let marker = SproutJournalRecord::CheckpointDiscardStarted {
+                    source_fingerprint: self.source_fingerprint.clone(),
+                    generation: generation.clone(),
+                    reorg_window: u32::try_from(SPROUT_REORG_WINDOW)
+                        .map_err(|_| journal_error("Sprout reorg window does not fit u32"))?,
+                };
+                snapshot.apply(marker.clone(), &self.source_fingerprint)?;
+                self.append_unlocked(namespace, &marker)?;
+            }
+            self.compact_unlocked(namespace, &snapshot, generation)?;
+            let discarded = crate::sprout_scan_run::discard_checkpoint_generation_while_leased(
+                lease, checkpoint, generation,
+            )?;
+            #[cfg(test)]
+            if FAIL_AFTER_CHECKPOINT_DISCARD
+                .lock()
+                .unwrap()
+                .take_if(|failing| failing == checkpoint)
+                .is_some()
+            {
+                return Err(journal_error(
+                    "injected crash after checkpoint discard before completion",
+                ));
+            }
+            if !snapshot.discarded_checkpoints.contains(generation) {
+                let completed = SproutJournalRecord::CheckpointDiscarded {
+                    source_fingerprint: self.source_fingerprint.clone(),
+                    generation: generation.clone(),
+                };
+                snapshot.apply(completed.clone(), &self.source_fingerprint)?;
+                self.append_unlocked(namespace, &completed)?;
+            }
+            match discarded {
+                crate::sprout_scan_run::CheckpointDiscard::Removed => {
+                    Ok(CheckpointCleanupResult::Removed)
+                }
+                crate::sprout_scan_run::CheckpointDiscard::AlreadyAbsent => {
+                    Ok(CheckpointCleanupResult::AlreadyAbsent)
+                }
+            }
+        })
+    }
+
+    /// Resume only cleanup that already crossed the durable discard marker.
+    /// This path is usable after the checkpoint itself has been quarantined
+    /// or deleted, so a crash cannot strand the journal between start and
+    /// completion or require reconstructing authority from an absent secret.
+    pub fn resume_checkpoint_cleanup(
+        &self,
+        lease: &crate::sprout_scan_run::CheckpointLease,
+        checkpoint: &Path,
+    ) -> ZeckResult<Option<CheckpointCleanupResult>> {
+        let namespace = lease.clone_namespace();
+        with_sweep_journal_lock(&self.path, Some(&namespace), |namespace| {
+            lease.verify_for(checkpoint)?;
+            let mut snapshot = self.load_or_migrate_unlocked(namespace)?;
+            let pending = snapshot
+                .discard_started
+                .iter()
+                .filter(|generation| !snapshot.discarded_checkpoints.contains(*generation))
+                .cloned()
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                return Ok(None);
+            }
+            if pending.len() != 1 {
+                return Err(journal_error(
+                    "multiple interrupted checkpoint discards require manual review",
+                ));
+            }
+            let generation = &pending[0];
+            if !snapshot.checkpoint_manifests.contains_key(generation) {
+                return Err(journal_error("discard marker has no checkpoint manifest"));
+            }
+            let replacement_present = lease
+                .generation_if_present(checkpoint)?
+                .is_some_and(|current| &current != generation);
+            let current_source_notes = snapshot
+                .entries()
+                .map(|entry| note_id(&entry.outpoint))
+                .collect::<BTreeSet<_>>();
+            match snapshot.checkpoint_cleanup_eligibility(
+                &self.source_fingerprint,
+                generation,
+                &current_source_notes,
+            ) {
+                CheckpointCleanupEligibility::Retain { reason } => {
+                    return Ok(Some(CheckpointCleanupResult::Retain { reason }))
+                }
+                CheckpointCleanupEligibility::Eligible { .. } => {}
+            }
+            self.compact_unlocked(namespace, &snapshot, generation)?;
+            if replacement_present {
+                // The old generation crossed its durable discard boundary,
+                // but a new source was restored before restart recovery. Mark
+                // the old cleanup complete without touching the replacement.
+                let completed = SproutJournalRecord::CheckpointDiscarded {
+                    source_fingerprint: self.source_fingerprint.clone(),
+                    generation: generation.clone(),
+                };
+                snapshot.apply(completed.clone(), &self.source_fingerprint)?;
+                self.append_unlocked(namespace, &completed)?;
+                return Ok(Some(CheckpointCleanupResult::Retain {
+                    reason: "a replacement checkpoint generation was preserved".into(),
+                }));
+            }
+            let discarded = crate::sprout_scan_run::discard_checkpoint_generation_while_leased(
+                lease, checkpoint, generation,
+            )?;
+            let completed = SproutJournalRecord::CheckpointDiscarded {
+                source_fingerprint: self.source_fingerprint.clone(),
+                generation: generation.clone(),
+            };
+            snapshot.apply(completed.clone(), &self.source_fingerprint)?;
+            self.append_unlocked(namespace, &completed)?;
+            Ok(Some(match discarded {
+                crate::sprout_scan_run::CheckpointDiscard::Removed => {
+                    CheckpointCleanupResult::Removed
+                }
+                crate::sprout_scan_run::CheckpointDiscard::AlreadyAbsent => {
+                    CheckpointCleanupResult::AlreadyAbsent
+                }
+            }))
+        })
+    }
 }
 
 fn sibling_journal_short_name(path: &Path) -> ZeckResult<Option<String>> {
@@ -850,11 +1553,16 @@ fn sibling_journal_short_name(path: &Path) -> ZeckResult<Option<String>> {
 }
 
 fn inspect_sibling_journal(
+    namespace: &NamespaceLease,
     path: &Path,
     filename_short: &str,
 ) -> ZeckResult<(Option<ZeckNetwork>, SproutJournalSnapshot)> {
-    let bytes = fs::read(path)
-        .map_err(|err| journal_error(format!("reading {}: {err}", path.display())))?;
+    let bytes = namespace.read_child(path).map_err(|err| {
+        journal_error(format!(
+            "refusing symlink or irregular sibling journal {}: {err}",
+            path.display()
+        ))
+    })?;
     if bytes.is_empty() {
         return Err(journal_error("empty sibling journal"));
     }
@@ -882,10 +1590,10 @@ fn inspect_v2_sibling(
         .map_err(|err| journal_error(format!("invalid sibling journal header: {err}")))?
     {
         SproutJournalRecord::Header {
-            version,
+            version: 2 | SPROUT_SWEEP_JOURNAL_VERSION,
             network,
             source_fingerprint,
-        } if version == SPROUT_SWEEP_JOURNAL_VERSION => (network, source_fingerprint),
+        } => (network, source_fingerprint),
         _ => return Err(journal_error("unsupported sibling journal header")),
     };
     if fingerprint.len() != 64
@@ -1078,6 +1786,671 @@ mod tests {
         format!("{}:3:1 {sweep_txid}\n", "42".repeat(32))
     }
 
+    fn checkpoint_generation(dir: &Path, label: &[u8]) -> CheckpointGeneration {
+        let path = dir.join("scan.checkpoint");
+        std::fs::write(&path, label).unwrap();
+        crate::sprout_scan_run::checkpoint_generation(&path).unwrap()
+    }
+
+    fn mined_observation(height: u32, depth: u32, hash: u8) -> TxObservation {
+        crate::broadcast::observe_transaction(
+            ["first", "second"]
+                .into_iter()
+                .map(|label| crate::broadcast::EndpointTxEvidence {
+                    operator_id: label.to_owned(),
+                    endpoint: format!("https://{label}.example"),
+                    tip_height: Some(height.checked_add(depth).unwrap()),
+                    reported_height: Some(height),
+                    block_hash: Some(vec![hash; 32]),
+                    tx_in_block: true,
+                })
+                .collect(),
+            Some(100),
+        )
+    }
+
+    #[test]
+    fn checkpoint_cleanup_requires_two_mature_canonical_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let current = BTreeSet::from([note_id(&outpoint())]);
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::Mined,
+                None,
+                Some(&mature),
+            )
+            .unwrap();
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &generation,
+                &current
+            ),
+            CheckpointCleanupEligibility::Retain { .. }
+        ));
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::Mined,
+                None,
+                Some(&mature),
+            )
+            .unwrap();
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &generation,
+                &current
+            ),
+            CheckpointCleanupEligibility::Eligible { .. }
+        ));
+        let shallow_fork = mined_observation(2, SPROUT_REORG_WINDOW as u32 - 1, 0x22);
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::Mined,
+                None,
+                Some(&shallow_fork),
+            )
+            .unwrap();
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &generation,
+                &current
+            ),
+            CheckpointCleanupEligibility::Retain { .. }
+        ));
+    }
+
+    #[test]
+    fn checkpoint_cleanup_rejects_shallow_generation_mismatch_and_extra_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let current = BTreeSet::from([note_id(&outpoint())]);
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let shallow = mined_observation(1, SPROUT_REORG_WINDOW as u32 - 1, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    None,
+                    Some(&shallow),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &generation,
+                &current
+            ),
+            CheckpointCleanupEligibility::Retain { .. }
+        ));
+
+        let path = dir.path().join("scan.checkpoint");
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"checkpoint-a").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let replaced = crate::sprout_scan_run::checkpoint_generation(&path).unwrap();
+        assert_ne!(generation, replaced);
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &replaced,
+                &current
+            ),
+            CheckpointCleanupEligibility::Retain { .. }
+        ));
+
+        let mut extra = current.clone();
+        extra.insert(([0x99; 32], 1, 0));
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &generation,
+                &extra
+            ),
+            CheckpointCleanupEligibility::Retain { .. }
+        ));
+    }
+
+    #[test]
+    fn v2_journal_loads_without_inventing_a_checkpoint_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+        let text = std::fs::read_to_string(journal.path()).unwrap();
+        std::fs::write(
+            journal.path(),
+            text.replacen("\"version\":3", "\"version\":2", 1),
+        )
+        .unwrap();
+        let snapshot = journal.load_or_migrate().unwrap();
+        assert!(snapshot.checkpoint_manifest(&generation).is_none());
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &generation,
+                &BTreeSet::from([note_id(&outpoint())])
+            ),
+            CheckpointCleanupEligibility::Retain { .. }
+        ));
+
+        let mut snapshot = snapshot;
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let text = std::fs::read_to_string(journal.path()).unwrap();
+        let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(header["version"], 2);
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .checkpoint_manifest(&generation)
+                .unwrap()
+                .note_ids,
+            BTreeSet::from([note_id(&outpoint())])
+        );
+    }
+
+    #[test]
+    fn mixed_or_reorged_manifest_never_authorizes_checkpoint_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let current = BTreeSet::from([note_id(&outpoint())]);
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        let assert_retained = |candidate: &SproutJournalSnapshot| {
+            assert!(matches!(
+                candidate.checkpoint_cleanup_eligibility(
+                    journal.source_fingerprint(),
+                    &generation,
+                    &current
+                ),
+                CheckpointCleanupEligibility::Retain { .. }
+            ));
+        };
+
+        let mut missing = snapshot.clone();
+        missing.by_note.remove(&note_id(&outpoint()));
+        assert_retained(&missing);
+        for state in [
+            TxLifecycleState::NotSubmitted,
+            TxLifecycleState::Pending,
+            TxLifecycleState::SubmissionUnknown,
+            TxLifecycleState::Expired,
+            TxLifecycleState::Rejected,
+        ] {
+            let mut candidate = snapshot.clone();
+            candidate
+                .by_note
+                .get_mut(&note_id(&outpoint()))
+                .unwrap()
+                .state = state;
+            assert_retained(&candidate);
+        }
+        let mut single_source = snapshot.clone();
+        single_source
+            .by_note
+            .get_mut(&note_id(&outpoint()))
+            .unwrap()
+            .observations
+            .last_mut()
+            .unwrap()
+            .evidence
+            .truncate(1);
+        assert_retained(&single_source);
+        let mut contested = snapshot.clone();
+        contested
+            .by_note
+            .get_mut(&note_id(&outpoint()))
+            .unwrap()
+            .observations
+            .last_mut()
+            .unwrap()
+            .evidence[1]
+            .block_hash = Some(vec![0x22; 32]);
+        assert_retained(&contested);
+        let mut reorged = snapshot;
+        let entry = reorged.by_note.get_mut(&note_id(&outpoint())).unwrap();
+        entry.state = TxLifecycleState::Pending;
+        entry.observations.push(TxObservation {
+            state: crate::broadcast::TxObservationState::Reorged,
+            mined_height: None,
+            expiry_height: transaction.expiry_height,
+            primary_tip: Some(200),
+            secondary_tip: Some(200),
+            evidence: Vec::new(),
+        });
+        assert_retained(&reorged);
+    }
+
+    #[test]
+    fn legacy_v1_acceptance_never_authorizes_checkpoint_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let transaction = fixture();
+        std::fs::write(journal.path(), legacy_line(&transaction.txid.to_string())).unwrap();
+        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            snapshot.checkpoint_cleanup_eligibility(
+                journal.source_fingerprint(),
+                &generation,
+                &BTreeSet::from([note_id(&outpoint())])
+            ),
+            CheckpointCleanupEligibility::Retain { reason }
+                if reason.contains("legacy acceptance")
+        ));
+    }
+
+    #[test]
+    fn checkpoint_manifest_union_keeps_nonadjacent_source_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let first = JsOutPoint {
+            txid: [0x31; 32],
+            js_index: 1,
+            output_index: 0,
+        };
+        let third = JsOutPoint {
+            txid: [0x33; 32],
+            js_index: 3,
+            output_index: 1,
+        };
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&first])
+            .unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&third])
+            .unwrap();
+        let restored = journal.load_or_migrate().unwrap();
+        assert_eq!(
+            restored.checkpoint_manifest(&generation).unwrap().note_ids,
+            BTreeSet::from([note_id(&first), note_id(&third)])
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_is_visible_and_keeps_the_mined_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        let checkpoint = dir.path().join("scan.checkpoint");
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        crate::sprout_scan_run::fail_checkpoint_discard(&checkpoint);
+        let err = journal
+            .finalize_checkpoint_cleanup(&lease, &generation, &checkpoint)
+            .expect_err("a deletion error must be surfaced")
+            .to_string();
+        assert!(
+            err.contains("injected checkpoint deletion failure"),
+            "{err}"
+        );
+        assert!(checkpoint.exists());
+        drop(lease);
+        let restored = journal.load_or_migrate().unwrap();
+        let entry = restored.entry_for_note(&outpoint()).unwrap();
+        assert_eq!(entry.transaction.as_ref(), Some(&transaction));
+        assert_eq!(entry.value_zatoshis, Some(context().value_zatoshis));
+        assert_eq!(entry.last_submission, Some(SubmissionDisposition::Accepted));
+        assert_eq!(entry.observations.len(), 2);
+        assert!(restored.discard_started.contains(&generation));
+        assert!(!restored.discarded_checkpoints.contains(&generation));
+        let records = std::fs::read_to_string(journal.path()).unwrap();
+        assert_eq!(
+            records
+                .matches("\"record\":\"checkpoint_tombstone\"")
+                .count(),
+            1
+        );
+        assert!(records.contains("\"record\":\"prepared\""));
+        assert!(records.contains("\"record\":\"transition\""));
+
+        let reorg = TxObservation {
+            state: crate::broadcast::TxObservationState::Reorged,
+            mined_height: None,
+            expiry_height: transaction.expiry_height,
+            primary_tip: Some(50),
+            secondary_tip: Some(50),
+            evidence: ["first", "second"]
+                .into_iter()
+                .map(|label| crate::broadcast::EndpointTxEvidence {
+                    operator_id: label.into(),
+                    endpoint: format!("https://{label}.example"),
+                    tip_height: Some(50),
+                    reported_height: Some(u32::MAX),
+                    block_hash: None,
+                    tx_in_block: false,
+                })
+                .collect(),
+        };
+        let mut restored = restored;
+        journal
+            .append_transition(
+                &mut restored,
+                transaction.txid,
+                TxLifecycleState::Pending,
+                None,
+                Some(&reorg),
+            )
+            .unwrap();
+        journal
+            .append_transition(
+                &mut restored,
+                transaction.txid,
+                TxLifecycleState::Expired,
+                None,
+                Some(&confirmed_absence(100)),
+            )
+            .unwrap();
+        assert!(restored.ready_for_new_plan(&outpoint()));
+    }
+
+    #[test]
+    fn cleanup_restart_after_unlink_commits_an_idempotent_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        std::fs::write(&checkpoint, b"checkpoint-a").unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        journal
+            .mutate(
+                &mut snapshot,
+                SproutJournalRecord::CheckpointDiscardStarted {
+                    source_fingerprint: journal.source_fingerprint().to_owned(),
+                    generation: generation.clone(),
+                    reorg_window: SPROUT_REORG_WINDOW as u32,
+                },
+            )
+            .unwrap();
+        std::fs::remove_file(&checkpoint).unwrap();
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+
+        assert_eq!(
+            journal
+                .finalize_checkpoint_cleanup(&lease, &generation, &checkpoint)
+                .unwrap(),
+            CheckpointCleanupResult::AlreadyAbsent
+        );
+        drop(lease);
+        let restored = journal.load_or_migrate().unwrap();
+        assert!(restored.discarded_checkpoints.contains(&generation));
+        assert_eq!(
+            restored
+                .entry_for_note(&outpoint())
+                .unwrap()
+                .transaction
+                .as_ref(),
+            Some(&transaction)
+        );
+    }
+
+    #[test]
+    fn cleanup_restart_completes_old_generation_without_deleting_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        std::fs::write(&checkpoint, b"checkpoint-a").unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    Some(&SubmissionDisposition::Accepted),
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        journal
+            .mutate(
+                &mut snapshot,
+                SproutJournalRecord::CheckpointDiscardStarted {
+                    source_fingerprint: journal.source_fingerprint().to_owned(),
+                    generation: generation.clone(),
+                    reorg_window: SPROUT_REORG_WINDOW as u32,
+                },
+            )
+            .unwrap();
+        std::fs::write(&checkpoint, b"replacement checkpoint source").unwrap();
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+
+        let result = journal
+            .resume_checkpoint_cleanup(&lease, &checkpoint)
+            .unwrap();
+        assert!(matches!(
+            result,
+            Some(CheckpointCleanupResult::Retain { ref reason })
+                if reason.contains("replacement checkpoint")
+        ));
+        assert_eq!(
+            std::fs::read(&checkpoint).unwrap(),
+            b"replacement checkpoint source"
+        );
+        drop(lease);
+        let restored = journal.load_or_migrate().unwrap();
+        assert!(restored.discarded_checkpoints.contains(&generation));
+        assert!(journal
+            .resume_checkpoint_cleanup(
+                &crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap(),
+                &checkpoint,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_post_cleanup_reorg_never_makes_the_discarded_source_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("scan.checkpoint");
+        std::fs::write(&checkpoint, b"checkpoint-a").unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let journal = journal(dir.path());
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
+            .unwrap();
+        let transaction = fixture();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&transaction)
+            .unwrap();
+        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
+        for _ in 0..2 {
+            journal
+                .append_transition(
+                    &mut snapshot,
+                    transaction.txid,
+                    TxLifecycleState::Mined,
+                    None,
+                    Some(&mature),
+                )
+                .unwrap();
+        }
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        assert_eq!(
+            journal
+                .finalize_checkpoint_cleanup(&lease, &generation, &checkpoint)
+                .unwrap(),
+            CheckpointCleanupResult::Removed
+        );
+        drop(lease);
+        let reorg = TxObservation {
+            state: crate::broadcast::TxObservationState::Reorged,
+            mined_height: None,
+            expiry_height: transaction.expiry_height,
+            primary_tip: Some(50),
+            secondary_tip: Some(50),
+            evidence: ["first", "second"]
+                .into_iter()
+                .map(|label| crate::broadcast::EndpointTxEvidence {
+                    operator_id: label.into(),
+                    endpoint: format!("https://{label}.example"),
+                    tip_height: Some(50),
+                    reported_height: Some(u32::MAX),
+                    block_hash: None,
+                    tx_in_block: false,
+                })
+                .collect(),
+        };
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::Pending,
+                None,
+                Some(&reorg),
+            )
+            .unwrap();
+        assert!(!snapshot.ready_for_new_plan(&outpoint()));
+
+        std::fs::write(&checkpoint, b"restored checkpoint source").unwrap();
+        let restored_generation =
+            crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        journal
+            .record_checkpoint_manifest(&mut snapshot, &restored_generation, [&outpoint()])
+            .unwrap();
+        journal
+            .append_transition(
+                &mut snapshot,
+                transaction.txid,
+                TxLifecycleState::Expired,
+                None,
+                Some(&confirmed_absence(100)),
+            )
+            .unwrap();
+        assert!(
+            snapshot.ready_for_new_plan_with_restored_source(&outpoint()),
+            "a newly manifested checkpoint restores the source authority"
+        );
+    }
+
     #[test]
     fn v2_prepared_record_round_trips_every_safety_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -1105,7 +2478,7 @@ mod tests {
         let first_line = std::fs::read_to_string(journal.path()).unwrap();
         let header: serde_json::Value =
             serde_json::from_str(first_line.lines().next().unwrap()).unwrap();
-        assert_eq!(header["version"], 2);
+        assert_eq!(header["version"], 3);
         assert_eq!(header["network"], "mainnet");
         assert_eq!(
             header["source_fingerprint"],
@@ -1264,9 +2637,9 @@ mod tests {
         assert!(entry.transaction.is_none());
         assert_eq!(entry.state, TxLifecycleState::SubmissionUnknown);
         assert!(!snapshot.all_mined_for([&outpoint()]));
-        assert!(std::fs::read_to_string(journal.path())
-            .unwrap()
-            .starts_with("{\"record\":\"header\""));
+        let upgraded = std::fs::read_to_string(journal.path()).unwrap();
+        assert!(upgraded.starts_with(&legacy_line(&txid.to_string())));
+        assert!(upgraded.contains("{\"record\":\"header\""));
     }
 
     #[test]
@@ -1352,12 +2725,12 @@ mod tests {
         std::fs::write(journal.path(), &original).unwrap();
         assert!(journal.load_or_migrate().is_err());
         assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), original);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }
 
     #[cfg(unix)]
     #[test]
-    fn v1_migration_replaces_a_world_readable_file_with_private_v2() {
+    fn v1_migration_hardens_a_world_readable_file_before_append_only_upgrade() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
@@ -1369,7 +2742,13 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+        let authority_path = std::path::PathBuf::from(format!("{}.lock", journal.path().display()));
+        let authority_mode = std::fs::metadata(authority_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(authority_mode & 0o777, 0o600);
         let lock_path =
             std::path::PathBuf::from(format!("{}.lock.sqlite", journal.path().display()));
         let lock_mode = std::fs::metadata(lock_path).unwrap().permissions().mode();
@@ -1389,7 +2768,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_final_v2_transition_falls_back_to_the_previous_safe_state() {
+    fn torn_final_v2_transition_fails_closed_without_rewriting_history() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let tx = fixture();
@@ -1413,30 +2792,12 @@ mod tests {
             .unwrap();
         file.write_all(b"{\"record\":\"transition\",\"state\":\"mined\"")
             .unwrap();
-        let restored = journal.load_or_migrate().unwrap();
-        assert_eq!(
-            restored.entry_for_txid(tx.txid).unwrap().state,
-            TxLifecycleState::SubmissionUnknown
-        );
-        let mut restored = restored;
-        journal
-            .append_transition(
-                &mut restored,
-                tx.txid,
-                TxLifecycleState::Pending,
-                Some(&SubmissionDisposition::Accepted),
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            journal
-                .load_or_migrate()
-                .unwrap()
-                .entry_for_txid(tx.txid)
-                .unwrap()
-                .state,
-            TxLifecycleState::Pending
-        );
+        file.sync_all().unwrap();
+        drop(file);
+        let before = std::fs::read(journal.path()).unwrap();
+        let err = journal.load_or_migrate().unwrap_err().to_string();
+        assert!(err.contains("incomplete trailing record"), "{err}");
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
     }
 
     #[cfg(unix)]
@@ -1599,7 +2960,7 @@ mod tests {
             .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
             .unwrap();
         let (sender, receiver) = mpsc::channel();
-        let other = journal.clone();
+        let other = SweepJournal::for_keys(dir.path(), &[[0x42; 32]], ZeckNetwork::Mainnet);
         let worker =
             std::thread::spawn(move || sender.send(other.load_or_migrate().is_ok()).unwrap());
         assert!(receiver
@@ -1624,7 +2985,7 @@ mod tests {
             .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
             .unwrap();
         let (sender, receiver) = mpsc::channel();
-        let other = journal.clone();
+        let other = SweepJournal::for_keys(dir.path(), &[[0x42; 32]], ZeckNetwork::Mainnet);
         let worker = std::thread::spawn(move || {
             sender
                 .send(
@@ -1644,6 +3005,28 @@ mod tests {
             .unwrap());
         worker.join().unwrap();
         assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_journal_authority_denies_sidecar_replacement_and_second_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let mut authority_name = journal.path().as_os_str().to_os_string();
+        authority_name.push(".lock");
+        let authority = PathBuf::from(authority_name);
+        let displaced = authority.with_extension("displaced-lock");
+
+        with_sweep_journal_lock(journal.path(), None, |_| {
+            assert!(std::fs::rename(&authority, &displaced).is_err());
+            let second = with_sweep_journal_lock(journal.path(), None, |_| Ok(()))
+                .expect_err("a second journal authority must be refused");
+            assert!(second.to_string().contains("namespace"), "{second}");
+            Ok(())
+        })
+        .unwrap();
+        assert!(authority.exists());
+        assert!(!displaced.exists());
     }
 
     #[test]
@@ -1732,19 +3115,24 @@ mod tests {
     }
 
     #[test]
-    fn migration_rechecks_original_bytes_before_replacement() {
+    fn legacy_upgrade_is_append_only_and_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let original = legacy_line(&fixture().txid.to_string());
-        let appended = legacy_line(&TxId::from_bytes([0x55; 32]).to_string());
         std::fs::write(journal.path(), &original).unwrap();
-        std::fs::write(journal.path(), format!("{original}{appended}")).unwrap();
-        assert!(journal
-            .atomic_replace_if_unchanged(original.as_bytes(), b"replacement\n")
-            .is_err());
+        let original_id =
+            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
+                .unwrap();
+        let snapshot = journal.load_or_migrate().unwrap();
+        assert_eq!(snapshot.entries().count(), 1);
+        let upgraded = std::fs::read_to_string(journal.path()).unwrap();
+        assert!(upgraded.starts_with(&original));
+        assert_eq!(upgraded.matches("\"record\":\"header\"").count(), 1);
         assert_eq!(
-            std::fs::read_to_string(journal.path()).unwrap(),
-            format!("{original}{appended}")
+            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
+                .unwrap(),
+            original_id
         );
+        assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 1);
     }
 }

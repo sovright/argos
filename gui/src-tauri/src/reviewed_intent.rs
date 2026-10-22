@@ -270,6 +270,8 @@ pub struct SproutSweepIntent {
     pub confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     pub journal: SweepJournal,
     pub wallet_checkpoint: Option<WalletCheckpointAuthority>,
+    pub checkpoint_authority: Option<argos_core::sprout_sweep::ScanCheckpointAuthority>,
+    pub _checkpoint_reservation: Option<CheckpointReservation>,
     /// Set when the catch-up scan behind a scan-derived proposal could not
     /// confirm the chain tip; it leads the sweep report's warnings.
     pub tip_warning: Option<String>,
@@ -318,7 +320,7 @@ struct StoredProposal {
 struct StoreInner {
     scans: HashMap<SproutScanHandle, SproutScanSession>,
     proposals: HashMap<SproutProposalId, StoredProposal>,
-    in_flight_checkpoints: HashSet<PathBuf>,
+    checkpoint_reservations: Arc<Mutex<HashSet<PathBuf>>>,
     proposal_ttl: Duration,
 }
 
@@ -327,7 +329,7 @@ impl Default for StoreInner {
         Self {
             scans: HashMap::new(),
             proposals: HashMap::new(),
-            in_flight_checkpoints: HashSet::new(),
+            checkpoint_reservations: Arc::new(Mutex::new(HashSet::new())),
             proposal_ttl: PROPOSAL_TTL,
         }
     }
@@ -357,17 +359,17 @@ impl StoreInner {
 /// A scan or catch-up owns this reservation until its future finishes or is
 /// dropped. The guard also releases on unwinding; it never exposes keys.
 pub struct CheckpointReservation {
-    inner: Arc<Mutex<StoreInner>>,
+    reservations: Arc<Mutex<HashSet<PathBuf>>>,
     identity: PathBuf,
 }
 
 impl Drop for CheckpointReservation {
     fn drop(&mut self) {
-        let mut inner = self
-            .inner
+        let mut reservations = self
+            .reservations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.in_flight_checkpoints.remove(&self.identity);
+        reservations.remove(&self.identity);
     }
 }
 
@@ -437,16 +439,20 @@ impl ReviewedIntentStore {
 
     pub fn reserve_checkpoint(&self, checkpoint: &Path) -> Result<CheckpointReservation, String> {
         let identity = checkpoint_identity(checkpoint)?;
-        let mut inner = StoreInner::lock(&self.0)?;
-        if inner.in_flight_checkpoints.contains(&identity) {
+        let reservations = StoreInner::lock(&self.0)?.checkpoint_reservations.clone();
+        let mut held = reservations
+            .lock()
+            .map_err(|_| "Sprout checkpoint reservation store unavailable".to_owned())?;
+        if held.contains(&identity) {
             return Err("a Sprout scan or catch-up is already using this checkpoint".into());
         }
-        if inner.in_flight_checkpoints.len() >= MAX_IN_FLIGHT_CHECKPOINTS {
+        if held.len() >= MAX_IN_FLIGHT_CHECKPOINTS {
             return Err("too many Sprout scans or catch-ups are running".into());
         }
-        inner.in_flight_checkpoints.insert(identity.clone());
+        held.insert(identity.clone());
+        drop(held);
         Ok(CheckpointReservation {
-            inner: Arc::clone(&self.0),
+            reservations,
             identity,
         })
     }
@@ -765,6 +771,8 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(1),
                     wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: None,
                     tip_warning: None,
                 },
                 SproutSweepPreviewData {
@@ -851,6 +859,8 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(2),
                     wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: None,
                     tip_warning: None,
                 },
                 SproutSweepPreviewData {
@@ -915,6 +925,8 @@ mod tests {
                     confirmation_sources: Vec::new(),
                     journal: journal(3),
                     wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: None,
                     tip_warning: None,
                 },
                 SproutSweepPreviewData {
@@ -1070,6 +1082,44 @@ mod tests {
         let running_scan = store.reserve_checkpoint(&checkpoint).unwrap();
         assert!(store.reserve_checkpoint(&checkpoint).is_err());
         drop(running_scan);
+        assert!(store.reserve_checkpoint(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn scan_proposal_holds_checkpoint_reservation_through_execution_take() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 21);
+        let checkpoint = store.scan_material(&handle).unwrap().checkpoint;
+        let reservation = store.reserve_checkpoint(&checkpoint).unwrap();
+        let review = store
+            .insert_proposal(
+                SproutSweepIntent {
+                    source: SproutIntentSource::Scan(handle),
+                    notes: Vec::new(),
+                    destination: "zs-reviewed".into(),
+                    network: ZeckNetwork::Mainnet,
+                    lightwalletd_url: "https://node-21".into(),
+                    confirmation_sources: Vec::new(),
+                    journal: journal(21),
+                    wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: Some(reservation),
+                    tip_warning: None,
+                },
+                SproutSweepPreviewData {
+                    notes: 0,
+                    gross_zatoshis: 0,
+                    fee_zatoshis: 0,
+                    net_zatoshis: 0,
+                    active: Vec::new(),
+                    mined: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.reserve_checkpoint(&checkpoint).is_err());
+        let executing = store.take_scan_proposal(&review.proposal_id).unwrap();
+        assert!(store.reserve_checkpoint(&checkpoint).is_err());
+        drop(executing);
         assert!(store.reserve_checkpoint(&checkpoint).is_ok());
     }
 

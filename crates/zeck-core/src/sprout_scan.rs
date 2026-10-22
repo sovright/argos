@@ -590,6 +590,7 @@ impl SproutScanner {
             anchor: self.tree.root(),
             progress: self.progress,
             decrypt_from_height: self.decrypt_from,
+            checkpoint_generation: None,
         })
     }
 }
@@ -608,6 +609,10 @@ pub struct SproutScanResult {
     /// Notes paid to the keys below it were not looked for, so a surface
     /// reporting the result must say so.
     pub decrypt_from_height: Option<u32>,
+    /// Exact checkpoint object saved by the scan while its lease was still
+    /// held. Sweep review must bind this generation, never a later object at
+    /// the same pathname.
+    pub checkpoint_generation: Option<crate::sprout_scan_run::CheckpointGeneration>,
 }
 
 impl SproutScanResult {
