@@ -3515,6 +3515,8 @@ fn ensure_private_workspace_lineage_impl(
                 private_root,
                 &publication_parent,
             )?;
+            #[cfg(all(test, windows))]
+            eprintln!("workspace-lineage {}: staged", private_root.display());
             let staging = open_child_directory_for_mutation(&publication_parent, &staging_root)?;
             if private_object_id(&staging)? != staged_id {
                 return Err(invalid_lineage(
@@ -3527,12 +3529,19 @@ fn ensure_private_workspace_lineage_impl(
                 private_root,
                 &staging,
             )?;
+            #[cfg(all(test, windows))]
+            eprintln!("workspace-lineage {}: published", private_root.display());
             sync_private_directory(&publication_parent)?;
             // Bridge the mutation handle to a handle opened relative to the
             // retained parent before releasing it. The identity handle shares
             // delete, so it can coexist with the mutation handle on Windows.
             let published_identity =
                 open_child_directory_for_identity(&publication_parent, private_root)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-lineage {}: root identity bridged",
+                private_root.display()
+            );
             if private_object_id(&published_identity)? != staged_id {
                 return Err(invalid_lineage(
                     "private workspace root changed during staged publication",
@@ -3540,6 +3549,11 @@ fn ensure_private_workspace_lineage_impl(
             }
             drop(staging);
             let publication_parent_identity = open_publication_parent_identity(publish_parent)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-lineage {}: parent identity bridged",
+                private_root.display()
+            );
             if private_object_id(&publication_parent_identity)?
                 != private_object_id(&publication_parent)?
             {
@@ -3549,6 +3563,11 @@ fn ensure_private_workspace_lineage_impl(
             }
             drop(publication_parent);
             let publication_parent = open_workspace_publication_authority(publish_parent)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-lineage {}: parent authority retained",
+                private_root.display()
+            );
             if private_object_id(&publication_parent)?
                 != private_object_id(&publication_parent_identity)?
             {
@@ -3560,6 +3579,11 @@ fn ensure_private_workspace_lineage_impl(
             // Keep the publication parent continuously pinned while opening
             // the long-lived root authority through that exact parent.
             let published = open_child_directory_for_authority(&publication_parent, private_root)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-lineage {}: root authority retained",
+                private_root.display()
+            );
             if private_object_id(&published)? != private_object_id(&published_identity)? {
                 return Err(invalid_lineage(
                     "private workspace root changed before authority retention",
@@ -3571,15 +3595,35 @@ fn ensure_private_workspace_lineage_impl(
                 &publication_parent,
                 published,
             )?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-lineage {}: root lineage verified",
+                private_root.display()
+            );
             if verified.id != staged_id {
                 return Err(invalid_lineage(
                     "private workspace root changed during staged publication",
                 ));
             }
             let leaf_handle = open_private_sqlite_parent(leaf)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-lineage {}: sqlite parent retained",
+                private_root.display()
+            );
             ensure_private_sqlite_lineage(&verified, &leaf_handle, leaf, database)?;
+            #[cfg(all(test, windows))]
+            eprintln!(
+                "workspace-lineage {}: sqlite lineage verified",
+                private_root.display()
+            );
             if activate_sqlite {
                 ensure_private_sqlite_file(&verified, &leaf_handle, leaf, database)?;
+                #[cfg(all(test, windows))]
+                eprintln!(
+                    "workspace-lineage {}: sqlite authority activated",
+                    private_root.display()
+                );
             }
             Ok(verified)
         }
