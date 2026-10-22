@@ -52,6 +52,7 @@ function lifecycleHarness() {
     pendingResumeRow: { workspace_path: "/secret" },
     resumeGeneration: 4,
     state,
+    cancelWalletReviewExpiry() { calls.push("wallet-expiry"); },
     invalidateWalletSproutReview() { calls.push("wallet-review"); },
     invalidateSproutScanSource() { calls.push("sprout-source"); },
     invalidateSweepReview() { calls.push("sweep-review"); },
@@ -78,6 +79,7 @@ for (const exit of [
     assert.equal(h.elements.get("resume-seed-visibility").checked, false);
     assert.equal(h.elements.get("seed-input").classList.contains("masked"), true);
     assert.equal(h.elements.get("resume-seed-input").classList.contains("masked"), true);
+    assert.ok(h.calls.includes("wallet-expiry"), `${exit}: wallet expiry timer`);
   });
 }
 

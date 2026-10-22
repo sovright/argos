@@ -76,6 +76,8 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   $("sprout-destination").value = "fixture-destination";
   $("confirmation-sources").value = "backup=https://confirm.example";
   const previews = [];
+  const timers = new Map();
+  let nextTimerId = 1;
   let onProgress;
   let failStatus = false;
   const context = vm.createContext({
@@ -87,6 +89,15 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       .split("\n").map((line) => line.trim()).filter(Boolean),
     sproutScanPeerEntries: () => [],
     sproutScanPeers: () => [],
+    setTimeout(callback, delay) {
+      const id = nextTimerId++;
+      timers.set(id, { callback, delay, cleared: false });
+      return id;
+    },
+    clearTimeout(id) {
+      const timer = timers.get(id);
+      if (timer) timer.cleared = true;
+    },
     setStatus: (id, text) => {
       if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
       $(id).textContent = text;
@@ -154,6 +165,12 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     source.indexOf("const sproutScanListenersReady", source.indexOf('for (const id of ["sprout-scan-keys"'))), context);
   return {
     $, previews,
+    timers,
+    fireTimer(id, { includeCleared = false } = {}) {
+      const timer = timers.get(id);
+      assert.ok(timer, `unknown timer ${id}`);
+      if (!timer.cleared || includeCleared) timer.callback();
+    },
     edit(id, value, event = "input") { $(id).value = value; $(id).dispatch(event); },
     failNextStatus: () => { failStatus = true; },
     progress: (payload) => onProgress({ payload }),
@@ -204,6 +221,63 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     },
   };
 }
+
+test("a successful wallet inspection expires frontend passphrase and review authority", async () => {
+  const h = harness();
+  await h.open("/fixture/encrypted.dat", "wallet secret");
+
+  const [[timerId, timer]] = [...h.timers.entries()];
+  assert.ok(timerId, "successful inspection must schedule an expiry");
+  assert.ok(timer.delay <= 30 * 60 * 1000, "frontend expiry must not outlive the backend review");
+  assert.equal(h.$("wallet-passphrase").value, "wallet secret");
+  assert.equal(h.peek("walletFile.passphrase"), "wallet secret");
+  assert.equal(h.peek("walletFile.reviewId"), "review:/fixture/encrypted.dat");
+
+  h.fireTimer(timerId);
+
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.peek("walletFile"), null);
+  assert.equal(h.peek("sproutPreviewWallet"), null);
+  assert.equal(h.$("wallet-next").disabled, true);
+  assert.equal(h.$("wallet-summary").hidden, true);
+});
+
+test("a stale wallet expiry callback cannot clear a newer successful inspection", async () => {
+  const h = harness();
+  await h.open("/fixture/old.dat", "old secret");
+  const [oldTimerId] = [...h.timers.keys()];
+  h.peek("globalThis.oldWalletReview = walletFile");
+
+  await h.open("/fixture/new.dat", "new secret");
+  const newTimerId = [...h.timers.keys()].at(-1);
+  assert.notEqual(newTimerId, oldTimerId);
+  assert.equal(h.timers.get(oldTimerId).cleared, true);
+
+  // A callback may already be queued when clearTimeout runs. Its generation
+  // guard, rather than timer cancellation alone, must protect the new review.
+  h.fireTimer(oldTimerId, { includeCleared: true });
+
+  assert.equal(h.$("wallet-passphrase").value, "new secret");
+  assert.equal(h.peek("oldWalletReview.passphrase"), null);
+  assert.equal(h.peek("walletFile.path"), "/fixture/new.dat");
+  assert.equal(h.peek("walletFile.passphrase"), "new secret");
+  assert.equal(h.peek("walletFile.reviewId"), "review:/fixture/new.dat");
+});
+
+test("successful secret handoff cancels expiry and a queued callback cannot revoke the accepted source", async () => {
+  const h = harness();
+  await h.open("/fixture/accepted.dat", "accepted secret");
+  const [timerId] = [...h.timers.keys()];
+
+  h.peek("clearTransientSecrets()");
+  assert.equal(h.timers.get(timerId).cleared, true);
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.peek("walletFile.passphrase"), null);
+
+  h.fireTimer(timerId, { includeCleared: true });
+  assert.equal(h.peek("walletFile.path"), "/fixture/accepted.dat");
+  assert.equal(h.peek("walletFile.reviewId"), "review:/fixture/accepted.dat");
+});
 
 test("opaque wallet review ID is passed to every wallet-backed command", async () => {
   const calls = [];

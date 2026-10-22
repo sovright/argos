@@ -327,6 +327,7 @@ function flowHarness() {
       $("execute-sweep").disabled = true;
     },
     forgetWalletCaveats() {},
+    cancelWalletReviewExpiry() {},
     // This harness loads only the ordinary-flow slice; Sprout review state is
     // exercised by the dedicated wallet and scan VM suites.
     invalidateWalletSproutReview() {},

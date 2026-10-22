@@ -425,11 +425,39 @@ let walletSproutReviewDestination = null;
 let walletSproutReviewConfig = null;
 let walletSproutProposalGeneration = 0;
 let walletSproutExecutionPending = false;
+// The backend drops an unclaimed wallet review after 30 minutes. Expire the
+// webview's plaintext and opaque review source first, with enough margin that
+// IPC response time cannot make the frontend outlive that backend authority.
+const WALLET_REVIEW_EXPIRY_MS = 29 * 60 * 1000;
+let walletReviewExpiryTimer = null;
+let walletReviewExpiryGeneration = 0;
+
+function cancelWalletReviewExpiry() {
+  ++walletReviewExpiryGeneration;
+  if (walletReviewExpiryTimer !== null) {
+    clearTimeout(walletReviewExpiryTimer);
+    walletReviewExpiryTimer = null;
+  }
+}
+
+function scheduleWalletReviewExpiry() {
+  cancelWalletReviewExpiry();
+  const generation = walletReviewExpiryGeneration;
+  walletReviewExpiryTimer = setTimeout(() => {
+    // clearTimeout cannot retract a callback already queued by the webview.
+    // The generation guard prevents an old callback from revoking newer state.
+    if (generation !== walletReviewExpiryGeneration) return;
+    walletReviewExpiryTimer = null;
+    forgetLoadedWalletFile();
+    setStatus("wallet-status", "Wallet review expired. Open the wallet file again.", "error");
+  }, WALLET_REVIEW_EXPIRY_MS);
+}
 
 // Clear plaintext authority as soon as the backend has accepted it, and from
 // every exit that abandons the current recovery attempt. The browser event
 // gives the separate address-search module the same lifecycle boundary.
 function clearTransientSecrets({ abandonWallet = false } = {}) {
+  cancelWalletReviewExpiry();
   for (const id of [
     "seed-input", "wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys",
     "resume-seed-input", "resume-bip39-passphrase",
@@ -1209,7 +1237,9 @@ function forgetWalletCaveats() {
 // never clears it, so a seed typed afterwards would otherwise be scanned as
 // the old file and its balance shown as the seed's answer.
 function forgetLoadedWalletFile() {
+  cancelWalletReviewExpiry();
   ++walletOpenGeneration;
+  if (walletFile?.passphrase != null) walletFile.passphrase = null;
   walletFile = null;
   sproutPreviewWallet = null;
   invalidateWalletSproutReview();
@@ -1264,7 +1294,9 @@ function renderSproutUncoveredBanners() {
 }
 
 async function openWalletFile() {
+  cancelWalletReviewExpiry();
   const generation = ++walletOpenGeneration;
+  if (walletFile?.passphrase != null) walletFile.passphrase = null;
   walletFile = null;
   sproutPreviewWallet = null;
   invalidateWalletSproutReview();
@@ -1334,6 +1366,7 @@ async function openWalletFile() {
       throw new Error("wallet inspection did not return review authority; inspect it again");
     }
     walletFile = { path, reviewId: summary.review_id, passphrase, summary };
+    scheduleWalletReviewExpiry();
     renderWalletSummary(summary);
     // Carried forward so every later screen can say what the totals leave
     // out. Recorded at open time because the summary is not in scope later.
@@ -1343,6 +1376,8 @@ async function openWalletFile() {
     setStatus("wallet-status", "✓ Wallet file read.", "success");
   } catch (err) {
     if (generation !== walletOpenGeneration) return;
+    cancelWalletReviewExpiry();
+    if (walletFile?.passphrase != null) walletFile.passphrase = null;
     walletFile = null;
     $("wallet-next").disabled = true;
     $("wallet-summary").hidden = true;
