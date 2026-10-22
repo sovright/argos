@@ -5458,18 +5458,48 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_long_data_directory_can_review_and_reverify_a_sprout_wallet() {
+    async fn windows_gui_sprout_review_supports_internal_staging_beyond_max_path() {
         use std::os::windows::ffi::OsStrExt as _;
-        let outer = unused_temp_dir("long-gui-data");
-        let mut dir = outer.clone();
-        while dir.as_os_str().encode_wide().count() <= 280 {
-            dir.push("nested-user-selected-data-directory");
-        }
-        dir.push("workspace-v2");
+        let outer = unused_temp_dir("staging-gui-data");
+        let mut dir = outer.join("workspace-v2");
+        let (_, a_sk) = wallet_with_one_note(1_000_000);
+        // Exercise the original directory-publication failure while keeping
+        // SQLite filenames within the existing native VFS's Win32 range.
+        let (journal, staging) = loop {
+            let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+                &dir,
+                &[a_sk],
+                ZeckNetwork::Mainnet,
+            );
+            let root = journal.path().parent().unwrap();
+            let staging = root.with_file_name(format!(
+                ".{}-staging-{}",
+                root.file_name().unwrap().to_str().unwrap(),
+                uuid::Uuid::nil(),
+            ));
+            if staging.as_os_str().encode_wide().count() > 260 {
+                break (journal, staging);
+            }
+            dir.push("nested");
+        };
         assert!(!dir.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        assert!(staging.as_os_str().encode_wide().count() > 248,
+            "the actual internal staging name must exceed CreateDirectoryW's legacy directory limit");
+        let sqlite = journal
+            .path()
+            .parent()
+            .unwrap()
+            .join(".journal.lock.sqlite");
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let mut filename = sqlite.as_os_str().to_os_string();
+            filename.push(suffix);
+            assert!(filename.encode_wide().count() < 260,
+                "the SQLite database and sidecars must remain below the legacy Win32 file limit: {filename:?}");
+        }
         argos_core::service::ensure_recovery_data_dir(&dir)
-            .expect("a user-selected data path beyond MAX_PATH can be authenticated");
+            .expect("a data path with an oversized internal staging name can be authenticated");
         let (_, intent) = reviewed_one_note_wallet(&dir).await;
+        assert_eq!(intent.journal.path(), journal.path());
         assert_eq!(intent.notes.len(), 1);
         let notice = verify_review_at_execute(&intent)
             .await
