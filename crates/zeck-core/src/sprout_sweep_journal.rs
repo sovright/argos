@@ -1908,7 +1908,9 @@ mod tests {
     }
 
     fn artifact_data_dir(outer: &Path) -> PathBuf {
-        outer.join("artifact-data")
+        // An absent intermediate exercises production private-directory creation;
+        // elevated Windows runners can assign the raw temp root to Administrators.
+        outer.join("publication").join("artifact-data")
     }
 
     fn journal(outer: &std::path::Path) -> SweepJournal {
