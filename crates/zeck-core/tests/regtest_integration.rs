@@ -2632,8 +2632,7 @@ async fn crash_mid_scan_resumes_from_fully_scanned_height() {
     );
 
     eprintln!(
-        "[regtest] R-S27 ok: SIGKILL at block {kill_block}, resume reached {} zatoshis (matches baseline)",
-        resume_total
+        "[regtest] R-S27 ok: SIGKILL at block {kill_block}, resume reached {resume_total} zatoshis (matches baseline)"
     );
 }
 
@@ -3869,8 +3868,7 @@ async fn transparent_only_wallet_sweeps_to_a_shielded_destination() {
     });
     assert_eq!(
         after_total, 0,
-        "every UTXO must have been swept; {} zatoshis remain",
-        after_total
+        "every UTXO must have been swept; {after_total} zatoshis remain"
     );
 }
 
