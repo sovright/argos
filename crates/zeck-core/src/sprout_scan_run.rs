@@ -2807,11 +2807,16 @@ pub enum CheckpointDiscard {
 }
 
 #[cfg(test)]
-static FAIL_CHECKPOINT_DISCARD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+static FAIL_CHECKPOINT_DISCARD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
 pub(crate) fn fail_checkpoint_discard(path: &Path) {
-    *FAIL_CHECKPOINT_DISCARD.lock().unwrap() = Some(path.to_path_buf());
+    FAIL_CHECKPOINT_DISCARD
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf());
 }
 
 pub fn discard_checkpoint(path: &Path) -> ZeckResult<CheckpointDiscard> {
@@ -2849,12 +2854,7 @@ pub(crate) fn discard_checkpoint_generation_while_leased(
 
 fn discard_checkpoint_temporaries(lease: &CheckpointLease, path: &Path) -> ZeckResult<bool> {
     #[cfg(test)]
-    if FAIL_CHECKPOINT_DISCARD
-        .lock()
-        .unwrap()
-        .take_if(|failing| failing == path)
-        .is_some()
-    {
+    if FAIL_CHECKPOINT_DISCARD.lock().unwrap().remove(path) {
         return Err(ZeckError::TransactionBuild(
             "injected checkpoint deletion failure".into(),
         ));
