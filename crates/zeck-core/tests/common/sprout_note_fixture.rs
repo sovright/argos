@@ -99,6 +99,25 @@ pub async fn plant_sprout_note(a_sk: [u8; 32]) -> PlantedSproutNote {
     };
 
     rpc("generate", serde_json::json!([110])).await;
+    // `generate` can return before zcashd's wallet has indexed the newly
+    // matured coinbase outputs. Sending immediately then races wallet sync
+    // and intermittently reports "Insufficient funds" even though the chain
+    // is already at the required height.
+    let balance_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let balance = rpc("getbalance", serde_json::json!([]))
+            .await
+            .as_f64()
+            .expect("numeric wallet balance");
+        if balance > 4.0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < balance_deadline,
+            "zcashd wallet did not index enough matured coinbase funds within 30 seconds"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let addr = argos_core::imported::encode_transparent_address(
         &address,
         argos_core::ZeckNetwork::Testnet,
