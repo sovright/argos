@@ -22,8 +22,11 @@ tauri.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-plugin-dialog.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 # Surface argos-core diagnostics (scan reconnects, donation decisions/fallbacks)
 # to the dev console / stderr. Both are already workspace dependencies.
 tracing.workspace = true
 tracing-subscriber.workspace = true
 argos-core = { path = "../../crates/zeck-core" }
+# Scan sessions hold decoded Sprout spending keys; wiped on drop.
+zeroize.workspace = true

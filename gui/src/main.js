@@ -28,8 +28,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
 const state = {
   scanHandle: null,
+  scanAuthorityGeneration: 0,
+  completedScanHandle: null,
   lastProgress: null,
-  sweepProposal: null,
+  sweepReview: null,
+  proposalGeneration: 0,
+  proposalPending: false,
+  sweepExecutionPending: false,
   destination: null,
   memo: null,
   maxFeeZec: null,
@@ -37,11 +42,13 @@ const state = {
   unlistenComplete: null,
   unlistenDiscovered: null,
   scanConfig: null,
+  defaultDataDir: null,
   savedReportPath: null,
   donationEnabled: false,
   matchedRecovery: null,
   retainedAddressSearchId: null,
   addressMatchRecoveryLocked: false,
+  addressMatchRecoveryStartGeneration: null,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -240,6 +247,14 @@ let furthestStep = 0; // tracks how far the user has reached
 const STEP_ALIASES = { "wallet-file": "seed" };
 
 function goTo(step) {
+  if (step !== "wallet-file") {
+    // Leaving the wallet screen drops reviewed proposals, so a sweep is
+    // re-reviewed on return. A running Sprout scan is not stopped: it can
+    // run for hours, and moving between steps does not change its keys or
+    // settings. Changing those does release it (see the input listeners).
+    invalidateWalletSproutReview();
+    invalidateSproutScanReview();
+  }
   const leavingMatchedConfig = state.matchedRecovery &&
     document.querySelector('.screen[data-step="config"]')?.classList.contains("active") &&
     step !== "config" && step !== "scan";
@@ -400,6 +415,28 @@ let walletOpenGeneration = 0;
 let sproutPreviewWallet = null;
 // Independent of the selected wallet: reopening must not permit a second sweep.
 let sproutSweepSource = null;
+let walletSproutReview = null;
+let walletSproutReviewDestination = null;
+let walletSproutProposalGeneration = 0;
+
+function invalidateWalletSproutReview() {
+  ++walletSproutProposalGeneration;
+  if (walletSproutReview) {
+    invoke("release_sprout_proposal", { proposalId: walletSproutReview.proposal_id }).catch(() => {});
+  }
+  walletSproutReview = null;
+  walletSproutReviewDestination = null;
+  $("sprout-sweep-confirm").checked = false;
+  $("sprout-sweep-confirm").disabled = true;
+  $("sprout-sweep-run").disabled = true;
+}
+
+function updateWalletSproutSweepButton() {
+  $("sprout-sweep-run").disabled = !walletSproutReview ||
+    walletSproutReviewDestination !== $("sprout-destination").value.trim() ||
+    sproutPreviewWallet !== walletFile || !$("sprout-sweep-confirm").checked ||
+    sproutSweepSource !== null;
+}
 
 function renderWalletSummary(summary) {
   const list = $("wallet-summary-list");
@@ -666,27 +703,41 @@ function forgetSproutScanInputs() {
 
 async function showSproutSweep() {
   const source = walletFile;
+  invalidateWalletSproutReview();
   sproutPreviewWallet = null;
   $("sprout-sweep-run").disabled = true;
+  $("sprout-sweep-plan").textContent = "";
+  $("sprout-sweep-pool").textContent = "";
+  $("sprout-sweep-params").textContent = "";
   if (!source) return;
   const panel = $("wallet-sprout-sweep");
   panel.hidden = false;
+
+  const destination = $("sprout-destination").value.trim();
+  if (!destination) {
+    $("sprout-sweep-plan").textContent = "Enter a destination to review this sweep.";
+    return;
+  }
+  const generation = walletSproutProposalGeneration;
 
   try {
     const previewNetwork = $("network-select").value;
     // A malformed entry in the scan panel's peer field must not cost the
     // preview: the raw entries go to the backend, which skips live
     // verification, keeps the wallet file's own spent record and says why
-    // in the scan warning. The sweep itself still refuses the field.
+    // in the scan warning. The sweep itself still refuses the field, and the
+    // backend refuses to execute a proposal reviewed with it.
     let previewPeers;
     try {
       previewPeers = sproutScanPeers();
     } catch {
       previewPeers = sproutScanPeerEntries();
     }
-    const preview = await invoke("preview_sprout_sweep", {
+    const preview = await invoke("propose_wallet_sprout_sweep", {
       path: source.path,
       passphrase: source.passphrase,
+      destination,
+      lightwalletdUrl: $("lightwalletd-url").value.trim(),
       network: previewNetwork,
       // Where the scan panel keeps its checkpoint: a scan of these keys
       // settles spends the wallet file cannot see.
@@ -696,7 +747,11 @@ async function showSproutSweep() {
       peers: previewPeers,
     });
 
-    if (walletFile !== source) return;
+    if (walletFile !== source || generation !== walletSproutProposalGeneration ||
+        destination !== $("sprout-destination").value.trim()) {
+      invoke("release_sprout_proposal", { proposalId: preview.proposal_id }).catch(() => {});
+      return;
+    }
 
     // Verification runs again for this preview. Show its current verdict
     // beside the plan, even if inspection used an earlier checkpoint view.
@@ -709,7 +764,10 @@ async function showSproutSweep() {
 
     $("sprout-sweep-plan").textContent =
       `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
-      `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.`;
+      `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.` +
+      // Keys dropped as forged, in inspect's words: the quote is for the
+      // genuine keys' notes only, and says why the rest are not in it.
+      (preview.warnings ?? []).map((warning) => ` ${warning}`).join("");
 
     // Stated before the user commits. Pasting a unified address reasonably
     // creates the expectation that funds land in its best pool, and for
@@ -721,16 +779,20 @@ async function showSproutSweep() {
     if (preview.params_present) {
       $("sprout-sweep-params").textContent = "";
       sproutPreviewWallet = source;
-      $("sprout-sweep-run").disabled = sproutSweepSource !== null;
+      walletSproutReview = preview;
+      walletSproutReviewDestination = destination;
+      $("sprout-sweep-confirm").disabled = false;
+      updateWalletSproutSweepButton();
     } else {
       $("sprout-sweep-params").textContent =
         `Sprout proving parameters are missing. Download the 725 MB file to ` +
         `${preview.params_path} before sweeping:  ` +
         `curl -o ${preview.params_path} https://download.z.cash/downloads/sprout-groth16.params`;
       $("sprout-sweep-run").disabled = true;
+      invoke("release_sprout_proposal", { proposalId: preview.proposal_id }).catch(() => {});
     }
   } catch (err) {
-    if (walletFile !== source) return;
+    if (walletFile !== source || generation !== walletSproutProposalGeneration) return;
     $("sprout-sweep-plan").textContent = "";
     setStatus("sprout-sweep-status", `✗ ${err}`, "error");
     $("sprout-sweep-run").disabled = true;
@@ -750,10 +812,16 @@ async function runSproutSweep() {
     return;
   }
 
-  if (sproutPreviewWallet !== walletFile) {
+  if (sproutPreviewWallet !== walletFile || !walletSproutReview ||
+      walletSproutReviewDestination !== destination) {
     setStatus("sprout-sweep-status", "Wait for this wallet’s Sprout preview before sweeping.", "error");
     return;
   }
+  if (!$("sprout-sweep-confirm").checked) {
+    setStatus("sprout-sweep-status", "Tick the box to confirm this moves funds irreversibly.", "error");
+    return;
+  }
+  const proposalId = walletSproutReview.proposal_id;
 
   const button = $("sprout-sweep-run");
   try {
@@ -766,15 +834,9 @@ async function runSproutSweep() {
       "",
     );
 
-    const report = await invoke("execute_sprout_sweep", {
-      path: source.path,
-      passphrase: source.passphrase,
-      destination,
-      lightwalletdUrl: $("lightwalletd-url").value.trim(),
-      network: $("network-select").value,
-      dataDir: $("data-dir").value.trim() || null,
-      peers: sproutScanPeers(),
-    });
+    // Refuses a malformed scan peer field before anything is sent (#272).
+    sproutScanPeers();
+    const report = await invoke("execute_wallet_sprout_sweep", { proposalId });
 
     if (walletFile !== source) return;
 
@@ -858,11 +920,16 @@ async function runSproutSweep() {
     button.disabled = false;
   } finally {
     sproutSweepSource = null;
-    if (walletFile !== source) {
-      button.disabled = !walletFile || sproutPreviewWallet !== walletFile;
+    if (walletFile === source && walletSproutReview?.proposal_id === proposalId) {
+      invalidateWalletSproutReview();
     }
+    updateWalletSproutSweepButton();
   }
 }
+
+$("sprout-destination").addEventListener("input", invalidateWalletSproutReview);
+$("sprout-destination").addEventListener("change", showSproutSweep);
+$("sprout-sweep-confirm").addEventListener("change", updateWalletSproutSweepButton);
 
 /// Sprout keys a scan and sweep will not cover, remembered across screens.
 ///
@@ -1007,6 +1074,8 @@ function forgetLoadedWalletFile() {
   ++walletOpenGeneration;
   walletFile = null;
   sproutPreviewWallet = null;
+  invalidateWalletSproutReview();
+  invalidateSproutScanSource();
   forgetWalletCaveats();
   $("wallet-path").value = "";
   $("wallet-passphrase").value = "";
@@ -1018,6 +1087,8 @@ function forgetLoadedWalletFile() {
   $("sprout-sweep-plan").textContent = "";
   $("sprout-sweep-pool").textContent = "";
   $("sprout-sweep-params").textContent = "";
+  $("sprout-sweep-spent-status").textContent = "";
+  $("sprout-sweep-status").textContent = "";
   $("wallet-open").disabled = false;
   setStatus("wallet-status", "", "");
   // A panel the file opened goes with it; one holding a typed key stays.
@@ -1058,6 +1129,8 @@ async function openWalletFile() {
   const generation = ++walletOpenGeneration;
   walletFile = null;
   sproutPreviewWallet = null;
+  invalidateWalletSproutReview();
+  invalidateSproutScanSource();
   // The previous file's caveats must not outlive it, even if this open fails.
   forgetWalletCaveats();
   $("wallet-summary").hidden = true;
@@ -1145,6 +1218,7 @@ $("wallet-browse")?.addEventListener("click", async () => {
     const path = await invoke("pick_wallet_file");
     // Cancelling is not an error, and must not clear a file already chosen.
     if (!path) return;
+    invalidateScanAuthority();
     $("wallet-path").value = path;
     // A freshly chosen file is not the one the old passphrase belongs to.
     $("wallet-passphrase").value = "";
@@ -1155,13 +1229,19 @@ $("wallet-browse")?.addEventListener("click", async () => {
   }
 });
 
-$("wallet-open")?.addEventListener("click", openWalletFile);
-$("wallet-forget")?.addEventListener("click", forgetLoadedWalletFile);
+$("wallet-open")?.addEventListener("click", () => {
+  invalidateScanAuthority();
+  openWalletFile();
+});
+$("wallet-forget")?.addEventListener("click", () => {
+  invalidateScanAuthority();
+  forgetLoadedWalletFile();
+});
 $("wallet-path")?.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
+  if (e.key === "Enter") { e.preventDefault(); invalidateScanAuthority(); openWalletFile(); }
 });
 $("wallet-passphrase")?.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); openWalletFile(); }
+  if (e.key === "Enter") { e.preventDefault(); invalidateScanAuthority(); openWalletFile(); }
 });
 
 // Drag-and-drop, using Tauri's core webview event rather than an HTML5 drop
@@ -1185,6 +1265,7 @@ $("wallet-passphrase")?.addEventListener("keydown", (e) => {
       // elsewhere in the app cannot silently swap the selected file.
       const screen = document.querySelector('.screen[data-step="wallet-file"]');
       if (!screen?.classList.contains("active")) return;
+      invalidateScanAuthority();
       $("wallet-path").value = paths[0];
       // As with the picker: a new file is not the one the old passphrase
       // belongs to.
@@ -1281,6 +1362,113 @@ async function checkSaplingKeys() {
 // ─── Sprout scan ────────────────────────────────────────────────────────────
 // The fallback for a wallet whose note data is missing, and the only route
 // for a raw key with no wallet file. Hours, so it checkpoints and resumes.
+
+let sproutScanHandle = null;
+let sproutScanGeneration = 0;
+let sproutScanResult = null;
+let sproutScanReview = null;
+let sproutScanReviewDestination = null;
+let sproutScanProposalGeneration = 0;
+let sproutScanExecutionPending = false;
+
+function invalidateSproutScanReview() {
+  ++sproutScanProposalGeneration;
+  if (sproutScanReview) {
+    invoke("release_sprout_proposal", { proposalId: sproutScanReview.proposal_id }).catch(() => {});
+  }
+  sproutScanReview = null;
+  sproutScanReviewDestination = null;
+  $("sprout-scan-sweep-plan").textContent = "";
+  $("sprout-scan-confirm").checked = false;
+  $("sprout-scan-confirm").disabled = true;
+  $("sprout-scan-sweep-run").disabled = true;
+}
+
+function updateSproutScanSweepButton() {
+  $("sprout-scan-sweep-run").disabled = !sproutScanResult || !sproutScanReview ||
+    !sproutScanReview.params_present ||
+    sproutScanReviewDestination !== $("sprout-scan-destination").value.trim() ||
+    !$("sprout-scan-confirm").checked || sproutScanExecutionPending;
+}
+
+function invalidateSproutScanSource() {
+  ++sproutScanGeneration;
+  const handle = sproutScanHandle;
+  sproutScanHandle = null;
+  sproutScanResult = null;
+  invalidateSproutScanReview();
+  $("sprout-scan-sweep").hidden = true;
+  $("sprout-scan-bar").hidden = true;
+  $("sprout-scan-run").disabled = false;
+  $("sprout-scan-sweep-results").innerHTML = "";
+  setStatus("sprout-scan-status", "", "");
+  if (handle) invoke("release_sprout_scan", { handle }).catch(() => {});
+}
+
+function publishSproutScanSnapshot(snapshot, generation = sproutScanGeneration) {
+  if (generation !== sproutScanGeneration || !sproutScanHandle ||
+      snapshot.handle !== sproutScanHandle) return;
+  if (snapshot.status === "running") return;
+  if (sproutScanResult) return;
+  $("sprout-scan-bar").hidden = true;
+  $("sprout-scan-run").disabled = false;
+  if (snapshot.status === "failed") {
+    setStatus("sprout-scan-status", `✗ ${snapshot.error || "The scan did not finish."}`, "error");
+    return;
+  }
+  const report = snapshot.report;
+  if (!report) return;
+  sproutScanResult = report;
+  // The bound actually used: after a resume, the saved scan's.
+  $("sprout-scan-plan").textContent =
+    report.decrypt_from_height != null
+      ? `${report.decrypt_line} Trial decryption ran from block ${Number(report.decrypt_from_height).toLocaleString()}.`
+      : report.decrypt_line;
+  const caveat = report.tip_warning ? ` ${report.tip_warning}` : "";
+  setStatus(
+    "sprout-scan-status",
+    (report.notes_found > 0
+      ? `✓ Found ${report.notes_found} note(s), ${fmt(report.total_zatoshis)}. ` +
+        `${report.spent_notes} already spent.`
+      : "Scan complete. No unspent Sprout notes were found for these keys.") + caveat,
+    report.notes_found > 0 ? "success" : "",
+  );
+  $("sprout-scan-sweep").hidden = report.notes_found === 0;
+  if (report.notes_found > 0 && $("sprout-scan-destination").value.trim()) {
+    refreshSproutScanReview();
+  }
+}
+
+async function refreshSproutScanReview() {
+  invalidateSproutScanReview();
+  const handle = sproutScanHandle;
+  const destination = $("sprout-scan-destination").value.trim();
+  if (!handle || !sproutScanResult || !destination) return;
+  const generation = sproutScanGeneration;
+  const proposalGeneration = sproutScanProposalGeneration;
+  try {
+    const review = await invoke("propose_sprout_scan_sweep", { scanHandle: handle, destination });
+    if (generation !== sproutScanGeneration || proposalGeneration !== sproutScanProposalGeneration ||
+        handle !== sproutScanHandle || destination !== $("sprout-scan-destination").value.trim()) {
+      invoke("release_sprout_proposal", { proposalId: review.proposal_id }).catch(() => {});
+      return;
+    }
+    sproutScanReview = review;
+    sproutScanReviewDestination = destination;
+    $("sprout-scan-sweep-plan").textContent =
+      `${review.notes} note(s): ${fmt(review.gross_zatoshis)} gross, ` +
+      `${fmt(review.fee_zatoshis)} fee, ${fmt(review.net_zatoshis)} to your address. ` +
+      `${review.lands_in_sapling}`;
+    $("sprout-scan-confirm").disabled = !review.params_present;
+    if (!review.params_present) {
+      $("sprout-scan-sweep-plan").textContent += ` Sprout proving parameters are missing: ${review.params_path}`;
+    }
+    updateSproutScanSweepButton();
+  } catch (err) {
+    if (generation !== sproutScanGeneration || proposalGeneration !== sproutScanProposalGeneration) return;
+    setStatus("sprout-scan-status", `✗ ${err}`, "error");
+  }
+}
 
 // The raw lines of the key box, unfiltered. The backend (`collect_scan_keys`)
 // owns the skip rule and numbers a failure by the line the user can see, so
@@ -1413,6 +1601,8 @@ async function checkSproutKeys() {
 }
 
 async function runSproutScan() {
+  invalidateSproutScanSource();
+  const generation = sproutScanGeneration;
   const keys = sproutScanKeys();
   if (!keys.length && !walletFile) {
     setStatus(
@@ -1444,7 +1634,7 @@ async function runSproutScan() {
   setStatus("sprout-scan-status", "Connecting to the Zcash network…", "");
 
   try {
-    const report = await invoke("start_sprout_scan", {
+    const handle = await invoke("start_sprout_scan", {
       keys: sproutScanKeyLines(),
       // The wallet file's own Sprout keys are merged in by the backend, so
       // leaving the box blank genuinely works now.
@@ -1459,30 +1649,34 @@ async function runSproutScan() {
       birthdayFloor: decrypt.birthdayFloor,
       decryptEveryBlock: decrypt.decryptEveryBlock,
     });
-    $("sprout-scan-bar").hidden = true;
-    // The bound actually used: after a resume, the saved scan's.
-    $("sprout-scan-plan").textContent =
-      report.decrypt_from_height != null
-        ? `${report.decrypt_line} Trial decryption ran from block ${Number(report.decrypt_from_height).toLocaleString()}.`
-        : report.decrypt_line;
-    // The core's own sentence, so the GUI and CLI give the same caveat.
-    const caveat = report.tip_warning ? ` ${report.tip_warning}` : "";
-    setStatus(
-      "sprout-scan-status",
-      (report.notes_found > 0
-        ? `✓ Found ${report.notes_found} note(s), ${fmt(report.total_zatoshis)}. ` +
-          `${report.spent_notes} already spent.`
-        : `Scan complete. No unspent Sprout notes were found for these keys.`) + caveat,
-      report.notes_found > 0 ? "success" : "",
-    );
-    // Found money needs somewhere to go.
-    $("sprout-scan-sweep").hidden = report.notes_found === 0;
+    if (generation !== sproutScanGeneration) {
+      invoke("release_sprout_scan", { handle }).catch(() => {});
+      return;
+    }
+    sproutScanHandle = handle;
+    // A scan may finish before its listeners are installed. The snapshot
+    // closes that race after both event subscriptions become active.
+    const listenersReady = await sproutScanListenersReady;
+    if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
+    let snapshot = await invoke("get_sprout_scan", { handle });
+    publishSproutScanSnapshot(snapshot, generation);
+    // If event registration failed, keep reading the retained backend state.
+    // The first snapshot alone can still be running for hours.
+    while (!listenersReady && snapshot.status === "running" &&
+           generation === sproutScanGeneration && handle === sproutScanHandle) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (generation !== sproutScanGeneration || handle !== sproutScanHandle) return;
+      snapshot = await invoke("get_sprout_scan", { handle });
+      publishSproutScanSnapshot(snapshot, generation);
+    }
   } catch (err) {
-    $("sprout-scan-bar").hidden = true;
-    // Interrupting is safe and expected: the scan checkpoints as it goes.
+    if (generation !== sproutScanGeneration) return;
+    // A failed snapshot request leaves no reliable completion channel. Release
+    // local authority and let the user retry; the backend worker checkpoints.
+    invalidateSproutScanSource();
     setStatus("sprout-scan-status", `✗ ${err}`, "error");
   }
-  button.disabled = false;
+  if (generation === sproutScanGeneration && !sproutScanHandle) button.disabled = false;
 }
 
 /// Sweep what the scan found.
@@ -1495,24 +1689,21 @@ async function runSproutScanSweep() {
     setStatus("sprout-scan-status", "Enter a destination address first.", "error");
     return;
   }
-  if (!$("sprout-scan-confirm").checked) {
+  if (!sproutScanHandle || !sproutScanResult || !sproutScanReview ||
+      !sproutScanReview.params_present ||
+      sproutScanReviewDestination !== destination || !$("sprout-scan-confirm").checked) {
     setStatus(
       "sprout-scan-status",
-      "Tick the box to confirm this moves funds irreversibly.",
+      "Review this destination and tick the box before moving funds irreversibly.",
       "error",
     );
     return;
   }
-
-  // The sweep resumes the scan to reload its notes, so it dials the same
-  // peers the scan did.
-  let peers;
-  try {
-    peers = sproutScanPeers();
-  } catch (err) {
-    setStatus("sprout-scan-status", `✗ ${err.message}`, "error");
-    return;
-  }
+  if (sproutScanExecutionPending) return;
+  const handle = sproutScanHandle;
+  const generation = sproutScanGeneration;
+  const proposalId = sproutScanReview.proposal_id;
+  sproutScanExecutionPending = true;
 
   // No decrypt bound is sent: the backend resumes under the one the saved
   // scan used, read from its checkpoint. Re-deriving it from the form would
@@ -1532,16 +1723,20 @@ async function runSproutScanSweep() {
   );
 
   try {
-    const report = await invoke("sweep_sprout_from_scan", {
-      keys: sproutScanKeyLines(),
-      path: walletFile ? walletFile.path : null,
-      passphrase: walletFile ? walletFile.passphrase : null,
-      destination,
-      network: $("network-select").value,
-      dataDir: $("data-dir").value.trim(),
-      lightwalletdUrl: $("lightwalletd-url").value.trim(),
-      peers,
-    });
+    const report = await invoke("execute_sprout_scan_sweep", { proposalId });
+    // The panel may have moved on to another scan source while proving ran.
+    // These funds moved regardless, so the report is always shown, labelled
+    // as the earlier scan's, never dropped.
+    const earlier = generation !== sproutScanGeneration || handle !== sproutScanHandle;
+    const prefix = earlier ? "Earlier Sprout scan: " : "";
+    if (earlier) {
+      $("sprout-scan-sweep").hidden = false;
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent =
+        "This result belongs to the earlier Sprout scan, swept before its keys or settings changed.";
+      list.appendChild(li);
+    }
 
     noteSproutBroadcast(report, true);
     for (const sent of report.sent) {
@@ -1595,12 +1790,12 @@ async function runSproutScanSweep() {
           ? `The ${report.sent.length} transaction(s) above were already broadcast and cannot be undone.`
           : "");
       list.appendChild(li);
-      setStatus("sprout-scan-status", "✗ The sweep did not finish.", "error");
+      setStatus("sprout-scan-status", `${prefix}✗ The sweep did not finish.`, "error");
     } else {
       const refused = (report.rejected ?? []).length;
       setStatus(
         "sprout-scan-status",
-        `✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
+        `${prefix}✓ Swept ${fmt(report.total_swept)} to ${destination}.` +
           (refused > 0 ? ` ${refused} note(s) refused by the network — see below.` : ""),
         "success",
       );
@@ -1610,9 +1805,16 @@ async function runSproutScanSweep() {
       }
     }
   } catch (err) {
-    setStatus("sprout-scan-status", `✗ ${err}`, "error");
+    // Execution refuses only when nothing was broadcast; still say so, for
+    // the earlier scan too, rather than leave the click unanswered.
+    const earlier = generation !== sproutScanGeneration || handle !== sproutScanHandle;
+    setStatus("sprout-scan-status", `${earlier ? "Earlier Sprout scan: " : ""}✗ ${err}`, "error");
+  } finally {
+    sproutScanExecutionPending = false;
+    if (generation === sproutScanGeneration && handle === sproutScanHandle &&
+        sproutScanReview?.proposal_id === proposalId) invalidateSproutScanReview();
+    updateSproutScanSweepButton();
   }
-  button.disabled = false;
 }
 
 $("sprout-scan-sweep-run").addEventListener("click", runSproutScanSweep);
@@ -1620,33 +1822,65 @@ $("sprout-scan-check").addEventListener("click", checkSproutKeys);
 $("sapling-keys-check")?.addEventListener("click", checkSaplingKeys);
 $("sprout-scan-run").addEventListener("click", runSproutScan);
 $("sprout-scan-entry")?.addEventListener("toggle", onSproutScanEntryToggle);
+$("sprout-scan-destination").addEventListener("input", invalidateSproutScanReview);
+$("sprout-scan-destination").addEventListener("change", refreshSproutScanReview);
+$("sprout-scan-confirm").addEventListener("change", updateSproutScanSweepButton);
+for (const id of ["sprout-scan-keys", "sprout-scan-peers", "network-select",
+  "data-dir", "lightwalletd-url", "server-preset", "wallet-path", "wallet-passphrase"]) {
+  $(id)?.addEventListener("input", invalidateSproutScanSource);
+  $(id)?.addEventListener("change", invalidateSproutScanSource);
+}
+// The scan panel's peers verify the saved scan behind a wallet review (#272),
+// so they define its notes as much as the data directory does.
+for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "server-preset", "sprout-scan-peers"]) {
+  $(id)?.addEventListener("input", invalidateWalletSproutReview);
+  $(id)?.addEventListener("change", invalidateWalletSproutReview);
+}
+for (const id of ["network-select", "data-dir"]) {
+  for (const event of ["input", "change"]) {
+    $(id)?.addEventListener(event, () => {
+      // Inspection and its spendable balance used these settings. Require a
+      // fresh read before showing any wallet-derived Sprout evidence again.
+      const path = $("wallet-path").value;
+      forgetLoadedWalletFile();
+      $("wallet-path").value = path;
+    });
+  }
+}
 
-(async () => {
+const sproutScanListenersReady = (async () => {
   try {
-    // The backend's sentence on where decryption starts, before the hours.
-    await listen("sprout-scan-plan", (event) => {
-      $("sprout-scan-plan").textContent = event.payload;
-    });
-    await listen("sprout-scan-progress", (event) => {
-      const p = event.payload;
-      const pct = p.target ? (p.height / p.target) * 100 : 0;
-      $("sprout-scan-bar").value = pct;
-      // Waiting for a peer, not scanning. The bar keeps the scan's position
-      // and the line says why nothing is moving, so a busy network does not
-      // look like a hung app. The sentence comes from the backend.
-      if (p.peerWait) {
-        setStatus("sprout-scan-status", `${p.peerWait} Safe to stop; progress is saved every 500 blocks.`, "");
-        return;
-      }
-      setStatus(
-        "sprout-scan-status",
-        `Scanning ${p.height.toLocaleString()} / ${p.target.toLocaleString()} ` +
-          `(${pct.toFixed(1)}%) — ${p.notesFound} note(s) found. Safe to stop; progress is saved every 500 blocks.`,
-        "",
-      );
-    });
+    await Promise.all([
+      // The backend's sentence on where decryption starts, before the hours.
+      listen("sprout-scan-plan", (event) => {
+        $("sprout-scan-plan").textContent = event.payload;
+      }),
+      listen("sprout-scan-progress", (event) => {
+        const p = event.payload;
+        if (!sproutScanHandle || p.handle !== sproutScanHandle) return;
+        const pct = p.target ? (p.height / p.target) * 100 : 0;
+        $("sprout-scan-bar").value = pct;
+        // Waiting for a peer, not scanning. The bar keeps the scan's position
+        // and the line says why nothing is moving, so a busy network does not
+        // look like a hung app. The sentence comes from the backend.
+        if (p.peerWait) {
+          setStatus("sprout-scan-status", `${p.peerWait} Safe to stop; progress is saved every 500 blocks.`, "");
+          return;
+        }
+        setStatus(
+          "sprout-scan-status",
+          `Scanning ${p.height.toLocaleString()} / ${p.target.toLocaleString()} ` +
+            `(${pct.toFixed(1)}%) — ${p.notesFound} note(s) found. Safe to stop; progress is saved every 500 blocks.`,
+          "",
+        );
+      }),
+      listen("sprout-scan-complete", (event) => {
+        publishSproutScanSnapshot(event.payload);
+      }),
+    ]);
+    return true;
   } catch (_) {
-    // No event channel: the final result still reports.
+    return false;
   }
 })();
 
@@ -1762,6 +1996,9 @@ document.addEventListener("address-match-recovery", async (event) => {
     if (!retainedMatch) {
       throw new Error("The selected address match is no longer available.");
     }
+    // Selecting a match changes both source and network without a DOM input
+    // event. Revoke the prior scan and proposal before exposing the match.
+    invalidateScanAuthority();
     state.matchedRecovery = { searchId, matchId, match: retainedMatch, network: snapshot.network };
     state.retainedAddressSearchId = searchId;
     // A matched capability is the sole recovery source. Clear any inputs left
@@ -2020,6 +2257,7 @@ async function runBirthdayAutodetect() {
       return;
     }
     $("birthday-height").value = result.birthday;
+    invalidateScanAuthority();
     birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
@@ -2050,6 +2288,7 @@ $("birthday-estimate").addEventListener("click", async () => {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
     });
     $("birthday-height").value = height;
+    invalidateScanAuthority();
     birthdayTouched = true;
     updateScanEstimate();
     const approx = formatApproxMonth(approxDateFromHeight(height));
@@ -2113,6 +2352,8 @@ phrase, or clear the seed phrase to scan the pasted key.";
 }
 
 $("start-scan").addEventListener("click", async () => {
+  if (state.sweepExecutionPending) return;
+  const generation = state.scanAuthorityGeneration;
   // Three routes to the same scan: a seed phrase, a wallet file, or a
   // pasted Sapling spending key.
   const hasTypedSaplingKeys = hasSaplingScanKeys();
@@ -2159,11 +2400,13 @@ go back and provide one.",
 
   try {
     const info = await invoke("validate_address", { address, network: $("network-select").value });
+    if (generation !== state.scanAuthorityGeneration) return;
     if (!info.destination_ok) {
       setStatus("config-status", "✗ Address must have an Orchard or Sapling receiver.", "error");
       return;
     }
   } catch (err) {
+    if (generation !== state.scanAuthorityGeneration) return;
     setStatus("config-status", `✗ ${err}`, "error");
     return;
   }
@@ -2182,8 +2425,10 @@ go back and provide one.",
   if (!dataDirVal) {
     try {
       dataDirVal = await invoke("default_data_dir");
+      if (generation !== state.scanAuthorityGeneration) return;
       $("data-dir").value = dataDirVal;
     } catch (_) {
+      if (generation !== state.scanAuthorityGeneration) return;
       setStatus("config-status", "✗ Could not determine a data directory. Please enter one manually.", "error");
       $("start-scan").disabled = false;
       return;
@@ -2212,6 +2457,7 @@ go back and provide one.",
   setStatus("config-status", "Starting scan…", "");
   $("start-scan").disabled = true;
 
+  let matched = null;
   try {
     let handle;
     // Raw lines, so the backend applies its own skip rule and its errors
@@ -2222,9 +2468,10 @@ go back and provide one.",
       scanWarningVariant(walletFile, typedSaplingKeys.length, !!state.matchedRecovery),
     );
     if (state.matchedRecovery) {
-      const matched = state.matchedRecovery;
+      matched = state.matchedRecovery;
       const matchedConfig = configForMatchedRecovery(config);
       state.addressMatchRecoveryLocked = true;
+      state.addressMatchRecoveryStartGeneration = generation;
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: true } }));
       handle = await invoke("start_matched_recovery", {
         searchId: matched.searchId,
@@ -2233,8 +2480,6 @@ go back and provide one.",
         // the sweep screen has no memo field to remove it from afterwards.
         config: { ...matchedConfig, sweep_memo: state.memo },
       });
-      state.matchedRecovery = null;
-      clearMatchedRecoveryUi();
     } else if (walletFile || typedSaplingKeys.length) {
       // Routing between the HD path and the imported-account path lives in
       // the core service, not here: it depends on whether the file yielded a
@@ -2256,6 +2501,22 @@ go back and provide one.",
       });
     } else {
       handle = await invoke("start_scan", { config });
+    }
+    if (generation !== state.scanAuthorityGeneration) {
+      // The backend may have started scan A after its form was edited into B.
+      // It is no longer UI authority; ask it to stop without disturbing B.
+      invoke("cancel_scan", { handle }).catch(() => {});
+      if (matched && state.matchedRecovery === matched &&
+          state.addressMatchRecoveryStartGeneration === generation) {
+        state.addressMatchRecoveryLocked = false;
+        state.addressMatchRecoveryStartGeneration = null;
+        document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
+      }
+      return;
+    }
+    if (matched) {
+      state.matchedRecovery = null;
+      clearMatchedRecoveryUi();
     }
     state.scanHandle = handle;
     if (state.retainedAddressSearchId) {
@@ -2284,10 +2545,20 @@ go back and provide one.",
     if (saplingBox) saplingBox.value = "";
     $("sapling-key-addresses").innerHTML = "";
     goTo("scan");
-    await startProgressListeners();
+    await startProgressListeners(handle);
   } catch (err) {
+    if (generation !== state.scanAuthorityGeneration) {
+      if (matched && state.matchedRecovery === matched &&
+          state.addressMatchRecoveryStartGeneration === generation) {
+        state.addressMatchRecoveryLocked = false;
+        state.addressMatchRecoveryStartGeneration = null;
+        document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
+      }
+      return;
+    }
     if (state.matchedRecovery) {
       state.addressMatchRecoveryLocked = false;
+      state.addressMatchRecoveryStartGeneration = null;
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
     }
     setStatus("config-status", `✗ ${err}`, "error");
@@ -2296,13 +2567,18 @@ go back and provide one.",
     // Clear the seed phrase from the DOM regardless of whether start_scan
     // succeeded; on failure the user can retype, and a successful scan no
     // longer needs the cleartext phrase visible.
-    seedInput.value = "";
+    if (generation === state.scanAuthorityGeneration) seedInput.value = "";
   }
 });
 
 // ─── Step 4: Scan Progress ────────────────────────────────────────────────────
 
-async function startProgressListeners() {
+async function startProgressListeners(expectedHandle) {
+  const expectedId = expectedHandle.id;
+  const expectedGeneration = state.scanAuthorityGeneration;
+  const isCurrent = () => state.scanAuthorityGeneration === expectedGeneration &&
+    state.scanHandle?.id === expectedId;
+  let terminalEventSeen = false;
   $("scan-phase").textContent = "Starting…";
   $("scan-server").textContent = "Connecting…";
   $("scan-progress-text").textContent = "0 / 0";
@@ -2332,17 +2608,19 @@ async function startProgressListeners() {
 
   const [unlistenProgress, unlistenComplete, unlistenDiscovered] = await Promise.all([
     listen("scan-progress", (event) => {
-      if (event.payload.handle?.id !== state.scanHandle?.id) return;
+      if (event.payload.handle?.id !== expectedId || !isCurrent() || terminalEventSeen) return;
       updateScanUI(event.payload);
     }),
     listen("scan-complete", (event) => {
-      if (event.payload.handle?.id !== state.scanHandle?.id) return;
+      if (event.payload.handle?.id !== expectedId || !isCurrent() || terminalEventSeen) return;
+      terminalEventSeen = true;
       updateScanUI(event.payload);
       notifyScanComplete(event.payload);
       cleanupListeners();
     }),
     listen("scan-discovery", (event) => {
-      const d = event.payload;
+      if (event.payload.handle?.id !== expectedId || !isCurrent() || terminalEventSeen) return;
+      const d = event.payload.discovery;
       const div = document.createElement("div");
       div.className = "discovery-toast";
       // at_block_height is the scan frontier when first observed, not the
@@ -2363,9 +2641,34 @@ async function startProgressListeners() {
       container.style.display = "";
     }),
   ]);
+  if (!isCurrent()) {
+    unlistenProgress();
+    unlistenComplete();
+    unlistenDiscovered();
+    return;
+  }
   state.unlistenProgress = unlistenProgress;
   state.unlistenComplete = unlistenComplete;
   state.unlistenDiscovered = unlistenDiscovered;
+  if (terminalEventSeen) {
+    cleanupListeners();
+    return;
+  }
+  // A fast scan can finish before the completion subscription exists. Query
+  // the backend after registration and apply only this scan's live snapshot.
+  try {
+    const progress = await invoke("get_scan_progress", { handle: { id: expectedId } });
+    if (!isCurrent() || terminalEventSeen || progress?.handle?.id !== expectedId) return;
+    updateScanUI(progress);
+    if (["complete", "cancelled", "error"].includes(progress.phase)) {
+      notifyScanComplete(progress);
+      cleanupListeners();
+    }
+  } catch (err) {
+    if (isCurrent() && !terminalEventSeen) {
+      setStatus("scan-message", `Could not refresh scan progress: ${err}`, "error");
+    }
+  }
 }
 
 function scanCompletionSummary(progress) {
@@ -2557,7 +2860,7 @@ function returnToAddressMatches() {
   clearMatchedRecoveryUi();
   state.scanHandle = null;
   state.lastProgress = null;
-  state.sweepProposal = null;
+  invalidateSweepReview();
   state.addressMatchRecoveryLocked = false;
   $("start-scan").disabled = false;
   setStatus("config-status", "", "");
@@ -2600,6 +2903,7 @@ function appendCell(tr, text) {
 
 $("back-to-config").addEventListener("click", () => {
   cleanupListeners();
+  invalidateSweepReview();
   state.scanHandle = null;
   $("back-to-config").style.display = "none";
   $("start-scan").disabled = false;
@@ -2620,6 +2924,58 @@ $("cancel-scan").addEventListener("click", async () => {
   }
 });
 
+function invalidateScanAuthority() {
+  state.scanAuthorityGeneration += 1;
+  cleanupListeners();
+  invalidateSweepReview();
+  state.scanHandle = null;
+  state.lastProgress = null;
+  state.scanConfig = null;
+  state.savedReportPath = null;
+  $("scan-phase").textContent = "Idle";
+  $("scan-server").textContent = "Not connected";
+  $("scan-progress-text").textContent = "0 / 0";
+  $("scan-eta").textContent = "Calculating…";
+  $("scan-progress-bar").style.width = "0%";
+  $("scan-rows").innerHTML = "";
+  $("scan-discoveries").innerHTML = "";
+  $("scan-discoveries").style.display = "none";
+  $("scan-totals").textContent = "Grand total: 0.00000000 ZEC across 0 accounts.";
+  $("scan-workspace").textContent = "Workspace: not initialized";
+  $("scan-sleep-banner").style.display = "none";
+  $("scan-sandblasting-banner").style.display = "none";
+  $("scan-gap-extension-banner").style.display = "none";
+  $("scan-sleep-detail").textContent = "";
+  $("scan-gap-extension-detail").textContent = "";
+  $("sweep-rows").innerHTML = "";
+  $("sweep-skipped").innerHTML = "";
+  $("sweep-summary").textContent = "";
+  $("copy-report-path").style.display = "none";
+  setStatus("scan-message", "", "");
+  $("review-sweep").disabled = true;
+  $("back-to-config").style.display = "none";
+  $("cancel-scan").disabled = true;
+  $("start-scan").disabled = state.sweepExecutionPending;
+  eta.reset();
+}
+
+for (const id of [
+  "seed-input", "wallet-path", "wallet-passphrase", "sapling-scan-keys",
+  "network-select", "birthday-height", "accounts-range", "auto-gap-limit",
+  "gap-limit", "transparent-index-start", "transparent-index-count",
+  "transparent-include-change", "lightwalletd-url", "server-preset", "data-dir",
+  "sprout-scan-peers",
+]) {
+  $(id)?.addEventListener("input", invalidateScanAuthority);
+  $(id)?.addEventListener("change", invalidateScanAuthority);
+}
+
+$("wallet-path")?.addEventListener("input", () => {
+  const path = $("wallet-path").value;
+  forgetLoadedWalletFile();
+  $("wallet-path").value = path;
+});
+
 function donationParamsFromForm() {
   if (!state.donationEnabled) return { donationRate: null, donorEmail: null };
   const enabled = $("donate-enabled").checked;
@@ -2629,36 +2985,77 @@ function donationParamsFromForm() {
   return { donationRate, donorEmail };
 }
 
-async function refreshSweepProposal() {
+function invalidateSweepReview() {
+  state.proposalGeneration += 1;
+  state.sweepReview = null;
+  state.proposalPending = false;
+  $("irreversible-check").checked = false;
+  $("irreversible-check").disabled = true;
+  $("execute-sweep").disabled = true;
+  if (!state.sweepExecutionPending) setStatus("sweep-execute-status", "", "");
+}
+
+function setSweepProposalPending(pending) {
+  state.proposalPending = pending;
+  if (pending) {
+    state.sweepReview = null;
+    $("irreversible-check").checked = false;
+    $("irreversible-check").disabled = true;
+    $("execute-sweep").disabled = true;
+    setStatus("sweep-execute-status", "", "");
+  }
+}
+
+function sweepRequestFromForm() {
   const { donationRate, donorEmail } = donationParamsFromForm();
-  const proposal = await invoke("propose_sweep", {
+  return {
     handle: state.scanHandle,
-    destination: state.destination,
-    memo: state.memo,
-    maxFeeZec: state.maxFeeZec,
+    destination: $("destination-input").value.trim(),
+    memo: $("sweep-memo").value.trim() || null,
+    maxFeeZec: $("max-fee-zec").value.trim() || null,
     donationRate,
     donorEmail,
-  });
-  state.sweepProposal = proposal;
-  renderSweepProposal(proposal);
+  };
+}
+
+async function refreshSweepProposal() {
+  if (state.sweepExecutionPending) return null;
+  invalidateSweepReview();
+  setSweepProposalPending(true);
+  const generation = state.proposalGeneration;
+  const handleId = state.scanHandle?.id;
+  const request = sweepRequestFromForm();
+  try {
+    const review = await invoke("propose_sweep", request);
+    if (generation !== state.proposalGeneration || handleId !== state.scanHandle?.id) return null;
+    state.sweepReview = { ...review, handleId, donationRateForDisplay: request.donationRate };
+    setSweepProposalPending(false);
+    renderSweepProposal(review.proposal);
+    return review;
+  } catch (err) {
+    if (generation !== state.proposalGeneration || handleId !== state.scanHandle?.id) return null;
+    invalidateSweepReview();
+    setStatus("sweep-execute-status", `✗ ${err}`, "error");
+    throw err;
+  }
 }
 
 async function maybeRefreshProposal() {
-  if (!state.sweepProposal) return;
+  if (state.sweepExecutionPending || !state.scanHandle || state.lastProgress?.phase !== "complete") return;
   try {
     await refreshSweepProposal();
   } catch (err) {
-    setStatus("sweep-execute-status", `✗ ${err}`, "error");
+    // refreshSweepProposal displays errors only for the current generation.
   }
 }
 
 $("review-sweep").addEventListener("click", async () => {
+  if (state.sweepExecutionPending) return;
   setStatus("scan-message", "Fetching sweep proposal…", "");
   $("review-sweep").disabled = true;
 
   try {
-    await refreshSweepProposal();
-    goTo("sweep");
+    if (await refreshSweepProposal()) goTo("sweep");
   } catch (err) {
     setStatus("scan-message", `✗ ${err}`, "error");
     $("review-sweep").disabled = false;
@@ -2678,7 +3075,7 @@ $("sweep-back").addEventListener("click", () => {
 // donation. Only the *selected* rate is ever sent to the backend; the chips
 // just preview amounts so we don't fan out three propose_sweep calls.
 function estimateDonationZat(pct) {
-  const p = state.sweepProposal;
+  const p = state.sweepReview?.proposal;
   if (!p) return null;
   const base = (p.net_received_zatoshis || 0) + (p.total_donation_zatoshis || 0);
   return Math.round((base * pct) / 100);
@@ -2697,6 +3094,7 @@ function selectDonationPreset(pctValue) {
       String(chip.dataset.pct === String(pctValue)),
     );
   });
+  invalidateSweepReview();
   maybeRefreshProposal();
 }
 
@@ -2706,6 +3104,7 @@ document.querySelectorAll("#donate-presets .preset-chip").forEach((chip) => {
 
 // Custom field: keep its chip highlighted while typing; re-propose on change.
 $("donate-rate").addEventListener("input", () => {
+  invalidateSweepReview();
   document.querySelectorAll("#donate-presets .preset-chip").forEach((chip) => {
     chip.setAttribute("aria-pressed", String(chip.dataset.pct === "custom"));
   });
@@ -2723,13 +3122,18 @@ $("donate-skip").addEventListener("click", () => {
       chip.setAttribute("aria-pressed", "false");
     });
     $("donate-skip").textContent = "Changed your mind? Add a donation";
+    invalidateSweepReview();
     maybeRefreshProposal();
   } else {
     $("donate-skip").textContent = "No thanks, skip donation";
     selectDonationPreset("10"); // re-enables, un-collapses, and re-proposes
   }
 });
-// email does not affect amounts; it's read fresh at propose/execute time, no re-propose needed
+
+for (const id of ["destination-input", "sweep-memo", "max-fee-zec", "donate-email", "donate-enabled"]) {
+  $(id).addEventListener("input", invalidateSweepReview);
+  $(id).addEventListener("change", maybeRefreshProposal);
+}
 
 // ─── Step 5: Sweep Review ─────────────────────────────────────────────────────
 
@@ -2818,9 +3222,6 @@ function renderSweepProposal(proposal) {
   }
 
   $("irreversible-check").checked = false;
-  // Re-enable the checkbox: a prior sweep's execute click disables it (and only
-  // the error path re-enables it), so without this a second proposal in the
-  // same session leaves the checkbox stuck disabled and the sweep unclickable.
   $("irreversible-check").disabled = false;
   $("execute-sweep").disabled = true;
 }
@@ -2840,41 +3241,54 @@ $("sweep-rows").addEventListener("click", (e) => {
 });
 
 $("irreversible-check").addEventListener("change", () => {
-  $("execute-sweep").disabled = !$("irreversible-check").checked;
+  $("execute-sweep").disabled = state.sweepExecutionPending || !state.sweepReview || state.proposalPending ||
+    state.sweepReview.handleId !== state.scanHandle?.id || !$("irreversible-check").checked;
 });
 
 $("execute-sweep").addEventListener("click", async () => {
+  const review = state.sweepReview;
+  if (state.sweepExecutionPending || !review || state.proposalPending ||
+      review.handleId !== state.scanHandle?.id ||
+      !$("irreversible-check").checked) return;
+  const handle = state.scanHandle;
+  const completionContext = {
+    handle,
+    scanConfig: state.scanConfig,
+    lastProgress: state.lastProgress,
+  };
+  state.sweepExecutionPending = true;
+  state.sweepReview = null;
   $("execute-sweep").disabled = true;
   $("irreversible-check").disabled = true;
-  setStatus("sweep-execute-status", "Broadcasting transactions to the Zcash network… this may take up to 2 minutes.", "");
 
   try {
-    const { donationRate, donorEmail } = donationParamsFromForm();
+    setStatus("sweep-execute-status", "Broadcasting transactions to the Zcash network… this may take up to 2 minutes.", "");
     // `execute_sweep` rejects only when nothing was broadcast. A mid-sequence
     // abort after one or more broadcasts resolves with `{ transactions, error }`
     // so the already-broadcast transaction IDs are still shown (audit Issue E).
-    const outcome = await invoke("execute_sweep", {
-      handle: state.scanHandle,
-      destination: state.destination,
-      memo: state.memo,
-      maxFeeZec: state.maxFeeZec,
-      donationRate,
-      donorEmail,
-    });
+    const outcome = await invoke("execute_sweep", { handle, proposalId: review.proposal_id });
+    state.completedScanHandle = handle;
     setStatus("sweep-execute-status", "", "");
     renderCompleteScreen(
       outcome.transactions,
       outcome.skipped_accounts,
       outcome.total_donation_zatoshis || 0,
-      donationRate,
+      review.donationRateForDisplay,
       outcome.error,
       outcome.donation_note,
+      completionContext,
     );
+    if (state.scanHandle?.id !== handle.id) {
+      $("complete-summary").textContent =
+        "This result belongs to the sweep started before the scan source changed. " +
+        $("complete-summary").textContent;
+    }
     goTo("complete");
   } catch (err) {
-    $("execute-sweep").disabled = false;
-    $("irreversible-check").disabled = false;
+    invalidateSweepReview();
     setStatus("sweep-execute-status", `✗ Sweep failed: ${err}`, "error");
+  } finally {
+    state.sweepExecutionPending = false;
   }
 });
 
@@ -2935,7 +3349,7 @@ function sweepCompleteSummary(results, error) {
   return `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
 }
 
-function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote) {
+function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote, completionContext = null) {
   $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
   if (state.retainedAddressSearchId) {
     state.addressMatchRecoveryLocked = false;
@@ -3039,14 +3453,14 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     donationEl.textContent = "";
   }
 
-  const report = buildReport(results);
+  const report = buildReport(results, completionContext);
   $("save-report").dataset.report = report;
   $("report-path").value = buildDefaultReportPath();
 }
 
-function buildReport(results) {
-  const cfg = state.scanConfig;
-  const prog = state.lastProgress;
+function buildReport(results, completionContext = null) {
+  const cfg = completionContext?.scanConfig ?? state.scanConfig;
+  const prog = completionContext?.lastProgress ?? state.lastProgress;
   const accountsScanned = prog?.accounts?.length ?? "—";
   const network = cfg?.network ?? "—";
   const birthday = cfg?.birthday != null ? Number(cfg.birthday).toLocaleString() : "—";
@@ -3096,7 +3510,7 @@ $("save-report").addEventListener("click", async () => {
   }
   try {
     const saved = await invoke("save_recovery_report", {
-      handle: state.scanHandle,
+      handle: state.completedScanHandle || state.scanHandle,
       path,
       report,
     });
@@ -3118,7 +3532,8 @@ $("copy-report-path").addEventListener("click", () => {
 });
 
 $("delete-workspace").addEventListener("click", async () => {
-  if (!state.scanHandle) {
+  const handle = state.completedScanHandle || state.scanHandle;
+  if (!handle) {
     setStatus("delete-workspace-status", "No workspace to delete.", "error");
     return;
   }
@@ -3135,10 +3550,11 @@ $("delete-workspace").addEventListener("click", async () => {
   btn.disabled = true;
   setStatus("delete-workspace-status", "Deleting…", "");
   try {
-    const deletedPath = await invoke("delete_workspace", { handle: state.scanHandle });
+    const deletedPath = await invoke("delete_workspace", { handle });
     setStatus("delete-workspace-status", `✓ Deleted ${deletedPath}`, "success");
     // The session is gone server-side; further per-handle commands would fail.
     state.scanHandle = null;
+    state.completedScanHandle = null;
     state.savedReportPath = null;
     // The recovery report is inside the workspace we just deleted; the
     // "Copy path" affordance now points at nothing.
@@ -3150,8 +3566,8 @@ $("delete-workspace").addEventListener("click", async () => {
   }
 });
 
-$("restart-flow").addEventListener("click", () => {
-  cleanupListeners();
+function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } = {}) {
+  invalidateScanAuthority();
   if (state.retainedAddressSearchId || state.matchedRecovery) {
     const searchId = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
     state.retainedAddressSearchId = null;
@@ -3161,16 +3577,19 @@ $("restart-flow").addEventListener("click", () => {
   furthestStep = 0;
   Object.assign(state, {
     scanHandle: null,
+    completedScanHandle: null,
     lastProgress: null,
-    sweepProposal: null,
-    destination: null,
-    memo: null,
-    maxFeeZec: null,
+    sweepReview: null,
+    proposalPending: false,
+    destination: destination || null,
+    memo: memo || null,
+    maxFeeZec: maxFeeZec || null,
     scanConfig: null,
     savedReportPath: null,
     matchedRecovery: null,
     retainedAddressSearchId: null,
     addressMatchRecoveryLocked: false,
+    addressMatchRecoveryStartGeneration: null,
   });
   $("copy-report-path").style.display = "none";
   $("delete-workspace").disabled = false;
@@ -3182,14 +3601,36 @@ $("restart-flow").addEventListener("click", () => {
   $("sapling-scan-keys").value = "";
   $("sapling-key-addresses").replaceChildren();
   forgetSproutScanInputs();
+  $("sprout-scan-peers").value = "";
+  $("sprout-destination").value = "";
   seedVisibility.checked = false;
   seedInput.classList.add("masked");
   seedNextBtn.disabled = true;
   setStatus("seed-status", "", "");
   setStatus("config-status", "", "");
-  $("destination-input").value = "";
-  $("max-fee-zec").value = "";
-  $("sweep-memo").value = "";
+  $("destination-input").value = destination;
+  $("max-fee-zec").value = maxFeeZec;
+  $("sweep-memo").value = memo;
+  $("memo-byte-count").textContent = `${new TextEncoder().encode(memo).length} / 512 bytes`;
+  $("memo-byte-count").style.color = "";
+  $("scan-label").value = defaultScanLabel();
+  $("scan-label").placeholder = defaultScanLabel();
+  $("network-select").value = "mainnet";
+  $("birthday-height").value = "419200";
+  // The starting value again, not a birthday the user chose.
+  birthdayTouched = false;
+  $("birthday-date").value = "";
+  setStatus("birthday-probe-status", "", "");
+  $("accounts-range").value = "20";
+  $("accounts-range-value").textContent = "20";
+  $("accounts-range-value").style.opacity = "0.4";
+  $("auto-gap-limit").checked = true;
+  $("accounts-range").disabled = false;
+  $("gap-limit").value = "20";
+  $("gap-limit-row").style.display = "none";
+  $("server-preset").value = "recommended";
+  $("lightwalletd-url").value = SERVER_PRESETS.mainnet;
+  $("data-dir").value = state.defaultDataDir || "";
   $("transparent-index-start").value = "0";
   $("transparent-index-count").value = "1000";
   $("transparent-include-change").checked = false;
@@ -3209,6 +3650,20 @@ $("restart-flow").addEventListener("click", () => {
   });
   setStatus("donate-amount-preview", "", "");
   $("start-scan").disabled = false;
+  $("irreversible-check").checked = false;
+  $("irreversible-check").disabled = true;
+  $("execute-sweep").disabled = true;
+  $("sweep-rows").innerHTML = "";
+  $("sweep-skipped").innerHTML = "";
+  $("sweep-summary").textContent = "";
+  $("complete-txids").innerHTML = "";
+  $("complete-summary").textContent = "";
+  $("complete-skipped").textContent = "";
+  $("complete-donation").textContent = "";
+  $("complete-report").textContent = "";
+  $("complete-report").style.display = "none";
+  $("save-report").dataset.report = "";
+  setStatus("save-report-status", "", "");
 
   // Reset scan screen to blank state so stale results aren't visible if the
   // user navigates forward via the sidebar before starting a new scan.
@@ -3227,6 +3682,10 @@ $("restart-flow").addEventListener("click", () => {
   $("back-to-config").style.display = "none";
   $("cancel-scan").style.display = "";
 
+}
+
+$("restart-flow").addEventListener("click", () => {
+  resetRecoveryFlowState();
   goTo("welcome");
 });
 
@@ -3388,6 +3847,7 @@ function fmtRelativeTime(epochSeconds) {
 }
 
 let pendingResumeRow = null;
+let resumeGeneration = 0;
 
 const DISMISSED_SESSIONS_KEY = "argos-dismissed-sessions";
 
@@ -3529,13 +3989,18 @@ async function refreshResumePanel() {
 }
 
 function openResumeModal(row) {
+  ++resumeGeneration;
   pendingResumeRow = row;
+  $("resume-confirm").disabled = false;
   $("resume-modal-title").textContent = `Resume "${row.label || "(unlabeled scan)"}"`;
   $("resume-seed-input").value = "";
   $("resume-seed-input").classList.add("masked");
   $("resume-seed-visibility").checked = false;
   $("resume-label-input").value = "";
   $("resume-bip39-passphrase").value = "";
+  $("resume-destination-input").value = "";
+  $("resume-memo-input").value = "";
+  $("resume-max-fee-zec").value = "";
   $("resume-bip39-passphrase-field").hidden = !row.match_coordinates;
   setStatus("resume-modal-status", "", "");
   $("resume-modal").hidden = false;
@@ -3543,10 +4008,15 @@ function openResumeModal(row) {
 }
 
 function closeResumeModal() {
+  ++resumeGeneration;
   pendingResumeRow = null;
+  $("resume-confirm").disabled = false;
   $("resume-modal").hidden = true;
   $("resume-seed-input").value = "";
   $("resume-bip39-passphrase").value = "";
+  $("resume-destination-input").value = "";
+  $("resume-memo-input").value = "";
+  $("resume-max-fee-zec").value = "";
 }
 
 function passphraseForResumedSession(row, value) {
@@ -3562,47 +4032,90 @@ $("resume-seed-clear-clipboard").addEventListener("click", () =>
 );
 
 $("resume-confirm").addEventListener("click", async () => {
+  if (state.sweepExecutionPending) {
+    setStatus("resume-modal-status", "Wait for the current sweep to finish before resuming a scan.", "error");
+    return;
+  }
   if (!pendingResumeRow) return;
+  const row = pendingResumeRow;
+  const generation = resumeGeneration;
+  const scanGeneration = state.scanAuthorityGeneration;
+  const isCurrent = () => generation === resumeGeneration && pendingResumeRow === row &&
+    scanGeneration === state.scanAuthorityGeneration;
   const seed = $("resume-seed-input").value.trim().toLowerCase();
   if (!seed) {
     setStatus("resume-modal-status", "Enter the seed phrase to continue.", "error");
     return;
   }
+  const destination = $("resume-destination-input").value.trim();
+  const memo = $("resume-memo-input").value.trim();
+  const maxFeeZec = $("resume-max-fee-zec").value.trim();
+  if (!destination) {
+    setStatus("resume-modal-status", "Enter a destination Unified Address.", "error");
+    return;
+  }
+  if (!/^\d+(?:\.\d{1,8})?$/.test(maxFeeZec) || Number(maxFeeZec) <= 0 || !Number.isFinite(Number(maxFeeZec))) {
+    setStatus("resume-modal-status", "Enter a positive maximum fee in ZEC with at most 8 decimal places.", "error");
+    return;
+  }
+  try {
+    const info = await invoke("validate_address", { address: destination, network: row.network });
+    if (!isCurrent()) return;
+    if (!info.destination_ok) {
+      setStatus("resume-modal-status", "Destination must have an Orchard or Sapling receiver.", "error");
+      return;
+    }
+  } catch (err) {
+    if (!isCurrent()) return;
+    setStatus("resume-modal-status", `Could not validate destination: ${err}`, "error");
+    return;
+  }
   const labelOverride = $("resume-label-input").value.trim();
   const passphrase = passphraseForResumedSession(
-    pendingResumeRow,
+    row,
     $("resume-bip39-passphrase").value,
   );
-  const lightwalletdUrl =
-    $("lightwalletd-url").value.trim() ||
-    (pendingResumeRow.network === "testnet"
-      ? SERVER_PRESETS.testnet
-      : SERVER_PRESETS.mainnet);
+  const lightwalletdUrl = SERVER_PRESETS[row.network] ?? SERVER_PRESETS.mainnet;
 
   $("resume-confirm").disabled = true;
   setStatus("resume-modal-status", "Verifying seed and resuming…", "");
   try {
     // Resume is seed-only, so it always runs the shielded block sync.
     showScanWarning("shielded");
-    const handle = await invoke("resume_session", {
+    const resumed = await invoke("resume_session", {
       input: {
-        workspace_path: pendingResumeRow.workspace_path,
+        workspace_path: row.workspace_path,
         seed,
         passphrase,
         lightwalletd_url: lightwalletdUrl,
         label: labelOverride || null,
       },
     });
-    state.scanHandle = handle;
+    if (!isCurrent()) {
+      await invoke("cancel_scan", { handle: resumed.handle }).catch(() => {});
+      return;
+    }
+    resetRecoveryFlowState({ destination, memo, maxFeeZec });
+    state.scanConfig = {
+      network: resumed.network,
+      data_dir: resumed.data_dir,
+      lightwalletd_url: resumed.lightwalletd_url,
+    };
+    $("network-select").value = resumed.network;
+    $("data-dir").value = resumed.data_dir;
+    $("lightwalletd-url").value = resumed.lightwalletd_url;
+    $("server-preset").value = resumed.lightwalletd_url === SERVER_PRESETS[resumed.network]
+      ? "recommended" : "custom";
+    state.scanHandle = resumed.handle;
     closeResumeModal();
     // Skip the seed/config screens — they don't apply to a resumed scan.
     furthestStep = steps.indexOf("scan");
     goTo("scan");
-    await startProgressListeners();
+    await startProgressListeners(resumed.handle);
   } catch (err) {
-    setStatus("resume-modal-status", `✗ ${err}`, "error");
+    if (isCurrent()) setStatus("resume-modal-status", `✗ ${err}`, "error");
   } finally {
-    $("resume-confirm").disabled = false;
+    if (isCurrent()) $("resume-confirm").disabled = false;
   }
 });
 
@@ -3617,6 +4130,7 @@ goTo("welcome");
 
 invoke("default_data_dir")
   .then((dir) => {
+    state.defaultDataDir = dir || null;
     if (dir && !$("data-dir").value.trim()) $("data-dir").value = dir;
   })
   .catch(() => {

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod reviewed_intent;
 
 use argos_core::RecoveryService;
 use commands::AppState;
@@ -28,6 +29,7 @@ fn main() {
         .manage(AppState {
             service: RecoveryService::new(),
             address_search: argos_core::address_search::AddressSearchService::default(),
+            reviewed_intent: reviewed_intent::ReviewedIntentStore::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::validate_seed,
@@ -53,10 +55,14 @@ fn main() {
             commands::check_sprout_key,
             commands::check_sapling_key,
             commands::start_sprout_scan,
-            commands::sweep_sprout_from_scan,
-            commands::preview_sprout_sweep,
+            commands::get_sprout_scan,
+            commands::release_sprout_scan,
+            commands::release_sprout_proposal,
+            commands::propose_wallet_sprout_sweep,
+            commands::execute_wallet_sprout_sweep,
+            commands::propose_sprout_scan_sweep,
+            commands::execute_sprout_scan_sweep,
             commands::sprout_nu7_warning,
-            commands::execute_sprout_sweep,
             commands::default_data_dir,
             commands::notify_user,
             commands::list_incomplete_sessions,

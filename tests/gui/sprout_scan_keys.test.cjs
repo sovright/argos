@@ -82,8 +82,29 @@ function driveHandler(name, boxText, report) {
     sproutScanPeers: () => [],
     invoke: async (command, args) => {
       calls.push({ command, args });
+      // #271: the scan returns a backend handle and its result arrives as a
+      // snapshot; the sweep executes a reviewed proposal by id.
+      if (command === "start_sprout_scan") return "scan-1";
+      if (command === "get_sprout_scan") return { handle: args.handle, status: "running", report: null, error: null };
       return report;
     },
+    // Reviewed-intent state the handlers read (#271). The scan panel holds
+    // a completed scan and a proposal reviewed for this destination.
+    sproutScanHandle: null,
+    sproutScanGeneration: 0,
+    sproutScanResult: null,
+    sproutScanReview: null,
+    sproutScanReviewDestination: null,
+    sproutScanExecutionPending: false,
+    sproutScanListenersReady: Promise.resolve(true),
+    invalidateSproutScanSource() {},
+    invalidateSproutScanReview() {},
+    updateSproutScanSweepButton() {},
+    publishSproutScanSnapshot() {},
+    noteSproutBroadcast() {},
+    sweepLeftNothingBehind: () => false,
+    uncoveredSproutKeys: 0,
+    renderSproutUncoveredBanners() {},
   };
   // `async function` must be kept whole, so slice from its own keyword.
   const start = source.indexOf(`async function ${name}(`);
@@ -104,29 +125,36 @@ function driveHandler(name, boxText, report) {
   );
   vm.createContext(context);
   const run = vm.runInContext(`${source.slice(start, end)}; ${name}`, context);
-  return { run, calls };
+  return { run, calls, context };
 }
 
 const BOX = "# my keys\n\nSKone\n   \n# mid\nSKtwo\n";
 const RAW_LINES = ["# my keys", "", "SKone", "   ", "# mid", "SKtwo", ""];
 
 test("runSproutScan sends the unfiltered lines so backend line numbers match the box", async () => {
-  const { run, calls } = driveHandler("runSproutScan", BOX, {
-    notes_found: 0, total_zatoshis: 0, spent_notes: 0,
-  });
+  const { run, calls } = driveHandler("runSproutScan", BOX, null);
   await run();
-  assert.equal(calls.length, 1, "comments and blanks must not block a real key");
-  assert.equal(calls[0].command, "start_sprout_scan");
-  assert.deepEqual([...calls[0].args.keys], RAW_LINES);
+  const starts = calls.filter((call) => call.command === "start_sprout_scan");
+  assert.equal(starts.length, 1, "comments and blanks must not block a real key");
+  assert.deepEqual([...starts[0].args.keys], RAW_LINES);
   // Nothing chosen: no floor, skip left to the wallet's own key times.
-  assert.equal(calls[0].args.birthdayFloor, null);
-  assert.equal(calls[0].args.decryptEveryBlock, false);
+  assert.equal(starts[0].args.birthdayFloor, null);
+  assert.equal(starts[0].args.decryptEveryBlock, false);
 });
 
-test("runSproutScanSweep sends the unfiltered lines so backend line numbers match the box", async () => {
-  const { run, calls } = driveHandler("runSproutScanSweep", BOX, { sent: [] });
+// #271 binds the keys at scan start: the box's raw lines go to
+// `start_sprout_scan` (above), and the sweep can no longer re-send a box
+// that may have been edited since. Executing sends only the reviewed
+// proposal's id, so no line from the box, wallet path or passphrase leaves
+// the frontend at sweep time.
+test("runSproutScanSweep sends only the reviewed proposal, never the box's lines", async () => {
+  const { run, calls, context } = driveHandler("runSproutScanSweep", BOX, { sent: [] });
+  context.sproutScanHandle = "scan-1";
+  context.sproutScanResult = { notes_found: 1 };
+  context.sproutScanReview = { proposal_id: "proposal-1", params_present: true };
+  context.sproutScanReviewDestination = "zs1destination";
   await run();
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].command, "sweep_sprout_from_scan");
-  assert.deepEqual([...calls[0].args.keys], RAW_LINES);
+  assert.equal(calls[0].command, "execute_sprout_scan_sweep");
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].args)), { proposalId: "proposal-1" });
 });

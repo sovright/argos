@@ -2337,8 +2337,8 @@ async fn main() -> Result<()> {
                 donation_rate,
                 donor_email,
             };
-            let proposal = service.propose_sweep(&handle, request.clone()).await?;
-            print_sweep_preview(&proposal);
+            let reviewed = service.propose_sweep(&handle, request).await?;
+            print_sweep_preview(&reviewed.proposal);
 
             if dry_run {
                 println!();
@@ -2349,7 +2349,7 @@ async fn main() -> Result<()> {
             if confirm_sweep {
                 println!();
                 println!("Broadcasting sweep transactions…");
-                let execution = service.execute_sweep(&handle, request).await;
+                let execution = service.execute_sweep(&handle, &reviewed.proposal_id).await;
                 match execution {
                     Ok(outcome) => {
                         println!();

@@ -87,6 +87,9 @@ function harness({ walletFile, seed = "", invoke }) {
     formatApproxMonth: () => "Jan 2020",
     approxDateFromHeight: () => null,
     birthdayTouched: false,
+    // #271: a new birthday revokes the completed scan's sweep authority.
+    scanAuthorityInvalidations: 0,
+    invalidateScanAuthority() { ctx.scanAuthorityInvalidations += 1; },
   };
   vm.createContext(ctx);
   // The real helpers, not stubs: the pasted-Sapling-key plumbing is what

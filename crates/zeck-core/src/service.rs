@@ -1,4 +1,9 @@
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
+    sync::Arc,
+    time::Instant,
+};
 
 use secrecy::SecretString;
 use tokio::{
@@ -44,15 +49,15 @@ use crate::{
     address::validate_destination_address,
     derivation::{legacy_transparent_account_key_from_seed, legacy_transparent_secret_key},
     error::{ZeckError, ZeckResult},
-    key_source::{KeySource, SeedKeySource},
+    key_source::{KeySource, KeySourceFingerprint, SeedKeySource},
     lightwalletd::{
         connect_lightwalletd_endpoints_with_retry, validate_lightwalletd_network,
         validated_lightwalletd_endpoints,
     },
     models::{
-        ProposedTx, ProposedTxKind, RuntimeScanConfig, ScanConfig, ScanHandle, ScanPhase,
-        ScanProgress, SkippedSweepAccount, SweepOutcome, SweepProposal, SweepRequest,
-        TxBroadcastResult,
+        ProposedTx, ProposedTxKind, ReviewedSweepProposal, RuntimeScanConfig, ScanConfig,
+        ScanHandle, ScanPhase, ScanProgress, SkippedSweepAccount, SweepOutcome, SweepProposal,
+        SweepProposalId, SweepRequest, TxBroadcastResult,
     },
     scan::{
         refresh_scan_progress, run_recovery_scan, run_wallet_sync_with_retry, ScanTaskState,
@@ -156,13 +161,239 @@ const SECONDARY_CONFIRMATION_TIMEOUT_SECS: u64 = 5;
 /// Balance must decrease after every confirmed step; this is a second bound
 /// against a pathological stream of newly-arriving UTXOs.
 const MAX_TRANSPARENT_SHIELDING_STEPS: u32 = 10_000;
+const MAX_REVIEWED_SWEEPS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepAccountSnapshot {
+    account_index: u32,
+    sapling_zatoshis: u64,
+    orchard_zatoshis: u64,
+    transparent_zatoshis: u64,
+    transparent_utxo_count: u32,
+    total_zatoshis: u64,
+}
+
+/// Only values that change spend authority belong here. Progress text and
+/// timing can change between review and execution without changing balances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepBalanceSnapshot {
+    scan_handle: String,
+    source_fingerprint: KeySourceFingerprint,
+    network: crate::models::ZeckNetwork,
+    workspace_root: std::path::PathBuf,
+    synced_to_height: Option<u64>,
+    accounts: Vec<SweepAccountSnapshot>,
+    total_zatoshis: Option<u64>,
+}
+
+impl SweepBalanceSnapshot {
+    fn capture(session: &ScanSession, progress: &ScanProgress) -> Self {
+        let mut accounts: Vec<_> = progress
+            .accounts
+            .iter()
+            .map(|account| SweepAccountSnapshot {
+                account_index: account.account_index,
+                sapling_zatoshis: account.sapling_zatoshis,
+                orchard_zatoshis: account.orchard_zatoshis,
+                transparent_zatoshis: account.transparent_zatoshis,
+                transparent_utxo_count: account.transparent_utxo_count,
+                total_zatoshis: account.total_zatoshis,
+            })
+            .collect();
+        accounts.sort_by_key(|account| account.account_index);
+        Self {
+            scan_handle: progress.handle.id.clone(),
+            source_fingerprint: session.source_fingerprint,
+            network: session.runtime.network,
+            workspace_root: session.workspace_root.clone(),
+            synced_to_height: progress.synced_to_height,
+            accounts,
+            total_zatoshis: progress
+                .summary
+                .as_ref()
+                .map(|summary| summary.total_zatoshis),
+        }
+    }
+}
+
+/// One transaction's amounts as the reviewed quote showed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewedTxAmounts {
+    source_account: u32,
+    gross_zatoshis: u64,
+    fee_zatoshis: u64,
+    net_zatoshis: u64,
+    donation_zatoshis: u64,
+}
+
+/// The amounts the user reviewed. At execute, a proposal is rebuilt from the
+/// same (re-validated) progress and request and must quote exactly these, so
+/// a builder that would now move a different total fails closed instead of
+/// signing it. This compares quote to quote; comparing the transactions the
+/// wallet actually builds against the quote (ZIP-317 fees included) is the
+/// follow-up in #275.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewedAmounts {
+    transactions: Vec<ReviewedTxAmounts>,
+    total_send_zatoshis: u64,
+    total_fee_zatoshis: u64,
+    net_received_zatoshis: u64,
+    total_donation_zatoshis: u64,
+}
+
+impl ReviewedAmounts {
+    fn of(proposal: &SweepProposal) -> Self {
+        Self {
+            transactions: proposal
+                .transactions
+                .iter()
+                .map(|tx| ReviewedTxAmounts {
+                    source_account: tx.source_account,
+                    gross_zatoshis: tx.gross_zatoshis,
+                    fee_zatoshis: tx.fee_zatoshis,
+                    net_zatoshis: tx.net_zatoshis,
+                    donation_zatoshis: tx.donation_zatoshis,
+                })
+                .collect(),
+            total_send_zatoshis: proposal.total_send_zatoshis,
+            total_fee_zatoshis: proposal.total_fee_zatoshis,
+            net_received_zatoshis: proposal.net_received_zatoshis,
+            total_donation_zatoshis: proposal.total_donation_zatoshis,
+        }
+    }
+}
+
+struct ReviewedSweepIntent {
+    request: SweepRequest,
+    snapshot: SweepBalanceSnapshot,
+    amounts: ReviewedAmounts,
+}
+
+impl ReviewedSweepIntent {
+    fn capture(
+        request: SweepRequest,
+        proposal: &SweepProposal,
+        session: &ScanSession,
+        progress: &ScanProgress,
+    ) -> Self {
+        Self {
+            request,
+            snapshot: SweepBalanceSnapshot::capture(session, progress),
+            amounts: ReviewedAmounts::of(proposal),
+        }
+    }
+
+    /// Whether the scan this intent was reviewed against still stands: the
+    /// scan is complete and every balance, height, network, workspace and
+    /// source identity in the snapshot is unchanged. The session object
+    /// itself is immutable, so its handle and key source are not re-checked
+    /// here; a different session shows up as a different snapshot.
+    fn validate_state(&self, session: &ScanSession, progress: &ScanProgress) -> ZeckResult<()> {
+        if progress.phase != ScanPhase::Complete {
+            return Err(ZeckError::StaleSweepProposal(
+                "scan is no longer complete".to_owned(),
+            ));
+        }
+        if self.snapshot != SweepBalanceSnapshot::capture(session, progress) {
+            return Err(ZeckError::StaleSweepProposal(
+                "source, scan, workspace, or balance changed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fail closed when a proposal rebuilt at execute quotes amounts other
+    /// than the reviewed ones.
+    fn check_rebuilt(&self, rebuilt: &SweepProposal) -> ZeckResult<()> {
+        if ReviewedAmounts::of(rebuilt) != self.amounts {
+            return Err(ZeckError::StaleSweepProposal(
+                "the rebuilt sweep's amounts differ from the reviewed quote".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Build the quote shown for review, by the same route `execute_sweep`
+/// rebuilds it: seedless key sources quote without a donation leg.
+fn build_reviewable_proposal(
+    session: &ScanSession,
+    progress: &ScanProgress,
+    request: SweepRequest,
+) -> ZeckResult<SweepProposal> {
+    if session.runtime.key_source.wallet_seed()?.is_none() {
+        build_seedless_sweep_proposal(progress, request, session.runtime.network)
+    } else {
+        build_sweep_proposal(
+            progress,
+            request,
+            session.runtime.network,
+            crate::donation::DONATION_ADDRESS,
+        )
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Runs inside `propose_sweep` after the quote is built and before its id
+    /// is issued. Task-local so parallel tests cannot see each other's hook.
+    static PROPOSE_AFTER_BUILD: Box<dyn Fn(&ScanSession) + Send + Sync>;
+}
+
+/// Store a reviewed intent and issue its id, but only if `current` progress
+/// still matches the progress it was reviewed against. Proposal construction
+/// can read a wallet and take time; a progress refresh during that work must
+/// invalidate the quote before it is issued. The only way an id is stored.
+async fn issue_reviewed_proposal(
+    session: &ScanSession,
+    intent: ReviewedSweepIntent,
+    current: &ScanProgress,
+) -> ZeckResult<SweepProposalId> {
+    intent.validate_state(session, current)?;
+    let proposal_id = SweepProposalId(uuid::Uuid::new_v4().to_string());
+    session
+        .reviewed_sweeps
+        .lock()
+        .await
+        .insert(proposal_id.clone(), intent);
+    Ok(proposal_id)
+}
+
+#[derive(Default)]
+struct ReviewedSweepStore {
+    entries: VecDeque<(SweepProposalId, ReviewedSweepIntent)>,
+}
+
+impl ReviewedSweepStore {
+    fn insert(&mut self, id: SweepProposalId, intent: ReviewedSweepIntent) {
+        if self.entries.len() == MAX_REVIEWED_SWEEPS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((id, intent));
+    }
+
+    fn take(&mut self, id: &SweepProposalId) -> ZeckResult<ReviewedSweepIntent> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(stored_id, _)| stored_id == id)
+            .ok_or(ZeckError::UnknownSweepProposal)?;
+        Ok(self
+            .entries
+            .remove(index)
+            .expect("position came from entries")
+            .1)
+    }
+}
 
 struct ScanSession {
+    source_fingerprint: KeySourceFingerprint,
     state: SharedScanTaskState,
     runtime: RuntimeScanConfig,
     started_at: Instant,
     task: Mutex<Option<JoinHandle<()>>>,
     workspace_root: std::path::PathBuf,
+    reviewed_sweeps: Mutex<ReviewedSweepStore>,
 }
 
 type SharedScanSession = Arc<ScanSession>;
@@ -220,6 +451,7 @@ impl RecoveryService {
         };
 
         let workspace_root = RecoveryWorkspace::from_runtime(&runtime)?.root().to_owned();
+        let source_fingerprint = runtime.key_source.fingerprint()?;
 
         // Cancel any existing session targeting the same workspace to prevent
         // concurrent SQLite writers from locking each other out.
@@ -236,11 +468,13 @@ impl RecoveryService {
         }
 
         let session = Arc::new(ScanSession {
+            source_fingerprint,
             state: state.clone(),
             runtime: runtime.clone(),
             started_at: Instant::now(),
             task: Mutex::new(None),
             workspace_root,
+            reviewed_sweeps: Mutex::new(ReviewedSweepStore::default()),
         });
 
         self.sessions
@@ -336,7 +570,7 @@ impl RecoveryService {
         &self,
         handle: &ScanHandle,
         request: SweepRequest,
-    ) -> ZeckResult<SweepProposal> {
+    ) -> ZeckResult<ReviewedSweepProposal> {
         let session = self.session(handle).await?;
         let progress = session.state.lock().await.progress.clone();
         if progress.phase != ScanPhase::Complete {
@@ -400,23 +634,26 @@ impl RecoveryService {
         }
 
         refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
-        if session.runtime.key_source.wallet_seed()?.is_none() {
-            return build_seedless_sweep_proposal(&progress, request, session.runtime.network);
-        }
-        build_sweep_proposal(
-            &progress,
-            request,
-            session.runtime.network,
-            crate::donation::DONATION_ADDRESS,
-        )
+        let proposal = build_reviewable_proposal(&session, &progress, request.clone())?;
+        let intent = ReviewedSweepIntent::capture(request, &proposal, &session, &progress);
+        // Test seam: lets a test move progress between the build above and
+        // the issue below, which is the window the re-check exists for.
+        #[cfg(test)]
+        let _ = PROPOSE_AFTER_BUILD.try_with(|hook| hook(&session));
+        let state = session.state.lock().await;
+        let proposal_id = issue_reviewed_proposal(&session, intent, &state.progress).await?;
+        Ok(ReviewedSweepProposal {
+            proposal_id,
+            proposal,
+        })
     }
 
     pub async fn execute_sweep(
         &self,
         handle: &ScanHandle,
-        request: SweepRequest,
+        proposal_id: &SweepProposalId,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, request, None).await
+        self.execute_sweep_inner(handle, proposal_id, None).await
     }
 
     /// Test-only sweep entrypoint that inserts a fixed pause between
@@ -428,27 +665,25 @@ impl RecoveryService {
     pub async fn execute_sweep_with_test_pause(
         &self,
         handle: &ScanHandle,
-        request: SweepRequest,
+        proposal_id: &SweepProposalId,
         pause_between_broadcasts: std::time::Duration,
     ) -> ZeckResult<SweepOutcome> {
-        self.execute_sweep_inner(handle, request, Some(pause_between_broadcasts))
+        self.execute_sweep_inner(handle, proposal_id, Some(pause_between_broadcasts))
             .await
     }
 
     async fn execute_sweep_inner(
         &self,
         handle: &ScanHandle,
-        request: SweepRequest,
+        proposal_id: &SweepProposalId,
         pause_between_broadcasts: Option<std::time::Duration>,
     ) -> ZeckResult<SweepOutcome> {
         let session = self.session(handle).await?;
+        // The token is consumed while holding only the in-memory store lock.
+        // No wallet, proving, or network operation runs under this lock.
+        let intent = session.reviewed_sweeps.lock().await.take(proposal_id)?;
         let progress = session.state.lock().await.progress.clone();
-        if progress.phase != ScanPhase::Complete {
-            return Err(ZeckError::ScanNotReady(format!(
-                "current phase is {:?}",
-                progress.phase
-            )));
-        }
+        intent.validate_state(&session, &progress)?;
 
         // An imported wallet with no HD seed cannot go through the sweep
         // below, which derives a UnifiedSpendingKey per account. Route it
@@ -459,7 +694,16 @@ impl RecoveryService {
         // imported-keys branch: a seedless source that does not override
         // `imported_keys` would otherwise be refused at propose and accepted
         // here.
-        refuse_memo_for_key_source(session.runtime.key_source.as_ref(), request.memo.as_deref())?;
+        refuse_memo_for_key_source(
+            session.runtime.key_source.as_ref(),
+            intent.request.memo.as_deref(),
+        )?;
+        // Rebuilt from the progress just re-validated, by the route the quote
+        // was built, and compared with what was reviewed. Before any wallet,
+        // proving or network work, for every key source.
+        let rebuilt = build_reviewable_proposal(&session, &progress, intent.request.clone())?;
+        intent.check_rebuilt(&rebuilt)?;
+        let request = intent.request;
         if session.runtime.key_source.wallet_seed()?.is_none() {
             if let Some(keys) = session.runtime.key_source.imported_keys() {
                 // Before the Sapling legs broadcast, not after: the
@@ -474,12 +718,6 @@ impl RecoveryService {
             }
         }
 
-        let _ = build_sweep_proposal(
-            &progress,
-            request.clone(),
-            session.runtime.network,
-            crate::donation::DONATION_ADDRESS,
-        )?;
         execute_sweep_for_session(session, request, pause_between_broadcasts).await
     }
 
@@ -2382,7 +2620,8 @@ mod tests {
 
     use super::{
         build_seedless_sweep_proposal, build_sweep_proposal, is_distinct_lightwalletd_endpoint,
-        standalone_transparent_signing_keys,
+        standalone_transparent_signing_keys, ReviewedSweepIntent, ReviewedSweepStore, ScanSession,
+        SweepBalanceSnapshot, MAX_REVIEWED_SWEEPS,
     };
     use crate::{
         derivation::{
@@ -2390,12 +2629,274 @@ mod tests {
         },
         derive_accounts,
         error::ZeckError,
+        key_source::SeedKeySource,
         models::{
-            AccountBalancePreview, AddressScope, ProposedTxKind, ScanHandle, ScanPhase,
-            ScanProgress, SweepRequest, ZeckNetwork,
+            AccountBalancePreview, AddressScope, ProposedTxKind, RuntimeScanConfig, ScanHandle,
+            ScanPhase, ScanProgress, ScanSummary, SweepProposalId, SweepRequest, ZeckNetwork,
         },
-        scan::{TrackedAccount, TrackedTransparentKey},
+        scan::{ScanTaskState, TrackedAccount, TrackedTransparentKey},
     };
+    use std::{path::PathBuf, sync::Arc, time::Instant};
+    use tokio::sync::Mutex;
+
+    fn reviewed_session(handle: ScanHandle, phrase: &str) -> ScanSession {
+        let state = Arc::new(Mutex::new(ScanTaskState::new(handle)));
+        let source = Arc::new(SeedKeySource::new(SecretString::new(phrase.to_owned())));
+        let source_fingerprint =
+            crate::key_source::KeySource::fingerprint(source.as_ref()).unwrap();
+        ScanSession {
+            source_fingerprint,
+            state,
+            runtime: RuntimeScanConfig {
+                key_source: source,
+                birthday: 1,
+                num_accounts: Some(1),
+                gap_limit: 1,
+                transparent_scan: None,
+                lightwalletd_url: "https://example.invalid".to_owned(),
+                data_dir: PathBuf::from("/tmp/argos-reviewed-intent-test"),
+                network: ZeckNetwork::Mainnet,
+                label: String::new(),
+            },
+            started_at: Instant::now(),
+            task: Mutex::new(None),
+            workspace_root: PathBuf::from("/tmp/argos-reviewed-intent-test/workspace"),
+            reviewed_sweeps: Mutex::new(ReviewedSweepStore::default()),
+        }
+    }
+
+    fn reviewed_progress(handle: ScanHandle) -> ScanProgress {
+        let mut progress = progress_with_account(AccountBalancePreview {
+            account_index: 2,
+            sapling_address: "zs-test".to_owned(),
+            unified_address: "u-test".to_owned(),
+            transparent_receive_address: "t-recv".to_owned(),
+            transparent_change_address: "t-change".to_owned(),
+            transparent_utxo_count: 3,
+            sapling_zatoshis: 40_000,
+            orchard_zatoshis: 30_000,
+            transparent_zatoshis: 20_000,
+            total_zatoshis: 90_000,
+            has_activity: true,
+            status: "ok".to_owned(),
+        });
+        progress.handle = handle;
+        progress.synced_to_height = Some(100);
+        progress.summary = Some(ScanSummary {
+            total_zatoshis: 90_000,
+            authoritative_balances: true,
+            note: String::new(),
+            workspace_dir: String::new(),
+        });
+        progress
+    }
+
+    fn reviewed_proposal() -> crate::models::SweepProposal {
+        crate::models::SweepProposal {
+            transactions: Vec::new(),
+            donation_note: None,
+            skipped_accounts: Vec::new(),
+            total_send_zatoshis: 90_000,
+            total_fee_zatoshis: 10_000,
+            net_received_zatoshis: 80_000,
+            total_donation_zatoshis: 0,
+            dry_run_default: false,
+            warning: None,
+        }
+    }
+
+    fn reviewed_request() -> SweepRequest {
+        SweepRequest {
+            destination: "u-reviewed".to_owned(),
+            memo: Some("reviewed memo".to_owned()),
+            max_fee_zatoshis: Some(20_000),
+            donation_rate: Some(0.10),
+            donor_email: Some("reviewed@example.com".to_owned()),
+        }
+    }
+
+    #[test]
+    fn reviewed_intent_preserves_the_exact_request() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let id = SweepProposalId("reviewed".to_owned());
+        let mut store = ReviewedSweepStore::default();
+        store.insert(
+            id.clone(),
+            ReviewedSweepIntent::capture(
+                reviewed_request(),
+                &reviewed_proposal(),
+                &session,
+                &progress,
+            ),
+        );
+        let mut changed_live_request = reviewed_request();
+        changed_live_request.destination = "u-other".to_owned();
+        changed_live_request.memo = None;
+        changed_live_request.max_fee_zatoshis = Some(1);
+        changed_live_request.donation_rate = Some(0.99);
+        changed_live_request.donor_email = None;
+        let stored = store.take(&id).unwrap();
+        assert_eq!(stored.request.destination, "u-reviewed");
+        assert_eq!(stored.request.memo.as_deref(), Some("reviewed memo"));
+        assert_eq!(stored.request.max_fee_zatoshis, Some(20_000));
+        assert_eq!(stored.request.donation_rate, Some(0.10));
+        assert_eq!(
+            stored.request.donor_email.as_deref(),
+            Some("reviewed@example.com")
+        );
+        assert_ne!(stored.request.destination, changed_live_request.destination);
+        assert_ne!(
+            stored.request.donation_rate,
+            changed_live_request.donation_rate
+        );
+    }
+
+    #[test]
+    fn reviewed_intent_is_bound_to_its_scan_session() {
+        let handle_a = ScanHandle::new();
+        let session_a = reviewed_session(handle_a.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress_a = reviewed_progress(handle_a);
+        let handle_b = ScanHandle::new();
+        let session_b = reviewed_session(handle_b.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress_b = reviewed_progress(handle_b);
+        let id = SweepProposalId("a".to_owned());
+        let mut store_a = ReviewedSweepStore::default();
+        let mut store_b = ReviewedSweepStore::default();
+        store_a.insert(
+            id.clone(),
+            ReviewedSweepIntent::capture(
+                reviewed_request(),
+                &reviewed_proposal(),
+                &session_a,
+                &progress_a,
+            ),
+        );
+        assert!(matches!(
+            store_b.take(&id),
+            Err(ZeckError::UnknownSweepProposal)
+        ));
+        let intent = store_a.take(&id).unwrap();
+        assert!(matches!(
+            intent.validate_state(&session_b, &progress_b),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+    }
+
+    #[test]
+    fn reviewed_intent_is_one_shot() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let id = SweepProposalId("one".to_owned());
+        let mut store = ReviewedSweepStore::default();
+        store.insert(
+            id.clone(),
+            ReviewedSweepIntent::capture(
+                reviewed_request(),
+                &reviewed_proposal(),
+                &session,
+                &progress,
+            ),
+        );
+        assert!(store.take(&id).is_ok());
+        assert!(matches!(
+            store.take(&id),
+            Err(ZeckError::UnknownSweepProposal)
+        ));
+    }
+
+    #[test]
+    fn changed_balance_snapshot_requires_a_new_proposal() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let intent = ReviewedSweepIntent::capture(
+            reviewed_request(),
+            &reviewed_proposal(),
+            &session,
+            &progress,
+        );
+        assert!(intent.validate_state(&session, &progress).is_ok());
+        let mut volatile = progress.clone();
+        volatile.elapsed_seconds = Some(999);
+        volatile.message = Some("later".to_owned());
+        assert!(intent.validate_state(&session, &volatile).is_ok());
+        for changed in 0..8 {
+            let mut p = progress.clone();
+            match changed {
+                0 => p.synced_to_height = Some(101),
+                1 => p.accounts[0].account_index += 1,
+                2 => p.accounts[0].sapling_zatoshis += 1,
+                3 => p.accounts[0].orchard_zatoshis += 1,
+                4 => p.accounts[0].transparent_zatoshis += 1,
+                5 => p.accounts[0].transparent_utxo_count += 1,
+                6 => p.accounts[0].total_zatoshis += 1,
+                _ => p.summary.as_mut().unwrap().total_zatoshis += 1,
+            }
+            assert!(
+                matches!(
+                    intent.validate_state(&session, &p),
+                    Err(ZeckError::StaleSweepProposal(_))
+                ),
+                "changed field {changed}"
+            );
+        }
+        let mut other_network = reviewed_session(progress.handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        other_network.runtime.network = ZeckNetwork::Testnet;
+        assert!(matches!(
+            intent.validate_state(&other_network, &progress),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        other_network.runtime.network = ZeckNetwork::Mainnet;
+        other_network.workspace_root = PathBuf::from("/tmp/other-workspace");
+        assert!(matches!(
+            intent.validate_state(&other_network, &progress),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        let other_source = reviewed_session(
+            progress.handle.clone(),
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        );
+        assert!(matches!(
+            intent.validate_state(&other_source, &progress),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        assert_ne!(
+            SweepBalanceSnapshot::capture(&session, &progress),
+            SweepBalanceSnapshot::capture(&other_source, &progress)
+        );
+    }
+
+    #[test]
+    fn reviewed_intent_store_is_bounded() {
+        let handle = ScanHandle::new();
+        let session = reviewed_session(handle.clone(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let progress = reviewed_progress(handle);
+        let mut store = ReviewedSweepStore::default();
+        for n in 0..=MAX_REVIEWED_SWEEPS {
+            store.insert(
+                SweepProposalId(n.to_string()),
+                ReviewedSweepIntent::capture(
+                    reviewed_request(),
+                    &reviewed_proposal(),
+                    &session,
+                    &progress,
+                ),
+            );
+        }
+        assert!(matches!(
+            store.take(&SweepProposalId("0".to_owned())),
+            Err(ZeckError::UnknownSweepProposal)
+        ));
+        for n in 1..=MAX_REVIEWED_SWEEPS {
+            assert!(
+                store.take(&SweepProposalId(n.to_string())).is_ok(),
+                "entry {n}"
+            );
+        }
+    }
 
     #[test]
     fn transparent_range_signer_map_controls_every_coordinate() {
@@ -3515,14 +4016,20 @@ mod propose_workspace_guard_tests {
         task_state.workspace = Some(workspace.clone());
 
         let service = RecoveryService::new();
+        let source_fingerprint = runtime
+            .key_source
+            .fingerprint()
+            .expect("source fingerprint");
         service.sessions.write().await.insert(
             handle.id.clone(),
             Arc::new(ScanSession {
+                source_fingerprint,
                 state: Arc::new(Mutex::new(task_state)),
                 runtime,
                 started_at: Instant::now(),
                 task: Mutex::new(None),
                 workspace_root: workspace.root().to_owned(),
+                reviewed_sweeps: Mutex::new(ReviewedSweepStore::default()),
             }),
         );
         (service, handle)
@@ -3583,12 +4090,174 @@ mod propose_workspace_guard_tests {
             .await
             .expect("a transparent-only scan must be sweepable");
         assert_eq!(
-            proposal.transactions.len(),
+            proposal.proposal.transactions.len(),
             1,
             "{:?}",
-            proposal.transactions
+            proposal.proposal.transactions
         );
-        assert_eq!(proposal.transactions[0].gross_zatoshis, 2_099_979_000);
+        assert_eq!(
+            proposal.proposal.transactions[0].gross_zatoshis,
+            2_099_979_000
+        );
+    }
+
+    fn transparent_only_source() -> Arc<dyn KeySource> {
+        let mut keys = argos_wallet_import::ImportedKeys::default();
+        keys.transparent.push(TransparentKey {
+            secret: Secret::new([0x42; 32]),
+            provenance: Provenance::Standalone,
+            created_at: None,
+        });
+        Arc::new(ImportedKeySource::new(keys))
+    }
+
+    /// The execute-time stale check, at its call site. A balance that moved
+    /// after review must refuse the reviewed proposal before any wallet,
+    /// proving or network work: the session's endpoint is unroutable, so if
+    /// the check were skipped this would fail with a connection error (or
+    /// hit the timeout), never `StaleSweepProposal`.
+    #[tokio::test]
+    async fn execute_refuses_a_proposal_whose_balance_changed_after_review() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            transparent_only_source(),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+        let reviewed = service
+            .propose_sweep(&handle, request())
+            .await
+            .expect("reviewable");
+
+        let session = service.session(&handle).await.expect("session");
+        session.state.lock().await.progress.accounts[0].sapling_zatoshis += 1;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.execute_sweep(&handle, &reviewed.proposal_id),
+        )
+        .await
+        .expect("a stale proposal is refused before any network call");
+        assert!(
+            matches!(result, Err(ZeckError::StaleSweepProposal(_))),
+            "got: {result:?}"
+        );
+        // One-shot: the refused proposal is consumed, not left to retry.
+        assert!(matches!(
+            service.execute_sweep(&handle, &reviewed.proposal_id).await,
+            Err(ZeckError::UnknownSweepProposal)
+        ));
+    }
+
+    /// A proposal rebuilt at execute from the reviewed progress must quote the
+    /// amounts the user reviewed. Here the stored review is made to disagree
+    /// with the rebuild, as a builder change between review and execution
+    /// would; execution must refuse rather than sign the rebuilt amounts.
+    #[tokio::test]
+    async fn execute_refuses_when_the_rebuilt_quote_differs_from_the_review() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            transparent_only_source(),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+        let reviewed = service
+            .propose_sweep(&handle, request())
+            .await
+            .expect("reviewable");
+        let session = service.session(&handle).await.expect("session");
+        session.reviewed_sweeps.lock().await.entries[0]
+            .1
+            .amounts
+            .transactions[0]
+            .gross_zatoshis += 1;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.execute_sweep(&handle, &reviewed.proposal_id),
+        )
+        .await
+        .expect("refused before any network call");
+        match result {
+            Err(ZeckError::StaleSweepProposal(reason)) => {
+                assert!(reason.contains("amount"), "{reason}")
+            }
+            other => panic!("expected a stale proposal, got {other:?}"),
+        }
+    }
+
+    /// The propose-time re-check: progress that moved while the proposal was
+    /// being built must not be issued an id. `issue_reviewed_proposal` is the
+    /// only path that stores one, so `propose_sweep` cannot skip the check.
+    #[tokio::test]
+    async fn a_proposal_is_not_issued_when_progress_moved_while_it_was_built() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            transparent_only_source(),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+        let session = service.session(&handle).await.expect("session");
+        let progress = session.state.lock().await.progress.clone();
+        let proposal = build_seedless_sweep_proposal(&progress, request(), ZeckNetwork::Mainnet)
+            .expect("buildable");
+        let intent = ReviewedSweepIntent::capture(request(), &proposal, &session, &progress);
+
+        let mut moved = progress.clone();
+        moved.accounts[0].sapling_zatoshis += 1;
+        assert!(matches!(
+            issue_reviewed_proposal(&session, intent, &moved).await,
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        assert!(
+            session.reviewed_sweeps.lock().await.entries.is_empty(),
+            "a refused proposal must not be stored"
+        );
+
+        let intent = ReviewedSweepIntent::capture(request(), &proposal, &session, &progress);
+        let id = issue_reviewed_proposal(&session, intent, &progress)
+            .await
+            .expect("unchanged progress issues an id");
+        assert!(session.reviewed_sweeps.lock().await.take(&id).is_ok());
+    }
+
+    /// The same re-check at its call site: `propose_sweep` must compare the
+    /// intent with the progress current at issue time, not the snapshot the
+    /// quote was built from. Progress is moved between build and issue; a
+    /// call site passing the stale snapshot would issue an id here.
+    #[tokio::test]
+    async fn propose_refuses_when_progress_moves_between_build_and_issue() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            transparent_only_source(),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+        let hook: Box<dyn Fn(&ScanSession) + Send + Sync> = Box::new(|session| {
+            session
+                .state
+                .try_lock()
+                .expect("nothing else holds the scan state")
+                .progress
+                .accounts[0]
+                .sapling_zatoshis += 1;
+        });
+        let result = PROPOSE_AFTER_BUILD
+            .scope(hook, service.propose_sweep(&handle, request()))
+            .await;
+        assert!(
+            matches!(result, Err(ZeckError::StaleSweepProposal(_))),
+            "got: {result:?}"
+        );
+        let session = service.session(&handle).await.expect("session");
+        assert!(
+            session.reviewed_sweeps.lock().await.entries.is_empty(),
+            "a refused proposal must not be stored"
+        );
     }
 
     /// The other half: the guard still refuses a route whose balances do come

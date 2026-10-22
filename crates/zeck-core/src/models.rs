@@ -456,6 +456,17 @@ pub struct SweepProposal {
     pub warning: Option<String>,
 }
 
+/// Ephemeral authority for one reviewed ordinary sweep in one scan session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SweepProposalId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewedSweepProposal {
+    pub proposal_id: SweepProposalId,
+    pub proposal: SweepProposal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BirthdayDetectResult {
     pub birthday: u32,

@@ -57,6 +57,12 @@ pub enum ZeckError {
     #[error("scan session not found")]
     UnknownScanHandle,
 
+    #[error("reviewed sweep proposal not found or already used")]
+    UnknownSweepProposal,
+
+    #[error("reviewed sweep proposal is stale: {0}")]
+    StaleSweepProposal(String),
+
     #[error("scan was cancelled")]
     Cancelled,
 

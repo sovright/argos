@@ -21,7 +21,7 @@ const FINGERPRINT_DOMAIN: &[u8] = b"argos-key-source-fingerprint-v1";
 /// Identifies a key set for workspace keying. Changing the keys must
 /// change this, so a resume never reuses a workspace built from different
 /// keys — the same invariant the seed fingerprint provided before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeySourceFingerprint([u8; 32]);
 
 impl KeySourceFingerprint {

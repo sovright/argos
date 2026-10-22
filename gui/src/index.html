@@ -362,6 +362,10 @@
                 <p id="sprout-sweep-pool" class="muted"></p>
                 <p id="sprout-sweep-params" class="muted"></p>
                 <p id="sprout-sweep-spent-status" class="muted"></p>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="sprout-sweep-confirm" disabled />
+                  I understand this moves funds and cannot be undone.
+                </label>
                 <button id="sprout-sweep-run" type="button" disabled>
                   Sweep Sprout funds
                 </button>
@@ -481,11 +485,12 @@
                   spellcheck="false"
                   placeholder="zs1… or a Unified Address with a Sapling receiver"
                 />
+                <p id="sprout-scan-sweep-plan" class="muted"></p>
                 <label class="checkbox-row">
-                  <input type="checkbox" id="sprout-scan-confirm" />
+                  <input type="checkbox" id="sprout-scan-confirm" disabled />
                   I understand this moves funds and cannot be undone.
                 </label>
-                <button id="sprout-scan-sweep-run" type="button">Sweep found funds</button>
+                <button id="sprout-scan-sweep-run" type="button" disabled>Sweep found funds</button>
                 <ul id="sprout-scan-sweep-results" class="session-list"></ul>
               </div>
             </div>
@@ -926,6 +931,18 @@
           <span>Label (optional rename)</span>
           <input id="resume-label-input" type="text" maxlength="120" />
           <small>Leave blank to keep the existing label.</small>
+        </label>
+        <label class="field">
+          <span>Destination Unified Address</span>
+          <input id="resume-destination-input" type="text" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>Memo (optional)</span>
+          <input id="resume-memo-input" type="text" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>Maximum fee (ZEC)</span>
+          <input id="resume-max-fee-zec" type="text" inputmode="decimal" placeholder="0.01" autocomplete="off" />
         </label>
         <p id="resume-modal-status" class="status-line"></p>
         <div class="actions split">
