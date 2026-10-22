@@ -1657,6 +1657,28 @@ impl PrivateRootLineageLease {
                 "private workspace root path no longer names the retained object",
             ));
         }
+        #[cfg(unix)]
+        {
+            let parent_path = self.path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private workspace root has no parent",
+                )
+            })?;
+            let path_parent = open_publication_parent(parent_path)?;
+            if private_object_id(&path_parent)? != self.publication_parent_id {
+                return Err(invalid_lineage(
+                    "workspace publication parent path no longer names the retained object",
+                ));
+            }
+            let path_root = unix_private::open_directory(&self.path)?;
+            unix_private::verify_private_directory(&path_root)?;
+            if private_object_id(&path_root)? != self.id {
+                return Err(invalid_lineage(
+                    "private workspace root path no longer names the retained object",
+                ));
+            }
+        }
         Ok(())
     }
 
