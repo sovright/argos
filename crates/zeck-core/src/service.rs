@@ -1994,6 +1994,7 @@ fn build_sweep_proposal(
 
                 transactions.push(ProposedTx {
                     kind: ProposedTxKind::ShieldTransparent,
+                    leg_kind: crate::models::ProposedLegKind::Wallet,
                     source_account: account.account_index,
                     destination: account.unified_address.clone(),
                     gross_zatoshis: account.transparent_zatoshis,
@@ -2058,6 +2059,7 @@ fn build_sweep_proposal(
 
         transactions.push(ProposedTx {
             kind: ProposedTxKind::SweepShielded,
+            leg_kind: crate::models::ProposedLegKind::Wallet,
             source_account: account.account_index,
             destination: destination.encoded.clone(),
             gross_zatoshis: shielded_available,
@@ -2204,6 +2206,7 @@ fn build_exact_sweep_proposal(
                         })?;
                         transactions.push(ProposedTx {
                             kind: ProposedTxKind::ShieldTransparent,
+                            leg_kind: crate::models::ProposedLegKind::Wallet,
                             source_account: row.account_index,
                             destination: row.unified_address.clone(),
                             gross_zatoshis: gross,
@@ -2249,6 +2252,7 @@ fn build_exact_sweep_proposal(
                     let gross = checked_fee_total(net, fee)?;
                     transactions.push(ProposedTx {
                         kind: ProposedTxKind::SweepShielded,
+                        leg_kind: crate::models::ProposedLegKind::Wallet,
                         source_account: row.account_index,
                         destination: destination.encoded.clone(),
                         gross_zatoshis: gross,
@@ -2303,6 +2307,7 @@ fn build_exact_sweep_proposal(
                 let gross = checked_fee_total(net, fee)?;
                 transactions.push(ProposedTx {
                     kind: ProposedTxKind::SweepShielded,
+                    leg_kind: crate::models::ProposedLegKind::Wallet,
                     source_account: row.account_index,
                     destination: destination.encoded.clone(),
                     gross_zatoshis: gross,
@@ -2358,6 +2363,7 @@ fn build_exact_sweep_proposal(
             direct_account_index = Some(account_index);
             transactions.push(ProposedTx {
                 kind: ProposedTxKind::SweepShielded,
+                leg_kind: crate::models::ProposedLegKind::DirectTransparent,
                 source_account: account_index,
                 destination: destination.encoded.clone(),
                 gross_zatoshis: standalone_total,
@@ -2408,17 +2414,7 @@ fn build_exact_sweep_proposal(
             .then_some(account.derived.index)
         })
         .collect::<std::collections::HashSet<_>>();
-    // Imported Sapling sends run first, then the standalone transparent
-    // follow-up, then HD accounts. The review displays that same order.
-    transactions.sort_by_key(|tx| {
-        if tx.note.starts_with("Direct sweep of ") {
-            1
-        } else if imported_indices.contains(&tx.source_account) {
-            0
-        } else {
-            2
-        }
-    });
+    order_quoted_transactions(&mut transactions, &imported_indices);
     legs.sort_by_key(exact_leg_execution_rank);
     Ok(ExactSweepPlan {
         quote: SweepProposal {
@@ -2509,14 +2505,7 @@ async fn attach_direct_sweep_leg(
             "direct sweep inputs disappeared".to_owned(),
         ));
     };
-    let quoted = plan
-        .quote
-        .transactions
-        .iter()
-        .find(|tx| tx.source_account == account_index && tx.note.starts_with("Direct sweep of "))
-        .ok_or_else(|| {
-            ZeckError::StaleSweepProposal("direct sweep quote disappeared".to_owned())
-        })?;
+    let quoted = direct_leg_quote(&plan.quote.transactions, account_index)?;
     if quoted.gross_zatoshis != direct_plan.total_input_zatoshis
         || quoted.fee_zatoshis != direct_plan.fee_zatoshis
         || quoted.net_zatoshis != direct_plan.output_zatoshis
@@ -2542,6 +2531,32 @@ async fn attach_direct_sweep_leg(
     });
     plan.legs.sort_by_key(exact_leg_execution_rank);
     Ok(())
+}
+
+/// Imported Sapling sends run first, then the standalone transparent
+/// follow-up, then HD accounts. The review displays that same order.
+fn order_quoted_transactions(
+    transactions: &mut [ProposedTx],
+    imported_indices: &std::collections::HashSet<u32>,
+) {
+    transactions.sort_by_key(|tx| match tx.leg_kind {
+        crate::models::ProposedLegKind::DirectTransparent => 1,
+        crate::models::ProposedLegKind::Wallet if imported_indices.contains(&tx.source_account) => {
+            0
+        }
+        crate::models::ProposedLegKind::Wallet => 2,
+    });
+}
+
+/// The quoted direct transparent leg for `account_index`.
+fn direct_leg_quote(transactions: &[ProposedTx], account_index: u32) -> ZeckResult<&ProposedTx> {
+    transactions
+        .iter()
+        .find(|tx| {
+            tx.source_account == account_index
+                && tx.leg_kind == crate::models::ProposedLegKind::DirectTransparent
+        })
+        .ok_or_else(|| ZeckError::StaleSweepProposal("direct sweep quote disappeared".to_owned()))
 }
 
 fn exact_leg_execution_rank(leg: &ExactSweepLeg) -> u8 {
@@ -2697,6 +2712,7 @@ fn build_seedless_sweep_proposal(
             proposal.net_received_zatoshis = add(proposal.net_received_zatoshis, net_zatoshis)?;
             proposal.transactions.push(ProposedTx {
                 kind: ProposedTxKind::SweepShielded,
+                leg_kind: crate::models::ProposedLegKind::DirectTransparent,
                 source_account: account_index,
                 destination,
                 gross_zatoshis: transparent_zatoshis,
@@ -4400,6 +4416,7 @@ mod tests {
     fn reviewed_tx(account: u32, kind: ProposedTxKind, fee: u64) -> super::ProposedTx {
         super::ProposedTx {
             kind,
+            leg_kind: crate::models::ProposedLegKind::Wallet,
             source_account: account,
             destination: format!("destination-{account}"),
             gross_zatoshis: 100_000,
@@ -4409,6 +4426,41 @@ mod tests {
             note: String::new(),
             memo: None,
         }
+    }
+
+    #[test]
+    fn direct_leg_is_identified_by_its_kind_not_its_note_text() {
+        use crate::models::ProposedLegKind;
+
+        // A wallet leg whose display text happens to read like a direct
+        // sweep must not be ordered or matched as one.
+        let mut wallet = reviewed_tx(0, ProposedTxKind::SweepShielded, 10_000);
+        wallet.note = "Direct sweep of 3 standalone transparent UTXOs.".to_owned();
+        let mut direct = reviewed_tx(0, ProposedTxKind::SweepShielded, 15_000);
+        direct.leg_kind = ProposedLegKind::DirectTransparent;
+        let mut imported = reviewed_tx(4, ProposedTxKind::SweepShielded, 20_000);
+        imported.note = "Direct sweep of nothing.".to_owned();
+
+        let mut transactions = vec![wallet, direct, imported];
+        super::order_quoted_transactions(&mut transactions, &[4].into_iter().collect());
+        assert_eq!(
+            transactions
+                .iter()
+                .map(|tx| (tx.source_account, tx.leg_kind, tx.fee_zatoshis))
+                .collect::<Vec<_>>(),
+            vec![
+                (4, ProposedLegKind::Wallet, 20_000),
+                (0, ProposedLegKind::DirectTransparent, 15_000),
+                (0, ProposedLegKind::Wallet, 10_000),
+            ]
+        );
+        assert_eq!(
+            super::direct_leg_quote(&transactions, 0)
+                .unwrap()
+                .fee_zatoshis,
+            15_000
+        );
+        assert!(super::direct_leg_quote(&transactions, 4).is_err());
     }
 
     fn reviewed_quote(transactions: Vec<super::ProposedTx>) -> super::SweepProposal {
@@ -8541,6 +8593,7 @@ pub(crate) mod leg_fee_pin_tests {
         let quote = SweepProposal {
             transactions: vec![ProposedTx {
                 kind: ProposedTxKind::ShieldTransparent,
+                leg_kind: crate::models::ProposedLegKind::Wallet,
                 source_account: 0,
                 destination: "u-test".to_owned(),
                 gross_zatoshis: 100_000,

@@ -475,9 +475,23 @@ pub enum ProposedTxKind {
     SweepShielded,
 }
 
+/// The signing route a quoted transaction takes. Ordering and execution key
+/// on this, never on the display `note`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposedLegKind {
+    /// Built and signed through the wallet database (HD or imported Sapling).
+    #[default]
+    Wallet,
+    /// Standalone transparent UTXOs swept directly, with no wallet account.
+    DirectTransparent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedTx {
     pub kind: ProposedTxKind,
+    #[serde(default)]
+    pub leg_kind: ProposedLegKind,
     pub source_account: u32,
     pub destination: String,
     pub gross_zatoshis: u64,
