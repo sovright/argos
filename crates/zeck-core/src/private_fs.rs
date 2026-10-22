@@ -5861,12 +5861,8 @@ mod unix_private {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn remove_extended_acl_from_new(file: &File) -> io::Result<()> {
-        let result = unsafe {
-            libc::fremovexattr(
-                file.as_raw_fd(),
-                b"system.posix_acl_access\0".as_ptr().cast(),
-            )
-        };
+        let result =
+            unsafe { libc::fremovexattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr()) };
         if result == 0 {
             return Ok(());
         }
