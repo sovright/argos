@@ -31,6 +31,9 @@
 
 #![cfg(feature = "argos-network")]
 
+#[allow(dead_code)]
+mod common;
+
 use argos_core::{sprout, sprout_spend, sprout_witness};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 
@@ -133,17 +136,7 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     );
     let proving_key = sprout_spend::load_sprout_proving_key(&params).expect("proving key");
 
-    let key = argos_core::imported::ImportedTransparentKey {
-        secret: secp256k1::SecretKey::from_slice(&[0x11; 32]).expect("key"),
-        address: {
-            let secp = secp256k1::Secp256k1::signing_only();
-            let pk = secp256k1::PublicKey::from_secret_key(
-                &secp,
-                &secp256k1::SecretKey::from_slice(&[0x11; 32]).expect("key"),
-            );
-            zcash_transparent::address::TransparentAddress::from_pubkey(&pk)
-        },
-    };
+    let key = common::standalone_transparent::standalone_transparent_key();
 
     // Fund it. zcashd's own wallet pays a key we hold; Zebra cannot do this.
     rpc("generate", serde_json::json!([120])).await;
@@ -254,7 +247,7 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
             index,
             value,
             script_pubkey: script,
-            secret: key.secret,
+            secret: *key.secret_key(),
         }],
         vec![js],
         &js_key,

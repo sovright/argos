@@ -120,7 +120,8 @@ async fn local_public_transparent_review_binds_live_outpoint_before_submission()
         provenance: Provenance::Standalone,
         created_at: None,
     });
-    let data_dir = tempfile::tempdir().unwrap();
+    let data_parent = tempfile::tempdir().unwrap();
+    let data_dir = data_parent.path().join("argos-data");
     let service = RecoveryService::new();
     let handle = service
         .start_scan_from_key_source(
@@ -131,7 +132,7 @@ async fn local_public_transparent_review_binds_live_outpoint_before_submission()
                 transparent_scan: None,
                 lightwalletd_url: fake.url.clone(),
                 confirmation_sources: Vec::new(),
-                data_dir: data_dir.path().to_owned(),
+                data_dir: data_dir.clone(),
                 network: ZeckNetwork::Testnet,
                 label: "local direct quote binding".to_owned(),
             },
@@ -229,9 +230,10 @@ async fn standalone_transparent_quote_refuses_same_fee_outpoint_swap_before_sign
 
     utxo.txid = vec![0x62; 32];
     fake.set_scripted_address_utxos(vec![utxo]);
-    let data_dir = tempfile::tempdir().unwrap();
+    let data_parent = tempfile::tempdir().unwrap();
+    let data_dir = data_parent.path().join("argos-data");
     let registry =
-        argos_core::service::NetworkOperationGuard::acquire(data_dir.path(), ZeckNetwork::Testnet)
+        argos_core::service::NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Testnet)
             .unwrap();
     let mut log = registry.open_broadcast_log().unwrap();
     let destination = argos_core::derive_accounts(
@@ -4773,7 +4775,6 @@ async fn ironwood_only_hd_account_quotes_real_send_max() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the funded Argos regtest harness; see tests/regtest/README.md"]
 async fn automatic_transparent_range_recovers_low_and_high_indices() {
-    use argos_core::imported::ImportedTransparentKey;
     use argos_core::lightwalletd::connect_lightwalletd_endpoints_with_retry;
     use argos_core::transparent_recovery::fetch_transparent_utxos;
     use argos_core::TransparentScanConfig;
@@ -4809,19 +4810,19 @@ async fn automatic_transparent_range_recovers_low_and_high_indices() {
     let exact_keys = [7u32, 997u32]
         .into_iter()
         .map(|index| {
-            let secret = account
+            let mut secret = account
                 .derive_secret_key(
                     TransparentKeyScope::EXTERNAL,
                     NonHardenedChildIndex::from_index(index).unwrap(),
                 )
                 .unwrap();
-            ImportedTransparentKey {
-                secret,
-                address: match zcash_keys::address::Address::decode(&params, &address_at(index)) {
-                    Some(zcash_keys::address::Address::Transparent(address)) => address,
-                    _ => panic!("derived transparent address must decode"),
-                },
-            }
+            let key = common::standalone_transparent::imported_transparent_key(&mut secret);
+            let expected = match zcash_keys::address::Address::decode(&params, &address_at(index)) {
+                Some(zcash_keys::address::Address::Transparent(address)) => address,
+                _ => panic!("derived transparent address must decode"),
+            };
+            assert_eq!(key.address, expected);
+            key
         })
         .collect::<Vec<_>>();
     let (mut utxo_client, _) =
