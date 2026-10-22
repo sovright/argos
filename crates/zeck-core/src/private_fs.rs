@@ -2792,6 +2792,34 @@ fn open_publication_parent(path: &Path) -> io::Result<File> {
     Ok(parent)
 }
 
+fn open_workspace_publication_authority(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    return open_publication_parent(path);
+    #[cfg(windows)]
+    return windows_acl::open_directory_for_publication_authority(path);
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "workspace publication authority is unsupported on this platform",
+    ))
+}
+
+fn open_publication_parent_identity(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    return open_publication_parent(path);
+    #[cfg(windows)]
+    {
+        let parent = windows_acl::open_directory_for_identity(path)?;
+        windows_acl::verify_publication_parent(&parent)?;
+        return Ok(parent);
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "workspace publication identity is unsupported on this platform",
+    ))
+}
+
 fn ensure_publication_parent_exists(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(()),
@@ -2809,7 +2837,7 @@ pub(crate) fn verify_private_workspace_lineage(
             "private workspace root has no parent",
         )
     })?;
-    let publication_parent = open_publication_parent(publication_parent_path)?;
+    let publication_parent = open_workspace_publication_authority(publication_parent_path)?;
     let root = open_private_directory_lease(private_root)?;
     verify_private_workspace_lineage_from_handles(private_root, &publication_parent, root)
 }
@@ -3489,6 +3517,24 @@ fn ensure_private_workspace_lineage_impl(
                 ));
             }
             drop(staging);
+            let publication_parent_identity = open_publication_parent_identity(publish_parent)?;
+            if private_object_id(&publication_parent_identity)?
+                != private_object_id(&publication_parent)?
+            {
+                return Err(invalid_lineage(
+                    "workspace publication parent changed during publication",
+                ));
+            }
+            drop(publication_parent);
+            let publication_parent = open_workspace_publication_authority(publish_parent)?;
+            if private_object_id(&publication_parent)?
+                != private_object_id(&publication_parent_identity)?
+            {
+                return Err(invalid_lineage(
+                    "workspace publication parent changed before authority retention",
+                ));
+            }
+            drop(publication_parent_identity);
             // Keep the publication parent continuously pinned while opening
             // the long-lived root authority through that exact parent.
             let published = open_child_directory_for_authority(&publication_parent, private_root)?;
@@ -9032,6 +9078,18 @@ mod windows_acl {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
         )?;
         harden(&directory, true)?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_directory_for_publication_authority(
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let directory = open_directory_with_share(
+            path,
+            READ_CONTROL | FILE_LIST_DIRECTORY | FILE_GENERIC_WRITE | FILE_TRAVERSE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?;
+        verify_publication_parent(&directory)?;
         Ok(directory)
     }
 
