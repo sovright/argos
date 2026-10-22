@@ -1731,11 +1731,18 @@ impl RecoveryService {
         // the issue below, which is the window the re-check exists for.
         #[cfg(test)]
         let _ = PROPOSE_AFTER_BUILD.try_with(|hook| hook(&session));
+        let confirmation_notice = crate::lightwalletd::single_operator_notice(
+            &session.runtime.lightwalletd_url,
+            &session.runtime.confirmation_sources,
+        )?
+        .map(str::to_owned);
         let state = session.state.lock().await;
         let proposal_id = issue_reviewed_proposal(&session, intent, &state).await?;
+        let mut proposal = plan.quote;
+        proposal.confirmation_notice = confirmation_notice;
         Ok(ReviewedSweepProposal {
             proposal_id,
-            proposal: plan.quote,
+            proposal,
         })
     }
 
@@ -2763,6 +2770,7 @@ fn build_sweep_proposal(
         warning: Some(warning),
         donation_note: None,
         follow_up_review_required,
+        confirmation_notice: None,
     })
 }
 
@@ -3088,6 +3096,7 @@ fn build_exact_sweep_proposal(
             }),
             donation_note: (!has_hd_leg).then(|| SEEDLESS_DONATION_NOTE.to_owned()),
             follow_up_review_required,
+            confirmation_notice: None,
         },
         legs,
         direct_account_index,
@@ -5273,6 +5282,7 @@ mod tests {
             dry_run_default: false,
             warning: None,
             follow_up_review_required: false,
+            confirmation_notice: None,
         }
     }
 
@@ -5356,6 +5366,7 @@ mod tests {
             dry_run_default: true,
             warning: None,
             follow_up_review_required: false,
+            confirmation_notice: None,
         };
         intent.bind_quote(&quote);
         assert_eq!(intent.request.reviewed_fee_zatoshis, Some(25_000));
@@ -5417,6 +5428,7 @@ mod tests {
             dry_run_default: true,
             warning: None,
             follow_up_review_required: false,
+            confirmation_notice: None,
         }
     }
 
@@ -8088,6 +8100,36 @@ mod propose_workspace_guard_tests {
             .expect("unchanged progress issues an id");
         drop(state);
         assert!(session.reviewed_sweeps.lock().await.take(&id).is_ok());
+    }
+
+    /// The product must complete a recovery with only the defaults: review
+    /// does not require a second confirmation operator, it says that
+    /// confirmation will rest on one.
+    #[tokio::test]
+    async fn review_under_a_single_operator_carries_the_notice() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let (service, handle) = completed_session(
+            tempdir.path(),
+            transparent_only_source(),
+            transparent_account(2_099_979_000),
+        )
+        .await;
+        let chain = (
+            3_000_000,
+            vec![crate::transparent_recovery::tests_support::utxo(
+                crate::transparent_recovery::tests_support::addr(0x42),
+                2_099_979_000,
+                7,
+            )],
+        );
+        let reviewed = DIRECT_LEG_CHAIN
+            .scope(chain, service.propose_sweep(&handle, request()))
+            .await
+            .expect("a single-operator configuration can review a sweep");
+        assert_eq!(
+            reviewed.proposal.confirmation_notice.as_deref(),
+            Some(crate::lightwalletd::SINGLE_OPERATOR_NOTICE)
+        );
     }
 
     /// The same re-check at its call site: `propose_sweep` must compare the

@@ -2335,6 +2335,12 @@ async fn main() -> Result<()> {
                 } => {
                     warn_about_uncovered_pools(keys, false);
                     let resolved = imported_transparent_keys(keys)?;
+                    if !*dry_run {
+                        print_single_operator_notice(
+                            &cli.lightwalletd_url,
+                            &cli.confirmation_source,
+                        )?;
+                    }
                     return run_transparent_sweep(
                         &resolved,
                         &cli.data_dir,
@@ -2641,14 +2647,19 @@ async fn main() -> Result<()> {
                             println!();
                         }
                         match outcome.error {
-                            None => println!(
-                                "{}",
-                                sweep_completion_guidance_with_skips(
-                                    &statuses,
-                                    !outcome.skipped_accounts.is_empty(),
-                                    outcome.follow_up_review_required
-                                )
-                            ),
+                            None => {
+                                println!(
+                                    "{}",
+                                    sweep_completion_guidance_with_skips(
+                                        &statuses,
+                                        !outcome.skipped_accounts.is_empty(),
+                                        outcome.follow_up_review_required
+                                    )
+                                );
+                                if let Some(caveat) = sweep_discard_caveat(&outcome.transactions) {
+                                    println!("{caveat}");
+                                }
+                            }
                             // A mid-sequence abort: the transactions above were
                             // already broadcast and are irreversible, but the
                             // remaining accounts were not swept (audit Issue E).
@@ -3343,6 +3354,21 @@ fn sweep_donation_line(
     }
 }
 
+/// Corroborated mining is not yet "discard the source" until it is deep
+/// enough; say so when every row is Mined but not all are safe.
+fn sweep_discard_caveat(results: &[argos_core::models::TxBroadcastResult]) -> Option<String> {
+    let all_mined = !results.is_empty()
+        && results
+            .iter()
+            .all(|result| result.status == argos_core::TxLifecycleState::Mined);
+    (all_mined && !results.iter().all(|result| result.safe_to_discard)).then(|| {
+        format!(
+            "Keep the source until every transaction is {} confirmations deep; run `argos reconcile` to check.",
+            argos_core::broadcast::MIN_DISCARD_CONFIRMATIONS
+        )
+    })
+}
+
 fn sweep_completion_guidance_with_skips(
     states: &[argos_core::TxLifecycleState],
     has_skipped_accounts: bool,
@@ -3365,6 +3391,20 @@ fn sweep_completion_guidance(
     follow_up_review_required: bool,
 ) -> &'static str {
     use argos_core::TxLifecycleState as State;
+    if states.contains(&State::MinedSingleSource)
+        && !states.iter().any(|state| {
+            matches!(
+                state,
+                State::SubmissionUnknown | State::Pending | State::NotSubmitted
+            )
+        })
+    {
+        return if follow_up_review_required {
+            "Shielding mined according to one confirmation operator. Rescan and review a new proposal for the send; keep your source keys or wallet file until an independent source confirms."
+        } else {
+            "Mined according to one confirmation operator. Keep your source keys or wallet file until an independent source confirms (add --confirmation-source and run `argos reconcile`)."
+        };
+    }
     if follow_up_review_required {
         if states.contains(&State::Expired) && states.contains(&State::SubmissionUnknown) {
             return "A shielding submission may already have moved; do not retry. Reconcile its txid. Another shielding transaction expired; rescan before rebuilding and review a new proposal before sending shielded funds. Keep the source wallet and recovery workspace.";
@@ -3457,6 +3497,24 @@ fn print_sweep_preview(proposal: &SweepProposal) {
         println!();
         println!("  Warning: {warning}");
     }
+
+    if let Some(notice) = &proposal.confirmation_notice {
+        println!();
+        println!("  Notice: {notice}");
+    }
+}
+
+/// One line before signing when fewer than two independent confirmation
+/// operators are configured. Informational: the sweep is not refused.
+fn print_single_operator_notice(lightwalletd_url: &str, raw_sources: &[String]) -> Result<()> {
+    let raw = raw_sources.iter().map(String::as_str).collect::<Vec<_>>();
+    let sources = argos_core::lightwalletd::parse_confirmation_sources(&raw)?;
+    if let Some(notice) =
+        argos_core::lightwalletd::single_operator_notice(lightwalletd_url, &sources)?
+    {
+        println!("Notice: {notice}");
+    }
+    Ok(())
 }
 
 /// Try to grab the user's attention when a long-running scan finishes. Best
@@ -3679,6 +3737,38 @@ mod tests {
             sweep_completion_guidance(&[State::Mined, State::NotSubmitted], false)
                 .contains("mined, but")
         );
+    }
+
+    #[test]
+    fn single_operator_mining_never_reads_as_complete_or_discardable() {
+        use argos_core::TxLifecycleState as State;
+        for follow_up in [false, true] {
+            let guidance = sweep_completion_guidance(&[State::MinedSingleSource], follow_up);
+            assert!(!guidance.contains("Sweep complete"), "{guidance}");
+            assert!(guidance.contains("independent source"), "{guidance}");
+        }
+        let mixed = sweep_completion_guidance(&[State::Mined, State::MinedSingleSource], false);
+        assert!(!mixed.contains("Sweep complete"), "{mixed}");
+        assert!(sweep_status_label(State::MinedSingleSource).contains("one confirmation operator"));
+    }
+
+    #[test]
+    fn corroborated_mining_still_waits_for_depth_before_discard() {
+        use argos_core::TxLifecycleState as State;
+        let row = |status, safe_to_discard| argos_core::models::TxBroadcastResult {
+            source_account: 0,
+            txid: Some("ab".to_owned()),
+            status,
+            fee_zatoshis: 10_000,
+            detail: String::new(),
+            confirmed_height: Some(100),
+            safe_to_discard,
+        };
+        assert!(sweep_discard_caveat(&[row(State::Mined, false)])
+            .unwrap()
+            .contains("confirmations"));
+        assert!(sweep_discard_caveat(&[row(State::Mined, true)]).is_none());
+        assert!(sweep_discard_caveat(&[row(State::Pending, false)]).is_none());
     }
 
     #[test]

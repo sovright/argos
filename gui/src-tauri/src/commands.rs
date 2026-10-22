@@ -152,9 +152,9 @@ fn ensure_tos_accepted_for_base(base: &Path) -> Result<(), String> {
     }
 }
 
-/// Require two independently labelled operators before the GUI starts a
-/// recovery that can submit funds. Backup hosts run by the same operator do
-/// not provide independent confirmation evidence.
+/// Parse the optional confirmation sources. None are required: with the
+/// defaults, confirmation rests on one operator and the sweep review says so.
+/// The scan URLs are validated with them so a duplicate authority is refused.
 fn parse_gui_confirmation_sources(
     scan_urls: &str,
     raw: &[String],
@@ -162,19 +162,8 @@ fn parse_gui_confirmation_sources(
     let raw = raw.iter().map(String::as_str).collect::<Vec<_>>();
     let explicit = argos_core::lightwalletd::parse_confirmation_sources(&raw)
         .map_err(|err| err.to_string())?;
-    let all = argos_core::lightwalletd::confirmation_endpoints(scan_urls, &explicit)
+    argos_core::lightwalletd::confirmation_endpoints(scan_urls, &explicit)
         .map_err(|err| err.to_string())?;
-    let operators = all
-        .iter()
-        .map(|source| source.operator_id.as_str())
-        .filter(|operator| !operator.trim().is_empty())
-        .collect::<std::collections::HashSet<_>>();
-    if operators.len() < 2 {
-        return Err(
-            "Add a confirmation lightwalletd endpoint run by an independent operator (operator-id=https://url); two hosts of one operator cannot confirm a sweep."
-                .to_owned(),
-        );
-    }
     Ok(explicit)
 }
 
@@ -3411,37 +3400,36 @@ mod tests {
     }
 
     #[test]
-    fn gui_requires_two_independent_labelled_confirmation_operators() {
+    fn gui_accepts_default_single_operator_confirmation() {
+        // The defaults (two hosts of one operator) must be enough to scan
+        // and sweep; review shows the single-operator notice instead.
+        let sources = super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443,https://na.zec.rocks:443",
+            &[],
+        )
+        .expect("default configuration needs no extra confirmation source");
+        assert!(sources.is_empty());
         let sources = super::parse_gui_confirmation_sources(
             "https://zec.rocks:443,https://na.zec.rocks:443",
             &["independent=https://other.example:443".to_owned()],
         )
-        .expect("explicit independent operator complements the known primary");
+        .expect("an optional independent operator is accepted");
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].operator_id, "independent");
+        // Malformed entries are still refused.
         assert!(super::parse_gui_confirmation_sources(
-            "https://zec.rocks:443,https://na.zec.rocks:443",
-            &[],
+            "https://zec.rocks:443",
+            &["no-separator".to_owned()],
         )
         .is_err());
         assert!(super::parse_gui_confirmation_sources(
             "https://zec.rocks:443",
-            &["other=https://na.zec.rocks:443".to_owned()],
-        )
-        .is_err());
-        assert!(super::parse_gui_confirmation_sources(
-            "https://custom.example:443",
-            &["one=https://one.example:443".to_owned()],
-        )
-        .is_err());
-        assert!(super::parse_gui_confirmation_sources(
-            "https://custom.example:443",
             &[
                 "one=https://one.example:443".to_owned(),
-                "two=https://two.example:443".to_owned(),
+                "two=https://one.example:443".to_owned(),
             ],
         )
-        .is_ok());
+        .is_err());
     }
 
     #[test]

@@ -75,13 +75,34 @@ test("pending and unknown keep the original wallet warning", () => {
   }
 });
 
-test("only all-mined results enable final cleanup", () => {
+test("unresolved results disable workspace deletion; resolved ones allow it", () => {
   const h = screen();
   h.renderCompleteScreen([result("mined"), result("pending")], [], 0, null, null, null);
   assert.equal(h.$("delete-workspace").disabled, true);
   h.renderCompleteScreen([result("mined"), result("mined")], [], 0, null, null, null);
   assert.equal(h.$("delete-workspace").disabled, false);
   assert.match(h.$("complete-summary").textContent, /2 transactions mined/i);
+  h.renderCompleteScreen([result("mined_single_source")], [], 0, null, null, null);
+  assert.equal(h.$("delete-workspace").disabled, false);
+});
+
+test("single-operator mining never says recovery is complete or safe to discard", () => {
+  const h = screen();
+  h.renderCompleteScreen([result("mined_single_source")], [], 0, null, null, null);
+  assert.equal(h.txStatusKind("mined_single_source"), "mined_single_source");
+  const copy = `${h.$("complete-heading").textContent} ${h.$("complete-summary").textContent} ${h.$("complete-confirmation-note").textContent}`;
+  assert.doesNotMatch(copy, /Recovery complete|independently confirmed/i);
+  assert.match(copy, /independent source/i);
+  assert.match(h.$("complete-txids").children[0].children[0].textContent, /one confirmation operator/i);
+});
+
+test("corroborated mining says recovery complete only when deep enough", () => {
+  const h = screen();
+  h.renderCompleteScreen([result("mined")], [], 0, null, null, null);
+  assert.notEqual(h.$("complete-heading").textContent, "Recovery complete");
+  assert.match(h.$("complete-confirmation-note").textContent, /confirmations/i);
+  h.renderCompleteScreen([{ ...result("mined"), safe_to_discard: true }], [], 0, null, null, null);
+  assert.equal(h.$("complete-heading").textContent, "Recovery complete");
 });
 
 test("proposal fee populates a blank execution cap", async () => {
@@ -259,22 +280,21 @@ test("unknown submission keeps donation amount uncertain even when recorded tota
   assert.doesNotMatch(h.$("complete-donation").textContent, /No donation was sent|Donated 0/);
 });
 
-test("all mined with skipped balance is incomplete and cannot delete workspace", () => {
+test("all mined with skipped balance is incomplete", () => {
   const h = screen();
   const skipped = [{ account_index: 2, gross_zatoshis: 100000, reason: "dust" }];
-  h.renderCompleteScreen([result("mined")], skipped, 0, null, null, null);
-  assert.equal(h.$("delete-workspace").disabled, true);
+  h.renderCompleteScreen([{ ...result("mined"), safe_to_discard: true }], skipped, 0, null, null, null);
   assert.doesNotMatch(h.$("complete-summary").textContent, /Recovery complete/);
   assert.match(h.$("complete-summary").textContent, /skipped|not swept/i);
 });
 
 test("expired rejected and not-submitted messages do not imply future mining", () => {
-  for (const status of ["expired", "rejected", "not_submitted"]) {
+  for (const [status, deletable] of [["expired", true], ["rejected", true], ["not_submitted", false]]) {
     const h = screen();
     h.renderCompleteScreen([result(status)], [], 0, null, null, null);
     const copy = `${h.$("complete-summary").textContent} ${h.$("complete-confirmation-note").textContent}`;
     assert.doesNotMatch(copy, /until.*mined|may still mine|pending or uncertain/i, status);
-    assert.equal(h.$("delete-workspace").disabled, true);
+    assert.equal(h.$("delete-workspace").disabled, !deletable, status);
   }
 });
 

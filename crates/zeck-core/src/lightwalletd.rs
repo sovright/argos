@@ -144,6 +144,36 @@ pub fn confirmation_endpoints(
     Ok(result)
 }
 
+/// Shown before signing (CLI) and at sweep review (GUI) when the configured
+/// sources are run by fewer than two independent operators. Recovery still
+/// proceeds: confirmation sources are optional.
+pub const SINGLE_OPERATOR_NOTICE: &str = "Confirmation will rest on a single operator. Keep your source keys or wallet file until an independent source confirms the sweep.";
+
+/// Whether the scan endpoints plus explicit confirmation sources include two
+/// distinct labelled operators.
+pub fn has_independent_confirmation_operators(
+    scan_urls: &str,
+    explicit: &[ConfirmationEndpoint],
+) -> ZeckResult<bool> {
+    let operators = confirmation_endpoints(scan_urls, explicit)?
+        .into_iter()
+        .map(|source| source.operator_id)
+        .filter(|operator| !operator.trim().is_empty())
+        .collect::<HashSet<_>>();
+    Ok(operators.len() >= 2)
+}
+
+/// [`SINGLE_OPERATOR_NOTICE`] when it applies to this configuration.
+pub fn single_operator_notice(
+    scan_urls: &str,
+    explicit: &[ConfirmationEndpoint],
+) -> ZeckResult<Option<&'static str>> {
+    Ok(
+        (!has_independent_confirmation_operators(scan_urls, explicit)?)
+            .then_some(SINGLE_OPERATOR_NOTICE),
+    )
+}
+
 pub struct LightwalletdTxObserver {
     sources: Vec<ConfirmationEndpoint>,
 }
@@ -544,6 +574,28 @@ mod tests {
     };
     use crate::models::ZeckNetwork;
     use zcash_client_backend::proto::service::LightdInfo;
+
+    #[test]
+    fn default_endpoints_are_one_confirmation_operator() {
+        let defaults = "https://zec.rocks:443,https://na.zec.rocks:443";
+        assert!(!super::has_independent_confirmation_operators(defaults, &[]).unwrap());
+        assert_eq!(
+            super::single_operator_notice(defaults, &[]).unwrap(),
+            Some(super::SINGLE_OPERATOR_NOTICE)
+        );
+        let independent =
+            super::parse_confirmation_sources(&["other=https://other.example:443"]).unwrap();
+        assert!(super::has_independent_confirmation_operators(defaults, &independent).unwrap());
+        assert_eq!(
+            super::single_operator_notice(defaults, &independent).unwrap(),
+            None
+        );
+        // A second host of the same operator is not independent.
+        let same = super::parse_confirmation_sources(&["x=https://na.zec.rocks:443"]).unwrap();
+        assert!(
+            !super::has_independent_confirmation_operators("https://zec.rocks:443", &same).unwrap()
+        );
+    }
 
     #[test]
     fn default_endpoints_are_well_formed() {

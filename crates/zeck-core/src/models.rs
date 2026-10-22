@@ -517,6 +517,11 @@ pub struct SweepProposal {
     /// The quoted stage shields funds; a mined/rescanned send needs new review.
     #[serde(default)]
     pub follow_up_review_required: bool,
+    /// Set on the reviewed copy shown to the user when fewer than two
+    /// independent confirmation operators are configured. Not part of the
+    /// bound quote: it describes the configuration, not the transactions.
+    #[serde(default)]
+    pub confirmation_notice: Option<String>,
 }
 
 /// Ephemeral authority for one reviewed ordinary sweep in one scan session.

@@ -638,7 +638,7 @@
             <label class="field span-two">
               <span>Independent confirmation servers</span>
               <textarea id="confirmation-sources" rows="2" spellcheck="false" placeholder="operator-id=https://independent.example:443"></textarea>
-              <small>One operator-id=https://lightwalletd-url per line. A sweep needs evidence from two different operators; the recommended servers are both run by zec.rocks and count as one.</small>
+              <small>Optional. One operator-id=https://lightwalletd-url per line. Without one, confirmation rests on a single operator (the recommended servers are both run by zec.rocks and count as one): the recovery completes, but keep your source until an independent source confirms.</small>
             </label>
             <label class="field span-two">
               <span>Where to save scan data on this computer</span>
@@ -938,7 +938,7 @@
         <label class="field">
           <span>Independent confirmation servers</span>
           <textarea id="resume-confirmation-sources" rows="2" spellcheck="false" placeholder="operator-id=https://independent.example:443"></textarea>
-          <small>Use the same independent operator labels you configured for the scan.</small>
+          <small>Optional. Use the same independent operator labels you configured for the scan.</small>
         </label>
         <label class="field">
           <span>Label (optional rename)</span>
