@@ -3968,4 +3968,50 @@ mod tests {
         let reloaded = journal.load_or_migrate().unwrap();
         assert_eq!(transaction_summaries(&reloaded).len(), 2);
     }
+
+    #[test]
+    fn one_hostile_orphan_sentinel_against_an_agreeing_pair_is_contested_not_reorged() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let note = lifecycle_note(1_000_000, 110);
+        let tx = fixture_transaction(1100, 140);
+        seed_entry(
+            &journal,
+            &note,
+            &tx,
+            crate::broadcast::TxLifecycleState::Mined,
+        );
+        let observation = crate::broadcast::observe_transaction(
+            vec![
+                endpoint("mallory", 150, Some(u32::MAX), false),
+                endpoint("alpha", 150, Some(90), true),
+                endpoint("bravo", 150, Some(90), true),
+            ],
+            Some(140),
+        );
+        assert_eq!(
+            observation.state,
+            crate::broadcast::TxObservationState::Contested
+        );
+        let mut node = LifecycleNode::accepted(150, 0);
+        let mut observer = LifecycleObserver::new([(tx.txid, observation)]);
+        let (outcome, builds, raw) =
+            run_lifecycle(&[note], &mut node, &mut observer, &journal, 1101);
+        assert_eq!(builds, 0);
+        assert!(raw.is_empty() && node.sent.is_empty());
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::Mined
+        );
+        assert!(!outcome.fresh_all_mined);
+        assert_eq!(
+            journal
+                .load_or_migrate()
+                .unwrap()
+                .entry_for_txid(tx.txid)
+                .unwrap()
+                .state,
+            crate::broadcast::TxLifecycleState::Mined
+        );
+    }
 }
