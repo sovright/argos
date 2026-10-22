@@ -25,15 +25,14 @@
 //! use argos_core::transparent_recovery::sweep_transparent_only;
 //! ```
 //!
-//! The old standalone per-key journal opener is also unavailable to new
-//! callers; the network registry guard owns journal opening and migration:
+//! There is no standalone per-key journal opener; the network registry
+//! guard owns journal opening:
 //!
 //! ```compile_fail
 //! use argos_core::transparent_recovery::open_standalone_broadcast_log;
 //! ```
 
 use sapling_crypto as sapling;
-use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 use tracing::warn;
 use zcash_client_backend::proto::service::{
@@ -48,42 +47,12 @@ use zcash_transparent::{
 use crate::{
     broadcast::{
         submit_prepared_transaction, BroadcastStore, LightwalletdSubmitter, PreparedTransaction,
-        TxSubmitter, BROADCAST_LOG_FILE_NAME,
+        TxSubmitter,
     },
     error::{ZeckError, ZeckResult},
     imported::{encode_transparent_address, ImportedTransparentKey},
     models::{TxBroadcastResult, ZeckNetwork},
 };
-
-/// Legacy standalone journal path, retained for discovery and migration.
-/// New submissions use the guarded network registry instead. Only public
-/// addresses enter this historical path's hash.
-pub fn standalone_broadcast_log_path(
-    data_dir: &std::path::Path,
-    keys: &[ImportedTransparentKey],
-    network: ZeckNetwork,
-) -> std::path::PathBuf {
-    let mut addresses = keys
-        .iter()
-        .map(|key| encode_transparent_address(&key.address, network))
-        .collect::<Vec<_>>();
-    addresses.sort();
-    addresses.dedup();
-    let mut hasher = Sha256::new();
-    for address in addresses {
-        hasher.update((address.len() as u32).to_le_bytes());
-        hasher.update(address.as_bytes());
-    }
-    let digest = hasher.finalize();
-    let fingerprint = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    data_dir
-        .join(network.label())
-        .join(format!("transparent-{fingerprint}"))
-        .join(BROADCAST_LOG_FILE_NAME)
-}
 
 /// lightwalletd is queried in batches so a wallet with many addresses does
 /// not build one enormous request. zcashd wallets routinely hold hundreds
@@ -1374,32 +1343,6 @@ mod sweep_tests {
 
     fn height() -> BlockHeight {
         BlockHeight::from_u32(3_000_000)
-    }
-
-    #[test]
-    fn standalone_log_identity_uses_sorted_public_addresses_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let make = |secret: u8, address: u8| ImportedTransparentKey {
-            secret: secp256k1::SecretKey::from_slice(&[secret; 32]).unwrap(),
-            address: tests_support::addr(address),
-        };
-        let first = standalone_broadcast_log_path(
-            dir.path(),
-            &[make(1, 0x11), make(2, 0x22)],
-            ZeckNetwork::Mainnet,
-        );
-        let same_public_addresses = standalone_broadcast_log_path(
-            dir.path(),
-            &[make(4, 0x22), make(3, 0x11)],
-            ZeckNetwork::Mainnet,
-        );
-        let other_network = standalone_broadcast_log_path(
-            dir.path(),
-            &[make(1, 0x11), make(2, 0x22)],
-            ZeckNetwork::Testnet,
-        );
-        assert_eq!(first, same_public_addresses);
-        assert_ne!(first, other_network);
     }
 
     #[test]

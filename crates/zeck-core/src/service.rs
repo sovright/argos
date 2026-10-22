@@ -923,7 +923,6 @@ fn create_cleanup_marker(
     tombstone: &std::path::Path,
     broadcast_log: &DurableBroadcastLog,
     outcome: Option<&SweepOutcome>,
-    local_journal_exists: bool,
 ) -> ZeckResult<()> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
@@ -959,7 +958,6 @@ fn create_cleanup_marker(
         "workspace": root,
         "tombstone": tombstone,
         "receipts": receipts,
-        "local_journal_exists": local_journal_exists,
     });
     file.write_all(payload.to_string().as_bytes())
         .map_err(|err| {
@@ -1030,10 +1028,6 @@ fn recover_interrupted_cleanup(
         .get("receipts")
         .and_then(|value| value.as_array())
         .ok_or_else(|| manual("missing durable receipt list"))?;
-    let local_journal_exists = payload
-        .get("local_journal_exists")
-        .and_then(|value| value.as_bool())
-        .ok_or_else(|| manual("missing journal location"))?;
     let expected = receipts
         .iter()
         .map(|receipt| {
@@ -1061,13 +1055,9 @@ fn recover_interrupted_cleanup(
     if !root.is_dir() || root.is_symlink() {
         return Err(manual("surviving workspace is missing or unsafe"));
     }
-    let local_path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
-    if local_journal_exists && (!local_path.is_file() || local_path.is_symlink()) {
-        return Err(manual("surviving workspace journal is missing or unsafe"));
-    }
     let registry = operation_lock
-        .open_broadcast_log_for(&local_path)
-        .map_err(|_| manual("surviving journal cannot be imported into the registry"))?;
+        .open_broadcast_log()
+        .map_err(|_| manual("the network registry cannot be opened"))?;
     let registry_records = registry.records();
     for (txid, digest) in expected {
         let Some(receipt) = registry_records
@@ -1080,9 +1070,6 @@ fn recover_interrupted_cleanup(
             return Err(manual("registry raw transaction changed"));
         }
     }
-    // The registry owns and replays the exact surviving local source lock.
-    // Newer outcome receipts live only in the global registry and need not
-    // also appear in an older imported prefix.
     drop(registry);
     clear_cleanup_marker(root)?;
     refuse_interrupted_cleanup(root)
@@ -1184,56 +1171,10 @@ impl NetworkOperationGuard {
         network_broadcast_log_path(&self.data_dir, self.network)
     }
 
-    /// Migrate every pre-registry journal while holding the network-wide
-    /// operation lock. Existing source locks remain held for the returned
-    /// log's lifetime, including sidecars whose JSONL has not appeared yet.
-    /// A failed lock or import stops the caller before signing or deletion.
+    /// Open the network registry. The caller already holds the network-wide
+    /// operation lock, so no other Argos operation can append concurrently.
     pub fn open_broadcast_log(&self) -> ZeckResult<DurableBroadcastLog> {
-        self.open_broadcast_log_with_current(None)
-    }
-
-    /// Also lock this operation's exact pre-registry workspace/key-set path,
-    /// even if no old process has created a sidecar or JSONL there yet.
-    pub fn open_broadcast_log_for(
-        &self,
-        current_legacy_path: &std::path::Path,
-    ) -> ZeckResult<DurableBroadcastLog> {
-        self.open_broadcast_log_with_current(Some(current_legacy_path))
-    }
-
-    fn open_broadcast_log_with_current(
-        &self,
-        current_legacy_path: Option<&std::path::Path>,
-    ) -> ZeckResult<DurableBroadcastLog> {
-        let mut registry = DurableBroadcastLog::open(self.broadcast_log_path()?)?;
-        let mut sources = discover_legacy_broadcast_logs(&self.data_dir, self.network)?;
-        if let Some(current_legacy_path) = current_legacy_path {
-            let parent = current_legacy_path.parent().ok_or_else(|| {
-                ZeckError::Storage(format!(
-                    "legacy log {} has no parent",
-                    current_legacy_path.display()
-                ))
-            })?;
-            let name = current_legacy_path.file_name().ok_or_else(|| {
-                ZeckError::Storage(format!(
-                    "legacy log {} has no file name",
-                    current_legacy_path.display()
-                ))
-            })?;
-            // Canonicalize the parent, not the file: the held-source check
-            // must still see and reject a symlink at the JSONL path itself.
-            sources.push(canonical_workspace_identity(parent)?.join(name));
-        }
-        sources.sort();
-        sources.dedup();
-        for path in sources {
-            if path.is_file() {
-                registry.import_legacy_log(&path)?;
-            } else {
-                registry.hold_legacy_source(&path)?;
-            }
-        }
-        Ok(registry)
+        DurableBroadcastLog::open(self.broadcast_log_path()?)
     }
 }
 
@@ -1251,91 +1192,6 @@ pub fn network_broadcast_log_path(
     network: crate::models::ZeckNetwork,
 ) -> ZeckResult<std::path::PathBuf> {
     Ok(network_registry_root(data_dir, network)?.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-}
-
-fn discover_legacy_broadcast_logs(
-    data_dir: &std::path::Path,
-    network: crate::models::ZeckNetwork,
-) -> ZeckResult<Vec<std::path::PathBuf>> {
-    let lock_suffix = format!(".{}.lock.sqlite", crate::broadcast::BROADCAST_LOG_FILE_NAME);
-    let network_root = canonical_workspace_identity(data_dir)?.join(network.label());
-    let entries = match std::fs::read_dir(&network_root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(ZeckError::Storage(format!(
-                "reading legacy workspace root {}: {err}",
-                network_root.display()
-            )));
-        }
-    };
-    let mut stack = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|err| {
-            ZeckError::Storage(format!(
-                "reading legacy workspace root {}: {err}",
-                network_root.display()
-            ))
-        })?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("workspace-") || name.starts_with("transparent-") {
-            stack.push(entry.path());
-        }
-    }
-    let mut journals = Vec::new();
-    while let Some(path) = stack.pop() {
-        let metadata = std::fs::symlink_metadata(&path).map_err(|err| {
-            ZeckError::Storage(format!(
-                "inspecting legacy workspace {}: {err}",
-                path.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(ZeckError::Storage(format!(
-                "refusing symlink in legacy workspace discovery: {}",
-                path.display()
-            )));
-        }
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(&path).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "reading legacy workspace {}: {err}",
-                    path.display()
-                ))
-            })? {
-                stack.push(
-                    entry
-                        .map_err(|err| {
-                            ZeckError::Storage(format!(
-                                "reading legacy workspace {}: {err}",
-                                path.display()
-                            ))
-                        })?
-                        .path(),
-                );
-            }
-        } else if metadata.is_file() {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    ZeckError::Storage(format!("invalid legacy source name {}", path.display()))
-                })?;
-            if name == crate::broadcast::BROADCAST_LOG_FILE_NAME {
-                journals.push(path);
-            } else if let Some(source_name) = name.strip_suffix(&lock_suffix) {
-                journals.push(
-                    path.parent()
-                        .expect("sidecar file has a parent")
-                        .join(source_name)
-                        .join(crate::broadcast::BROADCAST_LOG_FILE_NAME),
-                );
-            }
-        }
-    }
-    journals.sort();
-    Ok(journals)
 }
 
 impl RecoveryService {
@@ -1416,9 +1272,8 @@ impl RecoveryService {
             })?;
         let operation_lock = NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network)?;
         recover_interrupted_cleanup(&workspace_root, &operation_lock)?;
-        workspace.ensure_broadcast_log_directory()?;
-        let legacy_log_guards =
-            operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        // Refuse to start on a registry that cannot be replayed.
+        drop(operation_lock.open_broadcast_log()?);
 
         // Cancel any existing session targeting the same workspace to prevent
         // concurrent SQLite writers from locking each other out.
@@ -1460,7 +1315,6 @@ impl RecoveryService {
         let task = tokio::spawn(async move {
             let _workspace_guard = scan_guard;
             let _operation_lock = operation_lock;
-            let _legacy_log_guards = legacy_log_guards;
             // Acquire a power-management guard so the OS doesn't put the
             // machine to sleep mid-scan. Held for the entire scan task; the
             // Drop impl releases on completion, error, panic, or task abort.
@@ -1563,8 +1417,7 @@ impl RecoveryService {
         let _operation_lock =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let global_log = _operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let global_log = _operation_lock.open_broadcast_log()?;
         if global_log.has_unresolved_history() {
             return Err(ZeckError::Broadcast(
                 "cannot review a new sweep while the network registry has unresolved prepared transaction history".to_owned(),
@@ -1740,8 +1593,7 @@ impl RecoveryService {
         let operation_guard =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let mut log = operation_guard.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let mut log = operation_guard.open_broadcast_log()?;
         let previous_states = log
             .records()
             .into_iter()
@@ -1830,8 +1682,7 @@ impl RecoveryService {
         let operation_guard =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let mut log = operation_guard.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let mut log = operation_guard.open_broadcast_log()?;
         let previous_states = log
             .records()
             .into_iter()
@@ -1890,16 +1741,14 @@ impl RecoveryService {
         let _operation_lock =
             NetworkOperationGuard::acquire(&session.runtime.data_dir, session.runtime.network)?;
         refuse_interrupted_cleanup(&session.workspace_root)?;
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        let global_log = _operation_lock.open_broadcast_log_for(&workspace.broadcast_log_path())?;
+        let global_log = _operation_lock.open_broadcast_log()?;
         if global_log.has_unresolved_history() {
             return Err(ZeckError::Broadcast(
                 "cannot start a new sweep while the network registry has unresolved prepared transaction history".to_owned(),
             ));
         }
-        // Per-leg signers reopen the registry. Release only that registry
-        // lock, retaining every legacy source lock through the entire route.
-        let _legacy_source_guards = global_log.into_legacy_source_guards();
+        // Per-leg signers reopen the registry under the held operation lock.
+        drop(global_log);
         if self
             .reconciliation_rescan_required
             .lock()
@@ -2300,15 +2149,9 @@ impl RecoveryService {
             }
         }
 
-        let workspace = RecoveryWorkspace::from_runtime(&session.runtime)?;
-        // Import and inspect the surviving workspace journal after a retry
-        // restored its actual path. The network registry (outside the
-        // workspace, so it survives deletion) is authoritative for all
-        // aliases; the local journal is also checked so a changed source
-        // cannot be silently ignored.
-        let local_path = workspace.broadcast_log_path();
-        let local_journal_exists = local_path.exists();
-        let mut broadcast_log = _operation_lock.open_broadcast_log_for(&local_path)?;
+        // The network registry lives outside the workspace, so it survives
+        // deletion and is authoritative for every workspace on this network.
+        let mut broadcast_log = _operation_lock.open_broadcast_log()?;
         // The only refusal: a broadcast whose outcome is not yet resolved.
         // Observe each once first, so a transaction that has since mined (by
         // any operator), expired, or been rejected does not block. An
@@ -2367,7 +2210,6 @@ impl RecoveryService {
                     &tombstone,
                     &broadcast_log,
                     outcome.as_ref(),
-                    local_journal_exists,
                 )?;
             }
             if let Err(err) = std::fs::rename(&workspace_root, &tombstone) {
@@ -8133,14 +7975,7 @@ mod propose_workspace_guard_tests {
         )
         .await;
         let session = service.session(&handle).await.unwrap();
-        let path = session
-            .state
-            .lock()
-            .await
-            .workspace
-            .as_ref()
-            .unwrap()
-            .broadcast_log_path();
+        let path = registry_log_path(&session.workspace_root);
         let lock = DurableBroadcastLog::open(&path).unwrap();
         let error = service
             .delete_workspace(&handle)
@@ -8155,97 +7990,6 @@ mod propose_workspace_guard_tests {
         assert!(session.workspace_root.exists());
         assert!(service.session(&handle).await.is_ok());
         drop(lock);
-    }
-
-    #[tokio::test]
-    async fn absent_legacy_journal_lock_blocks_scan_review_and_execution() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle) = completed_session(
-            tempdir.path(),
-            Arc::new(SeedKeySource::new(SecretString::new(
-                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
-            ))),
-            transparent_account(0),
-        )
-        .await;
-        let session = service.session(&handle).await.unwrap();
-        let legacy_path = RecoveryWorkspace::from_runtime(&session.runtime)
-            .unwrap()
-            .broadcast_log_path();
-        assert!(!legacy_path.exists());
-        let legacy_writer = DurableBroadcastLog::open(&legacy_path).unwrap();
-        assert!(!legacy_path.exists(), "only the legacy sidecar exists");
-
-        let fresh_service = RecoveryService::new();
-        let runtime = &session.runtime;
-        let scan_error = fresh_service
-            .start_scan_from_key_source(
-                ScanConfig {
-                    birthday: runtime.birthday,
-                    num_accounts: runtime.num_accounts,
-                    gap_limit: runtime.gap_limit,
-                    transparent_scan: runtime.transparent_scan,
-                    lightwalletd_url: runtime.lightwalletd_url.clone(),
-                    confirmation_sources: runtime.confirmation_sources.clone(),
-                    data_dir: runtime.data_dir.clone(),
-                    network: runtime.network,
-                    label: runtime.label.clone(),
-                },
-                runtime.key_source.clone(),
-            )
-            .await
-            .expect_err("a scan cannot race an older writer before JSONL appears");
-        assert!(scan_error.to_string().contains("in use"), "{scan_error}");
-
-        let review_error = service
-            .propose_sweep(&handle, request())
-            .await
-            .expect_err("a quote cannot race the older writer");
-        assert!(
-            review_error.to_string().contains("in use"),
-            "{review_error}"
-        );
-        let execution_error = service
-            .execute_sweep(&handle, &SweepProposalId("unused".to_owned()))
-            .await
-            .expect_err("execution cannot enter before the older writer releases its lock");
-        assert!(
-            execution_error.to_string().contains("in use"),
-            "{execution_error}"
-        );
-        drop(legacy_writer);
-    }
-
-    #[test]
-    fn network_registry_holds_an_alias_legacy_sidecar_without_jsonl() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let alias_root = tempdir
-            .path()
-            .join("mainnet/workspace-old/birthday-1/scope-old");
-        std::fs::create_dir_all(&alias_root).unwrap();
-        let legacy_path = alias_root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
-        let legacy_writer = DurableBroadcastLog::open(&legacy_path).unwrap();
-        assert!(
-            !legacy_path.exists(),
-            "older process has not written JSONL yet"
-        );
-
-        let operation =
-            NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
-        let error = operation
-            .open_broadcast_log()
-            .err()
-            .expect("existing legacy sidecar must block a global signer");
-        assert!(error.to_string().contains("in use"), "{error}");
-        drop(legacy_writer);
-
-        let registry = operation.open_broadcast_log().unwrap();
-        let attempted_old_open = DurableBroadcastLog::open(&legacy_path)
-            .err()
-            .expect("the global registry must retain the legacy lock until it closes");
-        assert!(attempted_old_open.to_string().contains("in use"));
-        drop(registry);
-        DurableBroadcastLog::open(&legacy_path).unwrap();
     }
 
     fn mined_outcome(txid: String) -> SweepOutcome {
@@ -8298,13 +8042,29 @@ mod propose_workspace_guard_tests {
         )
     }
 
+    /// The network registry a workspace (or its tombstone) shares.
+    fn registry_log_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
+        let network_root = workspace_root
+            .ancestors()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "mainnet" || name == "testnet")
+            })
+            .expect("workspace lives under a network directory");
+        let path = network_root
+            .join(".broadcast-registry")
+            .join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
     fn seed_source() -> Arc<dyn KeySource> {
         Arc::new(SeedKeySource::new(SecretString::new(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
         )))
     }
 
-    /// Pre-registry eligibility: a Complete, Cancelled or Error scan may be
+    /// Baseline eligibility: a Complete, Cancelled or Error scan may be
     /// deleted with or without a sweep outcome, and with tracked shielded
     /// accounts -- the source keys, not the workspace, hold spend authority.
     #[tokio::test]
@@ -8411,9 +8171,7 @@ mod propose_workspace_guard_tests {
             .workspace_root
             .clone();
         let txid = TxId::from_bytes([84; 32]);
-        let mut log =
-            DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-                .unwrap();
+        let mut log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid,
             raw_tx: vec![84, 85],
@@ -8466,7 +8224,7 @@ mod propose_workspace_guard_tests {
             .insert(root.clone(), root.clone());
         let added_txid = TxId::from_bytes([85; 32]);
         let raw = vec![85, 86, 87];
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid: added_txid,
@@ -8501,7 +8259,7 @@ mod propose_workspace_guard_tests {
             .lock()
             .await
             .insert(root.clone(), tombstone.clone());
-        let path = tombstone.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&tombstone);
         let added_txid = TxId::from_bytes([86; 32]);
         let raw = vec![86, 87, 88];
         let mut log = DurableBroadcastLog::open(&path).unwrap();
@@ -8521,9 +8279,7 @@ mod propose_workspace_guard_tests {
             root.exists(),
             "the surviving tombstone must be restored for validation"
         );
-        let reopened =
-            DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-                .unwrap();
+        let reopened = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(reopened.latest(added_txid).unwrap().prepared.raw_tx, raw);
         assert_eq!(
             reopened.latest(added_txid).unwrap().state,
@@ -8567,8 +8323,7 @@ mod propose_workspace_guard_tests {
             result.is_err(),
             "a durable deletion marker must survive process restart"
         );
-        let log = DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-            .unwrap();
+        let log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
     }
 
@@ -8594,7 +8349,6 @@ mod propose_workspace_guard_tests {
                     "txid": txid.to_string(),
                     "raw_sha256": format!("{:x}", Sha256::digest([84, 85])),
                 }],
-                "local_journal_exists": true,
             })
             .to_string(),
         )
@@ -8661,17 +8415,19 @@ mod propose_workspace_guard_tests {
     }
 
     #[tokio::test]
-    async fn restart_without_surviving_journal_receipt_requires_manual_recovery() {
+    async fn restart_without_registry_receipt_requires_manual_recovery() {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, _) = completed_mined_session(tempdir.path()).await;
         let root = root.canonicalize().unwrap();
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let tombstone = root.with_file_name(format!(
             "{}.deleting-restart-missing",
             root.file_name().unwrap().to_string_lossy()
         ));
+        // The marker binds a receipt the registry never recorded.
+        let missing = TxId::from_bytes([0xEE; 32]);
         let marker = super::cleanup_marker_path(&root).unwrap();
         std::fs::write(
             &marker,
@@ -8679,16 +8435,14 @@ mod propose_workspace_guard_tests {
                 "workspace": root,
                 "tombstone": tombstone,
                 "receipts": [{
-                    "txid": txid.to_string(),
+                    "txid": missing.to_string(),
                     "raw_sha256": format!("{:x}", Sha256::digest([84, 85])),
                 }],
-                "local_journal_exists": true,
             })
             .to_string(),
         )
         .unwrap();
         std::fs::rename(&root, &tombstone).unwrap();
-        std::fs::remove_file(tombstone.join(crate::broadcast::BROADCAST_LOG_FILE_NAME)).unwrap();
 
         let restarted = RecoveryService::new();
         let error = restarted
@@ -8714,136 +8468,6 @@ mod propose_workspace_guard_tests {
             "surviving tombstone remains available for inspection"
         );
         assert!(marker.exists());
-    }
-
-    #[tokio::test]
-    async fn restart_accepts_global_outcome_after_immutable_legacy_prefix() {
-        use sha2::{Digest, Sha256};
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, legacy_txid) = completed_mined_session(tempdir.path()).await;
-        let root = root.canonicalize().unwrap();
-        let runtime = service.session(&handle).await.unwrap().runtime.clone();
-        let global_txid = TxId::from_bytes([99; 32]);
-        let raw = vec![99, 100];
-        let guard =
-            super::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network).unwrap();
-        let mut registry = guard.open_broadcast_log().unwrap();
-        registry
-            .persist_prepared(&PreparedTransaction {
-                txid: global_txid,
-                raw_tx: raw.clone(),
-                fee_zatoshis: 10_000,
-                expiry_height: Some(130),
-            })
-            .unwrap();
-        registry
-            .transition(global_txid, TxLifecycleState::SubmissionUnknown, None, None)
-            .unwrap();
-        registry
-            .transition(
-                global_txid,
-                TxLifecycleState::Pending,
-                Some(&SubmissionDisposition::Accepted),
-                None,
-            )
-            .unwrap();
-        registry
-            .transition(
-                global_txid,
-                TxLifecycleState::Mined,
-                None,
-                Some(&mined_deletion_observation()),
-            )
-            .unwrap();
-        drop(registry);
-        drop(guard);
-
-        let tombstone = root.with_file_name(format!(
-            "{}.deleting-global-outcome",
-            root.file_name().unwrap().to_string_lossy()
-        ));
-        let marker = super::cleanup_marker_path(&root).unwrap();
-        std::fs::write(
-            &marker,
-            serde_json::json!({
-                "workspace": root,
-                "tombstone": tombstone,
-                "receipts": [{
-                    "txid": global_txid.to_string(),
-                    "raw_sha256": format!("{:x}", Sha256::digest(&raw)),
-                }],
-                "local_journal_exists": true,
-            })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::rename(&root, &tombstone).unwrap();
-
-        let restarted = RecoveryService::new();
-        let started = restarted
-            .start_scan_from_key_source(
-                ScanConfig {
-                    birthday: runtime.birthday,
-                    num_accounts: runtime.num_accounts,
-                    gap_limit: runtime.gap_limit,
-                    transparent_scan: runtime.transparent_scan,
-                    lightwalletd_url: runtime.lightwalletd_url.clone(),
-                    confirmation_sources: runtime.confirmation_sources.clone(),
-                    data_dir: runtime.data_dir.clone(),
-                    network: runtime.network,
-                    label: runtime.label.clone(),
-                },
-                runtime.key_source.clone(),
-            )
-            .await
-            .expect("global receipt can follow an immutable legacy journal");
-        assert!(root.exists());
-        assert!(!marker.exists());
-        restarted.cancel_scan(&started).await.unwrap();
-        let guard =
-            super::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network).unwrap();
-        let registry = guard.open_broadcast_log().unwrap();
-        assert_eq!(
-            registry.latest(legacy_txid).unwrap().prepared.raw_tx,
-            vec![84, 85]
-        );
-        assert_eq!(registry.latest(global_txid).unwrap().prepared.raw_tx, raw);
-    }
-
-    #[test]
-    fn global_registry_imports_legacy_transparent_history() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir
-            .path()
-            .join("mainnet")
-            .join("transparent-legacy")
-            .join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let txid = TxId::from_bytes([96; 32]);
-        let mut source = DurableBroadcastLog::open(&path).unwrap();
-        source
-            .persist_prepared(&PreparedTransaction {
-                txid,
-                raw_tx: vec![96, 97, 98],
-                fee_zatoshis: 10_000,
-                expiry_height: Some(140),
-            })
-            .unwrap();
-        source
-            .transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
-            .unwrap();
-        drop(source);
-
-        let guard =
-            super::NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
-        let registry = guard.open_broadcast_log().unwrap();
-        assert_eq!(
-            registry.latest(txid).unwrap().prepared.raw_tx,
-            vec![96, 97, 98]
-        );
-        assert!(registry.has_unresolved_history());
-        assert!(path.exists(), "migration must preserve the original source");
     }
 
     #[tokio::test]
@@ -8876,8 +8500,7 @@ mod propose_workspace_guard_tests {
         );
         assert!(root.exists());
         scanner.cancel_scan(&scanning).await.unwrap();
-        let log = DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-            .unwrap();
+        let log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
     }
 
@@ -8911,60 +8534,8 @@ mod propose_workspace_guard_tests {
         );
         assert!(root.exists());
         scanner.cancel_scan(&scanning).await.unwrap();
-        let log = DurableBroadcastLog::open(root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME))
-            .unwrap();
+        let log = DurableBroadcastLog::open(registry_log_path(&root)).unwrap();
         assert_eq!(log.latest(txid).unwrap().prepared.raw_tx, vec![84, 85]);
-    }
-
-    #[tokio::test]
-    async fn network_registry_discovers_unknown_from_reordered_imported_workspace() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let source = |first: u8, second: u8| {
-            let mut keys = argos_wallet_import::ImportedKeys::default();
-            for byte in [first, second] {
-                keys.transparent.push(TransparentKey {
-                    secret: Secret::new([byte; 32]),
-                    provenance: Provenance::Standalone,
-                    created_at: None,
-                });
-            }
-            Arc::new(ImportedKeySource::new(keys)) as Arc<dyn KeySource>
-        };
-        let (service, handle) =
-            completed_session(tempdir.path(), source(0x41, 0x42), transparent_account(0)).await;
-        let first = service.session(&handle).await.unwrap();
-        let mut reordered = first.runtime.clone();
-        reordered.key_source = source(0x42, 0x41);
-        let second_root = RecoveryWorkspace::from_runtime(&reordered)
-            .unwrap()
-            .root()
-            .to_owned();
-        assert_ne!(first.workspace_root, second_root);
-        let txid = TxId::from_bytes([93; 32]);
-        let mut old = DurableBroadcastLog::open(
-            first
-                .workspace_root
-                .join(crate::broadcast::BROADCAST_LOG_FILE_NAME),
-        )
-        .unwrap();
-        old.persist_prepared(&PreparedTransaction {
-            txid,
-            raw_tx: vec![93, 94, 95],
-            fee_zatoshis: 10_000,
-            expiry_height: Some(130),
-        })
-        .unwrap();
-        old.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
-            .unwrap();
-        drop(old);
-
-        let guard = NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
-        let registry = guard.open_broadcast_log().unwrap();
-        assert_eq!(registry.blocking_submission(), Some(txid));
-        assert_eq!(
-            registry.latest(txid).unwrap().prepared.raw_tx,
-            vec![93, 94, 95]
-        );
     }
 
     #[tokio::test]
@@ -9019,7 +8590,7 @@ mod propose_workspace_guard_tests {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle, root, original) = completed_mined_session(tempdir.path()).await;
         let extra = TxId::from_bytes([97; 32]);
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid: extra,
@@ -9147,7 +8718,7 @@ mod propose_workspace_guard_tests {
             .workspace_root
             .clone();
         let txid = TxId::from_bytes([91; 32]);
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid,
@@ -9262,7 +8833,7 @@ mod propose_workspace_guard_tests {
             .unwrap()
             .workspace_root
             .clone();
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let txid = TxId::from_bytes([71; 32]);
         let raw = vec![71, 72, 73];
         let (unknown_written, unknown_seen) = tokio::sync::oneshot::channel();
@@ -9330,7 +8901,7 @@ mod propose_workspace_guard_tests {
             .unwrap()
             .workspace_root
             .clone();
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let txid = TxId::from_bytes([72; 32]);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {
@@ -9424,7 +8995,7 @@ mod propose_workspace_guard_tests {
             .unwrap()
             .workspace_root
             .clone();
-        let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
+        let path = registry_log_path(&root);
         let txid = TxId::from_bytes([73; 32]);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&PreparedTransaction {

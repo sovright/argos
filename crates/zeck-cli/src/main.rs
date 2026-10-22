@@ -728,9 +728,7 @@ async fn run_transparent_sweep(
     // Hold the durable lock through scanning and submission. A prior unknown
     // transaction takes precedence even if the new UTXO scan is empty.
     let registry = argos_core::service::NetworkOperationGuard::acquire(data_dir, network)?;
-    let legacy_path =
-        argos_core::transparent_recovery::standalone_broadcast_log_path(data_dir, keys, network);
-    let mut log = registry.open_broadcast_log_for(&legacy_path)?;
+    let mut log = registry.open_broadcast_log()?;
     if let Some(txid) = log.blocking_submission() {
         bail!(
             "transaction {txid} may already have reached the network or was retryably refused; \
@@ -3932,16 +3930,14 @@ mod tests {
             }
             imported_transparent_keys(&imported).unwrap()
         };
-        let first_keys = make_keys(false);
         let overlapping_keys = make_keys(true);
         let txid = TxId::from_bytes([0xA5; 32]);
-        let legacy = argos_core::transparent_recovery::standalone_broadcast_log_path(
-            dir.path(),
-            &first_keys,
-            ZeckNetwork::Testnet,
-        );
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        let mut log = argos_core::broadcast::DurableBroadcastLog::open(legacy).unwrap();
+        // A submission from a one-key set is recorded in the network
+        // registry, which every key set on this data directory shares.
+        let registry =
+            argos_core::service::NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Testnet)
+                .unwrap();
+        let mut log = registry.open_broadcast_log().unwrap();
         log.persist_prepared(&PreparedTransaction {
             txid,
             raw_tx: vec![0x01],
@@ -3957,6 +3953,7 @@ mod tests {
         )
         .unwrap();
         drop(log);
+        drop(registry);
 
         let error = tokio::time::timeout(
             Duration::from_secs(2),
@@ -3975,48 +3972,6 @@ mod tests {
         .expect("unresolved submission must block before contacting lightwalletd")
         .expect_err("overlapping keys must not start a second sweep");
         assert!(error.to_string().contains(&txid.to_string()), "{error}");
-    }
-
-    #[tokio::test]
-    async fn absent_standalone_legacy_journal_lock_blocks_cli_before_network() {
-        use argos_core::argos_wallet_import::keys::{Provenance, TransparentKey};
-        use secrecy::Secret;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut imported = ImportedKeys::default();
-        imported.transparent.push(TransparentKey {
-            secret: Secret::new([0x41; 32]),
-            provenance: Provenance::Standalone,
-            created_at: None,
-        });
-        let keys = imported_transparent_keys(&imported).unwrap();
-        let legacy_path = argos_core::transparent_recovery::standalone_broadcast_log_path(
-            dir.path(),
-            &keys,
-            ZeckNetwork::Testnet,
-        );
-        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        let legacy_writer = argos_core::broadcast::DurableBroadcastLog::open(&legacy_path).unwrap();
-        assert!(!legacy_path.exists(), "only the old lock sidecar exists");
-
-        let error = tokio::time::timeout(
-            Duration::from_secs(2),
-            run_transparent_sweep(
-                &keys,
-                dir.path(),
-                ZeckNetwork::Testnet,
-                "http://127.0.0.1:1",
-                "irrelevant",
-                None,
-                false,
-                true,
-            ),
-        )
-        .await
-        .expect("legacy lock must be checked before the network")
-        .expect_err("an older writer may still submit from this standalone key set");
-        assert!(error.to_string().contains("in use"), "{error}");
-        drop(legacy_writer);
     }
 
     /// The speed-for-memory knob reaches the scanner.

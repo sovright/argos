@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
     fs::OpenOptions,
     io::{Cursor, Seek, Write},
@@ -10,7 +10,6 @@ use std::{
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction, SendResponse,
@@ -28,51 +27,6 @@ pub use crate::models::TxLifecycleState;
 
 pub const BROADCAST_LOG_SCHEMA_VERSION: u32 = 1;
 pub const BROADCAST_LOG_FILE_NAME: &str = "broadcasts-v1.jsonl";
-const LEGACY_IMPORT_MANIFEST_FILE_NAME: &str = "legacy-imports-v1.json";
-
-#[derive(Default, Serialize, Deserialize)]
-struct LegacyImportManifest {
-    /// Canonical source path to the exact bytes imported from that source.
-    sources: BTreeMap<String, String>,
-}
-
-fn atomic_replace_private(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ZeckError::Storage(format!("{} has no parent directory", path.display())))?;
-    let temp = parent.join(format!(
-        ".{}.import-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("log"),
-        uuid::Uuid::new_v4()
-    ));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp)
-            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", temp.display())))?;
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", temp.display())))?;
-        fs::rename(&temp, path)
-            .map_err(|err| ZeckError::Storage(format!("replacing {}: {err}", path.display())))?;
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", parent.display())))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
-}
-
 /// The lock lives beside the workspace, so renaming or deleting that
 /// workspace cannot unlink the lock inode while a submitter holds it.
 fn broadcast_lock_path(path: &Path) -> ZeckResult<PathBuf> {
@@ -659,46 +613,6 @@ enum BroadcastLogEvent {
     },
 }
 
-impl BroadcastLogEvent {
-    fn txid(&self) -> TxId {
-        match self {
-            Self::Prepared { txid, .. } | Self::StateChanged { txid, .. } => {
-                TxId::from_bytes(*txid)
-            }
-        }
-    }
-}
-
-fn ordered_event_lines(bytes: &[u8]) -> ZeckResult<Vec<(TxId, Vec<u8>)>> {
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !bytes.ends_with(b"\n") {
-        return Err(ZeckError::Storage(
-            "incomplete broadcast log during legacy import".to_owned(),
-        ));
-    }
-    bytes[..bytes.len() - 1]
-        .split(|byte| *byte == b'\n')
-        .map(|line| {
-            let event: BroadcastLogEvent = serde_json::from_slice(line).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "invalid broadcast event during legacy import: {err}"
-                ))
-            })?;
-            Ok((event.txid(), line.to_vec()))
-        })
-        .collect()
-}
-
-fn event_lines_by_txid(bytes: &[u8]) -> ZeckResult<HashMap<TxId, Vec<Vec<u8>>>> {
-    let mut grouped: HashMap<TxId, Vec<Vec<u8>>> = HashMap::new();
-    for (txid, line) in ordered_event_lines(bytes)? {
-        grouped.entry(txid).or_default().push(line);
-    }
-    Ok(grouped)
-}
-
 pub struct DurableBroadcastLog {
     path: PathBuf,
     latest: HashMap<TxId, PersistedTransaction>,
@@ -706,17 +620,6 @@ pub struct DurableBroadcastLog {
     // SQLite owns an OS file lock, released by Drop or process death. The
     // sidecar never stores transaction data and cannot leave a stale lock.
     _process_lock: rusqlite::Connection,
-    // A network registry keeps every legacy source locked until the caller's
-    // entire scan, review, submission, reconciliation, or deletion ends.
-    // Otherwise an older binary can append to a local journal just after its
-    // one-time import (or after an absent-JSONL sidecar was overlooked).
-    held_legacy_sources: Vec<DurableBroadcastLog>,
-}
-
-/// Keeps old workspace/standalone journal locks alive while a route reopens
-/// the network registry for its individual submissions.
-pub(crate) struct LegacyBroadcastGuards {
-    _held: Vec<DurableBroadcastLog>,
 }
 
 impl DurableBroadcastLog {
@@ -849,190 +752,9 @@ impl DurableBroadcastLog {
             latest: HashMap::new(),
             write_failed: false,
             _process_lock: process_lock,
-            held_legacy_sources: Vec::new(),
         };
         log.replay_from_disk()?;
         Ok(log)
-    }
-
-    /// Lock a legacy source even when its JSONL does not exist yet. If bytes
-    /// exist, import them while still holding that exact source lock. A
-    /// missing manifest after a crash is safe to recover because each source
-    /// transaction must be an exact event prefix of the network registry.
-    pub(crate) fn hold_legacy_source(&mut self, source_path: &Path) -> ZeckResult<()> {
-        self.hold_legacy_source_before_lock(source_path, || {})
-    }
-
-    fn hold_legacy_source_before_lock<F: FnOnce()>(
-        &mut self,
-        source_path: &Path,
-        before_lock: F,
-    ) -> ZeckResult<()> {
-        if self.write_failed {
-            return Err(ZeckError::Storage(format!(
-                "broadcast log {} needs reopening after a failed write",
-                self.path.display()
-            )));
-        }
-        let source_path = source_path.to_path_buf();
-        if source_path == self.path {
-            return Err(ZeckError::Storage(
-                "cannot import broadcast log into itself".to_owned(),
-            ));
-        }
-        let source = if let Some(index) = self
-            .held_legacy_sources
-            .iter()
-            .position(|source| source.path == source_path)
-        {
-            self.held_legacy_sources.swap_remove(index)
-        } else {
-            before_lock();
-            Self::open(&source_path)?
-        };
-        // Inspect only after acquiring the exact source sidecar. An older
-        // writer could create its first JSONL between a pre-lock absent stat
-        // and this acquisition; that newly persisted Unknown must be imported.
-        let present = match fs::symlink_metadata(&source_path) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
-            Ok(_) => {
-                return Err(ZeckError::Storage(format!(
-                    "legacy broadcast log {} must be a regular file",
-                    source_path.display()
-                )));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-            Err(err) => {
-                return Err(ZeckError::Storage(format!(
-                    "inspecting legacy log {}: {err}",
-                    source_path.display()
-                )));
-            }
-        };
-        let result = if present {
-            self.import_locked_legacy_log(&source_path, &source)
-        } else {
-            Ok(())
-        };
-        self.held_legacy_sources.push(source);
-        result
-    }
-
-    /// Copy an existing legacy journal into this locked network registry.
-    /// Kept for in-crate callers and fixture tests; the source remains locked.
-    pub(crate) fn import_legacy_log(&mut self, source_path: &Path) -> ZeckResult<()> {
-        if !source_path.is_file() {
-            return Err(ZeckError::Storage(format!(
-                "legacy broadcast log {} is missing",
-                source_path.display()
-            )));
-        }
-        self.hold_legacy_source(source_path)
-    }
-
-    pub(crate) fn into_legacy_source_guards(mut self) -> LegacyBroadcastGuards {
-        let held = std::mem::take(&mut self.held_legacy_sources);
-        LegacyBroadcastGuards { _held: held }
-    }
-
-    fn import_locked_legacy_log(
-        &mut self,
-        source_path: &Path,
-        source: &DurableBroadcastLog,
-    ) -> ZeckResult<()> {
-        let source_bytes = fs::read(source_path).map_err(|err| {
-            ZeckError::Storage(format!(
-                "reading legacy log {}: {err}",
-                source_path.display()
-            ))
-        })?;
-        let source_digest = format!("{:x}", Sha256::digest(&source_bytes));
-        let manifest_path = self
-            .path
-            .parent()
-            .ok_or_else(|| ZeckError::Storage("broadcast registry has no directory".to_owned()))?
-            .join(LEGACY_IMPORT_MANIFEST_FILE_NAME);
-        let mut manifest: LegacyImportManifest = match fs::read(&manifest_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "invalid legacy import manifest {}: {err}",
-                    manifest_path.display()
-                ))
-            })?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                LegacyImportManifest::default()
-            }
-            Err(err) => {
-                return Err(ZeckError::Storage(format!(
-                    "reading legacy import manifest {}: {err}",
-                    manifest_path.display()
-                )))
-            }
-        };
-        let source_key = source_path.to_string_lossy().into_owned();
-        if let Some(previous_digest) = manifest.sources.get(&source_key) {
-            if previous_digest != &source_digest {
-                return Err(ZeckError::Storage(format!(
-                    "legacy broadcast log {} changed after import",
-                    source_path.display()
-                )));
-            }
-        }
-
-        let registry_bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(err) => {
-                return Err(ZeckError::Storage(format!(
-                    "reading registry {}: {err}",
-                    self.path.display()
-                )))
-            }
-        };
-        let source_events = event_lines_by_txid(&source_bytes)?;
-        let registry_events = event_lines_by_txid(&registry_bytes)?;
-        for (txid, source_lines) in &source_events {
-            if let Some(registry_lines) = registry_events.get(txid) {
-                if !registry_lines.starts_with(source_lines) {
-                    return Err(ZeckError::Storage(format!(
-                        "conflicting legacy broadcast history for {txid} in {}",
-                        source_path.display()
-                    )));
-                }
-                if source.latest(*txid).is_none() || self.latest(*txid).is_none() {
-                    return Err(ZeckError::Storage(format!(
-                        "missing broadcast history for {txid} during legacy import"
-                    )));
-                }
-            }
-        }
-        let mut merged = registry_bytes.clone();
-        for (txid, line) in ordered_event_lines(&source_bytes)? {
-            if !registry_events.contains_key(&txid) {
-                merged.extend_from_slice(&line);
-                merged.push(b'\n');
-            }
-        }
-        if merged != registry_bytes {
-            if let Err(err) = atomic_replace_private(&self.path, &merged) {
-                self.write_failed = true;
-                return Err(err);
-            }
-            if let Err(err) = self.replay_from_disk() {
-                self.write_failed = true;
-                return Err(err);
-            }
-        }
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            manifest.sources.entry(source_key)
-        {
-            entry.insert(source_digest);
-            let bytes = serde_json::to_vec(&manifest).map_err(|err| {
-                ZeckError::Serialization(format!("serializing legacy import manifest: {err}"))
-            })?;
-            atomic_replace_private(&manifest_path, &bytes)?;
-        }
-        Ok(())
     }
 
     fn replay_from_disk(&mut self) -> ZeckResult<()> {
@@ -1936,126 +1658,6 @@ mod tests {
                 None,
             )
             .is_err());
-    }
-
-    #[test]
-    fn legacy_import_preserves_bytes_and_ignores_unchanged_source_after_reconciliation() {
-        let dir = tempfile::tempdir().unwrap();
-        let old_root = dir.path().join("workspace-old");
-        let registry_root = dir.path().join(".broadcast-registry");
-        fs::create_dir_all(&old_root).unwrap();
-        fs::create_dir_all(&registry_root).unwrap();
-        let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
-        let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
-        let tx = fixture();
-        let mut old = DurableBroadcastLog::open(&old_path).unwrap();
-        old.persist_prepared(&tx).unwrap();
-        old.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
-            .unwrap();
-        drop(old);
-        let old_bytes = fs::read(&old_path).unwrap();
-
-        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
-        registry.import_legacy_log(&old_path).unwrap();
-        assert_eq!(fs::read(&registry_path).unwrap(), old_bytes);
-        assert_eq!(registry.blocking_submission(), Some(tx.txid));
-        assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
-
-        registry
-            .transition(
-                tx.txid,
-                TxLifecycleState::Pending,
-                Some(&SubmissionDisposition::Accepted),
-                None,
-            )
-            .unwrap();
-        let advanced = fs::read(&registry_path).unwrap();
-        registry.import_legacy_log(&old_path).unwrap();
-        assert_eq!(fs::read(&registry_path).unwrap(), advanced);
-        assert_eq!(
-            registry.latest(tx.txid).unwrap().state,
-            TxLifecycleState::Pending
-        );
-
-        // A crash can land after the atomic registry replacement but before
-        // its manifest entry. The exact source prefix still proves import.
-        let manifest = registry_root.join(LEGACY_IMPORT_MANIFEST_FILE_NAME);
-        fs::remove_file(&manifest).unwrap();
-        registry.import_legacy_log(&old_path).unwrap();
-        assert_eq!(fs::read(&registry_path).unwrap(), advanced);
-        assert!(manifest.exists());
-
-        drop(registry);
-        let mut old = DurableBroadcastLog::open(&old_path).unwrap();
-        old.transition(
-            tx.txid,
-            TxLifecycleState::Pending,
-            Some(&SubmissionDisposition::Accepted),
-            None,
-        )
-        .unwrap();
-        drop(old);
-        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
-        assert!(registry.import_legacy_log(&old_path).is_err());
-        assert_eq!(fs::read(&registry_path).unwrap(), advanced);
-    }
-
-    #[test]
-    fn imported_legacy_journal_lock_survives_until_registry_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let old_root = dir.path().join("workspace-old");
-        let registry_root = dir.path().join(".broadcast-registry");
-        fs::create_dir_all(&old_root).unwrap();
-        fs::create_dir_all(&registry_root).unwrap();
-        let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
-        let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
-        let tx = fixture();
-        let mut old = DurableBroadcastLog::open(&old_path).unwrap();
-        old.persist_prepared(&tx).unwrap();
-        drop(old);
-
-        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
-        registry.import_legacy_log(&old_path).unwrap();
-        assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
-        let attempt = DurableBroadcastLog::open(&old_path)
-            .err()
-            .expect("older signer must not reopen its source while registry operates");
-        assert!(attempt.to_string().contains("in use"), "{attempt}");
-        let guards = registry.into_legacy_source_guards();
-        let attempt = DurableBroadcastLog::open(&old_path)
-            .err()
-            .expect("per-leg registry reopening must not release the old source lock");
-        assert!(attempt.to_string().contains("in use"), "{attempt}");
-        drop(guards);
-        DurableBroadcastLog::open(&old_path).unwrap();
-    }
-
-    #[test]
-    fn jsonl_created_after_absent_hint_is_imported_under_source_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let old_root = dir.path().join("workspace-old");
-        let registry_root = dir.path().join(".broadcast-registry");
-        fs::create_dir_all(&old_root).unwrap();
-        fs::create_dir_all(&registry_root).unwrap();
-        let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
-        let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
-        let tx = fixture();
-        assert!(!old_path.exists());
-
-        let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
-        registry
-            .hold_legacy_source_before_lock(&old_path, || {
-                // Deterministically occupy the gap where a pre-lock absence
-                // check would have been stale in the older implementation.
-                let mut old = DurableBroadcastLog::open(&old_path).unwrap();
-                old.persist_prepared(&tx).unwrap();
-                old.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
-                    .unwrap();
-            })
-            .unwrap();
-        assert_eq!(registry.blocking_submission(), Some(tx.txid));
-        assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
-        assert!(DurableBroadcastLog::open(&old_path).is_err());
     }
 
     #[test]
