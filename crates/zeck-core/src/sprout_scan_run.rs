@@ -426,7 +426,7 @@ impl CheckpointLease {
     fn finish_cleanup(
         &self,
         quarantine: &Path,
-        file: &fs::File,
+        file: fs::File,
         expected: &CheckpointObjectId,
         cleanup_id: [u8; 16],
     ) -> ZeckResult<()> {
@@ -3142,7 +3142,7 @@ fn discard_checkpoint_generation_while_leased_with_observers(
         )));
     }
     before_quarantine_delete(&quarantine);
-    lease.finish_cleanup(&quarantine, &file, &moved.object, cleanup_id)?;
+    lease.finish_cleanup(&quarantine, file, &moved.object, cleanup_id)?;
     Ok(CheckpointDiscard::Removed)
 }
 

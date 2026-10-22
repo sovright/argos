@@ -1027,7 +1027,7 @@ impl PrivateArtifactAccess {
                         ));
                     }
                     self.namespace
-                        .remove_open_child(&self.artifact, &file, old)?;
+                        .remove_open_child(&self.artifact, file, old)?;
                     self.namespace.sync_parent()?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1185,7 +1185,7 @@ impl PrivateArtifactAccess {
     pub(crate) fn finish_retiring_child(
         &self,
         quarantine: &Path,
-        file: &File,
+        file: File,
         expected: &PrivateObjectId,
         cleanup_id: [u8; 16],
     ) -> io::Result<()> {
@@ -1956,7 +1956,7 @@ impl NamespaceLease {
         self.verify_current()?;
         let file = open_child_file_for_removal(&self.parent, path)?;
         let expected = private_object_id(&file)?;
-        self.remove_open_child(path, &file, &expected)?;
+        self.remove_open_child(path, file, &expected)?;
         sync_private_directory(&self.parent)?;
         self.verify_current()
     }
@@ -1964,7 +1964,7 @@ impl NamespaceLease {
     pub(crate) fn remove_open_child(
         &self,
         path: &Path,
-        file: &File,
+        file: File,
         expected_id: &PrivateObjectId,
     ) -> io::Result<()> {
         self.require_child(path)?;
@@ -3472,6 +3472,10 @@ fn ensure_private_workspace_lineage_impl(
                 &staging,
             )?;
             sync_private_directory(&publication_parent)?;
+            // The mutation handle denies delete sharing on Windows. Release it
+            // before reopening the published path; the object-ID comparison
+            // below still detects any substitution in that window.
+            drop(staging);
             let current_parent = open_publication_parent(publish_parent)?;
             if private_object_id(&current_parent)? != publication_parent_id {
                 return Err(invalid_lineage(
@@ -4351,7 +4355,7 @@ fn remove_ephemeral_probe_cleanup_marker(
             "ephemeral probe cleanup marker changed before retirement",
         ));
     }
-    remove_open_child_file(publication_parent, marker_path, &marker, marker_id)?;
+    remove_open_child_file(publication_parent, marker_path, marker, marker_id)?;
     publication_parent.sync_all()
 }
 
@@ -5291,10 +5295,10 @@ fn remove_open_child_directory(
 fn remove_open_child_file(
     parent: &File,
     path: &Path,
-    file: &File,
+    file: File,
     expected_id: &PrivateObjectId,
 ) -> io::Result<()> {
-    if &private_object_id(file)? != expected_id {
+    if &private_object_id(&file)? != expected_id {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "retained private child changed before deletion",
@@ -5303,7 +5307,9 @@ fn remove_open_child_file(
     #[cfg(windows)]
     {
         let _ = (parent, path);
-        windows_acl::delete_open_file(file)
+        windows_acl::delete_open_file(&file)?;
+        drop(file);
+        Ok(())
     }
     #[cfg(unix)]
     {
@@ -9424,6 +9430,7 @@ mod tests {
         file.seek(SeekFrom::Start(corrupt_at)).unwrap();
         file.write_all(&[0x7f]).unwrap();
         file.sync_all().unwrap();
+        drop(file);
 
         let recovered = access.current_record().unwrap().unwrap();
         assert_eq!(recovered.sequence + 1, newest.sequence);
@@ -9472,7 +9479,7 @@ mod tests {
             .quarantine_active_child(&expected, second_cleanup)
             .unwrap();
         resumed
-            .finish_retiring_child(&quarantine, &file, &expected, second_cleanup)
+            .finish_retiring_child(&quarantine, file, &expected, second_cleanup)
             .unwrap();
         assert!(!artifact.exists());
         assert!(!quarantine.exists());
@@ -10527,6 +10534,7 @@ mod windows_tests {
             .open(&path)
             .unwrap();
         unsafe { set_world_access(&file, false) };
+        drop(file);
 
         let error = crate::sprout_scan_run::checkpoint_generation(&path)
             .expect_err("a permissive checkpoint must be rejected before its bytes are read");
@@ -10536,6 +10544,11 @@ mod windows_tests {
             "{error}"
         );
         assert_eq!(fs::read(&path).unwrap(), b"spending-key checkpoint");
+        let file = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL)
+            .open(&path)
+            .unwrap();
         unsafe { assert_world_access_is_still_present(&file) };
     }
 
@@ -10880,7 +10893,7 @@ mod windows_tests {
         rename_child_file(lease.parent(), &child, &renamed).unwrap();
         let opened = open_child_file_for_removal(lease.parent(), &renamed).unwrap();
         let opened_id = private_object_id(&opened).unwrap();
-        remove_open_child_file(lease.parent(), &renamed, &opened, &opened_id).unwrap();
+        remove_open_child_file(lease.parent(), &renamed, opened, &opened_id).unwrap();
 
         assert!(!renamed.exists());
         assert!(!detached.exists());
@@ -10959,6 +10972,7 @@ mod windows_tests {
         .unwrap();
         truncated_handle.write_all(b"replacement").unwrap();
         truncated_handle.sync_all().unwrap();
+        drop(truncated_handle);
 
         let atomic = parent.join("atomic-target");
         write_private_file_atomic_windows_in_parent(&retained, &atomic, b"atomic", |_| Ok(()))
@@ -10977,7 +10991,7 @@ mod windows_tests {
         rename_child_file(&retained, &source, &renamed).unwrap();
         let opened = open_child_file_for_removal(&retained, &renamed).unwrap();
         let opened_id = private_object_id(&opened).unwrap();
-        remove_open_child_file(&retained, &renamed, &opened, &opened_id).unwrap();
+        remove_open_child_file(&retained, &renamed, opened, &opened_id).unwrap();
 
         assert_eq!(
             fs::read(parent.join("journal")).unwrap(),
