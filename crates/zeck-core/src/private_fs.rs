@@ -46,7 +46,10 @@ pub fn harden_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        let directory = unix_private::open_directory(path)?;
+        unix_private::remove_extended_acl(&directory)?;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        unix_private::verify_no_extended_acl(&directory)
     }
     #[cfg(windows)]
     {
@@ -64,7 +67,9 @@ pub fn harden_private_file(file: &File) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+        unix_private::remove_extended_acl(file)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        unix_private::verify_no_extended_acl(file)
     }
     #[cfg(windows)]
     {
@@ -191,6 +196,37 @@ pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_private_file_atomic_with_observer(path, bytes, |_| Ok(()))
 }
 
+/// Remove destination-scoped atomic staging left by a crashed writer once it
+/// is old enough that it cannot belong to an active write.
+pub fn remove_stale_private_file_staging(
+    path: &Path,
+    minimum_age: std::time::Duration,
+) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        unix_private::cleanup_staging(path, Some(minimum_age))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, minimum_age);
+        Ok(false)
+    }
+}
+
+/// Remove every safe, destination-scoped atomic staging directory for `path`.
+/// Callers must serialize this with writers for the same destination.
+pub fn discard_private_file_staging(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        unix_private::cleanup_staging(path, None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
 fn write_private_file_atomic_with_observer(
     path: &Path,
     bytes: &[u8],
@@ -280,6 +316,7 @@ fn private_temporary(path: &Path) -> std::path::PathBuf {
 #[cfg(unix)]
 mod unix_private {
     use super::{harden_private_file, validate_private_file};
+    use sha2::{Digest, Sha256};
     use std::{
         ffi::{CString, OsStr},
         fs::{self, File},
@@ -294,6 +331,39 @@ mod unix_private {
 
     const ARTIFACT_NAME: &str = "artifact";
 
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct FileIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos_acl {
+        use std::ffi::c_void;
+
+        pub(super) const ACL_TYPE_EXTENDED: i32 = 0x0000_0100;
+        pub(super) const ACL_FIRST_ENTRY: i32 = 0;
+
+        unsafe extern "C" {
+            pub(super) fn acl_init(count: i32) -> *mut c_void;
+            pub(super) fn acl_free(object: *mut c_void) -> i32;
+            pub(super) fn acl_set_fd_np(fd: i32, acl: *mut c_void, acl_type: i32) -> i32;
+            pub(super) fn acl_get_fd_np(fd: i32, acl_type: i32) -> *mut c_void;
+            pub(super) fn acl_get_entry(
+                acl: *mut c_void,
+                entry_id: i32,
+                entry: *mut *mut c_void,
+            ) -> i32;
+        }
+    }
+
     fn c_string(value: &OsStr, description: &str) -> io::Result<CString> {
         CString::new(value.as_bytes()).map_err(|_| {
             io::Error::new(
@@ -305,6 +375,63 @@ mod unix_private {
 
     fn last_error() -> io::Error {
         io::Error::last_os_error()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn remove_extended_acl(file: &File) -> io::Result<()> {
+        let acl = unsafe { macos_acl::acl_init(1) };
+        if acl.is_null() {
+            return Err(last_error());
+        }
+        let result = unsafe {
+            macos_acl::acl_set_fd_np(file.as_raw_fd(), acl, macos_acl::ACL_TYPE_EXTENDED)
+        };
+        unsafe {
+            macos_acl::acl_free(acl);
+        }
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn remove_extended_acl(_file: &File) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn verify_no_extended_acl(file: &File) -> io::Result<()> {
+        let acl =
+            unsafe { macos_acl::acl_get_fd_np(file.as_raw_fd(), macos_acl::ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = last_error();
+            return if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        let result =
+            unsafe { macos_acl::acl_get_entry(acl, macos_acl::ACL_FIRST_ENTRY, &mut entry) };
+        unsafe {
+            macos_acl::acl_free(acl);
+        }
+        match result {
+            0 => Ok(()),
+            value if value > 0 => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private object retained an extended macOS ACL",
+            )),
+            _ => Err(last_error()),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn verify_no_extended_acl(_file: &File) -> io::Result<()> {
+        Ok(())
     }
 
     pub(super) fn open_directory(path: &Path) -> io::Result<File> {
@@ -328,9 +455,20 @@ mod unix_private {
         Ok(directory)
     }
 
-    fn create_staging_directory(parent: &File) -> io::Result<(File, CString, PathBuf)> {
+    fn staging_prefix(path: &Path) -> io::Result<String> {
+        let destination = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private file has no name")
+        })?;
+        let digest = Sha256::digest(destination.as_bytes());
+        Ok(format!(".argos-private-{digest:x}-"))
+    }
+
+    fn create_staging_directory(
+        parent: &File,
+        prefix: &str,
+    ) -> io::Result<(File, CString, PathBuf, FileIdentity)> {
         for _ in 0..16 {
-            let name = format!(".argos-private-{}", uuid::Uuid::new_v4());
+            let name = format!("{prefix}{}", uuid::Uuid::new_v4());
             let c_name = c_string(OsStr::new(&name), "staging name")?;
             let created = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) };
             if created != 0 {
@@ -358,6 +496,7 @@ mod unix_private {
                     "private staging directory was substituted during creation",
                 ));
             }
+            remove_extended_acl(&directory)?;
             directory.set_permissions(fs::Permissions::from_mode(0o700))?;
             let metadata = directory.metadata()?;
             if metadata.mode() & 0o777 != 0o700 {
@@ -366,7 +505,13 @@ mod unix_private {
                     "private staging directory permissions were not established",
                 ));
             }
-            return Ok((directory, c_name, PathBuf::from(name)));
+            verify_no_extended_acl(&directory)?;
+            return Ok((
+                directory,
+                c_name,
+                PathBuf::from(name),
+                file_identity(&metadata),
+            ));
         }
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -406,10 +551,168 @@ mod unix_private {
         }
     }
 
-    fn remove_staging_entry(parent: RawFd, name: &CString) {
-        unsafe {
-            libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR);
+    #[allow(clippy::unnecessary_cast)] // libc field aliases differ across Unix targets.
+    fn entry_identity(parent: RawFd, name: &CString) -> io::Result<FileIdentity> {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        if unsafe {
+            libc::fstatat(
+                parent,
+                name.as_ptr(),
+                status.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(last_error());
         }
+        let status = unsafe { status.assume_init() };
+        Ok(FileIdentity {
+            device: status.st_dev as u64,
+            inode: status.st_ino as u64,
+        })
+    }
+
+    fn remove_staging_entry(
+        parent: RawFd,
+        name: &CString,
+        expected: FileIdentity,
+    ) -> io::Result<bool> {
+        match entry_identity(parent, name) {
+            Ok(actual) if actual == expected => {
+                if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+                    Ok(true)
+                } else {
+                    Err(last_error())
+                }
+            }
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private staging directory changed before cleanup",
+            )),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn open_staging_directory(parent: RawFd, name: &CString) -> io::Result<File> {
+        let descriptor = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(last_error());
+        }
+        let directory = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private staging directory is not owner-only",
+            ));
+        }
+        verify_no_extended_acl(&directory)?;
+        Ok(directory)
+    }
+
+    fn open_staged_artifact(directory: RawFd) -> io::Result<Option<File>> {
+        let artifact = c_string(OsStr::new(ARTIFACT_NAME), "artifact name")?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory,
+                artifact.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let err = last_error();
+            return if err.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(err)
+            };
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file.metadata()?;
+        validate_private_file(&file)?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staged private artifact is not owner-only",
+            ));
+        }
+        verify_no_extended_acl(&file)?;
+        Ok(Some(file))
+    }
+
+    fn cleanup_candidate(parent: &File, name: &OsStr, staging: File) -> io::Result<bool> {
+        let name = c_string(name, "staging name")?;
+        let staging_identity = file_identity(&staging.metadata()?);
+        if let Some(artifact_file) = open_staged_artifact(staging.as_raw_fd())? {
+            let artifact = c_string(OsStr::new(ARTIFACT_NAME), "artifact name")?;
+            let expected = file_identity(&artifact_file.metadata()?);
+            if entry_identity(staging.as_raw_fd(), &artifact)? != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "staged private artifact changed before cleanup",
+                ));
+            }
+            if unsafe { libc::unlinkat(staging.as_raw_fd(), artifact.as_ptr(), 0) } != 0 {
+                return Err(last_error());
+            }
+            staging.sync_all()?;
+        }
+        drop(staging);
+        remove_staging_entry(parent.as_raw_fd(), &name, staging_identity)
+    }
+
+    pub(super) fn cleanup_staging(
+        path: &Path,
+        minimum_age: Option<std::time::Duration>,
+    ) -> io::Result<bool> {
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let prefix = staging_prefix(path)?;
+        let parent = open_directory(parent_path)?;
+        let now = std::time::SystemTime::now();
+        let mut removed = false;
+        for entry in fs::read_dir(parent_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name_text) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name_text.strip_prefix(&prefix) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(id).is_err() {
+                continue;
+            }
+            let candidate =
+                open_staging_directory(parent.as_raw_fd(), &c_string(&name, "staging name")?)?;
+            if minimum_age.is_some_and(|minimum| {
+                candidate
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_none_or(|age| age < minimum)
+            }) {
+                continue;
+            }
+            removed |= cleanup_candidate(&parent, &name, candidate)?;
+        }
+        if removed {
+            parent.sync_all()?;
+        }
+        Ok(removed)
     }
 
     pub(super) fn write_atomic(
@@ -428,12 +731,14 @@ mod unix_private {
         let artifact = c_string(OsStr::new(ARTIFACT_NAME), "artifact name")?;
         let parent = open_directory(parent_path)?;
         parent.sync_all()?;
-        let (staging, staging_name, staging_relative) = create_staging_directory(&parent)?;
+        let prefix = staging_prefix(path)?;
+        let (staging, staging_name, staging_relative, staging_identity) =
+            create_staging_directory(&parent, &prefix)?;
         let exposed = parent_path.join(staging_relative);
         let mut file = match create_artifact(staging.as_raw_fd()) {
             Ok(file) => file,
             Err(err) => {
-                remove_staging_entry(parent.as_raw_fd(), &staging_name);
+                let _ = remove_staging_entry(parent.as_raw_fd(), &staging_name, staging_identity);
                 return Err(err);
             }
         };
@@ -464,8 +769,24 @@ mod unix_private {
         }
         drop(file);
         drop(staging);
-        remove_staging_entry(parent.as_raw_fd(), &staging_name);
+        let _ = remove_staging_entry(parent.as_raw_fd(), &staging_name, staging_identity);
         result
+    }
+
+    #[cfg(test)]
+    pub(super) fn abandon_staged_write(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = open_directory(parent_path)?;
+        let prefix = staging_prefix(path)?;
+        let (staging, _, relative, _) = create_staging_directory(&parent, &prefix)?;
+        let mut artifact = create_artifact(staging.as_raw_fd())?;
+        artifact.write_all(bytes)?;
+        artifact.sync_all()?;
+        staging.sync_all()?;
+        Ok(parent_path.join(relative))
     }
 }
 
@@ -1095,6 +1416,105 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fs::read(path).unwrap(), b"verified secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_cleanup_does_not_remove_a_substituted_empty_directory() {
+        use std::{cell::RefCell, os::unix::fs::PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let path = tmp.path().join("checkpoint");
+        let moved = tmp.path().join("moved-private-entry");
+        let decoy = RefCell::new(None);
+        write_private_file_atomic_with_observer(&path, b"verified secret", |exposed| {
+            fs::rename(exposed, &moved)?;
+            fs::create_dir(exposed)?;
+            *decoy.borrow_mut() = Some(exposed.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"verified secret");
+        assert!(
+            decoy.borrow().as_ref().unwrap().is_dir(),
+            "cleanup removed an attacker-substituted staging name"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_removes_crash_left_secret_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wallet-a.checkpoint");
+        let staging = super::unix_private::abandon_staged_write(&path, b"spend-capable").unwrap();
+        assert_eq!(
+            fs::read(staging.join("artifact")).unwrap(),
+            b"spend-capable"
+        );
+
+        assert!(remove_stale_private_file_staging(&path, std::time::Duration::ZERO).unwrap());
+        assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_cleanup_is_scoped_to_one_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("wallet-a.checkpoint");
+        let second = tmp.path().join("wallet-b.checkpoint");
+        let first_staging =
+            super::unix_private::abandon_staged_write(&first, b"first secret").unwrap();
+        let second_staging =
+            super::unix_private::abandon_staged_write(&second, b"second secret").unwrap();
+
+        assert!(discard_private_file_staging(&first).unwrap());
+        assert!(!first_staging.exists());
+        assert!(second_staging.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn atomic_private_objects_drop_inherited_macos_acls_before_use() {
+        use std::process::Command;
+
+        fn has_extended_acl(path: &Path) -> bool {
+            let output = Command::new("ls").arg("-lde").arg(path).output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .any(|line| line.trim_start().starts_with("0:"))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let status = Command::new("chmod")
+            .arg("+a")
+            .arg(
+                "everyone allow list,search,add_file,add_subdirectory,delete_child,\
+                 file_inherit,directory_inherit",
+            )
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(has_extended_acl(tmp.path()));
+
+        let path = tmp.path().join("checkpoint");
+        write_private_file_atomic_with_observer(&path, b"spend-capable", |staging| {
+            assert!(
+                !has_extended_acl(staging),
+                "the staging directory retained an inherited macOS ACL"
+            );
+            assert!(
+                !has_extended_acl(&staging.join("artifact")),
+                "the staged artifact retained an inherited macOS ACL"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(!has_extended_acl(&path));
     }
 }
 
