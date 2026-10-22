@@ -3215,12 +3215,11 @@ mod tests {
     fn windows_journal_authority_denies_sidecar_replacement_and_second_writer() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        let mut authority_name = journal.path().as_os_str().to_os_string();
-        authority_name.push(".lock");
-        let authority = PathBuf::from(authority_name);
+        let access = journal.artifact_access().unwrap();
+        let authority = access.namespace().lock_path().to_path_buf();
         let displaced = authority.with_extension("displaced-lock");
 
-        with_sweep_journal_lock(journal.path(), None, |_| {
+        with_sweep_journal_lock(journal.path(), Some(access.namespace()), |_| {
             assert!(std::fs::rename(&authority, &displaced).is_err());
             let second = with_sweep_journal_lock(journal.path(), None, |_| Ok(()))
                 .expect_err("a second journal authority must be refused");
