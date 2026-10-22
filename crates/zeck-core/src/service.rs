@@ -9385,6 +9385,7 @@ mod propose_workspace_guard_tests {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle, root, txid) =
             completed_mined_session(&artifact_data_dir(&tempdir)).await;
+        let root = root.canonicalize().unwrap();
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let tombstone = root.with_file_name(format!(
             "{}.deleting-replay-generation-a",
