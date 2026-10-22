@@ -4862,11 +4862,8 @@ mod tests {
         let peer = silent_peer().await;
         // Per process: two `cargo test` runs on one machine must not delete
         // each other's checkpoint mid-run.
-        let dir = std::env::temp_dir().join(format!(
-            "argos-scan-silent-peer-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Regtest);
+        let dir = ScratchDir::new("scan-silent-peer-test");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
 
         let mut notices = Vec::new();
         let outcome = tokio::time::timeout(
@@ -4919,9 +4916,8 @@ mod tests {
         for _ in 0..(MAX_EMPTY_REPLIES + 2) {
             peers.push(silent_peer().await);
         }
-        let dir =
-            std::env::temp_dir().join(format!("argos-scan-budget-test-{}", uuid::Uuid::new_v4()));
-        let path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Regtest);
+        let dir = ScratchDir::new("scan-budget-test");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
 
         let mut silences = 0u32;
         let outcome = tokio::time::timeout(
@@ -5513,43 +5509,45 @@ mod tests {
     /// and it always says what it found — never an unexplained silence.
     #[tokio::test]
     async fn a_wallets_scan_lookup_always_explains_itself() {
-        let dir =
-            std::env::temp_dir().join(format!("argos-lookup-notice-{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = ScratchDir::new("lookup-notice");
         let keys = [[0x21; 32]];
 
-        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &keys).await;
+        let (chain, notice) =
+            wallet_evidence_with_current(&dir.0, P2pNetwork::Mainnet, &keys).await;
         assert!(chain.is_none());
         let notice = notice.expect("no scan must be said, with where it looked");
-        assert!(notice.contains(&dir.display().to_string()), "{notice}");
+        assert!(notice.contains(&dir.0.display().to_string()), "{notice}");
 
         // A duplicated key in the wallet names the same checkpoint the scan
         // wrote for the deduplicated set.
         let mut scanner = SproutScanner::new(&keys);
         scanner.scan_block_at(&[], [0xCD; 32], 300_000).unwrap();
-        save_checkpoint(&scanner, P2pNetwork::Mainnet, &checkpoint_path(&dir, &keys)).unwrap();
+        save_checkpoint(
+            &scanner,
+            P2pNetwork::Mainnet,
+            &checkpoint_path(&dir.0, &keys),
+        )
+        .unwrap();
         let (chain, notice) =
-            wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[keys[0], keys[0]]).await;
+            wallet_evidence_with_current(&dir.0, P2pNetwork::Mainnet, &[keys[0], keys[0]]).await;
         let chain = chain.expect("the duplicate must not hide the scan");
         assert!(!chain.complete);
         assert!(notice.unwrap().contains("before reaching the chain tip"));
 
         // Unusable evidence is said, not swallowed.
-        let mainnet_path = checkpoint_path(&dir, &keys);
+        let mainnet_path = checkpoint_path(&dir.0, &keys);
         let mainnet_bytes = std::fs::read(&mainnet_path).unwrap();
-        let testnet_path = checkpoint_path_for_network(&dir, &keys, P2pNetwork::Testnet);
+        let testnet_path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Testnet);
         save_checkpoint(&scanner, P2pNetwork::Testnet, &testnet_path).unwrap();
         std::fs::write(&testnet_path, mainnet_bytes).unwrap();
-        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Testnet, &keys).await;
+        let (chain, notice) =
+            wallet_evidence_with_current(&dir.0, P2pNetwork::Testnet, &keys).await;
         assert!(chain.is_none());
         assert!(notice.unwrap().contains("different network"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn fresh_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("argos-{tag}-{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    fn fresh_dir(tag: &str) -> ScratchDir {
+        ScratchDir::new(tag)
     }
 
     fn write_scan(dir: &Path, keys: &[[u8; 32]], height: u32, complete: bool) -> PathBuf {
@@ -5571,9 +5569,9 @@ mod tests {
     async fn a_scan_of_more_keys_than_the_wallet_holds_is_found() {
         let dir = fresh_dir("superset");
         let (a, b, c) = ([0x31; 32], [0x32; 32], [0x33; 32]);
-        write_scan(&dir, &[a, b], 3_000_000, true);
+        write_scan(&dir.0, &[a, b], 3_000_000, true);
 
-        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[a]).await;
+        let (chain, notice) = wallet_evidence_with_current(&dir.0, P2pNetwork::Mainnet, &[a]).await;
         let chain = chain.expect("a scan covering the wallet's keys must be used");
         assert_eq!(chain.scanned_to, 3_000_000);
         let notice = notice.expect("using a wider scan is said");
@@ -5581,13 +5579,12 @@ mod tests {
 
         // Not a superset: the wallet holds a key the scan never looked for —
         // even though the scan looked for more keys than the wallet has.
-        write_scan(&dir, &[a, b, [0x35; 32]], 3_000_000, true);
-        let (chain, _) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[a, c]).await;
+        write_scan(&dir.0, &[a, b, [0x35; 32]], 3_000_000, true);
+        let (chain, _) = wallet_evidence_with_current(&dir.0, P2pNetwork::Mainnet, &[a, c]).await;
         assert!(
             chain.is_none(),
             "a scan missing one of the wallet's keys proves nothing"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -5616,17 +5613,16 @@ mod tests {
     async fn an_unusable_covering_scan_is_reported_not_hidden() {
         let dir = fresh_dir("covering-broken");
         let (a, b) = ([0x37; 32], [0x38; 32]);
-        let path = write_scan(&dir, &[a, b], 3_000_000, true);
+        let path = write_scan(&dir.0, &[a, b], 3_000_000, true);
         // Damage the body, past the header the covering search reads.
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
 
-        let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &[a]).await;
+        let (chain, notice) = wallet_evidence_with_current(&dir.0, P2pNetwork::Mainnet, &[a]).await;
         assert!(chain.is_none());
         let notice = notice.unwrap();
         assert!(notice.contains("could not be used"), "{notice}");
         assert!(notice.contains(&path.display().to_string()), "{notice}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn joinsplit_revealing(nf: [u8; 32]) -> argos_wallet_import::keys::SproutJoinSplit {
@@ -5647,22 +5643,25 @@ mod tests {
     /// removed after. Two `cargo test` runs on one machine must not share
     /// or delete each other's files, and a crashed run must not leave one
     /// behind that fails the next run permanently.
-    struct ScratchDir(std::path::PathBuf);
+    struct ScratchDir(std::path::PathBuf, tempfile::TempDir);
 
     impl ScratchDir {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "argos-chain-evidence-{tag}-{}",
-                uuid::Uuid::new_v4()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            Self(dir)
+            let parent = tempfile::Builder::new()
+                .prefix(&format!("argos-{tag}-"))
+                .tempdir()
+                .expect("create a private test-owned publication parent");
+            let dir = parent.path().join("recovery-data");
+            Self(dir, parent)
         }
     }
 
     impl Drop for ScratchDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+            // Keep the `TempDir` field observably live until after the child
+            // cleanup above; its own drop removes the private parent.
+            let _ = self.1.path();
         }
     }
 
@@ -5910,10 +5909,10 @@ mod tests {
             .scan_block_at(&[], [0xCD; 32], 2_000_000)
             .expect("an empty block");
         let dir = fresh_dir("scan-network-tag-test");
-        let mainnet_path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Mainnet);
+        let mainnet_path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Mainnet);
         save_checkpoint(&scanner, P2pNetwork::Mainnet, &mainnet_path).unwrap();
         let mainnet_bytes = std::fs::read(&mainnet_path).unwrap();
-        let path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Testnet);
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Testnet);
         save_checkpoint(&scanner, P2pNetwork::Testnet, &path).unwrap();
         std::fs::write(&path, mainnet_bytes).unwrap();
 
@@ -6100,7 +6099,7 @@ mod tests {
             scanner
                 .scan_block_at(&[], [0xCF; 32], 400)
                 .expect("an empty block");
-            let path = checkpoint_path_for_network(&dir, &keys, P2pNetwork::Regtest);
+            let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
             save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
             assert_eq!(
                 saved_decrypt_from(&path, P2pNetwork::Regtest, &keys).unwrap(),
@@ -6121,7 +6120,7 @@ mod tests {
             .scan_block_at(&[], [0xCE; 32], 400)
             .expect("an empty block");
         let dir = fresh_dir("decrypt-bound-resume");
-        let path = checkpoint_path_for_network(&dir, &keys, P2pNetwork::Regtest);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
 
         let err = run_sprout_scan(&keys, P2pNetwork::Regtest, &[], None, &path, |_| {})
