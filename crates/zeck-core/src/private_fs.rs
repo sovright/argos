@@ -8144,13 +8144,19 @@ mod windows_acl {
             ptr::null(),
             FILE_DIRECTORY_FILE,
         )?;
+        #[cfg(test)]
+        eprintln!("workspace-root-authority {}: opened", path.display());
         if !validate_recursive_entry(&directory)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "private workspace entry is not a directory",
             ));
         }
+        #[cfg(test)]
+        eprintln!("workspace-root-authority {}: validated", path.display());
         PrivateSecurity::new(true)?.verify(&directory)?;
+        #[cfg(test)]
+        eprintln!("workspace-root-authority {}: ACL verified", path.display());
         Ok(directory)
     }
 
