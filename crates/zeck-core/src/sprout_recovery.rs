@@ -1413,7 +1413,7 @@ mod tests {
 
     fn inventory_journal(dir: &std::path::Path) -> crate::sprout_sweep_journal::SweepJournal {
         crate::sprout_sweep_journal::SweepJournal::for_keys(
-            dir,
+            &dir.join("artifact-data"),
             &[[0x42; 32]],
             crate::ZeckNetwork::Mainnet,
         )
@@ -1644,23 +1644,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = inventory_journal(dir.path());
         let outpoint = recovered.notes[0].outpoint;
-        let note_txid: String = outpoint
-            .txid
-            .iter()
-            .rev()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        crate::private_fs::write_private_file(
+        let purpose = crate::private_fs::private_artifact_purpose(
+            crate::ZeckNetwork::Mainnet.label(),
+            journal.source_fingerprint(),
+        );
+        let root = crate::private_fs::private_artifact_root_path(journal.data_dir(), &purpose);
+        let access = crate::private_fs::PrivateArtifactAccess::acquire(
+            &root,
+            &purpose,
+            crate::private_fs::PrivateArtifactDomain::Journal,
             journal.path(),
-            format!(
-                "{note_txid}:{}:{} {}\n",
-                outpoint.js_index,
-                outpoint.output_index,
-                "ab".repeat(32)
-            )
-            .as_bytes(),
         )
         .unwrap();
+        access
+            .append_child_if_unchanged_with_lineage(None, |authority_anchor, generation| {
+                let header = serde_json::json!({
+                    "record": "header",
+                    "version": crate::sprout_sweep_journal::SPROUT_SWEEP_JOURNAL_VERSION,
+                    "network": crate::ZeckNetwork::Mainnet,
+                    "source_fingerprint": journal.source_fingerprint(),
+                    "authority_anchor": authority_anchor,
+                    "artifact_generation": generation,
+                });
+                let legacy_entry = serde_json::json!({
+                    "record": "legacy_accepted",
+                    "note_id": crate::sprout_sweep_journal::note_id(&outpoint),
+                    "txid": "ab".repeat(32),
+                });
+                Ok(format!("{header}\n{legacy_entry}\n").into_bytes())
+            })
+            .unwrap();
+        drop(access);
         let snapshot = journal.load_or_migrate().unwrap();
 
         let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);

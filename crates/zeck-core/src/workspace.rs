@@ -55,6 +55,110 @@ pub struct RecoveryWorkspace {
     wallet_db_path: PathBuf,
 }
 
+/// Retained create-time authority for files exported into one recovery
+/// workspace. Holding this value pins the private workspace root while a UI
+/// resolves the destination and publishes the file through an exact parent
+/// handle.
+pub struct PrivateWorkspaceFileAuthority {
+    workspace_root: PathBuf,
+    private_root: PathBuf,
+    lineage: private_fs::PrivateRootLineageLease,
+}
+
+impl PrivateWorkspaceFileAuthority {
+    pub fn acquire(workspace_root: impl AsRef<Path>) -> ZeckResult<Self> {
+        let workspace_root = workspace_root.as_ref().to_path_buf();
+        let database = workspace_root.join("wallet.sqlite");
+        let private_root = private_root_for_wallet_database(&database).map_err(|err| {
+            ZeckError::Storage(format!(
+                "deriving private authority for recovery workspace {}: {err}",
+                workspace_root.display()
+            ))
+        })?;
+        let lineage =
+            private_fs::verify_private_workspace_lineage(private_root).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "authenticating recovery workspace {}: {err}",
+                    workspace_root.display()
+                ))
+            })?;
+        verify_private_dirs(private_root, &workspace_root)?;
+        Ok(Self {
+            workspace_root,
+            private_root: private_root.to_path_buf(),
+            lineage,
+        })
+    }
+
+    pub fn write_private_file(&self, path: &Path, bytes: &[u8]) -> ZeckResult<()> {
+        let parent = path.parent().ok_or_else(|| {
+            ZeckError::Storage(format!("private export {} has no parent", path.display()))
+        })?;
+        if !parent.starts_with(&self.workspace_root) || path.file_name().is_none() {
+            return Err(ZeckError::Storage(format!(
+                "private export {} is outside recovery workspace {}",
+                path.display(),
+                self.workspace_root.display()
+            )));
+        }
+
+        self.lineage.verify_current().map_err(|err| {
+            ZeckError::Storage(format!(
+                "revalidating recovery workspace before export: {err}"
+            ))
+        })?;
+        private_fs::create_private_dir_all(parent).map_err(|err| {
+            ZeckError::Storage(format!(
+                "creating private report directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+        verify_private_dirs(&self.private_root, parent)?;
+        let retained_parent = private_fs::open_private_directory_lease(parent).map_err(|err| {
+            ZeckError::Storage(format!(
+                "retaining private report directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+        self.lineage.verify_current().map_err(|err| {
+            ZeckError::Storage(format!(
+                "revalidating recovery workspace before report write: {err}"
+            ))
+        })?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(ZeckError::Storage(format!(
+                    "private export {} is not a regular file",
+                    path.display()
+                )))
+            }
+            Ok(_) => {
+                private_fs::verify_private_child_file(&retained_parent, path).map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "verifying existing private export {}: {err}",
+                        path.display()
+                    ))
+                })?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ZeckError::Storage(format!(
+                    "inspecting private export {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+        private_fs::write_private_file_atomic_in_parent(&retained_parent, path, bytes).map_err(
+            |err| ZeckError::Storage(format!("writing private export {}: {err}", path.display())),
+        )?;
+        self.lineage.verify_current().map_err(|err| {
+            ZeckError::Storage(format!(
+                "revalidating recovery workspace after report write: {err}"
+            ))
+        })
+    }
+}
+
 impl RecoveryWorkspace {
     pub fn from_runtime(config: &RuntimeScanConfig) -> ZeckResult<Self> {
         Self::from_key_source(config.key_source.as_ref(), config)
@@ -1275,6 +1379,66 @@ mod tests {
         crate::private_fs::ensure_private_workspace_lineage(&private_root, &workspace, &database)
             .expect("lineaged private test workspace");
         workspace
+    }
+
+    #[test]
+    fn private_workspace_file_authority_publishes_inside_verified_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = private_test_directory(&dir);
+        let authority = PrivateWorkspaceFileAuthority::acquire(&workspace).unwrap();
+        let report = workspace.join("reports/recovery.json");
+
+        authority
+            .write_private_file(&report, b"private recovery report")
+            .unwrap();
+
+        assert_eq!(fs::read(&report).unwrap(), b"private recovery report");
+        authority.write_private_file(&report, b"updated").unwrap();
+        assert_eq!(fs::read(&report).unwrap(), b"updated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_workspace_file_authority_refuses_reused_permissive_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = private_test_directory(&dir);
+        let authority = PrivateWorkspaceFileAuthority::acquire(&workspace).unwrap();
+        let report = workspace.join("recovery.json");
+        fs::write(&report, b"legacy bytes").unwrap();
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = authority
+            .write_private_file(&report, b"new bytes")
+            .expect_err("permissive reuse must remain untrusted")
+            .to_string();
+
+        assert!(error.contains("private export"), "{error}");
+        assert_eq!(fs::read(&report).unwrap(), b"legacy bytes");
+        assert_eq!(
+            fs::metadata(&report).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_workspace_file_authority_refuses_workspace_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = private_test_directory(&dir);
+        let authority = PrivateWorkspaceFileAuthority::acquire(&workspace).unwrap();
+        let private_root = workspace.parent().unwrap().parent().unwrap();
+        let displaced = dir.path().join("displaced-private-root");
+        fs::rename(private_root, &displaced).unwrap();
+        crate::private_fs::create_private_dir_all(&workspace).unwrap();
+        let report = workspace.join("recovery.json");
+
+        authority
+            .write_private_file(&report, b"must not publish")
+            .expect_err("the authenticated workspace pathname was replaced");
+
+        assert!(!report.exists());
     }
 
     fn file_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {

@@ -677,11 +677,22 @@ pub fn resume_interrupted_scan_checkpoint_cleanup(
     journal: &SweepJournal,
     network: crate::ZeckNetwork,
 ) -> ZeckResult<Option<ScanCheckpointCleanup>> {
-    let lease = crate::sprout_scan_run::CheckpointLease::acquire(checkpoint)?;
-    let data_dir = journal
-        .path()
+    crate::service::ensure_recovery_data_dir(journal.data_dir())?;
+    let artifact_root = checkpoint
         .parent()
-        .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
+        .ok_or_else(|| ZeckError::ScanNotReady("checkpoint has no private artifact root".into()))?;
+    match std::fs::symlink_metadata(artifact_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ZeckError::ScanNotReady(format!(
+                "inspecting checkpoint artifact root {}: {error}",
+                artifact_root.display()
+            )))
+        }
+        Ok(_) => {}
+    }
+    let lease = crate::sprout_scan_run::CheckpointLease::acquire(checkpoint)?;
+    let data_dir = journal.data_dir();
     let _network_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
     Ok(
         match journal.resume_checkpoint_cleanup(&lease, checkpoint)? {
@@ -710,10 +721,7 @@ pub fn prepare_scan_checkpoint_authority(
 ) -> ZeckResult<ScanCheckpointAuthority> {
     let lease = crate::sprout_scan_run::CheckpointLease::acquire(checkpoint)?;
     journal.bind_checkpoint_namespace(&lease)?;
-    let data_dir = journal
-        .path()
-        .parent()
-        .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
+    let data_dir = journal.data_dir();
     let _network_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
     lease.verify_for(checkpoint)?;
     let generation = lease.generation(checkpoint)?;
@@ -753,10 +761,7 @@ pub fn finalize_scan_checkpoint(
             "not every transaction was freshly observed mined".into(),
         ));
     }
-    let data_dir = journal
-        .path()
-        .parent()
-        .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
+    let data_dir = journal.data_dir();
     let _network_guard = crate::service::NetworkOperationGuard::acquire(data_dir, network)?;
     match journal.finalize_checkpoint_cleanup(
         &authority._lease,
@@ -1407,11 +1412,7 @@ pub async fn sweep_sprout_notes(
 ) -> ZeckResult<SproutSweepOutcome> {
     let (sapling_dest, _) = parse_sapling_destination_kind(destination, network)?;
 
-    let data_dir = options
-        .journal
-        .path()
-        .parent()
-        .ok_or_else(|| ZeckError::Storage("Sprout journal has no data directory".into()))?;
+    let data_dir = options.journal.data_dir();
     with_sprout_operation_guard(
         data_dir,
         network,
@@ -1881,23 +1882,74 @@ mod tests {
         }
     }
 
+    fn artifact_data_dir(outer: &Path) -> PathBuf {
+        outer.join("recovery-data")
+    }
+
+    fn checkpoint_fixture(
+        outer: &Path,
+    ) -> (
+        PathBuf,
+        SweepJournal,
+        crate::sprout_scan_run::CheckpointGeneration,
+    ) {
+        let keys = [[0x42; 32]];
+        let data_dir = artifact_data_dir(outer);
+        let journal = SweepJournal::for_keys(&data_dir, &keys, crate::ZeckNetwork::Mainnet);
+        journal.load_or_migrate().unwrap();
+        let checkpoint = crate::sprout_scan_run::checkpoint_path_for_network(
+            &data_dir,
+            &keys,
+            crate::p2p::wire::P2pNetwork::Mainnet,
+        );
+        let scanner = crate::sprout_scan::SproutScanner::new(&keys);
+        crate::sprout_scan_run::save_checkpoint(
+            &scanner,
+            crate::p2p::wire::P2pNetwork::Mainnet,
+            &checkpoint,
+        )
+        .unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        (checkpoint, journal, generation)
+    }
+
+    #[test]
+    fn first_run_with_no_artifact_root_has_no_interrupted_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("recovery-data");
+        let keys = [[0x42; 32]];
+        let checkpoint = crate::sprout_scan_run::checkpoint_path_for_network(
+            &data_dir,
+            &keys,
+            crate::p2p::wire::P2pNetwork::Mainnet,
+        );
+        let journal = SweepJournal::for_keys(&data_dir, &keys, crate::ZeckNetwork::Mainnet);
+
+        assert!(resume_interrupted_scan_checkpoint_cleanup(
+            &checkpoint,
+            &journal,
+            crate::ZeckNetwork::Mainnet,
+        )
+        .unwrap()
+        .is_none());
+        assert!(!checkpoint.parent().unwrap().exists());
+    }
+
     #[test]
     fn stale_scan_generation_cannot_manifest_or_delete_a_replacement_with_an_extra_note() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"scan result with one note").unwrap();
-        let reviewed = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
-        let mut journal =
-            SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
+        let (checkpoint, mut journal, reviewed) = checkpoint_fixture(dir.path());
         let stale_note = lifecycle_note(1_000_000, 1);
 
-        let replacement = dir.path().join("replacement.checkpoint");
-        crate::private_fs::write_private_file(
-            &replacement,
-            b"new scan result with one extra recovered note",
+        let scanner = crate::sprout_scan::SproutScanner::new(&[[0x42; 32]]);
+        crate::sprout_scan_run::save_checkpoint(
+            &scanner,
+            crate::p2p::wire::P2pNetwork::Mainnet,
+            &checkpoint,
         )
         .unwrap();
-        std::fs::rename(&replacement, &checkpoint).unwrap();
+        let replacement = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        assert_ne!(reviewed, replacement);
 
         let err = match prepare_scan_checkpoint_authority(
             &checkpoint,
@@ -1913,19 +1965,15 @@ mod tests {
         let snapshot = journal.load_or_migrate().unwrap();
         assert!(snapshot.checkpoint_manifest(&reviewed).is_none());
         assert_eq!(
-            std::fs::read(&checkpoint).unwrap(),
-            b"new scan result with one extra recovered note"
+            crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap(),
+            replacement
         );
     }
 
     #[test]
     fn production_restart_completes_a_crash_after_unlink_before_completion() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"spend-capable checkpoint").unwrap();
-        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
-        let mut journal =
-            SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
+        let (checkpoint, mut journal, generation) = checkpoint_fixture(dir.path());
         let note = lifecycle_note(1_000_000, 2);
         let authority = prepare_scan_checkpoint_authority(
             &checkpoint,
@@ -1985,11 +2033,7 @@ mod tests {
     #[test]
     fn a_new_current_journal_entry_after_prepare_retains_the_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"spend-capable checkpoint").unwrap();
-        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
-        let mut journal =
-            SweepJournal::for_keys(dir.path(), &[[0x42; 32]], crate::ZeckNetwork::Mainnet);
+        let (checkpoint, mut journal, generation) = checkpoint_fixture(dir.path());
         let first = lifecycle_note(1_000_000, 3);
         let authority = prepare_scan_checkpoint_authority(
             &checkpoint,
@@ -2180,7 +2224,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(data_dir.path());
         let guard = crate::service::NetworkOperationGuard::acquire(
-            data_dir.path(),
+            journal.data_dir(),
             crate::ZeckNetwork::Mainnet,
         )
         .unwrap();
@@ -2207,7 +2251,7 @@ mod tests {
 
         drop(guard);
         let released = crate::service::NetworkOperationGuard::acquire(
-            data_dir.path(),
+            journal.data_dir(),
             crate::ZeckNetwork::Mainnet,
         );
         assert!(
@@ -2519,7 +2563,7 @@ mod tests {
 
     fn lifecycle_journal(dir: &Path) -> crate::sprout_sweep_journal::SweepJournal {
         crate::sprout_sweep_journal::SweepJournal::for_keys(
-            dir,
+            &artifact_data_dir(dir),
             &[[0x42; 32]],
             crate::ZeckNetwork::Mainnet,
         )
@@ -2578,6 +2622,33 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    fn replace_with_legacy_entry(
+        journal: &crate::sprout_sweep_journal::SweepJournal,
+        note: &SpendableSproutNote,
+        legacy_txid: zcash_primitives::transaction::TxId,
+    ) -> Vec<u8> {
+        seed_entry(
+            journal,
+            note,
+            &fixture_transaction(990, 140),
+            crate::broadcast::TxLifecycleState::Pending,
+        );
+        let note_txid = note
+            .outpoint
+            .txid
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let legacy = format!(
+            "{note_txid}:{}:{} {legacy_txid}\n",
+            note.outpoint.js_index, note.outpoint.output_index
+        )
+        .into_bytes();
+        std::fs::write(journal.path(), &legacy).unwrap();
+        legacy
     }
 
     fn run_lifecycle(
@@ -2664,13 +2735,14 @@ mod tests {
             (vec![[0x42; 32], [0x24; 32]], vec![[0x42; 32]]),
         ] {
             let dir = tempfile::tempdir().unwrap();
+            let data_dir = artifact_data_dir(dir.path());
             let current = crate::sprout_sweep_journal::SweepJournal::for_keys(
-                dir.path(),
+                &data_dir,
                 &current_keys,
                 crate::ZeckNetwork::Mainnet,
             );
             let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
-                dir.path(),
+                &data_dir,
                 &sibling_keys,
                 crate::ZeckNetwork::Mainnet,
             );
@@ -2712,8 +2784,19 @@ mod tests {
     fn malformed_sibling_journal_stops_before_network_proving_or_send() {
         let dir = tempfile::tempdir().unwrap();
         let current = lifecycle_journal(dir.path());
-        let malformed = dir.path().join("sprout-sweep-deadbeefdeadbeef.journal");
-        crate::private_fs::write_private_file(&malformed, b"{not valid json}\n").unwrap();
+        let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x24; 32]],
+            crate::ZeckNetwork::Mainnet,
+        );
+        seed_entry(
+            &sibling,
+            &lifecycle_note(1_000_000, 203),
+            &fixture_transaction(910, 140),
+            crate::TxLifecycleState::Pending,
+        );
+        let malformed = sibling.path().to_path_buf();
+        std::fs::write(&malformed, b"{not valid json}\n").unwrap();
         let note = lifecycle_note(1_000_000, 202);
         let mut node = LifecycleNode::accepted(100, 1);
         let mut observer = LifecycleObserver::default();
@@ -2729,16 +2812,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sibling_overlap_is_inspected_without_migration() {
+    fn legacy_sibling_is_refused_without_migration() {
         let dir = tempfile::tempdir().unwrap();
         let current = lifecycle_journal(dir.path());
         let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
-            dir.path(),
+            &artifact_data_dir(dir.path()),
             &[[0x42; 32], [0x24; 32]],
             crate::ZeckNetwork::Mainnet,
         );
         let legacy = format!("{}:0:0 {}\n", "cb".repeat(32), "33".repeat(32));
-        crate::private_fs::write_private_file(sibling.path(), legacy.as_bytes()).unwrap();
+        seed_entry(
+            &sibling,
+            &lifecycle_note(1_000_000, 0xcb),
+            &fixture_transaction(911, 140),
+            crate::TxLifecycleState::Pending,
+        );
+        std::fs::write(sibling.path(), legacy.as_bytes()).unwrap();
         let note = lifecycle_note(1_000_000, 0xcb);
         let mut node = LifecycleNode::accepted(100, 1);
         let mut observer = LifecycleObserver::default();
@@ -2748,7 +2837,8 @@ mod tests {
         assert!(outcome
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("overlap")));
+            .is_some_and(|error| error
+                .contains("legacy sibling journal has no mandatory v4 lineage boundary")));
         assert_eq!(std::fs::read(sibling.path()).unwrap(), legacy.as_bytes());
         assert_eq!(node.tip_calls, 0);
         assert!(observer.observed.is_empty());
@@ -2761,7 +2851,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let current = lifecycle_journal(dir.path());
         let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
-            dir.path(),
+            &artifact_data_dir(dir.path()),
             &[[0x42; 32], [0x24; 32]],
             crate::ZeckNetwork::Mainnet,
         );
@@ -2813,7 +2903,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let current = lifecycle_journal(dir.path());
         let sibling = crate::sprout_sweep_journal::SweepJournal::for_keys(
-            dir.path(),
+            &artifact_data_dir(dir.path()),
             &[[0x42; 32], [0x24; 32]],
             crate::ZeckNetwork::Mainnet,
         );
@@ -2962,7 +3052,7 @@ mod tests {
             crate::broadcast::TxLifecycleState::Pending,
         );
 
-        let observe_path = dir.path().to_path_buf();
+        let observe_path = journal.data_dir().to_path_buf();
         let mut observer =
             LifecycleObserver::new([(pending.txid, absent(pending.expiry_height, 120))]);
         observer.before_observe = Some(Box::new(move || {
@@ -2973,7 +3063,7 @@ mod tests {
             .is_err());
         }));
 
-        let send_path = dir.path().to_path_buf();
+        let send_path = journal.data_dir().to_path_buf();
         let mut node = LifecycleNode::accepted(120, 2);
         node.before_send = Some(Box::new(move |_| {
             assert!(crate::service::NetworkOperationGuard::acquire(
@@ -2983,42 +3073,43 @@ mod tests {
             .is_err());
         }));
 
-        let build_path = dir.path().to_path_buf();
+        let build_path = journal.data_dir().to_path_buf();
         let mut build_count = 0;
-        let outcome = with_sprout_operation_guard(dir.path(), crate::ZeckNetwork::Mainnet, async {
-            Ok(run_sweep(
-                &[pending_note, ready_note],
-                &mut node,
-                &mut observer,
-                crate::ZeckNetwork::Mainnet,
-                |note: &SpendableSproutNote, expiry: BlockHeight, _| {
-                    assert!(crate::service::NetworkOperationGuard::acquire(
-                        &build_path,
-                        crate::ZeckNetwork::Mainnet,
-                    )
-                    .is_err());
-                    build_count += 1;
-                    let tx = fixture_transaction(320, expiry.into());
-                    Ok(BuiltSproutSweep {
-                        txid: tx.txid.to_string(),
-                        raw: tx.raw_tx,
-                        value_swept: note.note.value - SPROUT_SWEEP_FEE,
-                    })
-                },
-                NoteSource::WalletFile,
-                &journal,
-                |_| {},
-            )
-            .await)
-        })
-        .await
-        .unwrap();
+        let outcome =
+            with_sprout_operation_guard(journal.data_dir(), crate::ZeckNetwork::Mainnet, async {
+                Ok(run_sweep(
+                    &[pending_note, ready_note],
+                    &mut node,
+                    &mut observer,
+                    crate::ZeckNetwork::Mainnet,
+                    |note: &SpendableSproutNote, expiry: BlockHeight, _| {
+                        assert!(crate::service::NetworkOperationGuard::acquire(
+                            &build_path,
+                            crate::ZeckNetwork::Mainnet,
+                        )
+                        .is_err());
+                        build_count += 1;
+                        let tx = fixture_transaction(320, expiry.into());
+                        Ok(BuiltSproutSweep {
+                            txid: tx.txid.to_string(),
+                            raw: tx.raw_tx,
+                            value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                        })
+                    },
+                    NoteSource::WalletFile,
+                    &journal,
+                    |_| {},
+                )
+                .await)
+            })
+            .await
+            .unwrap();
 
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(build_count, 1);
         assert_eq!(node.sent.len(), 2, "one retry and one new submission");
         assert!(crate::service::NetworkOperationGuard::acquire(
-            dir.path(),
+            journal.data_dir(),
             crate::ZeckNetwork::Mainnet,
         )
         .is_ok());
@@ -3382,27 +3473,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unknown_without_raw_waits_a_conservative_expiry_window() {
+    fn legacy_unknown_without_raw_is_refused_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(dir.path());
         let note = lifecycle_note(1_000_000, 15);
         let legacy_txid = zcash_primitives::transaction::TxId::from_bytes([0xab; 32]);
-        let note_txid: String = note
-            .outpoint
-            .txid
-            .iter()
-            .rev()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        crate::private_fs::write_private_file(
-            journal.path(),
-            format!(
-                "{note_txid}:{}:{} {legacy_txid}\n",
-                note.outpoint.js_index, note.outpoint.output_index
-            )
-            .as_bytes(),
-        )
-        .unwrap();
+        let legacy = replace_with_legacy_entry(&journal, &note, legacy_txid);
         let mut node = LifecycleNode::accepted(100, 0);
         let mut observer = LifecycleObserver::new([(legacy_txid, absent(None, 100))]);
         let (outcome, builds, raw) = run_lifecycle(
@@ -3414,59 +3490,21 @@ mod tests {
         );
         assert_eq!(builds, 0);
         assert!(raw.is_empty() && node.sent.is_empty());
-        assert!(outcome.error.is_some());
-        assert_eq!(
-            journal
-                .load_or_migrate()
-                .unwrap()
-                .entry_for_note(&note.outpoint)
-                .unwrap()
-                .legacy_expiry_bound,
-            Some(140)
-        );
-
-        let mut node = LifecycleNode::accepted(140, 0);
-        let mut observer = LifecycleObserver::new([(legacy_txid, absent(Some(140), 140))]);
-        let (outcome, builds, raw) = run_lifecycle(
-            std::slice::from_ref(&note),
-            &mut node,
-            &mut observer,
-            &journal,
-            141,
-        );
-        assert_eq!(builds, 0);
-        assert!(raw.is_empty() && node.sent.is_empty());
-        assert!(outcome.error.is_some());
-
-        let mut node = LifecycleNode::accepted(150, 1);
-        let mut observer = LifecycleObserver::new([(legacy_txid, absent(Some(140), 141))]);
-        let (_, builds, raw) = run_lifecycle(&[note], &mut node, &mut observer, &journal, 141);
-        assert_eq!(builds, 1);
-        assert_eq!(node.sent, raw);
+        assert_eq!(node.tip_calls, 0);
+        assert!(observer.observed.is_empty());
+        assert!(outcome.error.as_deref().is_some_and(|error| {
+            error.contains("legacy journal content has no mandatory v4 lineage boundary")
+        }));
+        assert_eq!(std::fs::read(journal.path()).unwrap(), legacy);
     }
 
     #[test]
-    fn legacy_expiry_bound_uses_the_highest_tip_corroborated_by_a_pair() {
+    fn legacy_journal_is_refused_before_untrusted_tip_inference() {
         let dir = tempfile::tempdir().unwrap();
         let journal = lifecycle_journal(dir.path());
         let note = lifecycle_note(1_000_000, 34);
         let legacy_txid = zcash_primitives::transaction::TxId::from_bytes([0xbc; 32]);
-        let note_txid: String = note
-            .outpoint
-            .txid
-            .iter()
-            .rev()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        crate::private_fs::write_private_file(
-            journal.path(),
-            format!(
-                "{note_txid}:{}:{} {legacy_txid}\n",
-                note.outpoint.js_index, note.outpoint.output_index
-            )
-            .as_bytes(),
-        )
-        .unwrap();
+        let legacy = replace_with_legacy_entry(&journal, &note, legacy_txid);
         let observation = crate::broadcast::observe_transaction(
             vec![
                 endpoint("alpha", 100, None, false),
@@ -3489,16 +3527,12 @@ mod tests {
 
         assert_eq!(builds, 0);
         assert!(raw.is_empty() && node.sent.is_empty());
-        assert!(outcome.error.is_some());
-        assert_eq!(
-            journal
-                .load_or_migrate()
-                .unwrap()
-                .entry_for_note(&note.outpoint)
-                .unwrap()
-                .legacy_expiry_bound,
-            Some(140)
-        );
+        assert_eq!(node.tip_calls, 0);
+        assert!(observer.observed.is_empty());
+        assert!(outcome.error.as_deref().is_some_and(|error| {
+            error.contains("legacy journal content has no mandatory v4 lineage boundary")
+        }));
+        assert_eq!(std::fs::read(journal.path()).unwrap(), legacy);
     }
 
     #[test]

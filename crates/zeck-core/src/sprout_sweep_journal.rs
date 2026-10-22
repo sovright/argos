@@ -2,8 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fs::File,
-    io::{Cursor, Read, Seek},
+    io::Cursor,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -11,10 +10,8 @@ use std::{
 use argos_wallet_import::keys::JsOutPoint;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::BranchId;
-use zeroize::Zeroizing;
 
 use crate::{
     broadcast::{
@@ -28,17 +25,21 @@ use crate::{
     sprout_scan_run::{full_key_set_fingerprint, key_set_fingerprint, CheckpointGeneration},
 };
 
-pub const SPROUT_SWEEP_JOURNAL_VERSION: u32 = 3;
+pub const SPROUT_SWEEP_JOURNAL_VERSION: u32 = 4;
 pub const SPROUT_EXPIRY_DELTA: u32 = 40;
 pub type SproutNoteId = ([u8; 32], u64, u8);
 
 #[cfg(test)]
-static FAIL_AFTER_CHECKPOINT_DISCARD: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+static FAIL_AFTER_CHECKPOINT_DISCARD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
 pub(crate) fn fail_after_checkpoint_discard(path: &Path) {
-    *FAIL_AFTER_CHECKPOINT_DISCARD.lock().unwrap() = Some(path.to_path_buf());
+    FAIL_AFTER_CHECKPOINT_DISCARD
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf());
 }
 
 pub fn note_id(outpoint: &JsOutPoint) -> SproutNoteId {
@@ -57,129 +58,6 @@ fn journal_error(message: impl Into<String>) -> ZeckError {
     ZeckError::Storage(message.into())
 }
 
-fn checkpoint_discard_prefix(path: &Path) -> ZeckResult<String> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| journal_error("checkpoint path has no file name"))?;
-    Ok(format!(
-        ".argos-checkpoint-discard-{:x}-",
-        Sha256::digest(name.as_encoded_bytes())
-    ))
-}
-
-fn checkpoint_discard_quarantines(
-    namespace: &NamespaceLease,
-    checkpoint: &Path,
-) -> ZeckResult<Vec<PathBuf>> {
-    let prefix = checkpoint_discard_prefix(checkpoint)?;
-    Ok(namespace
-        .child_names()
-        .map_err(|err| journal_error(format!("reading checkpoint quarantine names: {err}")))?
-        .into_iter()
-        .filter(|name| {
-            name.to_str()
-                .and_then(|name| name.strip_prefix(&prefix))
-                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        })
-        .map(|name| namespace.parent_path().join(name))
-        .collect())
-}
-
-fn hash_checkpoint_handle(file: &File, path: &Path) -> ZeckResult<(u64, [u8; 32])> {
-    let mut reader = file;
-    reader
-        .rewind()
-        .map_err(|err| journal_error(format!("seeking checkpoint {}: {err}", path.display())))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = Zeroizing::new([0u8; 64 * 1024]);
-    let mut len = 0u64;
-    loop {
-        let read = reader.read(&mut *buffer).map_err(|err| {
-            journal_error(format!("reading checkpoint {}: {err}", path.display()))
-        })?;
-        if read == 0 {
-            break;
-        }
-        len = len
-            .checked_add(read as u64)
-            .ok_or_else(|| journal_error("checkpoint length overflow"))?;
-        hasher.update(&buffer[..read]);
-    }
-    Ok((len, hasher.finalize().into()))
-}
-
-fn retained_quarantine_generation(
-    namespace: &NamespaceLease,
-    path: &Path,
-) -> ZeckResult<(File, CheckpointGeneration)> {
-    namespace
-        .require_child(path)
-        .and_then(|()| namespace.verify_current())
-        .map_err(|err| journal_error(format!("verifying checkpoint quarantine: {err}")))?;
-    let file = crate::private_fs::open_child_file_for_removal(namespace.parent(), path).map_err(
-        |err| {
-            journal_error(format!(
-                "opening checkpoint quarantine {}: {err}",
-                path.display()
-            ))
-        },
-    )?;
-    let before = file.metadata().map_err(|err| {
-        journal_error(format!(
-            "inspecting checkpoint quarantine {}: {err}",
-            path.display()
-        ))
-    })?;
-    if !before.is_file() {
-        return Err(journal_error(format!(
-            "checkpoint quarantine {} is not a regular file",
-            path.display()
-        )));
-    }
-    let before_object = crate::private_fs::private_object_id(&file).map_err(|err| {
-        journal_error(format!(
-            "reading checkpoint quarantine identity {}: {err}",
-            path.display()
-        ))
-    })?;
-    let (len, sha256) = hash_checkpoint_handle(&file, path)?;
-    let (verified_len, verified_sha256) = hash_checkpoint_handle(&file, path)?;
-    let after = file.metadata().map_err(|err| {
-        journal_error(format!(
-            "rechecking checkpoint quarantine {}: {err}",
-            path.display()
-        ))
-    })?;
-    let after_object = crate::private_fs::private_object_id(&file).map_err(|err| {
-        journal_error(format!(
-            "rechecking checkpoint quarantine identity {}: {err}",
-            path.display()
-        ))
-    })?;
-    namespace.verify_current().map_err(|err| {
-        journal_error(format!("rechecking checkpoint quarantine namespace: {err}"))
-    })?;
-    if before.len() != after.len()
-        || before.len() != len
-        || len != verified_len
-        || sha256 != verified_sha256
-        || before_object != after_object
-    {
-        return Err(journal_error(format!(
-            "checkpoint quarantine {} changed while it was reviewed",
-            path.display()
-        )));
-    }
-    Ok((
-        file,
-        CheckpointGeneration {
-            len,
-            sha256,
-            object: after_object,
-        },
-    ))
-}
-
 /// The lock inode is stable across the v1-to-v2 rename. Both the temporary
 /// legacy writer and v2 journal take this same SQLite process lock.
 pub(crate) fn with_sweep_journal_lock<T>(
@@ -187,15 +65,11 @@ pub(crate) fn with_sweep_journal_lock<T>(
     namespace: Option<&NamespaceLease>,
     operation: impl FnOnce(&NamespaceLease) -> ZeckResult<T>,
 ) -> ZeckResult<T> {
-    let mut sqlite_name = path.as_os_str().to_os_string();
-    sqlite_name.push(".lock.sqlite");
-    let sqlite_path = PathBuf::from(sqlite_name);
-    let mut authority_name = path.as_os_str().to_os_string();
-    authority_name.push(".lock");
-    let authority_path = PathBuf::from(authority_name);
     let parent = path
         .parent()
         .ok_or_else(|| journal_error("Sprout journal lock has no parent"))?;
+    let sqlite_path = parent.join(".journal.lock.sqlite");
+    let authority_path = parent.join(".journal.lock");
     let owned_namespace;
     let namespace = if let Some(namespace) = namespace {
         if namespace.parent_path() != parent {
@@ -384,6 +258,8 @@ enum SproutJournalRecord {
         version: u32,
         network: ZeckNetwork,
         source_fingerprint: String,
+        authority_anchor: [u8; 16],
+        artifact_generation: [u8; 16],
     },
     Prepared {
         note_id: SproutNoteId,
@@ -999,21 +875,113 @@ pub struct JournalNoteContext {
 
 #[derive(Debug)]
 pub struct SweepJournal {
+    data_dir: PathBuf,
     path: PathBuf,
+    root: PathBuf,
+    purpose: Vec<u8>,
     network: ZeckNetwork,
     source_fingerprint: String,
-    namespace: Option<std::sync::Weak<crate::private_fs::NamespaceLease>>,
+    retained_root: Option<std::sync::Weak<crate::private_fs::PrivateArtifactRootLease>>,
+    retained_namespace: Option<std::sync::Weak<crate::private_fs::NamespaceLease>>,
 }
 
 impl SweepJournal {
     pub fn for_keys(data_dir: &Path, spending_keys: &[[u8; 32]], network: ZeckNetwork) -> Self {
         let short = key_set_fingerprint(spending_keys);
+        let source_fingerprint = full_key_set_fingerprint(spending_keys);
+        let purpose =
+            crate::private_fs::private_artifact_purpose(network.label(), &source_fingerprint);
+        let root = crate::private_fs::private_artifact_root_path(data_dir, &purpose);
         Self {
-            path: data_dir.join(format!("sprout-sweep-{short}.journal")),
+            data_dir: data_dir.to_path_buf(),
+            path: root.join(format!("sprout-sweep-{short}.journal")),
+            root,
+            purpose,
             network,
-            source_fingerprint: full_key_set_fingerprint(spending_keys),
-            namespace: None,
+            source_fingerprint,
+            retained_root: None,
+            retained_namespace: None,
         }
+    }
+
+    fn artifact_access(&self) -> ZeckResult<crate::private_fs::PrivateArtifactAccess> {
+        let retained = self
+            .retained_root
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .zip(
+                self.retained_namespace
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade),
+            );
+        self.reject_direct_legacy_journals(retained.as_ref().map(|(root, _)| root.as_ref()))?;
+        let access = match retained {
+            Some((root, namespace)) => {
+                crate::private_fs::PrivateArtifactAccess::acquire_from_retained_root(
+                    root,
+                    &namespace,
+                    &self.purpose,
+                    crate::private_fs::PrivateArtifactDomain::Journal,
+                    &self.path,
+                )
+            }
+            None => crate::private_fs::PrivateArtifactAccess::acquire(
+                &self.root,
+                &self.purpose,
+                crate::private_fs::PrivateArtifactDomain::Journal,
+                &self.path,
+            ),
+        };
+        access.map_err(|error| {
+            journal_error(format!("opening private Sprout journal authority: {error}"))
+        })
+    }
+
+    fn artifact_access_bound_to_checkpoint(
+        &self,
+        lease: &crate::sprout_scan_run::CheckpointLease,
+    ) -> ZeckResult<crate::private_fs::PrivateArtifactAccess> {
+        let root = lease.clone_artifact_root();
+        let namespace = lease.clone_namespace();
+        self.reject_direct_legacy_journals(Some(&root))?;
+        crate::private_fs::PrivateArtifactAccess::acquire_from_retained_root(
+            root,
+            &namespace,
+            &self.purpose,
+            crate::private_fs::PrivateArtifactDomain::Journal,
+            &self.path,
+        )
+        .map_err(|error| {
+            journal_error(format!(
+                "opening checkpoint-bound private Sprout journal authority: {error}"
+            ))
+        })
+    }
+
+    fn reject_direct_legacy_journals(
+        &self,
+        retained_root: Option<&crate::private_fs::PrivateArtifactRootLease>,
+    ) -> ZeckResult<()> {
+        let names = match retained_root {
+            Some(root) => root.publication_parent_child_names(),
+            None => crate::private_fs::private_data_dir_child_names(&self.data_dir),
+        }
+        .map_err(|err| {
+            journal_error(format!(
+                "cannot verify the data directory for legacy Sprout journals {}: {err}",
+                self.data_dir.display()
+            ))
+        })?;
+        for name in names {
+            let text = name.to_string_lossy();
+            if text.starts_with("sprout-sweep-") && text.ends_with(".journal") {
+                return Err(journal_error(format!(
+                    "legacy direct Sprout journal {} has no create-time artifact authority and may contain broadcast or ambiguous transaction history; it was preserved unchanged. Reconcile and preserve its authenticated history before any further sweep",
+                    self.data_dir.join(name).display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn bind_checkpoint_namespace(
@@ -1021,6 +989,7 @@ impl SweepJournal {
         lease: &crate::sprout_scan_run::CheckpointLease,
     ) -> ZeckResult<()> {
         let namespace = lease.clone_namespace();
+        let root = lease.clone_artifact_root();
         let parent = self
             .path
             .parent()
@@ -1030,36 +999,41 @@ impl SweepJournal {
                 "checkpoint authority does not bind the sweep journal namespace",
             ));
         }
-        self.namespace = Some(std::sync::Arc::downgrade(&namespace));
+        self.retained_root = Some(std::sync::Arc::downgrade(&root));
+        self.retained_namespace = Some(std::sync::Arc::downgrade(&namespace));
         Ok(())
-    }
-
-    fn bound_namespace(
-        &self,
-    ) -> ZeckResult<Option<std::sync::Arc<crate::private_fs::NamespaceLease>>> {
-        Ok(self.namespace.as_ref().and_then(std::sync::Weak::upgrade))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub fn source_fingerprint(&self) -> &str {
         &self.source_fingerprint
     }
 
-    fn header(&self) -> SproutJournalRecord {
+    fn header(
+        &self,
+        authority_anchor: [u8; 16],
+        artifact_generation: [u8; 16],
+    ) -> SproutJournalRecord {
         SproutJournalRecord::Header {
             version: SPROUT_SWEEP_JOURNAL_VERSION,
             network: self.network,
             source_fingerprint: self.source_fingerprint.clone(),
+            authority_anchor,
+            artifact_generation,
         }
     }
 
     pub fn load_or_migrate(&self) -> ZeckResult<SproutJournalSnapshot> {
-        let namespace = self.bound_namespace()?;
-        with_sweep_journal_lock(&self.path, namespace.as_deref(), |namespace| {
-            self.load_or_migrate_unlocked(namespace)
+        let access = self.artifact_access()?;
+        with_sweep_journal_lock(&self.path, Some(access.namespace()), |namespace| {
+            self.load_or_migrate_unlocked(namespace, &access)
         })
     }
 
@@ -1073,52 +1047,80 @@ impl SweepJournal {
         &self,
         invocation_outpoints: &[JsOutPoint],
     ) -> ZeckResult<SproutJournalSnapshot> {
-        let namespace = self.bound_namespace()?;
-        with_sweep_journal_lock(&self.path, namespace.as_deref(), |namespace| {
-            let snapshot = self.load_or_migrate_unlocked(namespace)?;
-            let mut protected = invocation_outpoints
-                .iter()
-                .map(note_id)
-                .collect::<HashSet<_>>();
-            protected.extend(snapshot.entries().map(|entry| note_id(&entry.outpoint)));
-            self.reject_overlapping_siblings(namespace, &protected)?;
-            Ok(snapshot)
-        })
+        let access = self.artifact_access()?;
+        let snapshot =
+            with_sweep_journal_lock(&self.path, Some(access.namespace()), |namespace| {
+                self.load_or_migrate_unlocked(namespace, &access)
+            })?;
+        let mut protected = invocation_outpoints
+            .iter()
+            .map(note_id)
+            .collect::<HashSet<_>>();
+        protected.extend(snapshot.entries().map(|entry| note_id(&entry.outpoint)));
+        drop(access);
+        self.reject_overlapping_siblings(&protected)?;
+        Ok(snapshot)
     }
 
-    fn reject_overlapping_siblings(
-        &self,
-        namespace: &NamespaceLease,
-        protected: &HashSet<SproutNoteId>,
-    ) -> ZeckResult<()> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| journal_error("Sprout journal has no data directory"))?;
-        let mut siblings = namespace
-            .child_names()
-            .map_err(|err| journal_error(format!("reading {}: {err}", parent.display())))?
-            .into_iter()
-            .map(|name| parent.join(name))
-            .collect::<Vec<_>>();
-        siblings.sort();
-
-        for path in siblings {
-            if path == self.path {
-                continue;
+    fn reject_overlapping_siblings(&self, protected: &HashSet<SproutNoteId>) -> ZeckResult<()> {
+        let retained_root = self
+            .retained_root
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        self.reject_direct_legacy_journals(retained_root.as_deref())?;
+        let roots = match retained_root {
+            Some(root) => root.discover_sibling_roots(),
+            None => crate::private_fs::discover_private_artifact_roots_except(
+                &self.data_dir,
+                Some(&self.root),
+            ),
+        }
+        .map_err(|err| journal_error(format!("discovering private Sprout journals: {err}")))?;
+        for root in roots {
+            let mut journal_child = None;
+            for name in root.child_names().map_err(|err| {
+                journal_error(format!(
+                    "reading private artifact root {}: {err}",
+                    root.path().display()
+                ))
+            })? {
+                let path = root.path().join(name);
+                let Some(short) = sibling_journal_short_name(&path)? else {
+                    continue;
+                };
+                if journal_child.replace((path, short)).is_some() {
+                    return Err(journal_error(format!(
+                        "private artifact root {} contains multiple Sprout journals",
+                        root.path().display()
+                    )));
+                }
             }
-            let Some(short) = sibling_journal_short_name(&path)? else {
+            let Some((path, short)) = journal_child else {
                 continue;
             };
-            let (network, sibling) = with_sweep_journal_lock(&path, Some(namespace), |namespace| {
-                inspect_sibling_journal(namespace, &path, &short)
-            })
+            let sibling_purpose = root.purpose().to_vec();
+            let access = crate::private_fs::PrivateArtifactAccess::acquire_from_verified_root(
+                root,
+                &sibling_purpose,
+                crate::private_fs::PrivateArtifactDomain::Journal,
+                &path,
+            )
             .map_err(|err| {
                 journal_error(format!(
-                    "cannot safely inspect sibling Sprout journal {}: {err}",
+                    "cannot authenticate sibling Sprout journal {}: {err}",
                     path.display()
                 ))
             })?;
+            let (network, sibling) =
+                with_sweep_journal_lock(&path, Some(access.namespace()), |_| {
+                    inspect_authorized_sibling_journal(&access, &path, &short)
+                })
+                .map_err(|err| {
+                    journal_error(format!(
+                        "cannot safely inspect sibling Sprout journal {}: {err}",
+                        path.display()
+                    ))
+                })?;
             if network.is_some_and(|network| network != self.network) {
                 continue;
             }
@@ -1148,12 +1150,11 @@ impl SweepJournal {
     fn load_or_migrate_unlocked(
         &self,
         namespace: &NamespaceLease,
+        access: &crate::private_fs::PrivateArtifactAccess,
     ) -> ZeckResult<SproutJournalSnapshot> {
-        let (bytes, object_id) = match namespace.read_child_version(&self.path) {
-            Ok(version) => version,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(SproutJournalSnapshot::default())
-            }
+        let (bytes, object_id) = match access.read_optional_child_version() {
+            Ok(Some(version)) => version,
+            Ok(None) => return Ok(SproutJournalSnapshot::default()),
             Err(err) => {
                 return Err(journal_error(format!(
                     "reading {}: {err}",
@@ -1167,11 +1168,34 @@ impl SweepJournal {
         let text =
             std::str::from_utf8(&bytes).map_err(|_| journal_error("journal is not UTF-8"))?;
         let first = text.lines().next().unwrap_or_default();
-        if first.starts_with('{') {
-            self.load_v2(namespace, &object_id, &bytes)
-        } else {
-            self.migrate_v1(namespace, &object_id, text)
+        if !first.starts_with('{') {
+            return Err(journal_error(
+                "legacy journal content has no mandatory v4 lineage boundary; preserve it unchanged for explicit reconciliation",
+            ));
         }
+        let (authority_anchor, state) = access
+            .current_authority()
+            .map_err(|err| journal_error(format!("reading journal lineage authority: {err}")))?
+            .ok_or_else(|| journal_error("journal lineage authority is missing"))?;
+        let artifact_generation = match state {
+            crate::private_fs::PrivateArtifactState::Active { generation, object }
+                if object == object_id =>
+            {
+                generation
+            }
+            _ => {
+                return Err(journal_error(
+                    "journal lineage authority is not active for its exact object",
+                ))
+            }
+        };
+        self.load_v2(
+            namespace,
+            &object_id,
+            &bytes,
+            authority_anchor,
+            artifact_generation,
+        )
     }
 
     fn load_v2(
@@ -1179,6 +1203,8 @@ impl SweepJournal {
         namespace: &NamespaceLease,
         object_id: &PrivateObjectId,
         bytes: &[u8],
+        expected_anchor: [u8; 16],
+        expected_generation: [u8; 16],
     ) -> ZeckResult<SproutJournalSnapshot> {
         let mut complete = bytes.split(|byte| *byte == b'\n');
         let header = complete
@@ -1194,9 +1220,13 @@ impl SweepJournal {
                 version,
                 network,
                 source_fingerprint,
-            } if matches!(version, 2 | SPROUT_SWEEP_JOURNAL_VERSION)
+                authority_anchor,
+                artifact_generation,
+            } if version == SPROUT_SWEEP_JOURNAL_VERSION
                 && network == self.network
-                && source_fingerprint == self.source_fingerprint => {}
+                && source_fingerprint == self.source_fingerprint
+                && authority_anchor == expected_anchor
+                && artifact_generation == expected_generation => {}
             _ => {
                 return Err(journal_error(
                     "journal version, network, or source fingerprint mismatch",
@@ -1229,120 +1259,35 @@ impl SweepJournal {
         Ok(snapshot)
     }
 
-    fn migrate_v1(
-        &self,
-        namespace: &NamespaceLease,
-        object_id: &PrivateObjectId,
-        text: &str,
-    ) -> ZeckResult<SproutJournalSnapshot> {
-        if !text.ends_with('\n') {
-            return Err(journal_error("unterminated legacy journal record"));
-        }
-        let mut snapshot = SproutJournalSnapshot::default();
-        let mut upgraded = false;
-        for line in text.lines() {
-            if upgraded {
-                let record = serde_json::from_str::<SproutJournalRecord>(line).map_err(|err| {
-                    journal_error(format!("malformed upgraded journal record: {err}"))
-                })?;
-                snapshot.apply(record, &self.source_fingerprint)?;
-                continue;
-            }
-            if line.starts_with('{') {
-                match serde_json::from_str::<SproutJournalRecord>(line).map_err(|err| {
-                    journal_error(format!("invalid legacy upgrade delimiter: {err}"))
-                })? {
-                    SproutJournalRecord::Header {
-                        version: SPROUT_SWEEP_JOURNAL_VERSION,
-                        network,
-                        source_fingerprint,
-                    } if network == self.network
-                        && source_fingerprint == self.source_fingerprint =>
-                    {
-                        upgraded = true;
-                        continue;
-                    }
-                    _ => return Err(journal_error("invalid legacy upgrade delimiter")),
-                }
-            }
-            let (note_text, txid) = line
-                .split_once(' ')
-                .ok_or_else(|| journal_error("malformed legacy journal line"))?;
-            if txid.contains(' ') {
-                return Err(journal_error("malformed legacy journal line"));
-            }
-            let mut parts = note_text.split(':');
-            let tx = parts
-                .next()
-                .ok_or_else(|| journal_error("missing legacy note ID"))?;
-            let js = parts
-                .next()
-                .ok_or_else(|| journal_error("missing legacy JoinSplit index"))?
-                .parse::<u64>()
-                .map_err(|_| journal_error("invalid legacy JoinSplit index"))?;
-            let output = parts
-                .next()
-                .ok_or_else(|| journal_error("missing legacy output index"))?
-                .parse::<u8>()
-                .map_err(|_| journal_error("invalid legacy output index"))?;
-            if parts.next().is_some() || output > 1 {
-                return Err(journal_error("malformed legacy outpoint"));
-            }
-            let id = (decode_txid(tx)?.into(), js, output);
-            let txid = decode_txid(txid)?.to_string();
-            let record = SproutJournalRecord::LegacyAccepted { note_id: id, txid };
-            snapshot.apply(record, &self.source_fingerprint)?;
-        }
-        if !upgraded {
-            let mut delimiter = Vec::new();
-            serde_json::to_writer(&mut delimiter, &self.header())
-                .map_err(|err| journal_error(format!("encoding legacy upgrade: {err}")))?;
-            delimiter.push(b'\n');
-            namespace
-                .append_child_if_unchanged(
-                    &self.path,
-                    Some((object_id, text.as_bytes())),
-                    &delimiter,
-                )
-                .map_err(|err| journal_error(format!("syncing legacy upgrade: {err}")))?;
-        }
-        Ok(snapshot)
-    }
-
     fn append_unlocked(
         &self,
-        namespace: &NamespaceLease,
+        _namespace: &NamespaceLease,
+        access: &crate::private_fs::PrivateArtifactAccess,
         record: &SproutJournalRecord,
     ) -> ZeckResult<()> {
-        let mut version = match namespace.read_child_version(&self.path) {
-            Ok((bytes, id)) => Some((bytes, id)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(journal_error(format!("opening journal: {err}"))),
-        };
-        let mut suffix = Vec::new();
-        if version.as_ref().is_none_or(|(bytes, _)| bytes.is_empty()) {
-            serde_json::to_writer(&mut suffix, &self.header())
-                .map_err(|err| journal_error(format!("writing journal header: {err}")))?;
-            suffix.push(b'\n');
-        }
-        serde_json::to_writer(&mut suffix, record)
-            .map_err(|err| journal_error(format!("writing journal event: {err}")))?;
-        suffix.push(b'\n');
-        namespace
-            .append_child_if_unchanged(
-                &self.path,
-                version.as_mut().map(|(bytes, id)| (&*id, bytes.as_slice())),
-                &suffix,
+        let version = access
+            .read_optional_child_version()
+            .map_err(|err| journal_error(format!("opening journal: {err}")))?;
+        let write_header = version.as_ref().is_none_or(|(bytes, _)| bytes.is_empty());
+        access
+            .append_child_if_unchanged_with_lineage(
+                version.as_ref().map(|(bytes, id)| (id, bytes.as_slice())),
+                |authority_anchor, artifact_generation| {
+                    let mut suffix = Vec::new();
+                    if write_header {
+                        serde_json::to_writer(
+                            &mut suffix,
+                            &self.header(authority_anchor, artifact_generation),
+                        )
+                        .map_err(std::io::Error::other)?;
+                        suffix.push(b'\n');
+                    }
+                    serde_json::to_writer(&mut suffix, record).map_err(std::io::Error::other)?;
+                    suffix.push(b'\n');
+                    Ok(suffix)
+                },
             )
             .map_err(|err| journal_error(format!("syncing journal event: {err}")))
-    }
-
-    fn upgrade_header_unlocked(&self, namespace: &NamespaceLease) -> ZeckResult<()> {
-        // Both v2 headers and append-upgraded v1 journals remain physically
-        // unchanged. Their loaders already validated the durable prefix, and
-        // new v3 records make older readers fail closed without a rewrite.
-        let _ = namespace;
-        Ok(())
     }
 
     pub fn scoped_store<'a>(
@@ -1362,16 +1307,12 @@ impl SweepJournal {
         snapshot: &mut SproutJournalSnapshot,
         record: SproutJournalRecord,
     ) -> ZeckResult<()> {
-        let namespace = self.bound_namespace()?;
-        with_sweep_journal_lock(&self.path, namespace.as_deref(), |namespace| {
-            // The caller may have loaded before another process wrote.
-            // Replay under the lock; only this current durable state can
-            // authorize the next event.
-            let mut durable = self.load_or_migrate_unlocked(namespace)?;
+        let access = self.artifact_access()?;
+        with_sweep_journal_lock(&self.path, Some(access.namespace()), |namespace| {
+            let mut durable = self.load_or_migrate_unlocked(namespace, &access)?;
             *snapshot = durable.clone();
             durable.apply(record.clone(), &self.source_fingerprint)?;
-            self.upgrade_header_unlocked(namespace)?;
-            self.append_unlocked(namespace, &record)?;
+            self.append_unlocked(namespace, &access, &record)?;
             *snapshot = durable;
             Ok(())
         })
@@ -1385,13 +1326,15 @@ impl SweepJournal {
         submission: Option<&SubmissionDisposition>,
         observation: Option<&TxObservation>,
     ) -> ZeckResult<()> {
-        let record = SproutJournalRecord::Transition {
-            txid: txid.to_string(),
-            state,
-            submission: submission.cloned(),
-            observation: observation.cloned(),
-        };
-        self.mutate(snapshot, record)
+        self.mutate(
+            snapshot,
+            SproutJournalRecord::Transition {
+                txid: txid.to_string(),
+                state,
+                submission: submission.cloned(),
+                observation: observation.cloned(),
+            },
+        )
     }
 
     pub fn append_legacy_expiry_bound(
@@ -1401,24 +1344,27 @@ impl SweepJournal {
         verified_tip: u32,
         expiry_bound: u32,
     ) -> ZeckResult<()> {
-        let record = SproutJournalRecord::LegacyExpiryBound {
-            txid: txid.to_string(),
-            verified_tip,
-            expiry_bound,
-        };
-        self.mutate(snapshot, record)
+        self.mutate(
+            snapshot,
+            SproutJournalRecord::LegacyExpiryBound {
+                txid: txid.to_string(),
+                verified_tip,
+                expiry_bound,
+            },
+        )
     }
 
-    /// Durably bind an exact checkpoint object to every note it may recreate.
-    /// Repeated records only add members; they can never shrink a manifest.
     pub fn record_checkpoint_manifest<'a>(
         &self,
         snapshot: &mut SproutJournalSnapshot,
         generation: &CheckpointGeneration,
         notes: impl IntoIterator<Item = &'a JsOutPoint>,
     ) -> ZeckResult<()> {
-        let note_ids = notes.into_iter().map(note_id).collect::<BTreeSet<_>>();
-        self.record_checkpoint_manifest_ids(snapshot, generation, note_ids)
+        self.record_checkpoint_manifest_ids(
+            snapshot,
+            generation,
+            notes.into_iter().map(note_id).collect(),
+        )
     }
 
     pub fn record_checkpoint_manifest_ids(
@@ -1443,6 +1389,7 @@ impl SweepJournal {
     fn compact_unlocked(
         &self,
         namespace: &NamespaceLease,
+        access: &crate::private_fs::PrivateArtifactAccess,
         snapshot: &SproutJournalSnapshot,
         generation: &CheckpointGeneration,
     ) -> ZeckResult<()> {
@@ -1474,40 +1421,33 @@ impl SweepJournal {
                 last_submission: entry.last_submission.clone(),
                 observations: entry.observations.clone(),
             };
-            self.append_unlocked(namespace, &tombstone)?;
+            self.append_unlocked(namespace, access, &tombstone)?;
         }
         Ok(())
     }
 
-    /// Make the final decision, marker, compaction and deletion one journal
-    /// critical section. The caller additionally holds the network guard and
-    /// checkpoint lease, giving a single lock order for all cleanup paths.
     pub fn finalize_checkpoint_cleanup(
         &self,
         lease: &crate::sprout_scan_run::CheckpointLease,
         generation: &CheckpointGeneration,
         checkpoint: &Path,
     ) -> ZeckResult<CheckpointCleanupResult> {
-        let namespace = lease.clone_namespace();
-        with_sweep_journal_lock(&self.path, Some(&namespace), |namespace| {
+        let access = self.artifact_access_bound_to_checkpoint(lease)?;
+        with_sweep_journal_lock(&self.path, Some(access.namespace()), |namespace| {
             lease.verify_for(checkpoint)?;
-            let mut snapshot = self.load_or_migrate_unlocked(namespace)?;
+            let mut snapshot = self.load_or_migrate_unlocked(namespace, &access)?;
             match lease.generation_if_present(checkpoint)? {
                 Some(current) if &current != generation => {
                     return Ok(CheckpointCleanupResult::Retain {
                         reason: "the checkpoint generation changed after review".into(),
-                    })
+                    });
                 }
                 Some(_) => {}
-                None if snapshot.discard_started.contains(generation) => {
-                    // A crash may have happened after unlink but before the
-                    // completion marker. The synced start marker and exact
-                    // generation authorize only idempotent finalization.
-                }
+                None if snapshot.discard_started.contains(generation) => {}
                 None => {
                     return Err(journal_error(
                         "checkpoint disappeared before cleanup was authorized",
-                    ))
+                    ));
                 }
             }
             let current_source_notes = snapshot
@@ -1520,7 +1460,7 @@ impl SweepJournal {
                 &current_source_notes,
             ) {
                 CheckpointCleanupEligibility::Retain { reason } => {
-                    return Ok(CheckpointCleanupResult::Retain { reason })
+                    return Ok(CheckpointCleanupResult::Retain { reason });
                 }
                 CheckpointCleanupEligibility::Eligible { .. } => {}
             }
@@ -1532,9 +1472,9 @@ impl SweepJournal {
                         .map_err(|_| journal_error("Sprout reorg window does not fit u32"))?,
                 };
                 snapshot.apply(marker.clone(), &self.source_fingerprint)?;
-                self.append_unlocked(namespace, &marker)?;
+                self.append_unlocked(namespace, &access, &marker)?;
             }
-            self.compact_unlocked(namespace, &snapshot, generation)?;
+            self.compact_unlocked(namespace, &access, &snapshot, generation)?;
             let discarded = crate::sprout_scan_run::discard_checkpoint_generation_while_leased(
                 lease, checkpoint, generation,
             )?;
@@ -1542,8 +1482,7 @@ impl SweepJournal {
             if FAIL_AFTER_CHECKPOINT_DISCARD
                 .lock()
                 .unwrap()
-                .take_if(|failing| failing == checkpoint)
-                .is_some()
+                .remove(checkpoint)
             {
                 return Err(journal_error(
                     "injected crash after checkpoint discard before completion",
@@ -1555,34 +1494,28 @@ impl SweepJournal {
                     generation: generation.clone(),
                 };
                 snapshot.apply(completed.clone(), &self.source_fingerprint)?;
-                self.append_unlocked(namespace, &completed)?;
+                self.append_unlocked(namespace, &access, &completed)?;
             }
-            match discarded {
+            Ok(match discarded {
                 crate::sprout_scan_run::CheckpointDiscard::Removed => {
-                    Ok(CheckpointCleanupResult::Removed)
+                    CheckpointCleanupResult::Removed
                 }
                 crate::sprout_scan_run::CheckpointDiscard::AlreadyAbsent => {
-                    Ok(CheckpointCleanupResult::AlreadyAbsent)
+                    CheckpointCleanupResult::AlreadyAbsent
                 }
-            }
+            })
         })
     }
 
-    /// Reconcile cleanup that already crossed the durable discard marker.
-    /// A surviving canonical generation is retained, and an exact deletion
-    /// quarantine is restored: observations recorded before arbitrary
-    /// downtime never authorize a restart-time deletion. Completion is
-    /// idempotent only after the manifested generation is already absent from
-    /// both the canonical path and every deletion quarantine.
     pub fn resume_checkpoint_cleanup(
         &self,
         lease: &crate::sprout_scan_run::CheckpointLease,
         checkpoint: &Path,
     ) -> ZeckResult<Option<CheckpointCleanupResult>> {
-        let namespace = lease.clone_namespace();
-        with_sweep_journal_lock(&self.path, Some(&namespace), |namespace| {
+        let access = self.artifact_access_bound_to_checkpoint(lease)?;
+        with_sweep_journal_lock(&self.path, Some(access.namespace()), |namespace| {
             lease.verify_for(checkpoint)?;
-            let mut snapshot = self.load_or_migrate_unlocked(namespace)?;
+            let mut snapshot = self.load_or_migrate_unlocked(namespace, &access)?;
             let pending = snapshot
                 .discard_started
                 .iter()
@@ -1601,6 +1534,11 @@ impl SweepJournal {
             if !snapshot.checkpoint_manifests.contains_key(generation) {
                 return Err(journal_error("discard marker has no checkpoint manifest"));
             }
+            if lease.restore_interrupted_retirement(checkpoint)? {
+                return Ok(Some(CheckpointCleanupResult::Retain {
+                    reason: "the exact checkpoint retirement was restored after restart; fresh reconciliation and review are required before cleanup".into(),
+                }));
+            }
             let current_generation = lease.generation_if_present(checkpoint)?;
             if current_generation.as_ref() == Some(generation) {
                 return Ok(Some(CheckpointCleanupResult::Retain {
@@ -1608,46 +1546,6 @@ impl SweepJournal {
                 }));
             }
             let replacement_present = current_generation.is_some();
-            let quarantine_paths = checkpoint_discard_quarantines(namespace, checkpoint)?;
-            let mut matching_quarantine = None;
-            let mut unexpected_quarantine = false;
-            for quarantine in quarantine_paths {
-                let (file, current) = retained_quarantine_generation(namespace, &quarantine)?;
-                if &current == generation {
-                    if matching_quarantine.is_some() {
-                        return Ok(Some(CheckpointCleanupResult::Retain {
-                            reason: "multiple exact checkpoint deletion quarantines survived restart; all were preserved for manual review".into(),
-                        }));
-                    }
-                    matching_quarantine = Some((quarantine, file, current));
-                } else {
-                    unexpected_quarantine = true;
-                }
-            }
-            if let Some((quarantine, file, current)) = matching_quarantine {
-                if replacement_present {
-                    return Ok(Some(CheckpointCleanupResult::Retain {
-                        reason: "a replacement checkpoint and the old exact deletion quarantine both survived restart; both were preserved for manual review".into(),
-                    }));
-                }
-                namespace
-                    .rename_open_child(&quarantine, checkpoint, &file, &current.object)
-                    .and_then(|()| namespace.sync_parent())
-                    .map_err(|err| {
-                        journal_error(format!(
-                            "restoring exact checkpoint quarantine {}: {err}",
-                            quarantine.display()
-                        ))
-                    })?;
-                return Ok(Some(CheckpointCleanupResult::Retain {
-                    reason: "the exact checkpoint deletion quarantine was restored after restart; fresh reconciliation and review are required before cleanup".into(),
-                }));
-            }
-            if unexpected_quarantine {
-                return Ok(Some(CheckpointCleanupResult::Retain {
-                    reason: "an unexpected checkpoint deletion quarantine survived restart and was preserved for manual review".into(),
-                }));
-            }
             let current_source_notes = snapshot
                 .entries()
                 .map(|entry| note_id(&entry.outpoint))
@@ -1658,21 +1556,18 @@ impl SweepJournal {
                 &current_source_notes,
             ) {
                 CheckpointCleanupEligibility::Retain { reason } => {
-                    return Ok(Some(CheckpointCleanupResult::Retain { reason }))
+                    return Ok(Some(CheckpointCleanupResult::Retain { reason }));
                 }
                 CheckpointCleanupEligibility::Eligible { .. } => {}
             }
-            self.compact_unlocked(namespace, &snapshot, generation)?;
+            self.compact_unlocked(namespace, &access, &snapshot, generation)?;
             if replacement_present {
-                // The old generation crossed its durable discard boundary,
-                // but a new source was restored before restart recovery. Mark
-                // the old cleanup complete without touching the replacement.
                 let completed = SproutJournalRecord::CheckpointDiscarded {
                     source_fingerprint: self.source_fingerprint.clone(),
                     generation: generation.clone(),
                 };
                 snapshot.apply(completed.clone(), &self.source_fingerprint)?;
-                self.append_unlocked(namespace, &completed)?;
+                self.append_unlocked(namespace, &access, &completed)?;
                 return Ok(Some(CheckpointCleanupResult::Retain {
                     reason: "a replacement checkpoint generation was preserved".into(),
                 }));
@@ -1685,7 +1580,7 @@ impl SweepJournal {
                 generation: generation.clone(),
             };
             snapshot.apply(completed.clone(), &self.source_fingerprint)?;
-            self.append_unlocked(namespace, &completed)?;
+            self.append_unlocked(namespace, &access, &completed)?;
             Ok(Some(match discarded {
                 crate::sprout_scan_run::CheckpointDiscard::Removed => {
                     CheckpointCleanupResult::Removed
@@ -1724,32 +1619,63 @@ fn sibling_journal_short_name(path: &Path) -> ZeckResult<Option<String>> {
     Ok(Some(short.to_owned()))
 }
 
-fn inspect_sibling_journal(
-    namespace: &NamespaceLease,
+fn inspect_authorized_sibling_journal(
+    access: &crate::private_fs::PrivateArtifactAccess,
     path: &Path,
     filename_short: &str,
 ) -> ZeckResult<(Option<ZeckNetwork>, SproutJournalSnapshot)> {
-    let bytes = namespace.read_child(path).map_err(|err| {
-        journal_error(format!(
-            "refusing symlink or irregular sibling journal {}: {err}",
-            path.display()
-        ))
-    })?;
+    let (bytes, object_id) = access
+        .read_optional_child_version()
+        .map_err(|err| journal_error(format!("reading {}: {err}", path.display())))?
+        .ok_or_else(|| journal_error("enumerated sibling journal is absent from its authority"))?;
+    let (authority_anchor, state) = access
+        .current_authority()
+        .map_err(|err| journal_error(format!("reading sibling journal authority: {err}")))?
+        .ok_or_else(|| journal_error("sibling journal authority is missing"))?;
+    let artifact_generation = match state {
+        crate::private_fs::PrivateArtifactState::Active { generation, object }
+            if object == object_id =>
+        {
+            generation
+        }
+        _ => {
+            return Err(journal_error(
+                "sibling journal authority is not active for its exact object",
+            ))
+        }
+    };
+    inspect_sibling_journal_bytes(
+        &bytes,
+        filename_short,
+        authority_anchor,
+        artifact_generation,
+    )
+}
+
+fn inspect_sibling_journal_bytes(
+    bytes: &[u8],
+    filename_short: &str,
+    expected_anchor: [u8; 16],
+    expected_generation: [u8; 16],
+) -> ZeckResult<(Option<ZeckNetwork>, SproutJournalSnapshot)> {
     if bytes.is_empty() {
         return Err(journal_error("empty sibling journal"));
     }
     let text =
-        std::str::from_utf8(&bytes).map_err(|_| journal_error("sibling journal is not UTF-8"))?;
-    if text.lines().next().unwrap_or_default().starts_with('{') {
-        inspect_v2_sibling(&bytes, filename_short)
-    } else {
-        inspect_v1_sibling(text, filename_short).map(|snapshot| (None, snapshot))
+        std::str::from_utf8(bytes).map_err(|_| journal_error("sibling journal is not UTF-8"))?;
+    if !text.lines().next().unwrap_or_default().starts_with('{') {
+        return Err(journal_error(
+            "legacy sibling journal has no mandatory v4 lineage boundary",
+        ));
     }
+    inspect_v2_sibling(bytes, filename_short, expected_anchor, expected_generation)
 }
 
 fn inspect_v2_sibling(
     bytes: &[u8],
     filename_short: &str,
+    expected_anchor: [u8; 16],
+    expected_generation: [u8; 16],
 ) -> ZeckResult<(Option<ZeckNetwork>, SproutJournalSnapshot)> {
     if !bytes.contains(&b'\n') {
         return Err(journal_error("unterminated sibling journal header"));
@@ -1762,10 +1688,14 @@ fn inspect_v2_sibling(
         .map_err(|err| journal_error(format!("invalid sibling journal header: {err}")))?
     {
         SproutJournalRecord::Header {
-            version: 2 | SPROUT_SWEEP_JOURNAL_VERSION,
+            version: SPROUT_SWEEP_JOURNAL_VERSION,
             network,
             source_fingerprint,
-        } => (network, source_fingerprint),
+            authority_anchor,
+            artifact_generation,
+        } if authority_anchor == expected_anchor && artifact_generation == expected_generation => {
+            (network, source_fingerprint)
+        }
         _ => return Err(journal_error("unsupported sibling journal header")),
     };
     if fingerprint.len() != 64
@@ -1797,47 +1727,6 @@ fn inspect_v2_sibling(
         snapshot.apply(record, &fingerprint)?;
     }
     Ok((Some(network), snapshot))
-}
-
-fn inspect_v1_sibling(text: &str, filename_short: &str) -> ZeckResult<SproutJournalSnapshot> {
-    if !text.ends_with('\n') {
-        return Err(journal_error("unterminated legacy sibling journal record"));
-    }
-    let fingerprint = format!("legacy:{filename_short}");
-    let mut snapshot = SproutJournalSnapshot::default();
-    for line in text.lines() {
-        let (note_text, txid) = line
-            .split_once(' ')
-            .ok_or_else(|| journal_error("malformed legacy sibling journal line"))?;
-        if txid.contains(' ') {
-            return Err(journal_error("malformed legacy sibling journal line"));
-        }
-        let mut parts = note_text.split(':');
-        let tx = parts
-            .next()
-            .ok_or_else(|| journal_error("missing legacy sibling note ID"))?;
-        let js = parts
-            .next()
-            .ok_or_else(|| journal_error("missing legacy sibling JoinSplit index"))?
-            .parse::<u64>()
-            .map_err(|_| journal_error("invalid legacy sibling JoinSplit index"))?;
-        let output = parts
-            .next()
-            .ok_or_else(|| journal_error("missing legacy sibling output index"))?
-            .parse::<u8>()
-            .map_err(|_| journal_error("invalid legacy sibling output index"))?;
-        if parts.next().is_some() || output > 1 {
-            return Err(journal_error("malformed legacy sibling outpoint"));
-        }
-        snapshot.apply(
-            SproutJournalRecord::LegacyAccepted {
-                note_id: (decode_txid(tx)?.into(), js, output),
-                txid: decode_txid(txid)?.to_string(),
-            },
-            &fingerprint,
-        )?;
-    }
-    Ok(snapshot)
 }
 
 pub struct SproutBroadcastStore<'a> {
@@ -1950,22 +1839,82 @@ mod tests {
         }
     }
 
-    fn journal(dir: &std::path::Path) -> SweepJournal {
-        SweepJournal::for_keys(dir, &[[0x42; 32]], ZeckNetwork::Mainnet)
+    fn context_for(outpoint: JsOutPoint) -> JournalNoteContext {
+        JournalNoteContext {
+            outpoint,
+            value_zatoshis: 1_000_000,
+        }
     }
 
-    fn write_private_fixture(path: &Path, bytes: impl AsRef<[u8]>) {
-        crate::private_fs::write_private_file(path, bytes.as_ref()).unwrap();
+    fn artifact_data_dir(outer: &Path) -> PathBuf {
+        outer.join("artifact-data")
     }
 
-    fn legacy_line(sweep_txid: &str) -> String {
-        format!("{}:3:1 {sweep_txid}\n", "42".repeat(32))
+    fn journal(outer: &std::path::Path) -> SweepJournal {
+        SweepJournal::for_keys(
+            &artifact_data_dir(outer),
+            &[[0x42; 32]],
+            ZeckNetwork::Mainnet,
+        )
     }
 
-    fn checkpoint_generation(dir: &Path, label: &[u8]) -> CheckpointGeneration {
-        let path = dir.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, label).unwrap();
-        crate::sprout_scan_run::checkpoint_generation(&path).unwrap()
+    #[test]
+    fn exact_mode_legacy_direct_journal_is_refused_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        journal.load_or_migrate().unwrap();
+        let legacy = journal.data_dir().join(format!(
+            "sprout-sweep-{}.journal",
+            key_set_fingerprint(&[[0x42; 32]])
+        ));
+        crate::private_fs::write_private_file(&legacy, b"legacy secret\n").unwrap();
+
+        let error = journal
+            .load_or_migrate()
+            .expect_err("unmarked direct journal must fail closed");
+
+        assert!(error.to_string().contains("legacy direct Sprout journal"));
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy secret\n");
+        assert!(!journal.path().exists());
+        assert!(journal.root.exists());
+    }
+
+    fn checkpoint_generation(_dir: &Path, label: &[u8]) -> CheckpointGeneration {
+        use sha2::Digest as _;
+
+        let digest: [u8; 32] = sha2::Sha256::digest(label).into();
+        let mut lineage_anchor = [0u8; 16];
+        lineage_anchor.copy_from_slice(&digest[..16]);
+        let mut artifact_generation = [0u8; 16];
+        artifact_generation.copy_from_slice(&digest[16..]);
+        CheckpointGeneration {
+            lineage_anchor,
+            artifact_generation,
+            len: label.len() as u64,
+            sha256: digest,
+            object: crate::private_fs::PrivateObjectId::Unix {
+                device: u64::from_le_bytes(digest[..8].try_into().unwrap()),
+                inode: u64::from_le_bytes(digest[8..16].try_into().unwrap()),
+            },
+        }
+    }
+
+    fn authoritative_checkpoint(outer: &Path) -> (PathBuf, CheckpointGeneration) {
+        let keys = [[0x42; 32]];
+        let scanner = crate::sprout_scan::SproutScanner::new(&keys);
+        let path = crate::sprout_scan_run::checkpoint_path_for_network(
+            &artifact_data_dir(outer),
+            &keys,
+            crate::p2p::wire::P2pNetwork::Mainnet,
+        );
+        crate::sprout_scan_run::save_checkpoint(
+            &scanner,
+            crate::p2p::wire::P2pNetwork::Mainnet,
+            &path,
+        )
+        .unwrap();
+        let generation = crate::sprout_scan_run::checkpoint_generation(&path).unwrap();
+        (path, generation)
     }
 
     fn mined_observation(height: u32, depth: u32, hash: u8) -> TxObservation {
@@ -2091,11 +2040,8 @@ mod tests {
             CheckpointCleanupEligibility::Retain { .. }
         ));
 
-        let path = dir.path().join("scan.checkpoint");
-        let replacement = dir.path().join("replacement");
-        crate::private_fs::write_private_file(&replacement, b"checkpoint-a").unwrap();
-        std::fs::rename(&replacement, &path).unwrap();
-        let replaced = crate::sprout_scan_run::checkpoint_generation(&path).unwrap();
+        let mut replaced = generation.clone();
+        replaced.artifact_generation[0] ^= 1;
         assert_ne!(generation, replaced);
         assert!(matches!(
             snapshot.checkpoint_cleanup_eligibility(
@@ -2116,51 +2062,6 @@ mod tests {
             ),
             CheckpointCleanupEligibility::Retain { .. }
         ));
-    }
-
-    #[test]
-    fn v2_journal_loads_without_inventing_a_checkpoint_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
-        let mut snapshot = journal.load_or_migrate().unwrap();
-        journal
-            .scoped_store(context(), &mut snapshot)
-            .persist_prepared(&fixture())
-            .unwrap();
-        let text = std::fs::read_to_string(journal.path()).unwrap();
-        std::fs::write(
-            journal.path(),
-            text.replacen("\"version\":3", "\"version\":2", 1),
-        )
-        .unwrap();
-        let snapshot = journal.load_or_migrate().unwrap();
-        assert!(snapshot.checkpoint_manifest(&generation).is_none());
-        assert!(matches!(
-            snapshot.checkpoint_cleanup_eligibility(
-                journal.source_fingerprint(),
-                &generation,
-                &BTreeSet::from([note_id(&outpoint())])
-            ),
-            CheckpointCleanupEligibility::Retain { .. }
-        ));
-
-        let mut snapshot = snapshot;
-        journal
-            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
-            .unwrap();
-        let text = std::fs::read_to_string(journal.path()).unwrap();
-        let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-        assert_eq!(header["version"], 2);
-        assert_eq!(
-            journal
-                .load_or_migrate()
-                .unwrap()
-                .checkpoint_manifest(&generation)
-                .unwrap()
-                .note_ids,
-            BTreeSet::from([note_id(&outpoint())])
-        );
     }
 
     #[test]
@@ -2256,44 +2157,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_acceptance_never_authorizes_checkpoint_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let transaction = fixture();
-        crate::private_fs::write_private_file(
-            journal.path(),
-            legacy_line(&transaction.txid.to_string()).as_bytes(),
-        )
-        .unwrap();
-        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
-        let mut snapshot = journal.load_or_migrate().unwrap();
-        journal
-            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
-            .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
-        for _ in 0..2 {
-            journal
-                .append_transition(
-                    &mut snapshot,
-                    transaction.txid,
-                    TxLifecycleState::Mined,
-                    Some(&SubmissionDisposition::Accepted),
-                    Some(&mature),
-                )
-                .unwrap();
-        }
-        assert!(matches!(
-            snapshot.checkpoint_cleanup_eligibility(
-                journal.source_fingerprint(),
-                &generation,
-                &BTreeSet::from([note_id(&outpoint())])
-            ),
-            CheckpointCleanupEligibility::Retain { reason }
-                if reason.contains("legacy acceptance")
-        ));
-    }
-
-    #[test]
     fn checkpoint_manifest_union_keeps_nonadjacent_source_positions() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
@@ -2326,7 +2189,7 @@ mod tests {
     fn cleanup_failure_is_visible_and_keeps_the_mined_tombstone() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        let generation = checkpoint_generation(dir.path(), b"checkpoint-a");
+        let (checkpoint, generation) = authoritative_checkpoint(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
         journal
             .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
@@ -2348,7 +2211,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        let checkpoint = dir.path().join("scan.checkpoint");
         let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
         crate::sprout_scan_run::fail_checkpoint_discard(&checkpoint);
         let err = journal
@@ -2422,10 +2284,8 @@ mod tests {
     #[test]
     fn cleanup_restart_never_deletes_a_surviving_generation_from_stale_observations() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
+        let (checkpoint, generation) = authoritative_checkpoint(dir.path());
         let original = std::fs::read(&checkpoint).unwrap();
-        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
         let journal = journal(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
         journal
@@ -2478,153 +2338,9 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_restart_restores_a_surviving_exact_quarantine() {
-        use sha2::Digest as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
-        let original = std::fs::read(&checkpoint).unwrap();
-        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
-        let journal = journal(dir.path());
-        let mut snapshot = journal.load_or_migrate().unwrap();
-        journal
-            .record_checkpoint_manifest(&mut snapshot, &generation, [&outpoint()])
-            .unwrap();
-        let transaction = fixture();
-        journal
-            .scoped_store(context(), &mut snapshot)
-            .persist_prepared(&transaction)
-            .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
-        for _ in 0..2 {
-            journal
-                .append_transition(
-                    &mut snapshot,
-                    transaction.txid,
-                    TxLifecycleState::Mined,
-                    Some(&SubmissionDisposition::Accepted),
-                    Some(&mature),
-                )
-                .unwrap();
-        }
-        journal
-            .mutate(
-                &mut snapshot,
-                SproutJournalRecord::CheckpointDiscardStarted {
-                    source_fingerprint: journal.source_fingerprint().to_owned(),
-                    generation: generation.clone(),
-                    reorg_window: SPROUT_REORG_WINDOW as u32,
-                },
-            )
-            .unwrap();
-
-        // Simulate a crash after the exact checkpoint was renamed into its
-        // deletion quarantine but before that retained handle was unlinked.
-        let name = checkpoint.file_name().unwrap();
-        let prefix = format!(
-            ".argos-checkpoint-discard-{:x}-",
-            sha2::Sha256::digest(name.as_encoded_bytes())
-        );
-        let quarantine = dir.path().join(format!("{prefix}{}", uuid::Uuid::new_v4()));
-        std::fs::rename(&checkpoint, &quarantine).unwrap();
-
-        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
-        let result = journal
-            .resume_checkpoint_cleanup(&lease, &checkpoint)
-            .unwrap();
-        assert!(matches!(
-            result,
-            Some(CheckpointCleanupResult::Retain { ref reason })
-                if reason.contains("restored") && reason.contains("fresh reconciliation")
-        ));
-        assert_eq!(std::fs::read(&checkpoint).unwrap(), original);
-        assert_eq!(lease.generation(&checkpoint).unwrap(), generation);
-        assert!(!quarantine.exists());
-        drop(lease);
-
-        let restored = journal.load_or_migrate().unwrap();
-        assert!(restored.discard_started.contains(&generation));
-        assert!(!restored.discarded_checkpoints.contains(&generation));
-    }
-
-    #[test]
-    fn cleanup_restart_preserves_replacement_and_old_exact_quarantine() {
-        use sha2::Digest as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
-        let old_generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
-        let journal = journal(dir.path());
-        let mut snapshot = journal.load_or_migrate().unwrap();
-        journal
-            .record_checkpoint_manifest(&mut snapshot, &old_generation, [&outpoint()])
-            .unwrap();
-        let transaction = fixture();
-        journal
-            .scoped_store(context(), &mut snapshot)
-            .persist_prepared(&transaction)
-            .unwrap();
-        let mature = mined_observation(1, SPROUT_REORG_WINDOW as u32, 0x11);
-        for _ in 0..2 {
-            journal
-                .append_transition(
-                    &mut snapshot,
-                    transaction.txid,
-                    TxLifecycleState::Mined,
-                    Some(&SubmissionDisposition::Accepted),
-                    Some(&mature),
-                )
-                .unwrap();
-        }
-        journal
-            .mutate(
-                &mut snapshot,
-                SproutJournalRecord::CheckpointDiscardStarted {
-                    source_fingerprint: journal.source_fingerprint().to_owned(),
-                    generation: old_generation.clone(),
-                    reorg_window: SPROUT_REORG_WINDOW as u32,
-                },
-            )
-            .unwrap();
-
-        let name = checkpoint.file_name().unwrap();
-        let prefix = format!(
-            ".argos-checkpoint-discard-{:x}-",
-            sha2::Sha256::digest(name.as_encoded_bytes())
-        );
-        let quarantine = dir.path().join(format!("{prefix}{}", uuid::Uuid::new_v4()));
-        std::fs::rename(&checkpoint, &quarantine).unwrap();
-        crate::private_fs::write_private_file(&checkpoint, b"replacement checkpoint").unwrap();
-
-        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
-        let result = journal
-            .resume_checkpoint_cleanup(&lease, &checkpoint)
-            .unwrap();
-        assert!(matches!(
-            result,
-            Some(CheckpointCleanupResult::Retain { ref reason })
-                if reason.contains("replacement") && reason.contains("quarantine")
-        ));
-        assert_eq!(
-            std::fs::read(&checkpoint).unwrap(),
-            b"replacement checkpoint"
-        );
-        assert_eq!(std::fs::read(&quarantine).unwrap(), b"checkpoint-a");
-        drop(lease);
-
-        let restored = journal.load_or_migrate().unwrap();
-        assert!(restored.discard_started.contains(&old_generation));
-        assert!(!restored.discarded_checkpoints.contains(&old_generation));
-    }
-
-    #[test]
     fn cleanup_restart_after_unlink_commits_an_idempotent_tombstone() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
-        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let (checkpoint, generation) = authoritative_checkpoint(dir.path());
         let journal = journal(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
         journal
@@ -2647,24 +2363,20 @@ mod tests {
                 )
                 .unwrap();
         }
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        fail_after_checkpoint_discard(&checkpoint);
         journal
-            .mutate(
-                &mut snapshot,
-                SproutJournalRecord::CheckpointDiscardStarted {
-                    source_fingerprint: journal.source_fingerprint().to_owned(),
-                    generation: generation.clone(),
-                    reorg_window: SPROUT_REORG_WINDOW as u32,
-                },
-            )
-            .unwrap();
-        std::fs::remove_file(&checkpoint).unwrap();
+            .finalize_checkpoint_cleanup(&lease, &generation, &checkpoint)
+            .expect_err("the injected crash must happen after durable retirement");
+        assert!(!checkpoint.exists());
+        drop(lease);
         let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
 
         assert_eq!(
             journal
-                .finalize_checkpoint_cleanup(&lease, &generation, &checkpoint)
+                .resume_checkpoint_cleanup(&lease, &checkpoint)
                 .unwrap(),
-            CheckpointCleanupResult::AlreadyAbsent
+            Some(CheckpointCleanupResult::AlreadyAbsent)
         );
         drop(lease);
         let restored = journal.load_or_migrate().unwrap();
@@ -2682,9 +2394,7 @@ mod tests {
     #[test]
     fn cleanup_restart_completes_old_generation_without_deleting_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
-        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let (checkpoint, generation) = authoritative_checkpoint(dir.path());
         let journal = journal(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
         journal
@@ -2707,18 +2417,17 @@ mod tests {
                 )
                 .unwrap();
         }
+        let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
+        fail_after_checkpoint_discard(&checkpoint);
         journal
-            .mutate(
-                &mut snapshot,
-                SproutJournalRecord::CheckpointDiscardStarted {
-                    source_fingerprint: journal.source_fingerprint().to_owned(),
-                    generation: generation.clone(),
-                    reorg_window: SPROUT_REORG_WINDOW as u32,
-                },
-            )
-            .unwrap();
-        crate::private_fs::write_private_file(&checkpoint, b"replacement checkpoint source")
-            .unwrap();
+            .finalize_checkpoint_cleanup(&lease, &generation, &checkpoint)
+            .expect_err("the injected crash must leave retired authority before completion");
+        drop(lease);
+
+        let (replacement_path, replacement_generation) = authoritative_checkpoint(dir.path());
+        assert_eq!(replacement_path, checkpoint);
+        assert_ne!(replacement_generation, generation);
+        let replacement = std::fs::read(&checkpoint).unwrap();
         let lease = crate::sprout_scan_run::CheckpointLease::acquire(&checkpoint).unwrap();
 
         let result = journal
@@ -2729,9 +2438,10 @@ mod tests {
             Some(CheckpointCleanupResult::Retain { ref reason })
                 if reason.contains("replacement checkpoint")
         ));
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), replacement);
         assert_eq!(
-            std::fs::read(&checkpoint).unwrap(),
-            b"replacement checkpoint source"
+            lease.generation(&checkpoint).unwrap(),
+            replacement_generation
         );
         drop(lease);
         let restored = journal.load_or_migrate().unwrap();
@@ -2748,9 +2458,7 @@ mod tests {
     #[test]
     fn a_post_cleanup_reorg_never_makes_the_discarded_source_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let checkpoint = dir.path().join("scan.checkpoint");
-        crate::private_fs::write_private_file(&checkpoint, b"checkpoint-a").unwrap();
-        let generation = crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let (checkpoint, generation) = authoritative_checkpoint(dir.path());
         let journal = journal(dir.path());
         let mut snapshot = journal.load_or_migrate().unwrap();
         journal
@@ -2811,9 +2519,8 @@ mod tests {
             .unwrap();
         assert!(!snapshot.ready_for_new_plan(&outpoint()));
 
-        crate::private_fs::write_private_file(&checkpoint, b"restored checkpoint source").unwrap();
-        let restored_generation =
-            crate::sprout_scan_run::checkpoint_generation(&checkpoint).unwrap();
+        let (restored_path, restored_generation) = authoritative_checkpoint(dir.path());
+        assert_eq!(restored_path, checkpoint);
         journal
             .record_checkpoint_manifest(&mut snapshot, &restored_generation, [&outpoint()])
             .unwrap();
@@ -2833,7 +2540,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_prepared_record_round_trips_every_safety_field() {
+    fn v4_prepared_record_round_trips_every_safety_field() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let tx = fixture();
@@ -2859,12 +2566,45 @@ mod tests {
         let first_line = std::fs::read_to_string(journal.path()).unwrap();
         let header: serde_json::Value =
             serde_json::from_str(first_line.lines().next().unwrap()).unwrap();
-        assert_eq!(header["version"], 3);
+        assert_eq!(header["version"], 4);
         assert_eq!(header["network"], "mainnet");
         assert_eq!(
             header["source_fingerprint"],
             full_key_set_fingerprint(&[[0x42; 32]])
         );
+        assert_eq!(header["authority_anchor"].as_array().unwrap().len(), 16);
+        assert_eq!(header["artifact_generation"].as_array().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn authenticated_root_rejects_v2_and_v3_without_rewriting_history() {
+        for old_version in [2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = journal(dir.path());
+            let mut snapshot = journal.load_or_migrate().unwrap();
+            journal
+                .scoped_store(context(), &mut snapshot)
+                .persist_prepared(&fixture())
+                .unwrap();
+            let mut lines = std::fs::read_to_string(journal.path())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut header = serde_json::from_str::<serde_json::Value>(&lines[0]).unwrap();
+            header["version"] = old_version.into();
+            lines[0] = serde_json::to_string(&header).unwrap();
+            let legacy = lines.join("\n") + "\n";
+            std::fs::write(journal.path(), legacy.as_bytes()).unwrap();
+
+            let error = journal
+                .load_or_migrate()
+                .expect_err("old formats inside a new authenticated root are invalid")
+                .to_string();
+
+            assert!(error.contains("mismatch"), "{error}");
+            assert_eq!(std::fs::read(journal.path()).unwrap(), legacy.as_bytes());
+        }
     }
 
     #[test]
@@ -2876,20 +2616,44 @@ mod tests {
             .scoped_store(context(), &mut snapshot)
             .persist_prepared(&fixture())
             .unwrap();
-        assert!(
-            SweepJournal::for_keys(dir.path(), &[[0x42; 32]], ZeckNetwork::Testnet)
-                .load_or_migrate()
-                .is_err()
+        let other = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x43; 32]],
+            ZeckNetwork::Mainnet,
         );
-        let other = SweepJournal::for_keys(dir.path(), &[[0x43; 32]], ZeckNetwork::Mainnet);
-        std::fs::copy(journal.path(), other.path()).unwrap();
-        assert!(other.load_or_migrate().is_err());
+        let mut other_snapshot = other.load_or_migrate().unwrap();
+        other
+            .scoped_store(
+                context_for(JsOutPoint {
+                    txid: [0x99; 32],
+                    js_index: 0,
+                    output_index: 0,
+                }),
+                &mut other_snapshot,
+            )
+            .persist_prepared(&fixture())
+            .unwrap();
+        let replay = std::fs::read(journal.path()).unwrap();
+        std::fs::write(other.path(), replay).unwrap();
+
+        let error = other
+            .load_or_migrate()
+            .expect_err("journal bytes cannot be replayed under another root authority")
+            .to_string();
+        assert!(
+            error.contains("lineage") || error.contains("mismatch"),
+            "{error}"
+        );
     }
 
     #[test]
     fn scoped_load_strictly_validates_sibling_header_and_raw_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let current = SweepJournal::for_keys(dir.path(), &[[0x43; 32]], ZeckNetwork::Mainnet);
+        let current = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x43; 32]],
+            ZeckNetwork::Mainnet,
+        );
         let sibling = journal(dir.path());
         let mut snapshot = sibling.load_or_migrate().unwrap();
         sibling
@@ -2897,18 +2661,6 @@ mod tests {
             .persist_prepared(&fixture())
             .unwrap();
 
-        let mismatched = dir.path().join("sprout-sweep-deadbeefdeadbeef.journal");
-        std::fs::rename(sibling.path(), &mismatched).unwrap();
-        let err = current
-            .load_scoped_snapshot(&[outpoint()])
-            .expect_err("filename must authenticate the full fingerprint")
-            .to_string();
-        assert!(
-            err.contains("fingerprint") && err.contains("filename"),
-            "{err}"
-        );
-
-        std::fs::rename(&mismatched, sibling.path()).unwrap();
         let mut records = std::fs::read_to_string(sibling.path())
             .unwrap()
             .lines()
@@ -2933,7 +2685,11 @@ mod tests {
     fn scoped_load_ignores_only_a_fully_valid_other_network_sibling() {
         let dir = tempfile::tempdir().unwrap();
         let current = journal(dir.path());
-        let sibling = SweepJournal::for_keys(dir.path(), &[[0x43; 32]], ZeckNetwork::Testnet);
+        let sibling = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x43; 32]],
+            ZeckNetwork::Testnet,
+        );
         let mut snapshot = sibling.load_or_migrate().unwrap();
         sibling
             .scoped_store(context(), &mut snapshot)
@@ -2944,6 +2700,106 @@ mod tests {
             .expect("a valid other-network sibling cannot claim this network's note");
     }
 
+    #[test]
+    fn scoped_load_rejects_an_overlapping_authorized_key_set_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = journal(dir.path());
+        let sibling = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x43; 32]],
+            ZeckNetwork::Mainnet,
+        );
+        let mut snapshot = sibling.load_or_migrate().unwrap();
+        sibling
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+
+        let error = current
+            .load_scoped_snapshot(&[outpoint()])
+            .expect_err("another authenticated key-set history for the note must block sweeping")
+            .to_string();
+
+        assert!(error.contains("Sprout journal overlap"), "{error}");
+        assert!(error.contains(&sibling.path().display().to_string()));
+    }
+
+    #[test]
+    fn scoped_load_accepts_a_nonoverlapping_authorized_key_set_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = journal(dir.path());
+        let sibling = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x43; 32]],
+            ZeckNetwork::Mainnet,
+        );
+        let different = JsOutPoint {
+            txid: [0x99; 32],
+            js_index: 2,
+            output_index: 0,
+        };
+        let mut snapshot = sibling.load_or_migrate().unwrap();
+        sibling
+            .scoped_store(context_for(different), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+
+        current
+            .load_scoped_snapshot(&[outpoint()])
+            .expect("authenticated histories for distinct notes may coexist");
+    }
+
+    #[test]
+    fn scoped_load_rejects_a_tampered_private_root_before_reading_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = journal(dir.path());
+        let sibling = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x43; 32]],
+            ZeckNetwork::Mainnet,
+        );
+        sibling.load_or_migrate().unwrap();
+        std::fs::write(
+            sibling
+                .root
+                .join(crate::private_fs::PRIVATE_ARTIFACT_ROOT_MARKER),
+            b"tampered marker",
+        )
+        .unwrap();
+
+        let error = current
+            .load_scoped_snapshot(&[])
+            .expect_err("an unauthenticated sibling root must fail closed")
+            .to_string();
+
+        assert!(
+            error.contains("authenticated marker") || error.contains("invalid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_direct_legacy_journal_blocks_even_for_another_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = journal(dir.path());
+        current.load_or_migrate().unwrap();
+        let legacy = current
+            .data_dir()
+            .join("sprout-sweep-deadbeefdeadbeef.journal");
+        crate::private_fs::write_private_file(&legacy, b"possibly broadcast history\n").unwrap();
+
+        let error = current
+            .load_scoped_snapshot(&[])
+            .expect_err("an unreconciled direct sibling history must block every key set")
+            .to_string();
+
+        assert!(error.contains("legacy direct Sprout journal"), "{error}");
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"possibly broadcast history\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn scoped_load_rejects_a_symlinked_sibling() {
@@ -2951,34 +2807,21 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let current = journal(dir.path());
-        let target = dir.path().join("outside");
+        current.load_or_migrate().unwrap();
+        let target = current.data_dir().join("outside");
         std::fs::write(&target, b"not a journal\n").unwrap();
-        let sibling = dir.path().join("sprout-sweep-deadbeefdeadbeef.journal");
+        let sibling = current
+            .data_dir()
+            .join("sprout-sweep-deadbeefdeadbeef.journal");
         symlink(&target, &sibling).unwrap();
         let err = current
             .load_scoped_snapshot(&[])
             .expect_err("sibling symlinks fail closed")
             .to_string();
-        assert!(err.contains("symlink") && err.contains(&sibling.display().to_string()));
-    }
-
-    #[test]
-    fn store_refuses_to_append_to_an_existing_journal_with_another_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let mainnet = journal(dir.path());
-        let mut snapshot = mainnet.load_or_migrate().unwrap();
-        mainnet
-            .scoped_store(context(), &mut snapshot)
-            .persist_prepared(&fixture())
-            .unwrap();
-        let testnet = SweepJournal::for_keys(dir.path(), &[[0x42; 32]], ZeckNetwork::Testnet);
-        let original = std::fs::read(testnet.path()).unwrap();
-        let mut empty = SproutJournalSnapshot::default();
-        assert!(testnet
-            .scoped_store(context(), &mut empty)
-            .persist_prepared(&fixture())
-            .is_err());
-        assert_eq!(std::fs::read(testnet.path()).unwrap(), original);
+        assert!(
+            err.contains("legacy direct Sprout journal")
+                && err.contains(&sibling.display().to_string())
+        );
     }
 
     #[test]
@@ -3004,23 +2847,6 @@ mod tests {
         )
         .unwrap();
         assert!(journal.load_or_migrate().is_err());
-    }
-
-    #[test]
-    fn v1_accepted_entry_migrates_to_submission_unknown_not_mined() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let txid = fixture().txid;
-        write_private_fixture(journal.path(), legacy_line(&txid.to_string()));
-        let snapshot = journal.load_or_migrate().unwrap();
-        let entry = snapshot.entry_for_note(&outpoint()).unwrap();
-        assert_eq!(entry.legacy_txid, Some(txid));
-        assert!(entry.transaction.is_none());
-        assert_eq!(entry.state, TxLifecycleState::SubmissionUnknown);
-        assert!(!snapshot.all_mined_for([&outpoint()]));
-        let upgraded = std::fs::read_to_string(journal.path()).unwrap();
-        assert!(upgraded.starts_with(&legacy_line(&txid.to_string())));
-        assert!(upgraded.contains("{\"record\":\"header\""));
     }
 
     #[test]
@@ -3070,85 +2896,28 @@ mod tests {
     }
 
     #[test]
-    fn v1_accepted_entry_waits_for_a_conservative_expiry_horizon() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        write_private_fixture(journal.path(), legacy_line(&fixture().txid.to_string()));
-        let snapshot = journal.load_or_migrate().unwrap();
-        let entry = snapshot.entry_for_note(&outpoint()).unwrap();
-        assert_eq!(entry.state, TxLifecycleState::SubmissionUnknown);
-        assert_eq!(entry.legacy_expiry_bound, None);
-        assert!(!snapshot.ready_for_new_plan(&outpoint()));
-    }
-
-    #[test]
-    fn duplicate_identical_v1_lines_coalesce_but_conflicting_txids_fail_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let txid = fixture().txid.to_string();
-        let line = legacy_line(&txid);
-        write_private_fixture(journal.path(), format!("{line}{line}"));
-        assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 1);
-        let conflict = TxId::from_bytes([0x55; 32]).to_string();
-        write_private_fixture(journal.path(), format!("{line}{}", legacy_line(&conflict)));
-        assert!(journal.load_or_migrate().is_err());
-    }
-
-    #[test]
-    fn invalid_v1_migration_leaves_original_file_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let original = format!(
-            "{}{}",
-            legacy_line(&fixture().txid.to_string()),
-            legacy_line(&TxId::from_bytes([0x55; 32]).to_string())
-        );
-        write_private_fixture(journal.path(), &original);
-        assert!(journal.load_or_migrate().is_err());
-        assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), original);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn v1_migration_rejects_a_world_readable_file_without_repairing_it() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let original = legacy_line(&fixture().txid.to_string());
-        write_private_fixture(journal.path(), &original);
-        std::fs::set_permissions(journal.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
-        let original_id =
-            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
-                .unwrap();
-        let error = journal.load_or_migrate().unwrap_err().to_string();
-        assert!(error.contains("mode 600"), "{error}");
-        assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), original);
-        assert_eq!(
-            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
-                .unwrap(),
-            original_id
-        );
-        let mode = std::fs::metadata(journal.path())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o644);
-    }
-
-    #[test]
     fn malformed_complete_line_blocks_broadcast() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        write_private_fixture(
-            journal.path(),
-            format!("{}not a record\n", legacy_line(&fixture().txid.to_string())),
-        );
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal.path())
+            .unwrap();
+        file.write_all(b"not a record\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = std::fs::read(journal.path()).unwrap();
         assert!(journal.load_or_migrate().is_err());
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
     }
 
     #[test]
-    fn torn_final_v2_transition_fails_closed_without_rewriting_history() {
+    fn torn_final_v4_transition_fails_closed_without_rewriting_history() {
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let tx = fixture();
@@ -3328,20 +3097,26 @@ mod tests {
     }
 
     #[test]
-    fn separate_connection_lock_blocks_migration_and_append() {
+    fn separate_connection_lock_blocks_load_and_append() {
         use std::sync::mpsc;
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
-        write_private_fixture(journal.path(), legacy_line(&fixture().txid.to_string()));
-        let lock_path =
-            std::path::PathBuf::from(format!("{}.lock.sqlite", journal.path().display()));
-        crate::private_fs::write_private_file(&lock_path, b"").unwrap();
+        let mut initial = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(context(), &mut initial)
+            .persist_prepared(&fixture())
+            .unwrap();
+        let lock_path = journal.root.join(".journal.lock.sqlite");
         let connection = rusqlite::Connection::open(&lock_path).unwrap();
         connection
             .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
             .unwrap();
         let (sender, receiver) = mpsc::channel();
-        let other = SweepJournal::for_keys(dir.path(), &[[0x42; 32]], ZeckNetwork::Mainnet);
+        let other = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x42; 32]],
+            ZeckNetwork::Mainnet,
+        );
         let worker =
             std::thread::spawn(move || sender.send(other.load_or_migrate().is_ok()).unwrap());
         assert!(receiver
@@ -3366,7 +3141,11 @@ mod tests {
             .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
             .unwrap();
         let (sender, receiver) = mpsc::channel();
-        let other = SweepJournal::for_keys(dir.path(), &[[0x42; 32]], ZeckNetwork::Mainnet);
+        let other = SweepJournal::for_keys(
+            &artifact_data_dir(dir.path()),
+            &[[0x42; 32]],
+            ZeckNetwork::Mainnet,
+        );
         let worker = std::thread::spawn(move || {
             sender
                 .send(
@@ -3470,50 +3249,5 @@ mod tests {
         )
         .unwrap();
         assert!(journal.load_or_migrate().is_err());
-    }
-
-    #[test]
-    fn legacy_expiry_bound_must_be_exactly_the_protocol_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let txid = fixture().txid;
-        write_private_fixture(journal.path(), legacy_line(&txid.to_string()));
-        let mut snapshot = journal.load_or_migrate().unwrap();
-        assert!(journal
-            .append_legacy_expiry_bound(&mut snapshot, txid, 100, 101)
-            .is_err());
-        assert_eq!(
-            snapshot.entry_for_txid(txid).unwrap().legacy_expiry_bound,
-            None
-        );
-        journal
-            .append_legacy_expiry_bound(&mut snapshot, txid, 100, 140)
-            .unwrap();
-        assert_eq!(
-            snapshot.entry_for_txid(txid).unwrap().legacy_expiry_bound,
-            Some(140)
-        );
-    }
-
-    #[test]
-    fn legacy_upgrade_is_append_only_and_reopens() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = journal(dir.path());
-        let original = legacy_line(&fixture().txid.to_string());
-        write_private_fixture(journal.path(), &original);
-        let original_id =
-            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
-                .unwrap();
-        let snapshot = journal.load_or_migrate().unwrap();
-        assert_eq!(snapshot.entries().count(), 1);
-        let upgraded = std::fs::read_to_string(journal.path()).unwrap();
-        assert!(upgraded.starts_with(&original));
-        assert_eq!(upgraded.matches("\"record\":\"header\"").count(), 1);
-        assert_eq!(
-            crate::private_fs::private_object_id(&std::fs::File::open(journal.path()).unwrap())
-                .unwrap(),
-            original_id
-        );
-        assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 1);
     }
 }

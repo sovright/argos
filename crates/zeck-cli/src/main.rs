@@ -1403,7 +1403,8 @@ async fn scan_sprout(
     let (tip_anchor, tip_warning) = sprout_tip_anchor(network, lightwalletd_url).await;
     let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
 
-    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
+    let checkpoint =
+        argos_core::sprout_scan_run::checkpoint_path_for_network(data_dir, keys, p2p_network);
     let mut journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys, network);
     if let Some(recovered) = argos_core::sprout_sweep::resume_interrupted_scan_checkpoint_cleanup(
         &checkpoint,
@@ -2615,6 +2616,7 @@ async fn main() -> Result<()> {
     // Gate the network/funds-moving commands on Terms of Service acceptance.
     // `show-keys` is purely local key derivation and is intentionally ungated.
     if command_requires_tos(&cli.command) {
+        argos_core::service::ensure_recovery_data_dir(&cli.data_dir)?;
         ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
     }
 
@@ -4971,6 +4973,20 @@ mod tests {
         ])
         .expect_err("--seed-file and --wallet-file must still conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn fresh_absent_accept_tos_data_dir_initializes_before_acceptance_bytes() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("recovery-data");
+        assert!(!data_dir.exists());
+
+        argos_core::service::ensure_recovery_data_dir(&data_dir).unwrap();
+        ensure_tos_accepted(&data_dir, true).unwrap();
+
+        assert!(argos_core::is_tos_accepted(&data_dir));
+        argos_core::service::NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet)
+            .unwrap();
     }
 
     #[test]

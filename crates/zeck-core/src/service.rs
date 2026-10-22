@@ -1417,7 +1417,24 @@ fn read_cleanup_plan(
 /// Stable, cross-process exclusion for every workspace operation. It is
 /// separate from the broadcast journal lock because a sweep opens that lock
 /// after syncing and must not recursively acquire the same SQLite lock.
+pub fn ensure_recovery_data_dir(data_dir: &std::path::Path) -> ZeckResult<()> {
+    let container =
+        crate::private_fs::ensure_private_artifact_container(data_dir).map_err(|err| {
+            ZeckError::ScanNotReady(format!(
+                "recovery data directory {} has no authenticated create-time authority: {err}",
+                data_dir.display()
+            ))
+        })?;
+    container.verify_current().map_err(|err| {
+        ZeckError::ScanNotReady(format!(
+            "recovery data directory {} changed during authentication: {err}",
+            data_dir.display()
+        ))
+    })
+}
+
 pub struct NetworkOperationGuard {
+    _artifact_container: crate::private_fs::PrivateArtifactRootLease,
     _connection: rusqlite::Connection,
     namespace: crate::private_fs::NamespaceLease,
     compatibility_lock: crate::private_fs::RetainedNamespaceChild,
@@ -1430,6 +1447,7 @@ pub struct NetworkOperationGuard {
 /// SQLite guard has been acquired. This carries only retained file handles,
 /// so async sweep futures do not borrow the non-Sync SQLite connection.
 pub(crate) struct NetworkRegistryLease {
+    artifact_container: crate::private_fs::PrivateArtifactRootLease,
     namespace: crate::private_fs::NamespaceLease,
     compatibility_lock: crate::private_fs::RetainedNamespaceChild,
     compatibility_lock_path: std::path::PathBuf,
@@ -1439,6 +1457,11 @@ pub(crate) struct NetworkRegistryLease {
 
 impl NetworkRegistryLease {
     pub(crate) fn verify(&self) -> ZeckResult<()> {
+        self.artifact_container.verify_current().map_err(|err| {
+            ZeckError::ScanNotReady(format!(
+                "network operation data directory authority changed: {err}"
+            ))
+        })?;
         verify_network_lock_identity(&self.namespace, &self.compatibility_lock)
     }
 
@@ -1467,7 +1490,14 @@ impl NetworkOperationGuard {
         network: crate::models::ZeckNetwork,
         before_compatibility_create: F,
     ) -> ZeckResult<Self> {
-        let data_dir = canonical_workspace_identity(data_dir)?;
+        let artifact_container = crate::private_fs::ensure_private_artifact_container(data_dir)
+            .map_err(|err| {
+                ZeckError::ScanNotReady(format!(
+                    "network operation data directory {} has no authenticated create-time authority: {err}",
+                    data_dir.display()
+                ))
+            })?;
+        let data_dir = artifact_container.path().to_path_buf();
         let network_root = network_registry_root(&data_dir, network)?;
         crate::private_fs::create_private_dir_all(&network_root).map_err(|err| {
             ZeckError::Storage(format!(
@@ -1517,6 +1547,7 @@ impl NetworkOperationGuard {
             })?;
         verify_network_lock_identity(&namespace, &compatibility_lock)?;
         Ok(Self {
+            _artifact_container: artifact_container,
             _connection: connection,
             namespace,
             compatibility_lock,
@@ -1527,12 +1558,25 @@ impl NetworkOperationGuard {
     }
 
     pub(crate) fn verify(&self) -> ZeckResult<()> {
+        self._artifact_container.verify_current().map_err(|err| {
+            ZeckError::ScanNotReady(format!(
+                "network operation data directory authority changed: {err}"
+            ))
+        })?;
         verify_network_lock_identity(&self.namespace, &self.compatibility_lock)
     }
 
     pub(crate) fn registry_lease(&self) -> ZeckResult<NetworkRegistryLease> {
         self.verify()?;
         Ok(NetworkRegistryLease {
+            artifact_container: self
+                ._artifact_container
+                .try_clone_authority()
+                .map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "retaining network operation data directory authority: {err}"
+                    ))
+                })?,
             namespace: self.namespace.try_clone_authority().map_err(|err| {
                 ZeckError::Storage(format!("retaining network registry namespace: {err}"))
             })?,
@@ -1574,7 +1618,7 @@ impl NetworkOperationGuard {
     /// routes use this after the initial migration log has been converted
     /// into retained legacy-source guards, so recursively locking those
     /// sources would be both unnecessary and incorrect.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn reopen_broadcast_log(&self) -> ZeckResult<DurableBroadcastLog> {
         self.verify()?;
         let registry = DurableBroadcastLog::open_in_namespace(
@@ -1660,6 +1704,47 @@ mod network_namespace_tests {
     #[cfg(unix)]
     use std::io::Write;
 
+    fn data_dir(outer: &tempfile::TempDir) -> std::path::PathBuf {
+        outer.path().join("artifact-data")
+    }
+
+    #[test]
+    fn network_guard_creates_and_reopens_only_an_authenticated_absent_data_dir() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = data_dir(&outer);
+        assert!(!data_dir.exists());
+
+        let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
+        assert!(data_dir
+            .join(crate::private_fs::PRIVATE_ARTIFACT_ROOT_MARKER)
+            .is_file());
+        guard.verify().unwrap();
+        drop(guard);
+
+        NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
+    }
+
+    #[test]
+    fn network_guard_refuses_a_preexisting_unmarked_data_dir_unchanged() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = data_dir(&outer);
+        std::fs::create_dir(&data_dir).unwrap();
+        let sentinel = data_dir.join("historical-journal");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+
+        let error = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet)
+            .err()
+            .expect("an unmarked preexisting container must require reconciliation")
+            .to_string();
+
+        assert!(
+            error.contains("authenticated create-time authority"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+        assert!(!data_dir.join("mainnet").exists());
+    }
+
     #[cfg(unix)]
     fn prepared(byte: u8) -> PreparedTransaction {
         PreparedTransaction {
@@ -1674,9 +1759,10 @@ mod network_namespace_tests {
     #[test]
     fn registry_log_refuses_replaced_parent_without_touching_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let data_dir = data_dir(&dir);
+        let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let mut log = guard.reopen_broadcast_log().unwrap();
-        let root = network_registry_root(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let root = network_registry_root(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let detached = root.with_extension("detached");
         std::fs::rename(&root, &detached).unwrap();
         crate::private_fs::create_private_dir_all(&root).unwrap();
@@ -1700,9 +1786,10 @@ mod network_namespace_tests {
     #[test]
     fn first_compatibility_lock_creation_cannot_follow_a_replaced_parent() {
         let dir = tempfile::tempdir().unwrap();
+        let data_dir = data_dir(&dir);
         let replacement_root = std::cell::RefCell::new(None);
         let result = NetworkOperationGuard::acquire_with_before_compatibility_create(
-            dir.path(),
+            &data_dir,
             ZeckNetwork::Mainnet,
             |sqlite_path| {
                 let root = sqlite_path.parent().unwrap().to_path_buf();
@@ -1733,9 +1820,10 @@ mod network_namespace_tests {
     #[test]
     fn registry_log_refuses_replaced_sidecar_without_touching_registry() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let data_dir = data_dir(&dir);
+        let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let mut log = guard.reopen_broadcast_log().unwrap();
-        let root = network_registry_root(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let root = network_registry_root(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let lock_path = root.join(".workspace-operations.sqlite");
         std::fs::remove_file(&lock_path).unwrap();
         let mut replacement = crate::private_fs::open_private_file(
@@ -1746,7 +1834,7 @@ mod network_namespace_tests {
         replacement.write_all(b"replacement-sidecar").unwrap();
         replacement.sync_all().unwrap();
 
-        let second = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet)
+        let second = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet)
             .err()
             .expect("the retained parent/authority lock must refuse a split-brain guard");
         assert!(second.to_string().contains("in use"), "{second}");
@@ -1769,7 +1857,6 @@ mod network_namespace_tests {
     fn registry_log_refuses_replaced_data_directory_without_touching_either_tree() {
         let outer = tempfile::tempdir().unwrap();
         let data_dir = outer.path().join("data");
-        crate::private_fs::create_private_dir_all(&data_dir).unwrap();
         let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let mut log = guard.reopen_broadcast_log().unwrap();
         let detached_data = outer.path().join("detached-data");
@@ -1800,8 +1887,9 @@ mod network_namespace_tests {
     #[test]
     fn retained_registry_handles_deny_parent_and_sidecar_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
-        let root = network_registry_root(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let data_dir = data_dir(&dir);
+        let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
+        let root = network_registry_root(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let detached = root.with_extension("detached");
         assert!(std::fs::rename(&root, &detached).is_err());
         assert!(std::fs::remove_file(root.join(".workspace-operations.lock")).is_err());
@@ -8053,7 +8141,8 @@ mod tests {
         session.runtime.key_source = Arc::new(ImportedKeySource::new(keys));
         session.source_fingerprint = session.runtime.key_source.fingerprint().unwrap();
         let tempdir = tempfile::tempdir().unwrap();
-        session.runtime.data_dir = tempdir.path().to_owned();
+        session.runtime.data_dir = tempdir.path().join("recovery-data");
+        super::ensure_recovery_data_dir(&session.runtime.data_dir).unwrap();
         let workspace =
             crate::workspace::RecoveryWorkspace::from_runtime(&session.runtime).unwrap();
         workspace
@@ -8414,6 +8503,10 @@ mod propose_workspace_guard_tests {
     use argos_wallet_import::keys::{Provenance, TransparentKey};
     use secrecy::Secret;
 
+    fn artifact_data_dir(outer: &tempfile::TempDir) -> std::path::PathBuf {
+        outer.path().join("recovery-data")
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_identity_collapses_aliases_before_the_directory_exists() {
@@ -8509,7 +8602,7 @@ mod propose_workspace_guard_tests {
                     transparent_scan: None,
                     lightwalletd_url: "https://127.0.0.1:1".to_owned(),
                     confirmation_sources: Vec::new(),
-                    data_dir: tempdir.path().to_owned(),
+                    data_dir: artifact_data_dir(&tempdir),
                     network: ZeckNetwork::Mainnet,
                     label: String::new(),
                 },
@@ -8556,6 +8649,8 @@ mod propose_workspace_guard_tests {
         runtime: RuntimeScanConfig,
         account: AccountBalancePreview,
     ) -> (RecoveryService, ScanHandle) {
+        ensure_recovery_data_dir(&runtime.data_dir)
+            .expect("test recovery data directory authenticates before workspace creation");
         let workspace = RecoveryWorkspace::from_runtime(&runtime).expect("workspace paths");
         workspace
             .initialize_from_source(runtime.network, runtime.key_source.as_ref())
@@ -8611,7 +8706,7 @@ mod propose_workspace_guard_tests {
         let source_dropped = Arc::downgrade(&source);
         let tempdir = tempfile::tempdir().expect("temp dir");
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             source.clone(),
             transparent_account(2_099_979_000),
         )
@@ -8701,8 +8796,12 @@ mod propose_workspace_guard_tests {
         )));
         let source_dropped = Arc::downgrade(&source);
         let tempdir = tempfile::tempdir().expect("temp dir");
-        let (service, handle) =
-            completed_session(tempdir.path(), source.clone(), transparent_account(0)).await;
+        let (service, handle) = completed_session(
+            &artifact_data_dir(&tempdir),
+            source.clone(),
+            transparent_account(0),
+        )
+        .await;
         drop(source);
 
         let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
@@ -8751,8 +8850,12 @@ mod propose_workspace_guard_tests {
         )));
         let source_dropped = Arc::downgrade(&source);
         let tempdir = tempfile::tempdir().expect("temp dir");
-        let (service, handle) =
-            completed_session(tempdir.path(), source.clone(), transparent_account(0)).await;
+        let (service, handle) = completed_session(
+            &artifact_data_dir(&tempdir),
+            source.clone(),
+            transparent_account(0),
+        )
+        .await;
         drop(source);
         let session = service.session(&handle).await.expect("session");
         let expected = Arc::downgrade(session.shared());
@@ -8806,7 +8909,7 @@ mod propose_workspace_guard_tests {
     async fn reconciled_old_scan_cannot_issue_another_sweep_quote() {
         let dir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            dir.path(),
+            &artifact_data_dir(&dir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
                  abandon abandon about"
@@ -8854,7 +8957,7 @@ mod propose_workspace_guard_tests {
     async fn partial_reconciliation_error_invalidates_old_review() {
         let dir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            dir.path(),
+            &artifact_data_dir(&dir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
                  abandon abandon about"
@@ -8864,7 +8967,9 @@ mod propose_workspace_guard_tests {
         )
         .await;
         let registry_path = {
-            let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+            let guard =
+                NetworkOperationGuard::acquire(&artifact_data_dir(&dir), ZeckNetwork::Mainnet)
+                    .unwrap();
             let path = guard.broadcast_log_path().unwrap();
             let mut log = guard.open_broadcast_log().unwrap();
             for byte in [84, 85] {
@@ -8924,7 +9029,7 @@ mod propose_workspace_guard_tests {
     async fn retry_that_observes_mining_refuses_send_and_invalidates_old_review() {
         let dir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            dir.path(),
+            &artifact_data_dir(&dir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
                  abandon abandon about"
@@ -8935,7 +9040,9 @@ mod propose_workspace_guard_tests {
         .await;
         let txid = TxId::from_bytes([86; 32]);
         {
-            let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+            let guard =
+                NetworkOperationGuard::acquire(&artifact_data_dir(&dir), ZeckNetwork::Mainnet)
+                    .unwrap();
             let mut log = guard.open_broadcast_log().unwrap();
             log.persist_prepared(&PreparedTransaction {
                 txid,
@@ -8958,7 +9065,8 @@ mod propose_workspace_guard_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not eligible"), "{err}");
-        let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+        let guard =
+            NetworkOperationGuard::acquire(&artifact_data_dir(&dir), ZeckNetwork::Mainnet).unwrap();
         assert_eq!(
             guard
                 .open_broadcast_log()
@@ -9017,7 +9125,7 @@ mod propose_workspace_guard_tests {
 
         let tempdir = tempfile::tempdir().expect("temp dir");
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(ImportedKeySource::new(keys)),
             transparent_account(2_099_979_000),
         )
@@ -9066,7 +9174,7 @@ mod propose_workspace_guard_tests {
     async fn execute_refuses_a_proposal_whose_balance_changed_after_review() {
         let tempdir = tempfile::tempdir().expect("temp dir");
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             transparent_only_source(),
             transparent_account(2_099_979_000),
         )
@@ -9111,7 +9219,7 @@ mod propose_workspace_guard_tests {
     async fn a_proposal_is_not_issued_when_progress_moved_while_it_was_built() {
         let tempdir = tempfile::tempdir().expect("temp dir");
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             transparent_only_source(),
             transparent_account(2_099_979_000),
         )
@@ -9148,7 +9256,7 @@ mod propose_workspace_guard_tests {
     async fn issued_review_material_is_dropped_at_its_deadline_without_another_request() {
         let tempdir = tempfile::tempdir().expect("temp dir");
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             transparent_only_source(),
             transparent_account(2_099_979_000),
         )
@@ -9186,7 +9294,7 @@ mod propose_workspace_guard_tests {
         account.total_zatoshis = 5_000_000;
         account.transparent_utxo_count = 0;
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
                  abandon abandon about"
@@ -9210,7 +9318,7 @@ mod propose_workspace_guard_tests {
     async fn delete_workspace_refuses_an_external_broadcast_lock_holder() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
             ))),
@@ -9246,7 +9354,7 @@ mod propose_workspace_guard_tests {
     async fn absent_legacy_journal_lock_blocks_scan_review_and_execution() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
             ))),
@@ -9304,10 +9412,10 @@ mod propose_workspace_guard_tests {
     #[test]
     fn network_registry_holds_an_alias_legacy_sidecar_without_jsonl() {
         let tempdir = tempfile::tempdir().unwrap();
-        let alias_root = tempdir
-            .path()
-            .join("mainnet/workspace-old/birthday-1/scope-old");
-        std::fs::create_dir_all(&alias_root).unwrap();
+        let data_dir = artifact_data_dir(&tempdir);
+        ensure_recovery_data_dir(&data_dir).unwrap();
+        let alias_root = data_dir.join("mainnet/workspace-old/birthday-1/scope-old");
+        crate::private_fs::create_private_dir_all(&alias_root).unwrap();
         let legacy_path = alias_root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
         let legacy_writer = DurableBroadcastLog::open(&legacy_path).unwrap();
         assert!(
@@ -9315,8 +9423,7 @@ mod propose_workspace_guard_tests {
             "older process has not written JSONL yet"
         );
 
-        let operation =
-            NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+        let operation = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let error = operation
             .open_broadcast_log()
             .err()
@@ -9479,7 +9586,8 @@ mod propose_workspace_guard_tests {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let tombstone = root.with_file_name(format!(
             "{}.deleting-in-process-retry",
             root.file_name().unwrap().to_string_lossy()
@@ -9520,7 +9628,8 @@ mod propose_workspace_guard_tests {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let tombstone = root.with_file_name(format!(
             "{}.deleting-mutated-retry",
             root.file_name().unwrap().to_string_lossy()
@@ -9559,7 +9668,8 @@ mod propose_workspace_guard_tests {
     #[tokio::test]
     async fn durable_cleanup_marker_refuses_new_scan_after_service_restart() {
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let session = service.session(&handle).await.unwrap();
         let runtime = session.runtime.clone();
         let marker = root.with_file_name(format!(
@@ -9602,7 +9712,8 @@ mod propose_workspace_guard_tests {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let root = root.canonicalize().unwrap();
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let tombstone = root.with_file_name(format!(
@@ -9682,7 +9793,8 @@ mod propose_workspace_guard_tests {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let root = root.canonicalize().unwrap();
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let tombstone = root.with_file_name(format!(
@@ -9732,7 +9844,8 @@ mod propose_workspace_guard_tests {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, legacy_txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, legacy_txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let root = root.canonicalize().unwrap();
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let global_txid = TxId::from_bytes([99; 32]);
@@ -9822,7 +9935,8 @@ mod propose_workspace_guard_tests {
         use sha2::{Digest, Sha256};
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let runtime = service.session(&handle).await.unwrap().runtime.clone();
         let tombstone = root.with_file_name(format!(
             "{}.deleting-replay-generation-a",
@@ -9898,12 +10012,13 @@ mod propose_workspace_guard_tests {
     #[test]
     fn global_registry_imports_legacy_transparent_history() {
         let tempdir = tempfile::tempdir().unwrap();
-        let path = tempdir
-            .path()
+        let data_dir = artifact_data_dir(&tempdir);
+        ensure_recovery_data_dir(&data_dir).unwrap();
+        let path = data_dir
             .join("mainnet")
             .join("transparent-legacy")
             .join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::private_fs::create_private_dir_all(path.parent().unwrap()).unwrap();
         let txid = TxId::from_bytes([96; 32]);
         let mut source = DurableBroadcastLog::open(&path).unwrap();
         source
@@ -9919,8 +10034,7 @@ mod propose_workspace_guard_tests {
             .unwrap();
         drop(source);
 
-        let guard =
-            super::NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+        let guard = super::NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let registry = guard.open_broadcast_log().unwrap();
         assert_eq!(
             registry.latest(txid).unwrap().prepared.raw_tx,
@@ -9933,7 +10047,8 @@ mod propose_workspace_guard_tests {
     #[tokio::test]
     async fn another_service_cannot_delete_while_scan_owns_workspace() {
         let tempdir = tempfile::tempdir().unwrap();
-        let (deleter, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (deleter, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let runtime = deleter.session(&handle).await.unwrap().runtime.clone();
         let scanner = RecoveryService::new();
         let scanning = scanner
@@ -9968,7 +10083,8 @@ mod propose_workspace_guard_tests {
     #[tokio::test]
     async fn different_birthday_scan_excludes_deletion_in_same_network_registry() {
         let tempdir = tempfile::tempdir().unwrap();
-        let (deleter, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (deleter, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let runtime = deleter.session(&handle).await.unwrap().runtime.clone();
         let scanner = RecoveryService::new();
         let scanning = scanner
@@ -10014,8 +10130,12 @@ mod propose_workspace_guard_tests {
             }
             Arc::new(ImportedKeySource::new(keys)) as Arc<dyn KeySource>
         };
-        let (service, handle) =
-            completed_session(tempdir.path(), source(0x41, 0x42), transparent_account(0)).await;
+        let (service, handle) = completed_session(
+            &artifact_data_dir(&tempdir),
+            source(0x41, 0x42),
+            transparent_account(0),
+        )
+        .await;
         let first = service.session(&handle).await.unwrap();
         let mut reordered = first.runtime.clone();
         reordered.key_source = source(0x42, 0x41);
@@ -10042,7 +10162,9 @@ mod propose_workspace_guard_tests {
             .unwrap();
         drop(old);
 
-        let guard = NetworkOperationGuard::acquire(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+        let guard =
+            NetworkOperationGuard::acquire(&artifact_data_dir(&tempdir), ZeckNetwork::Mainnet)
+                .unwrap();
         let registry = guard.open_broadcast_log().unwrap();
         assert_eq!(registry.blocking_submission(), Some(txid));
         assert_eq!(
@@ -10054,7 +10176,8 @@ mod propose_workspace_guard_tests {
     #[tokio::test]
     async fn deletion_refuses_old_mined_receipt_when_fresh_sources_are_unavailable() {
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let result = service.delete_workspace(&handle).await;
         assert!(
             result.is_err(),
@@ -10069,7 +10192,8 @@ mod propose_workspace_guard_tests {
     #[tokio::test]
     async fn deletion_records_fresh_unmined_observation_and_preserves_workspace() {
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, txid) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, txid) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let unmined = crate::broadcast::observe_transaction(
             vec![crate::broadcast::EndpointTxEvidence {
                 operator_id: "one".to_owned(),
@@ -10088,7 +10212,8 @@ mod propose_workspace_guard_tests {
         assert!(result.is_err());
         assert!(root.exists());
         let registry_path =
-            super::network_broadcast_log_path(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+            super::network_broadcast_log_path(&artifact_data_dir(&tempdir), ZeckNetwork::Mainnet)
+                .unwrap();
         let log = DurableBroadcastLog::open(registry_path).unwrap();
         let record = log.latest(txid).unwrap();
         assert_eq!(record.prepared.raw_tx, vec![84, 85]);
@@ -10130,7 +10255,8 @@ mod propose_workspace_guard_tests {
         }
 
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, original) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, original) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let extra = TxId::from_bytes([97; 32]);
         let path = root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME);
         let mut log = DurableBroadcastLog::open(&path).unwrap();
@@ -10170,7 +10296,8 @@ mod propose_workspace_guard_tests {
         assert!(observer.seen.contains(&extra));
         assert!(root.exists());
         let registry_path =
-            super::network_broadcast_log_path(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+            super::network_broadcast_log_path(&artifact_data_dir(&tempdir), ZeckNetwork::Mainnet)
+                .unwrap();
         let registry = DurableBroadcastLog::open(registry_path).unwrap();
         assert_eq!(
             registry.latest(original).unwrap().prepared.raw_tx,
@@ -10189,7 +10316,8 @@ mod propose_workspace_guard_tests {
     #[tokio::test]
     async fn deletion_accepts_new_canonical_mining_evidence_before_removal() {
         let tempdir = tempfile::tempdir().unwrap();
-        let (service, handle, root, _) = completed_mined_session(tempdir.path()).await;
+        let (service, handle, root, _) =
+            completed_mined_session(&artifact_data_dir(&tempdir)).await;
         let deleted = service
             .delete_workspace_with_observer(
                 &handle,
@@ -10259,7 +10387,7 @@ mod propose_workspace_guard_tests {
                     endpoint: secondary.url.clone(),
                 },
             ],
-            data_dir: tempdir.path().to_owned(),
+            data_dir: artifact_data_dir(&tempdir),
             network: ZeckNetwork::Testnet,
             label: "two source deletion".to_owned(),
         };
@@ -10333,7 +10461,7 @@ mod propose_workspace_guard_tests {
     async fn gui_mined_result_without_matching_durable_history_cannot_delete() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
             ))),
@@ -10358,7 +10486,7 @@ mod propose_workspace_guard_tests {
     async fn active_workspace_operation_refuses_delete_without_waiting() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
             ))),
@@ -10380,7 +10508,7 @@ mod propose_workspace_guard_tests {
     async fn durable_unknown_and_raw_transaction_survive_refused_concurrent_delete() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
             ))),
@@ -10448,7 +10576,7 @@ mod propose_workspace_guard_tests {
     async fn deletion_requires_canonical_history_and_no_skipped_funds() {
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
             ))),
@@ -10491,7 +10619,8 @@ mod propose_workspace_guard_tests {
             "GUI result cannot override pending history"
         );
         let registry_path =
-            super::network_broadcast_log_path(tempdir.path(), ZeckNetwork::Mainnet).unwrap();
+            super::network_broadcast_log_path(&artifact_data_dir(&tempdir), ZeckNetwork::Mainnet)
+                .unwrap();
         let mut log = DurableBroadcastLog::open(&registry_path).unwrap();
         let observation = crate::broadcast::observe_transaction(
             ["one", "two"]
@@ -10549,7 +10678,7 @@ mod propose_workspace_guard_tests {
         use std::os::unix::fs::PermissionsExt;
         let tempdir = tempfile::tempdir().unwrap();
         let (service, handle) = completed_session(
-            tempdir.path(),
+            &artifact_data_dir(&tempdir),
             Arc::new(SeedKeySource::new(SecretString::new(
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_owned(),
             ))),

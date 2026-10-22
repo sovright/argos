@@ -1,12 +1,12 @@
 //! Fail-closed filesystem primitives for spend-capable recovery artifacts.
 
+use sha2::Digest as _;
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
 };
-use sha2::Digest as _;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PrivateObjectId {
@@ -75,18 +75,63 @@ impl PrivateArtifactRootLease {
         &self.path
     }
 
-    pub(crate) fn root(&self) -> &File {
-        &self.root
+    pub(crate) fn try_clone_authority(&self) -> io::Result<Self> {
+        self.verify_retained_current()?;
+        Ok(Self {
+            publication_parent: self.publication_parent.try_clone()?,
+            root: self.root.try_clone()?,
+            path: self.path.clone(),
+            id: self.id.clone(),
+            publication_parent_id: self.publication_parent_id.clone(),
+            marker_id: self.marker_id.clone(),
+            context: self.context.clone(),
+            bound_objects: self.bound_objects.clone(),
+        })
     }
 
-    pub(crate) fn bound_object_ids(
-        &self,
-    ) -> &std::collections::BTreeMap<String, PrivateObjectId> {
+    #[cfg(test)]
+    pub(crate) fn bound_object_ids(&self) -> &std::collections::BTreeMap<String, PrivateObjectId> {
         &self.bound_objects
     }
 
+    pub(crate) fn purpose(&self) -> &[u8] {
+        &self.context
+    }
+
+    pub(crate) fn child_names(&self) -> io::Result<Vec<OsString>> {
+        self.verify_retained_current()?;
+        parent_child_names(&self.root, &self.path)
+    }
+
+    pub(crate) fn publication_parent_child_names(&self) -> io::Result<Vec<OsString>> {
+        self.verify_retained_current()?;
+        let parent_path = self.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "artifact root has no parent")
+        })?;
+        parent_child_names(&self.publication_parent, parent_path)
+    }
+
+    pub(crate) fn discover_sibling_roots(&self) -> io::Result<Vec<PrivateArtifactRootLease>> {
+        self.verify_retained_current()?;
+        let parent_path = self.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "artifact root has no parent")
+        })?;
+        discover_private_artifact_roots_from_parent(
+            parent_path,
+            &self.publication_parent,
+            Some(&self.path),
+        )
+    }
+
     pub(crate) fn verify_current(&self) -> io::Result<()> {
-        let current = verify_private_artifact_root(&self.path, &self.context)?;
+        let root = open_child_directory_for_identity(&self.publication_parent, &self.path)?;
+        validate_private_directory_handle(&root)?;
+        let current = verify_private_artifact_root_from_handles(
+            &self.path,
+            &self.context,
+            self.publication_parent.try_clone()?,
+            root,
+        )?;
         if current.id != self.id
             || current.publication_parent_id != self.publication_parent_id
             || current.marker_id != self.marker_id
@@ -109,11 +154,9 @@ impl PrivateArtifactRootLease {
         }
         #[cfg(unix)]
         {
-            let current_parent = open_publication_parent(
-                self.path.parent().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "artifact root has no parent")
-                })?,
-            )?;
+            let current_parent = open_publication_parent(self.path.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "artifact root has no parent")
+            })?)?;
             if private_object_id(&current_parent)? != self.publication_parent_id {
                 return Err(invalid_lineage(
                     "private artifact publication parent path was replaced",
@@ -144,7 +187,10 @@ impl PrivateArtifactRootLease {
 
     pub(crate) fn namespace(&self, lock_name: &str) -> io::Result<NamespaceLease> {
         let expected = self.bound_objects.get(lock_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "unknown artifact namespace lock")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown artifact namespace lock",
+            )
         })?;
         // Cold preflight uses exclusive opens for every bound object. Do it
         // before retaining the domain lock: Windows correctly rejects a new
@@ -164,13 +210,41 @@ impl PrivateArtifactRootLease {
         Ok(lease)
     }
 
+    fn namespace_from_verified_root(&self, lock_name: &str) -> io::Result<NamespaceLease> {
+        let expected = self.bound_objects.get(lock_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown artifact namespace lock",
+            )
+        })?;
+        self.verify_retained_current()?;
+        for (name, bound_id) in &self.bound_objects {
+            let child = open_child_file_for_authority(&self.root, &self.path.join(name))?;
+            if private_object_id(&child)? != *bound_id {
+                return Err(invalid_lineage(format!(
+                    "private artifact root bound object {name} changed after discovery"
+                )));
+            }
+        }
+        let lease = NamespaceLease::acquire(&self.path, &self.path.join(lock_name))?;
+        if &lease.lock_id != expected || lease.parent_id != self.id {
+            return Err(invalid_lineage(
+                "private artifact namespace changed while its discovered root was retained",
+            ));
+        }
+        Ok(lease)
+    }
+
     fn namespace_from_retained(
         &self,
         held_namespace: &NamespaceLease,
         lock_name: &str,
     ) -> io::Result<NamespaceLease> {
         let expected = self.bound_objects.get(lock_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "unknown artifact namespace lock")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown artifact namespace lock",
+            )
         })?;
         self.verify_retained_current()?;
         held_namespace.verify_current()?;
@@ -193,6 +267,91 @@ impl PrivateArtifactRootLease {
         }
         Ok(lease)
     }
+}
+
+pub(crate) fn private_data_dir_child_names(data_dir: &Path) -> io::Result<Vec<OsString>> {
+    let container = ensure_private_artifact_container(data_dir)?;
+    container.child_names()
+}
+
+pub(crate) fn discover_private_artifact_roots(
+    data_dir: &Path,
+) -> io::Result<Vec<PrivateArtifactRootLease>> {
+    discover_private_artifact_roots_except(data_dir, None)
+}
+
+pub(crate) fn discover_private_artifact_roots_except(
+    data_dir: &Path,
+    excluded: Option<&Path>,
+) -> io::Result<Vec<PrivateArtifactRootLease>> {
+    let container = ensure_private_artifact_container(data_dir)?;
+    discover_private_artifact_roots_from_parent(data_dir, &container.root, excluded)
+}
+
+fn discover_private_artifact_roots_from_parent(
+    data_dir: &Path,
+    parent: &File,
+    excluded: Option<&Path>,
+) -> io::Result<Vec<PrivateArtifactRootLease>> {
+    let mut names = parent_child_names(parent, data_dir)?;
+    names.sort();
+    let mut roots = Vec::new();
+    for name in names {
+        let Some(text) = name.to_str() else { continue };
+        let Some(digest) = text.strip_prefix(".argos-private-artifacts-") else {
+            continue;
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid_lineage(format!(
+                "malformed private artifact root candidate {text}"
+            )));
+        }
+        let path = data_dir.join(&name);
+        if excluded == Some(path.as_path()) {
+            continue;
+        }
+        let initial = open_child_directory_for_identity(parent, &path).map_err(|error| {
+            invalid_lineage(format!(
+                "private artifact root candidate {} is untrusted: {error}",
+                path.display()
+            ))
+        })?;
+        validate_private_directory_handle(&initial)?;
+        let initial_id = private_object_id(&initial)?;
+        let marker = path.join(PRIVATE_ARTIFACT_ROOT_MARKER);
+        let (bytes, _) = read_private_lineage_child_bytes(&initial, &marker).map_err(|error| {
+            invalid_lineage(format!(
+                "private artifact root candidate {} has no authenticated marker: {error}",
+                path.display()
+            ))
+        })?;
+        let record: PrivateArtifactRootRecord =
+            decode_lineage_record(LineageRecordKind::ArtifactRoot, &bytes)?;
+        if private_artifact_root_path(data_dir, &record.purpose) != path {
+            return Err(invalid_lineage(format!(
+                "private artifact root candidate {} does not match its authenticated purpose",
+                path.display()
+            )));
+        }
+        let verified = verify_private_artifact_root_from_handles(
+            &path,
+            &record.purpose,
+            parent.try_clone()?,
+            initial,
+        )?;
+        if verified.id != initial_id {
+            return Err(invalid_lineage(format!(
+                "private artifact root candidate {} changed during discovery",
+                path.display()
+            )));
+        }
+        roots.push(verified);
+    }
+    Ok(roots)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -292,20 +451,53 @@ impl PrivateArtifactAccess {
         domain: PrivateArtifactDomain,
         artifact: &Path,
     ) -> io::Result<Self> {
+        Self::acquire_existing_with_observer(root_path, domain, artifact, || Ok(()))
+    }
+
+    fn acquire_existing_with_observer(
+        root_path: &Path,
+        domain: PrivateArtifactDomain,
+        artifact: &Path,
+        after_marker_read: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Self> {
         let parent = root_path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "private artifact root has no parent")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private artifact root has no parent",
+            )
         })?;
-        let root = open_private_directory_lease(root_path)?;
+        let container = ensure_private_artifact_container(parent)?;
+        let root = open_child_directory_for_identity(&container.root, root_path)?;
+        validate_private_directory_handle(&root)?;
+        let initial_id = private_object_id(&root)?;
         let marker = root_path.join(PRIVATE_ARTIFACT_ROOT_MARKER);
         let (bytes, _) = read_private_lineage_child_bytes(&root, &marker)?;
         let record: PrivateArtifactRootRecord =
-            decode_lineage_record(LineageRecordKind::PrivateArtifactRoot, &bytes)?;
+            decode_lineage_record(LineageRecordKind::ArtifactRoot, &bytes)?;
         if private_artifact_root_path(parent, &record.purpose) != root_path {
             return Err(invalid_lineage(
                 "private artifact root name does not match its authenticated purpose",
             ));
         }
-        Self::acquire(root_path, &record.purpose, domain, artifact)
+        after_marker_read()?;
+        let verified = verify_private_artifact_root_from_handles(
+            root_path,
+            &record.purpose,
+            container.root.try_clone()?,
+            open_child_directory_for_identity(&container.root, root_path)?,
+        )?;
+        if verified.id != initial_id {
+            return Err(invalid_lineage(
+                "private artifact root changed while its existing authority was acquired",
+            ));
+        }
+        Self::from_root(
+            std::sync::Arc::new(verified),
+            &record.purpose,
+            domain,
+            artifact,
+            None,
+        )
     }
 
     pub(crate) fn acquire(
@@ -342,6 +534,25 @@ impl PrivateArtifactAccess {
         Self::from_root(root, purpose, domain, artifact, Some(held_namespace))
     }
 
+    pub(crate) fn acquire_from_verified_root(
+        root: PrivateArtifactRootLease,
+        purpose: &[u8],
+        domain: PrivateArtifactDomain,
+        artifact: &Path,
+    ) -> io::Result<Self> {
+        if root.path != artifact.parent().unwrap_or_else(|| Path::new(""))
+            || root.context != purpose
+            || artifact.file_name().is_none()
+        {
+            return Err(invalid_lineage(
+                "verified artifact root does not match the requested purpose and child",
+            ));
+        }
+        let root = std::sync::Arc::new(root);
+        let namespace = root.namespace_from_verified_root(domain.lock_name())?;
+        Self::from_root_and_namespace(root, namespace, purpose, domain, artifact)
+    }
+
     fn from_root(
         root: std::sync::Arc<PrivateArtifactRootLease>,
         purpose: &[u8],
@@ -349,14 +560,24 @@ impl PrivateArtifactAccess {
         artifact: &Path,
         held_namespace: Option<&NamespaceLease>,
     ) -> io::Result<Self> {
-        let root_path = root.path.as_path();
         let namespace = match held_namespace {
             Some(namespace) => root.namespace_from_retained(namespace, domain.lock_name())?,
             None => root.namespace(domain.lock_name())?,
         };
+        Self::from_root_and_namespace(root, namespace, purpose, domain, artifact)
+    }
+
+    fn from_root_and_namespace(
+        root: std::sync::Arc<PrivateArtifactRootLease>,
+        namespace: NamespaceLease,
+        purpose: &[u8],
+        domain: PrivateArtifactDomain,
+        artifact: &Path,
+    ) -> io::Result<Self> {
+        let root_path = root.path.as_path();
         let authority = root_path.join(domain.authority_name());
-        let context_hash = sha2::Sha256::digest(private_artifact_root_context(root_path, purpose)?)
-            .into();
+        let context_hash =
+            sha2::Sha256::digest(private_artifact_root_context(root_path, purpose)?).into();
         let mut purpose_bytes = b"argos/private-artifact-purpose/v1".to_vec();
         purpose_bytes.extend_from_slice(domain.label().as_bytes());
         purpose_bytes.extend_from_slice(purpose);
@@ -445,9 +666,7 @@ impl PrivateArtifactAccess {
             records.push(record);
         }
         records.sort_by_key(|record| record.sequence);
-        if records.len() == 2
-            && records[0].anchor_id != records[1].anchor_id
-        {
+        if records.len() == 2 && records[0].anchor_id != records[1].anchor_id {
             return Err(invalid_lineage(
                 "artifact authority slots disagree on their permanent anchor",
             ));
@@ -463,9 +682,7 @@ impl PrivateArtifactAccess {
         Ok(self.current_record()?.map(|record| record.state))
     }
 
-    pub(crate) fn current_authority(
-        &self,
-    ) -> io::Result<Option<([u8; 16], PrivateArtifactState)>> {
+    pub(crate) fn current_authority(&self) -> io::Result<Option<([u8; 16], PrivateArtifactState)>> {
         Ok(self
             .current_record()?
             .map(|record| (record.anchor_id, record.state)))
@@ -477,10 +694,6 @@ impl PrivateArtifactAccess {
 
     pub(crate) fn artifact_path(&self) -> &Path {
         &self.artifact
-    }
-
-    pub(crate) fn purpose(&self) -> &[u8] {
-        &self.root.context
     }
 
     pub(crate) fn read_optional_child_version(
@@ -511,7 +724,8 @@ impl PrivateArtifactAccess {
             }
             Some(record) => Err(invalid_lineage(format!(
                 "{} artifact authority is interrupted in state {:?}; preserved unchanged",
-                self.domain.label(), record.state
+                self.domain.label(),
+                record.state
             ))),
         }
     }
@@ -522,8 +736,10 @@ impl PrivateArtifactAccess {
         const DIGEST_BYTES: usize = 32;
         let records = self.authority_records()?;
         let current = records.last();
-        let anchor_id = current
-            .map_or_else(|| uuid::Uuid::new_v4().into_bytes(), |record| record.anchor_id);
+        let anchor_id = current.map_or_else(
+            || uuid::Uuid::new_v4().into_bytes(),
+            |record| record.anchor_id,
+        );
         let sequence = current.map_or(0, |record| record.sequence + 1);
         let record = PrivateArtifactAuthorityRecord {
             schema_version: 1,
@@ -587,6 +803,7 @@ impl PrivateArtifactAccess {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn read_child_version(&self) -> io::Result<(Vec<u8>, PrivateObjectId)> {
         let (_, expected) = self.active_generation_and_id()?;
         let (bytes, actual) = self.namespace.read_child_version(&self.artifact)?;
@@ -599,7 +816,9 @@ impl PrivateArtifactAccess {
         Ok((bytes, actual))
     }
 
-    pub(crate) fn open_active_child(&self) -> io::Result<Option<(File, [u8; 16], PrivateObjectId)>> {
+    pub(crate) fn open_active_child(
+        &self,
+    ) -> io::Result<Option<(File, [u8; 16], PrivateObjectId)>> {
         match self.current_state()? {
             None => {
                 if self.namespace.child_exists(&self.artifact)? {
@@ -654,12 +873,113 @@ impl PrivateArtifactAccess {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn append_child_if_unchanged(
         &self,
         expected: Option<(&PrivateObjectId, &[u8])>,
         suffix: &[u8],
     ) -> io::Result<()> {
         self.append_child_if_unchanged_with_observer(expected, suffix, |_, _| Ok(()))
+    }
+
+    pub(crate) fn append_child_if_unchanged_with_lineage(
+        &self,
+        expected: Option<(&PrivateObjectId, &[u8])>,
+        build_suffix: impl FnOnce([u8; 16], [u8; 16]) -> io::Result<Vec<u8>>,
+    ) -> io::Result<()> {
+        match self.current_record()? {
+            None => {
+                if self.namespace.child_exists(&self.artifact)? {
+                    return Err(invalid_lineage(
+                        "existing private artifact predates create-time authority; preserved unchanged",
+                    ));
+                }
+                if expected.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "expected private artifact is absent",
+                    ));
+                }
+                let generation = uuid::Uuid::new_v4().into_bytes();
+                let candidate = self
+                    .artifact
+                    .file_name()
+                    .expect("artifact has a name")
+                    .to_string_lossy()
+                    .into_owned();
+                self.append_state(PrivateArtifactState::Pending {
+                    generation,
+                    candidate: candidate.clone(),
+                    old: None,
+                })?;
+                let mut file =
+                    create_child_file_read_append(self.namespace.parent(), &self.artifact)?;
+                file.sync_all()?;
+                self.namespace.sync_parent()?;
+                let object = private_object_id(&file)?;
+                self.append_state(PrivateArtifactState::Created {
+                    generation,
+                    candidate,
+                    object: object.clone(),
+                    old: None,
+                })?;
+                let (anchor, state) = self.current_authority()?.ok_or_else(|| {
+                    invalid_lineage("new artifact authority disappeared before its first byte")
+                })?;
+                if !matches!(state, PrivateArtifactState::Created { generation: current, object: ref current_object, .. }
+                    if current == generation && current_object == &object)
+                {
+                    return Err(invalid_lineage(
+                        "new artifact authority changed before its first byte",
+                    ));
+                }
+                let suffix = build_suffix(anchor, generation)?;
+                file.write_all(&suffix)?;
+                file.flush()?;
+                file.sync_all()?;
+                if private_object_id(&file)? != object {
+                    return Err(invalid_lineage(
+                        "private artifact changed during its first write",
+                    ));
+                }
+                self.append_state(PrivateArtifactState::Active { generation, object })?;
+                self.verify_authority_object()
+            }
+            Some(PrivateArtifactAuthorityRecord {
+                anchor_id,
+                state: PrivateArtifactState::Active { generation, object },
+                ..
+            }) => {
+                let (current, actual) = self.namespace.read_child_version(&self.artifact)?;
+                if actual != object {
+                    return Err(invalid_lineage(
+                        "private artifact was replaced before append",
+                    ));
+                }
+                match expected {
+                    Some((expected_id, expected_bytes))
+                        if *expected_id == actual && expected_bytes == current => {}
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "private artifact changed before append",
+                        ))
+                    }
+                }
+                let suffix = build_suffix(anchor_id, generation)?;
+                self.namespace.append_child_if_unchanged(
+                    &self.artifact,
+                    Some((&actual, &current)),
+                    &suffix,
+                )?;
+                self.verify_authority_object()
+            }
+            Some(record) => Err(invalid_lineage(format!(
+                "{} artifact authority is interrupted in state {:?}; preserved unchanged",
+                self.domain.label(),
+                record.state
+            ))),
+        }
     }
 
     fn finish_replacing(
@@ -706,7 +1026,8 @@ impl PrivateArtifactAccess {
                             "private artifact changed before exact replacement",
                         ));
                     }
-                    self.namespace.remove_open_child(&self.artifact, &file, old)?;
+                    self.namespace
+                        .remove_open_child(&self.artifact, &file, old)?;
                     self.namespace.sync_parent()?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -742,14 +1063,7 @@ impl PrivateArtifactAccess {
             old,
         }) = current.clone()
         {
-            self.finish_replacing(
-                generation,
-                &candidate,
-                &object,
-                len,
-                &sha256,
-                old.as_ref(),
-            )?;
+            self.finish_replacing(generation, &candidate, &object, len, &sha256, old.as_ref())?;
         }
         let old = match self.current_state()? {
             None => None,
@@ -759,9 +1073,9 @@ impl PrivateArtifactAccess {
             Some(PrivateArtifactState::Retired { .. }) => None,
             Some(state) => {
                 return Err(invalid_lineage(format!(
-                    "{} artifact replacement is interrupted in state {state:?}; preserved unchanged",
-                    self.domain.label()
-                )))
+                "{} artifact replacement is interrupted in state {state:?}; preserved unchanged",
+                self.domain.label()
+            )))
             }
         };
         if old.is_none() && self.namespace.child_exists(&self.artifact)? {
@@ -813,14 +1127,7 @@ impl PrivateArtifactAccess {
             sha256,
             old: old.clone(),
         })?;
-        self.finish_replacing(
-            generation,
-            &candidate,
-            &object,
-            len,
-            &sha256,
-            old.as_ref(),
-        )
+        self.finish_replacing(generation, &candidate, &object, len, &sha256, old.as_ref())
     }
 
     /// Move the exact active checkpoint into a deterministic quarantine and
@@ -891,7 +1198,10 @@ impl PrivateArtifactAccess {
             }) if object == *expected
                 && quarantine_id == *expected
                 && recorded_cleanup == cleanup_id
-                && quarantine.file_name() == Some(std::ffi::OsStr::new(&name)) => generation,
+                && quarantine.file_name() == Some(std::ffi::OsStr::new(&name)) =>
+            {
+                generation
+            }
             Some(state) => {
                 return Err(invalid_lineage(format!(
                     "checkpoint retirement state does not authorize deletion: {state:?}"
@@ -942,12 +1252,8 @@ impl PrivateArtifactAccess {
                         "checkpoint quarantine does not match retirement authority",
                     ));
                 }
-                self.namespace.rename_open_child(
-                    &quarantine,
-                    &self.artifact,
-                    &file,
-                    &object,
-                )?;
+                self.namespace
+                    .rename_open_child(&quarantine, &self.artifact, &file, &object)?;
                 self.namespace.sync_parent()?;
             }
             (Ok(_), Ok(_)) => {
@@ -969,6 +1275,7 @@ impl PrivateArtifactAccess {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn append_child_if_unchanged_with_observer(
         &self,
         expected: Option<(&PrivateObjectId, &[u8])>,
@@ -1000,10 +1307,8 @@ impl PrivateArtifactAccess {
                     candidate: candidate.clone(),
                     old: None,
                 })?;
-                let mut file = create_child_file_read_append(
-                    self.namespace.parent(),
-                    &self.artifact,
-                )?;
+                let mut file =
+                    create_child_file_read_append(self.namespace.parent(), &self.artifact)?;
                 file.sync_all()?;
                 self.namespace.sync_parent()?;
                 let object = private_object_id(&file)?;
@@ -1054,7 +1359,8 @@ impl PrivateArtifactAccess {
             }
             Some(record) => Err(invalid_lineage(format!(
                 "{} artifact authority is interrupted in state {:?}; preserved unchanged",
-                self.domain.label(), record.state
+                self.domain.label(),
+                record.state
             ))),
         }
     }
@@ -1085,9 +1391,9 @@ struct EphemeralProbeCleanupRecord {
 
 #[derive(Clone, Copy)]
 enum LineageRecordKind {
-    PrivateRoot,
-    PrivateSqlite,
-    PrivateArtifactRoot,
+    Root,
+    Sqlite,
+    ArtifactRoot,
     #[cfg(windows)]
     CleanupMarker,
 }
@@ -1141,7 +1447,9 @@ struct WindowsArtifactRootObjects {
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum WindowsArtifactRootState {
-    Pending { generation: [u8; 16] },
+    Pending {
+        generation: [u8; 16],
+    },
     Active {
         generation: [u8; 16],
         objects: WindowsArtifactRootObjects,
@@ -2224,13 +2532,14 @@ pub(crate) fn private_artifact_root_path(data_dir: &Path, purpose: &[u8]) -> std
     data_dir.join(name)
 }
 
+fn private_artifact_container_purpose() -> &'static [u8] {
+    b"argos/private-artifact-container/v1"
+}
+
 pub(crate) fn private_artifact_purpose(network: &str, full_fingerprint: &str) -> Vec<u8> {
     let mut purpose = b"argos/sprout-private-artifacts/v1".to_vec();
     append_lineage_context_component(&mut purpose, std::ffi::OsStr::new(network));
-    append_lineage_context_component(
-        &mut purpose,
-        std::ffi::OsStr::new(full_fingerprint),
-    );
+    append_lineage_context_component(&mut purpose, std::ffi::OsStr::new(full_fingerprint));
     purpose
 }
 
@@ -2513,13 +2822,13 @@ pub(crate) fn verify_private_workspace_lineage(
             private_root.display()
         ))
     })?;
-    let record: PrivateRootLineageRecord =
-        decode_lineage_record(LineageRecordKind::PrivateRoot, &bytes).map_err(|error| {
-            invalid_lineage(format!(
-                "private workspace root {} has an invalid lineage marker: {error}",
-                private_root.display()
-            ))
-        })?;
+    let record: PrivateRootLineageRecord = decode_lineage_record(LineageRecordKind::Root, &bytes)
+        .map_err(|error| {
+        invalid_lineage(format!(
+            "private workspace root {} has an invalid lineage marker: {error}",
+            private_root.display()
+        ))
+    })?;
     let context = private_root_lineage_context(private_root)?;
     if record.schema_version != PRIVATE_ROOT_LINEAGE_SCHEMA_VERSION
         || record.publication_parent != publication_parent_id
@@ -2543,9 +2852,7 @@ pub(crate) fn verify_private_workspace_lineage(
 }
 
 #[cfg(windows)]
-fn prepare_windows_artifact_root_creation(
-    context: &[u8],
-) -> io::Result<([u8; 16], [u8; 16])> {
+fn prepare_windows_artifact_root_creation(context: &[u8]) -> io::Result<([u8; 16], [u8; 16])> {
     let context_hash = windows_lineage::context_hash(context);
     match windows_lineage::read_artifact_authority(&context_hash)? {
         None => {
@@ -2599,9 +2906,7 @@ fn activate_or_verify_windows_artifact_root(
         ));
     }
     match &authority.state {
-        WindowsArtifactRootState::Pending { generation }
-            if generation == &record.generation =>
-        {
+        WindowsArtifactRootState::Pending { generation } if generation == &record.generation => {
             authority.state = WindowsArtifactRootState::Active {
                 generation: *generation,
                 objects,
@@ -2622,12 +2927,6 @@ fn verify_private_artifact_root(
     private_root: &Path,
     purpose: &[u8],
 ) -> io::Result<PrivateArtifactRootLease> {
-    let context = private_artifact_root_context(private_root, purpose)?;
-    #[cfg(windows)]
-    let _artifact_guard = {
-        let context_hash = windows_lineage::context_hash(&context);
-        windows_lineage::artifact_lock(&context_hash)?
-    };
     let publication_parent_path = private_root.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2635,8 +2934,25 @@ fn verify_private_artifact_root(
         )
     })?;
     let publication_parent = open_publication_parent(publication_parent_path)?;
+    let root = open_child_directory_for_identity(&publication_parent, private_root)?;
+    validate_private_directory_handle(&root)?;
+    verify_private_artifact_root_from_handles(private_root, purpose, publication_parent, root)
+}
+
+fn verify_private_artifact_root_from_handles(
+    private_root: &Path,
+    purpose: &[u8],
+    publication_parent: File,
+    root: File,
+) -> io::Result<PrivateArtifactRootLease> {
+    let context = private_artifact_root_context(private_root, purpose)?;
+    #[cfg(windows)]
+    let _artifact_guard = {
+        let context_hash = windows_lineage::context_hash(&context);
+        windows_lineage::artifact_lock(&context_hash)?
+    };
     let publication_parent_id = private_object_id(&publication_parent)?;
-    let root = open_private_directory_lease(private_root)?;
+    validate_private_directory_handle(&root)?;
     let id = private_object_id(&root)?;
     let marker_path = private_root.join(PRIVATE_ARTIFACT_ROOT_MARKER);
     let (bytes, marker_id) = read_private_lineage_child_bytes(&root, &marker_path).map_err(|error| {
@@ -2646,7 +2962,7 @@ fn verify_private_artifact_root(
         ))
     })?;
     let record: PrivateArtifactRootRecord =
-        decode_lineage_record(LineageRecordKind::PrivateArtifactRoot, &bytes).map_err(|error| {
+        decode_lineage_record(LineageRecordKind::ArtifactRoot, &bytes).map_err(|error| {
             invalid_lineage(format!(
                 "private artifact root {} has an invalid lineage marker: {error}",
                 private_root.display()
@@ -2705,12 +3021,32 @@ fn verify_private_artifact_root(
 
 /// Establish or verify a create-time-proven per-key artifact namespace.
 /// Existing directories are never repaired or retroactively marked trusted.
-pub(crate) fn ensure_private_artifact_root(
+fn ensure_private_artifact_root_raw(
     private_root: &Path,
     purpose: &[u8],
 ) -> io::Result<PrivateArtifactRootLease> {
+    ensure_private_artifact_root_with_parent(private_root, purpose, None)
+}
+
+fn ensure_private_artifact_root_with_parent(
+    private_root: &Path,
+    purpose: &[u8],
+    retained_parent: Option<&File>,
+) -> io::Result<PrivateArtifactRootLease> {
     match fs::symlink_metadata(private_root) {
-        Ok(_) => verify_private_artifact_root(private_root, purpose),
+        Ok(_) => match retained_parent {
+            Some(parent) => {
+                let root = open_child_directory_for_identity(parent, private_root)?;
+                validate_private_directory_handle(&root)?;
+                verify_private_artifact_root_from_handles(
+                    private_root,
+                    purpose,
+                    parent.try_clone()?,
+                    root,
+                )
+            }
+            None => verify_private_artifact_root(private_root, purpose),
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let publication_parent_path = private_root.parent().ok_or_else(|| {
                 io::Error::new(
@@ -2718,7 +3054,9 @@ pub(crate) fn ensure_private_artifact_root(
                     "private artifact root has no parent",
                 )
             })?;
-            fs::create_dir_all(publication_parent_path)?;
+            if retained_parent.is_none() {
+                fs::create_dir_all(publication_parent_path)?;
+            }
             let context = private_artifact_root_context(private_root, purpose)?;
             #[cfg(windows)]
             let _artifact_guard = {
@@ -2729,12 +3067,27 @@ pub(crate) fn ensure_private_artifact_root(
             // authority. A concurrent publisher that won before the mutex
             // must be verified, never treated as a fresh root.
             if fs::symlink_metadata(private_root).is_ok() {
-                return verify_private_artifact_root(private_root, purpose);
+                return match retained_parent {
+                    Some(parent) => {
+                        let root = open_child_directory_for_identity(parent, private_root)?;
+                        validate_private_directory_handle(&root)?;
+                        verify_private_artifact_root_from_handles(
+                            private_root,
+                            purpose,
+                            parent.try_clone()?,
+                            root,
+                        )
+                    }
+                    None => verify_private_artifact_root(private_root, purpose),
+                };
             }
             #[cfg(windows)]
             let (artifact_anchor_id, artifact_generation) =
                 prepare_windows_artifact_root_creation(&context)?;
-            let publication_parent = open_publication_parent(publication_parent_path)?;
+            let publication_parent = match retained_parent {
+                Some(parent) => parent.try_clone()?,
+                None => open_publication_parent(publication_parent_path)?,
+            };
             let publication_parent_id = private_object_id(&publication_parent)?;
             let destination_name = private_root.file_name().ok_or_else(|| {
                 io::Error::new(
@@ -2771,7 +3124,7 @@ pub(crate) fn ensure_private_artifact_root(
                 &staging_root.join(PRIVATE_ARTIFACT_ROOT_MARKER),
                 |marker_id| {
                     encode_lineage_record(
-                        LineageRecordKind::PrivateArtifactRoot,
+                        LineageRecordKind::ArtifactRoot,
                         &PrivateArtifactRootRecord {
                             schema_version: 1,
                             publication_parent: publication_parent_id.clone(),
@@ -2796,7 +3149,14 @@ pub(crate) fn ensure_private_artifact_root(
                 &staging,
             )?;
             publication_parent.sync_all()?;
-            let verified = verify_private_artifact_root(private_root, purpose)?;
+            let published = open_child_directory_for_identity(&publication_parent, private_root)?;
+            validate_private_directory_handle(&published)?;
+            let verified = verify_private_artifact_root_from_handles(
+                private_root,
+                purpose,
+                publication_parent,
+                published,
+            )?;
             if verified.id != staging_id {
                 return Err(invalid_lineage(
                     "private artifact root changed during no-replace publication",
@@ -2806,6 +3166,38 @@ pub(crate) fn ensure_private_artifact_root(
         }
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn ensure_private_artifact_container(
+    data_dir: &Path,
+) -> io::Result<PrivateArtifactRootLease> {
+    ensure_private_artifact_root_raw(data_dir, private_artifact_container_purpose()).map_err(
+        |error| {
+            if matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidData)
+            {
+                invalid_lineage(format!(
+                    "artifact data directory {} has no authenticated create-time container authority: {error}. Preserve and explicitly reconcile every historical Sprout journal before selecting a fresh authority location",
+                    data_dir.display()
+                ))
+            } else {
+                error
+            }
+        },
+    )
+}
+
+pub(crate) fn ensure_private_artifact_root(
+    private_root: &Path,
+    purpose: &[u8],
+) -> io::Result<PrivateArtifactRootLease> {
+    let data_dir = private_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private artifact root has no data directory",
+        )
+    })?;
+    let container = ensure_private_artifact_container(data_dir)?;
+    ensure_private_artifact_root_with_parent(private_root, purpose, Some(&container.root))
 }
 
 fn sqlite_lineage_path(database: &Path) -> io::Result<std::path::PathBuf> {
@@ -2892,7 +3284,7 @@ fn ensure_private_sqlite_lineage(
                 #[cfg(windows)]
                 anchor_id,
             };
-            encode_lineage_record(LineageRecordKind::PrivateSqlite, &record)
+            encode_lineage_record(LineageRecordKind::Sqlite, &record)
         })?;
         parent.sync_all()?;
         return Ok(());
@@ -2965,7 +3357,7 @@ fn initialize_staged_private_root(
             marker: marker_id.clone(),
             context,
         };
-        encode_lineage_record(LineageRecordKind::PrivateRoot, &record)
+        encode_lineage_record(LineageRecordKind::Root, &record)
     })?;
     #[cfg(not(windows))]
     let _ = &root_marker_id;
@@ -3303,14 +3695,12 @@ pub(crate) fn ensure_private_sqlite_file(
     let marker_path = sqlite_lineage_path(path)?;
     let (marker_bytes, marker_id) = read_private_lineage_child_bytes(parent, &marker_path)?;
     let record: PrivateSqliteLineageRecord =
-        decode_lineage_record(LineageRecordKind::PrivateSqlite, &marker_bytes).map_err(
-            |error| {
-                invalid_lineage(format!(
-                    "private SQLite lineage marker {} is invalid: {error}",
-                    marker_path.display()
-                ))
-            },
-        )?;
+        decode_lineage_record(LineageRecordKind::Sqlite, &marker_bytes).map_err(|error| {
+            invalid_lineage(format!(
+                "private SQLite lineage marker {} is invalid: {error}",
+                marker_path.display()
+            ))
+        })?;
     let database = open_sqlite_file_shared(parent, path)?;
     let database_id = private_object_id(&database)?;
     let context = sqlite_lineage_context(root, path)?;
@@ -4273,7 +4663,7 @@ fn inspect_private_workspace_cleanup_binding_filesystem(
     let (marker_bytes, marker_id) =
         read_private_lineage_child_bytes(&retained_leaf.directory, &marker_path)?;
     let record: PrivateSqliteLineageRecord =
-        decode_lineage_record(LineageRecordKind::PrivateSqlite, &marker_bytes)?;
+        decode_lineage_record(LineageRecordKind::Sqlite, &marker_bytes)?;
     let database_file = open_sqlite_file_shared(&retained_leaf.directory, database)?;
     let database_id = private_object_id(&database_file)?;
     let context = sqlite_lineage_context(&root, database)?;
@@ -4436,7 +4826,7 @@ pub(crate) fn revoke_private_workspace_lineage(
         let marker_path = sqlite_lineage_path(database)?;
         let (marker_bytes, marker_id) = read_private_lineage_child_bytes(parent, &marker_path)?;
         let record: PrivateSqliteLineageRecord =
-            decode_lineage_record(LineageRecordKind::PrivateSqlite, &marker_bytes)?;
+            decode_lineage_record(LineageRecordKind::Sqlite, &marker_bytes)?;
         let database_file = open_sqlite_file_shared(parent, database)?;
         let context = sqlite_lineage_context(&root, database)?;
         let objects = WindowsLineageObjects {
@@ -4684,7 +5074,7 @@ pub(crate) fn write_private_file_atomic_in_parent(
 /// is old enough that it cannot belong to an active write. The caller must
 /// serialize cleanup with every writer for `path`; age alone cannot prove a
 /// paused writer is inactive.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn remove_stale_private_file_staging(
     path: &Path,
     minimum_age: std::time::Duration,
@@ -4700,23 +5090,7 @@ pub(crate) fn remove_stale_private_file_staging(
     }
 }
 
-pub(crate) fn remove_stale_private_file_staging_in_parent(
-    parent: &File,
-    path: &Path,
-    minimum_age: std::time::Duration,
-) -> io::Result<bool> {
-    #[cfg(unix)]
-    {
-        unix_private::cleanup_staging_in_parent(parent, path, Some(minimum_age))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (parent, path, minimum_age);
-        Ok(false)
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn discard_private_file_staging(path: &Path) -> io::Result<bool> {
     #[cfg(unix)]
     {
@@ -4725,24 +5099,6 @@ pub(crate) fn discard_private_file_staging(path: &Path) -> io::Result<bool> {
     #[cfg(not(unix))]
     {
         let _ = path;
-        Ok(false)
-    }
-}
-
-/// Remove destination-scoped staging through a parent handle retained by the
-/// caller's namespace lease. On Unix this never follows a replaced parent
-/// pathname; Windows pins the namespace with a non-delete-shared lock file.
-pub(crate) fn discard_private_file_staging_in_parent(
-    parent: &File,
-    path: &Path,
-) -> io::Result<bool> {
-    #[cfg(unix)]
-    {
-        unix_private::cleanup_staging_in_parent(parent, path, None)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (parent, path);
         Ok(false)
     }
 }
@@ -5181,6 +5537,25 @@ pub(crate) fn open_private_directory_lease(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     windows_acl::harden(&directory, true)?;
     Ok(directory)
+}
+
+fn validate_private_directory_handle(directory: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix_private::verify_private_directory(directory)
+    }
+    #[cfg(windows)]
+    {
+        windows_acl::validate_private_directory(directory)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = directory;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private directory validation is unsupported on this platform",
+        ))
+    }
 }
 
 /// Open an exact-private SQLite parent without requesting delete authority and
@@ -5870,6 +6245,7 @@ mod unix_private {
         ))
     }
 
+    #[cfg(test)]
     fn open_staged_artifact(directory: RawFd) -> io::Result<Option<File>> {
         let artifact = c_string(OsStr::new(ARTIFACT_NAME), "artifact name")?;
         let descriptor = unsafe {
@@ -5900,6 +6276,7 @@ mod unix_private {
         Ok(Some(file))
     }
 
+    #[cfg(test)]
     fn cleanup_candidate(parent: &File, name: &OsStr, staging: File) -> io::Result<bool> {
         let name = c_string(name, "staging name")?;
         let staging_identity = file_identity(&staging.metadata()?);
@@ -5944,7 +6321,8 @@ mod unix_private {
         cleanup_staging_in_parent(&parent, path, minimum_age)
     }
 
-    pub(super) fn cleanup_staging_in_parent(
+    #[cfg(test)]
+    fn cleanup_staging_in_parent(
         parent: &File,
         path: &Path,
         minimum_age: Option<std::time::Duration>,
@@ -6627,8 +7005,7 @@ mod windows_lineage {
 
     const PRIVATE_ROOT_ENTROPY: &[u8] = b"argos/private-root-lineage/dpapi/v1";
     const PRIVATE_SQLITE_ENTROPY: &[u8] = b"argos/private-sqlite-lineage/dpapi/v1";
-    const PRIVATE_ARTIFACT_ROOT_ENTROPY: &[u8] =
-        b"argos/private-artifact-root/dpapi/v1";
+    const PRIVATE_ARTIFACT_ROOT_ENTROPY: &[u8] = b"argos/private-artifact-root/dpapi/v1";
     const CLEANUP_MARKER_ENTROPY: &[u8] = b"argos/workspace-cleanup-marker/dpapi/v1";
     const REGISTRY_AUTHORITY_ENTROPY: &[u8] = b"argos/private-lineage-registry/dpapi/v1";
     const REGISTRY_KEY: &str = "Software\\Argos\\WalletRescue\\PrivateRootAuthority\\v1";
@@ -6686,9 +7063,9 @@ mod windows_lineage {
 
     fn entropy(kind: LineageRecordKind) -> &'static [u8] {
         match kind {
-            LineageRecordKind::PrivateRoot => PRIVATE_ROOT_ENTROPY,
-            LineageRecordKind::PrivateSqlite => PRIVATE_SQLITE_ENTROPY,
-            LineageRecordKind::PrivateArtifactRoot => PRIVATE_ARTIFACT_ROOT_ENTROPY,
+            LineageRecordKind::Root => PRIVATE_ROOT_ENTROPY,
+            LineageRecordKind::Sqlite => PRIVATE_SQLITE_ENTROPY,
+            LineageRecordKind::ArtifactRoot => PRIVATE_ARTIFACT_ROOT_ENTROPY,
             LineageRecordKind::CleanupMarker => CLEANUP_MARKER_ENTROPY,
         }
     }
@@ -6939,10 +7316,21 @@ mod windows_lineage {
         let key = open_registry_key_at(ARTIFACT_REGISTRY_KEY, true)?
             .expect("write opens or creates the artifact registry key");
         let name = wide(&artifact_value_name(context_hash));
-        let length = u32::try_from(protected.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "artifact authority is too large"))?;
+        let length = u32::try_from(protected.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artifact authority is too large",
+            )
+        })?;
         let status = unsafe {
-            RegSetValueExW(key.0, name.as_ptr(), 0, REG_BINARY, protected.as_ptr(), length)
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_BINARY,
+                protected.as_ptr(),
+                length,
+            )
         };
         if status != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(status as i32));
@@ -7122,9 +7510,9 @@ mod windows_acl {
             FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
-            WRITE_OWNER,
+            FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+            SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
         },
         System::Threading::{
             CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
@@ -7530,7 +7918,7 @@ mod windows_acl {
         let directory = nt_open_child_with_options(
             parent,
             path,
-            FILE_READ_ATTRIBUTES,
+            READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_OPEN,
             ptr::null(),
@@ -8466,8 +8854,11 @@ mod windows_acl {
     }
 
     pub(super) fn open_directory_for_authority(path: &Path) -> io::Result<std::fs::File> {
-        let directory =
-            open_directory_with_share(path, READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+        let directory = open_directory_with_share(
+            path,
+            READ_CONTROL | FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?;
         harden(&directory, true)?;
         Ok(directory)
     }
@@ -8522,9 +8913,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fresh_absent_artifact_data_dir_is_published_as_authenticated_container() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("artifact-data");
+
+        let first = ensure_private_artifact_container(&data_dir).unwrap();
+        let first_id = first.id.clone();
+        assert_eq!(first.context, private_artifact_container_purpose());
+        assert!(data_dir.join(PRIVATE_ARTIFACT_ROOT_MARKER).is_file());
+        drop(first);
+
+        let reopened = ensure_private_artifact_container(&data_dir).unwrap();
+        assert_eq!(reopened.id, first_id);
+        assert!(reopened.child_names().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_authenticated_container_and_root_reopen_and_enumerate() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("artifact-data");
+        let container = ensure_private_artifact_container(&data_dir).unwrap();
+        assert!(container
+            .child_names()
+            .unwrap()
+            .iter()
+            .any(|name| { name == std::ffi::OsStr::new(PRIVATE_ARTIFACT_ROOT_MARKER) }));
+        drop(container);
+
+        let purpose = b"mainnet\0native-windows-enumeration";
+        let root = private_artifact_root_path(&data_dir, purpose);
+        ensure_private_artifact_root(&root, purpose).unwrap();
+        let names = private_data_dir_child_names(&data_dir).unwrap();
+        assert!(names.iter().any(|name| root.file_name() == Some(name)));
+
+        let reopened = ensure_private_artifact_root(&root, purpose).unwrap();
+        reopened.verify_current().unwrap();
+        assert_eq!(
+            reopened.child_names().unwrap().len(),
+            PRIVATE_ARTIFACT_BOUND_NAMES.len() + 1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_artifact_container_recovers_pending_before_publish() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("artifact-data");
+        let context =
+            private_artifact_root_context(&data_dir, private_artifact_container_purpose()).unwrap();
+        prepare_windows_artifact_root_creation(&context).unwrap();
+        assert!(!data_dir.exists());
+
+        let container = ensure_private_artifact_container(&data_dir).unwrap();
+
+        container.verify_current().unwrap();
+        assert!(data_dir.join(PRIVATE_ARTIFACT_ROOT_MARKER).is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_artifact_container_registry_prevents_rollback_or_remint() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("artifact-data");
+        let parked = outer.path().join("parked-artifact-data");
+        ensure_private_artifact_container(&data_dir).unwrap();
+        fs::rename(&data_dir, &parked).unwrap();
+
+        let missing = ensure_private_artifact_container(&data_dir)
+            .expect_err("an Active container authority must forbid reminting a missing path");
+        assert_eq!(missing.kind(), io::ErrorKind::PermissionDenied);
+
+        create_private_dir_all(&data_dir).unwrap();
+        let decoy = ensure_private_artifact_container(&data_dir)
+            .expect_err("an unmarked decoy cannot supersede the Active container");
+        assert_eq!(decoy.kind(), io::ErrorKind::PermissionDenied);
+        fs::remove_dir(&data_dir).unwrap();
+        fs::rename(&parked, &data_dir).unwrap();
+        ensure_private_artifact_container(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn preexisting_unmarked_artifact_data_dir_is_refused_unchanged() {
+        let outer = tempfile::tempdir().unwrap();
+        let data_dir = outer.path().join("existing-data");
+        create_private_dir_all(&data_dir).unwrap();
+        write_private_file(
+            &data_dir.join("sprout-sweep-deadbeefdeadbeef.journal"),
+            b"historical broadcast state",
+        )
+        .unwrap();
+
+        let error = ensure_private_artifact_container(&data_dir)
+            .expect_err("an unproven existing data dir must require reconciliation");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("explicitly reconcile"));
+        assert_eq!(
+            fs::read(data_dir.join("sprout-sweep-deadbeefdeadbeef.journal")).unwrap(),
+            b"historical broadcast state"
+        );
+        assert!(!data_dir.join(PRIVATE_ARTIFACT_ROOT_MARKER).exists());
+    }
+
+    #[test]
     fn fresh_private_artifact_root_binds_every_precreated_authority_object() {
         let outer = tempfile::tempdir().unwrap();
-        let root = outer.path().join(".argos-private-artifacts-mainnet-deadbeef");
+        let root = outer
+            .path()
+            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         let context = b"mainnet\0full-fingerprint\0artifact-root";
 
         let first = ensure_private_artifact_root(&root, context).unwrap();
@@ -8541,7 +9038,9 @@ mod tests {
     #[test]
     fn unmarked_private_artifact_root_is_refused_without_mutation() {
         let outer = tempfile::tempdir().unwrap();
-        let root = outer.path().join(".argos-private-artifacts-mainnet-deadbeef");
+        let data_dir = outer.path().join("artifact-data");
+        ensure_private_artifact_container(&data_dir).unwrap();
+        let root = data_dir.join(".argos-private-artifacts-mainnet-deadbeef");
         create_private_dir_all(&root).unwrap();
         write_private_file(&root.join("checkpoint"), b"legacy secret").unwrap();
 
@@ -8556,11 +9055,38 @@ mod tests {
     #[test]
     fn private_artifact_root_context_replay_is_refused() {
         let outer = tempfile::tempdir().unwrap();
-        let root = outer.path().join(".argos-private-artifacts-mainnet-deadbeef");
+        let root = outer
+            .path()
+            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         ensure_private_artifact_root(&root, b"mainnet\0fingerprint-a").unwrap();
 
         let error = ensure_private_artifact_root(&root, b"testnet\0fingerprint-a")
             .expect_err("network context replay must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_artifact_acquire_rejects_root_swapped_after_marker_read() {
+        let outer = tempfile::tempdir().unwrap();
+        let purpose = b"mainnet\0full-fingerprint";
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
+        let parked = outer.path().join("parked-private-root");
+        let artifact = root.join("checkpoint");
+        ensure_private_artifact_root(&root, purpose).unwrap();
+
+        let error = PrivateArtifactAccess::acquire_existing_with_observer(
+            &root,
+            PrivateArtifactDomain::Checkpoint,
+            &artifact,
+            || {
+                fs::rename(&root, &parked)?;
+                ensure_private_artifact_root(&root, purpose)?;
+                Ok(())
+            },
+        )
+        .expect_err("marker observation must remain bound to the retained root identity");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
@@ -8586,7 +9112,9 @@ mod tests {
     #[test]
     fn artifact_authority_is_durable_before_the_first_secret_byte() {
         let outer = tempfile::tempdir().unwrap();
-        let root = outer.path().join(".argos-private-artifacts-mainnet-deadbeef");
+        let root = outer
+            .path()
+            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         let artifact = root.join("journal");
         let purpose = b"mainnet\0full-fingerprint";
         let access = PrivateArtifactAccess::acquire(
@@ -8617,7 +9145,9 @@ mod tests {
     #[test]
     fn existing_unbound_artifact_is_refused_without_read_or_mutation() {
         let outer = tempfile::tempdir().unwrap();
-        let root = outer.path().join(".argos-private-artifacts-mainnet-deadbeef");
+        let root = outer
+            .path()
+            .join("artifact-data/.argos-private-artifacts-mainnet-deadbeef");
         let purpose = b"mainnet\0full-fingerprint";
         ensure_private_artifact_root(&root, purpose).unwrap();
         let artifact = root.join("journal");
@@ -8642,7 +9172,7 @@ mod tests {
     fn artifact_replacement_records_exact_generation_before_publication() {
         let outer = tempfile::tempdir().unwrap();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(outer.path(), purpose);
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -8669,7 +9199,7 @@ mod tests {
     fn windows_artifact_domains_cold_verify_before_retaining_their_bound_locks() {
         let outer = tempfile::tempdir().unwrap();
         let purpose = format!("mainnet\0{}", uuid::Uuid::new_v4()).into_bytes();
-        let root = private_artifact_root_path(outer.path(), &purpose);
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), &purpose);
         let checkpoint = root.join("checkpoint");
         let journal = root.join("journal");
 
@@ -8698,7 +9228,7 @@ mod tests {
     fn windows_artifact_registry_prevents_root_rollback_or_remint() {
         let outer = tempfile::tempdir().unwrap();
         let purpose = format!("mainnet\0{}", uuid::Uuid::new_v4()).into_bytes();
-        let root = private_artifact_root_path(outer.path(), &purpose);
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), &purpose);
         let parked = outer.path().join("parked-root");
         ensure_private_artifact_root(&root, &purpose).unwrap();
         fs::rename(&root, &parked).unwrap();
@@ -8720,7 +9250,7 @@ mod tests {
     fn artifact_authority_stays_bounded_across_full_chain_checkpoint_cadence() {
         let outer = tempfile::tempdir().unwrap();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(outer.path(), purpose);
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -8750,7 +9280,7 @@ mod tests {
     fn torn_newest_authority_slot_falls_back_to_previous_durable_state() {
         let outer = tempfile::tempdir().unwrap();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(outer.path(), purpose);
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -8775,7 +9305,11 @@ mod tests {
             .unwrap();
 
         let newest = access.current_record().unwrap().unwrap();
-        let mut file = OpenOptions::new().read(true).write(true).open(&access.authority).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&access.authority)
+            .unwrap();
         let corrupt_at = newest.sequence % 2 * 4096 + 4095;
         file.seek(SeekFrom::Start(corrupt_at)).unwrap();
         file.write_all(&[0x7f]).unwrap();
@@ -8793,7 +9327,7 @@ mod tests {
     fn checkpoint_retirement_restores_after_restart_and_retires_before_reuse() {
         let outer = tempfile::tempdir().unwrap();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(outer.path(), purpose);
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
         let artifact = root.join("checkpoint");
         let access = PrivateArtifactAccess::acquire(
             &root,
@@ -8845,7 +9379,7 @@ mod tests {
     fn retained_root_allows_checkpoint_and_journal_domains_to_coexist() {
         let outer = tempfile::tempdir().unwrap();
         let purpose = b"mainnet\0full-fingerprint";
-        let root = private_artifact_root_path(outer.path(), purpose);
+        let root = private_artifact_root_path(&outer.path().join("artifact-data"), purpose);
         let checkpoint = root.join("checkpoint");
         let journal = root.join("journal");
         let checkpoint_access = PrivateArtifactAccess::acquire(
@@ -9950,7 +10484,7 @@ mod windows_tests {
     #[test]
     fn windows_lineage_decoder_refuses_plaintext_json() {
         let error = decode_lineage_record::<PrivateRootLineageRecord>(
-            LineageRecordKind::PrivateRoot,
+            LineageRecordKind::Root,
             br#"{"schema_version":1}"#,
         )
         .expect_err("Windows lineage must never accept an unauthenticated JSON fallback");

@@ -153,9 +153,17 @@ pub const CHECKPOINT_EVERY: u64 = 500;
 /// proposal. A path and digest alone do not detect an atomic replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CheckpointGeneration {
+    pub lineage_anchor: [u8; 16],
+    pub artifact_generation: [u8; 16],
     pub len: u64,
     pub sha256: [u8; 32],
     pub object: CheckpointObjectId,
+}
+
+struct CheckpointContentGeneration {
+    len: u64,
+    sha256: [u8; 32],
+    object: CheckpointObjectId,
 }
 
 /// Cross-process lease for a checkpoint path.
@@ -168,27 +176,96 @@ pub struct CheckpointGeneration {
 /// to notice.
 pub struct CheckpointLease {
     namespace: std::sync::Arc<crate::private_fs::NamespaceLease>,
+    access: crate::private_fs::PrivateArtifactAccess,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
 impl CheckpointLease {
     pub fn acquire(path: &Path) -> ZeckResult<Self> {
-        let sidecar_path = checkpoint_lease_path(path);
-        let parent_path = sidecar_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        ensure_checkpoint_parent(path)?;
-        let namespace = crate::private_fs::NamespaceLease::acquire(&parent_path, &sidecar_path)
-            .map_err(|err| {
+        let parent_path = path.parent().ok_or_else(|| {
+            ZeckError::ScanNotReady("checkpoint has no private artifact root".into())
+        })?;
+        let access = crate::private_fs::PrivateArtifactAccess::acquire_existing(
+            parent_path,
+            crate::private_fs::PrivateArtifactDomain::Checkpoint,
+            path,
+        )
+        .map_err(|err| {
+            ZeckError::ScanNotReady(format!(
+                "checkpoint {} has no valid create-time authority: {err}",
+                path.display()
+            ))
+        })?;
+        Self::from_access(path, access)
+    }
+
+    fn acquire_for(
+        path: &Path,
+        network: P2pNetwork,
+        spending_keys: &[[u8; 32]],
+    ) -> ZeckResult<Self> {
+        let purpose = checkpoint_artifact_purpose(network, spending_keys);
+        let expected_root = path.parent().ok_or_else(|| {
+            ZeckError::ScanNotReady("checkpoint has no private artifact root".into())
+        })?;
+        let data_dir = expected_root.parent().ok_or_else(|| {
+            ZeckError::ScanNotReady("checkpoint artifact root has no data directory".into())
+        })?;
+        if crate::private_fs::private_artifact_root_path(data_dir, &purpose) != expected_root {
+            return Err(ZeckError::ScanNotReady(format!(
+                "checkpoint {} is outside its network and key-set artifact root",
+                path.display()
+            )));
+        }
+        crate::service::ensure_recovery_data_dir(data_dir)?;
+        let legacy = data_dir.join(format!(
+            "sprout-scan-{}.checkpoint",
+            key_set_fingerprint(spending_keys)
+        ));
+        match fs::symlink_metadata(&legacy) {
+            Ok(_) => {
+                return Err(ZeckError::ScanNotReady(format!(
+                    "legacy direct Sprout checkpoint {} has no create-time artifact authority; it was preserved unchanged. Move it aside while Argos is stopped and start a fresh scan",
+                    legacy.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ZeckError::ScanNotReady(format!(
+                    "cannot verify absence of legacy direct Sprout checkpoint {}: {error}",
+                    legacy.display()
+                )))
+            }
+        }
+        let access = crate::private_fs::PrivateArtifactAccess::acquire(
+            expected_root,
+            &purpose,
+            crate::private_fs::PrivateArtifactDomain::Checkpoint,
+            path,
+        )
+        .map_err(|err| {
+            ZeckError::ScanNotReady(format!(
+                "checkpoint {} has no valid create-time authority: {err}",
+                path.display()
+            ))
+        })?;
+        Self::from_access(path, access)
+    }
+
+    fn from_access(
+        path: &Path,
+        access: crate::private_fs::PrivateArtifactAccess,
+    ) -> ZeckResult<Self> {
+        let namespace =
+            std::sync::Arc::new(access.namespace().try_clone_authority().map_err(|err| {
                 ZeckError::ScanNotReady(format!(
-                    "checkpoint {} is in use by another recovery operation: {err}",
+                    "retaining checkpoint authority {}: {err}",
                     path.display()
                 ))
-            })?;
+            })?);
         let lease = Self {
-            namespace: std::sync::Arc::new(namespace),
+            namespace,
+            access,
             _not_sync: std::marker::PhantomData,
         };
         lease.verify_for(path)?;
@@ -226,71 +303,19 @@ impl CheckpointLease {
 
     fn open_child(&self, path: &Path) -> ZeckResult<Option<fs::File>> {
         self.child_path(path)?;
-        match crate::private_fs::open_child_file_for_removal(self.namespace.parent(), path) {
-            Ok(file) => Ok(Some(file)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(ZeckError::TransactionBuild(format!(
-                "opening checkpoint child {}: {err}",
+        if path != self.access.artifact_path() {
+            return Err(ZeckError::ScanNotReady(format!(
+                "checkpoint authority does not authorize auxiliary child {}",
                 path.display()
-            ))),
+            )));
         }
-    }
-
-    fn remove_child(&self, path: &Path) -> ZeckResult<bool> {
-        self.child_path(path)?;
-        match crate::private_fs::remove_child_file(self.namespace.parent(), path) {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(ZeckError::TransactionBuild(format!(
-                "removing checkpoint child {}: {err}",
-                path.display()
-            ))),
-        }
-    }
-
-    fn remove_open_child(
-        &self,
-        path: &Path,
-        file: &fs::File,
-        expected_id: &CheckpointObjectId,
-    ) -> ZeckResult<()> {
-        self.child_path(path)?;
-        self.namespace
-            .remove_open_child(path, file, expected_id)
+        self.access
+            .open_active_child()
+            .map(|child| child.map(|(file, _, _)| file))
             .map_err(|err| {
                 ZeckError::TransactionBuild(format!(
-                    "removing exact checkpoint child {}: {err}",
+                    "opening checkpoint child {}: {err}",
                     path.display()
-                ))
-            })
-    }
-
-    fn rename_open_child(
-        &self,
-        from: &Path,
-        to: &Path,
-        file: &fs::File,
-        expected: &CheckpointObjectId,
-    ) -> ZeckResult<()> {
-        self.child_path(from)?;
-        self.child_path(to)?;
-        self.namespace
-            .rename_open_child(from, to, file, expected)
-            .map_err(|err| {
-                ZeckError::TransactionBuild(format!(
-                    "renaming exact checkpoint child {} to {}: {err}",
-                    from.display(),
-                    to.display()
-                ))
-            })
-    }
-
-    fn child_names(&self) -> ZeckResult<Vec<std::ffi::OsString>> {
-        crate::private_fs::parent_child_names(self.namespace.parent(), self.namespace.parent_path())
-            .map_err(|err| {
-                ZeckError::TransactionBuild(format!(
-                    "reading checkpoint directory {}: {err}",
-                    self.namespace.parent_path().display()
                 ))
             })
     }
@@ -315,45 +340,111 @@ impl CheckpointLease {
         path: &Path,
     ) -> ZeckResult<Option<CheckpointGeneration>> {
         self.open_child(path)?
-            .map(|file| checkpoint_generation_from_handle(&file, path))
+            .map(|file| {
+                checkpoint_generation_from_handle(&file, path)
+                    .and_then(|content| self.bind_content_generation(content))
+            })
             .transpose()
+    }
+
+    fn bind_content_generation(
+        &self,
+        content: CheckpointContentGeneration,
+    ) -> ZeckResult<CheckpointGeneration> {
+        let (lineage_anchor, state) = self
+            .access
+            .current_authority()
+            .map_err(|err| {
+                ZeckError::ScanNotReady(format!("reading checkpoint lineage authority: {err}"))
+            })?
+            .ok_or_else(|| {
+                ZeckError::ScanNotReady("checkpoint lineage authority is missing".into())
+            })?;
+        let (artifact_generation, object) = match state {
+            crate::private_fs::PrivateArtifactState::Active { generation, object }
+            | crate::private_fs::PrivateArtifactState::Retiring {
+                generation, object, ..
+            } => (generation, object),
+            state => {
+                return Err(ZeckError::ScanNotReady(format!(
+                    "checkpoint lineage authority is not active or retiring: {state:?}"
+                )))
+            }
+        };
+        if object != content.object {
+            return Err(ZeckError::ScanNotReady(
+                "checkpoint content does not match its exact lineage authority".into(),
+            ));
+        }
+        Ok(CheckpointGeneration {
+            lineage_anchor,
+            artifact_generation,
+            len: content.len,
+            sha256: content.sha256,
+            object: content.object,
+        })
     }
 
     pub(crate) fn clone_namespace(&self) -> std::sync::Arc<crate::private_fs::NamespaceLease> {
         std::sync::Arc::clone(&self.namespace)
     }
+
+    pub(crate) fn clone_artifact_root(
+        &self,
+    ) -> std::sync::Arc<crate::private_fs::PrivateArtifactRootLease> {
+        self.access.root_lease()
+    }
+
+    pub(crate) fn restore_interrupted_retirement(&self, path: &Path) -> ZeckResult<bool> {
+        self.child_path(path)?;
+        self.access.restore_retiring_child().map_err(|err| {
+            ZeckError::ScanNotReady(format!(
+                "restoring interrupted checkpoint retirement {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    fn quarantine_for_cleanup(
+        &self,
+        path: &Path,
+        expected: &CheckpointObjectId,
+        cleanup_id: [u8; 16],
+    ) -> ZeckResult<(PathBuf, fs::File)> {
+        self.child_path(path)?;
+        self.access
+            .quarantine_active_child(expected, cleanup_id)
+            .map(|(path, file, _)| (path, file))
+            .map_err(|err| {
+                ZeckError::ScanNotReady(format!(
+                    "retiring exact checkpoint {}: {err}",
+                    path.display()
+                ))
+            })
+    }
+
+    fn finish_cleanup(
+        &self,
+        quarantine: &Path,
+        file: &fs::File,
+        expected: &CheckpointObjectId,
+        cleanup_id: [u8; 16],
+    ) -> ZeckResult<()> {
+        self.access
+            .finish_retiring_child(quarantine, file, expected, cleanup_id)
+            .map_err(|err| {
+                ZeckError::ScanNotReady(format!(
+                    "finishing exact checkpoint retirement {}: {err}",
+                    quarantine.display()
+                ))
+            })
+    }
 }
 
 fn checkpoint_lease_path(path: &Path) -> PathBuf {
-    let mut sidecar = path.as_os_str().to_os_string();
-    sidecar.push(".lease.sqlite");
-    PathBuf::from(sidecar)
-}
-
-fn ensure_checkpoint_parent(path: &Path) -> ZeckResult<()> {
-    let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return Ok(());
-    };
-    if parent.exists() {
-        if !parent.is_dir() {
-            return Err(ZeckError::TransactionBuild(format!(
-                "checkpoint parent {} is not a directory",
-                parent.display()
-            )));
-        }
-        return Ok(());
-    }
-    // A directory Argos creates for this checkpoint is private from birth.
-    // Existing user-selected data directories are never chmodded here.
-    crate::private_fs::create_private_dir_all(parent).map_err(|err| {
-        ZeckError::TransactionBuild(format!(
-            "creating private checkpoint directory {}: {err}",
-            parent.display()
-        ))
-    })
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".checkpoint.lease.sqlite")
 }
 
 pub use crate::private_fs::PrivateObjectId as CheckpointObjectId;
@@ -373,12 +464,13 @@ fn checkpoint_generation_with_post_read(
         ZeckError::ScanNotReady(format!("checkpoint {} is absent", path.display()))
     })?;
     checkpoint_generation_from_handle_with_post_read(&file, path, post_read)
+        .and_then(|content| lease.bind_content_generation(content))
 }
 
 fn checkpoint_generation_from_handle(
     file: &fs::File,
     path: &Path,
-) -> ZeckResult<CheckpointGeneration> {
+) -> ZeckResult<CheckpointContentGeneration> {
     checkpoint_generation_from_handle_with_post_read(file, path, || {})
 }
 
@@ -386,7 +478,7 @@ fn checkpoint_generation_from_handle_with_post_read(
     file: &fs::File,
     path: &Path,
     post_read: impl FnOnce(),
-) -> ZeckResult<CheckpointGeneration> {
+) -> ZeckResult<CheckpointContentGeneration> {
     let before = file.metadata().map_err(|err| {
         ZeckError::TransactionBuild(format!("inspecting checkpoint {}: {err}", path.display()))
     })?;
@@ -415,7 +507,7 @@ fn checkpoint_generation_from_handle_with_post_read(
             path.display()
         )));
     }
-    Ok(CheckpointGeneration {
+    Ok(CheckpointContentGeneration {
         len,
         sha256: digest,
         object: after_object,
@@ -607,7 +699,7 @@ fn load_checkpoint(
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
 ) -> ZeckResult<Option<SproutScanner>> {
-    let _lease = CheckpointLease::acquire(checkpoint_file)?;
+    let _lease = CheckpointLease::acquire_for(checkpoint_file, network, spending_keys)?;
     load_checkpoint_while_leased(&_lease, checkpoint_file, network, spending_keys)
 }
 
@@ -617,8 +709,6 @@ fn load_checkpoint_while_leased(
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
 ) -> ZeckResult<Option<SproutScanner>> {
-    lease.verify_for(checkpoint_file)?;
-    remove_stale_temp_files_while_leased(lease, checkpoint_file)?;
     lease.verify_for(checkpoint_file)?;
     let Some(mut file) = lease.open_child(checkpoint_file)? else {
         return Ok(None);
@@ -922,7 +1012,7 @@ fn lookup_chain_spends(
     network: P2pNetwork,
     spending_keys: &[[u8; 32]],
 ) -> ZeckResult<ChainSpendsLookup> {
-    let path = checkpoint_path(data_dir, spending_keys);
+    let path = checkpoint_path_for_network(data_dir, spending_keys, network);
     let Some(bytes) = read_checkpoint_file(&path)? else {
         return Ok(ChainSpendsLookup::NotFound { path });
     };
@@ -1050,42 +1140,116 @@ fn scans_covering(
     data_dir: &Path,
     network: P2pNetwork,
     wanted: &[[u8; 32]],
-) -> Vec<SecretSproutKeys> {
-    let Ok(entries) = std::fs::read_dir(data_dir) else {
-        return Vec::new();
-    };
-    let tag = network_tag(network);
+) -> Result<Vec<SecretSproutKeys>, String> {
+    for name in crate::private_fs::private_data_dir_child_names(data_dir).map_err(|err| {
+        format!(
+            "cannot verify the data directory for legacy Sprout checkpoints {}: {err}",
+            data_dir.display()
+        )
+    })? {
+        let text = name.to_string_lossy();
+        if text.starts_with("sprout-scan-") && text.ends_with(".checkpoint") {
+            return Err(format!(
+                "legacy direct Sprout checkpoint {} has no create-time artifact authority; it was preserved unchanged. Move it aside while Argos is stopped and start a fresh scan",
+                data_dir.join(name).display()
+            ));
+        }
+    }
+    let roots = crate::private_fs::discover_private_artifact_roots(data_dir).map_err(|err| {
+        format!(
+            "cannot authenticate private Sprout checkpoint roots in {}: {err}",
+            data_dir.display()
+        )
+    })?;
     let mut found = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !(name.starts_with("sprout-scan-") && name.ends_with(".checkpoint")) {
-            continue;
+    for root in roots {
+        let mut checkpoint = None;
+        for name in root.child_names().map_err(|err| {
+            format!(
+                "cannot enumerate private artifact root {}: {err}",
+                root.path().display()
+            )
+        })? {
+            let text = name.to_string_lossy();
+            if !(text.starts_with("sprout-scan-") && text.ends_with(".checkpoint")) {
+                continue;
+            }
+            let path = root.path().join(name);
+            if checkpoint.replace(path).is_some() {
+                return Err(format!(
+                    "private artifact root {} contains multiple Sprout checkpoints",
+                    root.path().display()
+                ));
+            }
         }
-        let path = entry.path();
-        let Ok(lease) = CheckpointLease::acquire(&path) else {
+        let Some(path) = checkpoint else {
             continue;
         };
-        let Ok(Some(mut file)) = lease.open_child(&path) else {
+        let purpose = root.purpose().to_vec();
+        let access = crate::private_fs::PrivateArtifactAccess::acquire_from_verified_root(
+            root,
+            &purpose,
+            crate::private_fs::PrivateArtifactDomain::Checkpoint,
+            &path,
+        )
+        .map_err(|err| {
+            format!(
+                "cannot authenticate Sprout checkpoint {}: {err}",
+                path.display()
+            )
+        })?;
+        let Some((mut file, _, _)) = access.open_active_child().map_err(|err| {
+            format!(
+                "cannot open authenticated Sprout checkpoint {}: {err}",
+                path.display()
+            )
+        })?
+        else {
             continue;
         };
-        let Ok(head) = read_secret_prefix(&mut file, HEADER_READ_LIMIT as usize) else {
-            continue;
-        };
+        let head = read_secret_prefix(&mut file, HEADER_READ_LIMIT as usize)
+            .map_err(|err| format!("cannot read Sprout checkpoint {}: {err}", path.display()))?;
         let [NETWORK_TAGGED, file_tag, body @ ..] = head.as_slice() else {
-            continue;
+            return Err(format!(
+                "authenticated Sprout checkpoint {} has no network tag",
+                path.display()
+            ));
         };
-        if *file_tag != tag {
+        let file_network = [
+            P2pNetwork::Mainnet,
+            P2pNetwork::Testnet,
+            P2pNetwork::Regtest,
+        ]
+        .into_iter()
+        .find(|candidate| network_tag(*candidate) == *file_tag)
+        .ok_or_else(|| {
+            format!(
+                "authenticated Sprout checkpoint {} has an unknown network tag",
+                path.display()
+            )
+        })?;
+        let keys = crate::sprout_scan::read_spending_keys(body).map_err(|err| {
+            format!(
+                "cannot read key-set header from authenticated Sprout checkpoint {}: {err}",
+                path.display()
+            )
+        })?;
+        if checkpoint_artifact_purpose(file_network, &keys) != purpose
+            || checkpoint_path_for_network(data_dir, &keys, file_network) != path
+        {
+            return Err(format!(
+                "authenticated Sprout checkpoint {} does not match its network, full key fingerprint, and child name",
+                path.display()
+            ));
+        }
+        if file_network != network {
             continue;
         }
-        let Ok(keys) = crate::sprout_scan::read_spending_keys(body) else {
-            continue;
-        };
         if keys.len() > wanted.len() && wanted.iter().all(|k| keys.binary_search(k).is_ok()) {
             found.push(keys);
         }
     }
-    found
+    Ok(found)
 }
 
 /// Read at most `limit` bytes without ever growing or replacing the backing
@@ -1120,12 +1284,13 @@ fn select_wallet_checkpoint(
     network: P2pNetwork,
     keys: &[[u8; 32]],
 ) -> Result<(SecretSproutKeys, Option<usize>), String> {
-    let path = checkpoint_path(data_dir, keys);
+    crate::service::ensure_recovery_data_dir(data_dir).map_err(|err| err.to_string())?;
+    let path = checkpoint_path_for_network(data_dir, keys, network);
     match std::fs::metadata(&path) {
         Ok(_) => Ok((SecretSproutKeys::copied_from(keys), None)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let mut unusable = Vec::new();
-            let best = scans_covering(data_dir, network, keys)
+            let best = scans_covering(data_dir, network, keys)?
                 .into_iter()
                 .filter_map(|wider| match lookup_chain_spends(data_dir, network, &wider) {
                     Ok(ChainSpendsLookup::Found(evidence)) => {
@@ -1133,7 +1298,7 @@ fn select_wallet_checkpoint(
                     }
                     Ok(_) => None,
                     Err(err) => {
-                        unusable.push(format!("{} ({err})", checkpoint_path(data_dir, &wider).display()));
+                        unusable.push(format!("{} ({err})", checkpoint_path_for_network(data_dir, &wider, network).display()));
                         None
                     }
                 })
@@ -1181,7 +1346,7 @@ async fn verified_checkpoint_lookup_with<V: CursorVerifier>(
     read_stamp: impl FnOnce(&Path) -> Option<Stamp> + Send + 'static,
     after_reconcile: impl FnOnce(&Path),
 ) -> ZeckResult<VerifiedLookup> {
-    let path = checkpoint_path(data_dir, keys);
+    let path = checkpoint_path_for_network(data_dir, keys, network);
     // A completed mainnet scan is millions of nullifiers: read and parse it
     // once, off the async runtime.
     let loaded = {
@@ -1280,7 +1445,7 @@ pub fn wallet_scan_notice_offline(
         Ok(selected) => selected,
         Err(notice) => return Some(notice),
     };
-    let path = checkpoint_path(data_dir, &selected);
+    let path = checkpoint_path_for_network(data_dir, &selected, network);
     let wider = wider_keys.map_or(String::new(), |width| {
         format!(" (it scanned this wallet's Sprout keys together with {width} other key(s))")
     });
@@ -1318,7 +1483,7 @@ pub async fn chain_spends_for_wallet(
         Ok(selected) => selected,
         Err(notice) => return (None, Some(notice)),
     };
-    let path = checkpoint_path(data_dir, &selected);
+    let path = checkpoint_path_for_network(data_dir, &selected, network);
     let result = tokio::time::timeout(WALLET_EVIDENCE_BUDGET, async {
         let mut waits = Vec::new();
         let mut peer = connect_peer_with_budget(
@@ -1377,9 +1542,52 @@ pub fn scan_key_set(wallet_keys: &[[u8; 32]], extra_keys: &[[u8; 32]]) -> Secret
 /// wallet never resumes into the wrong tree — a checkpoint restored under
 /// the wrong keys would hold a valid tree and find nothing, with no
 /// indication why.
-pub fn checkpoint_path(data_dir: &Path, spending_keys: &[[u8; 32]]) -> PathBuf {
+pub fn checkpoint_path_for_network(
+    data_dir: &Path,
+    spending_keys: &[[u8; 32]],
+    network: P2pNetwork,
+) -> PathBuf {
     let fingerprint = key_set_fingerprint(spending_keys);
-    data_dir.join(format!("sprout-scan-{fingerprint}.checkpoint"))
+    let purpose = checkpoint_artifact_purpose(network, spending_keys);
+    crate::private_fs::private_artifact_root_path(data_dir, &purpose)
+        .join(format!("sprout-scan-{fingerprint}.checkpoint"))
+}
+
+/// Return the mainnet checkpoint path for callers that predate explicit
+/// network selection. Production call sites with a selected network must use
+/// [`checkpoint_path_for_network`] so testnet and mainnet authorities cannot
+/// share a namespace.
+pub fn checkpoint_path(data_dir: &Path, spending_keys: &[[u8; 32]]) -> PathBuf {
+    checkpoint_path_for_network(data_dir, spending_keys, P2pNetwork::Mainnet)
+}
+
+pub fn checkpoint_data_dir<'a>(
+    checkpoint: &'a Path,
+    spending_keys: &[[u8; 32]],
+    network: P2pNetwork,
+) -> ZeckResult<&'a Path> {
+    let root = checkpoint
+        .parent()
+        .ok_or_else(|| ZeckError::ScanNotReady("checkpoint has no private artifact root".into()))?;
+    let data_dir = root.parent().ok_or_else(|| {
+        ZeckError::ScanNotReady("checkpoint artifact root has no data directory".into())
+    })?;
+    if checkpoint_path_for_network(data_dir, spending_keys, network) != checkpoint {
+        return Err(ZeckError::ScanNotReady(format!(
+            "checkpoint {} does not match its network, key set, and data directory",
+            checkpoint.display()
+        )));
+    }
+    Ok(data_dir)
+}
+
+fn checkpoint_artifact_purpose(network: P2pNetwork, spending_keys: &[[u8; 32]]) -> Vec<u8> {
+    let network = match network {
+        P2pNetwork::Mainnet => "mainnet",
+        P2pNetwork::Testnet => "testnet",
+        P2pNetwork::Regtest => "regtest",
+    };
+    crate::private_fs::private_artifact_purpose(network, &full_key_set_fingerprint(spending_keys))
 }
 
 /// A short, stable name for a set of Sprout spending keys: the first eight
@@ -2007,7 +2215,7 @@ pub async fn run_sprout_scan_with_decrypt_from(
     // Held across load, reconciliation and every atomic replacement. A
     // reviewed sweep proposal holds the same stable sidecar lock, so a scan
     // cannot replace the exact checkpoint while cleanup authority is live.
-    let checkpoint_lease = CheckpointLease::acquire(checkpoint_file)?;
+    let checkpoint_lease = CheckpointLease::acquire_for(checkpoint_file, network, spending_keys)?;
 
     // `fetched` counts blocks, so reaching the anchor's height means having
     // fetched one past it.
@@ -2276,7 +2484,8 @@ fn consume_page_or_save(
     height: &mut u32,
     checkpoint_file: &Path,
 ) -> ZeckResult<u64> {
-    let lease = CheckpointLease::acquire(checkpoint_file)?;
+    let keys = scanner.spending_keys();
+    let lease = CheckpointLease::acquire_for(checkpoint_file, network, keys.as_slice())?;
     consume_page_or_save_while_leased(
         &lease,
         scanner,
@@ -2732,7 +2941,8 @@ pub fn save_checkpoint(
     network: P2pNetwork,
     path: &Path,
 ) -> ZeckResult<()> {
-    let _lease = CheckpointLease::acquire(path)?;
+    let keys = scanner.spending_keys();
+    let _lease = CheckpointLease::acquire_for(path, network, keys.as_slice())?;
     save_checkpoint_while_leased(&_lease, scanner, network, path)
 }
 
@@ -2743,18 +2953,17 @@ fn save_checkpoint_while_leased(
     path: &Path,
 ) -> ZeckResult<()> {
     lease.verify_for(path)?;
-    ensure_checkpoint_parent(path)?;
     // Written to a private create-new sibling, synced, and renamed while a
     // platform-correct parent-directory handle stays open. An interrupt
     // cannot leave a half-written checkpoint where a good one was, and a
     // Windows directory is never opened as an ordinary file after mutation.
-    remove_stale_temp_files_while_leased(lease, path)?;
-    lease.verify_for(path)?;
     let checkpoint = scanner.checkpoint();
     let mut bytes = Zeroizing::new(Vec::with_capacity(2 + checkpoint.as_bytes().len()));
     bytes.extend_from_slice(&[NETWORK_TAGGED, network_tag(network)]);
     bytes.extend_from_slice(checkpoint.as_bytes());
-    crate::private_fs::write_private_file_atomic_in_parent(lease.namespace.parent(), path, &bytes)
+    lease
+        .access
+        .replace_child(&bytes)
         .map_err(|err| ZeckError::TransactionBuild(format!("replacing the scan checkpoint: {err}")))
 }
 
@@ -2763,7 +2972,8 @@ fn save_checkpoint_while_leased(
 /// error is the one the user needs to see.
 #[cfg(test)]
 fn save_before_stopping(scanner: &SproutScanner, network: P2pNetwork, path: &Path) {
-    let lease = match CheckpointLease::acquire(path) {
+    let keys = scanner.spending_keys();
+    let lease = match CheckpointLease::acquire_for(path, network, keys.as_slice()) {
         Ok(lease) => lease,
         Err(err) => {
             tracing::warn!("could not reserve the Sprout scan checkpoint while stopping: {err}");
@@ -2840,24 +3050,19 @@ pub fn discard_checkpoint(path: &Path) -> ZeckResult<CheckpointDiscard> {
     let lease = CheckpointLease::acquire(path)?;
     match lease.generation(path) {
         Ok(generation) => discard_checkpoint_generation_while_leased(&lease, path, &generation),
-        Err(_) if !path.exists() => {
-            let removed = discard_checkpoint_temporaries(&lease, path)?;
-            let quarantines = checkpoint_discard_quarantines(&lease, path)?;
-            if !quarantines.is_empty() {
-                return Err(ZeckError::ScanNotReady(format!(
-                    "checkpoint {} is absent but exact deletion quarantine {} remains; retained it because no manifested generation authorized deletion",
-                    path.display(),
-                    quarantines[0].display()
-                )));
+        Err(_) => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(CheckpointDiscard::AlreadyAbsent)
             }
-            lease.sync_parent()?;
-            Ok(if removed {
-                CheckpointDiscard::Removed
-            } else {
-                CheckpointDiscard::AlreadyAbsent
-            })
-        }
-        Err(err) => Err(err),
+            Err(error) => Err(ZeckError::ScanNotReady(format!(
+                "cannot verify checkpoint absence {}: {error}",
+                path.display()
+            ))),
+            Ok(_) => Err(ZeckError::ScanNotReady(format!(
+                "checkpoint {} exists but its authority could not be verified",
+                path.display()
+            ))),
+        },
     }
 }
 
@@ -2869,31 +3074,16 @@ pub(crate) fn discard_checkpoint_generation_while_leased(
     discard_checkpoint_generation_while_leased_with_observer(lease, path, expected, || {})
 }
 
-fn discard_checkpoint_temporaries(lease: &CheckpointLease, path: &Path) -> ZeckResult<bool> {
+fn fail_checkpoint_discard_if_injected(path: &Path) -> ZeckResult<()> {
+    #[cfg(not(test))]
+    let _ = path;
     #[cfg(test)]
     if FAIL_CHECKPOINT_DISCARD.lock().unwrap().remove(path) {
         return Err(ZeckError::TransactionBuild(
             "injected checkpoint deletion failure".into(),
         ));
     }
-    lease.verify_for(path)?;
-    let mut removed =
-        crate::private_fs::discard_private_file_staging_in_parent(lease.namespace.parent(), path)
-            .map_err(|err| {
-            ZeckError::TransactionBuild(format!(
-                "removing checkpoint private staging for {}: {err}",
-                path.display()
-            ))
-        })?;
-    lease.verify_for(path)?;
-    // Checkpoints written before unique temp names used this fixed sibling.
-    let fixed = path.with_extension("checkpoint.tmp");
-    removed |= lease.remove_child(&fixed)?;
-    for temp in unique_temp_siblings_in_parent(lease, path)? {
-        removed |= lease.remove_child(&temp)?;
-    }
-    lease.verify_for(path)?;
-    Ok(removed)
+    Ok(())
 }
 
 fn discard_checkpoint_generation_while_leased_with_observer(
@@ -2918,32 +3108,16 @@ fn discard_checkpoint_generation_while_leased_with_observers(
     after_generation_check: impl FnOnce(),
     before_quarantine_delete: impl FnOnce(&Path),
 ) -> ZeckResult<CheckpointDiscard> {
+    fail_checkpoint_discard_if_injected(path)?;
     lease.verify_for(path)?;
-    let mut removed = discard_checkpoint_temporaries(lease, path)?;
-    let (resumed_removed, unexpected_quarantines) =
-        discard_matching_checkpoint_quarantines(lease, path, expected)?;
-    removed |= resumed_removed;
-    if let Some(unexpected) = unexpected_quarantines.first() {
-        if resumed_removed {
-            lease.sync_parent()?;
-        }
-        return Err(ZeckError::ScanNotReady(format!(
-            "checkpoint deletion quarantine {} does not match the manifested generation; preserved it for review",
-            unexpected.display()
-        )));
-    }
     let file = match lease.open_child(path)? {
         Some(file) => file,
         None => {
             lease.sync_parent()?;
-            return Ok(if removed {
-                CheckpointDiscard::Removed
-            } else {
-                CheckpointDiscard::AlreadyAbsent
-            });
+            return Ok(CheckpointDiscard::AlreadyAbsent);
         }
     };
-    let current = checkpoint_generation_from_handle(&file, path)?;
+    let current = lease.bind_content_generation(checkpoint_generation_from_handle(&file, path)?)?;
     if &current != expected {
         return Err(ZeckError::ScanNotReady(format!(
             "checkpoint {} changed immediately before deletion",
@@ -2956,146 +3130,20 @@ fn discard_checkpoint_generation_while_leased_with_observers(
     // the path is replaced in this window.
     after_generation_check();
     lease.verify_for(path)?;
-    let quarantine = checkpoint_discard_quarantine(path)?;
-    lease.rename_open_child(path, &quarantine, &file, &current.object)?;
-    let moved = checkpoint_generation_from_handle(&file, &quarantine)?;
+    let cleanup_id = uuid::Uuid::new_v4().into_bytes();
+    drop(file);
+    let (quarantine, file) = lease.quarantine_for_cleanup(path, &current.object, cleanup_id)?;
+    let moved =
+        lease.bind_content_generation(checkpoint_generation_from_handle(&file, &quarantine)?)?;
     if &moved != expected {
-        lease.rename_open_child(&quarantine, path, &file, &moved.object)?;
         return Err(ZeckError::ScanNotReady(format!(
-            "checkpoint {} was replaced at the deletion boundary; the replacement was preserved",
+            "checkpoint {} changed at the durable retirement boundary; the quarantine was preserved",
             path.display()
         )));
     }
     before_quarantine_delete(&quarantine);
-    // Windows deletes the retained handle itself. Unix has no portable
-    // unlink-by-handle primitive, so private_fs performs a final identity
-    // recheck immediately before unlinkat. The namespace lease excludes all
-    // cooperating writers; a hostile same-UID process can still race the
-    // final open-to-unlink syscall gap, which is surfaced as a platform limit.
-    lease.remove_open_child(&quarantine, &file, &moved.object)?;
-    removed = true;
-    lease.sync_parent()?;
-    Ok(if removed {
-        CheckpointDiscard::Removed
-    } else {
-        CheckpointDiscard::AlreadyAbsent
-    })
-}
-
-fn checkpoint_discard_prefix(path: &Path) -> ZeckResult<String> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| ZeckError::TransactionBuild("checkpoint path has no file name".into()))?;
-    Ok(format!(
-        ".argos-checkpoint-discard-{:x}-",
-        Sha256::digest(name.as_encoded_bytes())
-    ))
-}
-
-fn checkpoint_discard_quarantine(path: &Path) -> ZeckResult<PathBuf> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let prefix = checkpoint_discard_prefix(path)?;
-    Ok(parent.join(format!("{prefix}{}", uuid::Uuid::new_v4())))
-}
-
-fn checkpoint_discard_quarantines(
-    lease: &CheckpointLease,
-    path: &Path,
-) -> ZeckResult<Vec<PathBuf>> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let prefix = checkpoint_discard_prefix(path)?;
-    Ok(lease
-        .child_names()?
-        .into_iter()
-        .filter(|name| {
-            name.to_str()
-                .and_then(|name| name.strip_prefix(&prefix))
-                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        })
-        .map(|name| parent.join(name))
-        .collect())
-}
-
-fn discard_matching_checkpoint_quarantines(
-    lease: &CheckpointLease,
-    path: &Path,
-    expected: &CheckpointGeneration,
-) -> ZeckResult<(bool, Vec<PathBuf>)> {
-    let mut removed = false;
-    let mut unexpected = Vec::new();
-    for quarantine in checkpoint_discard_quarantines(lease, path)? {
-        let file = lease
-            .open_child(&quarantine)?
-            .ok_or_else(|| ZeckError::ScanNotReady("checkpoint quarantine disappeared".into()))?;
-        let current = checkpoint_generation_from_handle(&file, &quarantine)?;
-        if &current != expected {
-            unexpected.push(quarantine);
-            continue;
-        }
-        lease.remove_open_child(&quarantine, &file, &current.object)?;
-        removed = true;
-    }
-    Ok((removed, unexpected))
-}
-
-/// How old a unique temp sibling must be before it is taken for a crashed
-/// writer's leftover. A save writes and renames within seconds; this is far
-/// past that, so a concurrent scan's file in progress is never touched.
-const STALE_TEMP_AGE: Duration = Duration::from_secs(10 * 60);
-
-fn remove_stale_temp_files_while_leased(lease: &CheckpointLease, path: &Path) -> ZeckResult<()> {
-    crate::private_fs::remove_stale_private_file_staging_in_parent(
-        lease.namespace.parent(),
-        path,
-        STALE_TEMP_AGE,
-    )
-    .map_err(|err| {
-        ZeckError::TransactionBuild(format!(
-            "removing stale checkpoint staging for {}: {err}",
-            path.display()
-        ))
-    })?;
-    let now = std::time::SystemTime::now();
-    for temp in unique_temp_siblings_in_parent(lease, path)? {
-        let stale = lease
-            .open_child(&temp)?
-            .and_then(|file| file.metadata().ok())
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= STALE_TEMP_AGE);
-        if stale {
-            lease.remove_child(&temp)?;
-        }
-    }
-    lease.sync_parent()
-}
-
-fn unique_temp_siblings_in_parent(
-    lease: &CheckpointLease,
-    path: &Path,
-) -> ZeckResult<Vec<PathBuf>> {
-    let temp_base = path.with_extension("checkpoint");
-    let Some(name) = temp_base.file_name().and_then(|name| name.to_str()) else {
-        return Ok(Vec::new());
-    };
-    let prefix = format!("{name}.");
-    Ok(lease
-        .child_names()?
-        .into_iter()
-        .filter(|name| {
-            name.to_str()
-                .and_then(|name| name.strip_prefix(&prefix))
-                .and_then(|name| name.strip_suffix(".tmp"))
-                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        })
-        .map(|name| lease.namespace.parent_path().join(name))
-        .collect())
+    lease.finish_cleanup(&quarantine, &file, &moved.object, cleanup_id)?;
+    Ok(CheckpointDiscard::Removed)
 }
 
 /// Take a peer, racing candidates.
@@ -3806,7 +3854,7 @@ mod tests {
     fn offline_inspection_names_the_scan_but_never_uses_its_evidence() {
         let dir = ScratchDir::new("offline-notice");
         let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         let notice = wallet_scan_notice_offline(&dir.0, P2pNetwork::Regtest, &keys)
             .expect("no scan is reported too");
         assert!(notice.contains("No full-block scan"), "{notice}");
@@ -3831,7 +3879,7 @@ mod tests {
         save_checkpoint(
             &scanner,
             P2pNetwork::Regtest,
-            &checkpoint_path(&dir.0, &keys),
+            &checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest),
         )
         .unwrap();
         let mut verifier = FakeCursorVerifier {
@@ -3851,7 +3899,7 @@ mod tests {
         let dir = ScratchDir::new("evidence-orphan");
         let keys = [[0x11; 32]];
         let scanner = reorg_scanner();
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let parent = ScanCursor {
             last_block_hash: [2; 32],
@@ -3883,7 +3931,7 @@ mod tests {
     async fn an_empty_peer_cannot_publish_an_orphaned_wallet_nullifier() {
         let dir = ScratchDir::new("empty-peer-orphan-nullifier");
         let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let original = std::fs::read(&path).unwrap();
         let mut peer = empty_headers_peer(3).await;
@@ -3913,7 +3961,7 @@ mod tests {
     async fn wallet_verification_cannot_replace_a_newer_scanner_checkpoint() {
         let dir = ScratchDir::new("concurrent-scan-writer");
         let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let mut replacement = reorg_scanner();
         replacement
@@ -3944,7 +3992,8 @@ mod tests {
     #[test]
     fn saving_a_checkpoint_does_not_touch_another_writers_temp_file() {
         let dir = ScratchDir::new("independent-temp-files");
-        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let other_writer_tmp = path.with_extension("checkpoint.tmp");
         std::fs::write(&other_writer_tmp, b"writer in progress").unwrap();
         save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
@@ -3988,24 +4037,28 @@ mod tests {
     }
 
     #[test]
-    fn discarding_a_checkpoint_removes_abandoned_unique_temp_files() {
+    fn discarding_a_checkpoint_preserves_unowned_temp_files() {
         let dir = ScratchDir::new("abandoned-unique-temp");
-        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
         save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let abandoned = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&abandoned, b"private partial checkpoint").unwrap();
-        let unrelated = dir.0.join("unrelated.tmp");
+        let unrelated = path.parent().unwrap().join("unrelated.tmp");
         std::fs::write(&unrelated, b"keep").unwrap();
         discard_checkpoint(&path).unwrap();
         assert!(!path.exists());
-        assert!(!abandoned.exists(), "a crash can leave private temp bytes");
+        assert!(
+            abandoned.exists(),
+            "cleanup must not infer ownership from a filename pattern"
+        );
         assert_eq!(std::fs::read(unrelated).unwrap(), b"keep");
     }
 
     #[test]
     fn checkpoint_lease_preserves_save_into_a_missing_private_parent() {
         let dir = ScratchDir::new("checkpoint-missing-parent");
-        let path = checkpoint_path(&dir.0.join("new/private"), &[[0x11; 32]]);
+        let data_dir = dir.0.join("new/private");
+        let path = checkpoint_path_for_network(&data_dir, &[[0x11; 32]], P2pNetwork::Regtest);
         save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         assert!(path.is_file());
         assert!(checkpoint_lease_path(&path).is_file());
@@ -4014,26 +4067,64 @@ mod tests {
     #[test]
     fn checkpoint_generation_rejects_identical_byte_replacement() {
         let dir = ScratchDir::new("checkpoint-generation-replacement");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"same checkpoint bytes").unwrap();
+        let scanner = reorg_scanner();
+        let data_dir = dir.0.join("artifact-data");
+        let path = checkpoint_path_for_network(
+            &data_dir,
+            scanner.spending_keys().as_slice(),
+            P2pNetwork::Regtest,
+        );
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let first = checkpoint_generation(&path).unwrap();
-        let replacement = dir.0.join("replacement");
-        crate::private_fs::write_private_file(&replacement, b"same checkpoint bytes").unwrap();
+        let replacement = path.with_extension("replacement");
+        crate::private_fs::write_private_file(&replacement, &std::fs::read(&path).unwrap())
+            .unwrap();
         std::fs::rename(&replacement, &path).unwrap();
+        assert!(checkpoint_generation(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), first.len);
+    }
+
+    #[test]
+    fn checkpoint_generation_binds_each_authorized_replacement_lineage() {
+        let dir = ScratchDir::new("checkpoint-generation-lineage");
+        let scanner = reorg_scanner();
+        let data_dir = dir.0.join("artifact-data");
+        let path = checkpoint_path_for_network(
+            &data_dir,
+            scanner.spending_keys().as_slice(),
+            P2pNetwork::Regtest,
+        );
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let first = checkpoint_generation(&path).unwrap();
+
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let second = checkpoint_generation(&path).unwrap();
+
         assert_eq!(first.len, second.len);
         assert_eq!(first.sha256, second.sha256);
+        assert_eq!(first.lineage_anchor, second.lineage_anchor);
+        assert_ne!(first.artifact_generation, second.artifact_generation);
         assert_ne!(first.object, second.object);
+        assert_ne!(first, second);
     }
 
     #[cfg(unix)]
     #[test]
     fn checkpoint_generation_rejects_same_length_in_place_mutation_during_review() {
         let dir = ScratchDir::new("checkpoint-generation-in-place-race");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"first checkpoint bytes").unwrap();
+        let scanner = reorg_scanner();
+        let data_dir = dir.0.join("artifact-data");
+        let path = checkpoint_path_for_network(
+            &data_dir,
+            scanner.spending_keys().as_slice(),
+            P2pNetwork::Regtest,
+        );
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let replacement = std::fs::read(&path).unwrap();
         let err = checkpoint_generation_with_post_read(&path, || {
-            std::fs::write(&path, b"other checkpoint bytes").unwrap();
+            let mut changed = replacement;
+            changed[0] ^= 1;
+            std::fs::write(&path, changed).unwrap();
         })
         .expect_err("an in-place mutation during the review must be rejected")
         .to_string();
@@ -4046,15 +4137,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = ScratchDir::new("checkpoint-permissive-read");
-        let keys = [[0x11; 32], [0x22; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
-        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let scanner = reorg_scanner();
+        let keys = scanner.spending_keys();
+        let data_dir = dir.0.join("artifact-data");
+        let path = checkpoint_path_for_network(&data_dir, keys.as_slice(), P2pNetwork::Regtest);
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert!(checkpoint_generation(&path).is_err());
         assert!(read_checkpoint_file(&path).is_err());
-        assert!(scans_covering(&dir.0, P2pNetwork::Regtest, &[[0x11; 32]]).is_empty());
+        assert!(scans_covering(&data_dir, P2pNetwork::Regtest, &keys[..1]).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4095,12 +4188,19 @@ mod tests {
     #[test]
     fn checkpoint_lease_serializes_replacement_and_cleanup_authority() {
         let dir = ScratchDir::new("checkpoint-lease");
-        let path = dir.0.join("scan.checkpoint");
-        std::fs::write(&path, b"checkpoint").unwrap();
+        let scanner = reorg_scanner();
+        let data_dir = dir.0.join("artifact-data");
+        let path = checkpoint_path_for_network(
+            &data_dir,
+            scanner.spending_keys().as_slice(),
+            P2pNetwork::Regtest,
+        );
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+        let checkpoint = std::fs::read(&path).unwrap();
         let first = CheckpointLease::acquire(&path).unwrap();
         assert!(CheckpointLease::acquire(&path).is_err());
-        assert!(save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"checkpoint");
+        assert!(save_checkpoint(&scanner, P2pNetwork::Regtest, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), checkpoint);
         drop(first);
         CheckpointLease::acquire(&path).unwrap();
     }
@@ -4109,19 +4209,19 @@ mod tests {
     #[test]
     fn replaced_lease_sidecar_revokes_old_cleanup_authority() {
         let dir = ScratchDir::new("checkpoint-lease-replaced-sidecar");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let old_generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
         let sidecar = checkpoint_lease_path(&path);
-        let displaced = dir.0.join("displaced-lease");
+        let displaced = path.parent().unwrap().join("displaced-lease");
         std::fs::rename(&sidecar, &displaced).unwrap();
 
         assert!(
             CheckpointLease::acquire(&path).is_err(),
             "the retained parent namespace lock must reject a replacement sidecar"
         );
-        let replacement = dir.0.join("replacement.checkpoint");
+        let replacement = path.parent().unwrap().join("replacement.checkpoint");
         crate::private_fs::write_private_file(&replacement, b"newer checkpoint").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
 
@@ -4132,12 +4232,9 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"newer checkpoint");
 
         drop(old);
-        let current = CheckpointLease::acquire(&path).unwrap();
-        let current_generation = current.generation(&path).unwrap();
-        assert_eq!(
-            discard_checkpoint_generation_while_leased(&current, &path, &current_generation)
-                .unwrap(),
-            CheckpointDiscard::Removed
+        assert!(
+            CheckpointLease::acquire(&path).is_err(),
+            "an unbound replacement cannot mint cleanup authority"
         );
     }
 
@@ -4147,16 +4244,17 @@ mod tests {
         use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
 
         let dir = ScratchDir::new("checkpoint-sidecar-staging-race");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let reviewed = std::fs::read(&path).unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
         let sidecar = checkpoint_lease_path(&path);
-        std::fs::rename(&sidecar, dir.0.join("displaced-lease")).unwrap();
+        std::fs::rename(&sidecar, path.parent().unwrap().join("displaced-lease")).unwrap();
 
         assert!(CheckpointLease::acquire(&path).is_err());
         let digest = Sha256::digest(path.file_name().unwrap().as_bytes());
-        let staging = dir.0.join(format!(
+        let staging = path.parent().unwrap().join(format!(
             ".argos-private-{digest:x}-{}",
             uuid::Uuid::new_v4()
         ));
@@ -4167,7 +4265,7 @@ mod tests {
         std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         assert!(discard_checkpoint_generation_while_leased(&old, &path, &generation).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"reviewed checkpoint");
+        assert_eq!(std::fs::read(&path).unwrap(), reviewed);
         assert_eq!(
             std::fs::read(&artifact).unwrap(),
             b"newer spend-capable staging"
@@ -4178,10 +4276,10 @@ mod tests {
     #[test]
     fn replaced_parent_namespace_cannot_redirect_old_cleanup() {
         let root = ScratchDir::new("checkpoint-parent-replacement");
-        let parent = root.0.join("active");
-        crate::private_fs::create_private_dir_all(&parent).unwrap();
-        let path = parent.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"old checkpoint").unwrap();
+        let path = checkpoint_path_for_network(&root.0, &[[0x11; 32]], P2pNetwork::Regtest);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        let old_checkpoint = std::fs::read(&path).unwrap();
+        let parent = path.parent().unwrap().to_path_buf();
         let generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
 
@@ -4189,28 +4287,27 @@ mod tests {
         std::fs::rename(&parent, &displaced).unwrap();
         crate::private_fs::create_private_dir_all(&parent).unwrap();
         crate::private_fs::write_private_file(&path, b"new checkpoint").unwrap();
-        let current = CheckpointLease::acquire(&path).unwrap();
+        assert!(CheckpointLease::acquire(&path).is_err());
 
         assert!(discard_checkpoint_generation_while_leased(&old, &path, &generation).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"new checkpoint");
         assert_eq!(
-            std::fs::read(displaced.join("scan.checkpoint")).unwrap(),
-            b"old checkpoint"
+            std::fs::read(displaced.join(path.file_name().unwrap())).unwrap(),
+            old_checkpoint
         );
-        drop(current);
     }
 
     #[cfg(unix)]
     #[test]
     fn sidecar_and_generation_swap_at_final_delete_boundary_preserves_new_checkpoint() {
         let dir = ScratchDir::new("checkpoint-final-delete-race");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let generation = checkpoint_generation(&path).unwrap();
         let old = CheckpointLease::acquire(&path).unwrap();
         let sidecar = checkpoint_lease_path(&path);
-        let displaced = dir.0.join("displaced-lease");
-        let replacement = dir.0.join("replacement.checkpoint");
+        let displaced = path.parent().unwrap().join("displaced-lease");
+        let replacement = path.parent().unwrap().join("replacement.checkpoint");
         let mut replacement_lease_refused = false;
 
         let err = discard_checkpoint_generation_while_leased_with_observer(
@@ -4231,219 +4328,10 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"newer checkpoint");
 
         drop(old);
-        let current = CheckpointLease::acquire(&path).unwrap();
-        let current_generation = current.generation(&path).unwrap();
-        assert_eq!(
-            discard_checkpoint_generation_while_leased(&current, &path, &current_generation)
-                .unwrap(),
-            CheckpointDiscard::Removed
+        assert!(
+            CheckpointLease::acquire(&path).is_err(),
+            "an unbound replacement cannot mint cleanup authority"
         );
-    }
-
-    #[test]
-    fn generation_swap_at_exact_delete_boundary_is_preserved_before_quarantine() {
-        let dir = ScratchDir::new("checkpoint-exact-delete-race");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
-        let generation = checkpoint_generation(&path).unwrap();
-        let lease = CheckpointLease::acquire(&path).unwrap();
-        let replacement = dir.0.join("replacement.checkpoint");
-
-        let err = discard_checkpoint_generation_while_leased_with_observer(
-            &lease,
-            &path,
-            &generation,
-            || {
-                crate::private_fs::write_private_file(&replacement, b"newer checkpoint").unwrap();
-                std::fs::rename(&replacement, &path).unwrap();
-            },
-        )
-        .expect_err("exact-object deletion must reject the raced generation")
-        .to_string();
-        assert!(err.contains("path changed before rename"), "{err}");
-        assert_eq!(std::fs::read(&path).unwrap(), b"newer checkpoint");
-        assert!(checkpoint_discard_quarantines(&lease, &path)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn quarantine_swap_after_verification_preserves_the_sentinel() {
-        let dir = ScratchDir::new("checkpoint-quarantine-delete-race");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
-        let generation = checkpoint_generation(&path).unwrap();
-        let lease = CheckpointLease::acquire(&path).unwrap();
-        let displaced = dir.0.join("verified-quarantine");
-
-        let err = discard_checkpoint_generation_while_leased_with_observers(
-            &lease,
-            &path,
-            &generation,
-            || {},
-            |quarantine| {
-                std::fs::rename(quarantine, &displaced).unwrap();
-                crate::private_fs::write_private_file(quarantine, b"sentinel replacement").unwrap();
-            },
-        )
-        .expect_err("the final identity check must reject a substituted quarantine")
-        .to_string();
-
-        assert!(err.contains("path changed before deletion"), "{err}");
-        let quarantine = checkpoint_discard_quarantines(&lease, &path).unwrap();
-        assert_eq!(quarantine.len(), 1);
-        assert_eq!(
-            std::fs::read(&quarantine[0]).unwrap(),
-            b"sentinel replacement"
-        );
-        assert_eq!(std::fs::read(&displaced).unwrap(), b"reviewed checkpoint");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_checkpoint_quarantine_uses_exact_open_handle_rename_and_delete() {
-        let dir = ScratchDir::new("checkpoint-windows-exact-delete");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
-        let generation = checkpoint_generation(&path).unwrap();
-        let lease = CheckpointLease::acquire(&path).unwrap();
-        let displaced = dir.0.join("must-not-move-open-quarantine");
-
-        assert_eq!(
-            discard_checkpoint_generation_while_leased_with_observers(
-                &lease,
-                &path,
-                &generation,
-                || {},
-                |quarantine| {
-                    assert!(
-                        std::fs::rename(quarantine, &displaced).is_err(),
-                        "the verified open quarantine must deny replacement before handle deletion"
-                    );
-                },
-            )
-            .unwrap(),
-            CheckpointDiscard::Removed
-        );
-        assert!(!path.exists());
-        assert!(!displaced.exists());
-        assert!(checkpoint_discard_quarantines(&lease, &path)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn exact_delete_restart_removes_only_the_manifested_quarantine() {
-        let dir = ScratchDir::new("checkpoint-exact-delete-restart");
-        let path = dir.0.join("scan.checkpoint");
-        crate::private_fs::write_private_file(&path, b"reviewed checkpoint").unwrap();
-        let generation = checkpoint_generation(&path).unwrap();
-        let lease = CheckpointLease::acquire(&path).unwrap();
-        let quarantine = checkpoint_discard_quarantine(&path).unwrap();
-        std::fs::rename(&path, &quarantine).unwrap();
-        let unrelated = checkpoint_discard_quarantine(&path).unwrap();
-        crate::private_fs::write_private_file(&unrelated, b"different generation").unwrap();
-
-        let err = discard_checkpoint_generation_while_leased(&lease, &path, &generation)
-            .expect_err("an unmanifested quarantine must block completion")
-            .to_string();
-        assert!(err.contains("does not match"), "{err}");
-        assert!(!quarantine.exists());
-        assert_eq!(std::fs::read(&unrelated).unwrap(), b"different generation");
-        std::fs::remove_file(&unrelated).unwrap();
-        assert_eq!(
-            discard_checkpoint_generation_while_leased(&lease, &path, &generation).unwrap(),
-            CheckpointDiscard::AlreadyAbsent
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn held_lease_blocks_read_and_cleanup_of_a_paused_atomic_writer() {
-        use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
-
-        let dir = ScratchDir::new("checkpoint-paused-writer");
-        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
-        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
-        let writer_path = path.clone();
-        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
-        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
-        let writer = std::thread::spawn(move || {
-            let _lease = CheckpointLease::acquire(&writer_path).unwrap();
-            let destination = writer_path.file_name().unwrap();
-            let digest = Sha256::digest(destination.as_bytes());
-            let staging = writer_path.parent().unwrap().join(format!(
-                ".argos-private-{digest:x}-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir(&staging).unwrap();
-            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let artifact = staging.join("artifact");
-            std::fs::write(&artifact, b"paused spend-capable checkpoint").unwrap();
-            std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o600)).unwrap();
-            paused_tx.send(staging.clone()).unwrap();
-            resume_rx.recv().unwrap();
-            staging
-        });
-        let staging = paused_rx.recv().unwrap();
-
-        let read_err = saved_decrypt_from(&path, P2pNetwork::Regtest, &[[0x11; 32]])
-            .expect_err("a read/cleanup entry must honor the live writer lease")
-            .to_string();
-        assert!(read_err.contains("in use"), "{read_err}");
-        let discard_err = discard_checkpoint(&path)
-            .expect_err("cleanup must not race the live writer")
-            .to_string();
-        assert!(discard_err.contains("in use"), "{discard_err}");
-        assert!(path.exists());
-        assert!(staging.join("artifact").exists());
-
-        resume_tx.send(()).unwrap();
-        let staging = writer.join().unwrap();
-        assert_eq!(
-            discard_checkpoint(&path).unwrap(),
-            CheckpointDiscard::Removed
-        );
-        assert!(!path.exists());
-        assert!(!staging.exists());
-    }
-
-    /// A crash between writing a unique temp file and renaming it leaves a
-    /// spend-capable 0600 file behind. Saving and loading sweep away such
-    /// leftovers once they are clearly abandoned, and never a temp file a
-    /// concurrent writer may still be filling.
-    #[test]
-    fn stale_unique_temp_files_are_removed_and_fresh_ones_kept() {
-        let dir = ScratchDir::new("stale-unique-temp");
-        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
-        let temp = |label: &str| {
-            let tmp = path.with_extension(format!("checkpoint.{}.tmp", uuid::Uuid::new_v4()));
-            crate::private_fs::write_private_file(&tmp, label.as_bytes()).unwrap();
-            tmp
-        };
-        let age = |tmp: &Path| {
-            std::fs::File::options()
-                .write(true)
-                .open(tmp)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE * 2)
-                .unwrap();
-        };
-        let stale = temp("crashed writer");
-        age(&stale);
-        let fresh = temp("writer in progress");
-        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
-        assert!(!stale.exists(), "an abandoned temp file is removed on save");
-        assert!(fresh.exists(), "a concurrent writer's temp file is kept");
-
-        let stale = temp("crashed writer");
-        age(&stale);
-        load_checkpoint(&path, P2pNetwork::Regtest, &[[0x11; 32]])
-            .unwrap()
-            .unwrap();
-        assert!(!stale.exists(), "an abandoned temp file is removed on load");
-        assert!(fresh.exists());
     }
 
     #[tokio::test]
@@ -4453,7 +4341,7 @@ mod tests {
         save_checkpoint(
             &reorg_scanner(),
             P2pNetwork::Regtest,
-            &checkpoint_path(&dir.0, &keys),
+            &checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest),
         )
         .unwrap();
         let mut current = FakeCursorVerifier {
@@ -4480,7 +4368,7 @@ mod tests {
     async fn replacement_after_rewind_cannot_supply_unverified_spends() {
         let dir = ScratchDir::new("evidence-replaced-after-rewind");
         let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let mut replacement = reorg_scanner();
         replacement
@@ -4515,7 +4403,7 @@ mod tests {
         save_checkpoint(
             &reorg_scanner(),
             P2pNetwork::Regtest,
-            &checkpoint_path(&dir.0, &keys),
+            &checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest),
         )
         .unwrap();
         let mut verifier = FakeCursorVerifier {
@@ -4543,7 +4431,7 @@ mod tests {
     async fn a_replaced_file_cannot_escape_through_a_stale_stamp_read() {
         let dir = ScratchDir::new("evidence-stale-stamp-read");
         let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
         let old_stamp = stamp_of(&path).unwrap();
         let mut replacement = reorg_scanner();
@@ -4592,10 +4480,11 @@ mod tests {
                 .unwrap();
             let mut body = scanner.checkpoint().as_bytes().to_vec();
             body[0] = legacy;
-            let path = checkpoint_path(&dir.0, &keys);
+            let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
             let mut file = vec![NETWORK_TAGGED, network_tag(P2pNetwork::Regtest)];
             file.extend_from_slice(&body);
-            crate::private_fs::write_private_file(&path, &file).unwrap();
+            save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
+            std::fs::write(&path, &file).unwrap();
             let mut verifier = FakeCursorVerifier {
                 response: Some(CanonicalContinuation::Current {
                     chain_has_more: false,
@@ -4624,7 +4513,8 @@ mod tests {
             .scan_block_at(&[joinsplit_revealing([0xEF; 32])], [1; 32], 1)
             .unwrap();
         scanner.mark_complete();
-        let path = checkpoint_path(&dir.0, &[wallet_key, extra_key]);
+        let path =
+            checkpoint_path_for_network(&dir.0, &[wallet_key, extra_key], P2pNetwork::Regtest);
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let mut verifier = FakeCursorVerifier {
             response: None,
@@ -4642,8 +4532,9 @@ mod tests {
     #[tokio::test]
     async fn resume_sends_retained_locators_newest_first() {
         let dir = ScratchDir::new("locator-order");
-        let path = dir.0.join("scan.checkpoint");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
         let mut scanner = reorg_scanner();
+        save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let mut verifier = FakeCursorVerifier {
             response: Some(CanonicalContinuation::Current {
                 chain_has_more: false,
@@ -4723,7 +4614,7 @@ mod tests {
     #[tokio::test]
     async fn off_chain_cursor_rewinds_to_the_common_ancestor_before_fetching() {
         let dir = ScratchDir::new("reorg-rewind");
-        let path = dir.0.join("scan.checkpoint");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
         let mut scanner = reorg_scanner();
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let ancestor = ScanCursor {
@@ -4752,7 +4643,7 @@ mod tests {
     #[tokio::test]
     async fn canonical_extension_clears_the_complete_flag() {
         let dir = ScratchDir::new("reorg-extension");
-        let path = dir.0.join("scan.checkpoint");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
         let mut scanner = reorg_scanner();
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let mut verifier = FakeCursorVerifier {
@@ -4774,7 +4665,7 @@ mod tests {
     #[tokio::test]
     async fn deep_reorg_preserves_the_checkpoint_and_returns_incomplete() {
         let dir = ScratchDir::new("reorg-deep");
-        let path = dir.0.join("scan.checkpoint");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
         let mut scanner = reorg_scanner();
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
         let original = std::fs::read(&path).unwrap();
@@ -4805,7 +4696,7 @@ mod tests {
     #[tokio::test]
     async fn unlocated_legacy_cursor_requires_rescan_without_inventing_ancestry() {
         let dir = ScratchDir::new("legacy-unlocated");
-        let path = dir.0.join("scan.checkpoint");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
         let mut scanner = SproutScanner::new(&[[0x11; 32]]);
         scanner.scan_block_at(&[], [0; 32], 7).unwrap();
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
@@ -4827,7 +4718,7 @@ mod tests {
     #[test]
     fn mid_fetch_reorg_stops_without_scanning_or_saving_a_mixed_page() {
         let dir = ScratchDir::new("reorg-mid-fetch");
-        let path = dir.0.join("scan.checkpoint");
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
         let mut scanner = reorg_scanner();
         scanner.mark_incomplete();
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
@@ -4973,11 +4864,9 @@ mod tests {
         // each other's checkpoint mid-run.
         let dir = std::env::temp_dir().join(format!(
             "argos-scan-silent-peer-test-{}",
-            std::process::id()
+            uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("silent.checkpoint");
-        discard_checkpoint(&path).unwrap();
+        let path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Regtest);
 
         let mut notices = Vec::new();
         let outcome = tokio::time::timeout(
@@ -5031,10 +4920,8 @@ mod tests {
             peers.push(silent_peer().await);
         }
         let dir =
-            std::env::temp_dir().join(format!("argos-scan-budget-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("budget.checkpoint");
-        discard_checkpoint(&path).unwrap();
+            std::env::temp_dir().join(format!("argos-scan-budget-test-{}", uuid::Uuid::new_v4()));
+        let path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Regtest);
 
         let mut silences = 0u32;
         let outcome = tokio::time::timeout(
@@ -5313,6 +5200,20 @@ mod tests {
         let b = checkpoint_path(dir, &[[0x22; 32]]);
         assert_ne!(a, b);
         assert!(a.to_string_lossy().contains("sprout-scan-"));
+    }
+
+    #[test]
+    fn checkpoint_data_dir_round_trips_the_authoritative_layout() {
+        let dir = Path::new("wallet-data");
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(dir, &keys, P2pNetwork::Testnet);
+
+        assert_eq!(
+            checkpoint_data_dir(&path, &keys, P2pNetwork::Testnet).unwrap(),
+            dir
+        );
+        assert!(checkpoint_data_dir(&path, &keys, P2pNetwork::Mainnet).is_err());
+        assert!(checkpoint_data_dir(&path, &[[0x22; 32]], P2pNetwork::Testnet).is_err());
     }
 
     #[test]
@@ -5612,9 +5513,9 @@ mod tests {
     /// and it always says what it found — never an unexplained silence.
     #[tokio::test]
     async fn a_wallets_scan_lookup_always_explains_itself() {
-        let dir = std::env::temp_dir().join(format!("argos-lookup-notice-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("argos-lookup-notice-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
         let keys = [[0x21; 32]];
 
         let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Mainnet, &keys).await;
@@ -5634,6 +5535,11 @@ mod tests {
         assert!(notice.unwrap().contains("before reaching the chain tip"));
 
         // Unusable evidence is said, not swallowed.
+        let mainnet_path = checkpoint_path(&dir, &keys);
+        let mainnet_bytes = std::fs::read(&mainnet_path).unwrap();
+        let testnet_path = checkpoint_path_for_network(&dir, &keys, P2pNetwork::Testnet);
+        save_checkpoint(&scanner, P2pNetwork::Testnet, &testnet_path).unwrap();
+        std::fs::write(&testnet_path, mainnet_bytes).unwrap();
         let (chain, notice) = wallet_evidence_with_current(&dir, P2pNetwork::Testnet, &keys).await;
         assert!(chain.is_none());
         assert!(notice.unwrap().contains("different network"));
@@ -5641,9 +5547,8 @@ mod tests {
     }
 
     fn fresh_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("argos-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("argos-{tag}-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
@@ -5746,10 +5651,11 @@ mod tests {
 
     impl ScratchDir {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("argos-chain-evidence-{tag}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "argos-chain-evidence-{tag}-{}",
+                uuid::Uuid::new_v4()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
     }
@@ -5857,9 +5763,12 @@ mod tests {
     fn no_scan_is_reported_with_where_it_looked() {
         let dir = ScratchDir::new("none");
         let keys = [[0x12; 32]];
+        let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+        discard_checkpoint(&path).unwrap();
         match lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys).unwrap() {
-            ChainSpendsLookup::NotFound { path } => {
-                assert_eq!(path, checkpoint_path(&dir.0, &keys))
+            ChainSpendsLookup::NotFound { path: found } => {
+                assert_eq!(found, path)
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -5877,6 +5786,8 @@ mod tests {
         // A directory where the file should be: reading it fails, and not
         // with NotFound. Portable, unlike a permission bit root ignores.
         let path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&scanned(&keys, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+        std::fs::remove_file(&path).unwrap();
         crate::private_fs::create_private_dir_all(&path).unwrap();
 
         let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
@@ -5895,13 +5806,13 @@ mod tests {
     fn chain_spends_from_another_network_are_refused() {
         let dir = ScratchDir::new("network");
         let keys = [[0x13; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
-        save_checkpoint(
-            &scanned(&keys, [0x99; 32], 2_000_000),
-            P2pNetwork::Mainnet,
-            &path,
-        )
-        .unwrap();
+        let mainnet = scanned(&keys, [0x99; 32], 2_000_000);
+        let mainnet_path = checkpoint_path(&dir.0, &keys);
+        save_checkpoint(&mainnet, P2pNetwork::Mainnet, &mainnet_path).unwrap();
+        let mainnet_bytes = std::fs::read(&mainnet_path).unwrap();
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Testnet);
+        save_checkpoint(&mainnet, P2pNetwork::Testnet, &path).unwrap();
+        std::fs::write(&path, mainnet_bytes).unwrap();
 
         let err = chain_spends(&dir.0, P2pNetwork::Testnet, &keys)
             .expect_err("a mainnet scan must not answer for testnet");
@@ -5916,11 +5827,9 @@ mod tests {
         let dir = ScratchDir::new("untagged");
         let keys = [[0x15; 32]];
         let path = checkpoint_path(&dir.0, &keys);
-        crate::private_fs::write_private_file(
-            &path,
-            scanned(&keys, [0x99; 32], 5).checkpoint().as_bytes(),
-        )
-        .unwrap();
+        let scanner = scanned(&keys, [0x99; 32], 5);
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
 
         let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &keys)
             .expect_err("no network recorded, so no verdict");
@@ -5937,12 +5846,11 @@ mod tests {
     fn a_checkpoint_for_other_keys_is_refused_whatever_its_name() {
         let dir = ScratchDir::new("keyset");
         let (a, b) = ([[0x16; 32]], [[0x17; 32]]);
-        save_checkpoint(
-            &scanned(&a, [0x99; 32], 5),
-            P2pNetwork::Mainnet,
-            &checkpoint_path(&dir.0, &b),
-        )
-        .unwrap();
+        let path = checkpoint_path(&dir.0, &b);
+        save_checkpoint(&scanned(&b, [0x99; 32], 5), P2pNetwork::Mainnet, &path).unwrap();
+        let mut bytes = vec![NETWORK_TAGGED, network_tag(P2pNetwork::Mainnet)];
+        bytes.extend_from_slice(scanned(&a, [0x99; 32], 5).checkpoint().as_bytes());
+        std::fs::write(&path, bytes).unwrap();
 
         let err = lookup_chain_spends(&dir.0, P2pNetwork::Mainnet, &b)
             .expect_err("keys A's scan must not answer for keys B");
@@ -6001,10 +5909,13 @@ mod tests {
         scanner
             .scan_block_at(&[], [0xCD; 32], 2_000_000)
             .expect("an empty block");
-        let dir = std::env::temp_dir().join("argos-scan-network-tag-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mainnet.checkpoint");
-        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+        let dir = fresh_dir("scan-network-tag-test");
+        let mainnet_path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Mainnet);
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &mainnet_path).unwrap();
+        let mainnet_bytes = std::fs::read(&mainnet_path).unwrap();
+        let path = checkpoint_path_for_network(&dir, &[[0x11; 32]], P2pNetwork::Testnet);
+        save_checkpoint(&scanner, P2pNetwork::Testnet, &path).unwrap();
+        std::fs::write(&path, mainnet_bytes).unwrap();
 
         let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Testnet, &[], None, &path, |_| {})
             .await
@@ -6023,8 +5934,9 @@ mod tests {
             .scan_block_at(&[], [0xCD; 32], 1_046_399)
             .expect("an empty block");
         let dir = ScratchDir::new("legacy-network-test");
-        let path = dir.0.join("legacy.checkpoint");
-        crate::private_fs::write_private_file(&path, scanner.checkpoint().as_bytes()).unwrap();
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Testnet);
+        save_checkpoint(&scanner, P2pNetwork::Testnet, &path).unwrap();
+        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
 
         let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Testnet, &[], None, &path, |_| {})
             .await
@@ -6045,10 +5957,11 @@ mod tests {
             .expect("an empty block");
 
         let dir = ScratchDir::new("canopy-resume-test");
-        let path = dir.0.join("canopy.checkpoint");
+        let path = checkpoint_path(&dir.0, &[[0x11; 32]]);
         // Written as every existing checkpoint was — before files recorded
         // their network — because those are the scans this must continue.
-        crate::private_fs::write_private_file(&path, scanner.checkpoint().as_bytes()).unwrap();
+        save_checkpoint(&scanner, P2pNetwork::Mainnet, &path).unwrap();
+        std::fs::write(&path, scanner.checkpoint().as_bytes()).unwrap();
 
         // Nothing listens on the only peer offered, so a run that goes on
         // to fetch can only still be waiting for a connection — or fail
@@ -6092,8 +6005,9 @@ mod tests {
     #[tokio::test]
     async fn a_corrupt_checkpoint_is_reported_not_discarded() {
         let dir = ScratchDir::new("corrupt");
-        let path = dir.0.join("corrupt.checkpoint");
-        crate::private_fs::write_private_file(&path, b"not a checkpoint").unwrap();
+        let path = checkpoint_path_for_network(&dir.0, &[[0x11; 32]], P2pNetwork::Regtest);
+        save_checkpoint(&reorg_scanner(), P2pNetwork::Regtest, &path).unwrap();
+        std::fs::write(&path, b"not a checkpoint").unwrap();
 
         let err = run_sprout_scan(&[[0x11; 32]], P2pNetwork::Regtest, &[], None, &path, |_| {})
             .await
@@ -6181,18 +6095,12 @@ mod tests {
         let keys = [[0x13; 32]];
         let dir = fresh_dir("saved-decrypt-from");
 
-        let missing = dir.join("missing.checkpoint");
-        assert_eq!(
-            saved_decrypt_from(&missing, P2pNetwork::Regtest, &keys).unwrap(),
-            None
-        );
-
         for (name, bound) in [("skip", Some(300)), ("every", None)] {
             let mut scanner = SproutScanner::with_decrypt_from(&keys, bound);
             scanner
                 .scan_block_at(&[], [0xCF; 32], 400)
                 .expect("an empty block");
-            let path = dir.join(format!("{name}.checkpoint"));
+            let path = checkpoint_path_for_network(&dir, &keys, P2pNetwork::Regtest);
             save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
             assert_eq!(
                 saved_decrypt_from(&path, P2pNetwork::Regtest, &keys).unwrap(),
@@ -6213,7 +6121,7 @@ mod tests {
             .scan_block_at(&[], [0xCE; 32], 400)
             .expect("an empty block");
         let dir = fresh_dir("decrypt-bound-resume");
-        let path = dir.join("skip.checkpoint");
+        let path = checkpoint_path_for_network(&dir, &keys, P2pNetwork::Regtest);
         save_checkpoint(&scanner, P2pNetwork::Regtest, &path).unwrap();
 
         let err = run_sprout_scan(&keys, P2pNetwork::Regtest, &[], None, &path, |_| {})
@@ -6235,7 +6143,7 @@ mod tests {
     fn a_hash_mismatch_saves_progress_before_the_page_and_none_of_it() {
         let dir = ScratchDir::new("mismatch-save");
         let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         let mut scanner = SproutScanner::new(&keys);
         let mut height = 1u32;
 
@@ -6313,7 +6221,7 @@ mod tests {
     fn a_mismatch_on_the_first_page_does_not_claim_progress() {
         let dir = ScratchDir::new("mismatch-first-page");
         let keys = [[0x11; 32]];
-        let path = checkpoint_path(&dir.0, &keys);
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
         let mut scanner = SproutScanner::new(&keys);
         let mut height = 1u32;
         let anchor = TipAnchor {

@@ -466,7 +466,7 @@ impl ProgressPoller {
     }
 }
 
-pub async fn run_recovery_scan(state: SharedScanTaskState, config: RuntimeScanConfig) {
+pub(crate) async fn run_recovery_scan(state: SharedScanTaskState, config: RuntimeScanConfig) {
     match run_recovery_scan_inner(state.clone(), config).await {
         Ok(()) | Err(ZeckError::Cancelled) => {}
         Err(err) => {

@@ -1854,7 +1854,11 @@ fn begin_sprout_scan_session(
     confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     peers: Vec<String>,
 ) -> Result<(SproutScanHandle, ScanMaterial, CheckpointReservation), String> {
-    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(dir, decoded.as_slice());
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path_for_network(
+        dir,
+        decoded.as_slice(),
+        network.into(),
+    );
     let reservation = store.reserve_checkpoint(&checkpoint)?;
     let fingerprint = argos_core::sprout_scan_run::key_set_fingerprint(decoded.as_slice());
     let handle = store.insert_scan(
@@ -1985,10 +1989,12 @@ pub async fn start_sprout_scan(
         .await
         .map_err(|err| err.to_string())
         .and_then(|result| {
-            let journal_dir = material
-                .checkpoint
-                .parent()
-                .ok_or_else(|| "invalid Sprout checkpoint location".to_owned())?;
+            let journal_dir = argos_core::sprout_scan_run::checkpoint_data_dir(
+                &material.checkpoint,
+                material.keys.as_slice(),
+                material.network.into(),
+            )
+            .map_err(|err| err.to_string())?;
             let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
                 journal_dir,
                 material.keys.as_slice(),
@@ -2188,10 +2194,12 @@ pub async fn propose_sprout_scan_sweep(
         // Checked before the catch-up: an address with no Sapling receiver or a
         // server address that cannot work should fail here, not after it.
         validate_sweep_request(&destination, material.network, &material.lightwalletd_url)?;
-        let dir = material
-            .checkpoint
-            .parent()
-            .ok_or("invalid Sprout checkpoint location")?;
+        let dir = argos_core::sprout_scan_run::checkpoint_data_dir(
+            &material.checkpoint,
+            material.keys.as_slice(),
+            material.network.into(),
+        )
+        .map_err(|err| err.to_string())?;
         let mut journal = argos_core::sprout_sweep::SweepJournal::for_keys(
             dir,
             material.keys.as_slice(),
@@ -2440,6 +2448,7 @@ fn with_resolved_sprout_data_dir<T>(
     next: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
     let dir = resolved?;
+    argos_core::service::ensure_recovery_data_dir(&dir).map_err(|err| err.to_string())?;
     next(&dir)
 }
 
@@ -2790,30 +2799,20 @@ pub async fn save_recovery_report(
         .as_ref()
         .map(|summary| PathBuf::from(&summary.workspace_dir))
         .ok_or_else(|| "recovery report can only be saved after workspace sync".to_owned())?;
+    let authority = argos_core::workspace::PrivateWorkspaceFileAuthority::acquire(&workspace_dir)
+        .map_err(|err| err.to_string())?;
     let path = resolve_report_path(&workspace_dir, path.trim())?;
-
-    if let Ok(metadata) = fs::symlink_metadata(&path) {
-        if metadata.file_type().is_symlink() {
-            return Err("report path must not be a symlink".to_owned());
-        }
-        if !metadata.is_file() {
-            return Err("report path must refer to a regular file".to_owned());
-        }
-    }
-
-    write_private_report(&path, report.as_bytes())
-        .map_err(|err| format!("writing {}: {err}", path.display()))?;
+    authority
+        .write_private_file(&path, report.as_bytes())
+        .map_err(|err| err.to_string())?;
     Ok(path.display().to_string())
 }
 
-/// Write `contents` to `path` with owner-only (`0o600`) permissions on Unix.
-///
-/// `OpenOptions::mode` only constrains the bits of a *newly created* file, and
-/// the caller deliberately permits writing into an existing regular file (which
-/// with `truncate` would retain its prior, looser mode). So this both creates
-/// at `0o600` AND re-tightens after the write, ensuring a reused report path is
-/// protected too (audit Suggestion 3). Windows has no mode bits; there it is a
-/// plain create+truncate write. The caller owns the symlink/regular-file guard.
+/// Write `contents` to `path` only when it can be created privately or an
+/// existing target already satisfies the platform's exact private policy.
+/// Reused permissive files are preserved and refused rather than repaired in
+/// place after their old readers may already have retained access.
+#[cfg(test)]
 fn write_private_report(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     argos_core::private_fs::write_private_file(path, contents)
 }
@@ -2876,8 +2875,6 @@ fn resolve_report_path(workspace_dir: &Path, requested: &str) -> Result<PathBuf,
     if !canonical_parent.starts_with(&workspace_root) {
         return Err("report path must stay inside the recovery workspace".to_owned());
     }
-    argos_core::private_fs::harden_private_directory(&canonical_parent)
-        .map_err(|err| format!("securing {}: {err}", canonical_parent.display()))?;
     let file_name = candidate
         .file_name()
         .filter(|file_name| !file_name.is_empty())
@@ -3192,6 +3189,12 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{sprout_nu7_warning, summary_nu7_warning};
+
+    fn unused_temp_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("argos-{label}-{}", uuid::Uuid::new_v4()));
+        assert!(!path.exists());
+        path
+    }
 
     #[test]
     fn validate_seed_accepts_protected_words_at_the_ipc_boundary() {
@@ -4649,6 +4652,21 @@ mod tests {
     }
 
     #[test]
+    fn fresh_gui_workspace_is_authenticated_before_sprout_work_starts() {
+        let workspace = unused_temp_dir("fresh-gui-workspace");
+        assert!(!workspace.exists());
+
+        super::with_resolved_sprout_data_dir(Ok(workspace.clone()), |resolved| {
+            assert_eq!(resolved, workspace);
+            argos_core::service::ensure_recovery_data_dir(resolved)
+                .map_err(|err| err.to_string())?;
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
     fn a_sweep_request_is_refused_on_its_own_inputs() {
         // Checked before the wallet file is decrypted: neither check needs
         // the keys, so a bad address or server is reported without them.
@@ -5221,7 +5239,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_private_report_tightens_a_reused_file_to_0o600() {
+    fn write_private_report_refuses_a_reused_permissive_file_unchanged() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("argos-report-perm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -5230,15 +5248,33 @@ mod tests {
         std::fs::write(&path, b"stale").expect("seed file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
 
-        super::write_private_report(&path, b"fresh").expect("write report");
+        super::write_private_report(&path, b"fresh")
+            .expect_err("a reused permissive report must fail closed");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o600,
-            "a reused report file must be re-tightened to 0o600"
+            mode, 0o644,
+            "a reused permissive report file must not be repaired in place"
         );
-        assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
+        assert_eq!(std::fs::read(&path).expect("read"), b"stale");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_private_report_creates_private_and_refuses_untrusted_reuse() {
+        let outer = unused_temp_dir("windows-private-report");
+        std::fs::create_dir(&outer).unwrap();
+        let private = outer.join("private-report.txt");
+        super::write_private_report(&private, b"private").expect("create private report");
+        assert_eq!(std::fs::read(&private).unwrap(), b"private");
+
+        let reused = outer.join("reused-report.txt");
+        std::fs::write(&reused, b"stale").unwrap();
+        super::write_private_report(&reused, b"replacement")
+            .expect_err("an untrusted reused report must fail closed");
+        assert_eq!(std::fs::read(&reused).unwrap(), b"stale");
+        std::fs::remove_dir_all(&outer).unwrap();
     }
 
     #[test]

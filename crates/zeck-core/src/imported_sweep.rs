@@ -1151,7 +1151,7 @@ mod fee_cap_tests {
             transparent_scan: None,
             lightwalletd_url: "http://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };
@@ -1187,7 +1187,7 @@ mod fee_cap_tests {
             transparent_scan: None,
             lightwalletd_url: "http://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };
@@ -1258,7 +1258,7 @@ mod fee_cap_tests {
             transparent_scan: None,
             lightwalletd_url: "https://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };
@@ -1564,7 +1564,7 @@ mod routing_tests {
             transparent_scan: None,
             lightwalletd_url: "https://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };
