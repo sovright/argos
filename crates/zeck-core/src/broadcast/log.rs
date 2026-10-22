@@ -281,7 +281,7 @@ impl DurableBroadcastLog {
     pub(crate) fn open_in_namespace(
         path: impl AsRef<Path>,
         namespace: &NamespaceLease,
-        compatibility_lock_path: &Path,
+        compatibility_lock: &RetainedNamespaceChild,
     ) -> ZeckResult<Self> {
         let path = path.as_ref().to_path_buf();
         namespace.require_child(&path).map_err(|err| {
@@ -303,7 +303,7 @@ impl DurableBroadcastLog {
             namespace: Some(namespace.try_clone_authority().map_err(|err| {
                 ZeckError::Storage(format!("retaining broadcast registry namespace: {err}"))
             })?),
-            compatibility_lock: Some(namespace.retain_child(compatibility_lock_path).map_err(
+            compatibility_lock: Some(namespace.clone_retained_child(compatibility_lock).map_err(
                 |err| ZeckError::Storage(format!("retaining workspace compatibility lock: {err}")),
             )?),
             held_legacy_sources: Vec::new(),

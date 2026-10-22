@@ -2118,6 +2118,7 @@ impl NamespaceLease {
         Ok(child)
     }
 
+    #[cfg(test)]
     pub(crate) fn retain_child(&self, path: &Path) -> io::Result<RetainedNamespaceChild> {
         self.require_child(path)?;
         self.verify_current()?;
@@ -2142,6 +2143,28 @@ impl NamespaceLease {
         let file = open_child_file_for_lock(&self.parent, path)?;
         sync_private_directory(&self.parent)?;
         let id = private_object_id(&file)?;
+        #[cfg(windows)]
+        let file = {
+            // The creation handle requests DELETE so a failed private-file
+            // validation can remove a new child. SQLite deliberately omits
+            // FILE_SHARE_DELETE, so retain the verified identity across a
+            // handoff to an attributes-only handle before SQLite reopens it.
+            let bridge = windows_acl::open_child_file_for_identity(&self.parent, path)?;
+            if private_object_id(&bridge)? != id {
+                return Err(invalid_lineage(
+                    "private namespace child changed before authority handoff",
+                ));
+            }
+            drop(file);
+            let retained = windows_acl::open_child_file_for_retained_authority(&self.parent, path)?;
+            if private_object_id(&retained)? != id {
+                return Err(invalid_lineage(
+                    "private namespace child changed during authority handoff",
+                ));
+            }
+            drop(bridge);
+            retained
+        };
         let child = RetainedNamespaceChild {
             namespace: self.try_clone_authority()?,
             file,
@@ -2150,6 +2173,27 @@ impl NamespaceLease {
         };
         child.verify_current()?;
         Ok(child)
+    }
+
+    pub(crate) fn clone_retained_child(
+        &self,
+        child: &RetainedNamespaceChild,
+    ) -> io::Result<RetainedNamespaceChild> {
+        self.verify_current()?;
+        child.verify_current()?;
+        if self.parent_path != child.namespace.parent_path
+            || self.parent_id != child.namespace.parent_id
+            || self.lock_path != child.namespace.lock_path
+            || self.lock_id != child.namespace.lock_id
+        {
+            return Err(invalid_lineage(
+                "retained child belongs to another private namespace",
+            ));
+        }
+        let clone = child.try_clone_authority()?;
+        self.verify_current()?;
+        clone.verify_current()?;
+        Ok(clone)
     }
 
     pub(crate) fn try_clone_authority(&self) -> io::Result<Self> {
@@ -2281,6 +2325,16 @@ impl NamespaceChildLock<'_> {
 }
 
 impl RetainedNamespaceChild {
+    fn try_clone_authority(&self) -> io::Result<Self> {
+        self.verify_current()?;
+        Ok(Self {
+            namespace: self.namespace.try_clone_authority()?,
+            file: self.file.try_clone()?,
+            path: self.path.clone(),
+            id: self.id.clone(),
+        })
+    }
+
     pub(crate) fn verify_current(&self) -> io::Result<()> {
         self.namespace.verify_current()?;
         if private_object_id(&self.file)? != self.id {
@@ -9216,6 +9270,26 @@ mod tests {
         assert!(reopened.child_names().is_ok());
     }
 
+    #[test]
+    fn retained_child_clone_is_bound_to_its_issuing_namespace() {
+        let outer = tempfile::tempdir().unwrap();
+        let first_parent = outer.path().join("first-private");
+        let second_parent = outer.path().join("second-private");
+        create_private_dir_all(&first_parent).unwrap();
+        create_private_dir_all(&second_parent).unwrap();
+        let first =
+            NamespaceLease::acquire(&first_parent, &first_parent.join("authority.lock")).unwrap();
+        let second =
+            NamespaceLease::acquire(&second_parent, &second_parent.join("authority.lock")).unwrap();
+        let child = first
+            .open_or_create_retained_child(&first_parent.join("compatibility.sqlite"))
+            .unwrap();
+
+        first.clone_retained_child(&child).unwrap();
+        let error = second.clone_retained_child(&child).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_authenticated_container_and_root_reopen_and_enumerate() {
@@ -10676,6 +10750,36 @@ mod windows_tests {
         assert_eq!(lease.read_child(&path).unwrap(), b"exact-private");
         let retained = lease.retain_child(&path).unwrap();
         retained.verify_current().unwrap();
+    }
+
+    #[test]
+    fn windows_retained_child_allows_sqlite_reopen_and_still_pins_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("private");
+        create_private_dir_all(&parent_path).unwrap();
+        let lease =
+            NamespaceLease::acquire(&parent_path, &parent_path.join("authority.lock")).unwrap();
+        let path = parent_path.join("compatibility.sqlite");
+        let renamed = parent_path.join("renamed.sqlite");
+
+        let retained = lease.open_or_create_retained_child(&path).unwrap();
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        connection
+            .execute_batch("BEGIN EXCLUSIVE TRANSACTION; ROLLBACK")
+            .unwrap();
+        drop(connection);
+
+        let cloned = lease.clone_retained_child(&retained).unwrap();
+        drop(retained);
+        assert!(
+            fs::rename(&path, &renamed).is_err(),
+            "retained authority must prevent SQLite path replacement"
+        );
+        cloned.verify_current().unwrap();
     }
 
     #[test]

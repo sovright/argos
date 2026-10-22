@@ -3339,6 +3339,22 @@ mod tests {
         path
     }
 
+    fn unused_artifact_data_dir(label: &str) -> std::path::PathBuf {
+        unused_temp_dir(label)
+            .join("publication")
+            .join("recovery-data")
+    }
+
+    fn remove_artifact_fixture(data_dir: &std::path::Path) {
+        let outer = data_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("artifact fixture has publication and outer parents");
+        if outer.exists() {
+            std::fs::remove_dir_all(outer).unwrap();
+        }
+    }
+
     #[test]
     fn validate_seed_accepts_protected_words_at_the_ipc_boundary() {
         let words = vec![secrecy::SecretString::new("abandon".to_owned()); 24];
@@ -3373,7 +3389,7 @@ mod tests {
 
     fn test_sprout_journal(marker: u8) -> argos_core::sprout_sweep::SweepJournal {
         argos_core::sprout_sweep::SweepJournal::for_keys(
-            &std::env::temp_dir().join(format!("argos-command-journal-{}", uuid::Uuid::new_v4())),
+            &unused_artifact_data_dir("command-journal"),
             &[[marker; 32]],
             argos_core::ZeckNetwork::Mainnet,
         )
@@ -4078,7 +4094,7 @@ mod tests {
             });
         let store = ReviewedIntentStore::default();
         let reported = std::cell::RefCell::new(Vec::new());
-        let dir = std::env::temp_dir().join(format!("argos-forged-{}", uuid::Uuid::new_v4()));
+        let dir = unused_artifact_data_dir("forged");
         argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let err = super::propose_wallet_sprout_sweep_core(
             &store,
@@ -4100,7 +4116,7 @@ mod tests {
         let reported = reported.into_inner();
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert!(reported[0].contains("does not control"), "{}", reported[0]);
-        let _ = std::fs::remove_dir_all(dir);
+        remove_artifact_fixture(&dir);
     }
 
     #[test]
@@ -4906,7 +4922,7 @@ mod tests {
         )
         .expect("preview aggregation must not panic or wrap");
         assert_eq!(preview.gross_zatoshis, u64::MAX);
-        std::fs::remove_dir_all(journal.data_dir()).unwrap();
+        remove_artifact_fixture(journal.data_dir());
     }
 
     #[test]
@@ -4966,7 +4982,7 @@ mod tests {
             argos_core::TxLifecycleState::SubmissionUnknown
         );
         assert!(preview.mined.is_empty());
-        let _ = std::fs::remove_dir_all(journal.data_dir());
+        remove_artifact_fixture(journal.data_dir());
     }
 
     #[test]
@@ -5012,7 +5028,7 @@ mod tests {
 
     #[test]
     fn fresh_gui_workspace_is_authenticated_before_sprout_work_starts() {
-        let workspace = unused_temp_dir("fresh-gui-workspace");
+        let workspace = unused_artifact_data_dir("fresh-gui-workspace");
         assert!(!workspace.exists());
 
         super::with_resolved_sprout_data_dir(Ok(workspace.clone()), |resolved| {
@@ -5022,7 +5038,7 @@ mod tests {
             Ok::<_, String>(())
         })
         .unwrap();
-        std::fs::remove_dir_all(&workspace).unwrap();
+        remove_artifact_fixture(&workspace);
     }
 
     #[test]
@@ -5167,11 +5183,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {
-        let dir = std::env::temp_dir().join(format!(
-            "argos-gui-unverified-sprout-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4(),
-        ));
+        let dir = unused_artifact_data_dir("gui-unverified-sprout");
         argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let a_sk = [0x52; 32];
         let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
@@ -5220,7 +5232,7 @@ mod tests {
         assert!(accounting.contains("not verified offline"), "{accounting}");
         assert!(accounting.contains(&checkpoint.display().to_string()));
         assert!(recovered.spent.is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     /// Review of #272, round 2: a malformed entry in the scan panel's peer
@@ -5230,11 +5242,7 @@ mod tests {
     /// used), and says why in the preview's scan warning.
     #[tokio::test]
     async fn a_malformed_scan_peer_degrades_the_preview_to_a_warning() {
-        let dir = std::env::temp_dir().join(format!(
-            "argos-gui-preview-bad-peer-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4(),
-        ));
+        let dir = unused_artifact_data_dir("gui-preview-bad-peer");
         argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let a_sk = [0x53; 32];
         let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
@@ -5280,7 +5288,7 @@ mod tests {
         // The sweep itself still refuses the same field, with the format.
         let err = parse_custom_peers(&["no-port-here".to_owned()]).unwrap_err();
         assert!(err.contains("host:port"), "{err}");
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     fn spent_note() -> SpentSproutNote {
@@ -5369,7 +5377,7 @@ mod tests {
             false,
         );
         assert!(!unreadable.nothing_left);
-        std::fs::remove_dir_all(journal.data_dir()).unwrap();
+        remove_artifact_fixture(journal.data_dir());
     }
 
     use super::*;

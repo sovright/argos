@@ -1041,7 +1041,6 @@ pub struct NetworkOperationGuard {
     _connection: rusqlite::Connection,
     namespace: crate::private_fs::NamespaceLease,
     compatibility_lock: crate::private_fs::RetainedNamespaceChild,
-    compatibility_lock_path: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     network: crate::models::ZeckNetwork,
 }
@@ -1053,7 +1052,6 @@ pub(crate) struct NetworkRegistryLease {
     artifact_container: crate::private_fs::PrivateArtifactRootLease,
     namespace: crate::private_fs::NamespaceLease,
     compatibility_lock: crate::private_fs::RetainedNamespaceChild,
-    compatibility_lock_path: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     network: crate::models::ZeckNetwork,
 }
@@ -1073,7 +1071,7 @@ impl NetworkRegistryLease {
         let registry = DurableBroadcastLog::open_in_namespace(
             network_broadcast_log_path(&self.data_dir, self.network)?,
             &self.namespace,
-            &self.compatibility_lock_path,
+            &self.compatibility_lock,
         )?;
         self.verify()?;
         Ok(registry)
@@ -1154,7 +1152,6 @@ impl NetworkOperationGuard {
             _connection: connection,
             namespace,
             compatibility_lock,
-            compatibility_lock_path: path,
             data_dir,
             network,
         })
@@ -1185,11 +1182,10 @@ impl NetworkOperationGuard {
             })?,
             compatibility_lock: self
                 .namespace
-                .retain_child(&self.compatibility_lock_path)
+                .clone_retained_child(&self.compatibility_lock)
                 .map_err(|err| {
                     ZeckError::Storage(format!("retaining workspace compatibility lock: {err}"))
                 })?,
-            compatibility_lock_path: self.compatibility_lock_path.clone(),
             data_dir: self.data_dir.clone(),
             network: self.network,
         })
@@ -1225,7 +1221,7 @@ impl NetworkOperationGuard {
         let registry = DurableBroadcastLog::open_in_namespace(
             self.broadcast_log_path()?,
             &self.namespace,
-            &self.compatibility_lock_path,
+            &self.compatibility_lock,
         )?;
         self.verify()?;
         Ok(registry)
@@ -1239,7 +1235,7 @@ impl NetworkOperationGuard {
         let mut registry = DurableBroadcastLog::open_in_namespace(
             self.broadcast_log_path()?,
             &self.namespace,
-            &self.compatibility_lock_path,
+            &self.compatibility_lock,
         )?;
         self.verify()?;
         let mut sources = discover_legacy_broadcast_logs(&self.data_dir, self.network)?;
@@ -1306,7 +1302,9 @@ mod network_namespace_tests {
     use std::io::Write;
 
     fn data_dir(outer: &tempfile::TempDir) -> std::path::PathBuf {
-        outer.path().join("artifact-data")
+        let publication = outer.path().join("publication");
+        crate::private_fs::create_private_dir_all(&publication).unwrap();
+        publication.join("artifact-data")
     }
 
     #[test]
@@ -1490,6 +1488,9 @@ mod network_namespace_tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = data_dir(&dir);
         let guard = NetworkOperationGuard::acquire(&data_dir, ZeckNetwork::Mainnet).unwrap();
+        let registry = guard.registry_lease().unwrap();
+        registry.verify().unwrap();
+        registry.reopen_broadcast_log().unwrap();
         let root = network_registry_root(&data_dir, ZeckNetwork::Mainnet).unwrap();
         let detached = root.with_extension("detached");
         assert!(std::fs::rename(&root, &detached).is_err());
