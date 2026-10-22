@@ -159,24 +159,42 @@ It is intentionally separate from the ordinary compact-block scan:
   re-running a finished scan catches up to the new tip.
 
 The Sprout checkpoint is spend-capable: it contains the raw keys, recovered
-note plaintexts, and witnesses needed to resume and sweep. Argos creates its
-private directory as `0700` and sensitive files as `0600` on Unix, owned by
-the current user without extended or inherited ACLs. On Windows creation sets
-the current token user as owner and a protected DACL granting full control only
-to that user and LocalSystem. All reused objects must already match these exact
-controls or Argos refuses them before truncating, appending, or repairing
-permissions. Existing private roots and wallet databases must also carry their
-create-time lineage; legacy unmarked or insecure workspaces are refused and
-must be archived, recreated, and rescanned rather than repaired in place.
+note plaintexts, and witnesses needed to resume and sweep. Before the first
+secret, checkpoint, or journal byte is written, Argos publishes the exact data
+directory as a create-time-authenticated private container. Opaque roots bound
+to the network and full key-set fingerprint inside that container hold the
+checkpoint, version-4 journal, locks, replacement candidates, and deletion
+quarantines. Unix uses
+current-user-owned `0700` roots and `0600` files without extended or inherited
+ACLs. Windows uses a protected DACL granting full control only to the current
+user and LocalSystem, plus DPAPI `CurrentUser` and HKCU authority so a
+temporarily tightened stale handle cannot authorize reuse. Existing unmarked
+data directories, direct checkpoints or journals, and in-root version-1 to
+version-3 journals are preserved unchanged and refused before read, append, or
+truncate; chmod, DACL changes, or adding a marker cannot adopt them.
+
+The current binary cannot prove that an unmarked legacy directory contains
+every historical broadcast record. Preserve the entire old directory,
+including journals and any saved raw transaction bytes. Use the trusted prior
+Argos release or manual checks against independent chain sources to reconcile
+every pending or unknown txid and its raw transaction evidence. Then select a
+genuinely absent data-directory path for the current binary and rescan. Never
+delete the old directory, wallet, checkpoint, journal, or raw transaction
+evidence until the funds and every transaction are independently settled. The
+current binary deliberately has no automatic adoption or migration path.
 Protect the checkpoint and the original wallet
 or Sprout key until Argos has freshly observed every manifested transaction as
 canonical mined. A successful broadcast, a node accepting a transaction, or a
 previously observed mined state is not enough to discard either source.
 
 Before submitting a Sprout transaction, Argos durably journals its exact
-serialized bytes. An accepted submission remains **pending** until independent
-confirmation sources report canonical mined evidence. If submission has an
-unknown outcome, Argos stops before processing later notes: on the next run it
+serialized bytes. The version-4 journal header binds the full key-set
+fingerprint, network, lineage anchor, and artifact generation. Before proving,
+reconciliation, or send, Argos validates authenticated sibling roots and stops
+if another key set's journal claims any of the same Sprout notes. An accepted
+submission remains **pending** until independent confirmation sources report
+canonical mined evidence. If submission has an unknown outcome, Argos stops
+before processing later notes: on the next run it
 reconciles that transaction and, while it remains valid, retries the same bytes
 rather than building a different spend. For an absent or unresolved saved
 transaction, Argos builds a replacement only after independent sources
@@ -187,13 +205,17 @@ Keep the wallet or key, checkpoint, and journal available through every retry
 and restart. A checkpoint is retained while any manifested note is prepared,
 unknown, pending, contested, rejected, expired but recoverable, missing, or not
 fully reconciled. Cleanup requires the current checkpoint notes to equal the
-durable manifest for the exact checkpoint generation (length, digest, and file
-object), and every entry to be currently mined with the same canonical block
-height and hash in the two newest separate reconciliation rounds, each with
-matching observations from two independent operator authorities at a depth of
-100 blocks. A durable tombstone preserves the generation,
-manifest, signed transaction bytes, and evidence before exact-object deletion,
-so restart recovery does not turn deletion into permission to respent a note.
+durable manifest for the exact checkpoint generation (lineage anchor, authority
+generation, length, digest, and file object), and every entry to be currently
+mined with the same canonical block height and hash in the two newest separate
+reconciliation rounds. Each round needs matching observations from two
+independent operator authorities at a depth of 100 blocks. A durable
+discard-start record and note tombstones preserve the generation, manifest,
+signed transaction bytes, and evidence before authority
+enters `Retiring`. The exact object is then quarantined and deleted, authority
+becomes `Retired`, and the journal records completion last. A restart restores
+any surviving canonical or quarantined checkpoint for fresh review; it never
+uses stale observations to finish deleting that survivor.
 
 Checkpoint replacement and deletion use retained handles and same-directory
 staging. Keep the Argos private data directory and its staging files on one
@@ -216,12 +238,13 @@ independent. To reconcile the Sprout journal automatically, rerun the confirmed
 network, and `--data-dir`; the generic `reconcile` command does not read the
 Sprout journal.
 
-Sprout scan checkpoints written before block bodies were authenticated
-against their headers (checkpoint versions 1 to 3, including scans saved with
-a decrypt-from bound) are refused for resume and as spend evidence. Keep the
-old file and your spending-key source, move the checkpoint aside or use a new
-data directory, and run a fresh scan; the decrypt-from bound is derived again
-from the wallet when it starts.
+Sprout scan checkpoints written before block bodies were authenticated against
+their headers (checkpoint versions 1 to 3, including scans saved with a
+decrypt-from bound) are refused for resume and as spend evidence. Preserve the
+whole old data directory and the spending-key source, reconcile its transaction
+history as described above, choose a genuinely absent data-directory path, and
+run a fresh scan; the decrypt-from bound is derived again from the wallet when
+it starts.
 
 ```bash
 # First see whether the wallet already has spendable note data.
@@ -277,14 +300,14 @@ The findings and their fixes are tracked in this repository's pull-request histo
 ## Operational Notes
 
 - Recovery sessions persist wallet/cache state on disk for auditability and sweep construction. Workspace subdirectories are random per session so the path does not reveal a stable seed fingerprint.
-- New private storage is assembled create-only in a staging root. Argos syncs the root marker, workspace leaf, empty database, and database marker before atomically publishing the root. A crash before publication leaves no trusted final root; a published partial or identity-mismatched generation fails closed. The resume panel represents an insecure or unmarked legacy workspace only as a rescan-required row derived from its path. It never reads that workspace's label, balances, scan height, or database. Archive it while Argos is stopped, then start a new recovery and rescan.
-- Private recovery directories and sensitive files use exact current-user-owned `0700`/`0600` modes without extended or inherited ACLs on supported Unix systems. On Windows the current token user must own them and a protected current-user+LocalSystem DACL is required. All reused objects must already match these controls and their create-time lineage before any permission change, read, truncate, append, or other sensitive use. Argos never repairs them in place because changing permissions cannot revoke stale handles. Archive an insecure or unmarked legacy workspace while Argos is stopped, then create a new recovery and rescan; changing its mode, DACL, or marker does not make it trusted. Windows authenticates the private-root lineage marker with DPAPI `CurrentUser` and keeps a permanent per-leaf/database anchor in HKCU, keyed by the full canonical workspace/database context, whose state advances `Pending` -> `Active` -> `Revoked`. The first database authorization in a process performs an exclusive cold preflight; retained exact-object authority then permits that process's SQLite writer and progress readers to coexist. SQLite sidecars proven absent before connection open are the narrow creation exception: SQLite creates them while Argos retains their exact-private parent, then Argos normalizes and verifies them before releasing that parent. Workspace cleanup first syncs its durable cleanup marker, then revokes the Windows lineage anchor before deleting the tombstone. These controls do not isolate another process running as the same user or an administrator, and rollback of the user's HKCU/profile state remains a Windows residual.
-- The GUI clears seed, passphrase, and pasted-key fields once a scan accepts them; when a scan finishes, fails, or is cancelled; after Sprout execution; on **Forget this file**, abandonment to the welcome screen, **Start over**, and window close. Ordinary navigation and a wallet-inspection error keep the wallet passphrase available for the next step or retry. Dropping frontend state makes its opaque review ID inaccessible, while the backend rejects a review ID on its first use after 30 minutes. Finished Sprout scan secrets expire after 30 minutes; reviewed proposals expire 15 minutes after creation and carry their exact source identity until then. Running scans retain their keys until completion or explicit release, and release waits for workers before the last owner is dropped.
+- New private storage is assembled create-only in a staging root. Argos syncs the root marker, workspace leaf, empty database, and database marker before atomically publishing the root. A crash before publication leaves no trusted final root; a published partial or identity-mismatched generation fails closed. The resume panel represents an insecure or unmarked legacy workspace only as a rescan-required row derived from its path. It never reads that workspace's label, balances, scan height, or database. Preserve that tree, reconcile its pending or unknown transaction IDs using the prior trusted version or independent chain checks, and start a rescan in a genuinely absent data directory; do not delete the old evidence during reconciliation.
+- Private recovery directories and sensitive files use exact current-user-owned `0700`/`0600` modes without extended or inherited ACLs on supported Unix systems. On Windows the current token user must own them and a protected current-user+LocalSystem DACL is required. All reused objects must already match these controls and their create-time lineage before any permission change, read, truncate, append, or other sensitive use. Argos never repairs them in place because changing permissions cannot revoke stale handles. Preserve an insecure or unmarked legacy workspace, reconcile its transaction history using trusted independent evidence, then create a new recovery under a genuinely absent data-directory path and rescan; changing its mode, DACL, or marker does not make it trusted. Windows authenticates the private-root lineage marker with DPAPI `CurrentUser` and keeps a permanent per-leaf/database anchor in HKCU, keyed by the full canonical workspace/database context, whose state advances `Pending` -> `Active` -> `Revoked`. The first database authorization in a process performs an exclusive cold preflight; retained exact-object authority then permits that process's SQLite writer and progress readers to coexist. SQLite sidecars proven absent before connection open are the narrow creation exception: SQLite creates them while Argos retains their exact-private parent, then Argos normalizes and verifies them before releasing that parent. Workspace cleanup first syncs its durable cleanup marker, then revokes the Windows lineage anchor before deleting the tombstone. These controls do not isolate another process running as the same user or an administrator, and rollback of the user's HKCU/profile state remains a Windows residual.
+- The GUI clears seed, passphrase, and pasted-key fields once a scan accepts them; when a scan finishes, fails, or is cancelled; after Sprout execution; on **Forget this file**, abandonment to the welcome screen, **Start over**, and window close. Ordinary navigation and a wallet-inspection error keep the wallet passphrase only within the active review window: the GUI drops the passphrase and opaque review ID after 29 minutes, before the backend's 30-minute review limit. Finished Sprout scan secrets expire after 30 minutes; reviewed proposals expire 15 minutes after creation and carry their exact source identity until then. Running scans retain their keys until completion or explicit release, and release waits for workers before the last owner is dropped.
 - Secret owners use best-effort zeroization on drop. This shortens ordinary plaintext lifetime but cannot defeat swap, crash/core dumps, allocator or compiler copies, kernel caches, DMA, forensic capture, or a compromised process; use an encrypted disk and encrypted or disabled swap for high-value recovery.
 - Transparent funds are imported into the wallet workspace using Argos's audited legacy derivation, not modern per-account transparent derivation.
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
-- Sprout transactions are journaled before submission. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. An absent or unresolved transaction requires independently corroborated absence beyond expiry before rebuilding. A deterministic, retryable, or already-known reply from the primary submission endpoint remains SubmissionUnknown until independent observation resolves it.
+- Sprout transactions are journaled before submission in version-4 authenticated roots bound to the network, full key-set fingerprint, lineage anchor, and artifact generation. Argos rejects overlapping note claims across sibling roots. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. An absent or unresolved transaction requires independently corroborated absence beyond expiry before rebuilding. A deterministic, retryable, or already-known reply from the primary submission endpoint remains SubmissionUnknown until independent observation resolves it.
 - Keep the original wallet or Sprout key, scan checkpoint, and journal until Argos reports that the current checkpoint notes exactly equal the durable manifest for that exact generation, every manifest entry is currently canonical mined, and the two newest separate reconciliation rounds report the same mined height and block hash, each at least 100 blocks deep and backed by two independent operators. A broadcast, visible arrival, node acceptance, or one confirmation is insufficient.
 - A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
 - A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.
