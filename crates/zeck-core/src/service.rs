@@ -8757,30 +8757,9 @@ mod leg_gating_tests {
     use crate::broadcast::{EndpointTxEvidence, TxObservation, TxSubmitter};
     use crate::models::ZeckNetwork;
     use zcash_client_backend::proto::service::SendResponse;
-    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
-    use zcash_protocol::consensus::BranchId;
 
     fn prepared(expiry: u32) -> PreparedTransaction {
-        let tx = TransactionData::<Authorized>::from_parts(
-            TxVersion::V5,
-            BranchId::Nu5,
-            0,
-            BlockHeight::from_u32(expiry),
-            None,
-            None,
-            None,
-            None,
-        )
-        .freeze()
-        .unwrap();
-        let mut raw_tx = Vec::new();
-        tx.write(&mut raw_tx).unwrap();
-        PreparedTransaction {
-            txid: tx.txid(),
-            raw_tx,
-            fee_zatoshis: 10_000,
-            expiry_height: Some(expiry),
-        }
+        crate::test_support::empty_v5_prepared(expiry, 10_000)
     }
 
     #[derive(Default)]

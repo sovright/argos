@@ -9,10 +9,7 @@ use std::{
     time::Duration,
 };
 use zcash_client_backend::proto::service::SendResponse;
-use zcash_primitives::transaction::Authorized;
 use zcash_primitives::transaction::TxId;
-use zcash_primitives::transaction::{TransactionData, TxVersion};
-use zcash_protocol::consensus::{BlockHeight, BranchId};
 
 #[test]
 fn retryable_disposition_blocks_followup_only_while_pending() {
@@ -531,26 +528,7 @@ impl TxSubmitter for ScriptedSubmitter {
     }
 }
 fn fixture() -> PreparedTransaction {
-    let tx = TransactionData::<Authorized>::from_parts(
-        TxVersion::V5,
-        BranchId::Nu5,
-        0,
-        BlockHeight::from_u32(100),
-        None,
-        None,
-        None,
-        None,
-    )
-    .freeze()
-    .unwrap();
-    let mut raw_tx = Vec::new();
-    tx.write(&mut raw_tx).unwrap();
-    PreparedTransaction {
-        txid: tx.txid(),
-        raw_tx,
-        fee_zatoshis: 12_345,
-        expiry_height: Some(100),
-    }
+    crate::test_support::empty_v5_prepared(100, 12_345)
 }
 fn network(store: &RecordingStore, script: Script) -> ScriptedSubmitter {
     ScriptedSubmitter {
@@ -840,27 +818,7 @@ async fn failed_unknown_transition_prevents_network_io() {
 
 #[tokio::test]
 async fn failed_final_transition_returns_known_unknown_after_accepted_response() {
-    struct FinalTransitionFails(RecordingStore);
-    impl BroadcastStore for FinalTransitionFails {
-        fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
-            self.0.persist_prepared(tx)
-        }
-        fn transition(
-            &mut self,
-            txid: TxId,
-            state: TxLifecycleState,
-            submission: Option<&SubmissionDisposition>,
-            observation: Option<&TxObservation>,
-        ) -> ZeckResult<()> {
-            if submission.is_some() {
-                return Err(ZeckError::Storage("final sync failed".into()));
-            }
-            self.0.transition(txid, state, submission, observation)
-        }
-        fn latest(&self, txid: TxId) -> Option<PersistedTransaction> {
-            self.0.latest(txid)
-        }
-    }
+    use crate::test_support::FinalTransitionFails;
     let tx = fixture();
     let recording = RecordingStore::default();
     let mut store = FinalTransitionFails(recording.clone());
@@ -887,27 +845,7 @@ async fn failed_final_transition_returns_known_unknown_after_accepted_response()
 
 #[tokio::test]
 async fn failed_final_transition_returns_known_unknown_after_transport_failure() {
-    struct FinalTransitionFails(RecordingStore);
-    impl BroadcastStore for FinalTransitionFails {
-        fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
-            self.0.persist_prepared(tx)
-        }
-        fn transition(
-            &mut self,
-            txid: TxId,
-            state: TxLifecycleState,
-            submission: Option<&SubmissionDisposition>,
-            observation: Option<&TxObservation>,
-        ) -> ZeckResult<()> {
-            if submission.is_some() {
-                return Err(ZeckError::Storage("final sync failed".into()));
-            }
-            self.0.transition(txid, state, submission, observation)
-        }
-        fn latest(&self, txid: TxId) -> Option<PersistedTransaction> {
-            self.0.latest(txid)
-        }
-    }
+    use crate::test_support::FinalTransitionFails;
     let tx = fixture();
     let recording = RecordingStore::default();
     let mut store = FinalTransitionFails(recording.clone());

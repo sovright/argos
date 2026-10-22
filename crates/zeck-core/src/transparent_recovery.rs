@@ -1202,65 +1202,11 @@ mod sweep_tests {
 
     #[tokio::test]
     async fn transparent_record_keeps_txid_fee_and_warning_when_final_sync_fails() {
-        use crate::broadcast::{BroadcastStore, DurableBroadcastLog, TxSubmitter};
-        use zcash_client_backend::proto::service::SendResponse;
-        use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
-        use zcash_protocol::consensus::BranchId;
+        use crate::broadcast::{BroadcastStore, DurableBroadcastLog};
+        use crate::test_support::{empty_v5_prepared, AcceptingSubmitter, FinalTransitionFails};
 
-        struct FinalSyncFails(DurableBroadcastLog);
-        impl BroadcastStore for FinalSyncFails {
-            fn persist_prepared(&mut self, tx: &PreparedTransaction) -> ZeckResult<()> {
-                self.0.persist_prepared(tx)
-            }
-            fn transition(
-                &mut self,
-                txid: zcash_primitives::transaction::TxId,
-                state: TxLifecycleState,
-                submission: Option<&crate::broadcast::SubmissionDisposition>,
-                observation: Option<&crate::broadcast::TxObservation>,
-            ) -> ZeckResult<()> {
-                if submission.is_some() {
-                    return Err(ZeckError::Storage("final sync failed".to_owned()));
-                }
-                self.0.transition(txid, state, submission, observation)
-            }
-            fn latest(
-                &self,
-                txid: zcash_primitives::transaction::TxId,
-            ) -> Option<crate::broadcast::PersistedTransaction> {
-                self.0.latest(txid)
-            }
-        }
-        struct Accepted;
-        #[async_trait::async_trait]
-        impl TxSubmitter for Accepted {
-            async fn send_raw(&mut self, _: Vec<u8>) -> Result<SendResponse, tonic::Status> {
-                Ok(SendResponse {
-                    error_code: 0,
-                    error_message: String::new(),
-                })
-            }
-        }
-        let tx = TransactionData::<Authorized>::from_parts(
-            TxVersion::V5,
-            BranchId::Nu5,
-            0,
-            BlockHeight::from_u32(100),
-            None,
-            None,
-            None,
-            None,
-        )
-        .freeze()
-        .unwrap();
-        let mut raw_tx = Vec::new();
-        tx.write(&mut raw_tx).unwrap();
-        let prepared = PreparedTransaction {
-            txid: tx.txid(),
-            raw_tx,
-            fee_zatoshis: 10_000,
-            expiry_height: Some(100),
-        };
+        let prepared = empty_v5_prepared(100, 10_000);
+        let txid = prepared.txid;
         let plan = TransparentSweepPlan {
             input_count: 1,
             total_input_zatoshis: 30_000,
@@ -1268,14 +1214,19 @@ mod sweep_tests {
             output_zatoshis: 20_000,
         };
         let dir = tempfile::tempdir().unwrap();
-        let mut store = FinalSyncFails(
+        let mut store = FinalTransitionFails(
             DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap(),
         );
-        let result =
-            submit_transparent_prepared(&mut store, &mut Accepted, prepared, plan, "destination")
-                .await
-                .unwrap();
-        assert_eq!(result.transaction.txid, Some(tx.txid().to_string()));
+        let result = submit_transparent_prepared(
+            &mut store,
+            &mut AcceptingSubmitter::default(),
+            prepared,
+            plan,
+            "destination",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.transaction.txid, Some(txid.to_string()));
         assert_eq!(result.transaction.fee_zatoshis, 10_000);
         assert_eq!(
             result.transaction.status,
@@ -1283,48 +1234,19 @@ mod sweep_tests {
         );
         assert!(result.transaction.detail.contains("final sync failed"));
         assert_eq!(
-            store.latest(tx.txid()).unwrap().state,
+            store.latest(txid).unwrap().state,
             TxLifecycleState::SubmissionUnknown
         );
     }
 
     #[tokio::test]
     async fn transparent_transport_failure_returns_known_txid_and_unknown_state() {
-        use crate::broadcast::{DurableBroadcastLog, PreparedTransaction, TxSubmitter};
+        use crate::broadcast::DurableBroadcastLog;
         use crate::models::TxLifecycleState;
-        use zcash_client_backend::proto::service::SendResponse;
-        use zcash_primitives::transaction::Authorized;
-        use zcash_primitives::transaction::{TransactionData, TxVersion};
-        use zcash_protocol::consensus::BranchId;
+        use crate::test_support::{empty_v5_prepared, LostReplySubmitter};
 
-        struct LostReply;
-        #[async_trait::async_trait]
-        impl TxSubmitter for LostReply {
-            async fn send_raw(&mut self, _raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
-                Err(tonic::Status::unavailable("reply lost after send"))
-            }
-        }
-
-        let tx = TransactionData::<Authorized>::from_parts(
-            TxVersion::V5,
-            BranchId::Nu5,
-            0,
-            BlockHeight::from_u32(100),
-            None,
-            None,
-            None,
-            None,
-        )
-        .freeze()
-        .unwrap();
-        let mut raw = Vec::new();
-        tx.write(&mut raw).unwrap();
-        let prepared = PreparedTransaction {
-            txid: tx.txid(),
-            raw_tx: raw,
-            fee_zatoshis: 10_000,
-            expiry_height: Some(100),
-        };
+        let prepared = empty_v5_prepared(100, 10_000);
+        let txid = prepared.txid;
         let plan = TransparentSweepPlan {
             input_count: 1,
             total_input_zatoshis: 30_000,
@@ -1334,13 +1256,18 @@ mod sweep_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
         let mut log = DurableBroadcastLog::open(&path).unwrap();
-        let outcome =
-            submit_transparent_prepared(&mut log, &mut LostReply, prepared, plan, "destination")
-                .await
-                .unwrap();
+        let outcome = submit_transparent_prepared(
+            &mut log,
+            &mut LostReplySubmitter,
+            prepared,
+            plan,
+            "destination",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome.transaction.txid.as_deref(),
-            Some(tx.txid().to_string().as_str())
+            Some(txid.to_string().as_str())
         );
         assert_eq!(
             outcome.transaction.status,

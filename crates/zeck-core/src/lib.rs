@@ -57,6 +57,9 @@ pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
 
+#[cfg(test)]
+mod test_support;
+
 pub use address::validate_destination_address;
 pub use birthday::{
     detect_birthday, detect_wallet_file_birthday, estimate_birthday_from_date,
