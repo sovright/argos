@@ -960,6 +960,7 @@ async fn sweep_sprout(
     data_dir: &Path,
     peers: &[String],
     lightwalletd_url: &str,
+    confirmation_source: &[String],
     destination: &str,
     sprout_params: Option<PathBuf>,
     gate: SweepGate,
@@ -970,10 +971,22 @@ async fn sweep_sprout(
         confirm_sweep,
     } = gate;
     let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Verify(peers)).await;
+    let spending_keys = wallet_sprout_keys(keys);
+    let journal =
+        argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
+    let outpoints = recovered
+        .notes
+        .iter()
+        .map(|note| note.outpoint)
+        .collect::<Vec<_>>();
+    let snapshot = journal.load_scoped_snapshot(&outpoints)?;
+    let inventory = argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+    let preview_plan = sprout_preview_plan(&inventory)?;
     // stdout, beside the plan: `> plan.txt` must keep the reason the total
     // is smaller than the wallet's history.
     print_sprout_accounting(keys, &recovered, false, "argos inspect-wallet --show-spent");
-    if recovered.nothing_left_to_sweep() {
+    print_sprout_lifecycle_entries(&snapshot);
+    if sprout_nothing_left(&recovered, &inventory, &snapshot, true) {
         println!("Nothing is left to sweep: every Sprout note this file records was spent by");
         println!("the wallet itself or is worth less than the fee to move it.");
         println!("To check that against the chain: argos scan-sprout --wallet-file <this file>");
@@ -982,7 +995,7 @@ async fn sweep_sprout(
         return Ok(());
     }
 
-    if recovered.notes.is_empty() {
+    if recovered.notes.is_empty() && snapshot.entries().next().is_none() {
         eprintln!("No spendable Sprout notes could be recovered from this wallet file.");
         if !recovered.issues.is_empty() {
             eprintln!("Why:");
@@ -995,15 +1008,38 @@ async fn sweep_sprout(
         anyhow::bail!("nothing to sweep from this file");
     }
 
-    let plan = argos_core::sprout_sweep::plan_sweep(&recovered.notes)?;
-    println!();
-    println!("\u{2501}\u{2501}\u{2501} Sprout sweep \u{2501}\u{2501}\u{2501}");
-    println!("  Notes              {}", plan.notes);
-    println!("  Gross              {}", format_zec(plan.gross_zatoshis));
-    println!("  Fee                {}", format_zec(plan.fee_zatoshis));
-    println!("  Net to destination {}", format_zec(plan.net_zatoshis));
-    println!("  Destination        {destination}");
-    println!();
+    let no_ready_action = sprout_no_ready_action(
+        preview_plan.is_some(),
+        snapshot.entries().map(|entry| entry.state),
+    );
+    if no_ready_action == Some(SproutNoReadyAction::RecoverOrRescan) {
+        println!("No Sprout note is ready for a new transaction.");
+        if let Some(guidance) =
+            sprout_lifecycle_status_guidance(snapshot.entries().map(|entry| entry.state))
+        {
+            for line in wrap_text(guidance, 76) {
+                println!("  {line}");
+            }
+        }
+        println!();
+        return Ok(());
+    }
+
+    if let Some(plan) = preview_plan {
+        println!();
+        println!("\u{2501}\u{2501}\u{2501} Sprout sweep \u{2501}\u{2501}\u{2501}");
+        println!("  Notes              {}", plan.notes);
+        println!("  Gross              {}", format_zec(plan.gross_zatoshis));
+        println!("  Fee                {}", format_zec(plan.fee_zatoshis));
+        println!("  Net to destination {}", format_zec(plan.net_zatoshis));
+        println!("  Destination        {destination}");
+        println!();
+    } else {
+        debug_assert_eq!(no_ready_action, Some(SproutNoReadyAction::Reconcile));
+        println!("No Sprout note is ready for a new transaction; lifecycle journal entries");
+        println!("will be reconciled before any proving work.");
+        println!();
+    }
     // Said before the confirmation, not after the broadcast: someone who
     // pastes a Unified Address expects the funds in its best pool, and for
     // Sprout that is never Orchard.
@@ -1020,6 +1056,12 @@ async fn sweep_sprout(
 
     if dry_run {
         println!("Dry run: nothing was built or broadcast.");
+        if snapshot
+            .entries()
+            .any(|entry| entry.state == argos_core::TxLifecycleState::SubmissionUnknown)
+        {
+            anyhow::bail!("a Sprout submission remains unknown; later work stays stopped");
+        }
         return Ok(());
     }
     if !confirm_sweep {
@@ -1030,13 +1072,12 @@ async fn sweep_sprout(
     }
 
     let params_path = sprout_params.unwrap_or_else(argos_core::sprout_sweep::default_params_path);
-    eprintln!(
-        "Loading Sprout proving parameters from {} (725 MB; verified by digest)",
-        params_path.display()
-    );
-
-    let journal =
-        argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &wallet_sprout_keys(keys));
+    let confirmation_sources = argos_core::lightwalletd::parse_confirmation_sources(
+        &confirmation_source
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )?;
     eprintln!(
         "Each broadcast is recorded in {}, so an interrupted sweep resumes without \
          proving any note twice.",
@@ -1050,35 +1091,40 @@ async fn sweep_sprout(
         &params_path,
         argos_core::sprout_sweep::SweepOptions {
             source: argos_core::sprout_sweep::NoteSource::WalletFile,
-            journal: Some(&journal),
+            journal: &journal,
+            confirmation_sources: &confirmation_sources,
         },
         |msg| eprintln!("  {msg}"),
     )
     .await?;
 
     println!();
-    for sent in &outcome.sent {
-        println!(
-            "  swept {} \u{2014} {}",
-            format_zec(sent.value_swept),
-            sent.txid
-        );
-    }
+    print_sprout_transactions(&outcome);
     print_sprout_nu7_broadcast_warning(network, &outcome);
     report_sprout_skips_and_errors(&outcome);
-    println!("Swept {} to {destination}", format_zec(outcome.total_swept));
-    if outcome.destination_kind
-        == Some(argos_core::sprout_sweep::DestinationKind::SaplingReceiverOfUnified)
-    {
+    if outcome.fresh_all_mined {
+        println!(
+            "Canonically mined {} from Sprout into Sapling.",
+            format_zec(outcome.mined_zatoshis)
+        );
+    }
+    if let Some(pool_line) = sprout_post_execution_pool_line(&outcome) {
         println!();
-        println!("These funds are in the Sapling receiver of that unified address.");
-        println!("To finish moving them to Orchard, shield them from your own wallet.");
+        println!("{pool_line}");
     }
     // Non-zero, so a script cannot read a sweep that stopped partway as done.
     if outcome.error.is_some() {
         bail!("the Sprout sweep did not finish; see above");
     }
     Ok(())
+}
+
+fn sprout_post_execution_pool_line(
+    outcome: &argos_core::sprout_sweep::SproutSweepOutcome,
+) -> Option<&'static str> {
+    (!outcome.transactions.is_empty()).then_some(
+        "Sprout recovery transactions move value into Sapling. Use the lifecycle rows above to verify each transaction before moving those funds again.",
+    )
 }
 
 /// Gather the spending keys a Sprout scan should look for.
@@ -1183,7 +1229,10 @@ fn sprout_scan_plan(
 async fn sprout_tip_anchor(
     network: ZeckNetwork,
     lightwalletd_url: &str,
-) -> Option<argos_core::sprout_scan_run::TipAnchor> {
+) -> (
+    Option<argos_core::sprout_scan_run::TipAnchor>,
+    Option<String>,
+) {
     match argos_core::sprout_scan_run::independent_tip_anchor(network, lightwalletd_url).await {
         Ok(anchor) => {
             eprintln!(
@@ -1191,18 +1240,26 @@ async fn sprout_tip_anchor(
                  reports it.",
                 anchor.height
             );
-            Some(anchor)
+            (Some(anchor), None)
         }
         Err(err) => {
-            eprintln!(
-                "  ⚠ {}",
-                argos_core::sprout_scan_run::unconfirmed_tip_warning(
-                    network.into(),
-                    &err.to_string()
-                )
+            let warning = argos_core::sprout_scan_run::unconfirmed_tip_warning(
+                network.into(),
+                &err.to_string(),
             );
-            None
+            eprintln!("  ⚠ {warning}");
+            (None, Some(warning))
         }
+    }
+}
+
+fn apply_sprout_tip_warning(
+    outcome: &mut argos_core::sprout_sweep::SproutSweepOutcome,
+    warning: Option<String>,
+) {
+    if let Some(warning) = warning {
+        outcome.fresh_all_mined = false;
+        outcome.warnings.insert(0, warning);
     }
 }
 
@@ -1212,6 +1269,7 @@ async fn scan_sprout(
     keys: &[[u8; 32]],
     network: ZeckNetwork,
     lightwalletd_url: &str,
+    confirmation_source: &[String],
     data_dir: &Path,
     peers: &[String],
     destination: Option<&str>,
@@ -1253,7 +1311,7 @@ async fn scan_sprout(
     println!();
     print_sprout_scan_cost_warning(network);
 
-    let tip_anchor = sprout_tip_anchor(network, lightwalletd_url).await;
+    let (tip_anchor, tip_warning) = sprout_tip_anchor(network, lightwalletd_url).await;
     let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
 
     let checkpoint = argos_core::sprout_scan_run::checkpoint_path(data_dir, keys);
@@ -1324,25 +1382,66 @@ async fn scan_sprout(
     println!("  Total             {}", format_zec(result.total_value()));
     println!();
 
-    if result.notes.is_empty() {
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys, network);
+    let outpoints = result
+        .notes
+        .iter()
+        .map(|note| note.outpoint)
+        .collect::<Vec<_>>();
+    let snapshot = journal.load_scoped_snapshot(&outpoints)?;
+    let inventory = argos_core::sprout_sweep::classify_sprout_notes(&result.notes, &snapshot);
+    let preview_plan = sprout_preview_plan(&inventory)?;
+    print_sprout_lifecycle_entries(&snapshot);
+
+    if result.notes.is_empty() && snapshot.entries().next().is_none() {
         println!("No unspent Sprout notes were found for these keys.");
         return Ok(());
     }
 
+    let no_ready_action = sprout_no_ready_action(
+        preview_plan.is_some(),
+        snapshot.entries().map(|entry| entry.state),
+    );
+    if no_ready_action == Some(SproutNoReadyAction::RecoverOrRescan) {
+        println!("No Sprout note is ready for a new transaction.");
+        if let Some(guidance) =
+            sprout_lifecycle_status_guidance(snapshot.entries().map(|entry| entry.state))
+        {
+            for line in wrap_text(guidance, 76) {
+                println!("  {line}");
+            }
+        }
+        println!();
+        return Ok(());
+    }
+
     let Some(destination) = destination else {
-        println!("Re-run with --destination <zs1…> --confirm-sweep to move these funds.");
-        println!("The scan resumes from its saved progress — it will not download again.");
+        for line in sprout_scan_followup_guidance(no_ready_action, false) {
+            println!("{line}");
+        }
         return Ok(());
     };
     if !confirm_sweep {
-        println!("Re-run with --confirm-sweep to broadcast the sweep.");
-        println!("The scan resumes from its saved progress — it will not download again.");
+        for line in sprout_scan_followup_guidance(no_ready_action, true) {
+            println!("{line}");
+        }
+        if snapshot
+            .entries()
+            .any(|entry| entry.state == argos_core::TxLifecycleState::SubmissionUnknown)
+        {
+            anyhow::bail!("a Sprout submission remains unknown; later work stays stopped");
+        }
         return Ok(());
     }
 
     let params_path = sprout_params.unwrap_or_else(argos_core::sprout_sweep::default_params_path);
-    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, keys);
-    let outcome = argos_core::sprout_sweep::sweep_sprout_notes(
+    let confirmation_sources = argos_core::lightwalletd::parse_confirmation_sources(
+        &confirmation_source
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )?;
+    let mut outcome = argos_core::sprout_sweep::sweep_sprout_notes(
         &result.notes,
         network,
         lightwalletd_url,
@@ -1350,18 +1449,23 @@ async fn scan_sprout(
         &params_path,
         argos_core::sprout_sweep::SweepOptions {
             source: argos_core::sprout_sweep::NoteSource::Scan,
-            journal: Some(&journal),
+            journal: &journal,
+            confirmation_sources: &confirmation_sources,
         },
         |msg| eprintln!("  {msg}"),
     )
     .await?;
+    apply_sprout_tip_warning(&mut outcome, tip_warning);
 
-    for sent in &outcome.sent {
-        println!("  swept {} — {}", format_zec(sent.value_swept), sent.txid);
-    }
+    print_sprout_transactions(&outcome);
     print_sprout_nu7_broadcast_warning(network, &outcome);
     report_sprout_skips_and_errors(&outcome);
-    println!("Swept {} to {destination}", format_zec(outcome.total_swept));
+    if outcome.fresh_all_mined {
+        println!(
+            "Canonically mined {} from Sprout into Sapling.",
+            format_zec(outcome.mined_zatoshis)
+        );
+    }
     if outcome.error.is_some() {
         bail!("the Sprout sweep did not finish; see above");
     }
@@ -1454,7 +1558,7 @@ async fn recover_with_scan(
     evidence: ScanEvidence<'_>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
-    let (chain, mut notice) = match evidence {
+    let (chain, notice) = match evidence {
         ScanEvidence::Offline => (
             None,
             argos_core::sprout_scan_run::wallet_scan_notice_offline(
@@ -1477,15 +1581,6 @@ async fn recover_with_scan(
         keys,
         chain.as_deref(),
     );
-    if !spending_keys.is_empty() {
-        match argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys).load() {
-            Ok(swept) => recovered.drop_already_swept(&swept),
-            Err(err) => {
-                let line = format!("Not using the sweep journal: {err}");
-                notice = Some(notice.map_or(line.clone(), |n| format!("{n} {line}")));
-            }
-        }
-    }
     recovered.chain_notice = notice;
     recovered
 }
@@ -1505,6 +1600,235 @@ fn display_txid(txid: &[u8; 32]) -> String {
     txid.iter().rev().map(|b| format!("{b:02x}")).collect()
 }
 
+fn sprout_lifecycle_amount(value_zatoshis: Option<u64>) -> String {
+    value_zatoshis.map_or_else(|| "amount unknown".to_owned(), format_zec)
+}
+
+const SPROUT_KEEP_SOURCE_WARNING: &str =
+    "Keep the original wallet or Sprout key and the scan checkpoint. Broadcast is not confirmation.";
+
+fn lifecycle_snapshot_requires_source(
+    mut states: impl Iterator<Item = argos_core::TxLifecycleState>,
+) -> bool {
+    states.next().is_some()
+}
+
+fn journal_states_allow_nothing_left(
+    states: impl Iterator<Item = argos_core::TxLifecycleState>,
+) -> bool {
+    !lifecycle_snapshot_requires_source(states)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SproutNoReadyAction {
+    Reconcile,
+    RecoverOrRescan,
+}
+
+fn sprout_no_ready_action(
+    has_ready_notes: bool,
+    states: impl Iterator<Item = argos_core::TxLifecycleState>,
+) -> Option<SproutNoReadyAction> {
+    if has_ready_notes {
+        return None;
+    }
+    let mut saw_lifecycle = false;
+    let mut saw_reconcilable = false;
+    for state in states {
+        saw_lifecycle = true;
+        saw_reconcilable |= matches!(
+            state,
+            argos_core::TxLifecycleState::NotSubmitted
+                | argos_core::TxLifecycleState::SubmissionUnknown
+                | argos_core::TxLifecycleState::Pending
+                | argos_core::TxLifecycleState::Mined
+        );
+    }
+    saw_lifecycle.then_some(if saw_reconcilable {
+        SproutNoReadyAction::Reconcile
+    } else {
+        SproutNoReadyAction::RecoverOrRescan
+    })
+}
+
+fn sprout_scan_followup_guidance(
+    no_ready_action: Option<SproutNoReadyAction>,
+    destination_present: bool,
+) -> [&'static str; 2] {
+    match (no_ready_action, destination_present) {
+        (Some(SproutNoReadyAction::Reconcile), false) => [
+            "Re-run with --destination <zs1…> --confirm-sweep to reconcile the existing journal.",
+            "Reconciliation may exact-byte retry saved transaction bytes; it does not create a fresh transaction or run Sprout proving when no note is ready.",
+        ],
+        (Some(SproutNoReadyAction::Reconcile), true) => [
+            "Re-run with --confirm-sweep to reconcile the existing journal.",
+            "Reconciliation may exact-byte retry saved transaction bytes; it does not create a fresh transaction or run Sprout proving when no note is ready.",
+        ],
+        (Some(SproutNoReadyAction::RecoverOrRescan), _) => [
+            "Recover or rescan the source before reviewing a new sweep plan.",
+            SPROUT_KEEP_SOURCE_WARNING,
+        ],
+        (None, false) => [
+            "Re-run with --destination <zs1…> --confirm-sweep to move these funds.",
+            "The scan resumes from its saved progress — it will not download again.",
+        ],
+        (None, true) => [
+            "Re-run with --confirm-sweep to broadcast the sweep.",
+            "The scan resumes from its saved progress — it will not download again.",
+        ],
+    }
+}
+
+fn sprout_lifecycle_status_guidance(
+    states: impl Iterator<Item = argos_core::TxLifecycleState>,
+) -> Option<&'static str> {
+    match sprout_no_ready_action(false, states)? {
+        SproutNoReadyAction::Reconcile => Some(
+            "The lifecycle rows above are the current status for this key set. Keep the original \
+             wallet or Sprout key and the scan checkpoint while those transactions are reconciled.",
+        ),
+        SproutNoReadyAction::RecoverOrRescan => Some(
+            "Keep the original wallet or Sprout key and the scan checkpoint. Recover or rescan the \
+             source before reviewing a new sweep plan.",
+        ),
+    }
+}
+
+fn sprout_nothing_left(
+    recovered: &argos_core::sprout_recovery::SproutRecovery,
+    inventory: &argos_core::sprout_sweep::SproutSweepInventory<'_>,
+    snapshot: &argos_core::sprout_sweep::SproutJournalSnapshot,
+    journal_read: bool,
+) -> bool {
+    journal_read
+        && journal_states_allow_nothing_left(snapshot.entries().map(|entry| entry.state))
+        && recovered.nothing_left_to_sweep(inventory)
+}
+
+fn sprout_preview_plan(
+    inventory: &argos_core::sprout_sweep::SproutSweepInventory<'_>,
+) -> argos_core::ZeckResult<Option<argos_core::sprout_sweep::SproutSweepPlan>> {
+    argos_core::sprout_sweep::plan_sweep_candidates(&inventory.ready)
+}
+
+fn print_sprout_lifecycle_entries(snapshot: &argos_core::sprout_sweep::SproutJournalSnapshot) {
+    let retain_source =
+        lifecycle_snapshot_requires_source(snapshot.entries().map(|entry| entry.state));
+    for entry in snapshot.entries() {
+        let txid = entry.txid();
+        let amount = sprout_lifecycle_amount(entry.value_zatoshis);
+        match entry.state {
+            argos_core::TxLifecycleState::Pending => {
+                println!("  broadcast/pending {amount} — {txid}");
+            }
+            argos_core::TxLifecycleState::NotSubmitted
+            | argos_core::TxLifecycleState::SubmissionUnknown => {
+                println!("  submission status unknown {amount} — {txid}");
+            }
+            argos_core::TxLifecycleState::Mined => {
+                // A journal snapshot is historical evidence. Only an active
+                // reconciliation can make this observation fresh enough to
+                // release the source material.
+                if let Some(height) = entry
+                    .observation
+                    .as_ref()
+                    .filter(|observation| observation.has_canonical_mined_evidence())
+                    .and_then(|observation| observation.mined_height)
+                {
+                    println!("  mined at height {height} {amount} — {txid}");
+                } else {
+                    println!("  submission status unknown {amount} — {txid}");
+                }
+            }
+            argos_core::TxLifecycleState::MinedSingleSource => {
+                if let Some(height) = entry
+                    .observation
+                    .as_ref()
+                    .filter(|observation| observation.has_single_source_mined_evidence())
+                    .and_then(|observation| observation.mined_height)
+                {
+                    println!(
+                        "  mined according to one confirmation operator at height {height} \
+                         {amount} — {txid}"
+                    );
+                } else {
+                    println!("  submission status unknown {amount} — {txid}");
+                }
+            }
+            argos_core::TxLifecycleState::Expired => {
+                println!("  expired; ready for a new plan {amount} — {txid}");
+            }
+            argos_core::TxLifecycleState::Rejected => {
+                println!("  rejected; value not moved {amount} — {txid}");
+            }
+        }
+    }
+    if retain_source {
+        println!("{SPROUT_KEEP_SOURCE_WARNING}");
+    }
+}
+
+fn print_sprout_transactions(outcome: &argos_core::sprout_sweep::SproutSweepOutcome) {
+    let mut retain_source = !outcome.fresh_all_mined
+        || !outcome.skipped.is_empty()
+        || !outcome.rejected.is_empty()
+        || outcome.error.is_some();
+    for transaction in &outcome.transactions {
+        let amount = sprout_lifecycle_amount(transaction.value_zatoshis);
+        match transaction.state {
+            argos_core::TxLifecycleState::Pending => {
+                retain_source = true;
+                println!("  broadcast/pending {amount} — {}", transaction.txid);
+            }
+            argos_core::TxLifecycleState::NotSubmitted
+            | argos_core::TxLifecycleState::SubmissionUnknown => {
+                retain_source = true;
+                println!(
+                    "  submission status unknown {amount} — {}",
+                    transaction.txid
+                );
+            }
+            argos_core::TxLifecycleState::Mined => {
+                if let Some(height) = transaction.mined_height {
+                    println!("  mined at height {height} {amount} — {}", transaction.txid);
+                } else {
+                    retain_source = true;
+                    println!(
+                        "  submission status unknown {amount} — {}",
+                        transaction.txid
+                    );
+                }
+            }
+            argos_core::TxLifecycleState::MinedSingleSource => {
+                retain_source = true;
+                println!(
+                    "  mined according to one confirmation operator {amount} — {}",
+                    transaction.txid
+                );
+            }
+            argos_core::TxLifecycleState::Expired if transaction.superseded => println!(
+                "  expired; superseded by a newer transaction for the same note {amount} — {}",
+                transaction.txid
+            ),
+            argos_core::TxLifecycleState::Rejected if transaction.superseded => println!(
+                "  rejected; superseded by a newer transaction for the same note {amount} — {}",
+                transaction.txid
+            ),
+            argos_core::TxLifecycleState::Expired => println!(
+                "  expired; ready for a new plan {amount} — {}",
+                transaction.txid
+            ),
+            argos_core::TxLifecycleState::Rejected => println!(
+                "  rejected; value not moved {amount} — {}",
+                transaction.txid
+            ),
+        }
+    }
+    if retain_source {
+        println!("{SPROUT_KEEP_SOURCE_WARNING}");
+    }
+}
+
 /// Print notes that did not move, and any partial failure.
 ///
 /// Both were previously dropped on the floor. A user seeing a smaller total
@@ -1517,17 +1841,6 @@ fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSwee
     }
     for warning in &outcome.warnings {
         eprintln!("  warning: {warning}");
-    }
-    if !outcome.already_held.is_empty() {
-        println!();
-        println!(
-            "  The node already holds {} of these transaction(s). They are not counted as swept",
-            outcome.already_held.len()
-        );
-        println!("  until they are mined; if one never is, running the sweep again retries it:");
-        for held in &outcome.already_held {
-            println!("    {} — {}", format_zec(held.value_swept), held.txid);
-        }
     }
     if !outcome.rejected.is_empty() {
         println!();
@@ -1562,11 +1875,11 @@ fn report_sprout_skips_and_errors(outcome: &argos_core::sprout_sweep::SproutSwee
         println!();
         eprintln!("  ⚠ THE SWEEP DID NOT FINISH");
         eprintln!("    {error}");
-        if !outcome.sent.is_empty() {
+        if !outcome.transactions.is_empty() {
             eprintln!(
-                "    The {} transaction(s) listed above were already broadcast and cannot \
-                 be undone. Check them before re-running.",
-                outcome.sent.len()
+                "    The {} transaction(s) listed above retain their recorded lifecycle \
+                 state. Reconcile them before re-running.",
+                outcome.transactions.len()
             );
         }
     }
@@ -1591,7 +1904,14 @@ fn print_sprout_nu7_broadcast_warning(
     network: ZeckNetwork,
     outcome: &argos_core::sprout_sweep::SproutSweepOutcome,
 ) {
-    if outcome.sent.is_empty() {
+    if !outcome.transactions.iter().any(|transaction| {
+        matches!(
+            transaction.state,
+            argos_core::TxLifecycleState::Pending
+                | argos_core::TxLifecycleState::SubmissionUnknown
+                | argos_core::TxLifecycleState::Mined
+        )
+    }) {
         return;
     }
     eprintln!();
@@ -1738,13 +2058,50 @@ async fn print_sprout_inspection(
         // not used, since only live peers can show its cursor survived any
         // reorganization.
         let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Offline).await;
+        let spending_keys = wallet_sprout_keys(keys);
+        let journal =
+            argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
+        let outpoints = recovered
+            .notes
+            .iter()
+            .map(|note| note.outpoint)
+            .collect::<Vec<_>>();
+        let (snapshot, journal_read) = if data_dir.exists() {
+            match journal.load_scoped_snapshot(&outpoints) {
+                Ok(snapshot) => (snapshot, true),
+                Err(err) => {
+                    println!("  Sweep lifecycle journal could not be read: {err}");
+                    println!("  {SPROUT_KEEP_SOURCE_WARNING}");
+                    (
+                        argos_core::sprout_sweep::SproutJournalSnapshot::default(),
+                        false,
+                    )
+                }
+            }
+        } else {
+            (
+                argos_core::sprout_sweep::SproutJournalSnapshot::default(),
+                true,
+            )
+        };
+        let inventory =
+            argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+        let preview_plan = match sprout_preview_plan(&inventory) {
+            Ok(plan) => plan,
+            Err(err) => {
+                println!("  Sprout sweep preview could not be computed: {err}");
+                println!("  {SPROUT_KEEP_SOURCE_WARNING}");
+                None
+            }
+        };
         print_sprout_accounting(
             keys,
             &recovered,
             show_spent,
             "argos inspect-wallet --show-spent",
         );
-        if recovered.nothing_left_to_sweep() {
+        print_sprout_lifecycle_entries(&snapshot);
+        if sprout_nothing_left(&recovered, &inventory, &snapshot, journal_read) {
             println!("  Nothing is left to sweep: every Sprout note this file records was spent");
             println!("  by the wallet itself or is worth less than the fee to move it.");
             // Still offered: the verdict is the file's, and a spend recorded
@@ -1758,7 +2115,20 @@ async fn print_sprout_inspection(
             print_sprout_scan_cost_warning(network);
             return;
         }
-        if recovered.notes.is_empty() {
+        let lifecycle_guidance =
+            sprout_lifecycle_status_guidance(snapshot.entries().map(|entry| entry.state));
+        if !journal_read {
+            return;
+        }
+        if preview_plan.is_none() && lifecycle_guidance.is_some() {
+            println!("  No Sprout note is ready for a new sweep.");
+            for line in wrap_text(lifecycle_guidance.expect("checked above"), 74) {
+                println!("  {line}");
+            }
+            println!();
+            return;
+        }
+        if recovered.notes.is_empty() && snapshot.entries().next().is_none() {
             println!("  No spendable Sprout notes were recovered from this file.");
             if !recovered.issues.is_empty() {
                 println!("  Why:");
@@ -1771,11 +2141,11 @@ async fn print_sprout_inspection(
             }
             println!();
             print_sprout_scan_cost_warning(network);
-        } else {
+        } else if let Some(plan) = preview_plan {
             println!(
                 "  {} spendable Sprout note(s), {} total.",
-                recovered.notes.len(),
-                format_zec(recovered.total_value())
+                plan.notes,
+                format_zec(plan.gross_zatoshis)
             );
             println!("  These were recovered from this file alone — no scan needed.");
             println!();
@@ -1791,6 +2161,8 @@ async fn print_sprout_inspection(
                 "    argos sweep-sprout --wallet-file <this file> \\\n      --destination <your zs1… or unified address> --confirm-sweep"
             );
             println!();
+        } else {
+            println!("  No recovered Sprout note is worth more than the fee to move it.");
         }
     }
 }
@@ -2206,6 +2578,7 @@ async fn main() -> Result<()> {
             &keys,
             network,
             &cli.lightwalletd_url,
+            &cli.confirmation_source,
             &cli.data_dir,
             peer,
             destination.as_deref(),
@@ -2468,6 +2841,7 @@ async fn main() -> Result<()> {
                 &cli.data_dir,
                 &peer,
                 &cli.lightwalletd_url,
+                &cli.confirmation_source,
                 &destination,
                 sprout_params,
                 SweepGate {
@@ -3646,6 +4020,104 @@ mod tests {
 
     use super::*;
 
+    fn preview_note(value: u64, id: u8) -> argos_core::sprout_recovery::SpendableSproutNote {
+        let a_sk = [0x42; 32];
+        let address = argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk);
+        let rho = [0x11; 32];
+        let r = [0x22; 32];
+        argos_core::sprout_recovery::SpendableSproutNote {
+            note: argos_core::sprout::SproutNotePlaintext {
+                value,
+                rho,
+                r,
+                memo: [0; 512],
+            },
+            a_sk,
+            address,
+            commitment: argos_core::sprout::note_commitment(address.a_pk(), value, &rho, &r),
+            anchor: [0; 32],
+            witness_path: vec![0; argos_core::sprout_witness::WITNESS_PATH_SIZE],
+            outpoint: argos_core::argos_wallet_import::keys::JsOutPoint {
+                txid: [id; 32],
+                js_index: 0,
+                output_index: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn cli_preview_counts_only_executable_ready_notes_and_cannot_wrap() {
+        let empty = argos_core::sprout_sweep::SproutJournalSnapshot::default();
+        let dust = preview_note(argos_core::sprout_sweep::SPROUT_SWEEP_FEE, 0x10);
+        let dust = [dust];
+        let dust_inventory = argos_core::sprout_sweep::classify_sprout_notes(&dust, &empty);
+        assert_eq!(sprout_preview_plan(&dust_inventory).unwrap(), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+            dir.path(),
+            &[[0x42; 32]],
+            argos_core::ZeckNetwork::Mainnet,
+        );
+        std::fs::write(
+            journal.path(),
+            format!("{}:0:0 {}\n", "11".repeat(32), "33".repeat(32)),
+        )
+        .unwrap();
+        let snapshot = journal.load_or_migrate().unwrap();
+        let notes = [preview_note(1_000_000, 0x11), preview_note(2_000_000, 0x12)];
+        let mixed = argos_core::sprout_sweep::classify_sprout_notes(&notes, &snapshot);
+        let plan = sprout_preview_plan(&mixed)
+            .unwrap()
+            .expect("one executable note");
+        assert_eq!(plan.notes, 1);
+        assert_eq!(plan.gross_zatoshis, 2_000_000);
+
+        let huge = [preview_note(u64::MAX, 0x13), preview_note(u64::MAX, 0x14)];
+        let huge_inventory = argos_core::sprout_sweep::classify_sprout_notes(&huge, &empty);
+        let plan = sprout_preview_plan(&huge_inventory)
+            .expect("overflow-safe preview")
+            .expect("executable notes");
+        assert_eq!(plan.gross_zatoshis, u64::MAX);
+    }
+
+    #[test]
+    fn post_execution_reporting_never_attributes_a_historical_destination() {
+        use argos_core::sprout_sweep::{SproutSweepOutcome, SproutSweepTransaction};
+
+        let historical = SproutSweepOutcome {
+            transactions: vec![SproutSweepTransaction {
+                txid: "historical".to_owned(),
+                value_zatoshis: Some(7),
+                state: argos_core::TxLifecycleState::Pending,
+                mined_height: None,
+                superseded: false,
+            }],
+            ..Default::default()
+        };
+        let line = sprout_post_execution_pool_line(&historical).expect("pool line");
+        assert!(line.contains("Sapling"), "{line}");
+        assert!(
+            !line.contains("unified") && !line.contains("address"),
+            "{line}"
+        );
+
+        assert_eq!(sprout_post_execution_pool_line(&historical), Some(line));
+
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(!source.contains("Canonically mined {} to {destination}"));
+        assert_eq!(
+            source
+                .matches("Canonically mined {} from Sprout into Sapling.")
+                .count(),
+            2,
+            "wallet and saved-scan execution must use the same provenance-safe summary"
+        );
+    }
+
     #[test]
     fn transparent_review_shows_exact_fee_and_net_before_confirmation() {
         let plan = argos_core::transparent_recovery::TransparentSweepPlan {
@@ -3671,6 +4143,130 @@ mod tests {
             review.contains("Destination        zs1destination"),
             "{review}"
         );
+    }
+
+    #[test]
+    fn orphan_nonterminal_journal_blocks_nothing_left_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+            dir.path(),
+            &[[0x42; 32]],
+            ZeckNetwork::Mainnet,
+        );
+        std::fs::write(
+            journal.path(),
+            format!("{}:0:0 {}\n", "11".repeat(32), "22".repeat(32)),
+        )
+        .unwrap();
+        let snapshot = journal.load_or_migrate().unwrap();
+        let recovered = argos_core::sprout_recovery::SproutRecovery {
+            dust: vec![argos_core::argos_wallet_import::keys::JsOutPoint {
+                txid: [0x33; 32],
+                js_index: 0,
+                output_index: 0,
+            }],
+            ..Default::default()
+        };
+        let inventory =
+            argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+        assert!(recovered.nothing_left_to_sweep(&inventory));
+        assert!(!sprout_nothing_left(
+            &recovered, &inventory, &snapshot, true
+        ));
+
+        for state in [
+            argos_core::TxLifecycleState::Expired,
+            argos_core::TxLifecycleState::Rejected,
+        ] {
+            assert!(lifecycle_snapshot_requires_source([state].into_iter()));
+            assert!(!journal_states_allow_nothing_left([state].into_iter()));
+        }
+    }
+
+    #[test]
+    fn terminal_orphan_inspection_keeps_source_and_requires_recovery() {
+        for state in [
+            argos_core::TxLifecycleState::Expired,
+            argos_core::TxLifecycleState::Rejected,
+        ] {
+            let guidance = sprout_lifecycle_status_guidance([state].into_iter())
+                .expect("every journal row needs lifecycle guidance");
+            assert!(guidance.contains("Keep the original wallet or Sprout key"));
+            assert!(guidance.contains("rescan") || guidance.contains("recover"));
+            assert!(!guidance.contains("no scan needed"), "{guidance}");
+            assert!(!guidance.contains("To move them"), "{guidance}");
+        }
+    }
+
+    #[test]
+    fn terminal_only_sweep_and_scan_require_recovery_before_a_new_plan() {
+        use argos_core::TxLifecycleState::{Expired, Pending, Rejected};
+
+        for state in [Expired, Rejected] {
+            assert_eq!(
+                sprout_no_ready_action(false, [state].into_iter()),
+                Some(SproutNoReadyAction::RecoverOrRescan),
+            );
+            let guidance = sprout_lifecycle_status_guidance([state].into_iter()).unwrap();
+            assert!(guidance.contains("Recover or rescan"), "{guidance}");
+            assert!(!guidance.contains("active journal"), "{guidance}");
+            assert!(!guidance.contains("confirm-sweep"), "{guidance}");
+        }
+
+        assert_eq!(
+            sprout_no_ready_action(false, [Pending].into_iter()),
+            Some(SproutNoReadyAction::Reconcile),
+        );
+        assert_eq!(
+            sprout_no_ready_action(true, [Expired].into_iter()),
+            None,
+            "a recovered expired note is ready to rebuild"
+        );
+    }
+
+    #[test]
+    fn reconcilable_zero_note_scan_offers_exact_byte_retry_not_a_new_sweep() {
+        for destination_present in [false, true] {
+            let guidance = sprout_scan_followup_guidance(
+                Some(SproutNoReadyAction::Reconcile),
+                destination_present,
+            )
+            .join(" ");
+            assert!(
+                guidance.contains("reconcile the existing journal"),
+                "{guidance}"
+            );
+            assert!(guidance.contains("exact-byte retry"), "{guidance}");
+            assert!(!guidance.contains("move these funds"), "{guidance}");
+            assert!(!guidance.contains("broadcast the sweep"), "{guidance}");
+            assert!(!guidance.contains("new proof"), "{guidance}");
+        }
+    }
+
+    #[test]
+    fn unreadable_journal_and_unconfirmed_scan_tip_block_final_verdicts() {
+        let recovered = argos_core::sprout_recovery::SproutRecovery {
+            dust: vec![argos_core::argos_wallet_import::keys::JsOutPoint {
+                txid: [0x44; 32],
+                js_index: 0,
+                output_index: 0,
+            }],
+            ..Default::default()
+        };
+        let snapshot = argos_core::sprout_sweep::SproutJournalSnapshot::default();
+        let inventory =
+            argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
+        assert!(!sprout_nothing_left(
+            &recovered, &inventory, &snapshot, false
+        ));
+
+        let mut outcome = argos_core::sprout_sweep::SproutSweepOutcome {
+            fresh_all_mined: true,
+            ..Default::default()
+        };
+        apply_sprout_tip_warning(&mut outcome, Some("tip coverage is incomplete".to_owned()));
+        assert!(!outcome.fresh_all_mined);
+        assert_eq!(outcome.warnings, vec!["tip coverage is incomplete"]);
     }
 
     #[test]

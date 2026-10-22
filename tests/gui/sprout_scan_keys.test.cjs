@@ -78,6 +78,7 @@ function driveHandler(name, boxText, report) {
     birthdayTouched: false,
     document: { createElement: el },
     fmt: String,
+    confirmationSourcesFromForm: () => ["backup=https://confirm.example"],
     setStatus() {},
     sproutScanPeers: () => [],
     invoke: async (command, args) => {
@@ -102,7 +103,6 @@ function driveHandler(name, boxText, report) {
     updateSproutScanSweepButton() {},
     publishSproutScanSnapshot() {},
     noteSproutBroadcast() {},
-    sweepLeftNothingBehind: () => false,
     uncoveredSproutKeys: 0,
     renderSproutUncoveredBanners() {},
   };
@@ -114,6 +114,12 @@ function driveHandler(name, boxText, report) {
     context,
     loadFunctions(
       [
+        "sproutReviewHasLifecycleStatus",
+        "sproutReviewMayRun",
+        "sproutSourceWarningMayClear",
+        "sproutLifecycleAmount",
+        "sproutLifecycleRow",
+        "renderSproutSweepReport",
         "sproutScanKeyLines",
         "sproutScanKeyEntries",
         "sproutScanKeys",
@@ -140,6 +146,10 @@ test("runSproutScan sends the unfiltered lines so backend line numbers match the
   // Nothing chosen: no floor, skip left to the wallet's own key times.
   assert.equal(starts[0].args.birthdayFloor, null);
   assert.equal(starts[0].args.decryptEveryBlock, false);
+  assert.deepEqual(
+    [...starts[0].args.confirmationSources],
+    ["backup=https://confirm.example"],
+  );
 });
 
 // #271 binds the keys at scan start: the box's raw lines go to
@@ -148,7 +158,11 @@ test("runSproutScan sends the unfiltered lines so backend line numbers match the
 // proposal's id, so no line from the box, wallet path or passphrase leaves
 // the frontend at sweep time.
 test("runSproutScanSweep sends only the reviewed proposal, never the box's lines", async () => {
-  const { run, calls, context } = driveHandler("runSproutScanSweep", BOX, { sent: [] });
+  const { run, calls, context } = driveHandler("runSproutScanSweep", BOX, {
+    transactions: [], mined_zatoshis: 0, pending_zatoshis: 0, unknown_zatoshis: 0,
+    skipped: [], rejected: [], warnings: [],
+    error: null, fresh_all_mined: false,
+  });
   context.sproutScanHandle = "scan-1";
   context.sproutScanResult = { notes_found: 1 };
   context.sproutScanReview = { proposal_id: "proposal-1", params_present: true };

@@ -14,7 +14,21 @@ const report = (notes) => ({ blocks_scanned: 100, joinsplits_seen: 3,
   tip_warning: null });
 const review = (id) => ({ proposal_id: id, notes: 1, gross_zatoshis: 100000,
   fee_zatoshis: 10000, net_zatoshis: 90000, params_present: true,
-  params_path: "/fixture/sprout.params", lands_in_sapling: "Lands in Sapling" });
+  params_path: "/fixture/sprout.params", lands_in_sapling: "Lands in Sapling",
+  active: [], mined: [] });
+const lifecycle = (transactions, overrides = {}) => ({
+  transactions, mined_zatoshis: 0, pending_zatoshis: 0, unknown_zatoshis: 0,
+  skipped: [], rejected: [], warnings: [],
+  error: null, fresh_all_mined: false, ...overrides,
+});
+
+function functionSource(source, name) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `${name} must remain testable`);
+  const end = source.indexOf("\n}\n", start);
+  assert.notEqual(end, -1, `${name} must have a closing brace`);
+  return source.slice(start, end + 3);
+}
 
 // The scan code and its real event handlers run in a VM. Only Tauri IPC and
 // the DOM boundary are simulated; the returned handles are opaque strings.
@@ -46,6 +60,7 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
   $("sprout-scan-sweep-run").disabled = true;
   const context = vm.createContext({
     $, document: { createElement: element }, fmt: (n) => String(n),
+    confirmationSourcesFromForm: () => ["backup=https://confirm.example"],
     setTimeout: (callback) => setImmediate(callback),
     setStatus: (id, message) => { $(id).textContent = message; },
     listen: async (name, callback) => {
@@ -60,7 +75,7 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
         if (command === "get_sprout_scan") return { handle: args.handle, status: "running", report: null, error: null };
         if (command === "release_sprout_scan" || command === "release_sprout_proposal") return null;
         if (command === "propose_sprout_scan_sweep") return review(`proposal-${args.scanHandle}`);
-        if (command === "execute_sprout_scan_sweep") return { sent: [], skipped: [], total_swept: 0, error: null };
+        if (command === "execute_sprout_scan_sweep") return lifecycle([]);
         throw new Error(`Unexpected IPC command: ${command}`);
       });
     },
@@ -71,9 +86,19 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
   vm.runInContext("let walletFile = null; let uncoveredSproutKeys = 0; function renderSproutUncoveredBanners() {} function checkSaplingKeys() {} function invalidateWalletSproutReview() {}", context);
   // Defined outside the scan section on main: the NU7 panel toggle, the
   // broadcast hook, and the settings step's birthday-touched flag.
-  vm.runInContext("var broadcastsNoted = []; function onSproutScanEntryToggle() {} function noteSproutBroadcast(report, fromScan) { broadcastsNoted.push({ report, fromScan }); } var birthdayTouched = false;", context);
-  vm.runInContext(source.slice(source.indexOf("function sweepLeftNothingBehind(report)"),
-    source.indexOf("function noteUncoveredSproutKeys(summary)")), context);
+  vm.runInContext("var sproutNu7Broadcast = false; var sproutScanNu7Broadcast = false; " +
+    "var broadcastsNoted = []; function onSproutScanEntryToggle() {} " +
+    "function noteSproutBroadcast(report, fromScan) { broadcastsNoted.push({ report, fromScan }); " +
+    "sproutNu7Broadcast = true; if (fromScan) sproutScanNu7Broadcast = true; } " +
+    "var birthdayTouched = false;", context);
+  vm.runInContext([
+    "sproutReviewHasLifecycleStatus",
+    "sproutReviewMayRun",
+    "sproutSourceWarningMayClear",
+    "sproutLifecycleAmount",
+    "sproutLifecycleRow",
+    "renderSproutSweepReport",
+  ].map((name) => functionSource(source, name)).join("\n"), context);
   vm.runInContext(source.slice(start, end), context);
   return {
     $, calls,
@@ -106,6 +131,49 @@ test("an immediate Sprout completion is recovered from the snapshot", async () =
   await h.scan();
   assert.equal(h.$("sprout-scan-sweep").hidden, false);
   assert.match(h.$("sprout-scan-status").textContent, /1 note/);
+});
+
+test("zero-note saved scan with lifecycle status opens and executes reconciliation", async () => {
+  const statusReview = {
+    ...review("status-proposal"),
+    notes: 0,
+    gross_zatoshis: 0,
+    fee_zatoshis: 0,
+    net_zatoshis: 0,
+    params_present: false,
+    active: [{ txid: "pending-tx", value_zatoshis: 7, state: "pending", mined_height: null }],
+  };
+  const h = harness((command, args, fallback) => {
+    if (command === "propose_sprout_scan_sweep") return statusReview;
+    if (command === "execute_sprout_scan_sweep") {
+      return lifecycle([{ txid: "pending-tx", value_zatoshis: 7, state: "pending", mined_height: null }]);
+    }
+    return fallback();
+  });
+  await h.scan();
+  await flush();
+  h.$("sprout-scan-destination").value = "zs-current-review-only";
+  h.emit("sprout-scan-complete", {
+    handle: "scan-1",
+    status: "completed",
+    report: { ...report(0), has_lifecycle_status: true },
+    error: null,
+  });
+  await flush();
+
+  assert.equal(h.$("sprout-scan-sweep").hidden, false);
+  assert.equal(h.peek("sproutScanReview?.proposal_id"), "status-proposal");
+  assert.equal(h.$("sprout-scan-sweep-run").textContent, "Check status and continue");
+  assert.match(h.$("sprout-scan-sweep-plan").textContent, /No note is ready|saved transaction/i);
+  assert.doesNotMatch(h.$("sprout-scan-sweep-plan").textContent, /to your address|new transaction will be proved/i);
+
+  h.$("sprout-scan-confirm").checked = true;
+  h.$("sprout-scan-confirm").dispatch("change");
+  await h.sweep();
+  assert.equal(
+    h.calls.filter((call) => call.command === "execute_sprout_scan_sweep").length,
+    1,
+  );
 });
 
 test("failed completion listener polls a running scan to its terminal snapshot", async () => {
@@ -222,8 +290,8 @@ test("scan review without proving parameters cannot execute", async () => {
 test("scan sweep keeps the wallet caveat when a note was refused", async () => {
   for (const [rejected, kept] of [[[], false], [["note refused"], true]]) {
     const h = harness((command, args, fallback) => command === "execute_sprout_scan_sweep"
-      ? { sent: [{ txid: "aa", value_swept: 5 }], total_swept: 5,
-          skipped: [], rejected, error: null }
+      ? lifecycle([{ txid: "aa", value_zatoshis: 5, state: "mined", mined_height: 123 }],
+        { mined_zatoshis: 5, rejected, fresh_all_mined: true })
       : fallback());
     h.peek("uncoveredSproutKeys = 1");
     await h.scan();
@@ -290,11 +358,9 @@ test("a running scan's progress still reaches the panel after navigating away an
   assert.match(h.$("sprout-scan-status").textContent, /70/);
 });
 
-// Review finding 4 on #271: a sweep that finished after the panel moved on
-// to another scan returned before rendering, so its broadcast txids were
-// never shown and the NU7 warning never switched to "confirm it is mined".
-// Funds that moved must always be reported, labelled as the earlier scan's.
-test("a scan sweep that finishes after the source changed still reports its broadcast", async () => {
+// A result that finishes after the panel moved on is still rendered as
+// historical evidence, but it cannot mutate the newly selected source.
+test("a scan sweep that finishes after the source changed still reports its lifecycle", async () => {
   const pending = deferred();
   const h = harness((command, args, fallback) => command === "execute_sprout_scan_sweep"
     ? pending.promise : fallback());
@@ -310,13 +376,56 @@ test("a scan sweep that finishes after the source changed still reports its broa
   // The user edits the key box while proving runs: a new scan source.
   h.edit("sprout-scan-keys", "SK-other");
   assert.equal(h.peek("sproutScanHandle"), null);
-  pending.resolve({ sent: [{ txid: "moved-tx", value_swept: 90000 }], total_swept: 90000,
-    skipped: [], rejected: [], error: null });
+  pending.resolve(lifecycle([
+    { txid: "moved-tx", value_zatoshis: 90000, state: "pending", mined_height: null },
+  ], { pending_zatoshis: 90000 }));
   await sweeping;
   const lines = h.$("sprout-scan-sweep-results").children.map((child) => child.textContent);
   assert.ok(lines.some((line) => /moved-tx/.test(line)), JSON.stringify(lines));
   assert.ok(lines.some((line) => /earlier Sprout scan/.test(line)), JSON.stringify(lines));
   assert.equal(h.$("sprout-scan-sweep").hidden, false, "the report must be visible");
-  assert.equal(h.peek("broadcastsNoted.length"), 1);
-  assert.equal(h.peek("broadcastsNoted[0].fromScan"), true);
+  assert.equal(h.peek("broadcastsNoted.length"), 0);
+  assert.equal(h.peek("sproutNu7Broadcast"), false);
+  assert.equal(h.peek("sproutScanNu7Broadcast"), false);
+});
+
+test("an earlier fresh-mined result cannot clear or relabel the current Sprout source", async () => {
+  const pending = deferred();
+  const h = harness((command, args, fallback) => command === "execute_sprout_scan_sweep"
+    ? pending.promise : fallback());
+  h.peek("uncoveredSproutKeys = 1");
+  await h.scan();
+  await flush();
+  h.emit("sprout-scan-complete", {
+    handle: "scan-1",
+    status: "completed",
+    report: report(1),
+    error: null,
+  });
+  h.edit("sprout-scan-destination", "zs-destination", "change");
+  await flush();
+  h.$("sprout-scan-confirm").checked = true;
+  h.$("sprout-scan-confirm").dispatch("change");
+  const sweeping = h.sweep();
+  await flush();
+
+  // Source B replaces A while A's network operation is still in flight.
+  h.edit("sprout-scan-keys", "SK-source-b");
+  h.peek("uncoveredSproutKeys = 2");
+  const currentAction = h.$("sprout-scan-sweep-run").textContent;
+  pending.resolve(lifecycle([
+    { txid: "a-mined-tx", value_zatoshis: 90000, state: "mined", mined_height: 456 },
+  ], { mined_zatoshis: 90000, fresh_all_mined: true }));
+  await sweeping;
+
+  const lines = h.$("sprout-scan-sweep-results").children.map((child) => child.textContent);
+  assert.ok(lines.some((line) => /a-mined-tx/.test(line)), JSON.stringify(lines));
+  assert.ok(lines.some((line) => /earlier Sprout scan/.test(line)), JSON.stringify(lines));
+  assert.equal(h.peek("uncoveredSproutKeys"), 2, "A must not clear B's source caveat");
+  assert.equal(h.peek("sproutNu7Broadcast"), false, "A must not relabel B's wallet warning");
+  assert.equal(h.peek("sproutScanNu7Broadcast"), false, "A must not relabel B's scan warning");
+  assert.equal(h.peek("broadcastsNoted.length"), 0, "A must not run the current-source broadcast hook");
+  assert.equal(h.$("sprout-scan-sweep-run").textContent, currentAction);
+  assert.equal(h.peek("sproutScanHandle"), null);
+  assert.equal(h.peek("sproutScanReview"), null);
 });

@@ -222,7 +222,7 @@
                 <li><strong>Are my recovery secrets transmitted?</strong> No. Seeds, wallet passphrases, and spending keys stay local. Ordinary scans download compact blocks from lightwalletd; Sprout scans download public full blocks from Zcash P2P peers.</li>
                 <li><strong>Can I use a transparent or Sapling address as my destination?</strong> Ordinary recovery requires a Unified Address with an Orchard or Sapling receiver. The separate Sprout sweep also accepts a bare Sapling address because Sprout can only land in Sapling.</li>
                 <li><strong>What if I had more than one ZecWallet Lite account?</strong> Argos scans up to 500 accounts automatically. If you enabled the gap-limit scan mode, it stops after 20 consecutive empty accounts by default — enough for almost all wallets.</li>
-                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume; Argos removes it after a successful sweep. Delete remaining recovery state only after confirming the funds arrived.</li>
+                <li><strong>What happens to my data after Argos finishes?</strong> The ordinary workspace stays in the chosen data directory. A Sprout scan checkpoint is spend-capable and remains so the scan can resume; Argos does not remove it, even after a sweep. Delete it and any remaining recovery state yourself, only after Argos reports fresh canonical mined evidence for every Sprout transaction.</li>
                 <li><strong>Can I run Argos offline?</strong> Source validation and key derivation are offline, but scanning requires a network connection: lightwalletd for ordinary recovery or Zcash P2P peers for Sprout.</li>
               </ul>
             </div>
@@ -347,8 +347,10 @@
                 <hr />
                 <p><strong>Move these funds now</strong></p>
                 <p class="muted">
-                  No scan is needed — the note data is in this file. The destination must
-                  have a Sapling receiver.
+                  Argos checks any saved transaction before creating a new one. Keep the
+                  original wallet file and private scan checkpoint until every transaction
+                  is freshly confirmed mined. New transactions require recovered note data,
+                  and the destination must have a Sapling receiver.
                 </p>
                 <label for="sprout-destination">Destination address</label>
                 <input
@@ -364,7 +366,7 @@
                 <p id="sprout-sweep-spent-status" class="muted"></p>
                 <label class="checkbox-row">
                   <input type="checkbox" id="sprout-sweep-confirm" disabled />
-                  I understand this moves funds and cannot be undone.
+                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
                 </label>
                 <button id="sprout-sweep-run" type="button" disabled>
                   Sweep Sprout funds
@@ -488,7 +490,7 @@
                 <p id="sprout-scan-sweep-plan" class="muted"></p>
                 <label class="checkbox-row">
                   <input type="checkbox" id="sprout-scan-confirm" disabled />
-                  I understand this moves funds and cannot be undone.
+                  I understand this may rebroadcast a saved transaction or move funds and cannot be undone.
                 </label>
                 <button id="sprout-scan-sweep-run" type="button" disabled>Sweep found funds</button>
                 <ul id="sprout-scan-sweep-results" class="session-list"></ul>

@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::commands::SproutScanReport;
+use crate::commands::{SproutScanReport, SproutSweepResult};
 
 pub const MAX_SCAN_SESSIONS: usize = 16;
 pub const MAX_PROPOSALS: usize = 32;
@@ -92,6 +92,8 @@ pub struct SproutSweepPreviewData {
     pub gross_zatoshis: u64,
     pub fee_zatoshis: u64,
     pub net_zatoshis: u64,
+    pub active: Vec<SproutSweepResult>,
+    pub mined: Vec<SproutSweepResult>,
 }
 
 #[derive(Serialize)]
@@ -126,7 +128,8 @@ pub struct SproutSweepIntent {
     pub destination: String,
     pub network: ZeckNetwork,
     pub lightwalletd_url: String,
-    pub journal: Option<SweepJournal>,
+    pub confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
+    pub journal: SweepJournal,
     /// Set when the catch-up scan behind a scan-derived proposal could not
     /// confirm the chain tip; it leads the sweep report's warnings.
     pub tip_warning: Option<String>,
@@ -157,6 +160,7 @@ pub struct ScanMaterial {
     pub checkpoint: PathBuf,
     pub network: ZeckNetwork,
     pub lightwalletd_url: String,
+    pub confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     pub peers: Vec<String>,
 }
 
@@ -166,6 +170,7 @@ struct SproutScanSession {
     checkpoint: PathBuf,
     network: ZeckNetwork,
     lightwalletd_url: String,
+    confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     peers: Vec<String>,
     status: SproutScanStatus,
     report: Option<SproutScanReport>,
@@ -334,6 +339,7 @@ impl ReviewedIntentStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_scan(
         &self,
         keys: Vec<[u8; 32]>,
@@ -341,6 +347,7 @@ impl ReviewedIntentStore {
         checkpoint: PathBuf,
         network: ZeckNetwork,
         lightwalletd_url: String,
+        confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
         peers: Vec<String>,
     ) -> Result<SproutScanHandle, String> {
         let mut inner = StoreInner::lock(&self.0)?;
@@ -356,6 +363,7 @@ impl ReviewedIntentStore {
                 checkpoint,
                 network,
                 lightwalletd_url,
+                confirmation_sources,
                 peers,
                 status: SproutScanStatus::Running,
                 report: None,
@@ -378,6 +386,7 @@ impl ReviewedIntentStore {
             checkpoint: scan.checkpoint.clone(),
             network: scan.network,
             lightwalletd_url: scan.lightwalletd_url.clone(),
+            confirmation_sources: scan.confirmation_sources.clone(),
             peers: scan.peers.clone(),
         })
     }
@@ -557,6 +566,14 @@ mod tests {
     use argos_core::ZeckNetwork;
     use std::path::PathBuf;
 
+    fn journal(marker: u8) -> SweepJournal {
+        SweepJournal::for_keys(
+            &std::env::temp_dir().join(format!("argos-reviewed-journal-{}", Uuid::new_v4())),
+            &[[marker; 32]],
+            ZeckNetwork::Mainnet,
+        )
+    }
+
     fn scan(store: &ReviewedIntentStore, marker: u8) -> SproutScanHandle {
         store
             .insert_scan(
@@ -565,6 +582,7 @@ mod tests {
                 PathBuf::from(format!("/tmp/scan-{marker}")),
                 ZeckNetwork::Mainnet,
                 format!("https://node-{marker}"),
+                Vec::new(),
                 vec![format!("peer-{marker}:8233")],
             )
             .inspect(|handle| {
@@ -576,6 +594,7 @@ mod tests {
                         notes_found: 1,
                         spent_notes: 0,
                         total_zatoshis: 100_000,
+                        has_lifecycle_status: false,
                         tip_warning: None,
                         decrypt_from_height: None,
                         decrypt_line: String::new(),
@@ -604,7 +623,8 @@ mod tests {
                     destination: destination.to_owned(),
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: endpoint,
-                    journal: None,
+                    confirmation_sources: Vec::new(),
+                    journal: journal(1),
                     tip_warning: None,
                     wallet_reverify: None,
                     peer_error: None,
@@ -614,6 +634,8 @@ mod tests {
                     gross_zatoshis: 100_000,
                     fee_zatoshis: 10_000,
                     net_zatoshis: 90_000,
+                    active: Vec::new(),
+                    mined: Vec::new(),
                 },
             )
             .unwrap()
@@ -680,7 +702,8 @@ mod tests {
                     destination: "zs-reviewed".into(),
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: "https://node-a".into(),
-                    journal: None,
+                    confirmation_sources: Vec::new(),
+                    journal: journal(2),
                     tip_warning: None,
                     wallet_reverify: None,
                     peer_error: None,
@@ -689,7 +712,9 @@ mod tests {
                     notes: 1,
                     gross_zatoshis: 100_000,
                     fee_zatoshis: 10_000,
-                    net_zatoshis: 90_000
+                    net_zatoshis: 90_000,
+                    active: Vec::new(),
+                    mined: Vec::new(),
                 }
             )
             .is_err());
@@ -723,6 +748,7 @@ mod tests {
                 PathBuf::from("/tmp/overflow"),
                 ZeckNetwork::Mainnet,
                 "https://node".into(),
+                Vec::new(),
                 Vec::new()
             )
             .is_err());
@@ -737,7 +763,8 @@ mod tests {
                     destination: "zs-reviewed".into(),
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: "https://node".into(),
-                    journal: None,
+                    confirmation_sources: Vec::new(),
+                    journal: journal(3),
                     tip_warning: None,
                     wallet_reverify: None,
                     peer_error: None,
@@ -746,7 +773,9 @@ mod tests {
                     notes: 1,
                     gross_zatoshis: 100_000,
                     fee_zatoshis: 10_000,
-                    net_zatoshis: 90_000
+                    net_zatoshis: 90_000,
+                    active: Vec::new(),
+                    mined: Vec::new(),
                 }
             )
             .is_err());
@@ -766,6 +795,7 @@ mod tests {
                     ZeckNetwork::Mainnet,
                     "https://node".into(),
                     Vec::new(),
+                    Vec::new(),
                 )
                 .unwrap();
             store.release_scan(&handle).unwrap();
@@ -778,6 +808,7 @@ mod tests {
                 PathBuf::from("/tmp/replacement"),
                 ZeckNetwork::Mainnet,
                 "https://node".into(),
+                Vec::new(),
                 Vec::new()
             )
             .is_ok());
@@ -799,6 +830,7 @@ mod tests {
                 checkpoint.clone(),
                 ZeckNetwork::Mainnet,
                 "https://node".into(),
+                Vec::new(),
                 Vec::new(),
             )
             .unwrap();
@@ -834,6 +866,7 @@ mod tests {
                 ZeckNetwork::Mainnet,
                 "https://node".into(),
                 Vec::new(),
+                Vec::new(),
             )
             .unwrap();
         let material = store.scan_material(&handle).unwrap();
@@ -859,6 +892,7 @@ mod tests {
                 PathBuf::from("/tmp/scan-5"),
                 ZeckNetwork::Mainnet,
                 "https://node".into(),
+                Vec::new(),
                 Vec::new(),
             )
             .unwrap();
