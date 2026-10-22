@@ -674,6 +674,16 @@ async function showSproutSweep() {
 
   try {
     const previewNetwork = $("network-select").value;
+    // A malformed entry in the scan panel's peer field must not cost the
+    // preview: the raw entries go to the backend, which skips live
+    // verification, keeps the wallet file's own spent record and says why
+    // in the scan warning. The sweep itself still refuses the field.
+    let previewPeers;
+    try {
+      previewPeers = sproutScanPeers();
+    } catch {
+      previewPeers = sproutScanPeerEntries();
+    }
     const preview = await invoke("preview_sprout_sweep", {
       path: source.path,
       passphrase: source.passphrase,
@@ -681,10 +691,16 @@ async function showSproutSweep() {
       // Where the scan panel keeps its checkpoint: a scan of these keys
       // settles spends the wallet file cannot see.
       dataDir: $("data-dir").value.trim() || null,
+      // The scan panel's peers, dialled first when that checkpoint is
+      // verified against live headers. Opening the wallet never dials.
+      peers: previewPeers,
     });
 
     if (walletFile !== source) return;
 
+    // Verification runs again for this preview. Show its current verdict
+    // beside the plan, even if inspection used an earlier checkpoint view.
+    setStatus("sprout-sweep-status", preview.scan_warning || "", "");
     // A preview for a network the user has since moved off, or one that
     // lands after a broadcast, would put back the wrong warning.
     if (preview.nu7_warning && previewNetwork === $("network-select").value && !sproutNu7Broadcast) {
@@ -757,6 +773,7 @@ async function runSproutSweep() {
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
       network: $("network-select").value,
       dataDir: $("data-dir").value.trim() || null,
+      peers: sproutScanPeers(),
     });
 
     if (walletFile !== source) return;
@@ -1297,12 +1314,17 @@ function sproutScanKeys() {
 // those come back as the backend's own, more specific error.
 const MAX_CUSTOM_PEERS = 8;
 
-function sproutScanPeers() {
+// The scan panel's peer entries, trimmed and deduplicated but not checked.
+function sproutScanPeerEntries() {
   const entries = $("sprout-scan-peers").value
     .split(/[\n,]/)
     .map((p) => p.trim().toLowerCase())
     .filter(Boolean);
-  const peers = [...new Set(entries)];
+  return [...new Set(entries)];
+}
+
+function sproutScanPeers() {
+  const peers = sproutScanPeerEntries();
   for (const peer of peers) {
     const match = /^(\[[0-9a-f:.]+\]|[a-z0-9._-]+):(\d+)$/.exec(peer);
     const port = match ? Number(match[2]) : 0;
