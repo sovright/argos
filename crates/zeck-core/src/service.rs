@@ -4340,18 +4340,67 @@ async fn broadcast_transactions(
         checked_fee_total(prior_fee_zatoshis, reviewed_batch_fee_zatoshis)?,
         max_fee_zatoshis,
     )?;
-    let mut batch_fee_zatoshis = 0u64;
+    let mut observer = LightwalletdTxObserver::new(lightwalletd_url, confirmation_sources)?;
+    submit_and_confirm_batch(
+        prepared,
+        account_index,
+        label,
+        results,
+        log,
+        &mut LightwalletdSubmitter { client },
+        &mut observer,
+        network,
+        &mut |txid, height| {
+            wallet_db
+                .set_transaction_status(
+                    txid,
+                    TransactionStatus::Mined(BlockHeight::from_u32(height)),
+                )
+                .map_err(|err| {
+                    ZeckError::Wallet(format!(
+                        "marking mined transaction {txid} in wallet db: {err}"
+                    ))
+                })
+        },
+    )
+    .await
+}
+
+/// Submit one leg's prepared transactions and poll each for confirmation.
+/// Separated from wallet access so the leg-to-leg gating is testable
+/// against a scripted node and observer.
+///
+/// Gating within one reviewed execution: an earlier leg that was accepted
+/// (Pending) does not stop this one, since every leg spends disjoint
+/// reviewed inputs. Only an unknown outcome (lost reply, retryable refusal)
+/// blocks the next submission.
+#[allow(clippy::too_many_arguments)]
+async fn submit_and_confirm_batch<N, O>(
+    prepared: Vec<PreparedTransaction>,
+    account_index: u32,
+    label: &str,
+    results: &mut Vec<TxBroadcastResult>,
+    log: &mut DurableBroadcastLog,
+    submitter: &mut N,
+    observer: &mut O,
+    network: crate::models::ZeckNetwork,
+    mark_mined: &mut (dyn FnMut(TxId, u32) -> ZeckResult<()> + Send),
+) -> ZeckResult<()>
+where
+    N: crate::broadcast::TxSubmitter,
+    O: TxObserver,
+{
+    if let Some(txid) = log.blocking_next_leg() {
+        return Err(ZeckError::Broadcast(format!(
+            "transaction {txid} may already have reached the network or was retryably refused; reconcile its durable record before another submission"
+        )));
+    }
     for tx in prepared {
         let txid = tx.txid;
         let fee_zatoshis = tx.fee_zatoshis;
         let expiry_height = tx.expiry_height;
-        let submission = submit_prepared_transaction(
-            log,
-            &mut LightwalletdSubmitter { client },
-            tx,
-            Duration::from_secs(30),
-        )
-        .await?;
+        let submission =
+            submit_prepared_transaction(log, submitter, tx, Duration::from_secs(30)).await?;
 
         // Record the submission before examining its disposition. A lost reply
         // still leaves a known txid, fee, and possibly an on-chain transaction.
@@ -4374,9 +4423,6 @@ async fn broadcast_transactions(
             confirmed_height: None,
             safe_to_discard: false,
         });
-        if submission.state.fee_is_at_risk() {
-            batch_fee_zatoshis = checked_fee_total(batch_fee_zatoshis, fee_zatoshis)?;
-        }
         if submission.blocks_followup_submission() {
             return Err(ZeckError::Broadcast(format!(
                 "{label} transaction {txid} may already have reached the network or was retryably refused; reconcile its stored bytes before retrying or submitting another sweep leg",
@@ -4389,11 +4435,10 @@ async fn broadcast_transactions(
             )));
         }
 
-        let mut observer = LightwalletdTxObserver::new(lightwalletd_url, confirmation_sources)?;
         let confirmation = wait_for_confirmation(
-            wallet_db,
+            mark_mined,
             log,
-            &mut observer,
+            observer,
             network,
             txid,
             expiry_height,
@@ -4420,12 +4465,7 @@ fn is_distinct_lightwalletd_endpoint(candidate: &str, primary: &str) -> bool {
 /// expires, or the polling budget runs out. Returns the lifecycle state, a
 /// detail line, the mined height, and whether it is safe to discard the source.
 async fn wait_for_confirmation<O: TxObserver>(
-    wallet_db: &mut WalletDb<
-        rusqlite::Connection,
-        crate::workspace::ArgosParams,
-        SystemClock,
-        rand_core::OsRng,
-    >,
+    mark_mined: &mut (dyn FnMut(TxId, u32) -> ZeckResult<()> + Send),
     log: &mut impl BroadcastStore,
     observer: &mut O,
     network: crate::models::ZeckNetwork,
@@ -4451,16 +4491,7 @@ async fn wait_for_confirmation<O: TxObserver>(
             let height = evidence.mined_height.ok_or_else(|| {
                 ZeckError::Broadcast(format!("mining evidence for {txid} has no height"))
             })?;
-            wallet_db
-                .set_transaction_status(
-                    txid,
-                    TransactionStatus::Mined(BlockHeight::from_u32(height)),
-                )
-                .map_err(|err| {
-                    ZeckError::Wallet(format!(
-                        "marking mined transaction {txid} in wallet db: {err}"
-                    ))
-                })?;
+            mark_mined(txid, height)?;
             let safe_to_discard = state == TxLifecycleState::Mined && evidence.is_safe_to_discard();
             return Ok(ConfirmationResult {
                 state,
@@ -4880,18 +4911,17 @@ mod tests {
             log.transition(txid, TxLifecycleState::SubmissionUnknown, None, None)
                 .unwrap();
             let mut observer = FixedConfirmationObserver(observation);
-            let mut wallet_db = crate::workspace::open_wallet_db(
-                &dir.path().join("wallet.sqlite"),
-                crate::workspace::consensus_network(ZeckNetwork::Testnet),
-            )
-            .unwrap();
+            let mut never_mined =
+                |_: zcash_primitives::transaction::TxId, _: u32| -> crate::ZeckResult<()> {
+                    panic!("an unresolved poll must not mark anything mined")
+                };
             let super::ConfirmationResult {
                 state: reported,
                 detail,
                 confirmed_height: height,
                 ..
             } = super::wait_for_confirmation(
-                &mut wallet_db,
+                &mut never_mined,
                 &mut log,
                 &mut observer,
                 ZeckNetwork::Testnet,
@@ -9836,5 +9866,245 @@ pub(crate) mod leg_fee_pin_tests {
             hd_leg_plan(&plan.legs, &[imported]),
             Err(ZeckError::StaleSweepProposal(_))
         ));
+    }
+}
+
+/// Leg-to-leg gating through the real submission and confirmation loop,
+/// against a scripted node and observer. Wallet-backed construction of the
+/// legs is covered by the regtest suite; these pin the broadcast policy.
+#[cfg(test)]
+mod leg_gating_tests {
+    use super::*;
+    use crate::broadcast::{EndpointTxEvidence, TxObservation, TxSubmitter};
+    use crate::models::ZeckNetwork;
+    use zcash_client_backend::proto::service::SendResponse;
+    use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+    use zcash_protocol::consensus::BranchId;
+
+    fn prepared(expiry: u32) -> PreparedTransaction {
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::V5,
+            BranchId::Nu5,
+            0,
+            BlockHeight::from_u32(expiry),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let mut raw_tx = Vec::new();
+        tx.write(&mut raw_tx).unwrap();
+        PreparedTransaction {
+            txid: tx.txid(),
+            raw_tx,
+            fee_zatoshis: 10_000,
+            expiry_height: Some(expiry),
+        }
+    }
+
+    #[derive(Default)]
+    struct Node {
+        sent: Vec<Vec<u8>>,
+        lose_reply_for: Option<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TxSubmitter for Node {
+        async fn send_raw(&mut self, raw: Vec<u8>) -> Result<SendResponse, tonic::Status> {
+            self.sent.push(raw.clone());
+            if self.lose_reply_for.as_ref() == Some(&raw) {
+                return Err(tonic::Status::unavailable("GoAway"));
+            }
+            Ok(SendResponse {
+                error_code: 0,
+                error_message: String::new(),
+            })
+        }
+    }
+
+    /// The default configuration: zec.rocks and na.zec.rocks, one operator.
+    fn default_operator_mined(height: u32) -> TxObservation {
+        crate::broadcast::observe_transaction(
+            ["https://zec.rocks:443", "https://na.zec.rocks:443"]
+                .into_iter()
+                .map(|endpoint| EndpointTxEvidence {
+                    operator_id: "zec.rocks".to_owned(),
+                    endpoint: endpoint.to_owned(),
+                    tip_height: Some(height + 2),
+                    reported_height: Some(height),
+                    block_hash: Some(vec![5; 32]),
+                    tx_in_block: true,
+                })
+                .collect(),
+            Some(500),
+        )
+    }
+
+    /// Observes each txid with the scripted result, Unavailable otherwise.
+    struct Observer(HashMap<TxId, TxObservation>);
+
+    #[async_trait::async_trait]
+    impl TxObserver for Observer {
+        async fn observe(
+            &mut self,
+            _network: ZeckNetwork,
+            txid: TxId,
+            expiry_height: Option<u32>,
+        ) -> ZeckResult<TxObservation> {
+            Ok(self
+                .0
+                .get(&txid)
+                .cloned()
+                .unwrap_or_else(|| crate::broadcast::observe_transaction(vec![], expiry_height)))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_account_broadcasts_while_the_first_is_still_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        let (first, second) = (prepared(300), prepared(301));
+        let mut node = Node::default();
+        let mut observer = Observer(HashMap::new());
+        let mut results = Vec::new();
+        let mut mined = Vec::new();
+        let mut mark = |txid: TxId, height: u32| {
+            mined.push((txid, height));
+            Ok(())
+        };
+        submit_and_confirm_batch(
+            vec![first.clone()],
+            0,
+            "sweep",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut mark,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results[0].status, TxLifecycleState::Pending);
+        submit_and_confirm_batch(
+            vec![second.clone()],
+            1,
+            "sweep",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut mark,
+        )
+        .await
+        .expect("an accepted earlier leg does not block a later one");
+        assert_eq!(node.sent, vec![first.raw_tx, second.raw_tx]);
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.source_account)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(mined.is_empty());
+        // Both remain unresolved for a NEW review.
+        assert!(log.has_unresolved_history());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_reply_blocks_the_next_leg() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        let (first, second) = (prepared(300), prepared(301));
+        let mut node = Node {
+            lose_reply_for: Some(first.raw_tx.clone()),
+            ..Node::default()
+        };
+        let mut observer = Observer(HashMap::new());
+        let mut results = Vec::new();
+        let mut mark = |_: TxId, _: u32| Ok(());
+        assert!(submit_and_confirm_batch(
+            vec![first.clone()],
+            0,
+            "sweep",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut mark,
+        )
+        .await
+        .is_err());
+        assert_eq!(results[0].status, TxLifecycleState::SubmissionUnknown);
+        assert!(submit_and_confirm_batch(
+            vec![second],
+            1,
+            "sweep",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut mark,
+        )
+        .await
+        .is_err());
+        assert_eq!(node.sent, vec![first.raw_tx]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shield_then_send_completes_under_the_default_single_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap();
+        let (shield, send) = (prepared(300), prepared(301));
+        let mut node = Node::default();
+        let mut observer = Observer(HashMap::from([
+            (shield.txid, default_operator_mined(120)),
+            (send.txid, default_operator_mined(125)),
+        ]));
+        let mut results = Vec::new();
+        let mut mined = Vec::new();
+        let mut mark = |txid: TxId, height: u32| {
+            mined.push((txid, height));
+            Ok(())
+        };
+        submit_and_confirm_batch(
+            vec![shield.clone()],
+            0,
+            "shielding",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut mark,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results[0].status, TxLifecycleState::MinedSingleSource);
+        // The execution-start gate for the follow-up review now passes.
+        assert!(!log.has_unresolved_history());
+        submit_and_confirm_batch(
+            vec![send.clone()],
+            0,
+            "sweep",
+            &mut results,
+            &mut log,
+            &mut node,
+            &mut observer,
+            ZeckNetwork::Mainnet,
+            &mut mark,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results[1].status, TxLifecycleState::MinedSingleSource);
+        assert_eq!(mined, vec![(shield.txid, 120), (send.txid, 125)]);
+        assert!(results.iter().all(|row| !row.safe_to_discard));
+        assert!(!log.has_unresolved_history());
+        assert_eq!(node.sent, vec![shield.raw_tx, send.raw_tx]);
     }
 }
