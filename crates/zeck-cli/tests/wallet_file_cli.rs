@@ -20,9 +20,105 @@ use std::process::{Command, Stdio};
 const SPROUT_PLAINTEXT: &str = "sprout-plaintext.dat";
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    relabeled_fixture(name, "mainnet")
+}
+
+/// The zcashd golden files were written on regtest, and operational imports
+/// refuse that network in a production build. Tests that exercise ordinary
+/// CLI behaviour use a disposable copy whose sole `networkinfo` value names
+/// `network` instead. The checked-in writer fixtures stay byte-for-byte
+/// unchanged, and files with no regtest marker (ZecWallet Lite) are used as
+/// they are.
+fn relabeled_fixture(name: &str, network: &str) -> PathBuf {
+    assert_eq!(network.len(), 7, "the marker is replaced in place");
+    let original = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../argos-wallet-import/tests/fixtures")
-        .join(name)
+        .join(name);
+    let Ok(mut bytes) = std::fs::read(&original) else {
+        return original;
+    };
+    let matches: Vec<_> = bytes
+        .windows(7)
+        .enumerate()
+        .filter_map(|(offset, window)| (window == b"regtest").then_some(offset))
+        .collect();
+    if matches.is_empty() {
+        return original;
+    }
+    assert_eq!(matches.len(), 1, "golden wallet network marker changed");
+    bytes[matches[0]..matches[0] + 7].copy_from_slice(network.as_bytes());
+    let path = std::env::temp_dir().join(format!(
+        "argos-cli-{network}-golden-{}-{name}",
+        std::process::id()
+    ));
+    // Tests run in parallel: write to a unique temporary name, then rename,
+    // so no reader can see a half-written copy.
+    let partial = path.with_extension(format!("partial-{:?}", std::thread::current().id()));
+    std::fs::write(&partial, bytes).unwrap();
+    std::fs::rename(&partial, &path).unwrap();
+    path
+}
+
+#[test]
+fn wallet_network_mismatch_stops_before_lightwalletd() {
+    let path = fixture("zwl-testnet-empty.dat");
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().unwrap(),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("network-mismatch"),
+        "scan",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mainnet") && stderr.contains("testnet"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("127.0.0.1") && !stderr.contains("lightwalletd probe"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn scan_routes_writer_wallet_seed_with_standalone_key_as_combined() {
+    let mut bytes = std::fs::read(fixture("zwl-mainnet-empty.dat")).unwrap();
+    // Writer fixture: one valid transparent key; keytype at 102..106.
+    // Reclassify that key as an imported standalone key.
+    assert_eq!(&bytes[102..106], &0u32.to_le_bytes());
+    bytes[102..106].copy_from_slice(&1u32.to_le_bytes());
+    let path = temporary_wallet("mixed-writer-key", &bytes);
+    let inspect = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(inspect.status.success());
+    let shown = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        shown.contains("standalone") && shown.contains("combined"),
+        "{shown}"
+    );
+    let out = argos(&[
+        "--wallet-file",
+        path.to_str().unwrap(),
+        "--accept-tos",
+        "--lightwalletd-url",
+        "https://127.0.0.1:1",
+        "--data-dir",
+        &scratch_dir("mixed-writer-key"),
+        "scan",
+    ]);
+    assert!(!out.status.success()); // deliberately unreachable lightwalletd
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("127.0.0.1") || stderr.contains("lightwalletd"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot be scanned alongside") && !stderr.contains("nothing to scan"),
+        "{stderr}"
+    );
 }
 
 /// Run `argos` with stdin closed.
@@ -36,6 +132,209 @@ fn argos(args: &[&str]) -> std::process::Output {
         .stdin(Stdio::null())
         .output()
         .expect("argos binary should run")
+}
+
+fn temporary_wallet(tag: &str, bytes: &[u8]) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("argos-cli-{tag}-{}.dat", std::process::id()));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+// A no-funds ZWL wallet using the writer's versioned layout. The seed is
+// public test entropy; these records have no chain history.
+fn zwl_with_tkeys(entries: &[(u32, bool, Option<[u8; 32]>, &str)]) -> Vec<u8> {
+    let mut bytes = 25u64.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&22u64.to_le_bytes());
+    bytes.push(0); // wallet is not encrypted
+    bytes.extend_from_slice(&[0; 48]); // encrypted seed slot
+    bytes.push(0); // nonce
+    bytes.extend_from_slice(&[0; 32]); // plaintext seed
+    bytes.push(0); // Orchard keys
+    bytes.push(0); // Sapling keys
+    bytes.push(entries.len() as u8);
+    for (kind, locked, secret, address) in entries {
+        bytes.push(1); // tkey record version
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.push(u8::from(*locked));
+        match secret {
+            Some(secret) => {
+                bytes.push(1);
+                bytes.extend_from_slice(secret);
+            }
+            None => bytes.push(0),
+        }
+        bytes.extend_from_slice(&(address.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(address.as_bytes());
+        bytes.push(0); // HD index
+        if *locked {
+            bytes.push(1);
+            bytes.push(48);
+            bytes.extend_from_slice(&[0xcc; 48]);
+            bytes.push(1);
+            bytes.push(24);
+            bytes.extend_from_slice(&[0xdd; 24]);
+        } else {
+            bytes.extend_from_slice(&[0, 0]); // no ciphertext or nonce
+        }
+    }
+    bytes.push(0); // empty block history
+    bytes.extend_from_slice(&21u64.to_le_bytes()); // WalletTxns version
+    bytes.push(0); // no transactions
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.extend_from_slice(b"main");
+    bytes.extend_from_slice(
+        &include_bytes!("../../argos-wallet-import/tests/fixtures/zwl-mainnet-empty.dat")[212..],
+    );
+    bytes
+}
+
+#[test]
+fn inspect_wallet_reports_structural_damage_and_preserve_file() {
+    let mut bytes = std::fs::read(fixture("zwl-mainnet-empty.dat")).unwrap();
+    bytes.truncate(20);
+    let path = temporary_wallet("truncated-zwl", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.contains("Recovery coverage: Incomplete"), "{shown}");
+    assert!(shown.contains("wallet container is damaged"), "{shown}");
+    assert!(shown.contains("Keep the original wallet file"), "{shown}");
+
+    // A zcashd BDB whose metadata names pages absent from the file is
+    // unrecoverable as a whole, but still needs the same preserve warning.
+    let bdb = fixture("modern-plaintext-truncated.dat");
+    let out = argos(&["--wallet-file", bdb.to_str().unwrap(), "inspect-wallet"]);
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains("wallet file structure is unreadable"),
+        "{error}"
+    );
+    assert!(error.contains("Keep the original wallet file"), "{error}");
+}
+
+#[test]
+fn inspect_wallet_distinguishes_locked_hd_and_standalone_keys() {
+    let hd_only = zwl_with_tkeys(&[(0, true, None, "t1LockedHd")]);
+    let hd_path = temporary_wallet("locked-hd-only", &hd_only);
+    let hd_out = argos(&["--wallet-file", hd_path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        hd_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hd_out.stderr)
+    );
+    // The seed is recovered, so a locked HD key is one of its own accounts:
+    // not reported as locked, and coverage stays complete (round-2 item D
+    // on #275).
+    let hd_shown = String::from_utf8_lossy(&hd_out.stdout);
+    assert!(
+        !hd_shown.contains("recover the wallet seed to recreate it"),
+        "{hd_shown}"
+    );
+    assert!(
+        hd_shown.contains("Every record that can hold a key was read."),
+        "{hd_shown}"
+    );
+
+    let bytes = zwl_with_tkeys(&[
+        (0, true, None, "t1LockedHd"),
+        (1, true, None, "t1LockedStandalone"),
+    ]);
+    let path = temporary_wallet("locked-provenance", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !shown.contains("recover the wallet seed to recreate it"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("cannot be recreated from the seed"),
+        "{shown}"
+    );
+    assert!(shown.contains("Keep the original wallet file"), "{shown}");
+    assert!(
+        shown.contains("It may contain keys or records Argos has not recovered"),
+        "the fund-hiding banner must remain visible: {shown}"
+    );
+    assert!(
+        !shown.contains("Anything listed above exists only there"),
+        "recovered HD keys can be recreated from the seed: {shown}"
+    );
+}
+
+#[test]
+fn inspect_wallet_redacts_identifier_mismatch() {
+    let bytes = zwl_with_tkeys(&[(0, false, Some([1; 32]), "t1SentinelWrongAddress")]);
+    let path = temporary_wallet("identifier-mismatch", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        shown.contains("stored public identifier does not match"),
+        "{shown}"
+    );
+    assert!(shown.contains("mismatched record was not used"), "{shown}");
+    assert!(
+        !shown.contains("t1SentinelWrongAddress") && !shown.contains("01010101"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn damaged_encryption_metadata_does_not_prompt_for_passphrase() {
+    use argos_core::argos_wallet_import::{bdb, zcashd::records::parse_record_key};
+    let mut bytes = std::fs::read(fixture("modern-encrypted.dat")).unwrap();
+    let value = bdb::walk(&bytes)
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|(key, _)| parse_record_key(key).is_some_and(|record| record.record_type == "mkey"))
+        .unwrap()
+        .1;
+    let offset = bytes
+        .windows(value.len())
+        .position(|window| window == value)
+        .unwrap();
+    bytes[offset] = 0xfc;
+    let path = temporary_wallet("damaged-mkey", &bytes);
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(!out.status.success());
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        shown.contains("wallet encryption metadata is damaged"),
+        "{shown}"
+    );
+    assert!(shown.contains("Keep the original wallet file"), "{shown}");
+    assert!(!shown.contains("Enter the wallet passphrase"), "{shown}");
+}
+
+#[test]
+fn wallet_network_mismatch_names_both_networks() {
+    let path = fixture("zwl-testnet-empty.dat");
+    let out = argos(&["--wallet-file", path.to_str().unwrap(), "inspect-wallet"]);
+    assert!(!out.status.success());
+    let shown = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        shown.contains("selected mainnet") && shown.contains("embedded testnet"),
+        "{shown}"
+    );
 }
 
 // Missing dispatch, wrong-network wording, or warning after validation would
@@ -162,7 +461,7 @@ fn nu7_warning_stays_silent_for_scan_and_sweep_of_a_wallet_without_sprout() {
 
 #[test]
 fn nu7_testnet_warning_explains_the_activation_boundary_without_urging_a_spend() {
-    let wallet = fixture(SPROUT_PLAINTEXT);
+    let wallet = relabeled_fixture(SPROUT_PLAINTEXT, "testnet");
     let out = argos(&[
         "--wallet-file",
         wallet.to_str().unwrap(),
@@ -586,20 +885,11 @@ fn a_key_file_alone_does_not_demand_a_wallet_file() {
     );
 }
 
-/// The over-refusal guard, at the surface a user actually types.
-///
-/// `--wallet-file` + `--sapling-key-file` is refused *only* when the wallet
-/// yields a BIP-39 mnemonic, because that wallet takes the HD route and the
-/// standalone key would be silently dropped. A seedless zcashd wallet takes
-/// the imported-account route, which reads `keys.sapling` directly, so the
-/// two must still merge — this is the combination the feature exists for.
-///
-/// The matching refusal cannot be exercised here: only an *encrypted*
-/// ZecWallet Lite wallet recovers a mnemonic, and its passphrase is
-/// prompt-only by design, so no non-interactive fixture can reach that
-/// branch. Both directions are pinned at the unit level instead, on
-/// `argos_core::sapling_key::merge_standalone_sapling_keys` — the single
-/// helper this path and the GUI's both call.
+/// `--wallet-file` + `--sapling-key-file` merges for every wallet. A
+/// seedless zcashd wallet takes the imported-account route, which reads
+/// `keys.sapling` directly; a wallet with a mnemonic takes the Combined
+/// route, which registers the supplied key beside the seed's accounts
+/// (see `a_seed_wallet_and_a_key_file_merge_into_one_recovery`).
 #[test]
 fn a_seedless_wallet_and_a_key_file_still_merge() {
     let wallet = fixture(SPROUT_PLAINTEXT);
@@ -635,6 +925,35 @@ fn a_seedless_wallet_and_a_key_file_still_merge() {
         !stdout.contains("secret-extended-key"),
         "no key material may be printed back, got: {stdout}"
     );
+}
+
+/// Review finding 6 on #275: a wallet file with a seed phrase (here the
+/// writer-produced ZecWallet Lite fixture) plus a key file used to be
+/// refused with "run two scans". The Combined route scans both, so the
+/// supplied key is merged and reported beside the wallet's own.
+#[test]
+fn a_seed_wallet_and_a_key_file_merge_into_one_recovery() {
+    let wallet = fixture("zwl-mainnet-empty.dat");
+    let keys = key_file("sapling-key-with-seed-wallet.txt", TEST_SAPLING_KEY_MAINNET);
+    let out = argos(&[
+        "--wallet-file",
+        wallet.to_str().expect("fixture path is UTF-8"),
+        "--sapling-key-file",
+        keys.to_str().expect("path is UTF-8"),
+        "inspect-wallet",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a seed wallet plus a supplied key must not be refused: {stderr}"
+    );
+    assert!(!stderr.contains("two scans"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("zs1"),
+        "the supplied key is reported: {stdout}"
+    );
+    assert!(!stdout.contains("secret-extended-key"), "{stdout}");
 }
 
 /// A wallet with no seed phrase sweeps without a memo, and a dropped memo
@@ -1060,7 +1379,7 @@ fn auto_detect_dates_a_seedless_wallet_from_its_key_times() {
 /// the scan goes ahead from the start rather than guessing.
 #[test]
 fn auto_detect_on_testnet_scans_from_the_start() {
-    let path = fixture(SPROUT_PLAINTEXT);
+    let path = relabeled_fixture(SPROUT_PLAINTEXT, "testnet");
     let out = argos(&[
         "--wallet-file",
         path.to_str().expect("utf-8"),

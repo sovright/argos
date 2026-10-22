@@ -6,5 +6,7 @@ use libfuzzer_sys::fuzz_target;
 // here is a real finding: this is the single highest-value test artifact
 // in the import path.
 fuzz_target!(|data: &[u8]| {
-    let _ = argos_wallet_import::bdb::walk(data);
+    if let Ok(walk) = argos_wallet_import::bdb::walk(data) {
+        assert!(walk.diagnostics.len() <= 1_000);
+    }
 });

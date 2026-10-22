@@ -28,6 +28,7 @@ fn fixture(name: &str) -> Vec<u8> {
 fn record(bytes: &[u8], record_type: &str) -> Option<Vec<u8>> {
     bdb::walk(bytes)
         .unwrap()
+        .records
         .into_iter()
         .find(|(k, _)| parse_record_key(k).is_some_and(|r| r.record_type == record_type))
         .map(|(_, v)| v)

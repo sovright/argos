@@ -8,7 +8,9 @@ pub mod records;
 pub mod seed;
 pub mod sprout;
 
-pub use crypto::{derive_master_key, find_mkey, MasterKey, MkeyRecord};
+pub use crypto::{
+    classify_encryption, derive_master_key, find_mkey, EncryptionMetadata, MasterKey, MkeyRecord,
+};
 pub use encrypted::collect_encrypted;
 pub use metadata::{KeyMetadataIndex, MetadataKind, UNKNOWN_CREATE_TIME_AT_OR_BEFORE};
 pub use plaintext::collect_plaintext;
@@ -19,15 +21,23 @@ use std::collections::HashSet;
 
 use secrecy::SecretString;
 
-use crate::{bdb, error::ImportError, keys::ImportedKeys};
+use crate::{
+    bdb,
+    error::{ImportDiagnostic, ImportError},
+    keys::ImportedKeys,
+};
 
-/// True when the wallet carries an `mkey` record and therefore needs a
-/// passphrase. Checked before prompting so we never ask for a passphrase
-/// the wallet does not use.
-pub fn needs_passphrase(bytes: &[u8]) -> bool {
-    bdb::walk(bytes)
-        .map(|pairs| find_mkey(&pairs).is_some())
-        .unwrap_or(false)
+/// Whether the wallet needs a passphrase. Reject damaged encryption metadata
+/// before prompting, so a missing `mkey` cannot masquerade as plaintext.
+pub fn needs_passphrase(bytes: &[u8]) -> Result<bool, ImportError> {
+    let walk = bdb::walk(bytes)?;
+    match classify_encryption(&walk.records) {
+        EncryptionMetadata::Unencrypted => Ok(false),
+        EncryptionMetadata::Encrypted(_) => Ok(true),
+        EncryptionMetadata::Damaged { reason } => {
+            Err(ImportError::DamagedEncryptionMetadata(reason))
+        }
+    }
 }
 
 /// Parse a zcashd `wallet.dat` into normalized key material.
@@ -38,18 +48,46 @@ pub fn import_zcashd(
     bytes: &[u8],
     passphrase: Option<&SecretString>,
 ) -> Result<ImportedKeys, ImportError> {
-    let pairs = Records(bdb::walk(bytes)?);
-    let master = match find_mkey(&pairs) {
+    let walk = bdb::walk(bytes)?;
+    let walk_diagnostics = walk.diagnostics;
+    let pairs = Records(walk.records);
+    let master = match classify_encryption(&pairs) {
+        EncryptionMetadata::Damaged { reason } => {
+            return Err(ImportError::DamagedEncryptionMetadata(reason));
+        }
         // Encrypted wallet: without a passphrase the encrypted records are
         // unreachable, and reporting partial plaintext results would let a
         // user believe they had recovered everything.
-        Some(mkey) => Some(derive_master_key(
+        EncryptionMetadata::Encrypted(mkey) => Some(derive_master_key(
             passphrase.ok_or(ImportError::WrongPassphrase)?,
             &mkey,
         )?),
-        None => None,
+        EncryptionMetadata::Unencrypted => None,
     };
-    Ok(import_records(&pairs, master.as_ref()))
+    let mut out = import_records(&pairs, master.as_ref());
+    out.diagnostics.splice(0..0, walk_diagnostics);
+
+    let absence_already_explained = out.diagnostics.iter().any(|diagnostic| match diagnostic {
+        ImportDiagnostic::UnrecoveredSeed { .. }
+        | ImportDiagnostic::UnscannedSeedAccounts { .. }
+        | ImportDiagnostic::MissingDerivedKeys { .. } => true,
+        ImportDiagnostic::UnparseableRecord { record_type, .. }
+        | ImportDiagnostic::DecryptionFailed { record_type, .. }
+        | ImportDiagnostic::PublicIdentifierMismatch { record_type, .. }
+        | ImportDiagnostic::LockedKey { record_type, .. } => matches!(
+            record_type.as_str(),
+            "key" | "zkey" | "sapzkey" | "ckey" | "czkey" | "csapzkey"
+        ),
+        _ => false,
+    });
+    if out.is_empty() && !absence_already_explained {
+        out.diagnostics
+            .push(ImportDiagnostic::MissingSpendAuthority {
+                format: "Berkeley DB",
+            });
+    }
+
+    Ok(out)
 }
 
 /// Every pass over the walked records. `master` is `Some` exactly when the
@@ -124,6 +162,284 @@ mod tests {
         std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap()
     }
 
+    fn mkey_record(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        bdb::walk(bytes)
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .expect("golden encrypted wallet has an mkey")
+    }
+
+    fn replace_unique(bytes: &mut [u8], original: &[u8], replacement: &[u8]) {
+        assert_eq!(original.len(), replacement.len());
+        let offsets: Vec<_> = bytes
+            .windows(original.len())
+            .enumerate()
+            .filter_map(|(index, window)| (window == original).then_some(index))
+            .collect();
+        assert_eq!(offsets.len(), 1, "fixture record must occur exactly once");
+        bytes[offsets[0]..offsets[0] + original.len()].copy_from_slice(replacement);
+    }
+
+    fn assert_damaged_encryption(bytes: &[u8]) {
+        let err = import_zcashd(bytes, None).unwrap_err();
+        let ImportError::DamagedEncryptionMetadata(reason) = &err else {
+            panic!("expected damaged encryption metadata, got {err}");
+        };
+        assert!(reason.contains("mkey"), "reason must name mkey");
+        assert!(
+            reason.contains("encrypted records"),
+            "reason must name encrypted records"
+        );
+        assert!(err.to_string().contains("Keep the original wallet file"));
+    }
+
+    #[test]
+    fn encrypted_records_with_truncated_mkey_are_damaged_not_plaintext() {
+        let mut bytes = read("modern-encrypted");
+        let (_, value) = mkey_record(&bytes);
+        let mut malformed = value.clone();
+        malformed[0] = 0xfc; // impossible ciphertext length within this record
+        replace_unique(&mut bytes, &value, &malformed);
+        assert_damaged_encryption(&bytes);
+    }
+
+    #[test]
+    fn encrypted_records_without_mkey_are_damaged_not_plaintext() {
+        let mut bytes = read("modern-encrypted");
+        let (key, _) = mkey_record(&bytes);
+        let mut renamed = key.clone();
+        renamed[1..5].copy_from_slice(b"xkey");
+        replace_unique(&mut bytes, &key, &renamed);
+        assert_damaged_encryption(&bytes);
+    }
+
+    #[test]
+    fn encrypted_seed_record_without_mkey_is_damaged() {
+        let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
+        let seed = pairs
+            .into_iter()
+            .find(|(key, _)| {
+                parse_record_key(key).is_some_and(|r| {
+                    matches!(r.record_type.as_str(), "chdseed" | "cmnemonicphrase")
+                })
+            })
+            .expect("golden fixture has encrypted seed");
+        let classification = crate::zcashd::crypto::classify_encryption(&[seed]);
+        assert!(matches!(
+            classification,
+            crate::zcashd::crypto::EncryptionMetadata::Damaged { .. }
+        ));
+    }
+
+    #[test]
+    fn unsupported_mkey_kdf_is_damaged_metadata() {
+        let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
+        let mut mkey = pairs
+            .into_iter()
+            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .unwrap();
+        let value = &mut mkey.1;
+        let (key_len, key_offset) = compact_size(value).unwrap();
+        let salt_offset = key_offset + key_len as usize;
+        let method_offset = salt_offset + 1 + 8;
+        value[method_offset..method_offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            crate::zcashd::crypto::classify_encryption(&[mkey]),
+            crate::zcashd::crypto::EncryptionMetadata::Damaged { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_mkey_ciphertext_shape_is_damaged_metadata() {
+        let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
+        let mut mkey = pairs
+            .into_iter()
+            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .unwrap();
+        // Keep the serialized record well formed, but shrink the AES-CBC
+        // ciphertext from the fixture's 48 bytes to an impossible 32 bytes.
+        mkey.1.drain(33..49);
+        mkey.1[0] = 32;
+        assert!(matches!(
+            crate::zcashd::crypto::classify_encryption(&[mkey]),
+            crate::zcashd::crypto::EncryptionMetadata::Damaged { .. }
+        ));
+    }
+
+    #[test]
+    fn plaintext_wallet_without_encrypted_records_is_unencrypted() {
+        let pairs = bdb::walk(&read("modern-plaintext")).unwrap().records;
+        assert!(matches!(
+            crate::zcashd::crypto::classify_encryption(&pairs),
+            crate::zcashd::crypto::EncryptionMetadata::Unencrypted
+        ));
+    }
+
+    #[test]
+    fn needs_passphrase_propagates_damaged_encryption_metadata() {
+        let mut bytes = read("modern-encrypted");
+        let (key, _) = mkey_record(&bytes);
+        let mut renamed = key.clone();
+        renamed[1..5].copy_from_slice(b"xkey");
+        replace_unique(&mut bytes, &key, &renamed);
+        assert!(matches!(
+            needs_passphrase(&bytes),
+            Err(ImportError::DamagedEncryptionMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn valid_empty_bdb_cannot_claim_complete_recovery() {
+        let mut bytes = vec![0u8; 1024];
+        bytes[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&512u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&1u32.to_le_bytes());
+        bytes[512 + 25] = bdb::PAGE_TYPE_LBTREE;
+
+        let keys = import_zcashd(&bytes, None).expect("valid empty btree must parse");
+        assert!(keys.is_empty());
+        assert!(keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            crate::error::ImportDiagnostic::MissingSpendAuthority {
+                format: "Berkeley DB"
+            }
+        )));
+        assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
+    }
+
+    #[test]
+    fn recognized_zcashd_without_spend_authority_is_key_material_missing() {
+        // One valid BDB leaf containing only a zcashd `version` metadata
+        // record. The container and record parse cleanly but have no keys.
+        let mut bytes = vec![0u8; 1024];
+        bytes[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&512u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&1u32.to_le_bytes());
+        let page = 512;
+        bytes[page + 20..page + 22].copy_from_slice(&2u16.to_le_bytes());
+        bytes[page + 25] = bdb::PAGE_TYPE_LBTREE;
+        let key = b"\x07version";
+        let value = 1u32.to_le_bytes();
+        for (slot, offset, data) in [(0, 40u16, key.as_slice()), (1, 60, value.as_slice())] {
+            let index = page + 26 + slot * 2;
+            bytes[index..index + 2].copy_from_slice(&offset.to_le_bytes());
+            let start = page + usize::from(offset);
+            bytes[start..start + 2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+            bytes[start + 2] = 1; // BDB key/data leaf entry
+            bytes[start + 3..start + 3 + data.len()].copy_from_slice(data);
+        }
+
+        let walk = bdb::walk(&bytes).expect("metadata-only BDB must parse");
+        assert_eq!(walk.records.len(), 1);
+        assert_eq!(
+            parse_record_key(&walk.records[0].0).unwrap().record_type,
+            "version"
+        );
+        assert!(walk.diagnostics.is_empty());
+
+        let keys = import_zcashd(&bytes, None).unwrap();
+        assert!(keys.is_empty());
+        assert!(keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ImportDiagnostic::MissingSpendAuthority {
+                format: "Berkeley DB"
+            }
+        )));
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::KeyMaterialMissing
+        );
+    }
+
+    #[test]
+    fn unrelated_malformed_record_does_not_hide_missing_spend_authority() {
+        // Valid metadata plus a record key that cannot identify any key
+        // type. Its parse diagnostic says nothing about spending authority.
+        let mut bytes = vec![0u8; 1024];
+        bytes[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&512u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&1u32.to_le_bytes());
+        let page = 512;
+        bytes[page + 20..page + 22].copy_from_slice(&4u16.to_le_bytes());
+        bytes[page + 25] = bdb::PAGE_TYPE_LBTREE;
+        let version = 1u32.to_le_bytes();
+        for (slot, offset, data) in [
+            (0, 40u16, b"\x07version".as_slice()),
+            (1, 60, version.as_slice()),
+            (2, 80, b"\xff".as_slice()),
+            (3, 100, b"unrelated".as_slice()),
+        ] {
+            let index = page + 26 + slot * 2;
+            bytes[index..index + 2].copy_from_slice(&offset.to_le_bytes());
+            let start = page + usize::from(offset);
+            bytes[start..start + 2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+            bytes[start + 2] = 1;
+            bytes[start + 3..start + 3 + data.len()].copy_from_slice(data);
+        }
+
+        let keys = import_zcashd(&bytes, None).unwrap();
+        assert!(keys.is_empty());
+        assert!(keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ImportDiagnostic::UnparseableRecord { record_type, .. }
+                if record_type == "<unparseable>"
+        )));
+        assert!(keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ImportDiagnostic::MissingSpendAuthority {
+                format: "Berkeley DB"
+            }
+        )));
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::KeyMaterialMissing
+        );
+    }
+
+    #[test]
+    fn seed_only_wallet_keeps_its_specific_coverage_without_missing_authority() {
+        // A structurally valid BDB leaf with only an unrecovered plaintext
+        // HD seed. This specific warning already explains absent spend keys.
+        let mut bytes = vec![0u8; 1024];
+        bytes[12..16].copy_from_slice(&0x0005_3162u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&512u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&1u32.to_le_bytes());
+        let page = 512;
+        bytes[page + 20..page + 22].copy_from_slice(&2u16.to_le_bytes());
+        bytes[page + 25] = bdb::PAGE_TYPE_LBTREE;
+        let key = b"\x06hdseed";
+        let value = [0x42u8; 32];
+        for (slot, offset, data) in [(0, 40u16, key.as_slice()), (1, 60, value.as_slice())] {
+            let index = page + 26 + slot * 2;
+            bytes[index..index + 2].copy_from_slice(&offset.to_le_bytes());
+            let start = page + usize::from(offset);
+            bytes[start..start + 2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+            bytes[start + 2] = 1;
+            bytes[start + 3..start + 3 + data.len()].copy_from_slice(data);
+        }
+
+        let keys = import_zcashd(&bytes, None).unwrap();
+        assert!(keys.is_empty());
+        assert!(keys
+            .diagnostics
+            .iter()
+            .any(ImportDiagnostic::is_unrecovered_seed));
+        assert!(!keys.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ImportDiagnostic::MissingSpendAuthority { .. }
+        )));
+        assert_eq!(
+            keys.coverage(),
+            crate::keys::ImportCoverage::SeedNotRecovered
+        );
+    }
+
     /// The record key, after its type, of the first key whose metadata
     /// names a legacy-account keypath containing `branch`.
     fn derived_key_id(pairs: &[(Vec<u8>, Vec<u8>)], branch: &str) -> Vec<u8> {
@@ -177,7 +493,7 @@ mod tests {
     /// every key it derived is read from this file".
     #[test]
     fn an_unreadable_derived_key_withdraws_the_verified_claim() {
-        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap();
+        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap().records;
         let id = derived_key_id(&pairs, "/2147483647'/0/");
         truncate_record(&mut pairs, "key", &id, 10);
         let keys = import_records(&pairs, None);
@@ -198,7 +514,7 @@ mod tests {
     /// belongs: as a missing derived key, not by the metadata diagnostic.
     #[test]
     fn unreadable_metadata_on_a_derived_key_is_graded_by_the_seed_check() {
-        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap();
+        let mut pairs = bdb::walk(&read("modern-plaintext")).unwrap().records;
         let id = derived_key_id(&pairs, "/2147483647'/1/");
         truncate_record(&mut pairs, "keymeta", &id, 20);
         let keys = import_records(&pairs, None);
@@ -225,7 +541,7 @@ mod tests {
     /// CBC decrypts it to 32 bytes of garbage with no diagnostic.)
     #[test]
     fn an_undecryptable_derived_key_withdraws_the_verified_claim() {
-        let mut pairs = bdb::walk(&read("modern-encrypted")).unwrap();
+        let mut pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
         let pass = SecretString::new("argos-test-passphrase".to_owned());
         let master = derive_master_key(&pass, &find_mkey(&pairs).unwrap()).unwrap();
         let id = derived_key_id(&pairs, "/2147483647'/1/");
@@ -244,10 +560,10 @@ mod tests {
 
     #[test]
     fn detects_which_wallets_need_a_passphrase() {
-        assert!(needs_passphrase(&read("modern-encrypted")));
-        assert!(needs_passphrase(&read("sprout-encrypted")));
-        assert!(!needs_passphrase(&read("modern-plaintext")));
-        assert!(!needs_passphrase(&read("sprout-plaintext")));
+        assert!(needs_passphrase(&read("modern-encrypted")).unwrap());
+        assert!(needs_passphrase(&read("sprout-encrypted")).unwrap());
+        assert!(!needs_passphrase(&read("modern-plaintext")).unwrap());
+        assert!(!needs_passphrase(&read("sprout-plaintext")).unwrap());
     }
 
     #[test]

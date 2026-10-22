@@ -226,6 +226,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "x25519-dalek",
+ "zcash_address",
+ "zcash_protocol",
+ "zcash_transparent",
 ]
 
 [[package]]

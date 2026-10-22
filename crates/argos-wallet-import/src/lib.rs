@@ -28,13 +28,14 @@
 
 pub mod bdb;
 pub mod error;
+mod identity;
 pub mod keys;
 pub mod sniff;
 pub mod zcashd;
 pub mod zwl;
 
 pub use error::{ImportDiagnostic, ImportError};
-pub use keys::{ImportCoverage, ImportedKeys, Provenance, SaplingKey};
+pub use keys::{EmbeddedNetwork, ImportCoverage, ImportedKeys, Provenance, SaplingKey};
 pub use sniff::{sniff, WalletFormat};
 
 use secrecy::SecretString;

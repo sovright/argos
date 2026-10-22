@@ -491,19 +491,22 @@ fn refuse_unconsumed_birthday_skip(cli: &Cli) -> Result<()> {
 /// land in shell history and in `ps` output for every user on the box
 /// (T-S6 in the threat model). We attempt an unencrypted read first so an
 /// unencrypted wallet is never asked for a passphrase it does not have.
-fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
+fn load_wallet_file(path: &Path, network: ZeckNetwork) -> Result<ImportedKeys> {
     let bytes = argos_core::wallet_file::read_wallet_file(path)
         .with_context(|| format!("failed to read wallet file {}", path.display()))?;
 
-    match argos_wallet_import::import_wallet_file(&bytes, None) {
+    match argos_core::import_wallet_file_for_network(&bytes, None, network) {
         Ok(mut keys) => {
             report_forged_sprout_keys(&mut keys);
             Ok(keys)
         }
         // The parser reports a locked wallet and a wrong passphrase with
         // the same variant. Here it can only mean "locked", because we
-        // supplied no passphrase to be wrong.
-        Err(argos_wallet_import::ImportError::WrongPassphrase) => {
+        // supplied no passphrase to be wrong. Matched by type, not message
+        // text, so rewording the error cannot silently stop the prompt.
+        Err(argos_core::ZeckError::WalletFile(
+            argos_wallet_import::ImportError::WrongPassphrase,
+        )) => {
             eprintln!("This wallet is encrypted.");
             let passphrase = Password::new()
                 .with_prompt("Enter the wallet passphrase")
@@ -511,8 +514,9 @@ fn load_wallet_file(path: &Path) -> Result<ImportedKeys> {
                 .interact()
                 .context("failed to read wallet passphrase from terminal")?;
             let passphrase = SecretString::new(passphrase);
-            let mut keys = argos_wallet_import::import_wallet_file(&bytes, Some(&passphrase))
-                .with_context(|| format!("failed to import wallet file {}", path.display()))?;
+            let mut keys =
+                argos_core::import_wallet_file_for_network(&bytes, Some(&passphrase), network)
+                    .with_context(|| format!("failed to import wallet file {}", path.display()))?;
             report_forged_sprout_keys(&mut keys);
             Ok(keys)
         }
@@ -1626,40 +1630,43 @@ async fn print_wallet_inspection(
     // the parser, and this adds what the recovery path can say about them.
     print_sprout_inspection(keys, network, show_spent, data_dir).await;
 
-    // Never summarized away: an unread record means key material that
-    // still exists only in the original file, and the user is the only
-    // one who can act on that.
+    // Never summarize diagnostics away: unrecovered material may still
+    // exist in the original file. A locked HD key is different because
+    // its recovered seed can recreate it.
     // "Every record" would be false: bookkeeping records with no key
     // material are skipped by design.
     match keys.coverage_notice() {
         None => println!("Every record that can hold a key was read."),
-        Some(notice) => {
-            println!("Recovery coverage: {notice}");
-            println!();
-            // Two different kinds of finding, printed apart. A record that
-            // could not be read exists only in the file; a note about the
-            // seed (an unscanned account, keys its chain derived that the
-            // file lacks) is not a record that failed to read, and calling
-            // it one told the user something false about both.
-            let (unread, seed): (Vec<_>, Vec<_>) =
-                keys.diagnostics.iter().partition(|d| !d.is_about_seed());
+        Some(notice) => println!("Recovery coverage: {notice}"),
+    }
+    if !keys.diagnostics.is_empty() {
+        println!();
+        // Two different kinds of finding, printed apart. A record that
+        // could not be read exists only in the file; a note about the
+        // seed (an unscanned account, keys its chain derived that the
+        // file lacks) is not a record that failed to read, and calling
+        // it one told the user something false about both.
+        let (unread, seed): (Vec<_>, Vec<_>) =
+            keys.diagnostics.iter().partition(|d| !d.is_about_seed());
+        if !unread.is_empty() {
+            println!("{} import diagnostic(s):", unread.len());
+            for diagnostic in &unread {
+                println!("  {diagnostic}");
+            }
+        }
+        if !seed.is_empty() {
             if !unread.is_empty() {
-                println!("{} record(s) could not be read:", unread.len());
-                for diagnostic in &unread {
-                    println!("  {diagnostic}");
-                }
                 println!();
             }
-            if !seed.is_empty() {
-                println!("About this wallet's seed:");
-                for diagnostic in &seed {
-                    println!("  {diagnostic}");
-                }
-                println!();
+            println!("About this wallet's seed:");
+            for diagnostic in &seed {
+                println!("  {diagnostic}");
             }
+        }
+        if keys.coverage().may_hide_funds() {
+            println!();
             println!(
-                "Keep the original wallet file: it is the only copy of these records and of \
-                 its seed."
+                "Keep the original wallet file. It may contain keys or records Argos has not recovered."
             );
         }
     }
@@ -1688,6 +1695,9 @@ async fn print_wallet_inspection(
     match argos_core::key_source::classify_recovery_route(keys) {
         argos_core::key_source::RecoveryRoute::Hd => {
             println!("Next: run `argos scan --wallet-file <path>` to check these keys for funds.");
+        }
+        argos_core::key_source::RecoveryRoute::Combined => {
+            println!("Next: run `argos scan --wallet-file <path>` for one combined scan of the recovered seed and standalone keys. Keep the original wallet file until every recovered balance has been moved and confirmed.");
         }
         argos_core::key_source::RecoveryRoute::ImportedAccounts => {
             println!(
@@ -1910,7 +1920,7 @@ async fn main() -> Result<()> {
     {
         ensure_tos_accepted(&cli.data_dir, cli.accept_tos)?;
         let wallet_keys = match &cli.wallet_file {
-            Some(path) => Some(load_wallet_file(path)?),
+            Some(path) => Some(load_wallet_file(path, network)?),
             None => None,
         };
         let SproutScanKeys {
@@ -1966,11 +1976,11 @@ async fn main() -> Result<()> {
         Option<Arc<ImportedKeySource>>,
     ) = match (&cli.wallet_file, &cli.sapling_key_file) {
         (Some(path), key_file) => {
-            let mut keys = load_wallet_file(path)?;
+            let mut keys = load_wallet_file(path, network)?;
             if let Some(key_path) = key_file {
-                // Refuses before any scan work starts when the wallet has a
-                // mnemonic: that wallet takes the HD route, which cannot
-                // carry a standalone key. See the helper for why.
+                // A wallet with a mnemonic takes the Combined route, which
+                // registers these keys beside the seed's accounts; a
+                // seedless one scans them as imported accounts.
                 keys_added_from_key_file = argos_core::sapling_key::merge_standalone_sapling_keys(
                     &mut keys,
                     load_sapling_key_file(key_path, network)?,
@@ -2052,9 +2062,9 @@ async fn main() -> Result<()> {
     {
         if seed_phrase.is_none() {
             argos_core::refuse_memo_without_seed(memo.as_deref())?;
-            // Before the scan: the transparent leg is swept last and needs a
-            // Sapling receiver, so an Orchard-only address would otherwise
-            // be found out after the Sapling legs had already broadcast.
+            // With a mnemonic, transparent keys may overlap discovered HD
+            // receivers. The core sweep checks any remaining direct leg
+            // after scanning; only a seedless source is certain here.
             if let Some(source) = imported.as_ref() {
                 argos_core::transparent_recovery::refuse_destination_the_transparent_leg_cannot_reach(
                     source.keys(),

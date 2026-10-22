@@ -10,7 +10,11 @@
 //! record was filed under, exactly as zcashd's own `DecryptKey` checks via
 //! `key.VerifyPubKey(vchPubKey)`.
 
-use argos_wallet_import::{bdb, keys::ImportedKeys, zcashd};
+use argos_wallet_import::{
+    bdb,
+    keys::{ImportCoverage, ImportedKeys},
+    zcashd, ImportDiagnostic,
+};
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -19,7 +23,9 @@ const FIXTURE_PASSPHRASE: &str = "argos-test-passphrase";
 fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
-    bdb::walk(&bytes).unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+    bdb::walk(&bytes)
+        .unwrap_or_else(|e| panic!("walking {fixture}: {e}"))
+        .records
 }
 
 /// The raw (unprefixed) serialized public key stored in a `record_type`
@@ -127,4 +133,74 @@ fn the_derivation_rejects_a_wrong_key() {
         derive_pubkey(key.secret.expose_secret()),
         "flipping one bit of the secret must change the derived public key"
     );
+}
+
+fn assert_one_rejected(before: &ImportedKeys, after: &ImportedKeys, kind: &str) {
+    assert_eq!(after.transparent.len() + 1, before.transparent.len());
+    for (actual, expected) in after
+        .transparent
+        .iter()
+        .zip(before.transparent.iter().skip(1))
+    {
+        assert_eq!(
+            actual.secret.expose_secret(),
+            expected.secret.expose_secret()
+        );
+    }
+    assert_ne!(after.coverage(), ImportCoverage::Complete);
+    let mismatches: Vec<_> = after
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d,
+        ImportDiagnostic::PublicIdentifierMismatch { record_type, identifier: "public key" }
+        if record_type == kind)
+        })
+        .collect();
+    assert_eq!(mismatches.len(), 1);
+    let message = mismatches[0].to_string();
+    assert!(!message.contains(&hex_pubkey(
+        &stored_pubkeys(&load("sprout-plaintext"), "key")[0]
+    )));
+}
+
+fn hex_pubkey(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn mutate_first_pubkey(pairs: &mut [(Vec<u8>, Vec<u8>)], kind: &str) {
+    let (raw_key, _) = pairs
+        .iter_mut()
+        .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == kind))
+        .unwrap();
+    let rest_start = 1 + kind.len();
+    let (len, prefix) = zcashd::compact_size(&raw_key[rest_start..]).unwrap();
+    assert!(len == 33 || len == 65);
+    raw_key[rest_start + prefix + len as usize - 1] ^= 1;
+}
+
+#[test]
+fn mutated_plaintext_pubkey_rejects_secret() {
+    let mut pairs = load("sprout-plaintext");
+    let mut before = ImportedKeys::default();
+    zcashd::collect_plaintext(&pairs, &mut before);
+    mutate_first_pubkey(&mut pairs, "key");
+    let mut after = ImportedKeys::default();
+    zcashd::collect_plaintext(&pairs, &mut after);
+    assert_one_rejected(&before, &after, "key");
+}
+
+#[test]
+fn mutated_ckey_pubkey_rejects_secret() {
+    let mut pairs = load("modern-encrypted");
+    let mkey = zcashd::find_mkey(&pairs).unwrap();
+    let master =
+        zcashd::derive_master_key(&SecretString::new(FIXTURE_PASSPHRASE.to_owned()), &mkey)
+            .unwrap();
+    let mut before = ImportedKeys::default();
+    zcashd::collect_encrypted(&pairs, &master, &mut before);
+    mutate_first_pubkey(&mut pairs, "ckey");
+    let mut after = ImportedKeys::default();
+    zcashd::collect_encrypted(&pairs, &master, &mut after);
+    assert_one_rejected(&before, &after, "ckey");
 }

@@ -283,7 +283,7 @@ where
             None => {
                 return Err(ZeckError::TransactionBuild(format!(
                     "Sapling spend {index} has no verified recipient scope"
-                )))
+                )));
             }
         };
         signer.sign_sapling(index, ask).map_err(|err| {
@@ -408,12 +408,17 @@ pub struct ImportedSweepOutcome {
     /// Sapling key, each with its own notes, and each sweeps separately.
     /// Reporting only one would under-report what moved.
     pub sapling_txids: Vec<String>,
+    /// Display IDs paired in order with broadcast Sapling transactions.
+    pub sapling_display_indices: Vec<u32>,
+    /// Display ID used when registered Sapling accounts held only dust/zero.
+    pub sapling_empty_display_index: Option<u32>,
     /// The Sapling leg ran to completion, so an empty `sapling_txids` means
     /// "nothing was spendable" rather than "we stopped before finding out".
     /// Without this the caller cannot tell a genuinely empty pool from one
     /// whose sweep aborted, and would report the first as the second.
     pub sapling_leg_completed: bool,
     pub transparent_txid: Option<String>,
+    pub transparent_display_index: Option<u32>,
     pub transparent_zatoshis: u64,
     pub transparent_fee_zatoshis: u64,
     /// Fees paid by the Sapling transactions already broadcast. The
@@ -458,6 +463,73 @@ pub async fn sweep_imported_wallet(
     (outcome, result)
 }
 
+/// Spend only the standalone identities registered by a mixed scan. The
+/// account IDs come from that scan; re-registering the original imported set
+/// would reintroduce HD-overlapping keys and duplicate spend authority.
+pub async fn sweep_imported_filtered_wallet(
+    runtime: &crate::models::RuntimeScanConfig,
+    keys: &argos_wallet_import::ImportedKeys,
+    sapling_accounts: &[(u32, AccountUuid, usize)],
+    transparent_indices: &[usize],
+    transparent_display_index: Option<u32>,
+    destination: &str,
+    max_fee_zatoshis: Option<u64>,
+) -> (ImportedSweepOutcome, ZeckResult<()>) {
+    let mut outcome = ImportedSweepOutcome {
+        sapling_empty_display_index: sapling_accounts.first().map(|account| account.0),
+        ..Default::default()
+    };
+    let result = async {
+        sweep_imported_sapling_leg(
+            runtime,
+            keys,
+            destination,
+            max_fee_zatoshis,
+            &mut outcome,
+            Some(sapling_accounts),
+        )
+        .await?;
+        outcome.sapling_leg_completed = true;
+        if !transparent_indices.is_empty() {
+            let all_keys = crate::imported::imported_transparent_keys(keys)?;
+            let selected = transparent_indices
+                .iter()
+                .map(|index| {
+                    all_keys.get(*index).ok_or_else(|| {
+                        ZeckError::Wallet(format!("standalone transparent key {index} is missing"))
+                    })
+                })
+                .collect::<ZeckResult<Vec<_>>>()?;
+            let selected = selected
+                .into_iter()
+                .map(|key| crate::imported::ImportedTransparentKey {
+                    secret: key.secret,
+                    address: key.address,
+                })
+                .collect::<Vec<_>>();
+            if let Some(swept) = crate::transparent_recovery::sweep_transparent_only(
+                &selected,
+                runtime.network,
+                &runtime.lightwalletd_url,
+                destination,
+                max_fee_zatoshis,
+                outcome.sapling_fee_zatoshis,
+            )
+            .await?
+            {
+                outcome.transparent_txid = Some(swept.txid);
+                outcome.transparent_display_index = transparent_display_index;
+                outcome.transparent_zatoshis = swept.plan.output_zatoshis;
+                outcome.transparent_fee_zatoshis = swept.plan.fee_zatoshis;
+            }
+        }
+        outcome.transparent_leg_completed = true;
+        Ok(())
+    }
+    .await;
+    (outcome, result)
+}
+
 /// The body of [`sweep_imported_wallet`], writing into an outcome the caller
 /// owns.
 ///
@@ -480,7 +552,8 @@ async fn sweep_imported_wallet_into(
     // either way. Whatever the Sapling leg already broadcast is in
     // `outcome` by then and stays there.
     let sapling_result =
-        sweep_imported_sapling_leg(runtime, keys, destination, max_fee_zatoshis, outcome).await;
+        sweep_imported_sapling_leg(runtime, keys, destination, max_fee_zatoshis, outcome, None)
+            .await;
     outcome.sapling_leg_completed = sapling_result.is_ok();
 
     // Transparent, through the path that needs no account at all.
@@ -536,6 +609,7 @@ async fn sweep_imported_sapling_leg(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
     outcome: &mut ImportedSweepOutcome,
+    registered_accounts: Option<&[(u32, AccountUuid, usize)]>,
 ) -> ZeckResult<()> {
     use crate::imported::register_imported_accounts;
     use crate::workspace::{consensus_network, open_wallet_db, RecoveryWorkspace};
@@ -544,6 +618,10 @@ async fn sweep_imported_sapling_leg(
     use zcash_proofs::prover::LocalTxProver;
 
     let params = consensus_network(runtime.network);
+
+    if registered_accounts.is_some_and(|accounts| accounts.is_empty()) {
+        return Ok(());
+    }
 
     // Every account, not just the first. `register_imported_accounts` creates
     // one account per Sapling key and `run_imported_scan` reports a balance
@@ -558,10 +636,12 @@ async fn sweep_imported_sapling_leg(
     // reaching the transparent path below — which needs no account at all.
     // The scan already routes on `classify_recovery_route`; this is the same
     // decision on the sweep side.
-    if !matches!(
-        crate::key_source::classify_recovery_route(keys),
-        crate::key_source::RecoveryRoute::ImportedAccounts
-    ) {
+    if registered_accounts.is_none()
+        && !matches!(
+            crate::key_source::classify_recovery_route(keys),
+            crate::key_source::RecoveryRoute::ImportedAccounts
+        )
+    {
         // No Sapling keys at all, so the leg is complete and empty rather
         // than skipped.
         return Ok(());
@@ -575,7 +655,27 @@ async fn sweep_imported_sapling_leg(
     enforce_sapling_fee_floor(max_fee_zatoshis)?;
 
     let workspace = RecoveryWorkspace::from_runtime(runtime)?;
-    let accounts = {
+    let accounts = if let Some(registered) = registered_accounts {
+        registered
+            .iter()
+            .map(|&(display_index, wallet_account_id, key_index)| {
+                let key = keys.sapling.get(key_index).ok_or_else(|| {
+                    ZeckError::Wallet(format!("standalone Sapling key {key_index} is missing"))
+                })?;
+                let extsk = crate::imported::parse_sapling_extsk(
+                    secrecy::ExposeSecret::expose_secret(&key.extsk),
+                )?;
+                Ok((
+                    display_index,
+                    crate::imported::ImportedWalletAccount {
+                        wallet_account_id,
+                        sapling_extsk: Some(extsk),
+                        transparent_addresses: Vec::new(),
+                    },
+                ))
+            })
+            .collect::<ZeckResult<Vec<_>>>()?
+    } else {
         let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), params)?;
         // Re-registration is idempotent and returns the accounts the
         // scan already created.
@@ -586,7 +686,11 @@ async fn sweep_imported_sapling_leg(
             ),
             None,
         );
-        register_imported_accounts(&mut wallet_db, keys, &birthday)?
+        unique_registered_accounts(register_imported_accounts(&mut wallet_db, keys, &birthday)?)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, account)| (index as u32, account))
+            .collect()
     };
 
     if accounts.is_empty() {
@@ -602,7 +706,7 @@ async fn sweep_imported_sapling_leg(
     // ~725 MB, and loading them per key would dominate the sweep.
     let prover = LocalTxProver::bundled();
 
-    for account in &accounts {
+    for (display_index, account) in &accounts {
         // Every account created from a Sapling key carries its key; the
         // `None` case is the transparent-anchor account, which has no
         // Sapling notes of its own to move.
@@ -659,6 +763,7 @@ async fn sweep_imported_sapling_leg(
                     )));
                 }
                 outcome.sapling_txids.push(tx.txid().to_string());
+                outcome.sapling_display_indices.push(*display_index);
                 // Counted only once broadcast: a transaction the node
                 // rejected paid nothing.
                 outcome.sapling_fee_zatoshis = crate::service::checked_fee_total(
@@ -684,9 +789,105 @@ async fn sweep_imported_sapling_leg(
     Ok(())
 }
 
+/// A wallet file may contain repeated records for one Sapling key. Registration
+/// reuses its UUID; the executor must visit that UUID only once.
+fn unique_registered_accounts(
+    accounts: Vec<crate::imported::ImportedWalletAccount>,
+) -> ZeckResult<Vec<crate::imported::ImportedWalletAccount>> {
+    let mut seen = std::collections::HashMap::new();
+    let mut unique = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let identity = account
+            .sapling_extsk
+            .as_ref()
+            .map(|key| key.to_diversifiable_full_viewing_key().to_bytes());
+        if let Some(previous) = seen.get(&account.wallet_account_id) {
+            if previous != &identity {
+                return Err(ZeckError::Wallet(
+                    "one registered Sapling account has conflicting key identities".to_owned(),
+                ));
+            }
+            continue;
+        }
+        seen.insert(account.wallet_account_id, identity);
+        unique.push(account);
+    }
+    Ok(unique)
+}
+
 #[cfg(test)]
 mod fee_cap_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn filtered_transparent_only_route_skips_sapling_registration_and_reaches_t_key() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let runtime = crate::models::RuntimeScanConfig {
+            key_source: std::sync::Arc::new(crate::key_source::ImportedKeySource::new(
+                argos_wallet_import::ImportedKeys::default(),
+            )),
+            birthday: 419_200,
+            num_accounts: Some(1),
+            gap_limit: 1,
+            transparent_scan: None,
+            lightwalletd_url: "http://127.0.0.1:1".to_owned(),
+            data_dir: tempdir.path().to_owned(),
+            network: crate::models::ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        let (outcome, result) = sweep_imported_filtered_wallet(
+            &runtime,
+            &argos_wallet_import::ImportedKeys::default(),
+            &[],
+            &[0],
+            Some(5),
+            "unused-destination",
+            Some(1),
+        )
+        .await;
+        let error = result.expect_err("the missing transparent key should be detected");
+        assert!(
+            error.to_string().contains("standalone transparent key 0"),
+            "{error}"
+        );
+        assert!(outcome.sapling_leg_completed);
+        assert!(outcome.sapling_txids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtered_sapling_leg_uses_the_scan_key_index_before_any_network_call() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let runtime = crate::models::RuntimeScanConfig {
+            key_source: std::sync::Arc::new(crate::key_source::ImportedKeySource::new(
+                argos_wallet_import::ImportedKeys::default(),
+            )),
+            birthday: 419_200,
+            num_accounts: Some(1),
+            gap_limit: 1,
+            transparent_scan: None,
+            lightwalletd_url: "http://127.0.0.1:1".to_owned(),
+            data_dir: tempdir.path().to_owned(),
+            network: crate::models::ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        let (outcome, result) = sweep_imported_filtered_wallet(
+            &runtime,
+            &argos_wallet_import::ImportedKeys::default(),
+            &[(7, AccountUuid::default(), 3)],
+            &[],
+            None,
+            "unused-destination",
+            None,
+        )
+        .await;
+        let error = result.expect_err("the scan's key index must resolve to a real key");
+        assert!(
+            error.to_string().contains("standalone Sapling key 3"),
+            "{error}"
+        );
+        assert_eq!(outcome.sapling_empty_display_index, Some(7));
+        assert!(outcome.sapling_txids.is_empty());
+    }
 
     /// `--max-fee` must reach the imported-Sapling leg.
     ///
@@ -801,6 +1002,24 @@ mod fee_cap_tests {
             enforce_sapling_fee_floor(Some(crate::service::MIN_SHIELDED_SEND_FEE_ZATOSHIS - 1)),
             Err(ZeckError::MaxFeeExceeded(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod registered_account_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_registered_sapling_uuid_is_swept_once() {
+        let extsk = || sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let make_account = || crate::imported::ImportedWalletAccount {
+            wallet_account_id: AccountUuid::default(),
+            sapling_extsk: Some(extsk()),
+            transparent_addresses: Vec::new(),
+        };
+        let unique = super::unique_registered_accounts(vec![make_account(), make_account()])
+            .expect("the same key may appear in more than one wallet record");
+        assert_eq!(unique.len(), 1);
     }
 }
 

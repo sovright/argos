@@ -22,7 +22,7 @@ use sapling_crypto as sapling;
 use tonic::transport::Channel;
 use tracing::warn;
 use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, GetAddressUtxosArg,
+    compact_tx_streamer_client::CompactTxStreamerClient, GetAddressUtxosArg, GetAddressUtxosReply,
 };
 use zcash_protocol::value::Zatoshis;
 use zcash_transparent::{
@@ -115,59 +115,92 @@ pub async fn fetch_transparent_utxos(
                 continue;
             };
 
-            // A negative value is a misbehaving server. Coercing it to
-            // zero would hide that; skipping it loudly does not.
-            let value = match u64::try_from(entry.value_zat)
-                .ok()
-                .and_then(|v| Zatoshis::from_u64(v).ok())
-            {
-                Some(v) => v,
-                None => {
-                    warn!(
-                        "lightwalletd returned out-of-range value_zat={} for {}; skipping",
-                        entry.value_zat, entry.address
-                    );
-                    continue;
-                }
-            };
-
-            let txid: [u8; 32] = match entry.txid.as_slice().try_into() {
-                Ok(t) => t,
-                Err(_) => {
-                    warn!(
-                        "lightwalletd returned a {}-byte txid for {}; skipping",
-                        entry.txid.len(),
-                        entry.address
-                    );
-                    continue;
-                }
-            };
-            let index = match u32::try_from(entry.index) {
-                Ok(i) => i,
-                Err(_) => {
-                    warn!(
-                        "lightwalletd returned a negative output index for {}; skipping",
-                        entry.address
-                    );
-                    continue;
-                }
-            };
-
-            // Derive the scriptPubKey from the address we already hold
-            // rather than adopting `entry.script` from the server. They
-            // should agree, but only one of them is something we can
-            // verify — and a script we accept unchecked is a script we
-            // would later sign against.
-            utxos.push(TransparentUtxo {
-                outpoint: OutPoint::new(txid, index),
-                txout: TxOut::new(value, address.script().into()),
-                address,
-                height: entry.height,
-            });
+            if let Some(utxo) = parse_reported_utxo(entry, address)? {
+                utxos.push(utxo);
+            }
         }
     }
 
-    Ok(utxos)
+    deduplicate_fetched_utxos(utxos)
+}
+
+/// Validate a server-reported coin against the address we control. A
+/// nonempty script is part of the server's outpoint claim, so a mismatch is
+/// an integrity failure even if another reply for that outpoint is valid.
+fn parse_reported_utxo(
+    entry: GetAddressUtxosReply,
+    address: TransparentAddress,
+) -> ZeckResult<Option<TransparentUtxo>> {
+    let value = match u64::try_from(entry.value_zat)
+        .ok()
+        .and_then(|v| Zatoshis::from_u64(v).ok())
+    {
+        Some(v) => v,
+        None => {
+            warn!(
+                "lightwalletd returned out-of-range value_zat={} for {}; skipping",
+                entry.value_zat, entry.address
+            );
+            return Ok(None);
+        }
+    };
+    let txid: [u8; 32] = match entry.txid.as_slice().try_into() {
+        Ok(txid) => txid,
+        Err(_) => {
+            warn!(
+                "lightwalletd returned a {}-byte txid for {}; skipping",
+                entry.txid.len(),
+                entry.address
+            );
+            return Ok(None);
+        }
+    };
+    let index = match u32::try_from(entry.index) {
+        Ok(index) => index,
+        Err(_) => {
+            warn!(
+                "lightwalletd returned a negative output index for {}; skipping",
+                entry.address
+            );
+            return Ok(None);
+        }
+    };
+
+    let expected_script: zcash_transparent::address::Script = address.script().into();
+    if !entry.script.is_empty() && entry.script != expected_script.0 .0 {
+        return Err(ZeckError::Wallet(format!(
+            "lightwalletd reported a conflicting script for transparent outpoint {:?}",
+            OutPoint::new(txid, index)
+        )));
+    }
+    Ok(Some(TransparentUtxo {
+        outpoint: OutPoint::new(txid, index),
+        txout: TxOut::new(value, expected_script),
+        address,
+        height: entry.height,
+    }))
+}
+
+/// Treat an outpoint as one coin even when a server repeats it in a batch.
+/// Conflicting replies cannot establish a trustworthy amount or owner.
+fn deduplicate_fetched_utxos(utxos: Vec<TransparentUtxo>) -> ZeckResult<Vec<TransparentUtxo>> {
+    let mut by_outpoint = std::collections::HashMap::<OutPoint, usize>::new();
+    let mut unique: Vec<TransparentUtxo> = Vec::with_capacity(utxos.len());
+    for utxo in utxos {
+        if let Some(&previous_index) = by_outpoint.get(&utxo.outpoint) {
+            let previous = &unique[previous_index];
+            if previous.address != utxo.address || previous.txout != utxo.txout {
+                return Err(ZeckError::Wallet(format!(
+                    "conflicting lightwalletd records for transparent outpoint {:?}",
+                    utxo.outpoint
+                )));
+            }
+            continue;
+        }
+        by_outpoint.insert(utxo.outpoint.clone(), unique.len());
+        unique.push(utxo);
+    }
+    Ok(unique)
 }
 
 /// Summarize a UTXO set into a per-address report.
@@ -180,8 +213,12 @@ pub fn summarize(
     let mut sums: std::collections::HashMap<TransparentAddress, (u64, u32)> =
         std::collections::HashMap::new();
     let mut total = 0u64;
+    let mut seen_outpoints = std::collections::HashSet::new();
 
     for utxo in utxos {
+        if !seen_outpoints.insert(&utxo.outpoint) {
+            continue;
+        }
         let value = u64::from(utxo.txout.value());
         let entry = sums.entry(utxo.address).or_insert((0, 0));
         entry.0 = entry.0.saturating_add(value);
@@ -301,6 +338,18 @@ pub fn plan_sweep<P: zcash_protocol::consensus::Parameters>(
 ) -> ZeckResult<Option<TransparentSweepPlan>> {
     if utxos.is_empty() {
         return Ok(None);
+    }
+
+    // The builder consumes the exact slice being priced. Even an identical
+    // duplicate would create two inputs for one coin; reject before proving.
+    let mut seen_outpoints = std::collections::HashSet::new();
+    for utxo in utxos {
+        if !seen_outpoints.insert(&utxo.outpoint) {
+            return Err(ZeckError::Wallet(format!(
+                "duplicate transparent outpoint {:?} in sweep inputs",
+                utxo.outpoint
+            )));
+        }
     }
 
     let total: u64 = utxos.iter().fold(0u64, |acc, u| {
@@ -687,6 +736,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn same_outpoint_and_value_with_conflicting_reported_script_is_rejected() {
+        let address = addr(1);
+        let expected_script: zcash_transparent::address::Script = address.script().into();
+        let entry = zcash_client_backend::proto::service::GetAddressUtxosReply {
+            address: encode_transparent_address(&address, ZeckNetwork::Mainnet),
+            txid: vec![0xAA; 32],
+            index: 0,
+            script: expected_script.0 .0.clone(),
+            value_zat: 100_000,
+            height: 100,
+        };
+        let first = super::parse_reported_utxo(entry.clone(), address)
+            .expect("matching script")
+            .expect("valid UTXO");
+        let mut conflicting = entry;
+        conflicting.script[0] ^= 1;
+        let error = super::parse_reported_utxo(conflicting, address)
+            .expect_err("the same outpoint cannot claim a different script");
+        assert!(error.to_string().contains("script"), "{error}");
+        assert_eq!(first.outpoint, OutPoint::new([0xAA; 32], 0));
+    }
+
+    #[test]
     fn balances_are_summed_per_address_not_per_utxo() {
         // The bug this guards against is reporting a wallet's largest
         // single UTXO as its balance, which understates recoverable funds.
@@ -697,6 +769,16 @@ mod tests {
         assert_eq!(report.funded.len(), 1, "one address, not one row per UTXO");
         assert_eq!(report.funded[0].zatoshis, 350);
         assert_eq!(report.funded[0].utxo_count, 2);
+    }
+
+    #[test]
+    fn repeated_outpoint_is_counted_only_once() {
+        // A lightwalletd batch can repeat the same outpoint. It is still one
+        // spendable coin, and quoting it twice would overstate recovery.
+        let coin = utxo(addr(1), 100_000, 0xAA);
+        let report = summarize(&[coin.clone(), coin], 1, 500, ZeckNetwork::Mainnet);
+        assert_eq!(report.total_zatoshis, 100_000);
+        assert_eq!(report.funded[0].utxo_count, 1);
     }
 
     #[test]
@@ -773,6 +855,15 @@ mod sweep_tests {
             plan.total_input_zatoshis,
             "inputs must equal fee plus output, with nothing unaccounted for"
         );
+    }
+
+    #[test]
+    fn conflicting_duplicate_outpoint_cannot_be_planned() {
+        let first = utxo(addr(1), 500_000, 0xAA);
+        let conflict = utxo(addr(2), 700_000, 0xAA);
+        let error = plan_sweep(&MAIN_NETWORK, height(), &[first, conflict])
+            .expect_err("one outpoint cannot have two owners or amounts");
+        assert!(error.to_string().contains("outpoint"), "{error}");
     }
 
     #[test]

@@ -105,4 +105,10 @@ pub enum ZeckError {
 
     #[error("wallet import failed: {0}")]
     Import(String),
+
+    /// The wallet-file parser's own error, kept typed so a caller can tell
+    /// a locked wallet (`ImportError::WrongPassphrase`) from damage or a
+    /// network mismatch without comparing message text.
+    #[error("wallet import failed: {0}")]
+    WalletFile(argos_wallet_import::ImportError),
 }

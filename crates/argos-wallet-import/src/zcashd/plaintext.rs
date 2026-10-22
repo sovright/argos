@@ -4,7 +4,11 @@ use secrecy::Secret;
 
 use crate::{
     error::ImportDiagnostic,
-    keys::{ImportedKeys, Provenance, SaplingKey, SproutKey, TransparentKey},
+    identity,
+    keys::{
+        merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
+        SaplingKey, SproutKey, TransparentKey,
+    },
     zcashd::{
         metadata::{is_metadata_record, KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
@@ -27,7 +31,6 @@ const IGNORED: &[&str] = &[
     "minversion",
     "mnemonichdchain",
     "name",
-    "networkinfo",
     "orchard_note_commitment_tree",
     "orderposnext",
     "pool",
@@ -41,6 +44,28 @@ fn read_length_prefixed(value: &[u8]) -> Option<&[u8]> {
     let (len, consumed) = compact_size(value)?;
     let end = consumed.checked_add(usize::try_from(len).ok()?)?;
     value.get(consumed..end)
+}
+
+fn networkinfo(value: &[u8]) -> Option<EmbeddedNetwork> {
+    let (package_len, package_prefix) = compact_size(value)?;
+    let package_end = package_prefix.checked_add(usize::try_from(package_len).ok()?)?;
+    let package = std::str::from_utf8(value.get(package_prefix..package_end)?).ok()?;
+    if package.is_empty() {
+        return None;
+    }
+    let rest = value.get(package_end..)?;
+    let (network_len, network_prefix) = compact_size(rest)?;
+    let network_end = network_prefix.checked_add(usize::try_from(network_len).ok()?)?;
+    if network_end != rest.len() {
+        return None;
+    }
+    let name = std::str::from_utf8(rest.get(network_prefix..network_end)?).ok()?;
+    match name {
+        "main" | "mainnet" => Some(EmbeddedNetwork::Mainnet),
+        "test" | "testnet" => Some(EmbeddedNetwork::Testnet),
+        "regtest" => Some(EmbeddedNetwork::Regtest),
+        _ => None,
+    }
 }
 
 /// Validate that a `key` record's DER blob has the exact header zcashd's
@@ -94,6 +119,10 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
         };
 
         match rec.record_type.as_str() {
+            "networkinfo" => match networkinfo(value) {
+                Some(network) => merge_embedded_network(out, network),
+                None => unrecognized_network(out, "zcashd", "invalid networkinfo value"),
+            },
             "zkey" => {
                 let addr: Option<[u8; 64]> = rec.rest.get(..64).and_then(|s| s.try_into().ok());
                 // Verified against the golden fixtures: the value is the bare
@@ -103,13 +132,24 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
                 let a_sk: Option<[u8; 32]> = value.get(..32).and_then(|s| s.try_into().ok());
 
                 match (addr, a_sk) {
-                    (Some(address), Some(a_sk)) => out.sprout.push(SproutKey {
-                        a_sk: Secret::new(a_sk),
-                        address,
-                        // zcashd Sprout keys were never HD-derived.
-                        provenance: Provenance::Standalone,
-                        created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
-                    }),
+                    (Some(address), Some(a_sk))
+                        if identity::sprout_address_from_spending_key(&a_sk) == address =>
+                    {
+                        out.sprout.push(SproutKey {
+                            a_sk: Secret::new(a_sk),
+                            address,
+                            // zcashd Sprout keys were never HD-derived.
+                            provenance: Provenance::Standalone,
+                            created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
+                        })
+                    }
+                    (Some(_), Some(_)) => {
+                        out.diagnostics
+                            .push(ImportDiagnostic::PublicIdentifierMismatch {
+                                record_type: "zkey".to_owned(),
+                                identifier: "payment address",
+                            })
+                    }
                     _ => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                         record_type: "zkey".to_owned(),
                         reason: "address or spending key has the wrong length".to_owned(),
@@ -121,7 +161,7 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
             // parent_fvk_tag(4) + child_index(4) + chain_code(32) +
             // expsk(96) + dk(32). The key remainder is the 32-byte IVK.
             "sapzkey" => match value.get(..169) {
-                Some(extsk) => {
+                Some(extsk) if identity::sapling_matches_ivk(extsk, &rec.rest) => {
                     out.sapling.push(SaplingKey {
                         extsk: Secret::new(extsk.to_vec()),
                         provenance: Provenance::Standalone,
@@ -129,6 +169,12 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
                     });
                     recovered.sapling.insert(rec.rest);
                 }
+                Some(_) => out
+                    .diagnostics
+                    .push(ImportDiagnostic::PublicIdentifierMismatch {
+                        record_type: "sapzkey".to_owned(),
+                        identifier: "incoming viewing key",
+                    }),
                 None => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                     record_type: "sapzkey".to_owned(),
                     reason: "extended spending key is truncated".to_owned(),
@@ -148,7 +194,11 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
                 // of the long form zcashd always emits.
                 match read_length_prefixed(value).and_then(secret_from_key_der) {
                     Some(s) => match <[u8; 32]>::try_from(s) {
-                        Ok(secret) => {
+                        Ok(secret)
+                            if read_length_prefixed(&rec.rest).is_some_and(|pubkey| {
+                                identity::transparent_matches_pubkey(&secret, pubkey)
+                            }) =>
+                        {
                             out.transparent.push(TransparentKey {
                                 secret: Secret::new(secret),
                                 provenance: Provenance::HdDerived,
@@ -157,6 +207,12 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
                             });
                             recovered.transparent.insert(rec.rest);
                         }
+                        Ok(_) => out
+                            .diagnostics
+                            .push(ImportDiagnostic::PublicIdentifierMismatch {
+                                record_type: "key".to_owned(),
+                                identifier: "public key",
+                            }),
                         Err(_) => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                             record_type: "key".to_owned(),
                             reason: "secret is not 32 bytes".to_owned(),
@@ -198,12 +254,83 @@ mod tests {
         (k, value.to_vec())
     }
 
+    fn network_value(package: &str, network: &str) -> Vec<u8> {
+        let mut value = vec![package.len() as u8];
+        value.extend_from_slice(package.as_bytes());
+        value.push(network.len() as u8);
+        value.extend_from_slice(network.as_bytes());
+        value
+    }
+
+    #[test]
+    fn networkinfo_recognizes_exact_network_aliases() {
+        for (name, expected) in [
+            ("main", crate::keys::EmbeddedNetwork::Mainnet),
+            ("mainnet", crate::keys::EmbeddedNetwork::Mainnet),
+            ("test", crate::keys::EmbeddedNetwork::Testnet),
+            ("testnet", crate::keys::EmbeddedNetwork::Testnet),
+            ("regtest", crate::keys::EmbeddedNetwork::Regtest),
+        ] {
+            let mut out = ImportedKeys::default();
+            collect_plaintext(
+                &[record("networkinfo", &[], &network_value("zcashd", name))],
+                &mut out,
+            );
+            assert_eq!(out.embedded_network, Some(expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn networkinfo_malformed_and_conflicting_records_never_claim_a_match() {
+        for bad in [vec![3, b'a'], network_value("zcashd", "mainish")] {
+            let mut out = ImportedKeys::default();
+            collect_plaintext(&[record("networkinfo", &[], &bad)], &mut out);
+            assert_eq!(out.embedded_network, None);
+            assert!(out
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, ImportDiagnostic::UnrecognizedNetworkMetadata { .. })));
+        }
+        let main = record("networkinfo", &[], &network_value("zcashd", "main"));
+        let test = record("networkinfo", &[], &network_value("zcashd", "test"));
+        let mut matching = ImportedKeys::default();
+        collect_plaintext(&[main.clone(), main.clone()], &mut matching);
+        assert_eq!(
+            matching.embedded_network,
+            Some(crate::keys::EmbeddedNetwork::Mainnet)
+        );
+        let mut conflict = ImportedKeys::default();
+        collect_plaintext(&[main, test], &mut conflict);
+        assert_eq!(conflict.embedded_network, None);
+        assert!(conflict
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, ImportDiagnostic::ConflictingNetworkMetadata { .. })));
+    }
+
+    fn genuine_sprout_pair() -> ([u8; 64], [u8; 32]) {
+        let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
+        pairs
+            .into_iter()
+            .find_map(|(raw_key, value)| {
+                let rec = parse_record_key(&raw_key)?;
+                if rec.record_type != "zkey" {
+                    return None;
+                }
+                Some((
+                    rec.rest.get(..64)?.try_into().ok()?,
+                    value.get(..32)?.try_into().ok()?,
+                ))
+            })
+            .unwrap()
+    }
+
     #[test]
     fn extracts_a_sprout_spending_key() {
-        let addr = [0xAB; 64];
+        let (addr, value) = genuine_sprout_pair();
         // The value is the bare 32-byte a_sk with no CompactSize prefix —
         // confirmed against the golden fixtures.
-        let value = [0xCD; 32];
         let pairs = vec![record("zkey", &addr, &value)];
 
         let mut out = ImportedKeys::default();
@@ -212,7 +339,7 @@ mod tests {
         assert_eq!(out.sprout.len(), 1);
         let k = &out.sprout[0];
         assert_eq!(k.address, addr);
-        assert_eq!(k.a_sk.expose_secret(), &[0xCD; 32]);
+        assert_eq!(k.a_sk.expose_secret(), &value);
     }
 
     fn metadata(time: i64) -> Vec<u8> {
@@ -228,13 +355,18 @@ mod tests {
     /// time plus one diagnostic — while every key is still recovered.
     #[test]
     fn creation_times_attach_to_their_own_keys() {
-        let (known, unknown, damaged) = ([0x01; 64], [0x02; 64], [0x03; 64]);
+        // Each address is derived from its key, so the identity check that
+        // refuses a key filed under someone else's address lets all three in.
+        let (known_sk, unknown_sk, damaged_sk) = ([0x01; 32], [0x02; 32], [0x03; 32]);
+        let known = identity::sprout_address_from_spending_key(&known_sk);
+        let unknown = identity::sprout_address_from_spending_key(&unknown_sk);
+        let damaged = identity::sprout_address_from_spending_key(&damaged_sk);
         let mut truncated = metadata(1_700_000_300);
         truncated.truncate(10);
         let pairs = vec![
-            record("zkey", &known, &[0xA1; 32]),
-            record("zkey", &unknown, &[0xA2; 32]),
-            record("zkey", &damaged, &[0xA3; 32]),
+            record("zkey", &known, &known_sk),
+            record("zkey", &unknown, &unknown_sk),
+            record("zkey", &damaged, &damaged_sk),
             record("zkeymeta", &known, &metadata(1_700_000_100)),
             // What `z_importkey` writes for a key of unknown age.
             record("zkeymeta", &unknown, &metadata(1)),
@@ -270,8 +402,7 @@ mod tests {
     #[test]
     fn a_malformed_record_does_not_silence_a_good_one() {
         // This is the governing principle: partial recovery.
-        let addr = [0x11; 64];
-        let good = [0x22; 32];
+        let (addr, good) = genuine_sprout_pair();
 
         let pairs = vec![
             record("zkey", &[0x99; 3], &[0x00]), // too-short address
@@ -354,7 +485,7 @@ mod tests {
     #[test]
     fn extracts_sprout_keys_from_the_golden_fixture() {
         let bytes = std::fs::read("tests/fixtures/sprout-plaintext.dat").unwrap();
-        let pairs = crate::bdb::walk(&bytes).unwrap();
+        let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let mut out = ImportedKeys::default();
         collect_plaintext(&pairs, &mut out);
         assert!(
