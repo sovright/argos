@@ -10,7 +10,7 @@ use std::{
 use crate::reviewed_intent::{
     CheckpointReservation, ReviewedIntentStore, ReviewedSproutSweep, ScanMaterial,
     SproutIntentSource, SproutProposalId, SproutScanHandle, SproutScanProgressEvent,
-    SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData,
+    SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData, WalletCheckpointAuthority,
 };
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
@@ -486,7 +486,7 @@ fn compute_sprout_summary(
     // stored address must not be counted, shown, or spent with.
     let forged = argos_core::sprout_recovery::reject_forged_sprout_keys(keys);
 
-    let recovered = recover_with_scan(app, keys, network, data_dir);
+    let recovered = recover_for_wallet_open(app, keys, network, data_dir);
     let journal_result = if keys.sprout.is_empty() {
         Ok(argos_core::sprout_sweep::SproutJournalSnapshot::default())
     } else {
@@ -1229,6 +1229,13 @@ fn empty_sprout_proposal_error(
     ))
 }
 
+fn with_chain_notice(message: impl Into<String>, notice: Option<&str>) -> String {
+    match notice {
+        Some(notice) if !notice.is_empty() => format!("{}. {notice}", message.into()),
+        _ => message.into(),
+    }
+}
+
 /// Strict: an unknown network name is refused, never defaulted, on the
 /// paths that bind a scan or a sweep to a chain. [`network_from`] is the
 /// lenient form, built on this one.
@@ -1254,9 +1261,11 @@ pub async fn propose_wallet_sprout_sweep(
     confirmation_sources: Option<Vec<String>>,
     network: String,
     data_dir: Option<String>,
+    peers: Vec<String>,
 ) -> Result<ReviewedSproutSweep, String> {
     ensure_tos_accepted(&app)?;
     let network = sprout_network(&network)?;
+    let peers = parse_custom_peers(&peers)?;
     let confirmation_sources = parse_gui_confirmation_sources(
         &lightwalletd_url,
         confirmation_sources.as_deref().unwrap_or(&[]),
@@ -1266,17 +1275,22 @@ pub async fn propose_wallet_sprout_sweep(
     validate_sweep_request(&destination, network, &lightwalletd_url)?;
     let bytes = argos_core::wallet_file::read_wallet_file(&path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
-    let (keys, recovered, forged_warnings) =
+    let (keys, forged_warnings) =
         import_gui_wallet_then(&bytes, passphrase.as_ref(), network, |mut keys| {
             // As inspect does: a forged key is dropped and named in the
             // review, and the genuine keys' notes are still swept. A forged
             // key controls no note of its own, and the commitment check
             // stops it spending anyone else's.
             let forged_warnings = drop_and_warn_forged_sprout_keys(&app, &mut keys);
-            let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref());
-            (keys, recovered, forged_warnings)
+            (keys, forged_warnings)
         })
         .map_err(|err| err.to_string())?;
+    let recovered = recover_with_scan(&app, &keys, network, data_dir.as_deref(), &peers).await;
+    let wallet_checkpoint = WalletCheckpointAuthority {
+        data_dir: resolve_data_dir(&app, data_dir.as_deref())?,
+        keys: wallet_sprout_keys(&keys),
+        peers,
+    };
     let journal =
         with_resolved_sprout_data_dir(resolve_data_dir(&app, data_dir.as_deref()), |dir| {
             Ok(argos_core::sprout_sweep::SweepJournal::for_keys(
@@ -1292,27 +1306,36 @@ pub async fn propose_wallet_sprout_sweep(
         .collect::<Vec<_>>();
     let snapshot = journal
         .load_scoped_snapshot(&outpoints)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| with_chain_notice(err.to_string(), recovered.chain_notice.as_deref()))?;
     let inventory = argos_core::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);
-    let plan = sprout_sweep_preview(&recovered.notes, &snapshot)?;
+    let plan = sprout_sweep_preview(&recovered.notes, &snapshot)
+        .map_err(|err| with_chain_notice(err, recovered.chain_notice.as_deref()))?;
     let plan_empty = plan.notes == 0 && plan.active.is_empty() && plan.mined.is_empty();
     if let Some(message) = empty_sprout_proposal_error(
         SproutProposalOrigin::Wallet,
         plan_empty,
         snapshot.entries().map(|entry| entry.state),
     ) {
-        return Err(message);
+        return Err(with_chain_notice(
+            message,
+            recovered.chain_notice.as_deref(),
+        ));
     }
     if plan_empty {
-        return Err(if recovered.nothing_left_to_sweep(&inventory) {
-            "nothing is left to sweep: the wallet file or scan shows its Sprout notes spent or below the fee".into()
+        let message: &str = if recovered.nothing_left_to_sweep(&inventory) {
+            "nothing is left to sweep: the wallet file or scan shows its Sprout notes spent or below the fee"
         } else {
-            "no spendable Sprout notes could be recovered from this wallet file".into()
-        });
+            "no spendable Sprout notes could be recovered from this wallet file"
+        };
+        return Err(with_chain_notice(
+            message,
+            recovered.chain_notice.as_deref(),
+        ));
     }
     // The reviewed notes, with their keys, are held in the proposal (see
     // `reviewed_intent`'s key-retention note), so execution never re-reads
     // the file and no file identity needs recording.
+    let scan_warning = recovered.chain_notice.clone();
     let mut review = state.reviewed_intent.insert_proposal(
         SproutSweepIntent {
             source: SproutIntentSource::Wallet,
@@ -1322,11 +1345,15 @@ pub async fn propose_wallet_sprout_sweep(
             lightwalletd_url,
             confirmation_sources,
             journal,
+            wallet_checkpoint: Some(wallet_checkpoint),
             tip_warning: None,
         },
         plan,
     )?;
     review.warnings = forged_warnings;
+    if let Some(warning) = scan_warning {
+        review.warnings.insert(0, warning);
+    }
     Ok(review)
 }
 
@@ -1334,6 +1361,37 @@ async fn execute_reviewed_sprout_sweep(
     app: AppHandle,
     intent: SproutSweepIntent,
 ) -> Result<SproutSweepReport, String> {
+    let mut fresh_checkpoint_warning = None;
+    if let Some(authority) = &intent.wallet_checkpoint {
+        let (chain, notice) = argos_core::sprout_scan_run::chain_spends_for_wallet(
+            &authority.data_dir,
+            intent.network.into(),
+            &authority.keys,
+            &authority.peers,
+        )
+        .await;
+        if let Some(chain) = chain {
+            for note in &intent.notes {
+                let nullifier = argos_core::sprout::prf_nf(&note.a_sk, &note.note.rho);
+                if chain.nullifiers.contains_key(&nullifier) {
+                    let txid = note
+                        .outpoint
+                        .txid
+                        .iter()
+                        .rev()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+                    return Err(format!(
+                        "a reviewed Sprout note was spent in the canonical chain before execution ({}:{}:{}); review the wallet again",
+                        txid,
+                        note.outpoint.js_index,
+                        note.outpoint.output_index
+                    ));
+                }
+            }
+        }
+        fresh_checkpoint_warning = notice;
+    }
     let source = match &intent.source {
         SproutIntentSource::Wallet => argos_core::sprout_sweep::NoteSource::WalletFile,
         SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
@@ -1358,6 +1416,9 @@ async fn execute_reviewed_sprout_sweep(
     .map_err(|err| err.to_string())?;
 
     apply_sprout_tip_warning(&mut outcome, intent.tip_warning);
+    if let Some(warning) = fresh_checkpoint_warning {
+        outcome.warnings.push(warning);
+    }
     Ok(sprout_sweep_report(outcome))
 }
 
@@ -2050,6 +2111,7 @@ pub async fn propose_sprout_scan_sweep(
             lightwalletd_url: material.lightwalletd_url,
             confirmation_sources: material.confirmation_sources,
             journal,
+            wallet_checkpoint: None,
             tip_warning,
         },
         plan,
@@ -2122,7 +2184,7 @@ fn import_gui_wallet_then<T>(
 /// from this app is found without asking. The scan is optional: without one,
 /// or with one that cannot be used, the file's own record stands, and the
 /// reason is logged rather than failing the wallet screen.
-fn recover_with_scan(
+fn recover_for_wallet_open(
     app: &AppHandle,
     keys: &argos_core::argos_wallet_import::ImportedKeys,
     network: argos_core::ZeckNetwork,
@@ -2132,12 +2194,39 @@ fn recover_with_scan(
     let dir = resolve_data_dir(app, data_dir).ok();
     // The lookup's notice is shown on the wallet screen, not logged: a scan
     // that exists but cannot be used must not look like no scan at all.
-    let (chain, notice) = match &dir {
-        Some(dir) => argos_core::sprout_scan_run::chain_spends_for_wallet(
+    let notice = match &dir {
+        Some(dir) => argos_core::sprout_scan_run::wallet_scan_notice_offline(
             dir,
             network.into(),
             &spending_keys,
         ),
+        None => None,
+    };
+    let mut recovered =
+        argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(keys, None);
+    recovered.chain_notice = notice;
+    recovered
+}
+
+async fn recover_with_scan(
+    app: &AppHandle,
+    keys: &argos_core::argos_wallet_import::ImportedKeys,
+    network: argos_core::ZeckNetwork,
+    data_dir: Option<&str>,
+    peers: &[String],
+) -> argos_core::sprout_recovery::SproutRecovery {
+    let spending_keys = wallet_sprout_keys(keys);
+    let dir = resolve_data_dir(app, data_dir).ok();
+    let (chain, notice) = match &dir {
+        Some(dir) => {
+            argos_core::sprout_scan_run::chain_spends_for_wallet(
+                dir,
+                network.into(),
+                &spending_keys,
+                peers,
+            )
+            .await
+        }
         None => (None, None),
     };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
@@ -3747,6 +3836,7 @@ mod tests {
                         lightwalletd_url: "https://node".into(),
                         confirmation_sources: Vec::new(),
                         journal: test_sprout_journal(10),
+                        wallet_checkpoint: None,
                         tip_warning: None,
                     },
                     SproutSweepPreviewData {

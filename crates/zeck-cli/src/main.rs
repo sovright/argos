@@ -428,6 +428,11 @@ enum Commands {
         /// Confirm you understand this is irreversible and broadcast.
         #[arg(long)]
         confirm_sweep: bool,
+
+        /// A Zcash node, as `host:port`, used to verify a saved full-block
+        /// scan before its spend evidence is trusted. Repeatable.
+        #[arg(long)]
+        peer: Vec<String>,
     },
 }
 
@@ -951,6 +956,7 @@ async fn sweep_sprout(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     data_dir: &Path,
+    peers: &[String],
     lightwalletd_url: &str,
     confirmation_source: &[String],
     destination: &str,
@@ -962,7 +968,7 @@ async fn sweep_sprout(
         dry_run,
         confirm_sweep,
     } = gate;
-    let recovered = recover_with_scan(keys, network, data_dir);
+    let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Verify(peers)).await;
     let spending_keys = wallet_sprout_keys(keys);
     let journal =
         argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
@@ -1532,17 +1538,37 @@ fn print_sprout_accounting(
 /// same keys — if one has run in this data directory — settle every spend it
 /// saw on chain. The scan is optional; a checkpoint that cannot be used is
 /// reported and the file's own record stands.
-fn recover_with_scan(
+enum ScanEvidence<'a> {
+    Offline,
+    Verify(&'a [String]),
+}
+
+async fn recover_with_scan(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     data_dir: &Path,
+    evidence: ScanEvidence<'_>,
 ) -> argos_core::sprout_recovery::SproutRecovery {
     let spending_keys = wallet_sprout_keys(keys);
-    let (chain, notice) = argos_core::sprout_scan_run::chain_spends_for_wallet(
-        data_dir,
-        network.into(),
-        &spending_keys,
-    );
+    let (chain, notice) = match evidence {
+        ScanEvidence::Offline => (
+            None,
+            argos_core::sprout_scan_run::wallet_scan_notice_offline(
+                data_dir,
+                network.into(),
+                &spending_keys,
+            ),
+        ),
+        ScanEvidence::Verify(peers) => {
+            argos_core::sprout_scan_run::chain_spends_for_wallet(
+                data_dir,
+                network.into(),
+                &spending_keys,
+                peers,
+            )
+            .await
+        }
+    };
     let mut recovered = argos_core::sprout_recovery::recover_spendable_sprout_notes_with_chain(
         keys,
         chain.as_deref(),
@@ -1962,7 +1988,7 @@ fn print_sprout_next_steps() {
     );
 }
 
-fn print_sprout_inspection(
+async fn print_sprout_inspection(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     show_spent: bool,
@@ -1990,7 +2016,7 @@ fn print_sprout_inspection(
         // witness. A wallet with both needs no network at all; a wallet
         // with neither needs the full-block scan, which is a different
         // proposition entirely and is quoted as such.
-        let recovered = recover_with_scan(keys, network, data_dir);
+        let recovered = recover_with_scan(keys, network, data_dir, ScanEvidence::Offline).await;
         let spending_keys = wallet_sprout_keys(keys);
         let journal =
             argos_core::sprout_sweep::SweepJournal::for_keys(data_dir, &spending_keys, network);
@@ -2105,7 +2131,7 @@ fn print_sprout_inspection(
 /// This is the only useful thing it can do with a zcashd `wallet.dat`
 /// today, so it must be honest about the difference between "found a
 /// key" and "can move the funds".
-fn print_wallet_inspection(
+async fn print_wallet_inspection(
     keys: &ImportedKeys,
     network: ZeckNetwork,
     show_spent: bool,
@@ -2173,7 +2199,7 @@ fn print_wallet_inspection(
     // The Sprout address list and spendability verdict live in a helper to
     // keep this function to one screen; the key/note counts above come from
     // the parser, and this adds what the recovery path can say about them.
-    print_sprout_inspection(keys, network, show_spent, data_dir);
+    print_sprout_inspection(keys, network, show_spent, data_dir).await;
 
     // Never summarize diagnostics away: unrecovered material may still
     // exist in the original file. A locked HD key is different because
@@ -2739,7 +2765,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::InspectWallet { show_spent } => {
             let source = imported.expect("--wallet-file is required and was checked above");
-            print_wallet_inspection(source.keys(), network, show_spent, &cli.data_dir);
+            print_wallet_inspection(source.keys(), network, show_spent, &cli.data_dir).await;
         }
 
         // Dispatched above, before key-source resolution, so that it never
@@ -2754,6 +2780,7 @@ async fn main() -> Result<()> {
             sprout_params,
             dry_run,
             confirm_sweep,
+            peer,
         } => {
             let source = imported.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -2765,6 +2792,7 @@ async fn main() -> Result<()> {
                 source.keys(),
                 network,
                 &cli.data_dir,
+                &peer,
                 &cli.lightwalletd_url,
                 &cli.confirmation_source,
                 &destination,

@@ -119,9 +119,16 @@ pub struct SproutSweepIntent {
     pub lightwalletd_url: String,
     pub confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     pub journal: SweepJournal,
+    pub wallet_checkpoint: Option<WalletCheckpointAuthority>,
     /// Set when the catch-up scan behind a scan-derived proposal could not
     /// confirm the chain tip; it leads the sweep report's warnings.
     pub tip_warning: Option<String>,
+}
+
+pub struct WalletCheckpointAuthority {
+    pub data_dir: PathBuf,
+    pub keys: Vec<[u8; 32]>,
+    pub peers: Vec<String>,
 }
 
 pub struct ScanMaterial {
@@ -594,6 +601,7 @@ mod tests {
                     lightwalletd_url: endpoint,
                     confirmation_sources: Vec::new(),
                     journal: journal(1),
+                    wallet_checkpoint: None,
                     tip_warning: None,
                 },
                 SproutSweepPreviewData {
@@ -671,6 +679,7 @@ mod tests {
                     lightwalletd_url: "https://node-a".into(),
                     confirmation_sources: Vec::new(),
                     journal: journal(2),
+                    wallet_checkpoint: None,
                     tip_warning: None,
                 },
                 SproutSweepPreviewData {
@@ -730,6 +739,7 @@ mod tests {
                     lightwalletd_url: "https://node".into(),
                     confirmation_sources: Vec::new(),
                     journal: journal(3),
+                    wallet_checkpoint: None,
                     tip_warning: None,
                 },
                 SproutSweepPreviewData {

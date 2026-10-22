@@ -429,6 +429,7 @@ function walletSproutExecutionConfig() {
     lightwalletdUrl: $("lightwalletd-url").value.trim(),
     confirmationSources: confirmationSourcesFromForm(),
     dataDir: $("data-dir").value.trim() || null,
+    peers: sproutScanPeerEntries(),
   };
 }
 
@@ -770,6 +771,7 @@ async function showSproutSweep() {
       // Where the scan panel keeps its checkpoint: a scan of these keys
       // settles spends the wallet file cannot see.
       dataDir: previewConfig.dataDir,
+      peers: previewConfig.peers,
     });
 
     if (walletFile !== source || generation !== walletSproutProposalGeneration ||
@@ -1604,12 +1606,16 @@ function sproutScanKeys() {
 // those come back as the backend's own, more specific error.
 const MAX_CUSTOM_PEERS = 8;
 
-function sproutScanPeers() {
+function sproutScanPeerEntries() {
   const entries = $("sprout-scan-peers").value
     .split(/[\n,]/)
     .map((p) => p.trim().toLowerCase())
     .filter(Boolean);
-  const peers = [...new Set(entries)];
+  return [...new Set(entries)];
+}
+
+function sproutScanPeers() {
+  const peers = sproutScanPeerEntries();
   for (const peer of peers) {
     const match = /^(\[[0-9a-f:.]+\]|[a-z0-9._-]+):(\d+)$/.exec(peer);
     const port = match ? Number(match[2]) : 0;
@@ -1875,11 +1881,11 @@ for (const id of ["sprout-scan-keys", "sprout-scan-peers", "network-select",
   $(id)?.addEventListener("input", invalidateSproutScanSource);
   $(id)?.addEventListener("change", invalidateSproutScanSource);
 }
-for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset"]) {
+for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset", "sprout-scan-peers"]) {
   $(id)?.addEventListener("input", invalidateWalletSproutReview);
   $(id)?.addEventListener("change", invalidateWalletSproutReview);
 }
-for (const id of ["lightwalletd-url", "confirmation-sources"]) {
+for (const id of ["lightwalletd-url", "confirmation-sources", "sprout-scan-peers"]) {
   $(id)?.addEventListener("change", () => {
     if (typeof showSproutSweep === "function") void showSproutSweep();
   });

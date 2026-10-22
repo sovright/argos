@@ -84,6 +84,8 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     fmt: (value) => String(value),
     confirmationSourcesFromForm: () => $("confirmation-sources").value
       .split("\n").map((line) => line.trim()).filter(Boolean),
+    sproutScanPeerEntries: () => [],
+    sproutScanPeers: () => [],
     setStatus: (id, text) => {
       if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
       $(id).textContent = text;
@@ -339,7 +341,7 @@ test("first wallet open displays its Sprout preview without a null-path error", 
   assert.deepEqual(h.previews, [{
     path: "/fixture/first.dat", passphrase: null, destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
-    network: "mainnet", dataDir: null,
+    network: "mainnet", dataDir: null, peers: [],
   }]);
   assert.equal(h.$("wallet-sprout-sweep").hidden, false);
   assert.match(h.$("sprout-sweep-plan").textContent, /90000 to your address/);
@@ -354,7 +356,7 @@ test("opening another wallet previews the new path and passphrase", async () => 
   assert.deepEqual(h.previews.at(-1), {
     path: "/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
-    network: "mainnet", dataDir: null,
+    network: "mainnet", dataDir: null, peers: [],
   });
   assert.equal(h.$("sprout-sweep-status").textContent, "");
 });
