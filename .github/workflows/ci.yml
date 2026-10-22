@@ -69,70 +69,82 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
 
       - name: cargo check (workspace)
         run: cargo check --workspace --target ${{ matrix.target }}
 
       - name: private filesystem tests (x64)
+        id: windows_private_fs
         if: matrix.label == 'x64'
         shell: pwsh
         run: |
-          $exact = (Resolve-Path scripts/run-exact-cargo-test.ps1).Path
+          $collect = (Resolve-Path scripts/collect-exact-cargo-test.ps1).Path
+          $failures = [System.Collections.Generic.List[string]]::new()
           cargo test -p argos-core private_fs --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $exact -Package argos-core -TestName private_fs::tests::windows_workspace_cleanup_uses_retained_directory_handles
-          & $exact -Package argos-core -TestName private_fs::tests::retained_sqlite_authority_can_enumerate_sync_and_delete_its_workspace
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_reused_permissive_objects_fail_closed_without_repair
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_owner_verifier_rejects_a_foreign_owner_sid
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_foreign_owner_verification_never_repairs_the_dacl
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_reuse_refuses_permissive_file_with_security_only_handle
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_relative_reuse_refuses_permissive_child_with_security_only_handle
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_authority_reads_and_retains_reject_permissive_sensitive_children
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_authority_reads_refuse_preheld_data_handles
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_checkpoint_generation_refuses_a_permissive_dacl
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_private_directory_authority_retains_no_delete_share
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_sqlite_preflight_refuses_a_preheld_data_handle
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_existing_private_root_reserves_pending_before_a_second_leaf
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_lineage_mutex_uses_global_private_hashed_name
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_reused_read_append_keeps_exclusive_handle_through_write
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_recursive_cleanup_refuses_permissive_nested_child
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_reuse_refuses_permissive_directory_with_security_only_handle
-          & $exact -Package argos-core -TestName sprout_scan_run::tests::checkpoint_lease_serializes_replacement_and_cleanup_authority
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_namespace_append_create_and_reuse_keep_retained_identity
-          & $exact -Package argos-core -TestName private_fs::windows_tests::windows_relative_primitives_never_touch_a_recreated_ancestor_tree
-          & $exact -Package argos-core -TestName private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse
-          & $exact -Package argos-core -TestName sprout_sweep_journal::tests::windows_journal_authority_denies_sidecar_replacement_and_second_writer
-          & $exact -Package argos-core -TestName service::network_namespace_tests::retained_registry_handles_deny_parent_and_sidecar_replacement
-          & $exact -Package argos-core -TestName sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle
-          & $exact -Package argos-core -TestName workspace::tests::append_private_file_writes_whole_terminated_lines
-          & $exact -Package argos-core -TestName workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader
-          & $exact -Package argos-core -TestName workspace::tests::runtime_read_only_connection_preserves_private_wal_sidecars
-          & $exact -Package argos-core -TestName workspace::tests::busy_wallet_rebuild_times_out_without_changing_the_live_database
-          & $exact -Package argos-core -TestName workspace::tests::listing_wallet_connection_is_immutable_and_query_only
-          & $exact -Package argos-core -TestName workspace::tests::listing_reads_an_initialized_trusted_workspace_without_mutation
-          & $exact -Package argos-core -TestName workspace::tests::private_workspace_file_authority_publishes_inside_verified_workspace
-          & $exact -Package argos-core -TestName scan::tests::cancel_resume::gap_extension_rebuilds_a_scanned_wallet_instead_of_importing_into_it
-          & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::restart_restores_tombstone_and_a_new_scan_may_delete_it
-          & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing
-          & $exact -Package argos-core -TestName service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation
-          & $exact -Package argos-core -TestName sprout_sweep_journal::tests::separate_connection_lock_blocks_load_and_append
-          & $exact -Package argos-core -TestName birthday::tests::probe_guard_retires_active_authority_before_removing_container
-          & $exact -Package argos-core -TestName birthday::tests::probe_guard_cleans_active_authority_during_unwind
-          & $exact -Package argos-core -TestName birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_marker_before_secret
-          & $exact -Package argos-core -TestName birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_secret_write
-          & $exact -Package argos-core -TestName birthday::tests::stale_probe_scan_skips_registered_live_probe
-          & $exact -Package argos-gui -TestName commands::tests::windows_write_private_report_creates_private_and_refuses_untrusted_reuse
-          & $exact -Package argos-gui -TestName commands::tests::fresh_gui_workspace_is_authenticated_before_sprout_work_starts
-          & $exact -Package argos-gui -TestName commands::tests::legacy_gui_default_selects_versioned_directory_and_keeps_legacy_rows_visible
-          & $exact -Package argos-gui -TestName commands::tests::execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent
-          & $exact -Package argos-gui -TestName commands::tests::the_sweep_step_runs_only_after_verification_passes
+          "exact_tests_started=true" >> $env:GITHUB_OUTPUT
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::tests::windows_workspace_cleanup_uses_retained_directory_handles
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::tests::retained_sqlite_authority_can_enumerate_sync_and_delete_its_workspace
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_reused_permissive_objects_fail_closed_without_repair
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_owner_verifier_rejects_a_foreign_owner_sid
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_foreign_owner_verification_never_repairs_the_dacl
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_reuse_refuses_permissive_file_with_security_only_handle
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_relative_reuse_refuses_permissive_child_with_security_only_handle
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_authority_reads_and_retains_reject_permissive_sensitive_children
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_authority_reads_refuse_preheld_data_handles
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_checkpoint_generation_refuses_a_permissive_dacl
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_private_directory_authority_retains_no_delete_share
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_sqlite_preflight_refuses_a_preheld_data_handle
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_existing_private_root_reserves_pending_before_a_second_leaf
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_lineage_mutex_uses_global_private_hashed_name
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_reused_read_append_keeps_exclusive_handle_through_write
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_recursive_cleanup_refuses_permissive_nested_child
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_reuse_refuses_permissive_directory_with_security_only_handle
+          & $collect -Failures $failures -Package argos-core -TestName sprout_scan_run::tests::checkpoint_lease_serializes_replacement_and_cleanup_authority
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_namespace_child_operations_stay_rooted_during_ancestor_rename_attempts
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_namespace_append_create_and_reuse_keep_retained_identity
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::windows_tests::windows_relative_primitives_never_touch_a_recreated_ancestor_tree
+          & $collect -Failures $failures -Package argos-core -TestName private_fs::tests::checkpoint_retirement_restores_after_restart_and_retires_before_reuse
+          & $collect -Failures $failures -Package argos-core -TestName sprout_sweep_journal::tests::windows_journal_authority_denies_sidecar_replacement_and_second_writer
+          & $collect -Failures $failures -Package argos-core -TestName service::network_namespace_tests::retained_registry_handles_deny_parent_and_sidecar_replacement
+          & $collect -Failures $failures -Package argos-core -TestName sprout_scan_run::tests::windows_checkpoint_reads_refuse_a_preheld_data_handle
+          & $collect -Failures $failures -Package argos-core -TestName workspace::tests::append_private_file_writes_whole_terminated_lines
+          & $collect -Failures $failures -Package argos-core -TestName workspace::tests::tuned_wallet_connections_allow_a_concurrent_reader
+          & $collect -Failures $failures -Package argos-core -TestName workspace::tests::runtime_read_only_connection_preserves_private_wal_sidecars
+          & $collect -Failures $failures -Package argos-core -TestName workspace::tests::busy_wallet_rebuild_times_out_without_changing_the_live_database
+          & $collect -Failures $failures -Package argos-core -TestName workspace::tests::listing_wallet_connection_is_immutable_and_query_only
+          & $collect -Failures $failures -Package argos-core -TestName workspace::tests::listing_reads_an_initialized_trusted_workspace_without_mutation
+          & $collect -Failures $failures -Package argos-core -TestName workspace::tests::private_workspace_file_authority_publishes_inside_verified_workspace
+          & $collect -Failures $failures -Package argos-core -TestName scan::tests::cancel_resume::gap_extension_rebuilds_a_scanned_wallet_instead_of_importing_into_it
+          & $collect -Failures $failures -Package argos-core -TestName service::propose_workspace_guard_tests::restart_restores_tombstone_and_a_new_scan_may_delete_it
+          & $collect -Failures $failures -Package argos-core -TestName service::propose_workspace_guard_tests::retry_rechecks_surviving_tombstone_journal_before_removing
+          & $collect -Failures $failures -Package argos-core -TestName service::propose_workspace_guard_tests::windows_old_dpapi_cleanup_marker_replay_is_rejected_after_new_generation
+          & $collect -Failures $failures -Package argos-core -TestName sprout_sweep_journal::tests::separate_connection_lock_blocks_load_and_append
+          & $collect -Failures $failures -Package argos-core -TestName birthday::tests::probe_guard_retires_active_authority_before_removing_container
+          & $collect -Failures $failures -Package argos-core -TestName birthday::tests::probe_guard_cleans_active_authority_during_unwind
+          & $collect -Failures $failures -Package argos-core -TestName birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_marker_before_secret
+          & $collect -Failures $failures -Package argos-core -TestName birthday::tests::authenticated_stale_probe_cleanup_recovers_crash_after_secret_write
+          & $collect -Failures $failures -Package argos-core -TestName birthday::tests::stale_probe_scan_skips_registered_live_probe
+          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::windows_write_private_report_creates_private_and_refuses_untrusted_reuse
+          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::fresh_gui_workspace_is_authenticated_before_sprout_work_starts
+          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::legacy_gui_default_selects_versioned_directory_and_keeps_legacy_rows_visible
+          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent
+          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::the_sweep_step_runs_only_after_verification_passes
+
+          if ($failures.Count -gt 0) {
+            throw ("{0} exact Cargo test(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
+          }
 
       - name: private artifact authority and sweep safety tests (x64)
-        if: matrix.label == 'x64'
+        # A named-test failure must not hide the other diagnostic stage. Setup
+        # or module failures still stop immediately, without repeated builds.
+        if: ${{ matrix.label == 'x64' && !cancelled() && steps.windows_private_fs.outputs.exact_tests_started == 'true' }}
         shell: pwsh
         run: |
-          $exact = (Resolve-Path scripts/run-exact-cargo-test.ps1).Path
+          $collect = (Resolve-Path scripts/collect-exact-cargo-test.ps1).Path
+          $failures = [System.Collections.Generic.List[string]]::new()
           $tests = @(
             'private_fs::tests::fresh_absent_artifact_data_dir_is_published_as_authenticated_container'
             'private_fs::tests::windows_authenticated_container_and_root_reopen_and_enumerate'
@@ -177,8 +189,10 @@ jobs:
             'service::network_namespace_tests::retained_registry_handles_deny_parent_and_sidecar_replacement'
           )
           foreach ($test in $tests) {
-            & $exact -Package argos-core -TestName $test
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $collect -Failures $failures -Package argos-core -TestName $test
+          }
+          if ($failures.Count -gt 0) {
+            throw ("{0} exact Cargo test(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
           }
 
   check-macos-private-authority:

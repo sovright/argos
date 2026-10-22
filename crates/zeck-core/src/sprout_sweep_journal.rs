@@ -3431,7 +3431,51 @@ mod tests {
 
     #[test]
     fn separate_connection_lock_blocks_load_and_append() {
-        use std::sync::mpsc;
+        use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+
+        fn refused_before_release(
+            receiver: &Receiver<Result<(), String>>,
+            operation: &str,
+        ) -> bool {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Err(RecvTimeoutError::Timeout) => false,
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("{operation} worker disconnected before reporting its result")
+                }
+                Ok(Ok(())) => panic!("{operation} bypassed the held compatibility lock"),
+                Ok(Err(error)) => {
+                    // SQLite omits FILE_SHARE_DELETE on Windows. Reopening its
+                    // compatibility file with DELETE authority must fail closed
+                    // before the operation can reach SQLite's waiting lock.
+                    assert!(
+                        cfg!(windows)
+                            && error.contains("retaining sweep journal compatibility lock")
+                            && error.contains("(os error 32)"),
+                        "{operation} returned an unexpected result while the compatibility lock was held: {error}"
+                    );
+                    true
+                }
+            }
+        }
+
+        fn finish_after_release(
+            receiver: &Receiver<Result<(), String>>,
+            refused: bool,
+            operation: &str,
+        ) {
+            if !refused {
+                let result = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|error| {
+                        panic!("{operation} worker did not finish after release: {error}")
+                    });
+                assert!(
+                    result.is_ok(),
+                    "{operation} failed after release: {result:?}"
+                );
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let journal = journal(dir.path());
         let mut initial = journal.load_or_migrate().unwrap();
@@ -3444,23 +3488,35 @@ mod tests {
         connection
             .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
             .unwrap();
+        let original = std::fs::read(journal.path()).unwrap();
         let (sender, receiver) = mpsc::channel();
         let other = SweepJournal::for_keys(
             &artifact_data_dir(dir.path()),
             &[[0x42; 32]],
             ZeckNetwork::Mainnet,
         );
-        let worker =
-            std::thread::spawn(move || sender.send(other.load_or_migrate().is_ok()).unwrap());
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(
+                    other
+                        .load_or_migrate()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+                .unwrap();
+        });
+        let refused = refused_before_release(&receiver, "load");
+        assert_eq!(std::fs::read(journal.path()).unwrap(), original);
         connection.execute_batch("COMMIT").unwrap();
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap());
+        // COMMIT releases SQLite's transaction lock; dropping the connection
+        // also releases its Windows file-sharing reservation.
+        drop(connection);
+        finish_after_release(&receiver, refused, "load");
         worker.join().unwrap();
+        assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 1);
+
         let tx = fixture_with_lock_time(1);
+        let worker_tx = tx.clone();
         let mut snapshot = journal.load_or_migrate().unwrap();
         let another_note = JournalNoteContext {
             outpoint: JsOutPoint {
@@ -3470,9 +3526,11 @@ mod tests {
             },
             value_zatoshis: 2_000_000,
         };
+        let connection = rusqlite::Connection::open(&lock_path).unwrap();
         connection
             .execute_batch("BEGIN EXCLUSIVE TRANSACTION")
             .unwrap();
+        let original = std::fs::read(journal.path()).unwrap();
         let (sender, receiver) = mpsc::channel();
         let other = SweepJournal::for_keys(
             &artifact_data_dir(dir.path()),
@@ -3484,19 +3542,24 @@ mod tests {
                 .send(
                     other
                         .scoped_store(another_note, &mut snapshot)
-                        .persist_prepared(&tx)
-                        .is_ok(),
+                        .persist_prepared(&worker_tx)
+                        .map_err(|error| error.to_string()),
                 )
                 .unwrap();
         });
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
+        let refused = refused_before_release(&receiver, "append");
+        assert_eq!(std::fs::read(journal.path()).unwrap(), original);
         connection.execute_batch("COMMIT").unwrap();
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap());
+        drop(connection);
+        finish_after_release(&receiver, refused, "append");
         worker.join().unwrap();
+        // Retry the exact operation after releasing both kinds of exclusion.
+        // Preparation is idempotent if the waiting worker already completed.
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        journal
+            .scoped_store(another_note, &mut snapshot)
+            .persist_prepared(&tx)
+            .unwrap();
         assert_eq!(journal.load_or_migrate().unwrap().entries().count(), 2);
     }
 
