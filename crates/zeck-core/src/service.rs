@@ -375,7 +375,9 @@ fn canonical_proposal<NoteRef: std::fmt::Debug>(
                 .txout()
                 .write(&mut identity)
                 .expect("serializing TxOut into Vec cannot fail");
-            identity.extend_from_slice(format!("{:?}", input.recipient_address()).as_bytes());
+            identity.extend_from_slice(&crate::transparent_recovery::transparent_address_identity(
+                input.recipient_address(),
+            ));
             local_inputs.push(identity);
         }
         for input in step
@@ -386,7 +388,7 @@ fn canonical_proposal<NoteRef: std::fmt::Debug>(
             local_inputs.push(canonical_shielded_note_identity(
                 input.txid().as_ref(),
                 input.output_index(),
-                &format!("{:?}", input.note().pool()),
+                shielded_pool_tag(input.note().pool()),
                 u64::from(input.note().value()),
                 input.internal_note_id(),
             ));
@@ -401,10 +403,19 @@ fn canonical_proposal<NoteRef: std::fmt::Debug>(
     bytes
 }
 
+/// A stable tag for a shielded pool in canonical identities.
+fn shielded_pool_tag(pool: ShieldedPool) -> u8 {
+    match pool {
+        ShieldedPool::Sapling => 0,
+        ShieldedPool::Orchard => 1,
+        ShieldedPool::Ironwood => 2,
+    }
+}
+
 fn canonical_shielded_note_identity<NoteRef: std::fmt::Debug>(
     txid: &[u8],
     output_index: u16,
-    pool: &str,
+    pool: u8,
     value: u64,
     local_id: &NoteRef,
 ) -> Vec<u8> {
@@ -412,9 +423,12 @@ fn canonical_shielded_note_identity<NoteRef: std::fmt::Debug>(
     identity.extend_from_slice(&(txid.len() as u64).to_le_bytes());
     identity.extend_from_slice(txid);
     identity.extend_from_slice(&output_index.to_le_bytes());
-    identity.extend_from_slice(&(pool.len() as u64).to_le_bytes());
-    identity.extend_from_slice(pool.as_bytes());
+    identity.push(pool);
     identity.extend_from_slice(&value.to_le_bytes());
+    // The wallet-local note ID (zcash_client_sqlite's ReceivedNoteId) is an
+    // opaque upstream type with no byte accessor, so its Debug text is the
+    // only available encoding. The note is already pinned by txid, output
+    // index, pool, and value above; this only binds the local row too.
     let local_id = format!("{local_id:?}");
     identity.extend_from_slice(&(local_id.len() as u64).to_le_bytes());
     identity.extend_from_slice(local_id.as_bytes());
@@ -464,9 +478,9 @@ fn canonical_transparent_input(utxo: &crate::transparent_recovery::TransparentUt
     utxo.txout
         .write(&mut bytes)
         .expect("serializing a TxOut into Vec cannot fail");
-    let address = format!("{:?}", utxo.address);
-    bytes.extend_from_slice(&(address.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(address.as_bytes());
+    bytes.extend_from_slice(&crate::transparent_recovery::transparent_address_identity(
+        &utxo.address,
+    ));
     bytes
 }
 
@@ -4418,6 +4432,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn canonical_pool_identity_is_an_explicit_tag() {
+        use zcash_protocol::ShieldedPool;
+        assert_eq!(
+            [
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood
+            ]
+            .map(super::shielded_pool_tag),
+            [0, 1, 2]
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn broadcast_pause_applies_only_inside_its_scope() {
         let start = tokio::time::Instant::now();
@@ -4765,12 +4793,10 @@ mod tests {
 
     #[test]
     fn shielded_local_id_stays_paired_with_its_chain_output() {
-        let a = super::canonical_shielded_note_identity(&[1; 32], 0, "Sapling", 50_000, &"local-a");
-        let b = super::canonical_shielded_note_identity(&[2; 32], 0, "Sapling", 50_000, &"local-b");
-        let swapped_a =
-            super::canonical_shielded_note_identity(&[1; 32], 0, "Sapling", 50_000, &"local-b");
-        let swapped_b =
-            super::canonical_shielded_note_identity(&[2; 32], 0, "Sapling", 50_000, &"local-a");
+        let a = super::canonical_shielded_note_identity(&[1; 32], 0, 0, 50_000, &"local-a");
+        let b = super::canonical_shielded_note_identity(&[2; 32], 0, 0, 50_000, &"local-b");
+        let swapped_a = super::canonical_shielded_note_identity(&[1; 32], 0, 0, 50_000, &"local-b");
+        let swapped_b = super::canonical_shielded_note_identity(&[2; 32], 0, 0, 50_000, &"local-a");
         let mut reviewed = vec![a, b];
         let mut changed = vec![swapped_a, swapped_b];
         reviewed.sort();

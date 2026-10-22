@@ -318,15 +318,27 @@ fn transparent_key_addresses(keys: &[ImportedTransparentKey], network: ZeckNetwo
     addresses
 }
 
+/// A stable byte identity for a transparent address: a kind tag (0 for
+/// P2PKH, 1 for P2SH) followed by the 20-byte hash. Unlike `Debug` text it
+/// cannot change with an upstream formatting change.
+pub(crate) fn transparent_address_identity(address: &TransparentAddress) -> [u8; 21] {
+    let (tag, hash) = match address {
+        TransparentAddress::PublicKeyHash(hash) => (0, hash),
+        TransparentAddress::ScriptHash(hash) => (1, hash),
+    };
+    let mut bytes = [0u8; 21];
+    bytes[0] = tag;
+    bytes[1..].copy_from_slice(hash);
+    bytes
+}
+
 fn transparent_input_identity(utxo: &TransparentUtxo) -> Vec<u8> {
     let mut bytes = utxo.outpoint.hash().to_vec();
     bytes.extend_from_slice(&utxo.outpoint.n().to_le_bytes());
     utxo.txout
         .write(&mut bytes)
         .expect("serializing a TxOut into Vec cannot fail");
-    let address = format!("{:?}", utxo.address);
-    bytes.extend_from_slice(&(address.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(address.as_bytes());
+    bytes.extend_from_slice(&transparent_address_identity(&utxo.address));
     bytes.extend_from_slice(&utxo.height.to_le_bytes());
     bytes
 }
@@ -1343,6 +1355,22 @@ mod sweep_tests {
 
     fn height() -> BlockHeight {
         BlockHeight::from_u32(3_000_000)
+    }
+
+    #[test]
+    fn canonical_address_identity_is_a_tagged_hash_not_debug_text() {
+        let mut p2pkh = [7u8; 21];
+        p2pkh[0] = 0;
+        let mut p2sh = [7u8; 21];
+        p2sh[0] = 1;
+        assert_eq!(
+            transparent_address_identity(&TransparentAddress::PublicKeyHash([7; 20])),
+            p2pkh
+        );
+        assert_eq!(
+            transparent_address_identity(&TransparentAddress::ScriptHash([7; 20])),
+            p2sh
+        );
     }
 
     #[test]
