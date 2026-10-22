@@ -76,6 +76,11 @@ document.addEventListener("DOMContentLoaded", () => {
     seedList.querySelectorAll("input, textarea").forEach((input) => { input.value = ""; });
   }
 
+  document.addEventListener("argos:clear-transient-secrets", () => {
+    generation++;
+    clearSecrets();
+  });
+
   function updateProfileScope() {
     const target = byId("address-search-target").value.trim();
     const transparent = !target || /^(t1|tm)/.test(target);

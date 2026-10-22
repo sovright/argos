@@ -286,6 +286,7 @@ document.querySelectorAll(".step-list li").forEach((li) => {
     const target = li.dataset.stepIndicator;
     const targetIdx = steps.indexOf(target);
     if (targetIdx <= furthestStep) {
+      if (target === "welcome") abandonRecoveryFlow();
       if (target === "config") {
         $("start-scan").disabled = false;
         setStatus("config-status", "", "");
@@ -308,6 +309,7 @@ document.querySelectorAll("[data-next]").forEach((btn) => {
 
 document.querySelectorAll("[data-prev]").forEach((btn) => {
   btn.addEventListener("click", () => {
+    if (btn.dataset.prev === "welcome") abandonRecoveryFlow();
     if (btn.dataset.prev === "seed" && state.matchedRecovery) {
       returnToAddressMatches();
       return;
@@ -422,6 +424,50 @@ let walletSproutReview = null;
 let walletSproutReviewDestination = null;
 let walletSproutReviewConfig = null;
 let walletSproutProposalGeneration = 0;
+
+// Clear plaintext authority as soon as the backend has accepted it, and from
+// every exit that abandons the current recovery attempt. The browser event
+// gives the separate address-search module the same lifecycle boundary.
+function clearTransientSecrets({ abandonWallet = false } = {}) {
+  for (const id of [
+    "seed-input", "wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys",
+    "resume-seed-input", "resume-bip39-passphrase",
+  ]) {
+    const input = $(id);
+    if (input) input.value = "";
+  }
+  for (const [toggleId, inputId] of [
+    ["seed-visibility", "seed-input"],
+    ["resume-seed-visibility", "resume-seed-input"],
+  ]) {
+    const toggle = $(toggleId);
+    const input = $(inputId);
+    if (toggle) toggle.checked = false;
+    input?.classList?.add("masked");
+  }
+  if (walletFile?.passphrase != null) walletFile.passphraseCleared = true;
+  if (walletFile) walletFile.passphrase = null;
+
+  if (!abandonWallet) return;
+  ++walletOpenGeneration;
+  walletFile = null;
+  sproutPreviewWallet = null;
+  sproutSweepSource = null;
+  invalidateWalletSproutReview();
+  invalidateSproutScanSource();
+  document.dispatchEvent(new CustomEvent("argos:clear-transient-secrets"));
+}
+
+function abandonRecoveryFlow() {
+  const handle = state.scanHandle;
+  if (handle && !state.sweepExecutionPending) {
+    invoke("cancel_scan", { handle }).catch(() => {});
+  }
+  invalidateScanAuthority();
+  ++resumeGeneration;
+  pendingResumeRow = null;
+  clearTransientSecrets({ abandonWallet: true });
+}
 
 function walletSproutExecutionConfig() {
   return {
@@ -904,6 +950,7 @@ async function runSproutSweep() {
     if (walletFile === source && walletSproutReview?.proposal_id === proposalId) {
       invalidateWalletSproutReview();
     }
+    clearTransientSecrets();
     updateWalletSproutSweepButton();
   }
 }
@@ -1758,6 +1805,7 @@ async function runSproutScan() {
       return;
     }
     sproutScanHandle = handle;
+    clearTransientSecrets();
     // A scan may finish before its listeners are installed. The snapshot
     // closes that race after both event subscriptions become active.
     const listenersReady = await sproutScanListenersReady;
@@ -1778,6 +1826,7 @@ async function runSproutScan() {
     // A failed snapshot request leaves no reliable completion channel. Release
     // local authority and let the user retry; the backend worker checkpoints.
     invalidateSproutScanSource();
+    clearTransientSecrets();
     setStatus("sprout-scan-status", `✗ ${err}`, "error");
   }
   if (generation === sproutScanGeneration && !sproutScanHandle) button.disabled = false;
@@ -1862,6 +1911,7 @@ async function runSproutScanSweep() {
     setStatus("sprout-scan-status", `${earlier ? "Earlier Sprout scan: " : ""}✗ ${err}`, "error");
   } finally {
     sproutScanExecutionPending = false;
+    clearTransientSecrets();
     if (generation === sproutScanGeneration && handle === sproutScanHandle &&
         sproutScanReview?.proposal_id === proposalId) invalidateSproutScanReview();
     updateSproutScanSweepButton();
@@ -2035,6 +2085,7 @@ $("transparent-include-change").addEventListener("change", updateTransparentScan
 updateTransparentScanSummary();
 
 window.addEventListener("beforeunload", () => {
+  abandonRecoveryFlow();
   // Backend-owned cleanup survives the webview unloading during configuration.
   const id = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
   if (id) invoke("release_address_search", { id }).catch(() => {});
@@ -2600,27 +2651,9 @@ go back and provide one.",
     if (state.retainedAddressSearchId) {
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: true } }));
     }
-    // Drop the wallet passphrase now that the backend holds the decrypted
-    // keys (threat model T-S2). Only on success: the passphrase field lives
-    // on the wallet screen, so clearing it after a failure would strand a
-    // user who retries from the config screen with no way to re-enter it.
-    if (walletFile) {
-      if (walletFile.passphrase != null) walletFile.passphraseCleared = true;
-      walletFile.passphrase = null;
-    }
-    const passphraseInput = $("wallet-passphrase");
-    if (passphraseInput) passphraseInput.value = "";
-    // The backend holds the decoded keys now; a spending key must not sit
-    // in the DOM for the lifetime of the scan→sweep→complete flow (T-S2).
-    //
-    // On the success path only, deliberately — same rule as the wallet
-    // passphrase two lines up. If starting the scan throws, the typed key
-    // stays in the textarea so the user can fix the birthday or the endpoint
-    // and retry; wiping it would strand someone whose only copy is on paper.
-    // No scan is running in that case, so nothing holds the key but this
-    // local WebView, which is already showing it.
-    const saplingBox = $("sapling-scan-keys");
-    if (saplingBox) saplingBox.value = "";
+    // The backend now owns the scan authority. Drop every transient plaintext
+    // input while retaining only the opaque backend handles needed to resume.
+    clearTransientSecrets();
     $("sapling-key-addresses").innerHTML = "";
     goTo("scan");
     await startProgressListeners(handle);
@@ -2640,12 +2673,13 @@ go back and provide one.",
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
     }
     setStatus("config-status", `✗ ${err}`, "error");
+    clearTransientSecrets();
     $("start-scan").disabled = false;
   } finally {
     // Clear the seed phrase from the DOM regardless of whether start_scan
     // succeeded; on failure the user can retype, and a successful scan no
     // longer needs the cleartext phrase visible.
-    if (generation === state.scanAuthorityGeneration) seedInput.value = "";
+    if (generation === state.scanAuthorityGeneration) clearTransientSecrets();
   }
 });
 
@@ -2906,6 +2940,7 @@ function updateScanUI(progress) {
   }
 
   const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
+  if (terminal) clearTransientSecrets();
   if (progress.phase === "cancelled" && !state.retainedAddressSearchId) {
     $("back-to-config").style.display = "";
     $("start-scan").disabled = false;
@@ -2995,6 +3030,7 @@ $("cancel-scan").addEventListener("click", async () => {
   if (!state.scanHandle) return;
   try {
     await invoke("cancel_scan", { handle: state.scanHandle });
+    clearTransientSecrets();
     $("cancel-scan").disabled = true;
     setStatus("scan-message", "Cancellation requested… waiting for the scan to stop safely.", "");
     // Refresh in case the terminal event arrived before the cancel response.
@@ -3435,6 +3471,7 @@ $("execute-sweep").addEventListener("click", async () => {
     invalidateSweepReview();
     setStatus("sweep-execute-status", `✗ Sweep failed: ${err}`, "error");
   } finally {
+    clearTransientSecrets();
     state.sweepExecutionPending = false;
   }
 });
@@ -4028,6 +4065,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
 }
 
 $("restart-flow").addEventListener("click", () => {
+  abandonRecoveryFlow();
   resetRecoveryFlowState();
   goTo("welcome");
 });
@@ -4356,8 +4394,7 @@ function closeResumeModal() {
   pendingResumeRow = null;
   $("resume-confirm").disabled = false;
   $("resume-modal").hidden = true;
-  $("resume-seed-input").value = "";
-  $("resume-bip39-passphrase").value = "";
+  clearTransientSecrets();
   $("resume-destination-input").value = "";
   $("resume-memo-input").value = "";
   $("resume-max-fee-zec").value = "";
@@ -4463,7 +4500,10 @@ $("resume-confirm").addEventListener("click", async () => {
     goTo("scan");
     await startProgressListeners(resumed.handle);
   } catch (err) {
-    if (isCurrent()) setStatus("resume-modal-status", `✗ ${err}`, "error");
+    if (isCurrent()) {
+      clearTransientSecrets();
+      setStatus("resume-modal-status", `✗ ${err}`, "error");
+    }
   } finally {
     if (isCurrent()) $("resume-confirm").disabled = false;
   }

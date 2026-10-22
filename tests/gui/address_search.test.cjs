@@ -121,6 +121,15 @@ test("submits all scope fields, clears secrets, and renders an exact match", asy
   assert.match(el("address-search-limitation").textContent, /before making any network connection/);
 });
 
+test("the shared recovery lifecycle event clears address-search candidates", async () => {
+  const { el, fireDocument } = harness(async () => null);
+  fillValidForm(el);
+  const row = el("address-search-seeds").children[0];
+  fireDocument("argos:clear-transient-secrets");
+  assert.equal(row.querySelector(".candidate-seed-words").value, "");
+  assert.equal(row.querySelector(".candidate-seed-passphrase").value, "");
+});
+
 test("recovery emits only opaque ids and public match metadata without releasing", async () => {
   const calls = [];
   const { el, dispatched } = harness(async (command) => {

@@ -80,7 +80,8 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   let failStatus = false;
   const context = vm.createContext({
     listen: async (name, callback) => { assert.equal(name, "sprout-sweep-progress"); onProgress = callback; },
-    $, document: { createElement: element },
+    $, document: { createElement: element, dispatchEvent() {} },
+    CustomEvent: class { constructor(type) { this.type = type; } },
     fmt: (value) => String(value),
     confirmationSourcesFromForm: () => $("confirmation-sources").value
       .split("\n").map((line) => line.trim()).filter(Boolean),
@@ -185,6 +186,9 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       $("wallet-passphrase").value = passphrase;
       await vm.runInContext("openWalletFile()", context);
       await flush();
+    },
+    abandonWallet() {
+      vm.runInContext("clearTransientSecrets({ abandonWallet: true })", context);
     },
   };
 }
@@ -550,6 +554,29 @@ function deferred() {
   return { promise, resolve, reject };
 }
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+test("late wallet reply cannot restore cleared secret state", async () => {
+  const inspection = deferred();
+  const h = harness(async (command, _args, fallback) => {
+    if (command === "inspect_wallet_file") {
+      await inspection.promise;
+      return fallback();
+    }
+    return fallback();
+  });
+  const opening = h.open("/fixture/wallet.dat", "synthetic-passphrase");
+  await flush();
+  h.abandonWallet();
+  inspection.resolve();
+  await opening;
+  await flush();
+  assert.equal(h.peek("walletFile"), null);
+  assert.equal(h.peek("sproutPreviewWallet"), null);
+  assert.equal(h.peek("walletSproutReview"), null);
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.$("wallet-next").disabled, true);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+});
 
 for (const fails of [false, true]) {
   test(`older wallet inspection ${fails ? "failure" : "success"} cannot replace a newer selection`, async () => {

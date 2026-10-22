@@ -70,6 +70,7 @@ function harness(
     goTo: () => {},
     renderCompleteScreen: (...args) => completed.push(args),
     cleanupListeners: () => {}, eta: { reset() {} },
+    clearTransientSecrets() {},
   });
   vm.runInContext(source.slice(start, end), context);
   return {
@@ -351,6 +352,7 @@ function flowHarness() {
     updateTransparentScanSummary() {}, clearMatchedRecoveryUi() {},
     goTo() {}, updateScanUI(progress) { state.lastProgress = progress; },
     notifyScanComplete() {},
+    clearTransientSecrets() {}, abandonRecoveryFlow() {},
   });
   context.walletOpenGeneration = 0;
   context.sproutPreviewWallet = { path: "/old/wallet.dat" };
