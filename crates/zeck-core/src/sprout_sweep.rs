@@ -80,6 +80,40 @@ const MAINNET_NU7_TIMELINE: &str =
 
 const TESTNET_NU7_SCHEDULE: &str = "The testnet NU7 activation height is 4,465,026.";
 
+/// Testnet NU7 activation height (ZIP 259). The pinned `zcash_protocol`
+/// carries it only behind `zcash_unstable = "nu7"`, so it is stated here.
+const TESTNET_NU7_ACTIVATION_HEIGHT: u32 = 4_465_026;
+
+/// The height at which NU7 activates on `network`, when one is assigned.
+///
+/// Mainnet has no assigned height yet (see [`MAINNET_NU7_SCHEDULE`]), so it
+/// has no hard guard: the warnings carry the deadline instead. A local
+/// regtest chain under the dev-only `argos-network` feature never activates
+/// NU7.
+pub fn nu7_activation_height(network: crate::ZeckNetwork) -> Option<u32> {
+    #[cfg(feature = "argos-network")]
+    if crate::workspace::regtest_consensus_params_installed() {
+        return None;
+    }
+    match network {
+        crate::ZeckNetwork::Mainnet => None,
+        crate::ZeckNetwork::Testnet => Some(TESTNET_NU7_ACTIVATION_HEIGHT),
+    }
+}
+
+/// `1234567` as `1,234,567`.
+fn group_thousands(value: u32) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
 /// The NU7 spending deadline, shared by every Sprout recovery interface.
 ///
 /// This is guidance, not a consensus activation check.
@@ -1613,6 +1647,23 @@ pub(crate) async fn run_sweep(
             ));
             break;
         };
+        // A Sprout spend is a version 4 transaction, and NU7 disables
+        // version 4 outright. A transaction built for a block at or past
+        // activation can never be mined, so refuse before a proving run.
+        if let Some(activation) = nu7_activation_height(network) {
+            if tip.saturating_add(1) >= activation {
+                outcome.error = Some(format!(
+                    "the next block ({}) is at or past NU7 activation at height {} on {}. NU7 \
+                     disables version 4 transactions, the only format that can spend Sprout, \
+                     so Sprout funds cannot move after activation. Nothing was built or sent \
+                     for {label}.",
+                    group_thousands(tip.saturating_add(1)),
+                    group_thousands(activation),
+                    network.label(),
+                ));
+                break;
+            }
+        }
         let branch_id = branch_id_for_height(network, tip);
         let expiry = BlockHeight::from_u32(tip + EXPIRY_DELTA);
 
@@ -4013,5 +4064,71 @@ mod tests {
                 .state,
             crate::broadcast::TxLifecycleState::Mined
         );
+    }
+
+    fn run_on_testnet_at(tip: u32, id: u8) -> (SproutSweepOutcome, usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::sprout_sweep_journal::SweepJournal::for_keys(
+            dir.path(),
+            &[[0x42; 32]],
+            crate::ZeckNetwork::Testnet,
+        );
+        let notes = [lifecycle_note(1_000_000, id)];
+        let mut node = LifecycleNode::accepted(tip, 1);
+        let mut observer = LifecycleObserver::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut builds = 0;
+        let outcome = runtime.block_on(run_sweep(
+            &notes,
+            &mut node,
+            &mut observer,
+            crate::ZeckNetwork::Testnet,
+            |note: &SpendableSproutNote, expiry: BlockHeight, _| {
+                builds += 1;
+                let tx = fixture_transaction(1200 + id as u32, expiry.into());
+                Ok(BuiltSproutSweep {
+                    txid: tx.txid.to_string(),
+                    raw: tx.raw_tx,
+                    value_swept: note.note.value - SPROUT_SWEEP_FEE,
+                })
+            },
+            NoteSource::WalletFile,
+            &journal,
+            |_| {},
+        ));
+        let sent = node.sent.len();
+        (outcome, builds, sent)
+    }
+
+    #[test]
+    fn no_sprout_transaction_is_built_for_a_block_at_or_past_nu7() {
+        let activation = nu7_activation_height(crate::ZeckNetwork::Testnet).unwrap();
+        assert_eq!(activation, 4_465_026);
+        assert!(TESTNET_NU7_SCHEDULE.contains(&group_thousands(activation)));
+        assert_eq!(nu7_activation_height(crate::ZeckNetwork::Mainnet), None);
+
+        // The next block is the last before activation: still buildable.
+        let (outcome, builds, sent) = run_on_testnet_at(activation - 2, 111);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!((builds, sent), (1, 1));
+
+        // The next block is the activation block: refused before proving.
+        for (offset, tip) in [activation - 1, activation, activation + 1000]
+            .into_iter()
+            .enumerate()
+        {
+            let (outcome, builds, sent) = run_on_testnet_at(tip, 112 + offset as u8);
+            assert_eq!((builds, sent), (0, 0), "tip {tip}");
+            let error = outcome.error.expect("NU7 refusal");
+            assert!(error.contains("NU7"), "{error}");
+            assert!(
+                error.contains("4,465,026") || error.contains("4465026"),
+                "{error}"
+            );
+            assert!(error.contains("cannot"), "{error}");
+        }
     }
 }
