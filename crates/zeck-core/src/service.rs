@@ -7642,7 +7642,13 @@ mod propose_workspace_guard_tests {
     #[tokio::test]
     async fn legacy_default_selects_fresh_versioned_directory_for_start_scan() {
         let tempdir = tempfile::tempdir().unwrap();
-        let legacy = tempdir.path().join("workspace");
+        // Windows tempfile directories can inherit an administrator owner.
+        // Create the fixture's publication parent with current-user authority;
+        // keep both candidate data directories separate from that parent.
+        let publication = tempdir.path().join("publication");
+        crate::private_fs::create_private_dir_all(&publication).unwrap();
+        let legacy = publication.join("workspace");
+        let versioned = publication.join("workspace-v2");
         let old_wallet =
             legacy.join("mainnet/workspace-deadbeefdeadbeefdeadbeefdeadbeef/birthday-1528061/auto-gap-20/wallet.sqlite");
         std::fs::create_dir_all(old_wallet.parent().unwrap()).unwrap();
@@ -7652,10 +7658,12 @@ mod propose_workspace_guard_tests {
             std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         std::fs::write(&old_wallet, b"v1.5.3 wallet evidence").unwrap();
-        let selected =
-            super::default_recovery_data_dir(&legacy, &tempdir.path().join("workspace-v2"))
-                .unwrap();
-        assert_eq!(selected, tempdir.path().join("workspace-v2"));
+        assert!(
+            !versioned.exists(),
+            "the fresh data directory starts absent"
+        );
+        let selected = super::default_recovery_data_dir(&legacy, &versioned).unwrap();
+        assert_eq!(selected, versioned);
         assert!(
             !selected.exists(),
             "default selection itself must be read-only"

@@ -1736,8 +1736,8 @@ pub(crate) struct RetainedWorkspaceDirectory {
 }
 
 /// Exact authority for removing a throwaway shielded-probe workspace. The
-/// registry remains Active until the exact private root has been removed and
-/// its publication parent synced; only then is the per-probe authority retired.
+/// registry remains Pending or Active until the exact private root has been
+/// removed and its publication parent synced; only then is its authority retired.
 #[derive(Debug)]
 pub(crate) struct EphemeralProbeCleanup {
     publication_parent: File,
@@ -4450,8 +4450,9 @@ impl EphemeralProbeRegistration {
         let file = open_child_file_for_lock(&parent, &path)?;
         let id = private_object_id(&file)?;
         lock_exclusive(&file)?;
+        let registration = Self { file, id, path };
         sync_private_directory(&parent)?;
-        Ok(Self { file, id, path })
+        Ok(registration)
     }
 
     fn verify(&self, private_root: &Path) -> io::Result<()> {
@@ -4461,6 +4462,28 @@ impl EphemeralProbeRegistration {
             return Err(invalid_lineage("ephemeral probe live registration changed"));
         }
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EphemeralProbeRegistration {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::{Storage::FileSystem::UnlockFileEx, System::IO::OVERLAPPED};
+
+        // Pair lock_exclusive's exact range before closing this synchronous
+        // handle. File drop still closes it if explicit unlock fails, and its
+        // no-delete-sharing protection remains in force until that close.
+        let mut overlapped = OVERLAPPED::default();
+        let _ = unsafe {
+            UnlockFileEx(
+                self.file.as_raw_handle(),
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
     }
 }
 
@@ -4632,8 +4655,9 @@ pub(crate) fn begin_ephemeral_probe_cleanup(
         &namespace_parent.join(".argos-ephemeral-probe-cleanup.lock"),
     )?;
     let retained_leaf = retain_private_workspace_for_cleanup(&namespace, leaf, database)?;
-    let binding =
-        inspect_private_workspace_cleanup_binding(private_root, &retained_leaf, database)?;
+    // A probe may fail before SQLite activation. Its authenticated preparation
+    // marker still binds the exact objects and generation of that Pending root.
+    let binding = inspect_prepared_ephemeral_probe_binding(private_root, &retained_leaf, database)?;
 
     let publication_parent_path = private_root.parent().ok_or_else(|| {
         io::Error::new(
@@ -4705,7 +4729,7 @@ impl EphemeralProbeCleanup {
         )?;
 
         #[cfg(windows)]
-        let (context_hash, _lineage_guard) = verify_active_ephemeral_probe_authority(
+        let (context_hash, _lineage_guard) = verify_ephemeral_probe_cleanup_authority(
             &self.private_root,
             &self.database,
             &self.binding,
@@ -4776,39 +4800,7 @@ fn read_ephemeral_probe_cleanup_marker(
 }
 
 #[cfg(windows)]
-fn verify_active_ephemeral_probe_authority(
-    private_root: &Path,
-    database: &Path,
-    binding: &PrivateWorkspaceCleanupBinding,
-) -> io::Result<([u8; 32], windows_acl::LineageMutex)> {
-    let context = sqlite_lineage_context_paths(private_root, database)?;
-    let context_hash = windows_lineage::context_hash(&context);
-    let guard = windows_lineage::lock(&context_hash)?;
-    let authority = windows_lineage::read_authority(&context_hash)?
-        .ok_or_else(|| invalid_lineage("ephemeral probe Windows lineage authority is missing"))?;
-    let anchor_id = binding
-        .anchor_id
-        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no anchor"))?;
-    let generation = binding
-        .generation
-        .ok_or_else(|| invalid_lineage("ephemeral probe binding has no generation"))?;
-    require_windows_authority_header(&authority, &context_hash, &anchor_id)?;
-    match authority.state {
-        WindowsLineageState::Active {
-            generation: current,
-            objects,
-        } if current == generation && objects == windows_objects_from_cleanup_binding(binding) => {}
-        _ => {
-            return Err(invalid_lineage(
-                "ephemeral probe cleanup requires the exact Active authority",
-            ));
-        }
-    }
-    Ok((context_hash, guard))
-}
-
-#[cfg(windows)]
-fn verify_stale_ephemeral_probe_authority(
+fn verify_ephemeral_probe_cleanup_authority(
     private_root: &Path,
     database: &Path,
     binding: &PrivateWorkspaceCleanupBinding,
@@ -4835,7 +4827,7 @@ fn verify_stale_ephemeral_probe_authority(
         } if current == generation && objects == windows_objects_from_cleanup_binding(binding) => {}
         _ => {
             return Err(invalid_lineage(
-                "stale ephemeral probe marker does not match Pending or Active authority",
+                "ephemeral probe marker does not match Pending or Active authority",
             ));
         }
     }
@@ -4854,7 +4846,7 @@ fn remove_ephemeral_probe_cleanup_marker(
         ));
     }
     remove_open_child_file(publication_parent, marker_path, marker, marker_id)?;
-    publication_parent.sync_all()
+    sync_private_directory(publication_parent)
 }
 
 /// Resume an authenticated ephemeral-probe cleanup marker left by a crash.
@@ -4882,7 +4874,7 @@ pub(crate) fn cleanup_stale_ephemeral_probe_marker(marker_path: &Path) -> io::Re
 
     #[cfg(windows)]
     let (context_hash, _lineage_guard, retire_authority) = if root_exists {
-        let (context_hash, guard) = verify_stale_ephemeral_probe_authority(
+        let (context_hash, guard) = verify_ephemeral_probe_cleanup_authority(
             &record.private_root,
             &record.database,
             &record.binding,
@@ -8149,15 +8141,119 @@ mod windows_acl {
     }
 
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let mut encoded = OsStr::new(path).encode_wide().collect::<Vec<_>>();
+        use std::path::{Component, Prefix};
+
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
         if encoded.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "private path contains a NUL character",
             ));
         }
-        encoded.push(0);
-        Ok(encoded)
+        // Explicit verbatim/NT/device paths already select their namespace.
+        // Keep their separators and dot components exactly as supplied.
+        let explicit_namespace = encoded.starts_with(&[92, 92, 63, 92])
+            || encoded.starts_with(&[92, 63, 63, 92])
+            || matches!(path.components().next(), Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::DeviceNS(_)));
+        if explicit_namespace {
+            encoded.push(0);
+            return Ok(encoded);
+        }
+
+        // On Windows absolute uses GetFullPathNameW: normalize relative,
+        // drive-relative, rooted and slash/dot components before opting out of
+        // Win32 parsing. It does not access the filesystem or follow reparse
+        // points. All pinned-parent, no-reparse, identity and DACL checks remain
+        // at their existing call sites. Never canonicalize a creation target.
+        let absolute = std::path::absolute(path)?;
+        encoded = absolute.as_os_str().encode_wide().collect();
+        let prefix = match absolute.components().next() {
+            Some(Component::Prefix(prefix)) => prefix.kind(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private path did not resolve to an absolute Windows path",
+                ));
+            }
+        };
+        let mut extended = match prefix {
+            Prefix::Disk(_) => r"\\?\".encode_utf16().collect::<Vec<_>>(),
+            Prefix::UNC(_, _) => {
+                // GetFullPathNameW has normalized both leading separators.
+                encoded.drain(..2);
+                r"\\?\UNC\".encode_utf16().collect()
+            }
+            // GetFullPathNameW can resolve a DOS device name to \\.\NAME.
+            Prefix::DeviceNS(_)
+            | Prefix::Verbatim(_)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::VerbatimUNC(_, _) => Vec::new(),
+        };
+        extended.extend_from_slice(&encoded);
+        extended.push(0);
+        Ok(extended)
+    }
+
+    #[cfg(test)]
+    mod path_tests {
+        use super::*;
+
+        #[test]
+        fn windows_native_paths_normalize_disk_unc_and_preserve_explicit_namespaces() {
+            for (input, expected) in [
+                (r"C:\argos\missing\..\wallet", r"\\?\C:\argos\wallet"),
+                (
+                    r"\\server\share\missing\..\wallet",
+                    r"\\?\UNC\server\share\wallet",
+                ),
+                (r"\\?\C:\argos\..\wallet", r"\\?\C:\argos\..\wallet"),
+                (
+                    r"\\?\UNC\server\share\..\wallet",
+                    r"\\?\UNC\server\share\..\wallet",
+                ),
+                (r"\\.\pipe\argos", r"\\.\pipe\argos"),
+                (r"\??\C:\argos\wallet", r"\??\C:\argos\wallet"),
+            ] {
+                let actual = wide(Path::new(input)).unwrap();
+                let expected = expected.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{input}");
+            }
+        }
+
+        #[test]
+        fn windows_native_relative_paths_keep_win32_resolution_and_reject_nuls() {
+            // Windows defines the current-drive/current-directory semantics.
+            // Compare the normalized name to that OS contract after stripping
+            // only our extended prefix; never resolve filesystem identities.
+            let current = std::env::current_dir().unwrap();
+            let drive = match current.components().next().unwrap() {
+                std::path::Component::Prefix(prefix) => match prefix.kind() {
+                    std::path::Prefix::Disk(drive) | std::path::Prefix::VerbatimDisk(drive) => {
+                        drive
+                    }
+                    _ => panic!("the native test runner requires a drive current directory"),
+                },
+                _ => panic!("the native test runner requires a drive current directory"),
+            };
+            let drive_relative = format!("{}:argos-relative-child", char::from(drive));
+            for input in [
+                r".\argos-relative-child",
+                r"\argos-rooted-child",
+                &drive_relative,
+            ] {
+                let expected = std::path::absolute(input).unwrap();
+                let actual = wide(Path::new(input)).unwrap();
+                let actual = std::ffi::OsString::from_wide(&actual[..actual.len() - 1]);
+                let actual = actual.to_string_lossy();
+                assert!(actual.starts_with(r"\\?\"));
+                assert_eq!(&actual[4..], expected.to_string_lossy(), "{input}");
+            }
+            assert_eq!(
+                wide(Path::new("bad\0path")).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     fn nt_error(status: i32) -> io::Error {
@@ -10590,6 +10686,74 @@ mod tests {
     }
 
     #[test]
+    fn prepared_probe_cleanup_requires_exact_objects_before_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp
+            .path()
+            .join(format!("zeck_probe_{}", uuid::Uuid::new_v4()));
+        create_private_dir_all(&probe).unwrap();
+        let private_root = probe.join("mainnet/workspace-test");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+        let registration =
+            prepare_ephemeral_probe_workspace(&private_root, &leaf, &database).unwrap();
+
+        // Preparation deliberately precedes activation and all secret writes.
+        let cleanup =
+            begin_ephemeral_probe_cleanup(registration, &private_root, &leaf, &database).unwrap();
+        cleanup.remove_exact_private_root_and_retire().unwrap();
+        assert!(!private_root.exists());
+    }
+
+    #[test]
+    fn prepared_probe_cleanup_rejects_a_replaced_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp
+            .path()
+            .join(format!("zeck_probe_{}", uuid::Uuid::new_v4()));
+        create_private_dir_all(&probe).unwrap();
+        let private_root = probe.join("mainnet/workspace-test");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+        let registration =
+            prepare_ephemeral_probe_workspace(&private_root, &leaf, &database).unwrap();
+        let saved = leaf.join("original.sqlite");
+        fs::rename(&database, &saved).unwrap();
+        write_private_file(&database, b"replacement must survive").unwrap();
+
+        assert!(
+            begin_ephemeral_probe_cleanup(registration, &private_root, &leaf, &database).is_err()
+        );
+        assert_eq!(fs::read(&database).unwrap(), b"replacement must survive");
+        assert!(saved.exists());
+        assert!(private_root.exists());
+    }
+
+    #[test]
+    fn stale_prepared_probe_registration_is_released_and_discovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp
+            .path()
+            .join(format!("zeck_probe_{}", uuid::Uuid::new_v4()));
+        create_private_dir_all(&probe).unwrap();
+        assert!(ephemeral_probe_container_owned_by_current_user(&probe).unwrap());
+        let private_root = probe.join("mainnet/workspace-test");
+        let leaf = private_root.join("birthday-1/scope");
+        let database = leaf.join("wallet.sqlite");
+        let registration =
+            prepare_ephemeral_probe_workspace(&private_root, &leaf, &database).unwrap();
+        let contended = EphemeralProbeRegistration::acquire(&private_root).unwrap_err();
+        assert!(ephemeral_probe_lock_is_contended(&contended), "{contended}");
+        drop(registration);
+        let reacquired = EphemeralProbeRegistration::acquire(&private_root)
+            .expect("a dropped live registration must not hide a stale probe");
+        drop(reacquired);
+
+        cleanup_stale_ephemeral_probes(temp.path()).unwrap();
+        assert!(!private_root.exists());
+    }
+
+    #[test]
     fn stale_probe_scan_ignores_noncanonical_candidate_names() {
         let temp = tempfile::tempdir().unwrap();
         for name in [
@@ -12274,6 +12438,42 @@ mod windows_tests {
             super::windows_acl::verify_current(&replacement, true).is_err(),
             "the substituted directory must not be hardened"
         );
+    }
+
+    #[test]
+    fn windows_private_artifact_publication_supports_paths_beyond_max_path() {
+        use std::os::windows::ffi::OsStrExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let mut data_dir = temp.path().join("user-selected-recovery-location");
+        while data_dir.as_os_str().encode_wide().count() <= 280 {
+            data_dir.push("nested-recovery-data-directory");
+        }
+        data_dir.push("workspace-v2");
+        assert!(!data_dir.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        assert!(!data_dir.exists());
+        let container = ensure_private_artifact_container(&data_dir)
+            .expect("publish an authenticated container through a long unprefixed path");
+        let purpose = b"long-path-artifact";
+        let root_path = private_artifact_root_path(&data_dir, purpose);
+        let root = ensure_private_artifact_root(&root_path, purpose)
+            .expect("publish the longer staged artifact root");
+        root.verify_current().unwrap();
+        let report = root_path.join("private-report.txt");
+        write_private_file(&report, b"private").expect("create a private file past MAX_PATH");
+        assert_eq!(fs::read(&report).unwrap(), b"private");
+        let reopened_file = windows_acl::open_file_for_identity(&report)
+            .expect("identity-only CreateFileW also supports the long path");
+        drop(reopened_file);
+        ensure_private_artifact_root(&root_path, purpose)
+            .expect("reopen the same authenticated long-path root")
+            .verify_current()
+            .unwrap();
+        let reused = root_path.join("untrusted-report.txt");
+        fs::write(&reused, b"preserve").unwrap();
+        write_private_file(&reused, b"replacement")
+            .expect_err("extended paths must not weaken exact reused-file DACL checks");
+        assert_eq!(fs::read(&reused).unwrap(), b"preserve");
+        container.verify_current().unwrap();
     }
 
     #[test]

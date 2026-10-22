@@ -5456,6 +5456,32 @@ mod tests {
         assert!(err.contains("spent on chain"), "{err}");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_long_data_directory_can_review_and_reverify_a_sprout_wallet() {
+        use std::os::windows::ffi::OsStrExt as _;
+        let outer = unused_temp_dir("long-gui-data");
+        let mut dir = outer.clone();
+        while dir.as_os_str().encode_wide().count() <= 280 {
+            dir.push("nested-user-selected-data-directory");
+        }
+        dir.push("workspace-v2");
+        assert!(!dir.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        argos_core::service::ensure_recovery_data_dir(&dir)
+            .expect("a user-selected data path beyond MAX_PATH can be authenticated");
+        let (_, intent) = reviewed_one_note_wallet(&dir).await;
+        assert_eq!(intent.notes.len(), 1);
+        let notice = verify_review_at_execute(&intent)
+            .await
+            .expect("reverification preserves long-path authority")
+            .expect("the fixture has no saved scan");
+        assert!(notice.contains("No full-block scan"), "{notice}");
+        argos_core::service::ensure_recovery_data_dir(&dir)
+            .expect("the same authenticated long data path reopens");
+        drop(intent);
+        std::fs::remove_dir_all(outer).unwrap();
+    }
+
     #[tokio::test]
     async fn execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent() {
         let dir = unused_artifact_data_dir("execute-lookup");

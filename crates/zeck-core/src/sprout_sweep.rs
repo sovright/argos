@@ -2216,7 +2216,14 @@ mod tests {
     #[test]
     fn first_run_with_no_artifact_root_has_no_interrupted_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("recovery-data");
+        let data_dir = artifact_data_dir(dir.path());
+        // Own the publication parent explicitly, without creating the data
+        // directory or granting authority to a preexisting artifact root.
+        crate::private_fs::create_private_dir_all(data_dir.parent().unwrap()).unwrap();
+        assert!(
+            !data_dir.exists(),
+            "the first-run data directory starts absent"
+        );
         let keys = [[0x42; 32]];
         let checkpoint = crate::sprout_scan_run::checkpoint_path_for_network(
             &data_dir,

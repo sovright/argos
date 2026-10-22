@@ -3109,24 +3109,39 @@ mod tests {
             &[[0x43; 32]],
             ZeckNetwork::Mainnet,
         );
-        sibling.load_or_migrate().unwrap();
-        std::fs::write(
-            sibling
-                .root
-                .join(crate::private_fs::PRIVATE_ARTIFACT_ROOT_MARKER),
-            b"tampered marker",
-        )
-        .unwrap();
+        let mut snapshot = sibling.load_or_migrate().unwrap();
+        sibling
+            .scoped_store(context(), &mut snapshot)
+            .persist_prepared(&fixture())
+            .unwrap();
+        // A journal decoder would reject this payload too. Require the marker
+        // authentication error instead, proving discovery stops before parsing it.
+        let journal_bytes = b"untrusted sibling journal must not be parsed\n";
+        std::fs::write(sibling.path(), journal_bytes).unwrap();
+        let marker = sibling
+            .root
+            .join(crate::private_fs::PRIVATE_ARTIFACT_ROOT_MARKER);
+        std::fs::write(&marker, b"tampered marker").unwrap();
 
         let error = current
             .load_scoped_snapshot(&[])
             .expect_err("an unauthenticated sibling root must fail closed")
             .to_string();
 
-        assert!(
-            error.contains("authenticated marker") || error.contains("invalid"),
-            "{error}"
+        let invalid_marker = error.starts_with(
+            "storage error: discovering private Sprout journals: private lineage record is invalid: ",
         );
+        let windows_dpapi_refusal = cfg!(windows)
+            && error.starts_with(
+                "storage error: discovering private Sprout journals: Windows DPAPI rejected private lineage authority: ",
+            )
+            && error.ends_with("(os error 87)");
+        assert!(
+            invalid_marker || windows_dpapi_refusal,
+            "tampered marker must be rejected before journal decoding: {error}"
+        );
+        assert_eq!(std::fs::read(sibling.path()).unwrap(), journal_bytes);
+        assert_eq!(std::fs::read(marker).unwrap(), b"tampered marker");
     }
 
     #[test]
@@ -3444,14 +3459,23 @@ mod tests {
                 }
                 Ok(Ok(())) => panic!("{operation} bypassed the held compatibility lock"),
                 Ok(Err(error)) => {
-                    // SQLite omits FILE_SHARE_DELETE on Windows. Reopening its
-                    // compatibility file with DELETE authority must fail closed
-                    // before the operation can reach SQLite's waiting lock.
+                    // Cold artifact verification first opens every bound child
+                    // with share=0, including the SQLite compatibility file.
+                    // Later retention also requests DELETE authority. Either
+                    // check can refuse SQLite's existing handle before waiting.
+                    let expected_context = error
+                        .starts_with("storage error: opening private Sprout journal authority: ")
+                        || error.starts_with(
+                            "storage error: retaining sweep journal compatibility lock ",
+                        );
                     assert!(
                         cfg!(windows)
-                            && error.contains("retaining sweep journal compatibility lock")
-                            && error.contains("(os error 32)"),
+                            && expected_context
+                            && error.ends_with("(os error 32)"),
                         "{operation} returned an unexpected result while the compatibility lock was held: {error}"
+                    );
+                    eprintln!(
+                        "{operation} safely refused before compatibility lock release: {error}"
                     );
                     true
                 }

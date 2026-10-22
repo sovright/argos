@@ -132,6 +132,7 @@ jobs:
           & $collect -Failures $failures -Package argos-gui -TestName commands::tests::legacy_gui_default_selects_versioned_directory_and_keeps_legacy_rows_visible
           & $collect -Failures $failures -Package argos-gui -TestName commands::tests::execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent
           & $collect -Failures $failures -Package argos-gui -TestName commands::tests::the_sweep_step_runs_only_after_verification_passes
+          & $collect -Failures $failures -Package argos-gui -TestName commands::tests::windows_long_data_directory_can_review_and_reverify_a_sprout_wallet
 
           if ($failures.Count -gt 0) {
             throw ("{0} exact Cargo test(s) failed:`n{1}" -f $failures.Count, ($failures -join "`n"))
