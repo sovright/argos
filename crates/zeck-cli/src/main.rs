@@ -2597,12 +2597,20 @@ async fn main() -> Result<()> {
                 match execution {
                     Ok(outcome) => {
                         println!();
-                        for result in &outcome.transactions {
+                        let guidance = argos_core::sweep_guidance::completion_guidance(
+                            &argos_core::sweep_guidance::CompletionGuidanceInput::from_outcome(
+                                &outcome,
+                                donation_rate.is_some_and(|rate| rate > 0.0),
+                            ),
+                        );
+                        for (result, label) in
+                            outcome.transactions.iter().zip(&guidance.status_labels)
+                        {
                             println!(
                                 "  account {}  {} ({})  txid {}  fee {}",
                                 result.source_account,
                                 result.status,
-                                sweep_status_label(result.status),
+                                label,
                                 result.txid.as_deref().unwrap_or("unknown"),
                                 format_zec(result.fee_zatoshis),
                             );
@@ -2632,29 +2640,15 @@ async fn main() -> Result<()> {
                             }
                             println!();
                         }
-                        let statuses: Vec<_> =
-                            outcome.transactions.iter().map(|tx| tx.status).collect();
-                        if let Some(donation_line) = sweep_donation_line(
-                            donation_rate,
-                            outcome.total_donation_zatoshis,
-                            &statuses,
-                            outcome.donation_note.as_deref(),
-                        ) {
+                        if let Some(donation_line) = &guidance.donation {
                             println!("{donation_line}");
                             println!();
                         }
                         match outcome.error {
                             None => {
-                                println!(
-                                    "{}",
-                                    sweep_completion_guidance_with_skips(
-                                        &statuses,
-                                        !outcome.skipped_accounts.is_empty(),
-                                        outcome.follow_up_review_required
-                                    )
-                                );
-                                if let Some(caveat) = sweep_discard_caveat(&outcome.transactions) {
-                                    println!("{caveat}");
+                                println!("{}", guidance.next_steps);
+                                for hint in sweep_completion_hints(&outcome.transactions) {
+                                    println!("{hint}");
                                 }
                             }
                             // A mid-sequence abort: the transactions above were
@@ -2663,13 +2657,7 @@ async fn main() -> Result<()> {
                             // Make this loud so the operator does not assume
                             // nothing was sent and retry into a double-broadcast.
                             Some(message) => {
-                                if outcome.transactions.iter().any(|tx| {
-                                    tx.status == argos_core::TxLifecycleState::SubmissionUnknown
-                                }) {
-                                    eprintln!("A listed transaction may already have reached the network; do not retry or discard the source wallet. Reconcile its txid before any further sweep.");
-                                } else {
-                                    eprintln!("Sweep aborted with the transaction results listed above. Keep the source wallet and recovery workspace; verify each txid before a new proposal. Remaining accounts were not swept.");
-                                }
+                                eprintln!("{}", guidance.next_steps);
                                 eprintln!("Error: {message}");
                                 std::process::exit(1);
                             }
@@ -3281,170 +3269,26 @@ fn print_scan_result(progress: &argos_core::ScanProgress) {
     }
 }
 
-fn sweep_status_label(status: argos_core::TxLifecycleState) -> &'static str {
+/// CLI-specific follow-ups to the shared completion guidance: the commands
+/// that resolve single-operator or not-yet-deep mining.
+fn sweep_completion_hints(results: &[argos_core::models::TxBroadcastResult]) -> Vec<String> {
     use argos_core::TxLifecycleState as State;
-    match status {
-        State::NotSubmitted => "Not submitted.",
-        State::SubmissionUnknown => {
-            "Submission uncertain — may already be on the network. Do not retry."
-        }
-        State::Pending => "Broadcast — awaiting independent confirmation.",
-        State::Mined => "Mined — independently confirmed.",
-        State::MinedSingleSource => {
-            "Mined — reported by one confirmation operator. Keep the source until an independent source confirms."
-        }
-        State::Expired => "Expired — rescan before rebuilding.",
-        State::Rejected => "Rejected by the node.",
-    }
-}
-
-fn sweep_donation_line(
-    donation_rate: Option<f64>,
-    total_zatoshis: u64,
-    states: &[argos_core::TxLifecycleState],
-    donation_note: Option<&str>,
-) -> Option<String> {
-    use argos_core::TxLifecycleState as State;
-    if donation_rate.is_none() && total_zatoshis == 0 {
-        return None;
-    }
-    if states.contains(&State::SubmissionUnknown) {
-        return Some("Donation status and amount are uncertain. Reconcile the transaction txid before reporting a donation total.".to_owned());
-    }
-    if states.contains(&State::Pending) {
-        return Some(format!("Proposed donation: {}. Awaiting independent confirmation; reconcile pending txids before reporting a donated amount.{}", format_zec(total_zatoshis), if states.contains(&State::Expired) { " An expired transaction also requires a rescan." } else { "" }));
-    }
-    if states.contains(&State::Expired) {
-        return Some(format!("Planned donation of {} is not confirmed. The transaction expired; rescan before rebuilding.", format_zec(total_zatoshis)));
-    }
-    if states.contains(&State::Rejected) || states.contains(&State::NotSubmitted) {
-        return Some(
-            if states
-                .iter()
-                .all(|state| matches!(state, State::Rejected | State::NotSubmitted))
-            {
-                "No donation was sent or confirmed; the transaction was rejected or not submitted."
-                    .to_owned()
-            } else {
-                "A donation total is not confirmed for this sweep. Review the rejected or unsubmitted transaction before reporting a donated amount.".to_owned()
-            },
+    let mut hints = Vec::new();
+    if results
+        .iter()
+        .any(|result| result.status == State::MinedSingleSource)
+    {
+        hints.push(
+            "Add --confirmation-source for an independent operator and run `argos reconcile`."
+                .to_owned(),
         );
     }
-    if total_zatoshis == 0 {
-        if let Some(note) = donation_note {
-            return Some(note.to_owned());
-        }
-        if states.is_empty() {
-            return Some("No donation was sent; no transaction was submitted.".to_owned());
-        }
-        return Some(
-            "No donation was sent; all listed transactions mined without a donation.".to_owned(),
-        );
+    let all_mined =
+        !results.is_empty() && results.iter().all(|result| result.status == State::Mined);
+    if all_mined && !results.iter().all(|result| result.safe_to_discard) {
+        hints.push("Run `argos reconcile` to check confirmation depth.".to_owned());
     }
-    if !states.is_empty() && states.iter().all(|state| *state == State::Mined) {
-        Some(format!(
-            "Donated to the Argos project: {}",
-            format_zec(total_zatoshis)
-        ))
-    } else {
-        Some("Donation total is not confirmed. Review the transaction results before reporting a donated amount.".to_owned())
-    }
-}
-
-/// Corroborated mining is not yet "discard the source" until it is deep
-/// enough; say so when every row is Mined but not all are safe.
-fn sweep_discard_caveat(results: &[argos_core::models::TxBroadcastResult]) -> Option<String> {
-    let all_mined = !results.is_empty()
-        && results
-            .iter()
-            .all(|result| result.status == argos_core::TxLifecycleState::Mined);
-    (all_mined && !results.iter().all(|result| result.safe_to_discard)).then(|| {
-        format!(
-            "Keep the source until every transaction is {} confirmations deep; run `argos reconcile` to check.",
-            argos_core::broadcast::MIN_DISCARD_CONFIRMATIONS
-        )
-    })
-}
-
-fn sweep_completion_guidance_with_skips(
-    states: &[argos_core::TxLifecycleState],
-    has_skipped_accounts: bool,
-    follow_up_review_required: bool,
-) -> &'static str {
-    if has_skipped_accounts
-        && !follow_up_review_required
-        && !states.is_empty()
-        && states
-            .iter()
-            .all(|state| *state == argos_core::TxLifecycleState::Mined)
-    {
-        return "Every listed transaction mined, but at least one account was not swept. Keep the source wallet and recovery workspace; review the skipped balance before a new proposal.";
-    }
-    sweep_completion_guidance(states, follow_up_review_required)
-}
-
-fn sweep_completion_guidance(
-    states: &[argos_core::TxLifecycleState],
-    follow_up_review_required: bool,
-) -> &'static str {
-    use argos_core::TxLifecycleState as State;
-    if states.contains(&State::MinedSingleSource)
-        && !states.iter().any(|state| {
-            matches!(
-                state,
-                State::SubmissionUnknown | State::Pending | State::NotSubmitted
-            )
-        })
-    {
-        return if follow_up_review_required {
-            "Shielding mined according to one confirmation operator. Rescan and review a new proposal for the send; keep your source keys or wallet file until an independent source confirms."
-        } else {
-            "Mined according to one confirmation operator. Keep your source keys or wallet file until an independent source confirms (add --confirmation-source and run `argos reconcile`)."
-        };
-    }
-    if follow_up_review_required {
-        if states.contains(&State::Expired) && states.contains(&State::SubmissionUnknown) {
-            return "A shielding submission may already have moved; do not retry. Reconcile its txid. Another shielding transaction expired; rescan before rebuilding and review a new proposal before sending shielded funds. Keep the source wallet and recovery workspace.";
-        }
-        if states.contains(&State::Expired) && states.contains(&State::Pending) {
-            return "A shielding transaction is awaiting independent confirmation; reconcile its txid. Another shielding transaction expired; rescan before rebuilding and review a new proposal before sending shielded funds. Keep the source wallet and recovery workspace.";
-        }
-        if states.contains(&State::Expired) {
-            return "A shielding transaction expired. Keep the source wallet and recovery workspace; rescan before rebuilding and review a new proposal before sending shielded funds.";
-        }
-        if states.contains(&State::SubmissionUnknown) {
-            return "Shielding submission may already have moved. Do not retry. Keep the source wallet and recovery workspace; reconcile the txid, then rescan and review a new proposal after mining.";
-        }
-        if states.contains(&State::Pending) {
-            return "Shielding transaction awaits independent confirmation. Keep the source wallet and recovery workspace; reconcile its txid, then rescan and review a new proposal after mining.";
-        }
-        return "Shielding stage submitted. Keep the source wallet and recovery workspace. After every shielding transaction mines, rescan and review a new proposal before sending shielded funds.";
-    }
-    if states.contains(&State::Expired) && states.contains(&State::SubmissionUnknown) {
-        return "A submission may already have moved; do not retry. Reconcile its txid. Another transaction expired; rescan before rebuilding. Keep the source wallet and recovery workspace.";
-    }
-    if states.contains(&State::Expired) && states.contains(&State::Pending) {
-        return "A transaction is awaiting independent confirmation; reconcile its txid. Another transaction expired; rescan before rebuilding. Keep the source wallet and recovery workspace.";
-    }
-    if states.contains(&State::SubmissionUnknown) {
-        return "A transaction may already have moved. Do not retry. Keep the source wallet and recovery workspace; reconcile its txid before a new proposal.";
-    }
-    if states.contains(&State::Pending) {
-        return "A transaction is awaiting independent confirmation. Keep the source wallet and recovery workspace until every submitted transaction mines.";
-    }
-    if states.contains(&State::Expired) {
-        return "A transaction expired. Keep the source wallet and recovery workspace; rescan before rebuilding.";
-    }
-    if states.contains(&State::Rejected) {
-        return "A transaction was rejected by the node. Review the evidence before a new proposal.";
-    }
-    if !states.is_empty() && states.iter().all(|state| *state == State::Mined) {
-        return "Sweep complete. Every submitted transaction was independently confirmed as mined.";
-    }
-    if states.contains(&State::Mined) {
-        return "A transaction mined, but this sweep did not finish. Keep the source wallet and recovery workspace; review the remaining results before a new proposal.";
-    }
-    "No transaction was submitted. Review the details before trying again."
+    hints
 }
 
 fn print_sweep_preview(proposal: &SweepProposal) {
@@ -3694,63 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sweep_status_copy_preserves_uncertain_and_mined_boundaries() {
-        use argos_core::TxLifecycleState as State;
-        assert_eq!(sweep_status_label(State::NotSubmitted), "Not submitted.");
-        assert_eq!(
-            sweep_status_label(State::SubmissionUnknown),
-            "Submission uncertain — may already be on the network. Do not retry."
-        );
-        assert_eq!(
-            sweep_status_label(State::Pending),
-            "Broadcast — awaiting independent confirmation."
-        );
-        assert_eq!(
-            sweep_status_label(State::Mined),
-            "Mined — independently confirmed."
-        );
-        assert_eq!(
-            sweep_status_label(State::Expired),
-            "Expired — rescan before rebuilding."
-        );
-        assert_eq!(sweep_status_label(State::Rejected), "Rejected by the node.");
-        assert!(
-            sweep_completion_guidance(&[State::SubmissionUnknown], false)
-                .contains("Keep the source wallet")
-        );
-        assert!(
-            sweep_completion_guidance(&[State::Pending], false).contains("Keep the source wallet")
-        );
-        assert!(
-            !sweep_completion_guidance(&[State::Mined, State::Pending], false)
-                .contains("Sweep complete")
-        );
-        assert!(!sweep_completion_guidance(&[State::Mined], true).contains("Sweep complete"));
-        assert!(sweep_completion_guidance(&[State::Mined], false).contains("Sweep complete"));
-        assert!(
-            sweep_completion_guidance(&[State::SubmissionUnknown], true).contains("Do not retry")
-        );
-        assert!(
-            sweep_completion_guidance(&[State::Mined, State::NotSubmitted], false)
-                .contains("mined, but")
-        );
-    }
-
-    #[test]
-    fn single_operator_mining_never_reads_as_complete_or_discardable() {
-        use argos_core::TxLifecycleState as State;
-        for follow_up in [false, true] {
-            let guidance = sweep_completion_guidance(&[State::MinedSingleSource], follow_up);
-            assert!(!guidance.contains("Sweep complete"), "{guidance}");
-            assert!(guidance.contains("independent source"), "{guidance}");
-        }
-        let mixed = sweep_completion_guidance(&[State::Mined, State::MinedSingleSource], false);
-        assert!(!mixed.contains("Sweep complete"), "{mixed}");
-        assert!(sweep_status_label(State::MinedSingleSource).contains("one confirmation operator"));
-    }
-
-    #[test]
-    fn corroborated_mining_still_waits_for_depth_before_discard() {
+    fn completion_hints_name_the_cli_commands_core_guidance_leaves_out() {
         use argos_core::TxLifecycleState as State;
         let row = |status, safe_to_discard| argos_core::models::TxBroadcastResult {
             source_account: 0,
@@ -3761,66 +3549,15 @@ mod tests {
             confirmed_height: Some(100),
             safe_to_discard,
         };
-        assert!(sweep_discard_caveat(&[row(State::Mined, false)])
-            .unwrap()
-            .contains("confirmations"));
-        assert!(sweep_discard_caveat(&[row(State::Mined, true)]).is_none());
-        assert!(sweep_discard_caveat(&[row(State::Pending, false)]).is_none());
-    }
-
-    #[test]
-    fn ordinary_sweep_donation_and_completion_wait_for_certain_receipts() {
-        use argos_core::TxLifecycleState as State;
-        let uncertain = sweep_donation_line(Some(0.1), 0, &[State::SubmissionUnknown], None)
-            .expect("requested donation must have a status line");
-        assert!(uncertain.contains("Donation status and amount are uncertain"));
-        assert!(!uncertain.contains("Donated") && !uncertain.contains("No donation"));
-        let sent = sweep_donation_line(Some(0.1), 0, &[State::Mined], None).unwrap();
-        assert!(sent.contains("No donation was sent"));
-        assert!(sweep_donation_line(None, 0, &[State::Mined], None).is_none());
-
-        let skipped = sweep_completion_guidance_with_skips(&[State::Mined], true, false);
-        assert!(!skipped.contains("Sweep complete"));
-        assert!(skipped.contains("not swept"));
-        assert!(
-            sweep_completion_guidance_with_skips(&[State::Mined], false, false)
-                .contains("Sweep complete")
-        );
-    }
-
-    #[test]
-    fn donation_receipt_waits_for_mining_and_mixed_statuses_need_distinct_actions() {
-        use argos_core::TxLifecycleState as State;
-        let pending = sweep_donation_line(Some(0.1), 100_000, &[State::Pending], None).unwrap();
-        assert!(pending
-            .to_lowercase()
-            .contains("awaiting independent confirmation"));
-        assert!(!pending.contains("Donated"));
-        let expired = sweep_donation_line(Some(0.1), 100_000, &[State::Expired], None).unwrap();
-        assert!(expired.contains("not confirmed"));
-        assert!(expired.contains("rescan"));
-        assert!(!expired.contains("Donated"));
-        let zero_pending = sweep_donation_line(Some(0.1), 0, &[State::Pending], None).unwrap();
-        assert!(!zero_pending.contains("No donation was sent"));
-        let rejected = sweep_donation_line(Some(0.1), 100_000, &[State::Rejected], None).unwrap();
-        assert!(rejected.contains("No donation was sent or confirmed"));
-        let mined = sweep_donation_line(Some(0.1), 100_000, &[State::Mined], None).unwrap();
-        assert!(mined.contains("Donated to the Argos project"));
-
-        for states in [
-            vec![State::Pending, State::Expired],
-            vec![State::SubmissionUnknown, State::Expired],
-        ] {
-            for follow_up in [false, true] {
-                let guidance = sweep_completion_guidance(&states, follow_up);
-                assert!(guidance.contains("rescan"), "{guidance}");
-                assert!(guidance.to_lowercase().contains("reconcile"), "{guidance}");
-                assert!(
-                    !guidance.contains("every submitted transaction mines"),
-                    "{guidance}"
-                );
-            }
-        }
+        let single = sweep_completion_hints(&[row(State::MinedSingleSource, false)]);
+        assert!(single
+            .iter()
+            .any(|hint| hint.contains("--confirmation-source")));
+        assert!(single.iter().any(|hint| hint.contains("argos reconcile")));
+        let shallow = sweep_completion_hints(&[row(State::Mined, false)]);
+        assert!(shallow.iter().any(|hint| hint.contains("argos reconcile")));
+        assert!(sweep_completion_hints(&[row(State::Mined, true)]).is_empty());
+        assert!(sweep_completion_hints(&[row(State::Pending, false)]).is_empty());
     }
 
     #[tokio::test]
