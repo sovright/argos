@@ -3,6 +3,7 @@ pub mod address_match_recovery;
 pub mod address_search;
 pub mod address_search_shielded;
 pub mod birthday;
+pub mod broadcast;
 pub mod derivation;
 pub mod donation;
 pub mod error;
@@ -45,15 +46,20 @@ pub mod sprout_sweep;
 // Direct p2p access. Sprout notes are invisible to lightwalletd -- compact
 // blocks carry no JoinSplits -- so finding one needs full blocks.
 pub mod p2p;
+pub mod reconciliation;
 // What a Sprout scan costs in time, bandwidth and disk, and the wording
 // that tells the user -- shared so the CLI and GUI cannot drift apart.
 pub mod sprout_scan_cost;
 // Drives a scan: connects, walks the chain, checkpoints. SproutScanner
 // itself is a passive consumer and knows nothing about the network.
 pub mod sprout_scan_run;
+pub mod sweep_guidance;
 pub mod tos;
 pub mod transparent_recovery;
 pub mod workspace;
+
+#[cfg(test)]
+mod test_support;
 
 pub use address::validate_destination_address;
 pub use birthday::{

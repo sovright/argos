@@ -72,6 +72,9 @@ pub enum ZeckError {
     #[error("estimated sweep fees exceed the configured maximum: {0}")]
     MaxFeeExceeded(String),
 
+    #[error("sweep fee quote changed: reviewed {reviewed} zats, current {current} zats; review a new proposal before submission")]
+    FeeQuoteChanged { reviewed: u64, current: u64 },
+
     #[error("invalid memo: {0}")]
     InvalidMemo(String),
 

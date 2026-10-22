@@ -13,7 +13,6 @@
 //!
 //! Gated on `argos-network` so production builds never link this module.
 
-#![cfg(feature = "argos-network")]
 #![allow(dead_code)] // Some helpers are exercised only by R-S27 or only by R-S29.
 
 use std::collections::VecDeque;

@@ -152,6 +152,21 @@ fn ensure_tos_accepted_for_base(base: &Path) -> Result<(), String> {
     }
 }
 
+/// Parse the optional confirmation sources. None are required: with the
+/// defaults, confirmation rests on one operator and the sweep review says so.
+/// The scan URLs are validated with them so a duplicate authority is refused.
+fn parse_gui_confirmation_sources(
+    scan_urls: &str,
+    raw: &[String],
+) -> Result<Vec<argos_core::ConfirmationEndpoint>, String> {
+    let raw = raw.iter().map(String::as_str).collect::<Vec<_>>();
+    let explicit = argos_core::lightwalletd::parse_confirmation_sources(&raw)
+        .map_err(|err| err.to_string())?;
+    argos_core::lightwalletd::confirmation_endpoints(scan_urls, &explicit)
+        .map_err(|err| err.to_string())?;
+    Ok(explicit)
+}
+
 // No `Debug`/`Serialize`/`Clone`: this struct carries the cleartext seed, so it
 // must never be debug-printed, serialized, or duplicated. It only deserializes
 // the Tauri command payload, and its `SecretString` seed field redacts and
@@ -163,6 +178,8 @@ pub struct ScanConfigInput {
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     pub data_dir: String,
     pub network: ZeckNetwork,
     #[serde(default = "argos_core::default_transparent_scan")]
@@ -181,6 +198,8 @@ pub struct ScanConfigInput {
 pub struct MatchedScanConfigInput {
     pub birthday: u32,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     pub data_dir: String,
     pub network: ZeckNetwork,
     #[serde(default)]
@@ -202,6 +221,8 @@ pub async fn start_matched_recovery(
     config: MatchedScanConfigInput,
 ) -> Result<ScanHandle, String> {
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&config.lightwalletd_url, &config.confirmation_sources)?;
     if config.transparent_scan.is_some() {
         return Err(
             "matched-address recovery cannot widen its transparent address range".to_owned(),
@@ -240,6 +261,7 @@ pub async fn start_matched_recovery(
                 num_accounts: Some(1),
                 gap_limit: 1,
                 lightwalletd_url: config.lightwalletd_url,
+                confirmation_sources,
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
@@ -656,6 +678,8 @@ pub struct WalletFileScanInput {
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     pub data_dir: String,
     pub network: ZeckNetwork,
     #[serde(default = "argos_core::default_transparent_scan")]
@@ -709,6 +733,8 @@ pub async fn start_scan_from_wallet_file(
     use std::sync::Arc;
 
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&config.lightwalletd_url, &config.confirmation_sources)?;
 
     // Either source alone is enough, and both together are meaningful: a
     // user may hold a wallet whose keys were never rescanned *and* a paper
@@ -768,6 +794,7 @@ pub async fn start_scan_from_wallet_file(
                 num_accounts: config.num_accounts,
                 gap_limit: config.gap_limit,
                 lightwalletd_url: config.lightwalletd_url,
+                confirmation_sources,
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
@@ -790,6 +817,8 @@ pub async fn start_scan(
     config: ScanConfigInput,
 ) -> Result<ScanHandle, String> {
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&config.lightwalletd_url, &config.confirmation_sources)?;
     let handle = state
         .service
         .start_scan(
@@ -798,6 +827,7 @@ pub async fn start_scan(
                 num_accounts: config.num_accounts,
                 gap_limit: config.gap_limit,
                 lightwalletd_url: config.lightwalletd_url,
+                confirmation_sources,
                 data_dir: PathBuf::from(config.data_dir),
                 network: config.network,
                 label: config.label.unwrap_or_default(),
@@ -885,6 +915,35 @@ pub async fn cancel_scan(state: State<'_, AppState>, handle: ScanHandle) -> Resu
 }
 
 #[tauri::command]
+pub async fn reconcile_sweep(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    handle: ScanHandle,
+) -> Result<Vec<argos_core::reconciliation::ReconciledTransaction>, String> {
+    ensure_tos_accepted(&app)?;
+    state
+        .service
+        .reconcile_sweep(&handle)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn retry_unknown_sweep(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    handle: ScanHandle,
+    txid: String,
+) -> Result<argos_core::reconciliation::ReconciledTransaction, String> {
+    ensure_tos_accepted(&app)?;
+    state
+        .service
+        .retry_unknown_sweep(&handle, &txid)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn propose_sweep(
     app: AppHandle,
@@ -903,6 +962,15 @@ pub async fn propose_sweep(
         .filter(|value| !value.is_empty())
         .map(parse_zec_to_zatoshis)
         .transpose()?;
+
+    // Observe every durable transaction first. A previously accepted sweep
+    // may now have canonical mining evidence, but only a fresh proposal can
+    // quote the remaining funds after that transition.
+    state
+        .service
+        .reconcile_sweep(&handle)
+        .await
+        .map_err(|err| err.to_string())?;
 
     state
         .service
@@ -940,13 +1008,28 @@ pub async fn execute_sweep(
         .map_err(|err| err.to_string())?;
 
     for result in &outcome.transactions {
-        let _ = app.emit("sweep-tx-broadcast", result);
-        if result.status == "confirmed" {
-            let _ = app.emit("sweep-tx-confirmed", result);
+        for event_name in sweep_event_names(result.status) {
+            let _ = app.emit(event_name, result);
         }
     }
 
     Ok(outcome)
+}
+
+fn sweep_event_names(status: argos_core::TxLifecycleState) -> &'static [&'static str] {
+    use argos_core::TxLifecycleState as State;
+    match status {
+        State::NotSubmitted | State::SubmissionUnknown | State::Rejected => &["sweep-tx-result"],
+        // One operator's mining report is not independent confirmation.
+        State::Pending | State::Expired | State::MinedSingleSource => {
+            &["sweep-tx-result", "sweep-tx-broadcast"]
+        }
+        State::Mined => &[
+            "sweep-tx-result",
+            "sweep-tx-broadcast",
+            "sweep-tx-confirmed",
+        ],
+    }
 }
 
 fn plan_wallet_sprout_preview(
@@ -1932,6 +2015,16 @@ fn summary_nu7_warning(sprout_keys: usize, network_name: &str) -> String {
     argos_core::sprout_sweep::nu7_recovery_warning(network_from(network_name))
 }
 
+/// The completion screen's summary, next steps, donation line, and status
+/// labels, from the same rules the CLI prints. Stateless: the frontend calls
+/// it again whenever a reconciliation changes a displayed row.
+#[tauri::command]
+pub fn sweep_completion_guidance(
+    input: argos_core::sweep_guidance::CompletionGuidanceInput,
+) -> argos_core::sweep_guidance::CompletionGuidance {
+    argos_core::sweep_guidance::completion_guidance(&input)
+}
+
 /// The NU7 warning text, re-fetched by the frontend when the network picker
 /// changes after a wallet was opened, and after a Sprout sweep broadcast
 /// (`broadcast`), when the advice becomes "confirm it is mined".
@@ -2651,6 +2744,8 @@ pub struct ResumeSessionInput {
     #[serde(default)]
     pub passphrase: Option<SecretString>,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<String>,
     /// If supplied (non-empty after trimming), overwrites the existing
     /// label in the sidecar at resume time. Mostly useful when resuming a
     /// legacy "(unlabeled scan)" workspace.
@@ -2663,6 +2758,7 @@ pub struct ResumeSessionResult {
     pub network: ZeckNetwork,
     pub data_dir: String,
     pub lightwalletd_url: String,
+    pub confirmation_sources: Vec<String>,
 }
 
 /// Resume an incomplete scan: verify the seed matches the workspace, then
@@ -2678,6 +2774,8 @@ pub async fn resume_session(
     input: ResumeSessionInput,
 ) -> Result<ResumeSessionResult, String> {
     ensure_tos_accepted(&app)?;
+    let confirmation_sources =
+        parse_gui_confirmation_sources(&input.lightwalletd_url, &input.confirmation_sources)?;
     let workspace_path = PathBuf::from(input.workspace_path.trim());
     if workspace_path.as_os_str().is_empty() {
         return Err("workspace path cannot be empty".to_owned());
@@ -2698,6 +2796,7 @@ pub async fn resume_session(
         num_accounts: keying.num_accounts,
         gap_limit: keying.gap_limit,
         lightwalletd_url: input.lightwalletd_url.clone(),
+        confirmation_sources,
         data_dir: data_dir.clone(),
         network: keying.network,
         label,
@@ -2742,6 +2841,7 @@ pub async fn resume_session(
         network: keying.network,
         data_dir: data_dir.to_string_lossy().into_owned(),
         lightwalletd_url: input.lightwalletd_url,
+        confirmation_sources: input.confirmation_sources,
     })
 }
 
@@ -2849,6 +2949,38 @@ mod tests {
 
     /// PR #263 review items 2 and 3: the GUI re-fetches the warning when the
     /// network changes, and after a broadcast switches to the mining wording.
+    #[test]
+    fn completion_guidance_command_reads_the_frontend_shape() {
+        let input = serde_json::from_value(serde_json::json!({
+            "transactions": [
+                { "status": "mined", "safe_to_discard": true },
+                { "status": "submission_unknown" }
+            ],
+            "skipped_accounts": 0,
+            "follow_up_review_required": false,
+            "error": null,
+            "status_only": false,
+            "donation_requested": true,
+            "donated_zatoshis": 0,
+            "donation_note": null
+        }))
+        .unwrap();
+        let guidance = super::sweep_completion_guidance(input);
+        assert!(!guidance.recovery_complete);
+        assert_eq!(guidance.status_labels.len(), 2);
+        assert!(guidance.summary.contains("may already have moved"));
+        let json = serde_json::to_value(&guidance).unwrap();
+        for field in [
+            "recovery_complete",
+            "summary",
+            "next_steps",
+            "donation",
+            "status_labels",
+        ] {
+            assert!(json.get(field).is_some(), "{field}");
+        }
+    }
+
     #[test]
     fn sprout_nu7_warning_command_picks_network_and_broadcast_wording() {
         let before = sprout_nu7_warning("testnet".into(), false);
@@ -3402,6 +3534,30 @@ mod tests {
         assert_eq!(keys.all.len(), keys.wallet.as_ref().unwrap().sprout.len());
     }
 
+    #[tokio::test]
+    async fn delete_workspace_command_uses_guarded_recovery_service() {
+        use tauri::Manager;
+        let app = tauri::test::mock_builder()
+            .manage(super::AppState {
+                service: argos_core::RecoveryService::new(),
+                address_search: argos_core::address_search::AddressSearchService::default(),
+                reviewed_intent: crate::reviewed_intent::ReviewedIntentStore::default(),
+            })
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let missing = argos_core::ScanHandle::new();
+        let backend = app
+            .state::<super::AppState>()
+            .service
+            .delete_workspace(&missing)
+            .await
+            .unwrap_err();
+        let command = super::delete_workspace(app.state(), missing)
+            .await
+            .unwrap_err();
+        assert_eq!(command, backend.to_string());
+    }
+
     // Orchard-only and Orchard+Sapling mainnet unified addresses. The first
     // is built from a fixed key in `transparent_recovery`'s tests.
     const ORCHARD_ONLY_UA: &str =
@@ -3495,6 +3651,78 @@ mod tests {
             ScanHandle,
             argos_core::SweepProposalId,
         ) -> _ = super::execute_sweep;
+    }
+
+    #[test]
+    fn reconciliation_commands_accept_only_existing_handle_and_txid() {
+        let _status: fn(AppHandle, State<'static, AppState>, ScanHandle) -> _ =
+            super::reconcile_sweep;
+        let _retry: fn(AppHandle, State<'static, AppState>, ScanHandle, String) -> _ =
+            super::retry_unknown_sweep;
+    }
+
+    #[test]
+    fn gui_accepts_default_single_operator_confirmation() {
+        // The defaults (two hosts of one operator) must be enough to scan
+        // and sweep; review shows the single-operator notice instead.
+        let sources = super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443,https://na.zec.rocks:443",
+            &[],
+        )
+        .expect("default configuration needs no extra confirmation source");
+        assert!(sources.is_empty());
+        let sources = super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443,https://na.zec.rocks:443",
+            &["independent=https://other.example:443".to_owned()],
+        )
+        .expect("an optional independent operator is accepted");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].operator_id, "independent");
+        // Malformed entries are still refused.
+        assert!(super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443",
+            &["no-separator".to_owned()],
+        )
+        .is_err());
+        assert!(super::parse_gui_confirmation_sources(
+            "https://zec.rocks:443",
+            &[
+                "one=https://one.example:443".to_owned(),
+                "two=https://one.example:443".to_owned(),
+            ],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sweep_events_distinguish_result_submission_and_mining() {
+        use argos_core::TxLifecycleState as State;
+        assert_eq!(
+            super::sweep_event_names(State::NotSubmitted),
+            &["sweep-tx-result"]
+        );
+        assert_eq!(
+            super::sweep_event_names(State::Rejected),
+            &["sweep-tx-result"]
+        );
+        assert_eq!(
+            super::sweep_event_names(State::SubmissionUnknown),
+            &["sweep-tx-result"]
+        );
+        for state in [State::Pending, State::Expired] {
+            assert_eq!(
+                super::sweep_event_names(state),
+                &["sweep-tx-result", "sweep-tx-broadcast"]
+            );
+        }
+        assert_eq!(
+            super::sweep_event_names(State::Mined),
+            &[
+                "sweep-tx-result",
+                "sweep-tx-broadcast",
+                "sweep-tx-confirmed"
+            ]
+        );
     }
 
     #[test]

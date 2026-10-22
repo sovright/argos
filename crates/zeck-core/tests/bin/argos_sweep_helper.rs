@@ -177,7 +177,7 @@ enum HelperEvent<'a> {
     Broadcast {
         source_account: u32,
         txid: Option<&'a str>,
-        status: &'a str,
+        status: &'a argos_core::models::TxLifecycleState,
         detail: &'a str,
         confirmed_height: Option<u32>,
     },
@@ -236,6 +236,7 @@ async fn main() {
         gap_limit: args.gap_limit,
         transparent_scan: None,
         lightwalletd_url: args.lightwalletd_url,
+        confirmation_sources: Vec::new(),
         data_dir: args.data_dir,
         network: ZeckNetwork::Testnet,
         label: args.label,

@@ -636,6 +636,11 @@
               <small>The server Argos connects to for blockchain data. Auto-filled by the preset above. You can add backup servers separated by commas.</small>
             </label>
             <label class="field span-two">
+              <span>Independent confirmation servers</span>
+              <textarea id="confirmation-sources" rows="2" spellcheck="false" placeholder="operator-id=https://independent.example:443"></textarea>
+              <small>Optional. One operator-id=https://lightwalletd-url per line. Without one, confirmation rests on a single operator (the recommended servers are both run by zec.rocks and count as one): the recovery completes, but keep your source until an independent source confirms.</small>
+            </label>
+            <label class="field span-two">
               <span>Where to save scan data on this computer</span>
               <input id="data-dir" type="text" placeholder="platform default populated on load" />
               <small>Argos saves its progress here so a scan can be resumed if interrupted. Change this to a permanent folder if you want to keep the data after a reboot.</small>
@@ -654,9 +659,9 @@
               <small>A short note attached to the recovery transaction. Visible only to the sender and recipient. <span id="memo-byte-count"></span></small>
             </label>
             <label class="field">
-              <span>Max transaction fee in ZEC (optional)</span>
+              <span>Maximum total sweep fee in ZEC (optional)</span>
               <input id="max-fee-zec" type="text" inputmode="decimal" placeholder="0.0002" />
-              <small>Leave blank to use the standard fee (~0.0002 ZEC). Only change this if you know what you're doing.</small>
+              <small>Leave blank to use the exact total fee shown in your reviewed proposal.</small>
             </label>
           </div>
           <div class="inline-actions">
@@ -763,6 +768,7 @@
             <button class="secondary" id="cancel-scan">Cancel</button>
             <button class="ghost" id="back-to-config" style="display:none">← Back to config</button>
             <button class="ghost" id="scan-return-address-matches" type="button" hidden>← Back to address matches</button>
+            <button class="secondary" id="scan-saved-transactions" type="button" disabled>Saved transaction status</button>
             <button class="primary" id="review-sweep" disabled>Review & Sweep</button>
           </div>
         </section>
@@ -844,8 +850,8 @@
 
         <section class="screen" data-step="complete">
           <p class="eyebrow">Step 6</p>
-          <h2>Recovery complete</h2>
-          <p class="lead" id="complete-summary">Transactions broadcast successfully.</p>
+          <h2 id="complete-heading">Sweep status</h2>
+          <p class="lead" id="complete-summary"></p>
           <!-- Repeated here deliberately: this screen is where the "Delete
                workspace" button lives, and the wallet file is the only copy
                of any Sprout key it holds. -->
@@ -853,11 +859,13 @@
           <div id="complete-txids" class="complete-txids"></div>
           <p id="complete-donation" hidden></p>
           <div class="report-card" id="complete-skipped"></div>
-          <!-- Audit Issue B: confirmation is attested by the single connected
-               lightwalletd server, so this advises independent verification. -->
           <p class="status-line" id="complete-confirmation-note">
-            Confirmation status is reported by the lightwalletd server you connected to. Before treating your recovery as final, verify each transaction ID on an independent Zcash block explorer or a second node.
+            Keep the source wallet and recovery workspace until submitted transactions are independently verified as mined.
           </p>
+          <div class="inline-actions">
+            <button class="secondary" id="complete-check-status" type="button">Check transaction status</button>
+            <p id="complete-reconciliation-status" class="status-line"></p>
+          </div>
           <div class="report-card" id="complete-report" style="display:none"></div>
           <div class="donate-card report-card">
             <h3>Help us keep doing this</h3>
@@ -926,6 +934,11 @@
           <span>BIP39 passphrase (if used)</span>
           <input id="resume-bip39-passphrase" type="password" autocomplete="off" spellcheck="false" />
           <small>This must match the passphrase used when the address was found. It is not your wallet encryption password.</small>
+        </label>
+        <label class="field">
+          <span>Independent confirmation servers</span>
+          <textarea id="resume-confirmation-sources" rows="2" spellcheck="false" placeholder="operator-id=https://independent.example:443"></textarea>
+          <small>Optional. Use the same independent operator labels you configured for the scan.</small>
         </label>
         <label class="field">
           <span>Label (optional rename)</span>

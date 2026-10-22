@@ -38,6 +38,7 @@ const state = {
   destination: null,
   memo: null,
   maxFeeZec: null,
+  autoFeeCapZec: null,
   unlistenProgress: null,
   unlistenComplete: null,
   unlistenDiscovered: null,
@@ -49,6 +50,9 @@ const state = {
   retainedAddressSearchId: null,
   addressMatchRecoveryLocked: false,
   addressMatchRecoveryStartGeneration: null,
+  completionContext: null,
+  reconciliationPending: false,
+  completionRender: 0,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1893,6 +1897,12 @@ const SERVER_PRESETS = {
   testnet: "https://testnet.zec.rocks:443",
 };
 
+const CONFIRMATION_SOURCES_STORAGE_KEY = "argos-confirmation-sources-v1";
+
+function confirmationSourcesFromForm(id = "confirmation-sources") {
+  return $(id).value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
 function clearMatchedRecoveryUi() {
   state.matchedRecovery = null;
   $("matched-recovery-banner").hidden = true;
@@ -2009,6 +2019,7 @@ document.addEventListener("address-match-recovery", async (event) => {
     $("sapling-key-addresses").replaceChildren();
     forgetSproutScanInputs();
     $("network-select").value = snapshot.network;
+    syncUntouchedBirthdayToNetwork(snapshot.network);
     $("network-select").disabled = true;
     // The Sprout panel's network mirror follows the now-locked picker.
     renderSproutScanPanel();
@@ -2038,10 +2049,28 @@ document.addEventListener("address-match-recovery", async (event) => {
   }
 });
 
+function defaultBirthdayForNetwork(network) {
+  return network === "testnet" ? 280_000 : 419_200;
+}
+
+function syncUntouchedBirthdayToNetwork(network = $("network-select").value) {
+  if (birthdayTouched) return;
+  $("birthday-height").value = String(defaultBirthdayForNetwork(network));
+  updateScanEstimate();
+  updateBirthdayHint();
+}
+
+function scanBirthdayFromForm(network, rawValue) {
+  const raw = String(rawValue ?? "").trim();
+  if (/^\d+$/.test(raw)) return Number(raw);
+  return defaultBirthdayForNetwork(network);
+}
+
 $("network-select").addEventListener("change", () => {
   if ($("server-preset").value === "recommended") {
     $("lightwalletd-url").value = SERVER_PRESETS[$("network-select").value] ?? SERVER_PRESETS.mainnet;
   }
+  syncUntouchedBirthdayToNetwork();
   renderSproutScanPanel();
   refreshSproutNu7Warning();
 });
@@ -2091,7 +2120,8 @@ const BLOCKS_PER_MINUTE = 38_000;
 function updateScanEstimate() {
   // The Sapling scan starts no earlier than activation, so a pre-Sapling
   // birthday (which only the Sprout scan uses) costs no extra here.
-  const birthday = Math.max(parseInt($("birthday-height").value, 10) || 0, 419200);
+  const activation = defaultBirthdayForNetwork($("network-select").value);
+  const birthday = Math.max(parseInt($("birthday-height").value, 10) || 0, activation);
   const blocks = Math.max(0, APPROX_CHAIN_TIP - birthday);
   const minutes = Math.round(blocks / BLOCKS_PER_MINUTE);
   const el = $("birthday-scan-estimate");
@@ -2437,14 +2467,16 @@ go back and provide one.",
 
   const autoGap = $("auto-gap-limit").checked;
   const labelRaw = ($("scan-label")?.value ?? "").trim();
+  const network = $("network-select").value;
   const config = {
     seed: seedInput.value.trim().toLowerCase(),
-    birthday: parseInt($("birthday-height").value, 10) || 419200,
+    birthday: scanBirthdayFromForm(network, $("birthday-height").value),
     num_accounts: state.matchedRecovery ? 1 : (autoGap ? null : parseInt($("accounts-range").value, 10)),
     gap_limit: state.matchedRecovery ? 1 : (autoGap ? parseInt($("gap-limit").value, 10) : 20),
     lightwalletd_url: $("lightwalletd-url").value.trim(),
+    confirmation_sources: confirmationSourcesFromForm(),
     data_dir: dataDirVal,
-    network: $("network-select").value,
+    network,
     label: labelRaw || defaultScanLabel(),
     transparent_scan: transparentScan,
   };
@@ -2587,6 +2619,7 @@ async function startProgressListeners(expectedHandle) {
   $("scan-rows").innerHTML = "";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
+  $("scan-saved-transactions").disabled = true;
   $("back-to-config").style.display = "none";
   $("scan-return-address-matches").hidden = true;
   $("cancel-scan").disabled = false;
@@ -2843,6 +2876,7 @@ function updateScanUI(progress) {
     !canReturnToAddressMatches(progress, state.retainedAddressSearchId);
   if (progress.phase === "complete") {
     $("review-sweep").disabled = false;
+    $("scan-saved-transactions").disabled = false;
   }
 }
 
@@ -2861,6 +2895,7 @@ function returnToAddressMatches() {
   state.scanHandle = null;
   state.lastProgress = null;
   invalidateSweepReview();
+  $("scan-saved-transactions").disabled = true;
   state.addressMatchRecoveryLocked = false;
   $("start-scan").disabled = false;
   setStatus("config-status", "", "");
@@ -2953,6 +2988,7 @@ function invalidateScanAuthority() {
   $("copy-report-path").style.display = "none";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
+  $("scan-saved-transactions").disabled = true;
   $("back-to-config").style.display = "none";
   $("cancel-scan").disabled = true;
   $("start-scan").disabled = state.sweepExecutionPending;
@@ -2963,7 +2999,7 @@ for (const id of [
   "seed-input", "wallet-path", "wallet-passphrase", "sapling-scan-keys",
   "network-select", "birthday-height", "accounts-range", "auto-gap-limit",
   "gap-limit", "transparent-index-start", "transparent-index-count",
-  "transparent-include-change", "lightwalletd-url", "server-preset", "data-dir",
+  "transparent-include-change", "lightwalletd-url", "confirmation-sources", "server-preset", "data-dir",
   "sprout-scan-peers",
 ]) {
   $(id)?.addEventListener("input", invalidateScanAuthority);
@@ -3025,9 +3061,26 @@ async function refreshSweepProposal() {
   const generation = state.proposalGeneration;
   const handleId = state.scanHandle?.id;
   const request = sweepRequestFromForm();
+  const autoFeeCap = state.autoFeeCapZec != null &&
+    $("max-fee-zec").value.trim() === state.autoFeeCapZec;
+  if (autoFeeCap) {
+    request.maxFeeZec = null;
+    $("max-fee-zec").value = "";
+    state.maxFeeZec = null;
+    state.autoFeeCapZec = null;
+  }
   try {
     const review = await invoke("propose_sweep", request);
     if (generation !== state.proposalGeneration || handleId !== state.scanHandle?.id) return null;
+    if (!$("max-fee-zec").value.trim() || autoFeeCap) {
+      const zatoshis = BigInt(review.proposal.total_fee_zatoshis);
+      const exactCap = `${zatoshis / 100000000n}.${String(zatoshis % 100000000n).padStart(8, "0")}`;
+      $("max-fee-zec").value = exactCap;
+      state.maxFeeZec = exactCap;
+      state.autoFeeCapZec = exactCap;
+    } else {
+      state.autoFeeCapZec = null;
+    }
     state.sweepReview = { ...review, handleId, donationRateForDisplay: request.donationRate };
     setSweepProposalPending(false);
     renderSweepProposal(review.proposal);
@@ -3057,10 +3110,52 @@ $("review-sweep").addEventListener("click", async () => {
   try {
     if (await refreshSweepProposal()) goTo("sweep");
   } catch (err) {
-    setStatus("scan-message", `✗ ${err}`, "error");
+    const message = String(err);
+    const guidance = message.includes("unresolved prepared transaction history")
+      ? " Use Saved transaction status to inspect or explicitly retry stored bytes." : "";
+    setStatus("scan-message", `✗ ${message}${guidance}`, "error");
     $("review-sweep").disabled = false;
   }
 });
+
+async function showSavedTransactions() {
+  const handle = state.scanHandle;
+  if (!handle || state.lastProgress?.phase !== "complete") return;
+  const button = $("scan-saved-transactions");
+  button.disabled = true;
+  setStatus("scan-message", "Checking saved transaction history…", "");
+  try {
+    const rows = await invoke("reconcile_sweep", { handle });
+    if (state.scanHandle?.id !== handle.id) return;
+    if (!rows.length) {
+      setStatus("scan-message", "No saved transaction receipts were found for this network.", "");
+      return;
+    }
+    const outcome = {
+      transactions: rows.map((row) => ({ source_account: null, ...row })),
+      skipped_accounts: [], total_donation_zatoshis: 0, donation_note: null,
+      error: null, follow_up_review_required: false,
+    };
+    const completionContext = {
+      handle, outcome, statusOnly: true, scanConfig: state.scanConfig,
+      lastProgress: state.lastProgress, donationRate: null,
+    };
+    state.completedScanHandle = handle;
+    invalidateSweepReview();
+    state.lastProgress = null;
+    $("review-sweep").disabled = true;
+    await renderCompleteScreen(outcome.transactions, [], 0, null, null, null, completionContext);
+    goTo("complete");
+  } catch (error) {
+    if (state.scanHandle?.id === handle.id) {
+      setStatus("scan-message", `Could not check saved transactions: ${error}`, "error");
+    }
+  } finally {
+    button.disabled = state.scanHandle?.id !== handle.id || state.lastProgress?.phase !== "complete";
+  }
+}
+
+$("scan-saved-transactions").addEventListener("click", showSavedTransactions);
 
 $("sweep-back").addEventListener("click", () => {
   // Re-enable Review & Sweep so the user can navigate back to sweep via the
@@ -3131,7 +3226,13 @@ $("donate-skip").addEventListener("click", () => {
 });
 
 for (const id of ["destination-input", "sweep-memo", "max-fee-zec", "donate-email", "donate-enabled"]) {
-  $(id).addEventListener("input", invalidateSweepReview);
+  $(id).addEventListener("input", () => {
+    if (id === "max-fee-zec") {
+      state.autoFeeCapZec = null;
+      state.maxFeeZec = $(id).value.trim() || null;
+    }
+    invalidateSweepReview();
+  });
   $(id).addEventListener("change", maybeRefreshProposal);
 }
 
@@ -3170,7 +3271,8 @@ function renderSweepProposal(proposal) {
 
   $("sweep-summary").textContent =
     `Net received: ${fmt(proposal.net_received_zatoshis)} after ${fmt(proposal.total_fee_zatoshis)} in fees.` +
-    (proposal.warning ? `  ⚠ ${proposal.warning}` : "");
+    (proposal.warning ? `  ⚠ ${proposal.warning}` : "") +
+    (proposal.confirmation_notice ? `  ${proposal.confirmation_notice}` : "");
 
   const skippedEl = $("sweep-skipped");
   skippedEl.replaceChildren();
@@ -3269,14 +3371,14 @@ $("execute-sweep").addEventListener("click", async () => {
     const outcome = await invoke("execute_sweep", { handle, proposalId: review.proposal_id });
     state.completedScanHandle = handle;
     setStatus("sweep-execute-status", "", "");
-    renderCompleteScreen(
+    await renderCompleteScreen(
       outcome.transactions,
       outcome.skipped_accounts,
       outcome.total_donation_zatoshis || 0,
       review.donationRateForDisplay,
       outcome.error,
       outcome.donation_note,
-      completionContext,
+      { ...completionContext, outcome, donationRate: review.donationRateForDisplay },
     );
     if (state.scanHandle?.id !== handle.id) {
       $("complete-summary").textContent =
@@ -3294,79 +3396,211 @@ $("execute-sweep").addEventListener("click", async () => {
 
 // ─── Step 6: Complete ─────────────────────────────────────────────────────────
 
-// The seed-phrase route reports "pending" then "confirmed"; the seedless
-// routes (imported wallet file, pasted Sapling key, transparent-only) report
-// "broadcast" and do not poll for confirmation. Both mean the transaction is
-// on the network and cannot be undone, so they must never read as failed: a
-// user told a sent transaction failed may retry and attempt a double spend.
+// Older results used "broadcast", "confirmed", and "failed" without the
+// current independent evidence. Treat those labels conservatively when shown.
 function txStatusKind(status) {
-  if (status === "confirmed") return "confirmed";
-  if (status === "pending" || status === "broadcast") return "sent";
-  return "failed";
+  if (status === "broadcast") return "pending";
+  if (status === "confirmed") return "pending";
+  if (status === "failed") return "submission_unknown";
+  if (["not_submitted", "submission_unknown", "pending", "mined", "mined_single_source", "expired", "rejected"].includes(status)) return status;
+  return "submission_unknown";
 }
 
-function txStatusLabel(status) {
-  const kind = txStatusKind(status);
-  if (kind === "confirmed") return "Confirmed";
-  if (kind === "sent") return "Broadcast — awaiting confirmation";
-  return "Failed";
-}
 
 function sweepStatusCounts(results) {
-  const counts = { confirmed: 0, pending: 0, failed: 0, broadcast: 0 };
+  const counts = { not_submitted: 0, unknown: 0, pending: 0, mined: 0, singleSource: 0, expired: 0, rejected: 0, broadcast: 0, safe: 0 };
   for (const r of results) {
     const kind = txStatusKind(r.status);
-    if (kind === "confirmed") counts.confirmed += 1;
-    else if (kind === "sent") counts.pending += 1;
-    else counts.failed += 1;
+    if (kind === "submission_unknown") counts.unknown += 1;
+    else if (kind === "mined_single_source") counts.singleSource += 1;
+    else counts[kind] += 1;
+    // Only corroborated, deep-enough mining may say the source can go.
+    if (kind === "mined" && r.safe_to_discard === true) counts.safe += 1;
   }
-  counts.broadcast = counts.confirmed + counts.pending;
+  counts.broadcast = counts.unknown + counts.pending + counts.mined + counts.singleSource + counts.expired;
   return counts;
 }
 
-function sweepCompleteSummary(results, error) {
-  const { confirmed, failed, broadcast } = sweepStatusCounts(results);
-  if (error) {
-    // The sweep aborted partway. The transactions below were already
-    // broadcast and are irreversible; the remaining accounts were not swept.
-    // Surface this so the user does not assume nothing was sent and retry
-    // (which would double-broadcast) — audit Issue E.
-    return `The sweep stopped before completing, but ${broadcast} transaction${broadcast === 1 ? " was" : "s were"} already broadcast and cannot be undone (listed below). ` +
-      `The remaining accounts were not swept. Rescan or check a block explorer before retrying, so you do not broadcast duplicates. Error: ${error}`;
-  }
-  if (results.length === 0) {
-    // Nothing was broadcast because every account with a balance was skipped
-    // (below the fee floor, or transparent funds that couldn't be shielded).
-    // The reasons are listed below — this is NOT a broadcast failure.
-    return "No funds were swept — every account with a balance was skipped (reasons below).";
-  }
-  if (failed === results.length) {
-    return "All transactions failed to broadcast. No funds were moved.";
-  }
-  if (confirmed > 0) {
-    return `${confirmed} transaction${confirmed > 1 ? "s" : ""} confirmed on-chain. Your funds are on their way.`;
-  }
-  return `${broadcast} transaction${broadcast > 1 ? "s" : ""} broadcast to the Zcash network. Confirmation usually takes 1–2 minutes.`;
+// The completion text comes from the backend (argos_core::sweep_guidance), the
+// same rules the CLI prints, so which state wins over which lives in one place.
+// Statuses are normalized first: the backend accepts only current tokens.
+function completionGuidanceInput(results, skipped, donated, donationRate, error, donationNote, statusOnly, followUpReviewRequired) {
+  return {
+    transactions: results.map((r) => ({
+      status: txStatusKind(r.status),
+      safe_to_discard: r.safe_to_discard === true,
+    })),
+    skipped_accounts: Array.isArray(skipped) ? skipped.length : 0,
+    follow_up_review_required: !!followUpReviewRequired,
+    error: error || null,
+    status_only: !!statusOnly,
+    donation_requested: Number.isFinite(donationRate) && donationRate > 0,
+    donated_zatoshis: Number(donated) || 0,
+    donation_note: donationNote || null,
+  };
 }
 
-function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote, completionContext = null) {
+// A failed lookup must never hide the transaction cards of a sweep that may
+// have moved funds, so it falls back to one conservative instruction.
+async function loadCompletionGuidance(input) {
+  try {
+    return await invoke("sweep_completion_guidance", { input });
+  } catch (error) {
+    return {
+      recovery_complete: false,
+      summary: "Could not load the completion guidance. Keep the source wallet and recovery workspace; review each transaction status before any new proposal.",
+      next_steps: `Guidance error: ${error}`,
+      donation: null,
+      status_labels: input.transactions.map((tx) => tx.status),
+    };
+  }
+}
+
+async function applyReconciledTransactions(rows) {
+  const context = state.completionContext;
+  if (!context) return;
+  const outcome = context.outcome || { transactions: [] };
+  const transactions = [...(outcome.transactions || [])];
+  for (const row of rows) {
+    const index = transactions.findIndex((item) => item.txid === row.txid);
+    if (index >= 0) transactions[index] = { ...transactions[index], ...row };
+    else transactions.push({ source_account: null, ...row });
+  }
+  const updatedOutcome = { ...outcome, transactions };
+  const updatedContext = { ...context, outcome: updatedOutcome };
+  await renderCompleteScreen(
+    transactions, updatedOutcome.skipped_accounts || [],
+    updatedOutcome.total_donation_zatoshis || 0,
+    updatedContext.donationRate ?? null,
+    updatedOutcome.error || null, updatedOutcome.donation_note || null,
+    updatedContext,
+  );
+}
+
+async function refreshSweepStatus() {
+  const context = state.completionContext;
+  const handle = context?.handle;
+  if (!handle || state.reconciliationPending) return;
+  state.reconciliationPending = true;
+  $("complete-check-status").disabled = true;
+  setStatus("complete-reconciliation-status", "Checking saved transactions with independent operators…", "");
+  try {
+    const rows = await invoke("reconcile_sweep", { handle });
+    if (state.completionContext !== context) return;
+    const reported = new Set(rows.map((row) => row.txid));
+    if (context.outcome?.transactions?.some((row) => row.txid && !reported.has(row.txid))) {
+      throw new Error("The journal did not return every displayed transaction; keep the recovery workspace.");
+    }
+    const newlyFinal = rows.some((row) => {
+      const previous = context.outcome?.transactions?.find((item) => item.txid === row.txid);
+      return (!previous || txStatusKind(previous.status) !== txStatusKind(row.status)) &&
+        ["mined", "mined_single_source", "expired", "rejected"].includes(txStatusKind(row.status));
+    });
+    await applyReconciledTransactions(rows);
+    if (newlyFinal) {
+      invalidateSweepReview();
+      state.lastProgress = null;
+    }
+    setStatus("complete-reconciliation-status", newlyFinal
+      ? "Transaction status refreshed. Run a fresh scan and review a new quote before another sweep stage."
+      : "Transaction status refreshed from independent operators.", "success");
+  } catch (error) {
+    if (state.completionContext !== context) return;
+    // A failed fresh observation cannot support deleting this workspace.
+    $("delete-workspace").disabled = true;
+    $("delete-workspace-zone").hidden = true;
+    setStatus("complete-reconciliation-status", `Could not verify current status: ${error}`, "error");
+  } finally {
+    state.reconciliationPending = false;
+    $("complete-check-status").disabled = false;
+  }
+}
+
+async function retryStoredSweepTransaction(txid) {
+  const context = state.completionContext;
+  const handle = context?.handle;
+  const current = context?.outcome?.transactions?.find((row) => row.txid === txid);
+  if (!handle || !current ||
+      !["submission_unknown", "not_submitted"].includes(txStatusKind(current.status)) ||
+      state.reconciliationPending) return;
+  if (!window.confirm(
+    `Retry only the exact saved transaction ${txid}? The app will first check its current status. ` +
+    "No new transaction will be built or signed."
+  )) return;
+  const network = context.scanConfig?.network ?? state.scanConfig?.network ?? "the configured network";
+  const dataDir = context.scanConfig?.data_dir ?? state.scanConfig?.data_dir ?? "the configured data directory";
+  if (typeof window.prompt !== "function") {
+    setStatus("complete-reconciliation-status", "Full txid confirmation is unavailable; transaction was not retried.", "error");
+    return;
+  }
+  const typedTxid = window.prompt(
+    `Saved transactions cover ${network} in ${dataDir} and may belong to another wallet. ` +
+    `To retry only the exact stored bytes for ${txid}, type the full txid:`,
+    "",
+  );
+  if (typedTxid === null) return;
+  if (typedTxid !== txid) {
+    setStatus("complete-reconciliation-status", "The full txid did not match; transaction was not retried.", "error");
+    return;
+  }
+  state.reconciliationPending = true;
+  $("complete-check-status").disabled = true;
+  setStatus("complete-reconciliation-status", "Checking status before retrying saved transaction…", "");
+  try {
+    const row = await invoke("retry_unknown_sweep", { handle, txid });
+    if (state.completionContext !== context) return;
+    await applyReconciledTransactions([row]);
+    setStatus("complete-reconciliation-status", "Saved transaction retry completed; check status for independent confirmation.", "success");
+  } catch (error) {
+    if (state.completionContext !== context) return;
+    $("delete-workspace").disabled = true;
+    $("delete-workspace-zone").hidden = true;
+    setStatus("complete-reconciliation-status", `Saved transaction was not retried: ${error}`, "error");
+  } finally {
+    state.reconciliationPending = false;
+    $("complete-check-status").disabled = false;
+  }
+}
+
+async function renderCompleteScreen(results, skipped, donated, donationRate, error, donationNote, completionContext = null) {
+  const render = (state.completionRender = (state.completionRender || 0) + 1);
+  state.completionContext = completionContext;
+  const statusOnly = !!completionContext?.statusOnly;
+  const statusButton = $("complete-check-status");
+  statusButton.hidden = !completionContext?.handle;
+  statusButton.onclick = () => refreshSweepStatus();
   $("complete-return-address-matches").hidden = !state.retainedAddressSearchId;
   if (state.retainedAddressSearchId) {
     state.addressMatchRecoveryLocked = false;
     document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
   }
-  const { broadcast } = sweepStatusCounts(results);
-  $("complete-summary").textContent = sweepCompleteSummary(results, error);
+  const { unknown, pending, not_submitted: notSubmitted } = sweepStatusCounts(results);
+  const followUpReviewRequired = !!(completionContext?.outcome?.follow_up_review_required ?? completionContext?.followUpReviewRequired);
+  // Deleting the workspace needs only resolved broadcasts (the service
+  // enforces the same rule); it never implies the source can be discarded.
+  // A staged sweep still owes its send leg, so the screen keeps the
+  // workspace it will rescan.
+  const deletable = !statusOnly && !followUpReviewRequired &&
+    unknown === 0 && pending === 0 && notSubmitted === 0;
+  // Text waits for the backend; the controls and cards below do not.
+  $("complete-heading").textContent = statusOnly ? "Saved transaction status" : "Sweep status";
+  $("complete-summary").textContent = "";
+  $("complete-confirmation-note").textContent = "";
+  $("delete-workspace").disabled = !deletable;
+  $("delete-workspace-zone").hidden = !deletable;
+  $("restart-flow").textContent = statusOnly || followUpReviewRequired ? "Rescan and review" : "Start over";
 
   const container = $("complete-txids");
   container.innerHTML = "";
+  const labels = [];
   results.forEach((r) => {
     const card = document.createElement("div");
-    card.className = "txid-card" + (txStatusKind(r.status) === "failed" ? " txid-card--failed" : "");
+    card.className = "txid-card" + (["rejected", "expired", "not_submitted"].includes(txStatusKind(r.status)) ? " txid-card--failed" : "");
 
     const label = document.createElement("div");
     label.className = "txid-label";
-    label.textContent = `Account ${r.source_account} · ${txStatusLabel(r.status)}`;
+    label.textContent = `${r.source_account == null ? "Journal transaction" : `Account ${r.source_account}`} · ${txStatusKind(r.status)}`;
+    labels.push({ label, prefix: r.source_account == null ? "Journal transaction" : `Account ${r.source_account}` });
     card.appendChild(label);
 
     if (r.txid) {
@@ -3389,22 +3623,32 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
       card.appendChild(row);
     }
 
-    if (r.confirmed_height) {
+    if (r.fee_zatoshis != null) {
+      const fee = document.createElement("div");
+      fee.className = "txid-note";
+      fee.textContent = `Fee: ${fmt(r.fee_zatoshis)}`;
+      card.appendChild(fee);
+    }
+
+    if (txStatusKind(r.status) === "mined" && r.confirmed_height) {
       const note = document.createElement("div");
       note.className = "txid-note";
       note.textContent = `Mined at block ${r.confirmed_height.toLocaleString()}`;
       card.appendChild(note);
-      if (r.detail) {
-        const detail = document.createElement("div");
-        detail.className = "txid-note";
-        detail.textContent = r.detail;
-        card.appendChild(detail);
-      }
-    } else if (r.detail && r.status !== "confirmed") {
+    }
+    if (r.detail) {
       const note = document.createElement("div");
       note.className = "txid-note";
       note.textContent = r.detail;
       card.appendChild(note);
+    }
+
+    if (r.txid && ["submission_unknown", "not_submitted"].includes(txStatusKind(r.status)) && completionContext?.handle) {
+      const retry = document.createElement("button");
+      retry.className = "secondary";
+      retry.textContent = "Retry saved transaction";
+      retry.addEventListener("click", () => retryStoredSweepTransaction(r.txid));
+      card.appendChild(retry);
     }
 
     container.appendChild(card);
@@ -3434,31 +3678,42 @@ function renderCompleteScreen(results, skipped, donated, donationRate, error, do
     skippedEl.appendChild(list);
   }
 
-  // Actual donated total (the truth, vs the proposal's estimate). Shown whenever
-  // a donation was requested — including when it came out to 0, so a proposal
-  // estimate that execution couldn't deliver is never silent.
   const donationEl = $("complete-donation");
-  const donationRequested = Number.isFinite(donationRate) && donationRate > 0;
-  if (donated > 0) {
-    donationEl.hidden = false;
-    donationEl.textContent = `Donated ${fmt(donated)} to the Argos project — thank you for supporting Zcash recovery.`;
-  } else if (donationRequested && broadcast > 0) {
-    donationEl.hidden = false;
-    // A route that never sends a donation says so itself; the fee-threshold
-    // reason below is true only on the seed-phrase route.
-    donationEl.textContent = donationNote ||
-      "No donation was sent: at the real network fee, each account's share fell below the 0.001 ZEC minimum, so your full balance went to your address.";
-  } else {
-    donationEl.hidden = true;
-    donationEl.textContent = "";
-  }
+  donationEl.hidden = true;
+  donationEl.textContent = "";
+  $("save-report").dataset.report = "";
 
-  const report = buildReport(results, completionContext);
+  const guidance = await loadCompletionGuidance(completionGuidanceInput(
+    results, skipped, donated, donationRate, error, donationNote, statusOnly, followUpReviewRequired,
+  ));
+  // A later render (for example after a status refresh) owns the screen.
+  if (render !== state.completionRender) return;
+  if (!statusOnly && guidance.recovery_complete) $("complete-heading").textContent = "Recovery complete";
+  $("complete-summary").textContent = guidance.summary;
+  $("complete-confirmation-note").textContent = guidance.next_steps;
+  labels.forEach(({ label, prefix }, index) => {
+    const text = guidance.status_labels?.[index];
+    if (text) label.textContent = `${prefix} · ${text}`;
+  });
+  // A recorded total is not a donation receipt until every relevant
+  // transaction has independent mining evidence; the backend decides.
+  donationEl.hidden = !guidance.donation;
+  donationEl.textContent = guidance.donation || "";
+
+  const report = buildReport(results, completionContext, guidance);
   $("save-report").dataset.report = report;
   $("report-path").value = buildDefaultReportPath();
 }
 
-function buildReport(results, completionContext = null) {
+function buildReport(results, completionContext = null, guidance = null) {
+  const outcome = completionContext?.outcome;
+  const statusOnly = !!completionContext?.statusOnly;
+  const transactions = outcome?.transactions ?? results;
+  const skipped = outcome?.skipped_accounts ?? [];
+  const error = outcome?.error ?? null;
+  const followUpReviewRequired = !!outcome?.follow_up_review_required;
+  const status = statusOnly ? "Saved transaction status" : guidance?.recovery_complete ? "Recovery complete" : followUpReviewRequired
+    ? "Shielding stage — follow-up review required" : "Incomplete";
   const cfg = completionContext?.scanConfig ?? state.scanConfig;
   const prog = completionContext?.lastProgress ?? state.lastProgress;
   const accountsScanned = prog?.accounts?.length ?? "—";
@@ -3483,15 +3738,26 @@ function buildReport(results, completionContext = null) {
     `Scan mode:        ${scanMode}`,
     `Workspace:        ${workspace}`,
     "",
+    `Status: ${status}`,
+    `Follow-up review required: ${followUpReviewRequired ? "yes" : "no"}`,
+    ...(error ? [`Error: ${error}`] : []),
+    `Guidance: ${guidance?.summary ?? "Keep the source wallet and recovery workspace; review each transaction status before any new proposal."}`,
+    "",
     "Transaction Results",
     "──────────────────",
-    ...results.map((r) => {
-      let line = `Account ${r.source_account}: ${r.status}`;
+    ...transactions.map((r) => {
+      let line = `${r.source_account == null ? "Journal transaction" : `Account ${r.source_account}`}: ${txStatusKind(r.status)}`;
       if (r.txid) line += `\n  txid: ${r.txid}`;
-      if (r.confirmed_height) line += `\n  confirmed at block ${r.confirmed_height}`;
-      if (r.detail) line += `\n  detail: ${r.detail}`;
+      if (r.fee_zatoshis != null) line += `\n  fee: ${fmt(r.fee_zatoshis)}`;
+      if (txStatusKind(r.status) === "mined" && r.confirmed_height) line += `\n  mined at block ${r.confirmed_height}`;
+      if (r.detail) line += `\n  evidence: ${r.detail}`;
       return line;
     }),
+    "",
+    "Skipped accounts",
+    "────────────────",
+    ...(skipped.length ? skipped.map((s) =>
+      `Account ${s.account_index}: ${s.reason} (${fmt(s.gross_zatoshis)})`) : ["None"]),
   ].join("\n");
 }
 
@@ -3532,6 +3798,7 @@ $("copy-report-path").addEventListener("click", () => {
 });
 
 $("delete-workspace").addEventListener("click", async () => {
+  if ($("delete-workspace").disabled) return;
   const handle = state.completedScanHandle || state.scanHandle;
   if (!handle) {
     setStatus("delete-workspace-status", "No workspace to delete.", "error");
@@ -3584,15 +3851,19 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
     destination: destination || null,
     memo: memo || null,
     maxFeeZec: maxFeeZec || null,
+    autoFeeCapZec: null,
     scanConfig: null,
     savedReportPath: null,
     matchedRecovery: null,
     retainedAddressSearchId: null,
     addressMatchRecoveryLocked: false,
     addressMatchRecoveryStartGeneration: null,
+    completionContext: null,
+    reconciliationPending: false,
   });
   $("copy-report-path").style.display = "none";
   $("delete-workspace").disabled = false;
+  $("delete-workspace-zone").hidden = false;
   $("save-report").disabled = false;
   setStatus("delete-workspace-status", "", "");
 
@@ -3616,9 +3887,9 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("scan-label").value = defaultScanLabel();
   $("scan-label").placeholder = defaultScanLabel();
   $("network-select").value = "mainnet";
-  $("birthday-height").value = "419200";
   // The starting value again, not a birthday the user chose.
   birthdayTouched = false;
+  syncUntouchedBirthdayToNetwork("mainnet");
   $("birthday-date").value = "";
   setStatus("birthday-probe-status", "", "");
   $("accounts-range").value = "20";
@@ -3679,6 +3950,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("scan-workspace").textContent = "Workspace: not initialized";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
+  $("scan-saved-transactions").disabled = true;
   $("back-to-config").style.display = "none";
   $("cancel-scan").style.display = "";
 
@@ -4001,6 +4273,7 @@ function openResumeModal(row) {
   $("resume-destination-input").value = "";
   $("resume-memo-input").value = "";
   $("resume-max-fee-zec").value = "";
+  $("resume-confirmation-sources").value = $("confirmation-sources").value;
   $("resume-bip39-passphrase-field").hidden = !row.match_coordinates;
   setStatus("resume-modal-status", "", "");
   $("resume-modal").hidden = false;
@@ -4088,6 +4361,7 @@ $("resume-confirm").addEventListener("click", async () => {
         seed,
         passphrase,
         lightwalletd_url: lightwalletdUrl,
+        confirmation_sources: confirmationSourcesFromForm("resume-confirmation-sources"),
         label: labelOverride || null,
       },
     });
@@ -4100,10 +4374,15 @@ $("resume-confirm").addEventListener("click", async () => {
       network: resumed.network,
       data_dir: resumed.data_dir,
       lightwalletd_url: resumed.lightwalletd_url,
+      confirmation_sources: resumed.confirmation_sources,
     };
     $("network-select").value = resumed.network;
     $("data-dir").value = resumed.data_dir;
     $("lightwalletd-url").value = resumed.lightwalletd_url;
+    $("confirmation-sources").value = (resumed.confirmation_sources || []).join("\n");
+    try {
+      localStorage.setItem(CONFIRMATION_SOURCES_STORAGE_KEY, $("confirmation-sources").value);
+    } catch (_) {}
     $("server-preset").value = resumed.lightwalletd_url === SERVER_PRESETS[resumed.network]
       ? "recommended" : "custom";
     state.scanHandle = resumed.handle;
@@ -4122,6 +4401,16 @@ $("resume-confirm").addEventListener("click", async () => {
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 $("lightwalletd-url").value = SERVER_PRESETS.mainnet;
+try {
+  $("confirmation-sources").value = localStorage.getItem(CONFIRMATION_SOURCES_STORAGE_KEY) || "";
+} catch (_) {
+  // Scans can still use the source input when webview storage is unavailable.
+}
+$("confirmation-sources").addEventListener("input", () => {
+  try {
+    localStorage.setItem(CONFIRMATION_SOURCES_STORAGE_KEY, $("confirmation-sources").value);
+  } catch (_) {}
+});
 renderSproutScanPanel();
 syncAccountScanControls();
 $("scan-label").value = defaultScanLabel();

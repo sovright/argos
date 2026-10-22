@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
 
 use crate::key_source::KeySource;
@@ -112,6 +113,58 @@ pub fn default_transparent_scan() -> Option<TransparentScanConfig> {
     Some(TransparentScanConfig::default())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationEndpoint {
+    pub operator_id: String,
+    pub endpoint: String,
+}
+
+/// Identity used when independent transaction evidence is counted. Keep this
+/// below both the network adapter and the broadcast log so they apply the
+/// same authority rules without depending on each other.
+pub(crate) fn normalized_confirmation_authority(endpoint: &str) -> Option<String> {
+    let url = Url::parse(endpoint).ok()?;
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let loopback = host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]"
+        || host.ends_with(".localhost");
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    if port == 0 {
+        return None;
+    }
+    Some(format!("{}://{}:{}", url.scheme(), host, port))
+}
+
+/// Known public endpoints share an operator even when callers supply different
+/// labels. Resolve this from the same validated host used for authority checks.
+pub(crate) fn known_confirmation_operator(endpoint: &str) -> Option<&'static str> {
+    let authority = normalized_confirmation_authority(endpoint)?;
+    let url = Url::parse(&authority).ok()?;
+    match url.host_str()? {
+        "zec.rocks" | "na.zec.rocks" | "testnet.zec.rocks" => Some("zec.rocks"),
+        _ => None,
+    }
+}
+
+pub(crate) fn canonical_confirmation_operator_id(operator_id: &str, endpoint: &str) -> String {
+    let operator_id = operator_id.trim();
+    if operator_id.is_empty() {
+        String::new()
+    } else {
+        known_confirmation_operator(endpoint)
+            .unwrap_or(operator_id)
+            .to_ascii_lowercase()
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeScanConfig {
     /// Where the scan keys come from. A BIP-39 seed phrase
@@ -125,6 +178,7 @@ pub struct RuntimeScanConfig {
     /// exact-match/imported-key recovery. New seed scans select an explicit range.
     pub transparent_scan: Option<TransparentScanConfig>,
     pub lightwalletd_url: String,
+    pub confirmation_sources: Vec<ConfirmationEndpoint>,
     pub data_dir: PathBuf,
     pub network: ZeckNetwork,
     /// User-facing label written to `session.json` so the launch-time
@@ -145,6 +199,7 @@ impl std::fmt::Debug for RuntimeScanConfig {
             .field("gap_limit", &self.gap_limit)
             .field("transparent_scan", &self.transparent_scan)
             .field("lightwalletd_url", &self.lightwalletd_url)
+            .field("confirmation_sources", &self.confirmation_sources)
             .field("data_dir", &self.data_dir)
             .field("network", &self.network)
             .field("label", &self.label)
@@ -160,6 +215,8 @@ pub struct ScanConfig {
     #[serde(default = "default_transparent_scan")]
     pub transparent_scan: Option<TransparentScanConfig>,
     pub lightwalletd_url: String,
+    #[serde(default)]
+    pub confirmation_sources: Vec<ConfirmationEndpoint>,
     pub data_dir: PathBuf,
     pub network: ZeckNetwork,
     #[serde(default)]
@@ -394,10 +451,9 @@ pub fn in_sandblasting_zone(height: u32, network: ZeckNetwork) -> bool {
 pub struct SweepRequest {
     pub destination: String,
     pub memo: Option<String>,
-    /// Maximum total fee in zatoshis across all sweep transactions. If actual
-    /// fees exceed this the sweep is aborted with `MaxFeeExceeded`. `None`
-    /// means no limit — use only when the caller has already reviewed the
-    /// proposal fee and explicitly accepted it.
+    /// Maximum total fee in zatoshis across all sweep transactions. The
+    /// service binds `None` to the exact reviewed proposal total before
+    /// issuing the one-shot proposal ID.
     pub max_fee_zatoshis: Option<u64>,
     /// Fraction of each account's send amount to donate (e.g. 0.10). `None`
     /// skips the donation entirely. Validated to 0.0..1.0.
@@ -415,9 +471,23 @@ pub enum ProposedTxKind {
     SweepShielded,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The signing route a quoted transaction takes. Ordering and execution key
+/// on this, never on the display `note`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposedLegKind {
+    /// Built and signed through the wallet database (HD or imported Sapling).
+    #[default]
+    Wallet,
+    /// Standalone transparent UTXOs swept directly, with no wallet account.
+    DirectTransparent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedTx {
     pub kind: ProposedTxKind,
+    #[serde(default)]
+    pub leg_kind: ProposedLegKind,
     pub source_account: u32,
     pub destination: String,
     pub gross_zatoshis: u64,
@@ -430,14 +500,14 @@ pub struct ProposedTx {
     pub memo: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedSweepAccount {
     pub account_index: u32,
     pub gross_zatoshis: u64,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SweepProposal {
     pub transactions: Vec<ProposedTx>,
     /// Set when this route can never send a donation, saying why — so a
@@ -454,6 +524,14 @@ pub struct SweepProposal {
     pub total_donation_zatoshis: u64,
     pub dry_run_default: bool,
     pub warning: Option<String>,
+    /// The quoted stage shields funds; a mined/rescanned send needs new review.
+    #[serde(default)]
+    pub follow_up_review_required: bool,
+    /// Set on the reviewed copy shown to the user when fewer than two
+    /// independent confirmation operators are configured. Not part of the
+    /// bound quote: it describes the configuration, not the transactions.
+    #[serde(default)]
+    pub confirmation_notice: Option<String>,
 }
 
 /// Ephemeral authority for one reviewed ordinary sweep in one scan session.
@@ -475,29 +553,86 @@ pub struct BirthdayDetectResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxLifecycleState {
+    NotSubmitted,
+    SubmissionUnknown,
+    Pending,
+    /// Mined with matching block evidence from an independent pair of
+    /// confirmation operators.
+    Mined,
+    /// Mined according to a single confirmation operator. Resolved for
+    /// continuing a recovery (later legs, a new review, workspace deletion),
+    /// but never enough to tell the user the source may be discarded.
+    MinedSingleSource,
+    Expired,
+    Rejected,
+}
+
+impl TxLifecycleState {
+    /// A submitted transaction can still be mined even if its reply was lost.
+    pub fn fee_is_at_risk(self) -> bool {
+        matches!(
+            self,
+            Self::SubmissionUnknown | Self::Pending | Self::Mined | Self::MinedSingleSource
+        )
+    }
+
+    /// Either mined state.
+    pub fn is_mined(self) -> bool {
+        matches!(self, Self::Mined | Self::MinedSingleSource)
+    }
+
+    /// Settled enough that a new review may start: the transaction mined
+    /// (by any configured operator), expired, or was definitively rejected.
+    pub fn is_resolved(self) -> bool {
+        matches!(
+            self,
+            Self::Mined | Self::MinedSingleSource | Self::Expired | Self::Rejected
+        )
+    }
+}
+
+impl std::fmt::Display for TxLifecycleState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotSubmitted => "not_submitted",
+            Self::SubmissionUnknown => "submission_unknown",
+            Self::Pending => "pending",
+            Self::Mined => "mined",
+            Self::MinedSingleSource => "mined_single_source",
+            Self::Expired => "expired",
+            Self::Rejected => "rejected",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxBroadcastResult {
     pub source_account: u32,
     pub txid: Option<String>,
-    pub status: String,
+    pub status: TxLifecycleState,
+    pub fee_zatoshis: u64,
     pub detail: String,
     pub confirmed_height: Option<u32>,
+    /// Corroborated by independent operators and at least
+    /// `broadcast::MIN_DISCARD_CONFIRMATIONS` deep. The only status that may
+    /// tell the user the source keys or wallet file can be discarded.
+    #[serde(default)]
+    pub safe_to_discard: bool,
 }
 
 /// Outcome of an `execute_sweep`, reported even when the sweep aborts partway.
 ///
-/// A multi-account sweep broadcasts transactions one account at a time. If a
-/// later account fails after an earlier one has already been broadcast, the
-/// earlier transactions are on-chain and irreversible. `transactions` always
-/// lists every transaction that was broadcast — on full success and on a
-/// partial abort alike — so the caller never loses the record of funds that
-/// have already moved (audit Issue E).
+/// A multi-account sweep submits transactions one account at a time.
+/// `transactions` records every attempted submission, including one whose
+/// reply was lost or whose rejection was definite. Each record retains the
+/// known txid, fee, and lifecycle state.
 ///
 /// `error` is `None` on full success and `Some(message)` when the sweep
-/// aborted after broadcasting the transactions in `transactions`. A failure
-/// *before any* transaction is broadcast is reported as an `Err` from
-/// `execute_sweep` instead, so an empty `transactions` with `error: Some` is
-/// never produced.
+/// aborted after preparing a listed transaction. A failure before any
+/// transaction is prepared is reported as an `Err` from `execute_sweep`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepOutcome {
     pub transactions: Vec<TxBroadcastResult>,
@@ -518,6 +653,8 @@ pub struct SweepOutcome {
     #[serde(default)]
     pub total_donation_zatoshis: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub follow_up_review_required: bool,
 }
 
 #[cfg(test)]
@@ -565,6 +702,7 @@ mod transparent_range_tests {
             "network": "mainnet"
         }))
         .unwrap();
+        assert!(config.confirmation_sources.is_empty());
         assert_eq!(
             config.transparent_scan,
             Some(TransparentScanConfig::default())

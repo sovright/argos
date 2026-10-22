@@ -85,6 +85,116 @@ fn wallet_network_mismatch_stops_before_lightwalletd() {
 }
 
 #[test]
+fn reconcile_empty_registry_needs_no_wallet_or_network_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = argos(&[
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+        "--lightwalletd-url",
+        "http://127.0.0.1:1",
+        "--accept-tos",
+        "reconcile",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("No stored transactions"), "{stdout}");
+}
+
+#[test]
+fn reconcile_unknown_txid_refuses_before_network_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = argos(&[
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+        "--lightwalletd-url",
+        "http://127.0.0.1:1",
+        "--accept-tos",
+        "reconcile",
+        "--txid",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("not found"), "{stderr}");
+    assert!(!stderr.contains("127.0.0.1"), "{stderr}");
+}
+
+#[test]
+fn reconcile_observes_every_stored_txid_or_only_the_selected_one() {
+    use argos_core::broadcast::{BroadcastStore, PreparedTransaction, SubmissionDisposition};
+    use argos_core::{service::NetworkOperationGuard, TxLifecycleState, ZeckNetwork};
+    use zcash_primitives::transaction::TxId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let guard = NetworkOperationGuard::acquire(dir.path(), ZeckNetwork::Mainnet).unwrap();
+    let mut log = guard.open_broadcast_log().unwrap();
+    let first = TxId::from_bytes([0xA1; 32]);
+    let second = TxId::from_bytes([0xB2; 32]);
+    for txid in [first, second] {
+        log.persist_prepared(&PreparedTransaction {
+            txid,
+            raw_tx: vec![0x01],
+            fee_zatoshis: 15_000,
+            expiry_height: None,
+        })
+        .unwrap();
+        log.transition(
+            txid,
+            TxLifecycleState::SubmissionUnknown,
+            Some(&SubmissionDisposition::AmbiguousTransport),
+            None,
+        )
+        .unwrap();
+    }
+    drop(log);
+    drop(guard);
+    let common = [
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+        "--lightwalletd-url",
+        "http://127.0.0.1:1",
+        "--accept-tos",
+        "reconcile",
+    ];
+    let all = argos(&common);
+    let all_stdout = String::from_utf8_lossy(&all.stdout);
+    let all_stderr = String::from_utf8_lossy(&all.stderr);
+    assert!(
+        all.status.success(),
+        "stdout: {all_stdout}\nstderr: {all_stderr}"
+    );
+    assert!(all_stdout.contains(&first.to_string()), "{all_stdout}");
+    assert!(all_stdout.contains(&second.to_string()), "{all_stdout}");
+    assert!(all_stdout.contains("SubmissionUnknown"), "{all_stdout}");
+
+    let selected = argos(&[
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+        "--lightwalletd-url",
+        "http://127.0.0.1:1",
+        "--accept-tos",
+        "reconcile",
+        "--txid",
+        &first.to_string(),
+    ]);
+    let selected_stdout = String::from_utf8_lossy(&selected.stdout);
+    let selected_stderr = String::from_utf8_lossy(&selected.stderr);
+    assert!(
+        selected.status.success(),
+        "stdout: {selected_stdout}\nstderr: {selected_stderr}"
+    );
+    assert!(
+        selected_stdout.contains(&first.to_string()),
+        "{selected_stdout}"
+    );
+    assert!(
+        !selected_stdout.contains(&second.to_string()),
+        "{selected_stdout}"
+    );
+}
+
+#[test]
 fn scan_routes_writer_wallet_seed_with_standalone_key_as_combined() {
     let mut bytes = std::fs::read(fixture("zwl-mainnet-empty.dat")).unwrap();
     // Writer fixture: one valid transparent key; keytype at 102..106.

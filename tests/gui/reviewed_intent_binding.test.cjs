@@ -295,6 +295,7 @@ function flowHarness() {
     SERVER_PRESETS: { mainnet: "main.example", testnet: "test.example" },
     eta: { reset() {} }, fmt: String, TextEncoder,
     defaultScanLabel: () => "today's scan",
+    confirmationSourcesFromForm: () => [],
     document: {
       createElement: () => element(),
       querySelectorAll: () => chips,
@@ -308,6 +309,7 @@ function flowHarness() {
       if (command === "resume_session") return {
         handle: { id: "scan-new" }, network: "testnet", data_dir: "/resumed",
         lightwalletd_url: "resumed.example",
+        confirmation_sources: ["independent=https://other.example:443"],
       };
       if (command === "get_scan_progress") return null;
       if (command === "cancel_scan") return null;
@@ -337,6 +339,15 @@ function flowHarness() {
     showScanWarning() {},
     scanWarningVariant() { return "shielded"; },
     birthdayTouched: false,
+    scanBirthdayFromForm(network, rawValue) {
+      const raw = String(rawValue ?? "").trim();
+      if (/^\d+$/.test(raw)) return Number(raw);
+      return network === "testnet" ? 280_000 : 419_200;
+    },
+    syncUntouchedBirthdayToNetwork(network = $("network-select").value) {
+      if (context.birthdayTouched) return;
+      $("birthday-height").value = String(network === "testnet" ? 280_000 : 419_200);
+    },
     updateTransparentScanSummary() {}, clearMatchedRecoveryUi() {},
     goTo() {}, updateScanUI(progress) { state.lastProgress = progress; },
     notifyScanComplete() {},
@@ -635,6 +646,8 @@ test("destination edit preserves completed scan authority", async () => {
 
 test("resume initializes every reviewed field", async () => {
   const h = flowHarness();
+  h.$("confirmation-sources").value = "independent=https://other.example:443";
+  h.context.confirmationSourcesFromForm = (id) => [h.$(id).value.trim()];
   loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
   loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
   loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
@@ -647,6 +660,9 @@ test("resume initializes every reviewed field", async () => {
   h.$("resume-max-fee-zec").value = "0.02";
   await h.$("resume-confirm").fire("click");
   assert.equal(h.calls.filter((call) => call.command === "resume_session").length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.find((call) => call.command === "resume_session").args.input.confirmation_sources)),
+    ["independent=https://other.example:443"]);
+  assert.equal(h.state.scanConfig.confirmation_sources[0], "independent=https://other.example:443");
   assert.equal(h.state.scanHandle.id, "scan-new");
   assert.equal(h.state.scanConfig.network, "testnet");
   assert.equal(h.state.scanConfig.data_dir, "/resumed");
@@ -809,4 +825,12 @@ test("start over restores every scan source setting to its documented default", 
   assert.equal(h.$("lightwalletd-url").value, "main.example");
   assert.equal(h.$("data-dir").value, "/platform/default");
   assert.equal(h.$("sprout-scan-peers").value, "");
+});
+
+test("sweep review shows the single-operator confirmation notice", async () => {
+  const notice = "Confirmation will rest on a single operator. Keep your source keys or wallet file until an independent source confirms the sweep.";
+  const h = harness(async () => review("proposal-single", { confirmation_notice: notice }));
+  await h.refresh();
+  assert.match(h.$("sweep-summary").textContent, /single operator/);
+  assert.equal(h.$("execute-sweep").disabled, true, "review alone never executes");
 });

@@ -17,6 +17,20 @@
 //! that was funded and later emptied reports zero here, which is the right
 //! answer to "what can I recover" and the wrong answer to "what did this
 //! wallet ever hold". Callers must not present it as the latter.
+//!
+//! Standalone callers must present a quote before submitting. The old direct
+//! signer is deliberately absent from the public API:
+//!
+//! ```compile_fail
+//! use argos_core::transparent_recovery::sweep_transparent_only;
+//! ```
+//!
+//! There is no standalone per-key journal opener; the network registry
+//! guard owns journal opening:
+//!
+//! ```compile_fail
+//! use argos_core::transparent_recovery::open_standalone_broadcast_log;
+//! ```
 
 use sapling_crypto as sapling;
 use tonic::transport::Channel;
@@ -31,9 +45,13 @@ use zcash_transparent::{
 };
 
 use crate::{
+    broadcast::{
+        submit_prepared_transaction, BroadcastStore, LightwalletdSubmitter, PreparedTransaction,
+        TxSubmitter,
+    },
     error::{ZeckError, ZeckResult},
     imported::{encode_transparent_address, ImportedTransparentKey},
-    models::ZeckNetwork,
+    models::{TxBroadcastResult, ZeckNetwork},
 };
 
 /// lightwalletd is queried in batches so a wallet with many addresses does
@@ -256,13 +274,114 @@ pub fn summarize(
 ///
 /// Produced separately from execution so a dry run and a real sweep agree
 /// by construction rather than by two code paths happening to match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentSweepPlan {
     pub input_count: usize,
     pub total_input_zatoshis: u64,
     pub fee_zatoshis: u64,
     /// What actually lands at the destination: inputs minus fee.
     pub output_zatoshis: u64,
+}
+
+/// A transparent-only sweep review bound to its complete spendable input set.
+///
+/// The inputs and target height stay private so a caller cannot replace the
+/// coins after displaying the fee. Execution refreshes the live set before
+/// signing and consumes that validated set without fetching it again.
+#[derive(Debug)]
+pub struct TransparentSweepQuote {
+    report: TransparentScanReport,
+    plan: Option<TransparentSweepPlan>,
+    utxos: Vec<TransparentUtxo>,
+    target_height: u32,
+    key_addresses: Vec<String>,
+    network: ZeckNetwork,
+}
+
+impl TransparentSweepQuote {
+    pub fn report(&self) -> &TransparentScanReport {
+        &self.report
+    }
+
+    pub fn plan(&self) -> Option<&TransparentSweepPlan> {
+        self.plan.as_ref()
+    }
+}
+
+fn transparent_key_addresses(keys: &[ImportedTransparentKey], network: ZeckNetwork) -> Vec<String> {
+    let mut addresses = keys
+        .iter()
+        .map(|key| encode_transparent_address(&key.address, network))
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+/// A stable byte identity for a transparent address: a kind tag (0 for
+/// P2PKH, 1 for P2SH) followed by the 20-byte hash. Unlike `Debug` text it
+/// cannot change with an upstream formatting change.
+pub(crate) fn transparent_address_identity(address: &TransparentAddress) -> [u8; 21] {
+    let (tag, hash) = match address {
+        TransparentAddress::PublicKeyHash(hash) => (0, hash),
+        TransparentAddress::ScriptHash(hash) => (1, hash),
+    };
+    let mut bytes = [0u8; 21];
+    bytes[0] = tag;
+    bytes[1..].copy_from_slice(hash);
+    bytes
+}
+
+fn transparent_input_identity(utxo: &TransparentUtxo) -> Vec<u8> {
+    let mut bytes = utxo.outpoint.hash().to_vec();
+    bytes.extend_from_slice(&utxo.outpoint.n().to_le_bytes());
+    utxo.txout
+        .write(&mut bytes)
+        .expect("serializing a TxOut into Vec cannot fail");
+    bytes.extend_from_slice(&transparent_address_identity(&utxo.address));
+    bytes.extend_from_slice(&utxo.height.to_le_bytes());
+    bytes
+}
+
+fn transparent_input_set_identity(utxos: &[TransparentUtxo]) -> Vec<Vec<u8>> {
+    let mut inputs = utxos
+        .iter()
+        .map(transparent_input_identity)
+        .collect::<Vec<_>>();
+    inputs.sort();
+    inputs
+}
+
+/// Fetch and cost the exact transparent inputs a standalone CLI sweep will
+/// show before confirmation. No signing or submission takes place.
+pub async fn quote_transparent_only(
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+) -> ZeckResult<TransparentSweepQuote> {
+    use zcash_protocol::consensus::BlockHeight;
+
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    let chain_tip = u32::try_from(info.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    let target_height = chain_tip.saturating_add(1);
+    let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+    let report = summarize(&utxos, keys.len(), chain_tip, network);
+    let plan = plan_sweep(
+        &crate::workspace::consensus_network(network),
+        BlockHeight::from_u32(target_height),
+        &utxos,
+    )?;
+    Ok(TransparentSweepQuote {
+        report,
+        plan,
+        utxos,
+        target_height,
+        key_addresses: transparent_key_addresses(keys, network),
+        network,
+    })
 }
 
 /// The ZIP-317 fee for sweeping `input_count` P2PKH inputs into a single
@@ -567,10 +686,11 @@ where
     Ok(result.transaction().clone())
 }
 
-/// Outcome of a completed transparent-only sweep.
+/// Outcome of a transparent sweep submission, including uncertain replies.
 #[derive(Debug, Clone)]
 pub struct TransparentSweepOutcome {
-    pub txid: String,
+    pub transaction: TxBroadcastResult,
+    pub disposition: crate::broadcast::SubmissionDisposition,
     pub plan: TransparentSweepPlan,
     pub destination: String,
 }
@@ -618,26 +738,116 @@ pub(crate) fn check_transparent_fee(
     }
 }
 
-/// Sweep every spendable transparent UTXO into one shielded output at
-/// `destination`.
-///
-/// `max_fee_zatoshis` is checked before anything is signed, so a fee the
-/// caller considers unacceptable costs nothing. It caps the whole sweep:
-/// `prior_fee_zatoshis` is what the caller's earlier transactions in the
-/// same sweep already paid (the Sapling leg of an imported wallet), and 0
-/// when this is the only transaction.
-///
-/// Broadcasts. Returns once lightwalletd has accepted the transaction into
-/// the mempool — acceptance is not confirmation, and the caller must say so.
-pub async fn sweep_transparent_only(
+/// Blocks the chain may advance between a CLI quote and its execution. The
+/// transaction is built at the execute-time height, so it carries a full
+/// expiry window from then; this bound only limits how stale the reviewed
+/// UTXO set and fee may be. It is half the default expiry delta.
+pub const TRANSPARENT_QUOTE_MAX_AGE_BLOCKS: u32 = 20;
+
+/// A quote stays executable while the consensus branch (and so the
+/// transaction version and fee rule) is unchanged and the tip has moved by
+/// at most [`TRANSPARENT_QUOTE_MAX_AGE_BLOCKS`] in either direction.
+pub(crate) fn require_quote_height_current(
+    network: ZeckNetwork,
+    quoted_target: u32,
+    current_target: u32,
+) -> ZeckResult<()> {
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    let params = crate::workspace::consensus_network(network);
+    if BranchId::for_height(&params, BlockHeight::from_u32(quoted_target))
+        != BranchId::for_height(&params, BlockHeight::from_u32(current_target))
+    {
+        return Err(ZeckError::StaleSweepProposal(
+            "a network upgrade activated after review; quote again".to_owned(),
+        ));
+    }
+    if current_target.abs_diff(quoted_target) > TRANSPARENT_QUOTE_MAX_AGE_BLOCKS {
+        return Err(ZeckError::StaleSweepProposal(format!(
+            "the transparent sweep quote is more than {TRANSPARENT_QUOTE_MAX_AGE_BLOCKS} blocks old; quote again"
+        )));
+    }
+    Ok(())
+}
+
+/// Execute a standalone transparent quote only while its exact reviewed
+/// coins, fee, output, and target height remain current. When no ceiling was
+/// supplied, the quoted fee is the maximum authorized by this review.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_transparent_only_from_quote(
+    store: &mut impl BroadcastStore,
+    keys: &[ImportedTransparentKey],
+    network: ZeckNetwork,
+    lightwalletd_url: &str,
+    destination: &str,
+    max_fee_zatoshis: Option<u64>,
+    quote: &TransparentSweepQuote,
+) -> ZeckResult<Option<TransparentSweepOutcome>> {
+    use zcash_protocol::consensus::BlockHeight;
+
+    sapling_receiver(destination, network)?;
+    if network != quote.network || transparent_key_addresses(keys, network) != quote.key_addresses {
+        return Err(ZeckError::StaleSweepProposal(
+            "transparent sweep source keys or network changed after review".to_owned(),
+        ));
+    }
+
+    let (mut client, _endpoint, info) =
+        crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
+    crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
+    let chain_tip = u32::try_from(info.block_height)
+        .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
+    let current_target = chain_tip.saturating_add(1);
+    require_quote_height_current(network, quote.target_height, current_target)?;
+    let current_utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+    if transparent_input_set_identity(&current_utxos)
+        != transparent_input_set_identity(&quote.utxos)
+    {
+        return Err(ZeckError::StaleSweepProposal(
+            "selected sweep inputs changed after review; quote again before signing".to_owned(),
+        ));
+    }
+    let Some(reviewed) = quote.plan.as_ref() else {
+        return Ok(None);
+    };
+    // The plan actually built, at the execute-time height. Its fee is
+    // compared with the reviewed quote's fee before anything is signed.
+    let Some(built) = plan_sweep(
+        &crate::workspace::consensus_network(network),
+        BlockHeight::from_u32(current_target),
+        &current_utxos,
+    )?
+    else {
+        return Err(ZeckError::StaleSweepProposal(
+            "the reviewed transparent inputs no longer cover a sweep; quote again".to_owned(),
+        ));
+    };
+    sweep_transparent_only_reviewed(
+        store,
+        keys,
+        network,
+        lightwalletd_url,
+        destination,
+        Some(max_fee_zatoshis.unwrap_or(reviewed.fee_zatoshis)),
+        0,
+        Some(reviewed.fee_zatoshis),
+        Some((&current_utxos, &built, current_target)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sweep_transparent_only_reviewed(
+    store: &mut impl BroadcastStore,
     keys: &[ImportedTransparentKey],
     network: ZeckNetwork,
     lightwalletd_url: &str,
     destination: &str,
     max_fee_zatoshis: Option<u64>,
     prior_fee_zatoshis: u64,
+    reviewed_fee_zatoshis: Option<u64>,
+    reviewed_inputs: Option<(&[TransparentUtxo], &TransparentSweepPlan, u32)>,
 ) -> ZeckResult<Option<TransparentSweepOutcome>> {
-    use zcash_client_backend::proto::service::RawTransaction;
     use zcash_proofs::prover::LocalTxProver;
     use zcash_protocol::consensus::BlockHeight;
 
@@ -645,20 +855,47 @@ pub async fn sweep_transparent_only(
     // should fail instantly, not after a scan.
     let recipient = sapling_receiver(destination, network)?;
 
+    // The reviewed fee against the plan that will be built, before any
+    // network or signing work, and before the fee ceiling: a changed fee is
+    // FeeQuoteChanged, never MaxFeeExceeded.
+    if let (Some(reviewed), Some((_, plan, _))) = (reviewed_fee_zatoshis, reviewed_inputs) {
+        if reviewed != plan.fee_zatoshis {
+            return Err(ZeckError::FeeQuoteChanged {
+                reviewed,
+                current: plan.fee_zatoshis,
+            });
+        }
+    }
+
     let (mut client, _endpoint, info) =
         crate::lightwalletd::probe_lightwalletd_endpoints_with_retry(lightwalletd_url).await?;
     crate::lightwalletd::validate_lightwalletd_network(network, &info)?;
 
     let chain_tip = u32::try_from(info.block_height)
         .map_err(|_| ZeckError::Lightwalletd("chain tip height overflowed u32".to_owned()))?;
-    let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
-
     let params = crate::workspace::consensus_network(network);
-    let target_height = BlockHeight::from_u32(chain_tip.saturating_add(1));
-
-    let Some(plan) = plan_sweep(&params, target_height, &utxos)? else {
-        return Ok(None);
+    let target_height = execution_target_height(
+        BlockHeight::from_u32(chain_tip.saturating_add(1)),
+        reviewed_inputs.map(|(_, _, height)| BlockHeight::from_u32(height)),
+    );
+    let (utxos, plan) = if let Some((utxos, plan, _)) = reviewed_inputs {
+        (utxos.to_vec(), plan.clone())
+    } else {
+        let utxos = fetch_transparent_utxos(&mut client, keys, network).await?;
+        let Some(plan) = plan_sweep(&params, target_height, &utxos)? else {
+            return Ok(None);
+        };
+        (utxos, plan)
     };
+
+    if let Some(reviewed) = reviewed_fee_zatoshis {
+        if reviewed != plan.fee_zatoshis {
+            return Err(ZeckError::FeeQuoteChanged {
+                reviewed,
+                current: plan.fee_zatoshis,
+            });
+        }
+    }
 
     check_transparent_fee(
         plan.fee_zatoshis,
@@ -683,30 +920,72 @@ pub async fn sweep_transparent_only(
     tx.write(&mut raw)
         .map_err(|err| ZeckError::TransactionBuild(format!("serializing the sweep: {err}")))?;
 
-    let response = client
-        .send_transaction(RawTransaction {
-            data: raw,
-            height: 0,
-        })
-        .await
-        .map_err(|err| ZeckError::Broadcast(err.to_string()))?
-        .into_inner();
-    if response.error_code != 0 {
-        let reason = if response.error_message.is_empty() {
-            format!("error code {}", response.error_code)
-        } else {
-            response.error_message.clone()
-        };
-        return Err(ZeckError::Broadcast(format!(
-            "the node rejected the sweep transaction: {reason}"
-        )));
-    }
+    let prepared = PreparedTransaction {
+        txid: tx.txid(),
+        raw_tx: raw,
+        fee_zatoshis: plan.fee_zatoshis,
+        expiry_height: Some(u32::from(tx.expiry_height())),
+    };
+    Ok(Some(
+        submit_transparent_prepared(
+            store,
+            &mut LightwalletdSubmitter {
+                client: &mut client,
+            },
+            prepared,
+            plan,
+            destination,
+        )
+        .await?,
+    ))
+}
 
-    Ok(Some(TransparentSweepOutcome {
-        txid: tx.txid().to_string(),
+fn execution_target_height(
+    current: zcash_protocol::consensus::BlockHeight,
+    reviewed: Option<zcash_protocol::consensus::BlockHeight>,
+) -> zcash_protocol::consensus::BlockHeight {
+    // The caller validated this concrete target with the reviewed UTXOs and
+    // version. A newer lightwalletd tip must not alter the signed transaction
+    // after the final quote comparison.
+    reviewed.unwrap_or(current)
+}
+
+async fn submit_transparent_prepared<S: BroadcastStore, N: TxSubmitter>(
+    store: &mut S,
+    submitter: &mut N,
+    prepared: PreparedTransaction,
+    plan: TransparentSweepPlan,
+    destination: &str,
+) -> ZeckResult<TransparentSweepOutcome> {
+    let submitted = submit_prepared_transaction(
+        store,
+        submitter,
+        prepared,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    Ok(TransparentSweepOutcome {
+        transaction: TxBroadcastResult {
+            source_account: 0,
+            txid: Some(submitted.txid.to_string()),
+            status: submitted.state,
+            fee_zatoshis: submitted.fee_zatoshis,
+            detail: format!(
+                "transparent sweep submission: {:?}{}",
+                submitted.disposition,
+                submitted
+                    .persistence_warning
+                    .as_ref()
+                    .map(|warning| format!(" Persistence warning: {warning}"))
+                    .unwrap_or_default()
+            ),
+            confirmed_height: None,
+            safe_to_discard: false,
+        },
+        disposition: submitted.disposition,
         plan,
         destination: destination.to_owned(),
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -826,10 +1105,199 @@ mod tests {
 mod sweep_tests {
     use super::tests_support::*;
     use super::*;
+    use crate::TxLifecycleState;
     use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK};
+
+    #[test]
+    fn reviewed_direct_build_keeps_validated_height_across_version_boundary() {
+        use zcash_primitives::transaction::TxVersion;
+        use zcash_protocol::consensus::{BranchId, NetworkUpgrade, Parameters as _};
+
+        let activation = MAIN_NETWORK.activation_height(NetworkUpgrade::Nu5).unwrap();
+        let reviewed = BlockHeight::from_u32(u32::from(activation) - 1);
+        let later = activation;
+        let selected = execution_target_height(later, Some(reviewed));
+        assert_eq!(selected, reviewed);
+        assert_eq!(execution_target_height(later, None), later);
+        assert_ne!(
+            TxVersion::suggested_for_branch(BranchId::for_height(&MAIN_NETWORK, selected)),
+            TxVersion::suggested_for_branch(BranchId::for_height(&MAIN_NETWORK, later)),
+        );
+    }
+
+    #[test]
+    fn quote_survives_a_new_block_but_not_a_branch_change_or_old_age() {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
+
+        let network = ZeckNetwork::Mainnet;
+        let activation = u32::from(MAIN_NETWORK.activation_height(NetworkUpgrade::Nu5).unwrap());
+        let quoted = activation + 1_000;
+        // A block landing between quote and execute is ordinary.
+        assert!(require_quote_height_current(network, quoted, quoted).is_ok());
+        assert!(require_quote_height_current(network, quoted, quoted + 1).is_ok());
+        assert!(require_quote_height_current(
+            network,
+            quoted,
+            quoted + TRANSPARENT_QUOTE_MAX_AGE_BLOCKS
+        )
+        .is_ok());
+        // Too old.
+        assert!(matches!(
+            require_quote_height_current(
+                network,
+                quoted,
+                quoted + TRANSPARENT_QUOTE_MAX_AGE_BLOCKS + 1
+            ),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+        // A consensus branch change invalidates the reviewed version.
+        assert!(matches!(
+            require_quote_height_current(network, activation - 1, activation),
+            Err(ZeckError::StaleSweepProposal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reviewed_transparent_fee_is_checked_against_the_built_plan_before_network() {
+        use crate::broadcast::DurableBroadcastLog;
+
+        let key = crate::imported::ImportedTransparentKey {
+            secret: secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap(),
+            address: addr(1),
+        };
+        let utxos = vec![utxo(addr(1), 1_000_000, 9)];
+        let built = plan_sweep(&MAIN_NETWORK, height(), &utxos)
+            .unwrap()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DurableBroadcastLog::open(dir.path().join("log.jsonl")).unwrap();
+        // The session endpoint is unroutable: the comparison must come first.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sweep_transparent_only_reviewed(
+                &mut log,
+                &[key],
+                ZeckNetwork::Mainnet,
+                "https://127.0.0.1:1",
+                &super::destination_tests::unified_address_for(
+                    zcash_protocol::consensus::NetworkType::Main,
+                ),
+                None,
+                0,
+                Some(built.fee_zatoshis + 5_000),
+                Some((&utxos, &built, u32::from(height()))),
+            ),
+        )
+        .await
+        .expect("no network before the reviewed-fee check");
+        assert!(
+            matches!(
+                result,
+                Err(ZeckError::FeeQuoteChanged { reviewed, current })
+                    if reviewed == built.fee_zatoshis + 5_000 && current == built.fee_zatoshis
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transparent_record_keeps_txid_fee_and_warning_when_final_sync_fails() {
+        use crate::broadcast::{BroadcastStore, DurableBroadcastLog};
+        use crate::test_support::{empty_v5_prepared, AcceptingSubmitter, FinalTransitionFails};
+
+        let prepared = empty_v5_prepared(100, 10_000);
+        let txid = prepared.txid;
+        let plan = TransparentSweepPlan {
+            input_count: 1,
+            total_input_zatoshis: 30_000,
+            fee_zatoshis: 10_000,
+            output_zatoshis: 20_000,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FinalTransitionFails(
+            DurableBroadcastLog::open(dir.path().join("broadcasts-v1.jsonl")).unwrap(),
+        );
+        let result = submit_transparent_prepared(
+            &mut store,
+            &mut AcceptingSubmitter::default(),
+            prepared,
+            plan,
+            "destination",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.transaction.txid, Some(txid.to_string()));
+        assert_eq!(result.transaction.fee_zatoshis, 10_000);
+        assert_eq!(
+            result.transaction.status,
+            TxLifecycleState::SubmissionUnknown
+        );
+        assert!(result.transaction.detail.contains("final sync failed"));
+        assert_eq!(
+            store.latest(txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn transparent_transport_failure_returns_known_txid_and_unknown_state() {
+        use crate::broadcast::DurableBroadcastLog;
+        use crate::models::TxLifecycleState;
+        use crate::test_support::{empty_v5_prepared, LostReplySubmitter};
+
+        let prepared = empty_v5_prepared(100, 10_000);
+        let txid = prepared.txid;
+        let plan = TransparentSweepPlan {
+            input_count: 1,
+            total_input_zatoshis: 30_000,
+            fee_zatoshis: 10_000,
+            output_zatoshis: 20_000,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        let outcome = submit_transparent_prepared(
+            &mut log,
+            &mut LostReplySubmitter,
+            prepared,
+            plan,
+            "destination",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.transaction.txid.as_deref(),
+            Some(txid.to_string().as_str())
+        );
+        assert_eq!(
+            outcome.transaction.status,
+            TxLifecycleState::SubmissionUnknown
+        );
+        assert_eq!(outcome.transaction.fee_zatoshis, 10_000);
+        assert!(
+            path.exists(),
+            "raw bytes must be durably stored before network I/O"
+        );
+    }
 
     fn height() -> BlockHeight {
         BlockHeight::from_u32(3_000_000)
+    }
+
+    #[test]
+    fn canonical_address_identity_is_a_tagged_hash_not_debug_text() {
+        let mut p2pkh = [7u8; 21];
+        p2pkh[0] = 0;
+        let mut p2sh = [7u8; 21];
+        p2sh[0] = 1;
+        assert_eq!(
+            transparent_address_identity(&TransparentAddress::PublicKeyHash([7; 20])),
+            p2pkh
+        );
+        assert_eq!(
+            transparent_address_identity(&TransparentAddress::ScriptHash([7; 20])),
+            p2sh
+        );
     }
 
     #[test]
@@ -955,7 +1423,7 @@ mod destination_tests {
     /// a test pass for the wrong reason. Deriving the receiver from a key
     /// and letting `zcash_address` encode it means the fixture is valid by
     /// construction, and the assertion below that it decodes proves it.
-    fn unified_address_for(network: zcash_protocol::consensus::NetworkType) -> String {
+    pub(super) fn unified_address_for(network: zcash_protocol::consensus::NetworkType) -> String {
         use zcash_address::unified::{Address, Encoding, Receiver};
 
         let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32]);

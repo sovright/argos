@@ -30,3 +30,6 @@ tracing-subscriber.workspace = true
 argos-core = { path = "../../crates/zeck-core" }
 # Scan sessions hold decoded Sprout spending keys; wiped on drop.
 zeroize.workspace = true
+
+[dev-dependencies]
+tauri = { workspace = true, features = ["test"] }

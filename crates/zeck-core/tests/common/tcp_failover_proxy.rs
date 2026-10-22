@@ -20,8 +20,6 @@
 //!
 //! Gated on `argos-network` to match the rest of the test fixtures.
 
-#![cfg(feature = "argos-network")]
-
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
