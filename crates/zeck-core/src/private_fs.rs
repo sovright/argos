@@ -9789,7 +9789,10 @@ mod tests {
             .unwrap();
         let corrupt_at = newest.sequence % 2 * 4096 + 4095;
         file.seek(SeekFrom::Start(corrupt_at)).unwrap();
-        file.write_all(&[0x7f]).unwrap();
+        let mut original = [0u8; 1];
+        file.read_exact(&mut original).unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&[original[0] ^ 0xff]).unwrap();
         file.sync_all().unwrap();
         drop(file);
 
