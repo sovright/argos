@@ -33,6 +33,7 @@ mod observation;
 mod submission;
 
 pub use crate::models::TxLifecycleState;
+pub(crate) use lifecycle::validate_transition;
 pub use log::*;
 pub use observation::*;
 pub use submission::*;

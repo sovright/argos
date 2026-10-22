@@ -24,7 +24,7 @@ pub(super) fn rejection_can_be_definitive(existing: &PersistedTransaction) -> bo
     })
 }
 
-pub(super) fn validate_transition(
+pub(crate) fn validate_transition(
     existing: &PersistedTransaction,
     state: TxLifecycleState,
     submission: Option<&SubmissionDisposition>,

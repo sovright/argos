@@ -36,7 +36,8 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 use crate::{
     broadcast::{
         resubmit_prepared_transaction, submit_prepared_transaction, PreparedTransaction,
-        TxLifecycleState, TxObservation, TxObservationState, TxObserver, TxSubmitter,
+        SubmissionDisposition, TxLifecycleState, TxObservation, TxObservationState, TxObserver,
+        TxSubmitter,
     },
     error::{ZeckError, ZeckResult},
     sprout::{self, SproutNotePlaintext},
@@ -782,6 +783,66 @@ pub(crate) fn tip_from_height(height: u64) -> Result<u32, String> {
         .ok_or_else(|| format!("implausible chain tip {height}"))
 }
 
+/// Unknown-anchor refusals in a row, with nothing yet accepted, after which
+/// the sweep stops.
+///
+/// An unknown anchor is normally about one note's witness. But a server that
+/// knows no Sprout anchor at all -- pruned, on a fork, on another chain --
+/// answers that way for every note, and each answer costs a proving run.
+/// Until something has been accepted there is no evidence the server can
+/// judge Sprout anchors, so a short run of these stops it and names the
+/// server. Spent-note refusals never count: those are genuinely per note, and
+/// the sweep tries every one.
+const UNKNOWN_ANCHOR_BREAKER: usize = 3;
+
+/// Passes submissions through and keeps the node's last reply.
+///
+/// The shared broadcast classifier only knows reasons that mean the same
+/// thing for every kind of transaction, so it leaves Sprout's per-note
+/// refusals (a spent nullifier, an unknown anchor) as an unknown outcome.
+/// The Sprout loop reads the reply itself, so one bad note is recorded as
+/// rejected instead of stopping every note after it.
+struct RecordingSubmitter<'a, N> {
+    inner: &'a mut N,
+    last_reply: Option<zcash_client_backend::proto::service::SendResponse>,
+}
+
+#[async_trait::async_trait]
+impl<N: TxSubmitter + Send> TxSubmitter for RecordingSubmitter<'_, N> {
+    async fn send_raw(
+        &mut self,
+        raw: Vec<u8>,
+    ) -> Result<zcash_client_backend::proto::service::SendResponse, tonic::Status> {
+        self.last_reply = None;
+        let reply = self.inner.send_raw(raw).await;
+        if let Ok(response) = &reply {
+            self.last_reply = Some(response.clone());
+        }
+        reply
+    }
+}
+
+/// A node reply that refuses this one note and says nothing about the rest.
+fn per_note_refusal(
+    reply: &zcash_client_backend::proto::service::SendResponse,
+) -> Option<(Refusal, String)> {
+    if reply.error_code == 0 {
+        return None;
+    }
+    let reason = if reply.error_message.trim().is_empty() {
+        format!("error code {}", reply.error_code)
+    } else {
+        reply.error_message.trim().to_owned()
+    };
+    match classify_refusal(reply.error_code, &reason) {
+        kind @ (Refusal::Spent
+        | Refusal::UnknownAnchor
+        | Refusal::PendingSpend
+        | Refusal::Evicted) => Some((kind, reason)),
+        Refusal::AlreadyAccepted | Refusal::Expired | Refusal::Other => None,
+    }
+}
+
 pub struct SproutSweepInventory<'a> {
     pub ready: Vec<&'a SpendableSproutNote>,
     pub active: Vec<SproutJournalEntry>,
@@ -1392,11 +1453,11 @@ fn note_label(index: usize, total: usize, note: &SpendableSproutNote) -> String 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sweep(
     notes: &[SpendableSproutNote],
-    node: &mut impl SweepNode,
+    node: &mut (impl SweepNode + Send),
     observer: &mut impl TxObserver,
     network: crate::ZeckNetwork,
     mut build: impl FnMut(&SpendableSproutNote, BlockHeight, BranchId) -> ZeckResult<BuiltSproutSweep>,
-    _source: NoteSource,
+    source: NoteSource,
     journal: &SweepJournal,
     mut progress: impl FnMut(String),
 ) -> SproutSweepOutcome {
@@ -1445,6 +1506,8 @@ pub(crate) async fn run_sweep(
         .map(|note| note_id(&note.outpoint))
         .collect::<HashSet<_>>();
 
+    let mut server_has_accepted = false;
+    let mut unknown_anchor_run = 0usize;
     for (index, note) in notes.iter().enumerate() {
         let label = note_label(index, total, note);
         if !ready_ids.contains(&note_id(&note.outpoint)) {
@@ -1541,6 +1604,10 @@ pub(crate) async fn run_sweep(
             ));
             break;
         }
+        let mut recorder = RecordingSubmitter {
+            inner: &mut *node,
+            last_reply: None,
+        };
         let result = {
             let mut store = journal.scoped_store(
                 JournalNoteContext {
@@ -1549,9 +1616,15 @@ pub(crate) async fn run_sweep(
                 },
                 &mut snapshot,
             );
-            submit_prepared_transaction(&mut store, node, transaction, Duration::from_secs(30))
-                .await
+            submit_prepared_transaction(
+                &mut store,
+                &mut recorder,
+                transaction,
+                Duration::from_secs(30),
+            )
+            .await
         };
+        let last_reply = recorder.last_reply.take();
         let result = match result {
             Ok(result) => result,
             Err(err) => {
@@ -1569,6 +1642,58 @@ pub(crate) async fn run_sweep(
             outcome.warnings.push(warning.clone());
             outcome.error = Some(warning);
             break;
+        }
+        if result.state == TxLifecycleState::Pending {
+            server_has_accepted = true;
+            unknown_anchor_run = 0;
+        }
+        // A refusal about this note alone: the node did not take these bytes
+        // and said why in terms of the note. Record the note as rejected and
+        // carry on; only a lost or unfamiliar reply stays unknown and stops.
+        let refusal = (result.state == TxLifecycleState::SubmissionUnknown)
+            .then(|| last_reply.as_ref().and_then(per_note_refusal))
+            .flatten();
+        if let Some((kind, reason)) = refusal {
+            let code = last_reply.as_ref().map_or(0, |reply| reply.error_code);
+            let disposition = SubmissionDisposition::DeterministicRejection {
+                code,
+                reason: reason.clone(),
+            };
+            if let Err(err) = journal.append_transition(
+                &mut snapshot,
+                result.txid,
+                TxLifecycleState::Rejected,
+                Some(&disposition),
+                None,
+            ) {
+                outcome.error = Some(format!(
+                    "{label} was refused ({reason}), but the refusal could not be recorded:                      {err}. It stays unknown; no later Sprout note was built or broadcast."
+                ));
+                break;
+            }
+            progress(format!("{label} was refused: {reason}"));
+            outcome.rejected.push(RejectedSweep {
+                outpoint: note.outpoint,
+                value: note.note.value,
+                kind,
+                source,
+                reason,
+            });
+            unknown_anchor_run = match kind {
+                Refusal::UnknownAnchor => unknown_anchor_run + 1,
+                _ => 0,
+            };
+            if !server_has_accepted && unknown_anchor_run >= UNKNOWN_ANCHOR_BREAKER {
+                outcome.error = Some(format!(
+                    "the server refused {unknown_anchor_run} notes in a row because it does \
+                     not recognise their witnesses' tree roots, and has accepted none in this \
+                     sweep. That points at the lightwalletd server (pruned, on a fork, or on \
+                     another chain) rather than the notes. The sweep stopped rather than prove \
+                     every remaining note into the same answer; try another lightwalletd server."
+                ));
+                break;
+            }
+            continue;
         }
         if result.blocks_followup_submission() {
             outcome.error = Some(format!(
@@ -3342,5 +3467,122 @@ mod tests {
         assert_eq!(builds, 1);
         assert_eq!(node.sent, raw);
         assert!(outcome.error.is_some());
+    }
+
+    fn replies(tip: u32, replies: &[(i32, &str)]) -> LifecycleNode {
+        LifecycleNode {
+            tip,
+            tip_calls: 0,
+            replies: replies
+                .iter()
+                .map(|(code, message)| {
+                    Ok(zcash_client_backend::proto::service::SendResponse {
+                        error_code: *code,
+                        error_message: (*message).to_owned(),
+                    })
+                })
+                .collect(),
+            sent: Vec::new(),
+            before_send: None,
+        }
+    }
+
+    #[test]
+    fn a_note_refused_as_spent_is_rejected_and_the_next_note_is_still_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let notes = [lifecycle_note(1_000_000, 90), lifecycle_note(2_000_000, 91)];
+        let mut node = replies(
+            120,
+            &[(-26, "bad-txns-sprout-duplicate-nullifier"), (0, "")],
+        );
+        let mut observer = LifecycleObserver::default();
+        let (outcome, builds, raw) = run_lifecycle(&notes, &mut node, &mut observer, &journal, 900);
+        assert_eq!(builds, 2, "{:?}", outcome.error);
+        assert_eq!(node.sent, raw);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].kind, Refusal::Spent);
+        assert_eq!(outcome.rejected[0].outpoint, notes[0].outpoint);
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::Rejected
+        );
+        assert_eq!(
+            outcome.transactions[1].state,
+            crate::broadcast::TxLifecycleState::Pending
+        );
+        assert_eq!(outcome.pending_zatoshis, 2_000_000 - SPROUT_SWEEP_FEE);
+        assert!(!outcome.fresh_all_mined);
+        let snapshot = journal.load_or_migrate().unwrap();
+        assert!(snapshot.ready_for_new_plan(&notes[0].outpoint));
+    }
+
+    #[test]
+    fn each_per_note_refusal_kind_is_recorded_and_carried_past() {
+        for (id, message, kind) in [
+            (92, "bad-txns-sprout-unknown-anchor", Refusal::UnknownAnchor),
+            (
+                93,
+                "transaction already spent some of its inputs",
+                Refusal::PendingSpend,
+            ),
+            (94, "zip-401 denial of service limits", Refusal::Evicted),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = lifecycle_journal(dir.path());
+            let notes = [
+                lifecycle_note(1_000_000, id),
+                lifecycle_note(2_000_000, id + 50),
+            ];
+            let mut node = replies(120, &[(-26, message), (0, "")]);
+            let mut observer = LifecycleObserver::default();
+            let (outcome, builds, _) =
+                run_lifecycle(&notes, &mut node, &mut observer, &journal, 920 + id as u32);
+            assert_eq!(builds, 2, "{message}: {:?}", outcome.error);
+            assert!(outcome.error.is_none(), "{message}: {:?}", outcome.error);
+            assert_eq!(outcome.rejected.len(), 1, "{message}");
+            assert_eq!(outcome.rejected[0].kind, kind, "{message}");
+            assert_eq!(outcome.rejected[0].reason, message);
+        }
+    }
+
+    #[test]
+    fn a_refusal_about_the_node_still_stops_the_sweep_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let notes = [lifecycle_note(1_000_000, 95), lifecycle_note(2_000_000, 96)];
+        let mut node = replies(120, &[(-1, "something unfamiliar")]);
+        let mut observer = LifecycleObserver::default();
+        let (outcome, builds, _) = run_lifecycle(&notes, &mut node, &mut observer, &journal, 950);
+        assert_eq!(builds, 1);
+        assert!(outcome.error.is_some());
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(
+            outcome.transactions[0].state,
+            crate::broadcast::TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[test]
+    fn a_run_of_unknown_anchors_with_nothing_accepted_stops_and_names_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = lifecycle_journal(dir.path());
+        let notes = [
+            lifecycle_note(1_000_000, 97),
+            lifecycle_note(1_000_000, 98),
+            lifecycle_note(1_000_000, 99),
+            lifecycle_note(1_000_000, 100),
+        ];
+        let anchor = (-26, "bad-txns-sprout-unknown-anchor");
+        let mut node = replies(120, &[anchor, anchor, anchor]);
+        let mut observer = LifecycleObserver::default();
+        let (outcome, builds, _) = run_lifecycle(&notes, &mut node, &mut observer, &journal, 970);
+        assert_eq!(builds, UNKNOWN_ANCHOR_BREAKER);
+        assert_eq!(outcome.rejected.len(), UNKNOWN_ANCHOR_BREAKER);
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("lightwalletd server")));
     }
 }
