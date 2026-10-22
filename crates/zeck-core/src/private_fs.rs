@@ -3340,6 +3340,108 @@ fn sqlite_sidecar_paths(database: &Path) -> [std::path::PathBuf; 3] {
     })
 }
 
+/// Retained proof that SQLite's WAL files were private before SQLite could
+/// read or write their first byte. Windows handles omit delete sharing, so the
+/// names cannot be replaced while SQLite opens and initializes them.
+#[derive(Debug)]
+pub(crate) struct PrivateSqliteSidecarAuthority {
+    parent: File,
+    parent_id: PrivateObjectId,
+    children: Vec<(std::path::PathBuf, File, PrivateObjectId)>,
+}
+
+impl PrivateSqliteSidecarAuthority {
+    pub(crate) fn verify_current(&self) -> io::Result<()> {
+        if private_object_id(&self.parent)? != self.parent_id {
+            return Err(invalid_lineage(
+                "retained private SQLite sidecar parent changed",
+            ));
+        }
+        for (path, retained, expected) in &self.children {
+            if private_object_id(retained)? != *expected {
+                return Err(invalid_lineage("retained private SQLite sidecar changed"));
+            }
+            let current = open_sqlite_file_shared(&self.parent, path)?;
+            if private_object_id(&current)? != *expected {
+                return Err(invalid_lineage(
+                    "private SQLite sidecar path changed while SQLite opened it",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn create_sqlite_sidecar_for_authority(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    return unix_private::create_child_file_read_append(parent, path);
+    #[cfg(windows)]
+    return windows_acl::create_child_file_for_retained_authority(parent, path);
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private SQLite sidecar creation is unsupported on this platform",
+        ))
+    }
+}
+
+fn retain_sqlite_sidecar(parent: &File, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    return unix_private::open_child_file(parent, path);
+    #[cfg(windows)]
+    return windows_acl::open_child_file_for_retained_authority(parent, path);
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private SQLite sidecar retention is unsupported on this platform",
+        ))
+    }
+}
+
+/// Create or validate WAL/SHM files before SQLite opens them, and retain their
+/// exact identities until WAL setup completes. An object that wins a create
+/// race is accepted only if it already has exact private security.
+pub(crate) fn prepare_private_sqlite_wal_sidecars(
+    parent: &File,
+    database: &Path,
+) -> io::Result<PrivateSqliteSidecarAuthority> {
+    let parent_id = private_object_id(parent)?;
+    let mut children = Vec::with_capacity(2);
+    let mut created_any = false;
+    for suffix in ["-wal", "-shm"] {
+        let mut path = database.as_os_str().to_owned();
+        path.push(suffix);
+        let path = std::path::PathBuf::from(path);
+        let retained = match create_sqlite_sidecar_for_authority(parent, &path) {
+            Ok(file) => {
+                file.sync_all()?;
+                created_any = true;
+                file
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                retain_sqlite_sidecar(parent, &path)?
+            }
+            Err(error) => return Err(error),
+        };
+        let id = private_object_id(&retained)?;
+        children.push((path, retained, id));
+    }
+    if created_any {
+        sync_private_directory(parent)?;
+    }
+    let authority = PrivateSqliteSidecarAuthority {
+        parent: parent.try_clone()?,
+        parent_id,
+        children,
+    };
+    authority.verify_current()?;
+    Ok(authority)
+}
+
 fn child_names_set(
     parent: &File,
     parent_path: &Path,
@@ -7948,6 +8050,24 @@ mod windows_acl {
         )?;
         validate_private_file(&file)?;
         PrivateSecurity::new(false)?.verify(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn create_child_file_for_retained_authority(
+        parent: &std::fs::File,
+        path: &Path,
+    ) -> io::Result<std::fs::File> {
+        let security = PrivateSecurity::new(false)?;
+        let file = nt_open_child(
+            parent,
+            path,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_CREATE,
+            security.attributes.lpSecurityDescriptor.cast_const(),
+        )?;
+        validate_private_file(&file)?;
+        security.verify(&file)?;
         Ok(file)
     }
 

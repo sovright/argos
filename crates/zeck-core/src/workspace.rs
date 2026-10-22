@@ -558,6 +558,8 @@ fn private_root_for_wallet_database(path: &Path) -> std::io::Result<&Path> {
 fn open_authorized_wallet_connection(
     path: &Path,
     flags: rusqlite::OpenFlags,
+    prepare_wal_sidecars: bool,
+    initialize: impl FnOnce(&rusqlite::Connection, bool) -> Result<(), rusqlite::Error>,
 ) -> Result<rusqlite::Connection, rusqlite::Error> {
     fn sqlite_io(error: std::io::Error) -> rusqlite::Error {
         rusqlite::Error::ToSqlConversionFailure(Box::new(error))
@@ -588,18 +590,47 @@ fn open_authorized_wallet_connection(
         };
         sidecars.push((sidecar, existed));
     }
+    let wal_authority = if prepare_wal_sidecars {
+        Some(private_fs::prepare_private_sqlite_wal_sidecars(&parent, path).map_err(sqlite_io)?)
+    } else {
+        None
+    };
     private_fs::ensure_private_sqlite_file(&root, &parent, parent_path, path).map_err(sqlite_io)?;
+    let database_was_empty = fs::metadata(path).map_err(sqlite_io)?.len() == 0;
     let connection = rusqlite::Connection::open_with_flags(path, flags)?;
-    for (sidecar, existed) in sidecars {
-        match fs::symlink_metadata(&sidecar) {
-            Ok(_) if existed => {}
-            Ok(_) => {
-                private_fs::secure_new_private_child_file(&parent, &sidecar).map_err(sqlite_io)?;
+    let initialize_result = initialize(&connection, database_was_empty);
+    let sidecar_result = if let Some(authority) = wal_authority {
+        authority
+            .verify_current()
+            .map_err(sqlite_io)
+            .and_then(|()| {
+                let (journal, existed) = &sidecars[0];
+                match fs::symlink_metadata(journal) {
+                    Ok(_) if *existed => Ok(()),
+                    Ok(_) => private_fs::secure_new_private_child_file(&parent, journal)
+                        .map_err(sqlite_io),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(sqlite_io(error)),
+                }
+            })
+    } else {
+        let mut result = Ok(());
+        for (sidecar, existed) in sidecars {
+            let checked = match fs::symlink_metadata(&sidecar) {
+                Ok(_) if existed => Ok(()),
+                Ok(_) => private_fs::secure_new_private_child_file(&parent, &sidecar),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = checked {
+                result = Err(sqlite_io(error));
+                break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(sqlite_io(error)),
         }
-    }
+        result
+    };
+    sidecar_result?;
+    initialize_result?;
     Ok(connection)
 }
 
@@ -609,6 +640,8 @@ pub(crate) fn open_wallet_connection_read_only(
     open_authorized_wallet_connection(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        false,
+        |_, _| Ok(()),
     )
 }
 
@@ -681,18 +714,55 @@ fn open_wallet_connection_for_listing(
 /// `synchronous=FULL`, no busy timeout). All production opens of `wallet.sqlite`
 /// should come through [`open_wallet_db`] instead.
 fn open_tuned_wallet_connection(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
-    let conn = open_authorized_wallet_connection(
+    open_authorized_wallet_connection(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    // `WalletDb::from_connection` requires the array module to be loaded.
-    rusqlite::vtab::array::load_module(&conn)?;
-    conn.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
-    // `PRAGMA journal_mode` returns the resulting mode as a row, so it needs
-    // the query form rather than `pragma_update`.
-    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    Ok(conn)
+        true,
+        |conn, database_was_empty| {
+            // `WalletDb::from_connection` requires the array module to be loaded.
+            rusqlite::vtab::array::load_module(conn)?;
+            conn.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
+            let journal_mode: String =
+                conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+            if !journal_mode.eq_ignore_ascii_case("wal") {
+                if !database_was_empty {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "a non-empty private wallet database is not already in WAL mode",
+                        ),
+                    )));
+                }
+                // SQLite uses a rollback-journal transaction to enter WAL
+                // mode. This is allowed only while the newly staged database
+                // is still empty, before it can contain wallet material. WAL
+                // and SHM are already private and retained before the change.
+                let resulting_mode =
+                    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                if !resulting_mode.eq_ignore_ascii_case("wal") {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "SQLite refused WAL mode for the private wallet database and remained in {resulting_mode} mode"
+                            ),
+                        ),
+                    )));
+                }
+            }
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            // A zero-byte database can enter WAL mode without opening its WAL
+            // object. Exhausting a schema read forces the pager to open and
+            // retain the exact pre-created WAL/SHM files before Argos releases
+            // its no-delete authority handles.
+            let mut statement = conn.prepare("PRAGMA table_list")?;
+            let mut rows = statement.query([])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        },
+    )
 }
 
 /// Opens a wallet database with the connection tuning from
@@ -2438,6 +2508,35 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_rollback_database_is_refused_without_a_wal_transition() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let raw = rusqlite::Connection::open(&path).expect("open rollback-mode fixture");
+        raw.execute_batch("CREATE TABLE rollback_fixture(value INTEGER);")
+            .expect("write rollback-mode fixture");
+        let mode: String = raw
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("read fixture journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        drop(raw);
+
+        let error = super::open_tuned_wallet_connection(&path)
+            .expect_err("nonempty rollback-mode databases must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("non-empty private wallet database is not already in WAL mode"),
+            "unexpected refusal: {error}"
+        );
+
+        let raw = rusqlite::Connection::open(&path).expect("reopen unchanged fixture");
+        let mode: String = raw
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("re-read fixture journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+    }
+
+    #[test]
     fn listing_wallet_connection_is_immutable_and_query_only() {
         let tempdir = tempfile::tempdir().expect("temp dir");
         let path = private_database_path(&tempdir);
@@ -2484,6 +2583,22 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("temp dir");
         let path = private_database_path(&tempdir);
         let writer = super::open_tuned_wallet_connection(&path).expect("open writer connection");
+        #[cfg(windows)]
+        {
+            let parent_path = path.parent().expect("database parent");
+            let parent = crate::private_fs::open_private_sqlite_parent(parent_path)
+                .expect("open retained private parent");
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_owned();
+                sidecar.push(suffix);
+                let sidecar = PathBuf::from(sidecar);
+                let replacement = sidecar.with_extension(format!("{suffix}.replacement"));
+                crate::private_fs::rename_child_file(&parent, &sidecar, &replacement)
+                    .expect_err("SQLite must keep its live WAL sidecar name pinned");
+                assert!(sidecar.exists());
+                assert!(!replacement.exists());
+            }
+        }
         writer
             .execute_batch(
                 "CREATE TABLE held_open(value INTEGER); INSERT INTO held_open VALUES (7);",
