@@ -8999,9 +8999,12 @@ mod windows_acl {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
-            .access_mode(
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | DELETE | READ_CONTROL,
-            )
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | READ_CONTROL)
+            // Withholding delete sharing pins the directory pathname and
+            // rejects any preheld delete-capable handle. The lease itself
+            // does not need DELETE access: mutations use exact child handles.
+            // Omitting DELETE here also lets independent verified leases on
+            // the same namespace coexist.
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let directory = options.open(path)?;
@@ -10528,6 +10531,10 @@ mod windows_tests {
         )
         .unwrap();
         access.replace_child(b"spending-key checkpoint").unwrap();
+        // checkpoint_generation deliberately establishes a fresh authority.
+        // Release the writer authority so its retained namespace lock does
+        // not mask the DACL failure with a Windows sharing violation.
+        drop(access);
         let file = OpenOptions::new()
             .read(true)
             .access_mode(READ_CONTROL | WRITE_DAC)
