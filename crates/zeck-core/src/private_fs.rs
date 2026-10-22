@@ -1628,6 +1628,7 @@ impl Drop for SqliteCleanupHold {
 /// policy. Existing unmarked roots are never blessed in place.
 #[derive(Debug)]
 pub(crate) struct PrivateRootLineageLease {
+    publication_parent: File,
     root: File,
     path: std::path::PathBuf,
     context_path: std::path::PathBuf,
@@ -1642,30 +1643,19 @@ impl PrivateRootLineageLease {
     }
 
     pub(crate) fn verify_current(&self) -> io::Result<()> {
+        if private_object_id(&self.publication_parent)? != self.publication_parent_id {
+            return Err(invalid_lineage(
+                "retained workspace publication parent changed",
+            ));
+        }
         if private_object_id(&self.root)? != self.id {
             return Err(invalid_lineage("retained private workspace root changed"));
         }
-        let parent_path = self.path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private workspace root has no parent",
-            )
-        })?;
-        let parent = open_publication_parent(parent_path)?;
-        if private_object_id(&parent)? != self.publication_parent_id {
+        let current = open_child_directory_for_identity(&self.publication_parent, &self.path)?;
+        if private_object_id(&current)? != self.id {
             return Err(invalid_lineage(
-                "workspace publication parent changed after lineage verification",
+                "private workspace root path no longer names the retained object",
             ));
-        }
-        #[cfg(unix)]
-        {
-            let current = unix_private::open_directory(&self.path)?;
-            unix_private::verify_private_directory(&current)?;
-            if private_object_id(&current)? != self.id {
-                return Err(invalid_lineage(
-                    "private workspace root path no longer names the retained object",
-                ));
-            }
         }
         Ok(())
     }
@@ -2864,6 +2854,7 @@ fn verify_private_workspace_lineage_from_handles(
         )));
     }
     Ok(PrivateRootLineageLease {
+        publication_parent: publication_parent.try_clone()?,
         root,
         path: private_root.to_path_buf(),
         context_path: private_root.to_path_buf(),
@@ -3364,8 +3355,9 @@ fn initialize_staged_private_root(
     staging_leaf: &Path,
     staging_database: &Path,
     context_root: &Path,
-    publication_parent_id: &PrivateObjectId,
+    publication_parent: &File,
 ) -> io::Result<PrivateObjectId> {
+    let publication_parent_id = private_object_id(publication_parent)?;
     create_private_dir_all(staging_leaf)?;
     let root = open_private_directory_lease(staging_root)?;
     let root_id = private_object_id(&root)?;
@@ -3384,11 +3376,12 @@ fn initialize_staged_private_root(
     #[cfg(not(windows))]
     let _ = &root_marker_id;
     let lineage = PrivateRootLineageLease {
+        publication_parent: publication_parent.try_clone()?,
         root,
         path: staging_root.to_path_buf(),
         context_path: context_root.to_path_buf(),
         id: root_id.clone(),
-        publication_parent_id: publication_parent_id.clone(),
+        publication_parent_id,
         root_marker_id,
     };
     let leaf = open_private_directory_lease(staging_leaf)?;
@@ -3438,7 +3431,6 @@ fn ensure_private_workspace_lineage_impl(
             #[cfg(windows)]
             let _lineage_guard = windows_lineage::lock(&context_hash)?;
             let publication_parent = open_publication_parent(publish_parent)?;
-            let publication_parent_id = private_object_id(&publication_parent)?;
             let names = child_names_set(&publication_parent, publish_parent)?;
             if names.contains(private_root.file_name().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "private root has no file name")
@@ -3471,7 +3463,7 @@ fn ensure_private_workspace_lineage_impl(
                 &staging_leaf,
                 &staging_database,
                 private_root,
-                &publication_parent_id,
+                &publication_parent,
             )?;
             let staging = open_child_directory_for_mutation(&publication_parent, &staging_root)?;
             if private_object_id(&staging)? != staged_id {
