@@ -578,6 +578,39 @@ test("late wallet reply cannot restore cleared secret state", async () => {
   assert.equal(h.$("sprout-sweep-run").disabled, true);
 });
 
+test("abandoning during wallet Sprout execution cannot start a second sweep", async () => {
+  const execution = deferred();
+  let executions = 0;
+  const h = harness((command, _args, fallback) => {
+    if (command === "execute_wallet_sprout_sweep") {
+      executions++;
+      return execution.promise;
+    }
+    return fallback();
+  });
+  await h.open("/fixture/old.dat");
+  h.$("sprout-destination").value = "zs-old";
+  h.$("sprout-destination").dispatch("change");
+  await flush();
+  const first = h.sweepConfirmed();
+  await flush();
+  assert.equal(executions, 1);
+  assert.equal(h.peek("walletSproutExecutionPending"), true);
+
+  h.abandonWallet();
+  await h.open("/fixture/new.dat");
+  h.$("sprout-destination").value = "zs-new";
+  h.$("sprout-destination").dispatch("change");
+  await flush();
+  await h.sweepConfirmed();
+  assert.equal(executions, 1);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+
+  execution.resolve(sproutLifecycleReport([]));
+  await first;
+  assert.equal(h.peek("walletSproutExecutionPending"), false);
+});
+
 for (const fails of [false, true]) {
   test(`older wallet inspection ${fails ? "failure" : "success"} cannot replace a newer selection`, async () => {
     const old = deferred();

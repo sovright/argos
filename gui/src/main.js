@@ -424,6 +424,7 @@ let walletSproutReview = null;
 let walletSproutReviewDestination = null;
 let walletSproutReviewConfig = null;
 let walletSproutProposalGeneration = 0;
+let walletSproutExecutionPending = false;
 
 // Clear plaintext authority as soon as the backend has accepted it, and from
 // every exit that abandons the current recovery attempt. The browser event
@@ -510,7 +511,7 @@ function updateWalletSproutSweepButton() {
     walletSproutReviewDestination !== $("sprout-destination").value.trim() ||
     !walletSproutConfigMatches(walletSproutReviewConfig) ||
     sproutPreviewWallet !== walletFile || !$("sprout-sweep-confirm").checked ||
-    sproutSweepSource !== null;
+    walletSproutExecutionPending;
 }
 
 function renderWalletSummary(summary) {
@@ -888,7 +889,7 @@ async function showSproutSweep() {
 }
 
 async function runSproutSweep() {
-  if (sproutSweepSource) return;
+  if (walletSproutExecutionPending) return;
   const source = walletFile;
   const destination = $("sprout-destination").value.trim();
   if (!destination) {
@@ -914,6 +915,7 @@ async function runSproutSweep() {
 
   const button = $("sprout-sweep-run");
   try {
+    walletSproutExecutionPending = true;
     sproutSweepSource = source;
     button.disabled = true;
     $("sprout-sweep-results").innerHTML = "";
@@ -947,6 +949,7 @@ async function runSproutSweep() {
     button.disabled = false;
   } finally {
     sproutSweepSource = null;
+    walletSproutExecutionPending = false;
     if (walletFile === source && walletSproutReview?.proposal_id === proposalId) {
       invalidateWalletSproutReview();
     }

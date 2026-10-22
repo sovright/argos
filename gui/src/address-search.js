@@ -77,8 +77,12 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   document.addEventListener("argos:clear-transient-secrets", () => {
+    const id = searchId;
     generation++;
+    stopPolling();
     clearSecrets();
+    if (id) beginCleanup(id);
+    searchId = null;
   });
 
   function updateProfileScope() {
