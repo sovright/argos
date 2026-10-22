@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     fs::OpenOptions,
     io::{Seek, Write},
@@ -9,6 +9,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zcash_primitives::transaction::TxId;
 
 use super::{
@@ -17,11 +18,26 @@ use super::{
 };
 use crate::{
     error::{ZeckError, ZeckResult},
+    private_fs::{open_private_file, NamespaceLease, PrivateOpenMode, RetainedNamespaceChild},
     workspace::append_private_file,
 };
 
 pub const BROADCAST_LOG_SCHEMA_VERSION: u32 = 1;
 pub const BROADCAST_LOG_FILE_NAME: &str = "broadcasts-v1.jsonl";
+pub(super) const LEGACY_IMPORT_MANIFEST_V1_FILE_NAME: &str = "legacy-imports-v1.json";
+pub(super) const LEGACY_IMPORT_MANIFEST_FILE_NAME: &str = "legacy-imports-v2.jsonl";
+
+#[derive(Default, Serialize, Deserialize)]
+struct LegacyImportManifest {
+    /// Canonical source path to the exact bytes imported from that source.
+    sources: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyImportRecord {
+    source: String,
+    digest: String,
+}
 
 /// The lock lives beside the workspace, so renaming or deleting that
 /// workspace cannot unlink the lock inode while a submitter holds it.
@@ -77,13 +93,69 @@ pub(super) enum BroadcastLogEvent {
     },
 }
 
+impl BroadcastLogEvent {
+    fn txid(&self) -> TxId {
+        match self {
+            Self::Prepared { txid, .. } | Self::StateChanged { txid, .. } => {
+                TxId::from_bytes(*txid)
+            }
+        }
+    }
+}
+
+fn ordered_event_lines(bytes: &[u8]) -> ZeckResult<Vec<(TxId, Vec<u8>)>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(ZeckError::Storage(
+            "incomplete broadcast log during legacy import".to_owned(),
+        ));
+    }
+    bytes[..bytes.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .map(|line| {
+            let event: BroadcastLogEvent = serde_json::from_slice(line).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "invalid broadcast event during legacy import: {err}"
+                ))
+            })?;
+            Ok((event.txid(), line.to_vec()))
+        })
+        .collect()
+}
+
+fn event_lines_by_txid(bytes: &[u8]) -> ZeckResult<HashMap<TxId, Vec<Vec<u8>>>> {
+    let mut grouped: HashMap<TxId, Vec<Vec<u8>>> = HashMap::new();
+    for (txid, line) in ordered_event_lines(bytes)? {
+        grouped.entry(txid).or_default().push(line);
+    }
+    Ok(grouped)
+}
+
 pub struct DurableBroadcastLog {
     path: PathBuf,
     latest: HashMap<TxId, PersistedTransaction>,
     write_failed: bool,
     // SQLite owns an OS file lock, released by Drop or process death. The
     // sidecar never stores transaction data and cannot leave a stale lock.
-    _process_lock: rusqlite::Connection,
+    _process_lock: Option<rusqlite::Connection>,
+    // The network registry is opened through the NetworkOperationGuard's
+    // retained namespace authority. Every registry and import-manifest read
+    // or replacement is then relative to that exact directory handle.
+    namespace: Option<NamespaceLease>,
+    compatibility_lock: Option<RetainedNamespaceChild>,
+    // A network registry keeps every legacy source locked until the caller's
+    // entire scan, review, submission, reconciliation, or deletion ends.
+    // Otherwise an older binary can append to a local journal just after its
+    // one-time import (or after an absent-JSONL sidecar was overlooked).
+    held_legacy_sources: Vec<DurableBroadcastLog>,
+}
+
+/// Keeps old workspace/standalone journal locks alive while a route reopens
+/// the network registry for its individual submissions.
+pub(crate) struct LegacyBroadcastGuards {
+    _held: Vec<DurableBroadcastLog>,
 }
 
 impl DurableBroadcastLog {
@@ -171,32 +243,14 @@ impl DurableBroadcastLog {
     pub fn open(path: impl AsRef<Path>) -> ZeckResult<Self> {
         let path = path.as_ref().to_path_buf();
         let lock_path = broadcast_lock_path(&path)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            options.mode(0o600);
-            options.open(&lock_path).map_err(|err| {
+        drop(
+            open_private_file(&lock_path, PrivateOpenMode::Append).map_err(|err| {
                 ZeckError::Storage(format!(
                     "opening broadcast lock {}: {err}",
                     lock_path.display()
                 ))
-            })?;
-            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "securing broadcast lock {}: {err}",
-                    lock_path.display()
-                ))
-            })?;
-        }
-        #[cfg(not(unix))]
-        options.open(&lock_path).map_err(|err| {
-            ZeckError::Storage(format!(
-                "opening broadcast lock {}: {err}",
-                lock_path.display()
-            ))
-        })?;
+            })?,
+        );
         let process_lock = rusqlite::Connection::open(&lock_path).map_err(|err| {
             ZeckError::Storage(format!(
                 "opening broadcast lock {}: {err}",
@@ -215,25 +269,321 @@ impl DurableBroadcastLog {
             path,
             latest: HashMap::new(),
             write_failed: false,
-            _process_lock: process_lock,
+            _process_lock: Some(process_lock),
+            namespace: None,
+            compatibility_lock: None,
+            held_legacy_sources: Vec::new(),
         };
         log.replay_from_disk()?;
         Ok(log)
     }
 
+    pub(crate) fn open_in_namespace(
+        path: impl AsRef<Path>,
+        namespace: &NamespaceLease,
+        compatibility_lock: &RetainedNamespaceChild,
+    ) -> ZeckResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        namespace.require_child(&path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "broadcast registry {} is outside the retained namespace: {err}",
+                path.display()
+            ))
+        })?;
+        namespace.verify_current().map_err(|err| {
+            ZeckError::Storage(format!(
+                "broadcast registry namespace changed before open: {err}"
+            ))
+        })?;
+        let mut log = Self {
+            path,
+            latest: HashMap::new(),
+            write_failed: false,
+            _process_lock: None,
+            namespace: Some(namespace.try_clone_authority().map_err(|err| {
+                ZeckError::Storage(format!("retaining broadcast registry namespace: {err}"))
+            })?),
+            compatibility_lock: Some(namespace.clone_retained_child(compatibility_lock).map_err(
+                |err| ZeckError::Storage(format!("retaining workspace compatibility lock: {err}")),
+            )?),
+            held_legacy_sources: Vec::new(),
+        };
+        log.replay_from_disk()?;
+        log.verify_namespace()?;
+        Ok(log)
+    }
+
+    fn verify_namespace(&self) -> ZeckResult<()> {
+        if let Some(namespace) = &self.namespace {
+            namespace.verify_current().map_err(|err| {
+                ZeckError::Storage(format!("broadcast registry namespace was replaced: {err}"))
+            })?;
+            if let Some(lock) = &self.compatibility_lock {
+                lock.verify_current().map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "workspace compatibility lock was replaced while held: {err}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_path(&self, path: &Path) -> ZeckResult<Option<Vec<u8>>> {
+        self.verify_namespace()?;
+        let result = if let Some(namespace) = &self.namespace {
+            namespace.read_child(path)
+        } else {
+            fs::read(path)
+        };
+        let value = match result {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => Err(ZeckError::Storage(format!(
+                "reading {}: {err}",
+                path.display()
+            )))?,
+        };
+        self.verify_namespace()?;
+        Ok(value)
+    }
+
+    fn append_line_to_path(&self, path: &Path, line: &[u8]) -> ZeckResult<()> {
+        self.verify_namespace()?;
+        if let Some(namespace) = &self.namespace {
+            let current = match namespace.read_child_version(path) {
+                Ok((bytes, object_id)) => Some((bytes, object_id)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(ZeckError::Storage(format!(
+                        "reading {} before append: {err}",
+                        path.display()
+                    )))
+                }
+            };
+            let expected = current
+                .as_ref()
+                .map(|(bytes, object_id)| (object_id, bytes.as_slice()));
+            let mut suffix = line.to_vec();
+            suffix.push(b'\n');
+            namespace
+                .append_child_if_unchanged(path, expected, &suffix)
+                .map_err(|err| {
+                    ZeckError::Storage(format!("appending {}: {err}", path.display()))
+                })?;
+            self.verify_namespace()
+        } else {
+            append_private_file(path, line)
+        }
+    }
+
+    /// Lock a legacy source even when its JSONL does not exist yet. If bytes
+    /// exist, import them while still holding that exact source lock. A
+    /// missing manifest after a crash is safe to recover because each source
+    /// transaction must be an exact event prefix of the network registry.
+    pub(crate) fn hold_legacy_source(&mut self, source_path: &Path) -> ZeckResult<()> {
+        self.hold_legacy_source_before_lock(source_path, || {})
+    }
+
+    pub(super) fn hold_legacy_source_before_lock<F: FnOnce()>(
+        &mut self,
+        source_path: &Path,
+        before_lock: F,
+    ) -> ZeckResult<()> {
+        if self.write_failed {
+            return Err(ZeckError::Storage(format!(
+                "broadcast log {} needs reopening after a failed write",
+                self.path.display()
+            )));
+        }
+        let source_path = source_path.to_path_buf();
+        if source_path == self.path {
+            return Err(ZeckError::Storage(
+                "cannot import broadcast log into itself".to_owned(),
+            ));
+        }
+        let source = if let Some(index) = self
+            .held_legacy_sources
+            .iter()
+            .position(|source| source.path == source_path)
+        {
+            self.held_legacy_sources.swap_remove(index)
+        } else {
+            before_lock();
+            Self::open(&source_path)?
+        };
+        // Inspect only after acquiring the exact source sidecar. An older
+        // writer could create its first JSONL between a pre-lock absent stat
+        // and this acquisition; that newly persisted Unknown must be imported.
+        let present = match fs::symlink_metadata(&source_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+            Ok(_) => {
+                return Err(ZeckError::Storage(format!(
+                    "legacy broadcast log {} must be a regular file",
+                    source_path.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(ZeckError::Storage(format!(
+                    "inspecting legacy log {}: {err}",
+                    source_path.display()
+                )));
+            }
+        };
+        let result = if present {
+            self.import_locked_legacy_log(&source_path, &source)
+        } else {
+            Ok(())
+        };
+        self.held_legacy_sources.push(source);
+        result
+    }
+
+    /// Copy an existing legacy journal into this locked network registry.
+    /// Kept for in-crate callers and fixture tests; the source remains locked.
+    pub(crate) fn import_legacy_log(&mut self, source_path: &Path) -> ZeckResult<()> {
+        if !source_path.is_file() {
+            return Err(ZeckError::Storage(format!(
+                "legacy broadcast log {} is missing",
+                source_path.display()
+            )));
+        }
+        self.hold_legacy_source(source_path)
+    }
+
+    pub(crate) fn into_legacy_source_guards(mut self) -> LegacyBroadcastGuards {
+        let held = std::mem::take(&mut self.held_legacy_sources);
+        LegacyBroadcastGuards { _held: held }
+    }
+
+    fn import_locked_legacy_log(
+        &mut self,
+        source_path: &Path,
+        source: &DurableBroadcastLog,
+    ) -> ZeckResult<()> {
+        let source_bytes = source.read_path(source_path)?.ok_or_else(|| {
+            ZeckError::Storage(format!(
+                "legacy broadcast log {} is missing",
+                source_path.display()
+            ))
+        })?;
+        let source_digest = format!("{:x}", Sha256::digest(&source_bytes));
+        let registry_parent = self
+            .path
+            .parent()
+            .ok_or_else(|| ZeckError::Storage("broadcast registry has no directory".to_owned()))?;
+        let legacy_manifest_path = registry_parent.join(LEGACY_IMPORT_MANIFEST_V1_FILE_NAME);
+        let manifest_path = registry_parent.join(LEGACY_IMPORT_MANIFEST_FILE_NAME);
+        let legacy_manifest: LegacyImportManifest = match self.read_path(&legacy_manifest_path)? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "invalid legacy import manifest {}: {err}",
+                    legacy_manifest_path.display()
+                ))
+            })?,
+            None => LegacyImportManifest::default(),
+        };
+        let mut imported_sources = legacy_manifest.sources;
+        if let Some(bytes) = self.read_path(&manifest_path)? {
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                return Err(ZeckError::Storage(format!(
+                    "incomplete legacy import manifest {}",
+                    manifest_path.display()
+                )));
+            }
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let record: LegacyImportRecord = serde_json::from_slice(line).map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "invalid legacy import record {}: {err}",
+                        manifest_path.display()
+                    ))
+                })?;
+                match imported_sources.get(&record.source) {
+                    Some(previous) if previous != &record.digest => {
+                        return Err(ZeckError::Storage(format!(
+                            "conflicting legacy import records for {}",
+                            record.source
+                        )))
+                    }
+                    Some(_) => {}
+                    None => {
+                        imported_sources.insert(record.source, record.digest);
+                    }
+                }
+            }
+        }
+        let source_key = source_path.to_string_lossy().into_owned();
+        if let Some(previous_digest) = imported_sources.get(&source_key) {
+            if previous_digest != &source_digest {
+                return Err(ZeckError::Storage(format!(
+                    "legacy broadcast log {} changed after import",
+                    source_path.display()
+                )));
+            }
+        }
+
+        let registry_bytes = self.read_path(&self.path)?.unwrap_or_default();
+        let source_events = event_lines_by_txid(&source_bytes)?;
+        let registry_events = event_lines_by_txid(&registry_bytes)?;
+        for (txid, source_lines) in &source_events {
+            if let Some(registry_lines) = registry_events.get(txid) {
+                if !registry_lines.starts_with(source_lines)
+                    && !source_lines.starts_with(registry_lines)
+                {
+                    return Err(ZeckError::Storage(format!(
+                        "conflicting legacy broadcast history for {txid} in {}",
+                        source_path.display()
+                    )));
+                }
+                if source.latest(*txid).is_none() || self.latest(*txid).is_none() {
+                    return Err(ZeckError::Storage(format!(
+                        "missing broadcast history for {txid} during legacy import"
+                    )));
+                }
+            }
+        }
+        let mut seen_by_txid = HashMap::<TxId, usize>::new();
+        let mut appended = false;
+        for (txid, line) in ordered_event_lines(&source_bytes)? {
+            let seen = seen_by_txid.entry(txid).or_default();
+            let existing = registry_events.get(&txid).map_or(0, Vec::len);
+            if *seen >= existing {
+                if let Err(err) = self.append_line_to_path(&self.path, &line) {
+                    self.write_failed = true;
+                    return Err(err);
+                }
+                appended = true;
+            }
+            *seen += 1;
+        }
+        if appended {
+            if let Err(err) = self.replay_from_disk() {
+                self.write_failed = true;
+                return Err(err);
+            }
+        }
+        if !imported_sources.contains_key(&source_key) {
+            let bytes = serde_json::to_vec(&LegacyImportRecord {
+                source: source_key,
+                digest: source_digest,
+            })
+            .map_err(|err| {
+                ZeckError::Serialization(format!("serializing legacy import record: {err}"))
+            })?;
+            self.append_line_to_path(&manifest_path, &bytes)?;
+        }
+        self.verify_namespace()?;
+        Ok(())
+    }
+
     fn replay_from_disk(&mut self) -> ZeckResult<()> {
         self.latest.clear();
         let path = self.path.clone();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(err) => {
-                return Err(ZeckError::Storage(format!(
-                    "reading {}: {err}",
-                    path.display()
-                )))
-            }
-        };
+        let bytes = self.read_path(&path)?.unwrap_or_default();
         let bytes = self.repair_unterminated_tail(bytes)?;
         if bytes.is_empty() {
             return Ok(());
@@ -274,7 +624,9 @@ impl DurableBroadcastLog {
     /// appended as one buffer and acknowledged only after a sync, so:
     ///
     /// - a final fragment that does not parse as an event was never
-    ///   acknowledged; it is truncated away (the earlier synced state stands);
+    ///   acknowledged; standalone logs truncate it away so the earlier synced
+    ///   state stands. Namespace-held logs refuse it until the namespace can
+    ///   perform an exact replacement transition;
     /// - a final event that parses was fully written; its newline is added so
     ///   the next append starts on a clean line.
     ///
@@ -289,6 +641,37 @@ impl DurableBroadcastLog {
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |index| index + 1);
         let complete = serde_json::from_slice::<BroadcastLogEvent>(&bytes[tail_start..]).is_ok();
+        if let Some(namespace) = &self.namespace {
+            if !complete {
+                return Err(ZeckError::Storage(format!(
+                    "incomplete broadcast log at {}: the retained private namespace cannot discard a torn final event without an exact replacement transition",
+                    self.path.display()
+                )));
+            }
+            let (current, object_id) = namespace.read_child_version(&self.path).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "reading {} before tail repair: {err}",
+                    self.path.display()
+                ))
+            })?;
+            if current != bytes {
+                return Err(ZeckError::Storage(format!(
+                    "broadcast log {} changed before tail repair",
+                    self.path.display()
+                )));
+            }
+            namespace
+                .append_child_if_unchanged(&self.path, Some((&object_id, &current)), b"\n")
+                .map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "terminating final event in {}: {err}",
+                        self.path.display()
+                    ))
+                })?;
+            self.verify_namespace()?;
+            bytes.push(b'\n');
+            return Ok(bytes);
+        }
         let file = OpenOptions::new()
             .write(true)
             .open(&self.path)
@@ -324,6 +707,7 @@ impl DurableBroadcastLog {
     }
 
     pub(super) fn append_event(&mut self, event: BroadcastLogEvent) -> ZeckResult<()> {
+        self.verify_namespace()?;
         if self.write_failed {
             return Err(ZeckError::Storage(format!(
                 "broadcast log {} needs reopening after a failed write",
@@ -334,10 +718,35 @@ impl DurableBroadcastLog {
         let bytes = serde_json::to_vec(&event).map_err(|err| {
             ZeckError::Serialization(format!("serializing broadcast log event: {err}"))
         })?;
-        if let Err(err) = append_private_file(&self.path, &bytes) {
+        let write_result = if let Some(namespace) = &self.namespace {
+            let current = match namespace.read_child_version(&self.path) {
+                Ok((bytes, object_id)) => Some((bytes, object_id)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(ZeckError::Storage(format!(
+                        "reading {} before append: {err}",
+                        self.path.display()
+                    )))
+                }
+            };
+            let mut suffix = bytes;
+            suffix.push(b'\n');
+            let expected = current
+                .as_ref()
+                .map(|(bytes, object_id)| (object_id, bytes.as_slice()));
+            namespace
+                .append_child_if_unchanged(&self.path, expected, &suffix)
+                .map_err(|err| {
+                    ZeckError::Storage(format!("appending {}: {err}", self.path.display()))
+                })
+        } else {
+            append_private_file(&self.path, &bytes)
+        };
+        if let Err(err) = write_result {
             self.write_failed = true;
             return Err(err);
         }
+        self.verify_namespace()?;
         let applied = self.apply_event(event, false);
         if applied.is_err() {
             self.write_failed = true;

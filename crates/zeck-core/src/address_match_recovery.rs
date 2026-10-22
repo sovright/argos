@@ -372,6 +372,11 @@ mod tests {
     #[test]
     fn session_round_trip_retains_coordinates_without_seed() {
         let dir = tempfile::tempdir().unwrap();
+        let private_root = dir.path().join("private-session");
+        let root = private_root.join("birthday-test/scope-test");
+        let database = root.join("wallet.sqlite");
+        crate::private_fs::ensure_private_workspace_lineage(&private_root, &root, &database)
+            .unwrap();
         let coordinates = MatchCoordinates {
             pool: DiscoveryPool::Sapling,
             account: 8,
@@ -384,15 +389,15 @@ mod tests {
         let meta =
             SessionMetadata::new_in_progress("match".to_owned(), ZeckNetwork::Mainnet, 1, None, 2)
                 .with_match_coordinates(Some(coordinates.clone()));
-        write_session_metadata(dir.path(), &meta).unwrap();
+        write_session_metadata(&root, &meta).unwrap();
         assert_eq!(
-            read_session_metadata(dir.path())
+            read_session_metadata(&root)
                 .unwrap()
                 .unwrap()
                 .match_coordinates,
             Some(coordinates)
         );
-        let json = std::fs::read_to_string(dir.path().join("session.json")).unwrap();
+        let json = std::fs::read_to_string(root.join("session.json")).unwrap();
         assert!(!json.contains("seed"));
         assert!(!json.contains("passphrase"));
     }

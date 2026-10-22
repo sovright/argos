@@ -620,7 +620,7 @@ where
     let mut signing_set = TransparentSigningSet::new();
     let mut pubkey_for_address = std::collections::HashMap::new();
     for key in keys {
-        let pubkey = signing_set.add_key(key.secret);
+        let pubkey = signing_set.add_key(key.signing_key_copy());
         pubkey_for_address.insert(key.address, pubkey);
     }
 
@@ -1161,10 +1161,8 @@ mod sweep_tests {
     async fn reviewed_transparent_fee_is_checked_against_the_built_plan_before_network() {
         use crate::broadcast::DurableBroadcastLog;
 
-        let key = crate::imported::ImportedTransparentKey {
-            secret: secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap(),
-            address: addr(1),
-        };
+        let mut secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let key = crate::imported::ImportedTransparentKey::new(&mut secret, addr(1));
         let utxos = vec![utxo(addr(1), 1_000_000, 9)];
         let built = plan_sweep(&MAIN_NETWORK, height(), &utxos)
             .unwrap()

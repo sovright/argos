@@ -18,7 +18,7 @@ Long syncs against public lightwalletd endpoints will regularly receive HTTP/2 G
 ### Tauri frontend
 - Uses `withGlobalTauri: true` — access Tauri APIs via `window.__TAURI__.core.invoke` and `window.__TAURI__.event.listen`, NOT bare ES module imports
 - No bundler — `<script src="./main.js">` not `type="module"`
-- Default data directory is resolved at runtime via `default_data_dir` Tauri command (maps to `AppDataDir/workspace`). Do NOT write workspace files inside `src-tauri/` or the Tauri dev watcher will trigger a rebuild mid-scan
+- Default data directory is resolved at runtime via `default_data_dir` Tauri command (`AppDataDir/workspace`, or `workspace-v2` when the old default is unmarked and must be preserved). Do NOT write workspace files inside `src-tauri/` or the Tauri dev watcher will trigger a rebuild mid-scan
 
 ### Scan architecture
 
@@ -265,19 +265,19 @@ planted checkpoint self-defeating. Parsed evidence is cached in
 `ChainSpendsCache`, keyed by path and network and validated by size and
 mtime, because the GUI asks twice per wallet open.
 
-Sprout sweeps are journaled. `sprout_sweep_journal::SweepJournal`
-(`sprout-sweep-<fingerprint>.journal`, beside the checkpoint, same
-key-set fingerprint) is a v2 lifecycle journal: the exact signed bytes are
-persisted before any send, and every transition (the #276 states, under
-its single-operator policy) is appended and synced. It holds outpoints,
-values, raw transactions and observations — no `a_sk`, no note plaintexts,
-so it is linkable (nullifiers) but not spend-capable. It is kept at `0600`
-and appended, not atomically replaced; only the v1 upgrade is an atomic
-replace. v1 (one `outpoint txid` line per accepted broadcast) shipped in
-1.5.0, so its migration stays; a v1 entry becomes `Pending`. A replaced
-expired/rejected transaction stays visible as superseded. The journal is
-never deleted: it is what stops a repeat run from proving or rebuilding a
-note whose transaction may still mine.
+Sprout sweeps are journaled. `sprout_sweep_journal::SweepJournal` uses a
+version-4 lifecycle journal inside the authenticated per-key artifact root.
+Its header binds the network, full key-set fingerprint, lineage anchor, and
+artifact generation. Exact signed bytes are persisted before any send, and
+every transition is appended and synced. The journal holds outpoints, values,
+raw transactions, and observations — no `a_sk` and no note plaintexts — so it
+is linkable through nullifiers but not spend-capable. Direct legacy journals
+and in-root versions 1–3 are preserved and refused rather than migrated. The
+journal is never deleted: it prevents a repeat run from proving or rebuilding
+a note whose transaction may still mine. The spend-capable scan checkpoint is
+separate and is removed automatically only through guarded cleanup after the
+same canonical mined evidence survives two independently corroborated,
+depth-100 reconciliation rounds for every manifested note.
 
 Routing (`is_transparent_only` in the CLI): a seedless wallet with Sapling
 keys takes the imported-account path; one with only transparent keys takes

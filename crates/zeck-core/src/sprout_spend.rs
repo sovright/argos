@@ -43,6 +43,7 @@ use zcash_primitives::transaction::sighash_v4::v4_signature_hash;
 use zcash_primitives::transaction::{Authorized, Transaction, TransactionData, TxVersion};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_transparent::bundle as transparent;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{ZeckError, ZeckResult};
 use crate::sprout::{
@@ -66,6 +67,15 @@ pub struct JoinSplitInput {
     /// The 966-byte encoding from `sprout_witness::encode_for_prover`.
     pub witness_path: Vec<u8>,
 }
+
+impl Drop for JoinSplitInput {
+    fn drop(&mut self) {
+        self.a_sk.zeroize();
+        self.witness_path.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for JoinSplitInput {}
 
 /// One JoinSplit output: a Sprout note paid to someone.
 ///
@@ -112,6 +122,15 @@ pub struct JoinSplitFields {
     pub rcm: [[u8; 32]; JS_OUTPUTS],
 }
 
+impl Drop for JoinSplitFields {
+    fn drop(&mut self) {
+        self.phi.zeroize();
+        self.rcm.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for JoinSplitFields {}
+
 /// The randomness one JoinSplit consumes, every field sampled independently.
 ///
 /// A struct rather than four more parameters because the independence is the
@@ -150,6 +169,16 @@ pub struct JoinSplitRandomness {
     pub rcm: [[u8; 32]; JS_OUTPUTS],
 }
 
+impl Drop for JoinSplitRandomness {
+    fn drop(&mut self) {
+        self.phi.zeroize();
+        self.esk.zeroize();
+        self.rcm.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for JoinSplitRandomness {}
+
 impl JoinSplitRandomness {
     /// Draw every field from one cryptographically secure source.
     ///
@@ -158,15 +187,15 @@ impl JoinSplitRandomness {
     /// rather than a review item.
     pub fn sample(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> Self {
         let mut draw = || {
-            let mut out = [0u8; 32];
-            rng.fill_bytes(&mut out);
+            let mut out = Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(&mut *out);
             out
         };
         Self {
-            phi: draw(),
-            random_seed: draw(),
-            esk: draw(),
-            rcm: [draw(), draw()],
+            phi: *draw(),
+            random_seed: *draw(),
+            esk: *draw(),
+            rcm: [*draw(), *draw()],
         }
     }
 }
@@ -184,12 +213,10 @@ pub fn compute_joinsplit_fields(
     joinsplit_pubkey: &[u8; 32],
     randomness: &JoinSplitRandomness,
 ) -> ZeckResult<JoinSplitFields> {
-    let JoinSplitRandomness {
-        phi,
-        random_seed,
-        esk,
-        rcm,
-    } = *randomness;
+    let phi = Zeroizing::new(randomness.phi);
+    let random_seed = randomness.random_seed;
+    let esk = Zeroizing::new(randomness.esk);
+    let rcm = Zeroizing::new(randomness.rcm);
     // Nullifiers first: hSig commits to them.
     let nullifiers = [
         prf_nf(&inputs[0].a_sk, &inputs[0].note.rho),
@@ -209,19 +236,19 @@ pub fn compute_joinsplit_fields(
     let mut commitments = [[0u8; 32]; JS_OUTPUTS];
     let mut ciphertexts: [Vec<u8>; JS_OUTPUTS] = [Vec::new(), Vec::new()];
     for i in 0..JS_OUTPUTS {
-        let rho = prf_rho(&phi, i, &h_sig);
+        let rho = Zeroizing::new(prf_rho(&phi, i, &h_sig));
         // The output note's commitment randomness, sampled by the caller
         // rather than derived here — §4.7.1 requires it be drawn
         // independently and uniformly, which is what `random_uint256()` does
         // in zcashd. `rho` stays derived: it is what binds the output to this
         // JoinSplit, and the spec derives it on purpose.
-        let r = rcm[i];
+        let r = Zeroizing::new(rcm[i]);
         commitments[i] = note_commitment(outputs[i].recipient.a_pk(), outputs[i].value, &rho, &r);
 
         let note = SproutNotePlaintext {
             value: outputs[i].value,
-            rho,
-            r,
+            rho: *rho,
+            r: *r,
             memo: [0u8; 512],
         };
         ciphertexts[i] = encrypt_note(
@@ -235,7 +262,7 @@ pub fn compute_joinsplit_fields(
     }
 
     Ok(JoinSplitFields {
-        rcm,
+        rcm: *rcm,
         vpub_old,
         vpub_new,
         anchor,
@@ -246,7 +273,7 @@ pub fn compute_joinsplit_fields(
         macs,
         ciphertexts,
         h_sig,
-        phi,
+        phi: *phi,
     })
 }
 
@@ -299,19 +326,20 @@ pub fn build_js_description(
 /// ZIP 215 verification semantics, and the two libraries disagree about
 /// edge-case signatures. This is the crate Zebra verifies with.
 pub struct JoinSplitSigningKey {
-    signing: ed25519_zebra::SigningKey,
+    signing: Zeroizing<ed25519_zebra::SigningKey>,
 }
 
 impl JoinSplitSigningKey {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        let bytes = Zeroizing::new(bytes);
         Self {
-            signing: ed25519_zebra::SigningKey::from(bytes),
+            signing: Zeroizing::new(ed25519_zebra::SigningKey::from(*bytes)),
         }
     }
 
     /// The `joinsplit_pubkey` field, which `hSig` is computed over.
     pub fn verification_key(&self) -> [u8; 32] {
-        ed25519_zebra::VerificationKey::from(&self.signing).into()
+        ed25519_zebra::VerificationKey::from(&*self.signing).into()
     }
 
     /// Sign the transaction's v4 sighash.
@@ -319,6 +347,8 @@ impl JoinSplitSigningKey {
         self.signing.sign(sighash).into()
     }
 }
+
+impl ZeroizeOnDrop for JoinSplitSigningKey {}
 
 /// Assemble a V4 transaction carrying a Sprout bundle, and sign it.
 ///

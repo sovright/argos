@@ -110,10 +110,10 @@ function harness({ walletFile, seed = "", invoke }) {
   return { run, ctx, els, hints };
 }
 
-test("the click handler passes the wallet path and passphrase to the backend", async () => {
+test("the click handler passes the wallet review ID and passphrase to the backend", async () => {
   const calls = [];
   const h = harness({
-    walletFile: { path: "/wallets/zwl.dat", passphrase: "hunter2", summary: { has_mnemonic: true } },
+    walletFile: { path: "/wallets/zwl.dat", reviewId: "review-zwl", passphrase: "hunter2", summary: { has_mnemonic: true } },
     seed: "ignored typed seed",
     invoke: async (cmd, args) => {
       calls.push({ cmd, args: plain(args) });
@@ -123,7 +123,8 @@ test("the click handler passes the wallet path and passphrase to the backend", a
   await h.run();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "detect_birthday_from_wallet_file");
-  assert.equal(calls[0].args.path, "/wallets/zwl.dat");
+  assert.equal(calls[0].args.reviewId, "review-zwl");
+  assert.equal("path" in calls[0].args, false);
   assert.equal(calls[0].args.passphrase, "hunter2");
   assert.equal(calls[0].args.lightwalletdUrl, "https://lwd.example:443");
   assert.equal(calls[0].args.network, "mainnet");
@@ -136,7 +137,7 @@ test("pasted Sapling keys go to the backend with the wallet file, so undated key
   // fallback, and the backend only knows about a pasted key if it is sent.
   const calls = [];
   const h = harness({
-    walletFile: { path: "/wallets/wallet.dat", passphrase: null, summary: { has_mnemonic: false } },
+    walletFile: { path: "/wallets/wallet.dat", reviewId: "review-wallet", passphrase: null, summary: { has_mnemonic: false } },
     invoke: async (cmd, args) => {
       calls.push({ cmd, args: plain(args) });
       return { birthday: 500000, method: "wallet_metadata", message: "core sentence" };
@@ -151,7 +152,7 @@ test("pasted Sapling keys go to the backend with the wallet file, so undated key
   // An empty box sends none.
   const none = [];
   const h2 = harness({
-    walletFile: { path: "/wallets/wallet.dat", passphrase: null, summary: { has_mnemonic: false } },
+    walletFile: { path: "/wallets/wallet.dat", reviewId: "review-wallet", passphrase: null, summary: { has_mnemonic: false } },
     invoke: async (cmd, args) => {
       none.push(plain(args));
       return { birthday: 500000, method: "wallet_metadata", message: "m" };
@@ -179,7 +180,7 @@ test("the click handler sends the typed seed lower-cased when no wallet is loade
 
 test("a result is dropped when another wallet was opened during detection", async () => {
   const h = harness({
-    walletFile: { path: "/old.dat", passphrase: null, summary: { has_mnemonic: true } },
+    walletFile: { path: "/old.dat", reviewId: "review-old", passphrase: null, summary: { has_mnemonic: true } },
     invoke: async () => {
       h.ctx.walletOpenGeneration += 1; // user opened a different wallet meanwhile
       return { birthday: 999 };

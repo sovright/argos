@@ -61,6 +61,7 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
   const context = vm.createContext({
     $, document: { createElement: element }, fmt: (n) => String(n),
     confirmationSourcesFromForm: () => ["backup=https://confirm.example"],
+    clearTransientSecrets() {},
     setTimeout: (callback) => setImmediate(callback),
     setStatus: (id, message) => { $(id).textContent = message; },
     listen: async (name, callback) => {

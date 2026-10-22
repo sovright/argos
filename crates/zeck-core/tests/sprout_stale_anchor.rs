@@ -28,6 +28,9 @@
 use argos_core::{sprout, sprout_spend, sprout_witness};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 
+#[path = "common/sprout_wallet_sync.rs"]
+mod sprout_wallet_sync;
+
 const RPC: &str = "http://127.0.0.1:18242";
 
 /// ZIP 317: two logical actions per JoinSplit, plus two for the Sapling
@@ -299,6 +302,10 @@ async fn a_historical_sprout_anchor_is_still_accepted() {
     };
 
     rpc("generate", serde_json::json!([120])).await;
+    sprout_wallet_sync::wait_for_spendable_balance(5.01, || {
+        rpc("getbalance", serde_json::json!(["*", 1]))
+    })
+    .await;
     let addr = argos_core::imported::encode_transparent_address(
         &address,
         argos_core::ZeckNetwork::Testnet,

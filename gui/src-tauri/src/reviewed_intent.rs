@@ -8,44 +8,51 @@
 //! re-decrypt the wallet file, or re-collect the panel's keys, from form
 //! fields at click time. That let execution diverge from the review (a
 //! different file, passphrase, key box, network or server than the one the
-//! user approved) and re-opened the decrypt window on every click. Holding
-//! the reviewed material instead binds execution to the review, at the cost
+//! user approved). Holding the reviewed material binds execution to the
+//! review; wallet-backed execution reopens the file only to verify its
+//! backend-held snapshot identity before any network or proving work, at the cost
 //! of keeping keys resident for a bounded time:
 //!
 //! - a proposal lives at most [`PROPOSAL_TTL`], is swept on every store
 //!   access, and is dropped on execute (one-shot) or explicit release;
-//! - a scan session lives until it is released (new scan, source change,
-//!   Start over) or the app exits. A completed one must outlive the TTL: its
-//!   sweep is often reviewed long after an hours-long scan finishes.
+//! - a running scan lives until it finishes or is explicitly released. A
+//!   completed or failed scan lives at most [`SCAN_SECRET_TTL`], long enough
+//!   to review a result without retaining abandoned keys for the process life.
 //! - at most [`MAX_SCAN_SESSIONS`] scans and [`MAX_PROPOSALS`] proposals.
 //!
-//! Held material is wiped on drop with `zeroize`: a scan session's keys sit
-//! in `Zeroizing`, wiped when the last `Arc` (the session's, or a running
-//! worker's) goes, and `SpendableSproutNote` zeroizes its `a_sk` and note
-//! secrets in its own `Drop`; a wallet proposal's copy of its Sprout keys,
-//! kept so execute can verify the saved scan again (#272), is `Zeroizing`
-//! too. So an expired, released or executed proposal leaves no key behind
-//! in freed memory. This is best effort, not a
-//! guarantee: copies made earlier (decoding buffers, a `Vec` reallocation,
-//! the wallet-import types, which are not all zeroizing) are not reached.
+//! Held key buffers are wiped on drop: a scan session and a wallet proposal's
+//! execute-time verification keys use [`SecretSproutKeys`], while
+//! `SpendableSproutNote` zeroizes its `a_sk` and note secrets in its own
+//! `Drop`. The store and a running worker share a scan's owner, so cancellation
+//! cannot wipe keys while the worker is still using them.
+//!
+//! This is best-effort process-memory hygiene, not process isolation. Copies
+//! made earlier (decoding buffers, a `Vec` reallocation, registers, stack
+//! temporaries, and wallet-import types that are not all zeroizing) are not
+//! reached, and zeroization cannot protect swap, core dumps, DMA, or an
+//! already-compromised process.
 
 use std::{
     collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
 use argos_core::{sprout_recovery::SpendableSproutNote, sprout_sweep::SweepJournal, ZeckNetwork};
+use secrecy::zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::commands::{SproutScanReport, SproutSweepResult};
 
 pub const MAX_SCAN_SESSIONS: usize = 16;
 pub const MAX_PROPOSALS: usize = 32;
 pub const MAX_IN_FLIGHT_CHECKPOINTS: usize = 16;
+pub const MAX_WALLET_REVIEWS: usize = 16;
+pub const WALLET_REVIEW_TTL: Duration = Duration::from_secs(30 * 60);
+/// Completed and failed scans retain their keys only for the review window.
+pub const SCAN_SECRET_TTL: Duration = Duration::from_secs(30 * 60);
 /// How long a reviewed Sprout proposal stays executable. Long enough to read
 /// the review and tick the box; short enough that spending keys held for it
 /// do not linger behind a review the user walked away from.
@@ -58,6 +65,152 @@ pub struct SproutScanHandle(pub String);
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SproutProposalId(pub String);
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WalletReviewId(pub String);
+
+/// Backend-owned authority for the exact file object and bytes inspected.
+/// It deliberately exposes neither the digest nor object identity to IPC.
+#[derive(PartialEq, Eq)]
+pub struct ReviewedWalletSource {
+    review_id: WalletReviewId,
+    path: PathBuf,
+    identity: Arc<argos_core::wallet_file::WalletFileIdentity>,
+}
+
+impl ReviewedWalletSource {
+    pub fn verify(&self) -> Result<argos_core::wallet_file::WalletFileSnapshot, String> {
+        argos_core::wallet_file::verify_wallet_snapshot(&self.path, &self.identity)
+            .map_err(|err| err.to_string())
+    }
+}
+
+struct StoredWalletReview {
+    source: Arc<ReviewedWalletSource>,
+    created: Instant,
+}
+
+struct WalletReviewInner {
+    reviews: HashMap<WalletReviewId, StoredWalletReview>,
+    ttl: Duration,
+}
+
+impl Default for WalletReviewInner {
+    fn default() -> Self {
+        Self {
+            reviews: HashMap::new(),
+            ttl: WALLET_REVIEW_TTL,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct WalletReviewRegistry(Arc<Mutex<WalletReviewInner>>);
+
+impl WalletReviewRegistry {
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self(Arc::new(Mutex::new(WalletReviewInner {
+            ttl,
+            ..WalletReviewInner::default()
+        })))
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, WalletReviewInner>, String> {
+        self.0
+            .lock()
+            .map_err(|_| "wallet review registry unavailable".to_owned())
+    }
+
+    fn sweep_expired(inner: &mut WalletReviewInner) {
+        let now = Instant::now();
+        let ttl = inner.ttl;
+        inner
+            .reviews
+            .retain(|_, stored| now.saturating_duration_since(stored.created) < ttl);
+    }
+
+    pub fn register(
+        &self,
+        path: PathBuf,
+        identity: Arc<argos_core::wallet_file::WalletFileIdentity>,
+    ) -> Result<WalletReviewId, String> {
+        let mut inner = self.lock()?;
+        Self::sweep_expired(&mut inner);
+        if inner.reviews.len() >= MAX_WALLET_REVIEWS {
+            return Err(
+                "too many wallet reviews; inspect the file again after an older review expires"
+                    .into(),
+            );
+        }
+        let review_id = loop {
+            let candidate = WalletReviewId(Uuid::new_v4().to_string());
+            if !inner.reviews.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let source = Arc::new(ReviewedWalletSource {
+            review_id: review_id.clone(),
+            path,
+            identity,
+        });
+        inner.reviews.insert(
+            review_id.clone(),
+            StoredWalletReview {
+                source,
+                created: Instant::now(),
+            },
+        );
+        Ok(review_id)
+    }
+
+    pub fn resolve(&self, id: &WalletReviewId) -> Result<Arc<ReviewedWalletSource>, String> {
+        let mut inner = self.lock()?;
+        Self::sweep_expired(&mut inner);
+        inner
+            .reviews
+            .get(id)
+            .map(|stored| Arc::clone(&stored.source))
+            .ok_or_else(|| "unknown or expired wallet review; inspect the wallet again".to_owned())
+    }
+
+    pub fn verify(
+        &self,
+        id: &WalletReviewId,
+    ) -> Result<
+        (
+            Arc<ReviewedWalletSource>,
+            argos_core::wallet_file::WalletFileSnapshot,
+        ),
+        String,
+    > {
+        let source = self.resolve(id)?;
+        self.verify_source(&source)
+            .map(|snapshot| (source, snapshot))
+    }
+
+    pub fn verify_source(
+        &self,
+        source: &Arc<ReviewedWalletSource>,
+    ) -> Result<argos_core::wallet_file::WalletFileSnapshot, String> {
+        match source.verify() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(err) => {
+                if let Ok(mut inner) = self.lock() {
+                    let is_matching = inner
+                        .reviews
+                        .get(&source.review_id)
+                        .is_some_and(|stored| Arc::ptr_eq(&stored.source, source));
+                    if is_matching {
+                        inner.reviews.remove(&source.review_id);
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -113,12 +266,13 @@ pub struct ReviewedSproutSweep {
     pub scan_warning: Option<String>,
 }
 
-/// Where a proposal's notes came from. A wallet proposal carries no file
-/// identity: its notes and their spending keys are held in the intent, so
-/// execution never re-reads the file and there is nothing to compare.
+/// Where a proposal's notes came from. A wallet proposal holds both the
+/// reviewed notes and an Arc to the backend-owned file snapshot identity.
+/// The registry may expire while the proposal remains live; execute still
+/// re-verifies the exact source before it touches the network or prover.
 #[derive(PartialEq, Eq)]
 pub enum SproutIntentSource {
-    Wallet,
+    Wallet(Arc<ReviewedWalletSource>),
     Scan(SproutScanHandle),
 }
 
@@ -130,32 +284,91 @@ pub struct SproutSweepIntent {
     pub lightwalletd_url: String,
     pub confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     pub journal: SweepJournal,
+    /// Execute-time authority for re-verifying a wallet proposal's saved scan
+    /// through the peers used at review. The current verdict replaces the
+    /// review-time verdict, and its keys are wiped when the proposal drops.
+    pub wallet_checkpoint: Option<WalletCheckpointAuthority>,
+    pub checkpoint_authority: Option<argos_core::sprout_sweep::ScanCheckpointAuthority>,
+    pub _checkpoint_reservation: Option<CheckpointReservation>,
     /// Set when the catch-up scan behind a scan-derived proposal could not
     /// confirm the chain tip; it leads the sweep report's warnings.
     pub tip_warning: Option<String>,
-    /// What a wallet proposal needs to verify its saved scan against live
-    /// headers again at execute (#272), through the peers it was reviewed
-    /// with. `None` for a scan-derived proposal. Execute's own verdict, not
-    /// the review's, ends the sweep report's warnings, and a reviewed note
-    /// that verdict or the sweep journal no longer leaves spendable refuses
-    /// the sweep.
-    pub wallet_reverify: Option<WalletReverification>,
     /// Set when the scan panel's peer field was malformed at review time.
     /// The review degrades to a warning, but execution refuses the proposal.
     pub peer_error: Option<String>,
 }
 
-/// The inputs to a wallet proposal's execute-time scan verification: the
-/// data directory its review looked in, the wallet's Sprout keys the
-/// checkpoint is keyed by (wiped on drop), and the review's parsed peer list.
-pub struct WalletReverification {
-    pub data_dir: Option<PathBuf>,
-    pub scan_keys: Zeroizing<Vec<[u8; 32]>>,
+pub struct WalletCheckpointAuthority {
+    pub data_dir: PathBuf,
+    pub keys: SecretSproutKeys,
     pub peers: Vec<String>,
 }
 
+/// A single zeroizing owner for decoded Sprout spending keys.
+///
+/// This type deliberately provides only immutable borrowed access and has no
+/// `Clone`, `Debug`, serialization, or owned-plaintext getter. Long-running
+/// scans share it through `Arc`, so the final owner is the one that wipes it.
+pub struct SecretSproutKeys {
+    keys: Vec<[u8; 32]>,
+    #[cfg(test)]
+    drop_probe: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl SecretSproutKeys {
+    pub fn new(keys: Vec<[u8; 32]>) -> Self {
+        Self {
+            keys,
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[[u8; 32]] {
+        &self.keys
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[cfg(test)]
+    fn with_drop_probe(keys: Vec<[u8; 32]>, probe: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            keys,
+            drop_probe: Some(probe),
+        }
+    }
+}
+
+impl From<Vec<[u8; 32]>> for SecretSproutKeys {
+    fn from(keys: Vec<[u8; 32]>) -> Self {
+        Self::new(keys)
+    }
+}
+
+impl Drop for SecretSproutKeys {
+    fn drop(&mut self) {
+        self.keys.zeroize();
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            debug_assert!(self
+                .keys
+                .iter()
+                .all(|key| key.iter().all(|byte| *byte == 0)));
+            probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 pub struct ScanMaterial {
-    pub keys: Arc<Zeroizing<Vec<[u8; 32]>>>,
+    pub keys: Arc<SecretSproutKeys>,
     pub key_fingerprint: String,
     pub checkpoint: PathBuf,
     pub network: ZeckNetwork,
@@ -165,7 +378,7 @@ pub struct ScanMaterial {
 }
 
 struct SproutScanSession {
-    keys: Arc<Zeroizing<Vec<[u8; 32]>>>,
+    keys: Arc<SecretSproutKeys>,
     key_fingerprint: String,
     checkpoint: PathBuf,
     network: ZeckNetwork,
@@ -175,12 +388,150 @@ struct SproutScanSession {
     status: SproutScanStatus,
     report: Option<SproutScanReport>,
     error: Option<String>,
+    finished_at: Option<Instant>,
     /// Stops the scan worker. Dropping its future also drops the checkpoint
     /// reservation it owns, so a released scan frees its checkpoint at once.
     /// The checkpoint is saved atomically every few hundred blocks, so an
     /// abort costs at most that much progress, and a later scan of the same
     /// keys resumes from it.
-    worker: Option<tokio::task::AbortHandle>,
+    worker: Option<ScanWorker>,
+    catchup: Option<ScanCatchupControl>,
+}
+
+#[derive(Clone)]
+struct ScanCatchupControl {
+    id: Uuid,
+    cancellation: ScanCancellation,
+    completion: ScanWorkerCompletion,
+}
+
+struct ScanCancellationInner {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Clone)]
+struct ScanCancellation(Arc<ScanCancellationInner>);
+
+impl ScanCancellation {
+    fn new() -> Self {
+        Self(Arc::new(ScanCancellationInner {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }))
+    }
+
+    fn cancel(&self) {
+        self.0
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.notify.notify_one();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.0.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// RAII authority for one in-flight scan catch-up. Releasing or expiring the
+/// scan signals cancellation, and release waits for this lease to drop so the
+/// catch-up's `ScanMaterial` key owner cannot outlive the release response.
+pub struct ScanCatchupLease {
+    store: Weak<Mutex<StoreInner>>,
+    handle: SproutScanHandle,
+    id: Uuid,
+    cancellation: ScanCancellation,
+    completion_guard: Option<ScanWorkerCompletionGuard>,
+}
+
+impl ScanCatchupLease {
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+}
+
+impl Drop for ScanCatchupLease {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.upgrade() {
+            let mut inner = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(scan) = inner.scans.get_mut(&self.handle) {
+                if scan
+                    .catchup
+                    .as_ref()
+                    .is_some_and(|active| active.id == self.id)
+                {
+                    scan.catchup = None;
+                }
+            }
+        }
+        drop(self.completion_guard.take());
+    }
+}
+
+struct ScanWorker {
+    abort: tokio::task::AbortHandle,
+    completion: ScanWorkerCompletion,
+}
+
+struct ScanWorkerCompletionInner {
+    finished: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+/// Lets cancellation wait until the worker future has dropped every key
+/// owner. The completion guard belongs to the supervisor that awaits the
+/// abortable scan task; its `Drop` covers success, error, panic and abort.
+#[derive(Clone)]
+pub struct ScanWorkerCompletion(Arc<ScanWorkerCompletionInner>);
+
+impl ScanWorkerCompletion {
+    pub fn new() -> Self {
+        Self(Arc::new(ScanWorkerCompletionInner {
+            finished: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }))
+    }
+
+    pub fn guard(&self) -> ScanWorkerCompletionGuard {
+        ScanWorkerCompletionGuard(Some(Arc::clone(&self.0)))
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.0.finished.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Default for ScanWorkerCompletion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct ScanWorkerCompletionGuard(Option<Arc<ScanWorkerCompletionInner>>);
+
+impl Drop for ScanWorkerCompletionGuard {
+    fn drop(&mut self) {
+        if let Some(completion) = self.0.take() {
+            completion
+                .finished
+                .store(true, std::sync::atomic::Ordering::Release);
+            completion.notify.notify_one();
+        }
+    }
 }
 
 struct StoredProposal {
@@ -191,8 +542,9 @@ struct StoredProposal {
 struct StoreInner {
     scans: HashMap<SproutScanHandle, SproutScanSession>,
     proposals: HashMap<SproutProposalId, StoredProposal>,
-    in_flight_checkpoints: HashSet<PathBuf>,
+    checkpoint_reservations: Arc<Mutex<HashSet<PathBuf>>>,
     proposal_ttl: Duration,
+    scan_ttl: Duration,
 }
 
 impl Default for StoreInner {
@@ -200,20 +552,53 @@ impl Default for StoreInner {
         Self {
             scans: HashMap::new(),
             proposals: HashMap::new(),
-            in_flight_checkpoints: HashSet::new(),
+            checkpoint_reservations: Arc::new(Mutex::new(HashSet::new())),
             proposal_ttl: PROPOSAL_TTL,
+            scan_ttl: SCAN_SECRET_TTL,
         }
     }
 }
 
 impl StoreInner {
-    /// Drop every proposal past its TTL. Called on each store access, so an
-    /// abandoned review's keys go with the next interaction.
+    /// Drop every proposal and finished scan past its TTL. Both maps change
+    /// under this mutex, so a scan can never disappear while a proposal tied
+    /// to its key material remains executable.
     fn sweep_expired(&mut self) {
-        let ttl = self.proposal_ttl;
         let now = Instant::now();
+        let proposal_ttl = self.proposal_ttl;
         self.proposals
-            .retain(|_, stored| now.saturating_duration_since(stored.created) < ttl);
+            .retain(|_, stored| now.saturating_duration_since(stored.created) < proposal_ttl);
+
+        let scan_ttl = self.scan_ttl;
+        let expired_scans = self
+            .scans
+            .iter()
+            .filter_map(|(handle, scan)| {
+                scan.finished_at
+                    .filter(|finished| now.saturating_duration_since(*finished) >= scan_ttl)
+                    .map(|_| handle.clone())
+            })
+            .collect::<HashSet<_>>();
+        if expired_scans.is_empty() {
+            return;
+        }
+        for handle in &expired_scans {
+            if let Some(catchup) = self
+                .scans
+                .get(handle)
+                .and_then(|scan| scan.catchup.as_ref())
+            {
+                catchup.cancellation.cancel();
+            }
+        }
+        self.proposals.retain(|_, stored| {
+            !matches!(
+                &stored.intent.source,
+                SproutIntentSource::Scan(handle) if expired_scans.contains(handle)
+            )
+        });
+        self.scans
+            .retain(|handle, _| !expired_scans.contains(handle));
     }
 
     fn lock(
@@ -230,17 +615,17 @@ impl StoreInner {
 /// A scan or catch-up owns this reservation until its future finishes or is
 /// dropped. The guard also releases on unwinding; it never exposes keys.
 pub struct CheckpointReservation {
-    inner: Arc<Mutex<StoreInner>>,
+    reservations: Arc<Mutex<HashSet<PathBuf>>>,
     identity: PathBuf,
 }
 
 impl Drop for CheckpointReservation {
     fn drop(&mut self) {
-        let mut inner = self
-            .inner
+        let mut reservations = self
+            .reservations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.in_flight_checkpoints.remove(&self.identity);
+        reservations.remove(&self.identity);
     }
 }
 
@@ -295,10 +680,32 @@ impl Clone for ReviewedIntentStore {
 }
 
 impl ReviewedIntentStore {
+    fn schedule_expiry_sweep(&self, after: Duration) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // Synchronous callers (principally unit tests) still sweep on
+            // every access. Production commands always run in Tokio.
+            return;
+        };
+        let store = Arc::clone(&self.0);
+        runtime.spawn(async move {
+            tokio::time::sleep(after).await;
+            drop(StoreInner::lock(&store));
+        });
+    }
+
     #[cfg(test)]
     pub fn with_proposal_ttl(proposal_ttl: Duration) -> Self {
         Self(Arc::new(Mutex::new(StoreInner {
             proposal_ttl,
+            ..StoreInner::default()
+        })))
+    }
+
+    #[cfg(test)]
+    pub fn with_retention(proposal_ttl: Duration, scan_ttl: Duration) -> Self {
+        Self(Arc::new(Mutex::new(StoreInner {
+            proposal_ttl,
+            scan_ttl,
             ..StoreInner::default()
         })))
     }
@@ -310,16 +717,20 @@ impl ReviewedIntentStore {
 
     pub fn reserve_checkpoint(&self, checkpoint: &Path) -> Result<CheckpointReservation, String> {
         let identity = checkpoint_identity(checkpoint)?;
-        let mut inner = StoreInner::lock(&self.0)?;
-        if inner.in_flight_checkpoints.contains(&identity) {
+        let reservations = StoreInner::lock(&self.0)?.checkpoint_reservations.clone();
+        let mut held = reservations
+            .lock()
+            .map_err(|_| "Sprout checkpoint reservation store unavailable".to_owned())?;
+        if held.contains(&identity) {
             return Err("a Sprout scan or catch-up is already using this checkpoint".into());
         }
-        if inner.in_flight_checkpoints.len() >= MAX_IN_FLIGHT_CHECKPOINTS {
+        if held.len() >= MAX_IN_FLIGHT_CHECKPOINTS {
             return Err("too many Sprout scans or catch-ups are running".into());
         }
-        inner.in_flight_checkpoints.insert(identity.clone());
+        held.insert(identity.clone());
+        drop(held);
         Ok(CheckpointReservation {
-            inner: Arc::clone(&self.0),
+            reservations,
             identity,
         })
     }
@@ -342,7 +753,7 @@ impl ReviewedIntentStore {
     #[allow(clippy::too_many_arguments)]
     pub fn insert_scan(
         &self,
-        keys: Vec<[u8; 32]>,
+        keys: impl Into<SecretSproutKeys>,
         key_fingerprint: String,
         checkpoint: PathBuf,
         network: ZeckNetwork,
@@ -358,7 +769,7 @@ impl ReviewedIntentStore {
         inner.scans.insert(
             handle.clone(),
             SproutScanSession {
-                keys: Arc::new(Zeroizing::new(keys)),
+                keys: Arc::new(keys.into()),
                 key_fingerprint,
                 checkpoint,
                 network,
@@ -368,7 +779,9 @@ impl ReviewedIntentStore {
                 status: SproutScanStatus::Running,
                 report: None,
                 error: None,
+                finished_at: None,
                 worker: None,
+                catchup: None,
             },
         );
         Ok(handle)
@@ -391,6 +804,35 @@ impl ReviewedIntentStore {
         })
     }
 
+    pub fn register_catchup(&self, handle: &SproutScanHandle) -> Result<ScanCatchupLease, String> {
+        let mut inner = StoreInner::lock(&self.0)?;
+        let scan = inner
+            .scans
+            .get_mut(handle)
+            .ok_or("unknown or released Sprout scan")?;
+        if !matches!(scan.status, SproutScanStatus::Completed) {
+            return Err("wait for the Sprout scan to complete".into());
+        }
+        if scan.catchup.is_some() {
+            return Err("a catch-up for this Sprout scan is already running".into());
+        }
+        let id = Uuid::new_v4();
+        let cancellation = ScanCancellation::new();
+        let completion = ScanWorkerCompletion::new();
+        scan.catchup = Some(ScanCatchupControl {
+            id,
+            cancellation: cancellation.clone(),
+            completion: completion.clone(),
+        });
+        Ok(ScanCatchupLease {
+            store: Arc::downgrade(&self.0),
+            handle: handle.clone(),
+            id,
+            cancellation,
+            completion_guard: Some(completion.guard()),
+        })
+    }
+
     pub fn snapshot(&self, handle: &SproutScanHandle) -> Result<SproutScanSnapshot, String> {
         let inner = StoreInner::lock(&self.0)?;
         let scan = inner
@@ -407,7 +849,13 @@ impl ReviewedIntentStore {
 
     /// Hand the store the scan worker's abort handle. A scan released before
     /// this lands is already gone, so its worker is stopped here instead.
-    pub fn attach_worker(&self, handle: &SproutScanHandle, worker: tokio::task::AbortHandle) {
+    pub fn attach_worker(
+        &self,
+        handle: &SproutScanHandle,
+        abort: tokio::task::AbortHandle,
+        completion: ScanWorkerCompletion,
+    ) {
+        let worker = ScanWorker { abort, completion };
         let orphaned = match StoreInner::lock(&self.0) {
             Ok(mut inner) => match inner.scans.get_mut(handle) {
                 Some(scan) => {
@@ -422,11 +870,12 @@ impl ReviewedIntentStore {
         };
         // Outside the lock: the worker's reservation takes it when dropped.
         if let Some(worker) = orphaned {
-            worker.abort();
+            worker.abort.abort();
         }
     }
 
     pub fn finish_scan(&self, handle: &SproutScanHandle, result: Result<SproutScanReport, String>) {
+        let mut finished_ttl = None;
         if let Ok(mut inner) = StoreInner::lock(&self.0) {
             // A released scan was removed; its late result has nowhere to go.
             if let Some(scan) = inner.scans.get_mut(handle) {
@@ -441,27 +890,44 @@ impl ReviewedIntentStore {
                         scan.error = Some(error);
                     }
                 }
+                scan.finished_at = Some(Instant::now());
+                finished_ttl = Some(inner.scan_ttl);
             }
+        }
+        if let Some(ttl) = finished_ttl {
+            self.schedule_expiry_sweep(ttl);
         }
     }
 
-    pub fn release_scan(&self, handle: &SproutScanHandle) -> Result<(), String> {
-        let mut inner = StoreInner::lock(&self.0)?;
-        let scan = inner
-            .scans
-            .remove(handle)
-            .ok_or("unknown or released Sprout scan")?;
-        inner.proposals.retain(|_, stored| {
-            !matches!(&stored.intent.source, SproutIntentSource::Scan(source) if source == handle)
-        });
-        drop(inner);
+    pub async fn release_scan(&self, handle: &SproutScanHandle) -> Result<(), String> {
+        let scan = {
+            let mut inner = StoreInner::lock(&self.0)?;
+            let scan = inner
+                .scans
+                .remove(handle)
+                .ok_or("unknown or released Sprout scan")?;
+            inner.proposals.retain(|_, stored| {
+                !matches!(&stored.intent.source, SproutIntentSource::Scan(source) if source == handle)
+            });
+            scan
+        };
         // Running or not, the session and its keys go now. A running worker
         // is aborted, which drops its checkpoint reservation with it, so the
         // same scan can be started again at once rather than after it ends.
         // Outside the lock, which that reservation's drop takes.
-        if let Some(worker) = scan.worker {
-            worker.abort();
+        if let Some(worker) = &scan.worker {
+            worker.abort.abort();
         }
+        if let Some(catchup) = &scan.catchup {
+            catchup.cancellation.cancel();
+        }
+        if let Some(worker) = &scan.worker {
+            worker.completion.wait().await;
+        }
+        if let Some(catchup) = &scan.catchup {
+            catchup.completion.wait().await;
+        }
+        drop(scan);
         Ok(())
     }
 
@@ -495,6 +961,9 @@ impl ReviewedIntentStore {
                 created: Instant::now(),
             },
         );
+        let proposal_ttl = inner.proposal_ttl;
+        drop(inner);
+        self.schedule_expiry_sweep(proposal_ttl);
         Ok(ReviewedSproutSweep {
             proposal_id,
             plan,
@@ -529,7 +998,7 @@ impl ReviewedIntentStore {
                 .proposals
                 .get(id)
                 .ok_or("unknown or already used Sprout proposal")?;
-            if !matches!(intent.intent.source, SproutIntentSource::Wallet) {
+            if !matches!(intent.intent.source, SproutIntentSource::Wallet(_)) {
                 return Err("proposal belongs to a scan-derived sweep".into());
             }
         }
@@ -574,6 +1043,19 @@ mod tests {
         )
     }
 
+    fn wallet_source(marker: u8) -> Arc<ReviewedWalletSource> {
+        let registry = WalletReviewRegistry::default();
+        let dir = std::env::temp_dir().join(format!("argos-wallet-source-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, [marker]).unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(path, Arc::new(snapshot.identity().clone()))
+            .unwrap();
+        registry.resolve(&id).unwrap()
+    }
+
     fn scan(store: &ReviewedIntentStore, marker: u8) -> SproutScanHandle {
         store
             .insert_scan(
@@ -613,7 +1095,7 @@ mod tests {
             SproutIntentSource::Scan(handle) => {
                 store.scan_material(handle).unwrap().lightwalletd_url
             }
-            SproutIntentSource::Wallet => "https://node-a".to_owned(),
+            SproutIntentSource::Wallet(_) => "https://node-a".to_owned(),
         };
         store
             .insert_proposal(
@@ -625,8 +1107,10 @@ mod tests {
                     lightwalletd_url: endpoint,
                     confirmation_sources: Vec::new(),
                     journal: journal(1),
+                    wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: None,
                     tip_warning: None,
-                    wallet_reverify: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -660,7 +1144,11 @@ mod tests {
     #[test]
     fn sprout_intent_is_one_shot() {
         let store = ReviewedIntentStore::default();
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(1)),
+            "zs-reviewed",
+        );
         assert!(store.take_proposal(&id).is_ok());
         assert!(store.take_proposal(&id).is_err());
     }
@@ -668,7 +1156,11 @@ mod tests {
     #[test]
     fn wrong_execution_route_cannot_consume_a_proposal() {
         let store = ReviewedIntentStore::default();
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(2)),
+            "zs-reviewed",
+        );
         assert!(store.take_scan_proposal(&id).is_err());
         assert!(store.take_wallet_proposal(&id).is_ok());
     }
@@ -678,8 +1170,8 @@ mod tests {
         let store = ReviewedIntentStore::default();
         // B finishes first; older A returns later. A must not evict the ID
         // already displayed for B, and B remains one-shot executable.
-        let b = proposal(&store, SproutIntentSource::Wallet, "zs-B");
-        let a = proposal(&store, SproutIntentSource::Wallet, "zs-A");
+        let b = proposal(&store, SproutIntentSource::Wallet(wallet_source(3)), "zs-B");
+        let a = proposal(&store, SproutIntentSource::Wallet(wallet_source(4)), "zs-A");
         assert_eq!(store.take_wallet_proposal(&b).unwrap().destination, "zs-B");
         assert!(store.take_wallet_proposal(&b).is_err());
         store.release_proposal(&a).unwrap();
@@ -704,8 +1196,10 @@ mod tests {
                     lightwalletd_url: "https://node-a".into(),
                     confirmation_sources: Vec::new(),
                     journal: journal(2),
+                    wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: None,
                     tip_warning: None,
-                    wallet_reverify: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -720,8 +1214,8 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn scan_a_result_cannot_be_swept_under_scan_b() {
+    #[tokio::test]
+    async fn scan_a_result_cannot_be_swept_under_scan_b() {
         let store = ReviewedIntentStore::default();
         let a = scan(&store, 1);
         let b = scan(&store, 2);
@@ -730,7 +1224,7 @@ mod tests {
             store.scan_material(&a).unwrap().key_fingerprint,
             store.scan_material(&b).unwrap().key_fingerprint
         );
-        store.release_scan(&a).unwrap();
+        store.release_scan(&a).await.unwrap();
         assert!(store.take_proposal(&id).is_err());
         assert!(store.scan_material(&b).is_ok());
     }
@@ -753,20 +1247,26 @@ mod tests {
             )
             .is_err());
         for _ in 0..MAX_PROPOSALS {
-            proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+            proposal(
+                &store,
+                SproutIntentSource::Wallet(wallet_source(5)),
+                "zs-reviewed",
+            );
         }
         assert!(store
             .insert_proposal(
                 SproutSweepIntent {
-                    source: SproutIntentSource::Wallet,
+                    source: SproutIntentSource::Wallet(wallet_source(6)),
                     notes: Vec::new(),
                     destination: "zs-reviewed".into(),
                     network: ZeckNetwork::Mainnet,
                     lightwalletd_url: "https://node".into(),
                     confirmation_sources: Vec::new(),
                     journal: journal(3),
+                    wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: None,
                     tip_warning: None,
-                    wallet_reverify: None,
                     peer_error: None,
                 },
                 SproutSweepPreviewData {
@@ -783,8 +1283,8 @@ mod tests {
 
     /// Finding 10: a released scan is gone, running or not, so it never
     /// holds a slot that a new scan needs.
-    #[test]
-    fn released_running_scans_do_not_count_toward_the_limit() {
+    #[tokio::test]
+    async fn released_running_scans_do_not_count_toward_the_limit() {
         let store = ReviewedIntentStore::default();
         for i in 0..MAX_SCAN_SESSIONS {
             let handle = store
@@ -798,7 +1298,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap();
-            store.release_scan(&handle).unwrap();
+            store.release_scan(&handle).await.unwrap();
             assert!(store.snapshot(&handle).is_err());
         }
         assert!(store
@@ -835,12 +1335,15 @@ mod tests {
             )
             .unwrap();
         let reservation = store.reserve_checkpoint(&checkpoint).unwrap();
+        let completion = ScanWorkerCompletion::new();
+        let completion_guard = completion.guard();
         let worker = tokio::spawn(async move {
+            let _completion_guard = completion_guard;
             let _reservation = reservation;
             std::future::pending::<()>().await;
         });
-        store.attach_worker(&handle, worker.abort_handle());
-        store.release_scan(&handle).unwrap();
+        store.attach_worker(&handle, worker.abort_handle(), completion);
+        store.release_scan(&handle).await.unwrap();
         let joined = tokio::time::timeout(Duration::from_secs(5), worker)
             .await
             .expect("release stops the worker promptly");
@@ -849,33 +1352,68 @@ mod tests {
         assert!(store.snapshot(&handle).is_err());
     }
 
-    /// A scan session's keys are held in `Zeroizing`, and the session is
-    /// their only owner once its worker is gone: releasing it leaves the
-    /// last `Arc` here, and dropping that wipes the keys. Wiping is what
-    /// `Zeroizing`'s `Drop` does; it is called directly so the zeros can be
-    /// observed.
-    #[test]
-    fn released_scan_keys_are_held_in_a_wiping_wrapper() {
-        use zeroize::Zeroize;
+    #[tokio::test]
+    async fn release_waits_for_worker_drop_before_reporting_keys_gone() {
         let store = ReviewedIntentStore::default();
         let handle = store
             .insert_scan(
-                vec![[0xab; 32], [0xcd; 32]],
-                "fingerprint-z".into(),
-                PathBuf::from("/tmp/scan-z"),
+                vec![[40; 32]],
+                "fingerprint-40".into(),
+                PathBuf::from("/tmp/scan-40"),
                 ZeckNetwork::Mainnet,
                 "https://node".into(),
                 Vec::new(),
                 Vec::new(),
             )
             .unwrap();
+        let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut inner = StoreInner::lock(&store.0).unwrap();
+            inner.scans.get_mut(&handle).unwrap().keys = Arc::new(
+                SecretSproutKeys::with_drop_probe(vec![[40; 32]], Arc::clone(&probe)),
+            );
+        }
         let material = store.scan_material(&handle).unwrap();
-        store.release_scan(&handle).unwrap();
-        let mut keys: Zeroizing<Vec<[u8; 32]>> =
-            Arc::try_unwrap(material.keys).expect("the released session kept no copy");
-        assert_eq!(keys.len(), 2);
-        keys.zeroize();
-        assert!(keys.is_empty(), "wiped and cleared");
+        let completion = ScanWorkerCompletion::new();
+        let completion_guard = completion.guard();
+        let worker = tokio::spawn(async move {
+            let _completion_guard = completion_guard;
+            let _material = material;
+            std::future::pending::<()>().await;
+        });
+        store.attach_worker(&handle, worker.abort_handle(), completion);
+
+        store.release_scan(&handle).await.unwrap();
+
+        assert!(probe.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(worker.await.is_err_and(|err| err.is_cancelled()));
+    }
+
+    #[tokio::test]
+    async fn release_cancels_catchup_and_waits_for_its_final_key_owner() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 41);
+        let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut inner = StoreInner::lock(&store.0).unwrap();
+            inner.scans.get_mut(&handle).unwrap().keys = Arc::new(
+                SecretSproutKeys::with_drop_probe(vec![[41; 32]], Arc::clone(&probe)),
+            );
+        }
+        let catchup = store.register_catchup(&handle).unwrap();
+        let material = store.scan_material(&handle).unwrap();
+        let task = tokio::spawn(async move {
+            let _material = material;
+            tokio::select! {
+                () = catchup.cancelled() => true,
+                () = std::future::pending::<()>() => false,
+            }
+        });
+
+        store.release_scan(&handle).await.unwrap();
+
+        assert!(probe.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(task.await.unwrap(), "catch-up observed cancellation");
     }
 
     /// A release that lands before the worker is attached still stops it.
@@ -884,7 +1422,7 @@ mod tests {
         let store = ReviewedIntentStore::default();
         let handle = scan(&store, 4);
         // `scan` completes the session; make a running one instead.
-        store.release_scan(&handle).unwrap();
+        store.release_scan(&handle).await.unwrap();
         let handle = store
             .insert_scan(
                 vec![[5; 32]],
@@ -896,13 +1434,39 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        store.release_scan(&handle).unwrap();
-        let worker = tokio::spawn(std::future::pending::<()>());
-        store.attach_worker(&handle, worker.abort_handle());
+        store.release_scan(&handle).await.unwrap();
+        let completion = ScanWorkerCompletion::new();
+        let completion_guard = completion.guard();
+        let worker = tokio::spawn(async move {
+            let _completion_guard = completion_guard;
+            std::future::pending::<()>().await;
+        });
+        store.attach_worker(&handle, worker.abort_handle(), completion);
         let joined = tokio::time::timeout(Duration::from_secs(5), worker)
             .await
             .expect("a late-attached worker is stopped");
         assert!(joined.is_err_and(|err| err.is_cancelled()));
+    }
+
+    #[tokio::test]
+    async fn a_late_worker_result_cannot_recreate_a_released_scan() {
+        let store = ReviewedIntentStore::default();
+        let handle = store
+            .insert_scan(
+                vec![[6; 32]],
+                "fingerprint-6".into(),
+                PathBuf::from("/tmp/scan-6"),
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        store.release_scan(&handle).await.unwrap();
+
+        store.finish_scan(&handle, Err("late failure".into()));
+
+        assert!(store.snapshot(&handle).is_err());
     }
 
     /// Finding 5: a reviewed proposal holds raw Sprout spending keys in its
@@ -910,7 +1474,11 @@ mod tests {
     #[test]
     fn sprout_proposals_expire() {
         let store = ReviewedIntentStore::with_proposal_ttl(std::time::Duration::ZERO);
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(7)),
+            "zs-reviewed",
+        );
         assert_eq!(
             store.take_wallet_proposal(&id).err().unwrap(),
             "unknown or already used Sprout proposal"
@@ -918,9 +1486,115 @@ mod tests {
         assert_eq!(store.proposal_count(), 0, "expired proposals are dropped");
 
         let store = ReviewedIntentStore::default();
-        let id = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let id = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(8)),
+            "zs-reviewed",
+        );
         assert!(store.take_wallet_proposal(&id).is_ok());
         assert_eq!(PROPOSAL_TTL, std::time::Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn completed_and_failed_scans_expire_but_running_scans_do_not() {
+        let store =
+            ReviewedIntentStore::with_retention(Duration::from_secs(15 * 60), Duration::ZERO);
+        let completed = scan(&store, 31);
+        let failed = store
+            .insert_scan(
+                vec![[32; 32]],
+                "fingerprint-32".into(),
+                PathBuf::from("/tmp/scan-32"),
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        store.finish_scan(&failed, Err("peer failure".into()));
+        let running = store
+            .insert_scan(
+                vec![[33; 32]],
+                "fingerprint-33".into(),
+                PathBuf::from("/tmp/scan-33"),
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert!(store.snapshot(&completed).is_err());
+        assert!(store.snapshot(&failed).is_err());
+        assert!(matches!(
+            store.snapshot(&running).unwrap().status,
+            SproutScanStatus::Running
+        ));
+    }
+
+    #[test]
+    fn scan_expiry_atomically_evicts_its_proposals() {
+        let store = ReviewedIntentStore::with_retention(
+            Duration::from_secs(15 * 60),
+            Duration::from_millis(20),
+        );
+        let handle = scan(&store, 34);
+        let proposal_id = proposal(
+            &store,
+            SproutIntentSource::Scan(handle.clone()),
+            "zs-reviewed",
+        );
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(store.snapshot(&handle).is_err());
+        assert!(store.take_scan_proposal(&proposal_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn finished_scan_keys_are_wiped_at_ttl_without_another_store_access() {
+        let store = ReviewedIntentStore::with_retention(
+            Duration::from_secs(15 * 60),
+            Duration::from_millis(20),
+        );
+        let handle = store
+            .insert_scan(
+                vec![[35; 32]],
+                "fingerprint-35".into(),
+                PathBuf::from("/tmp/scan-35"),
+                ZeckNetwork::Mainnet,
+                "https://node".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut inner = StoreInner::lock(&store.0).unwrap();
+            inner.scans.get_mut(&handle).unwrap().keys = Arc::new(
+                SecretSproutKeys::with_drop_probe(vec![[35; 32]], Arc::clone(&probe)),
+            );
+        }
+        store.finish_scan(&handle, Err("peer failure".into()));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(probe.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn scan_keys_zeroize_only_after_the_last_owner_drops() {
+        let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keys = Arc::new(SecretSproutKeys::with_drop_probe(
+            vec![[0x5a; 32]],
+            Arc::clone(&probe),
+        ));
+        let clone = Arc::clone(&keys);
+
+        drop(keys);
+        assert!(!probe.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(clone.as_slice(), &[[0x5a; 32]]);
+        drop(clone);
+        assert!(probe.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Expired proposals free their slots for new reviews.
@@ -928,7 +1602,11 @@ mod tests {
     fn expired_proposals_do_not_fill_the_store() {
         let store = ReviewedIntentStore::with_proposal_ttl(std::time::Duration::ZERO);
         for _ in 0..MAX_PROPOSALS + 1 {
-            proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+            proposal(
+                &store,
+                SproutIntentSource::Wallet(wallet_source(9)),
+                "zs-reviewed",
+            );
         }
     }
 
@@ -939,6 +1617,45 @@ mod tests {
         let running_scan = store.reserve_checkpoint(&checkpoint).unwrap();
         assert!(store.reserve_checkpoint(&checkpoint).is_err());
         drop(running_scan);
+        assert!(store.reserve_checkpoint(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn scan_proposal_holds_checkpoint_reservation_through_execution_take() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 21);
+        let checkpoint = store.scan_material(&handle).unwrap().checkpoint;
+        let reservation = store.reserve_checkpoint(&checkpoint).unwrap();
+        let review = store
+            .insert_proposal(
+                SproutSweepIntent {
+                    source: SproutIntentSource::Scan(handle),
+                    notes: Vec::new(),
+                    destination: "zs-reviewed".into(),
+                    network: ZeckNetwork::Mainnet,
+                    lightwalletd_url: "https://node-21".into(),
+                    confirmation_sources: Vec::new(),
+                    journal: journal(21),
+                    wallet_checkpoint: None,
+                    checkpoint_authority: None,
+                    _checkpoint_reservation: Some(reservation),
+                    tip_warning: None,
+                    peer_error: None,
+                },
+                SproutSweepPreviewData {
+                    notes: 0,
+                    gross_zatoshis: 0,
+                    fee_zatoshis: 0,
+                    net_zatoshis: 0,
+                    active: Vec::new(),
+                    mined: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.reserve_checkpoint(&checkpoint).is_err());
+        let executing = store.take_scan_proposal(&review.proposal_id).unwrap();
+        assert!(store.reserve_checkpoint(&checkpoint).is_err());
+        drop(executing);
         assert!(store.reserve_checkpoint(&checkpoint).is_ok());
     }
 
@@ -1027,8 +1744,8 @@ mod tests {
         assert!(store.reserve_checkpoint(&checkpoint).is_ok());
     }
 
-    #[test]
-    fn release_drops_scan_and_proposal_authority() {
+    #[tokio::test]
+    async fn release_drops_scan_and_proposal_authority() {
         let store = ReviewedIntentStore::default();
         let handle = scan(&store, 1);
         let id = proposal(
@@ -1036,10 +1753,14 @@ mod tests {
             SproutIntentSource::Scan(handle.clone()),
             "zs-reviewed",
         );
-        store.release_scan(&handle).unwrap();
+        store.release_scan(&handle).await.unwrap();
         assert!(store.snapshot(&handle).is_err());
         assert!(store.take_proposal(&id).is_err());
-        let wallet = proposal(&store, SproutIntentSource::Wallet, "zs-reviewed");
+        let wallet = proposal(
+            &store,
+            SproutIntentSource::Wallet(wallet_source(10)),
+            "zs-reviewed",
+        );
         store.release_proposal(&wallet).unwrap();
         assert!(store.take_proposal(&wallet).is_err());
     }
@@ -1059,5 +1780,101 @@ mod tests {
         .unwrap();
         assert_eq!(value["handle"], handle.0);
         assert_eq!(value["height"], 50);
+    }
+
+    fn reviewed_wallet(
+        registry: &WalletReviewRegistry,
+        bytes: &[u8],
+    ) -> (PathBuf, PathBuf, WalletReviewId) {
+        let dir = std::env::temp_dir().join(format!("argos-wallet-review-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, bytes).unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(path.clone(), Arc::new(snapshot.identity().clone()))
+            .unwrap();
+        (dir, path, id)
+    }
+
+    #[test]
+    fn stale_or_unknown_review_id_is_rejected() {
+        let registry = WalletReviewRegistry::with_ttl(Duration::ZERO);
+        let (dir, _path, id) = reviewed_wallet(&registry, b"wallet");
+        assert!(registry.verify(&id).is_err());
+        assert!(registry
+            .verify(&WalletReviewId("unknown".to_owned()))
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn changed_wallet_revokes_matching_review_id() {
+        let registry = WalletReviewRegistry::default();
+        let (dir, path, id) = reviewed_wallet(&registry, b"wallet-A");
+        std::fs::write(&path, b"wallet-B").unwrap();
+        assert!(registry.verify(&id).is_err());
+        assert!(registry.verify(&id).is_err(), "the rejected ID was revoked");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retained_source_mismatch_revokes_matching_review_id() {
+        let registry = WalletReviewRegistry::default();
+        let (dir, path, id) = reviewed_wallet(&registry, b"wallet-A");
+        let source = registry.resolve(&id).unwrap();
+        std::fs::write(&path, b"wallet-B").unwrap();
+        assert!(registry.verify_source(&source).is_err());
+        assert!(
+            registry.resolve(&id).is_err(),
+            "the rejected ID was revoked"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn registry_expiry_does_not_kill_a_reviewed_proposal() {
+        let registry = WalletReviewRegistry::with_ttl(Duration::from_millis(5));
+        let (dir, _path, id) = reviewed_wallet(&registry, b"wallet");
+        let source = registry.resolve(&id).unwrap();
+        let store = ReviewedIntentStore::default();
+        let proposal_id = proposal(
+            &store,
+            SproutIntentSource::Wallet(Arc::clone(&source)),
+            "zs-reviewed",
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(registry.resolve(&id).is_err(), "registry entry expired");
+        let intent = store.take_wallet_proposal(&proposal_id).unwrap();
+        let SproutIntentSource::Wallet(retained) = intent.source else {
+            panic!("wallet proposal source changed")
+        };
+        assert!(
+            retained.verify().is_ok(),
+            "proposal retains reviewed source"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wallet_review_registry_is_bounded() {
+        let registry = WalletReviewRegistry::default();
+        let mut roots = Vec::new();
+        for marker in 0..MAX_WALLET_REVIEWS {
+            let reviewed = reviewed_wallet(&registry, &[marker as u8]);
+            roots.push(reviewed);
+        }
+        let dir = std::env::temp_dir().join(format!("argos-wallet-review-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overflow.dat");
+        std::fs::write(&path, b"overflow").unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        assert!(registry
+            .register(path, Arc::new(snapshot.identity().clone()))
+            .is_err());
+        for (dir, _, _) in roots {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

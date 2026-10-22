@@ -1,9 +1,13 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex as StdMutex,
+use std::{
+    borrow::BorrowMut,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    },
 };
 
 use async_trait::async_trait;
+use rand_core::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use rustls::crypto::ring::default_provider;
 use secrecy::ExposeSecret;
@@ -32,7 +36,7 @@ use zcash_client_backend::{
     },
     sync,
 };
-use zcash_client_sqlite::AccountUuid;
+use zcash_client_sqlite::{util::SystemClock, AccountUuid, WalletDb};
 use zcash_keys::encoding::AddressCodec;
 use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK, TEST_NETWORK};
 use zcash_transparent::address::TransparentAddress;
@@ -467,7 +471,7 @@ impl ProgressPoller {
     }
 }
 
-pub async fn run_recovery_scan(state: SharedScanTaskState, config: RuntimeScanConfig) {
+pub(crate) async fn run_recovery_scan(state: SharedScanTaskState, config: RuntimeScanConfig) {
     match run_recovery_scan_inner(state.clone(), config).await {
         Ok(()) | Err(ZeckError::Cancelled) => {}
         Err(err) => {
@@ -1073,18 +1077,15 @@ async fn run_standalone_leg(
     Ok(true)
 }
 
-/// The standalone Sapling keys [`register_mixed_keys`] would register beside
-/// `hd_rows`: each standalone key once, skipping any that is one of the HD
-/// accounts' own Sapling keys. Shared with
-/// [`rebuild_for_mixed_keys_if_scanned`] so the rebuild decision and the
-/// registration cannot disagree about which accounts are new.
+/// Select each standalone Sapling key once, excluding keys already derived
+/// for the HD accounts. Rebuild detection and registration share this choice.
 fn select_mixed_sapling(
     hd_rows: &[TrackedAccount],
     keys: &argos_wallet_import::ImportedKeys,
     seed: &[u8; 64],
     network: crate::models::ZeckNetwork,
-) -> ZeckResult<Vec<(usize, sapling_crypto::zip32::ExtendedSpendingKey)>> {
-    use crate::imported::parse_sapling_extsk;
+) -> ZeckResult<Vec<(usize, crate::imported::ImportedSaplingSpendingKey)>> {
+    use crate::imported::ImportedSaplingSpendingKey;
     use argos_wallet_import::Provenance;
 
     let mut sapling_seen = std::collections::HashSet::new();
@@ -1102,30 +1103,21 @@ fn select_mixed_sapling(
         if key.provenance != Provenance::Standalone {
             continue;
         }
-        let extsk = parse_sapling_extsk(key.extsk.expose_secret())?;
-        let identity = extsk.to_diversifiable_full_viewing_key().to_bytes();
+        let extsk = ImportedSaplingSpendingKey::from_serialized(key.extsk.expose_secret())?;
+        let identity = extsk.full_viewing_key_identity()?;
         if sapling_seen.insert(identity) {
             selected.push((key_index, extsk));
         }
     }
+
     Ok(selected)
 }
 
-/// Before the standalone leg registers its Sapling keys as accounts, rebuild
-/// the wallet database if it has already scanned blocks and lacks any of
-/// them.
-///
-/// The leg runs after the HD gap loop has synced to the tip, so
-/// `register_mixed_keys`' `import_account_ufvk` would be the same
-/// consecutive `add_account` into a scanned database that
-/// [`prepare_scan_accounts`] avoids for HD accounts: a second standalone
-/// key fails with "the Sapling note commitment tree retains checkpoints
-/// both above and below height ...". The rebuilt database holds the HD
-/// accounts exactly as the gap loop imported them (same derivation, same
-/// birthday, same transparent receivers); `register_mixed_keys` then adds
-/// the standalone keys to it before anything is scanned. Standalone
-/// transparent keys alone never trigger this: attaching a receiver does not
-/// rewind the wallet.
+/// Register missing standalone Sapling accounts before any blocks are scanned.
+/// Consecutive account imports rewind a scanned wallet and can leave its note
+/// commitment tree checkpoints inconsistent. A rebuild preserves the HD account
+/// set and receiver configuration; registration then adds every standalone key.
+/// Standalone transparent receivers do not rewind the wallet.
 async fn rebuild_for_mixed_keys_if_scanned(
     leg: &StandaloneLeg<'_>,
     keys: &argos_wallet_import::ImportedKeys,
@@ -1147,7 +1139,7 @@ async fn rebuild_for_mixed_keys_if_scanned(
         }
         let mut missing = false;
         for (_, extsk) in &selected {
-            let ufvk = crate::imported::sapling_ufvk(extsk)?;
+            let ufvk = extsk.with_parsed(crate::imported::sapling_ufvk)?;
             if wallet_db
                 .get_account_for_ufvk(&ufvk)
                 .map_err(|err| {
@@ -1163,6 +1155,7 @@ async fn rebuild_for_mixed_keys_if_scanned(
             return Ok(());
         }
     }
+    drop(selected);
 
     let transparent_account = legacy_transparent_account_key_from_seed(network, leg.seed)?;
     let hd_accounts = derive_scan_accounts(
@@ -1214,6 +1207,7 @@ async fn register_mixed_keys(
                 .copied()
         })
         .collect();
+
     let resolved = imported_transparent_keys(keys)?;
     let mut selected_transparent = Vec::new();
     for (key_index, key) in keys.transparent.iter().enumerate() {
@@ -1230,7 +1224,7 @@ async fn register_mixed_keys(
     let mut wallet_db = open_wallet_db(workspace.wallet_db_path(), consensus_network(network))?;
     let mut imported_rows = Vec::new();
     for (ordinal, (key_index, extsk)) in selected_sapling.iter().enumerate() {
-        let ufvk = sapling_ufvk(extsk)?;
+        let ufvk = extsk.with_parsed(sapling_ufvk)?;
         let wallet_account_id = if let Some(existing) = wallet_db
             .get_account_for_ufvk(&ufvk)
             .map_err(|err| ZeckError::Wallet(format!("looking up mixed imported account: {err}")))?
@@ -1256,7 +1250,8 @@ async fn register_mixed_keys(
                     ZeckError::Internal("mixed account index overflowed".to_owned())
                 })?)
                 .ok_or_else(|| ZeckError::Internal("mixed account index overflowed".to_owned()))?;
-        let display = imported_account_display(display_index, extsk, None, network)?;
+        let display = extsk
+            .with_parsed(|parsed| imported_account_display(display_index, parsed, None, network))?;
         imported_rows.push(TrackedAccount {
             wallet_account_id,
             derived: display,
@@ -1285,7 +1280,7 @@ async fn register_mixed_keys(
     for &key_index in &selected_transparent {
         let key = &resolved[key_index];
         if !existing.contains_key(&key.address) {
-            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &key.secret);
+            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, key.secret_key());
             wallet_db
                 .import_standalone_transparent_pubkey(anchor_id, pubkey)
                 .map_err(|err| {
@@ -1667,12 +1662,14 @@ async fn run_imported_scan(
         let Some(extsk) = account.sapling_extsk.as_ref() else {
             continue;
         };
-        let display = imported_account_display(
-            index,
-            extsk,
-            account.transparent_addresses.first(),
-            config.network,
-        )?;
+        let display = extsk.with_parsed(|parsed| {
+            imported_account_display(
+                index,
+                parsed,
+                account.transparent_addresses.first(),
+                config.network,
+            )
+        })?;
         displays.push(display.clone());
         tracked.push(TrackedAccount {
             wallet_account_id: account.wallet_account_id,
@@ -1945,9 +1942,10 @@ enum AccountPreparation {
 /// in tests only above the NU6.3 activation height, where commitment tree
 /// anchor retention is active; see
 /// `upstream_consecutive_import_into_a_scanned_wallet_reports_corruption`.)
-/// In that case a fresh database is built with every account imported before any block
-/// is scanned, and atomically swapped in. That costs nothing over the old
-/// path: each rewind already requeued the whole range from the birthday.
+/// In that case a fresh database is built in memory with every account imported
+/// before any block is scanned, and transactionally copied into the live database.
+/// That costs nothing over the old path: each rewind already requeued the whole
+/// range from the birthday.
 ///
 /// This also covers a resumed workspace whose earlier run died partway
 /// through such an extension: whatever accounts it holds, a scanned
@@ -1997,9 +1995,9 @@ async fn prepare_scan_accounts(
     Ok(AccountPreparation::Rebuilt)
 }
 
-/// Replace the workspace's wallet database with a fresh one holding exactly
-/// the HD `accounts`, imported before any block is scanned, and make
-/// `tracked_accounts` describe them.
+/// Build exactly the HD account set in memory and transactionally install it
+/// without changing the authenticated live database object. Account IDs belong
+/// to the rebuilt contents, so the tracked set must be replaced after commit.
 async fn rebuild_wallet_db(
     workspace: &RecoveryWorkspace,
     network: crate::models::ZeckNetwork,
@@ -2009,19 +2007,19 @@ async fn rebuild_wallet_db(
     accounts: &[DerivedAccount],
     state: &SharedScanTaskState,
 ) -> ZeckResult<()> {
-    // Dropped on any early return below (a failed import, or the scan
-    // cancelled mid-import), which deletes the half-built database.
-    let rebuilt = workspace.begin_wallet_db_rebuild(network, seed)?;
-    let tracked = import_accounts_into(
-        rebuilt.path(),
-        network,
-        seed,
-        birthday,
-        transparent_mode,
-        accounts,
-        state,
-    )
-    .await?;
+    let mut rebuilt = workspace.begin_wallet_db_rebuild(network, seed)?;
+    let tracked = {
+        let mut rebuilt_wallet = rebuilt.wallet_db();
+        import_accounts_into_wallet(
+            &mut rebuilt_wallet,
+            seed,
+            birthday,
+            transparent_mode,
+            accounts,
+            state,
+        )
+        .await?
+    };
     workspace.commit_wallet_db_rebuild(rebuilt)?;
     // Account ids are per-database, so every previously tracked id now
     // points at nothing. Replace, never extend.
@@ -2029,9 +2027,8 @@ async fn rebuild_wallet_db(
     Ok(())
 }
 
-/// How the HD scan attaches transparent receivers: the configured index
-/// range, or the legacy ZecWallet Lite receiver. One function so the gap
-/// loop and the standalone leg's rebuild cannot import differently.
+/// Use the same transparent receiver mode for HD gap extensions and the
+/// standalone leg's reconstruction of those HD accounts.
 fn hd_transparent_import_mode<'a>(
     transparent_scan: Option<&'a crate::models::TransparentScanConfig>,
     transparent_account: &'a zcash_transparent::keys::AccountPrivKey,
@@ -2097,19 +2094,47 @@ async fn import_accounts_into(
     accounts: &[DerivedAccount],
     state: &SharedScanTaskState,
 ) -> ZeckResult<Vec<TrackedAccount>> {
+    let mut wallet_db = open_wallet_db(db_path, consensus_network(network))?;
+    import_accounts_into_wallet(
+        &mut wallet_db,
+        seed,
+        birthday,
+        transparent_mode,
+        accounts,
+        state,
+    )
+    .await
+}
+
+async fn import_accounts_into_wallet<C>(
+    wallet_db: &mut WalletDb<C, crate::workspace::ArgosParams, SystemClock, OsRng>,
+    seed: &[u8; 64],
+    birthday: &AccountBirthday,
+    transparent_mode: &TransparentImportMode<'_>,
+    accounts: &[DerivedAccount],
+    state: &SharedScanTaskState,
+) -> ZeckResult<Vec<TrackedAccount>>
+where
+    C: BorrowMut<Connection>,
+{
     if accounts.is_empty() {
         return Ok(Vec::new());
     }
     let cancelled = state.lock().await.cancelled.clone();
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(ZeckError::Cancelled);
+    }
 
     let seed_fingerprint = SeedFingerprint::from_seed(seed).ok_or_else(|| {
         ZeckError::Internal("mnemonic seed length is out of the ZIP 32 range".to_owned())
     })?;
-    let mut wallet_db = open_wallet_db(db_path, consensus_network(network))?;
 
     let mut tracked_accounts = Vec::with_capacity(accounts.len());
 
     for account in accounts {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(ZeckError::Cancelled);
+        }
         let zip32_index = AccountId::try_from(account.index).map_err(|_| {
             ZeckError::InvalidConfig(format!("account index {} is out of range", account.index))
         })?;
@@ -2645,11 +2670,8 @@ pub(crate) async fn refresh_scan_progress(
     // balances, so accounts that received and fully spent funds would appear
     // inactive.  Querying the raw sqlite tables lets us detect any note that was
     // ever received, which is the correct signal for gap-limit decisions.
-    let raw_conn = Connection::open_with_flags(
-        workspace.wallet_db_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|err| {
+    let raw_conn = crate::workspace::open_wallet_connection_read_only(workspace.wallet_db_path())
+        .map_err(|err| {
         ZeckError::Storage(format!("opening wallet database for activity check: {err}"))
     })?;
     raw_conn
@@ -3315,13 +3337,10 @@ fn duplicate_wallet_output_ownership(conn: &Connection) -> Result<bool, rusqlite
 /// Recheck persisted ownership immediately before quoting and executing a
 /// combined sweep, including after a completed scan has been resumed.
 pub(crate) fn validate_wallet_output_identities(workspace: &RecoveryWorkspace) -> ZeckResult<()> {
-    let conn = Connection::open_with_flags(
-        workspace.wallet_db_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|err| {
-        ZeckError::Storage(format!("opening wallet database for identity check: {err}"))
-    })?;
+    let conn = crate::workspace::open_wallet_connection_read_only(workspace.wallet_db_path())
+        .map_err(|err| {
+            ZeckError::Storage(format!("opening wallet database for identity check: {err}"))
+        })?;
     if duplicate_wallet_output_ownership(&conn)
         .map_err(|err| ZeckError::Storage(format!("checking wallet output identities: {err}")))?
     {
@@ -5391,8 +5410,8 @@ mod tests {
             };
             let params = consensus_network(ZeckNetwork::Mainnet);
             let tip = start + count - 1;
-            let mut wallet_db =
-                WalletDb::for_path(path, params, SystemClock, rand_core::OsRng).expect("wallet_db");
+            let mut wallet_db = crate::workspace::open_wallet_db(path, params)
+                .expect("open authorized wallet database");
             wallet_db.put_sapling_subtree_roots(0, &[]).unwrap();
             wallet_db.put_orchard_subtree_roots(0, &[]).unwrap();
             wallet_db
@@ -5578,7 +5597,7 @@ mod tests {
                 .unwrap();
             let transparent_account =
                 legacy_transparent_account_key(&test_seed_phrase(), config.network).unwrap();
-            let accounts = derive_accounts(&test_seed_phrase(), config.network, 6).unwrap();
+            let accounts = derive_accounts(&test_seed_phrase(), config.network, 7).unwrap();
             let state = Arc::new(Mutex::new(ScanTaskState::new(ScanHandle::new())));
             let scanned = ScannedWorkspace {
                 _tempdir: tempdir,
@@ -5664,12 +5683,52 @@ mod tests {
                 scanned.wallet_db().block_max_scanned().unwrap().is_some(),
                 "fixture must have scanned blocks or this test proves nothing"
             );
+            let database_before = std::fs::File::open(scanned.workspace.wallet_db_path()).unwrap();
+            let database_id_before =
+                crate::private_fs::private_object_id(&database_before).unwrap();
+            drop(database_before);
+            let marker_path = scanned
+                .workspace
+                .wallet_db_path()
+                .with_file_name("wallet.sqlite.argos-private-v1");
+            let marker_before = std::fs::read(&marker_path).unwrap();
+            let marker_file_before = std::fs::File::open(&marker_path).unwrap();
+            let marker_id_before =
+                crate::private_fs::private_object_id(&marker_file_before).unwrap();
+            drop(marker_file_before);
 
             let preparation = scanned
                 .prepare(6, 2)
                 .await
                 .expect("gap extension over a scanned wallet must succeed");
             assert_eq!(preparation, AccountPreparation::Rebuilt);
+
+            let database_after = std::fs::File::open(scanned.workspace.wallet_db_path()).unwrap();
+            assert_eq!(
+                crate::private_fs::private_object_id(&database_after).unwrap(),
+                database_id_before,
+                "the rebuild must preserve the exact database object bound by private lineage"
+            );
+            let marker_file_after = std::fs::File::open(&marker_path).unwrap();
+            assert_eq!(
+                crate::private_fs::private_object_id(&marker_file_after).unwrap(),
+                marker_id_before,
+                "the rebuild must preserve the exact lineage-marker object"
+            );
+            assert_eq!(
+                std::fs::read(&marker_path).unwrap(),
+                marker_before,
+                "the rebuild must preserve the database's lineage binding"
+            );
+            let authorized = crate::workspace::open_wallet_connection_read_only(
+                scanned.workspace.wallet_db_path(),
+            )
+            .expect("the rebuilt database must reopen through private authority");
+            let journal_mode: String = authorized
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            drop(authorized);
 
             assert_holds_accounts(&scanned, 6);
             assert!(
@@ -5689,7 +5748,12 @@ mod tests {
                 .unwrap()
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.contains("rebuild") || n.ends_with("-wal") || n.ends_with("-shm"))
+                .filter(|n| {
+                    n.contains("rebuild")
+                        || n.ends_with("-journal")
+                        || n.ends_with("-wal")
+                        || n.ends_with("-shm")
+                })
                 .collect();
             assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
 
@@ -5712,6 +5776,50 @@ mod tests {
                 Some(BlockHeight::from_u32(
                     DIVERGENCE_START + DIVERGENCE_BLOCKS - 1
                 ))
+            );
+            assert_eq!(
+                scanned.prepare(7, 6).await.expect("second extension"),
+                AccountPreparation::Rebuilt
+            );
+            assert_holds_accounts(&scanned, 7);
+        }
+
+        #[tokio::test]
+        async fn cancelled_rebuild_leaves_the_scanned_wallet_unchanged() {
+            let scanned = scanned_workspace().await;
+            let before_height = scanned
+                .wallet_db()
+                .block_max_scanned()
+                .unwrap()
+                .map(|metadata| metadata.block_height());
+            let before_accounts = scanned.wallet_db().get_account_ids().unwrap();
+            scanned
+                .state
+                .lock()
+                .await
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            let error = scanned.prepare(6, 2).await.unwrap_err();
+            assert!(matches!(error, crate::error::ZeckError::Cancelled));
+            assert_eq!(
+                scanned
+                    .wallet_db()
+                    .block_max_scanned()
+                    .unwrap()
+                    .map(|metadata| metadata.block_height()),
+                before_height
+            );
+            assert_eq!(
+                scanned.wallet_db().get_account_ids().unwrap(),
+                before_accounts
+            );
+            assert!(
+                std::fs::read_dir(scanned.workspace.root())
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry.file_name().to_string_lossy().contains("rebuild")),
+                "an in-memory rebuild must leave no disk staging artifacts"
             );
         }
 
@@ -5769,7 +5877,6 @@ mod tests {
             assert_holds_accounts(&scanned, 6);
             assert_eq!(scanned.state.lock().await.tracked_accounts.len(), 6);
         }
-
         /// Review on #279: the user's actual resume. An earlier run imported
         /// one extension account into the scanned database and failed on
         /// the next. The resumed first pass reuses that database and really

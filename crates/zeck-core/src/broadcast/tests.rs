@@ -369,6 +369,154 @@ fn rejection_after_acceptance_is_not_final() {
 }
 
 #[test]
+fn legacy_import_preserves_bytes_and_ignores_unchanged_source_after_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_root = dir.path().join("workspace-old");
+    let registry_root = dir.path().join(".broadcast-registry");
+    fs::create_dir_all(&old_root).unwrap();
+    fs::create_dir_all(&registry_root).unwrap();
+    let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
+    let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
+    let tx = fixture();
+    let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+    old.persist_prepared(&tx).unwrap();
+    old.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+        .unwrap();
+    drop(old);
+    let old_bytes = fs::read(&old_path).unwrap();
+
+    let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+    registry.import_legacy_log(&old_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), old_bytes);
+    assert_eq!(registry.blocking_submission(), Some(tx.txid));
+    assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
+
+    registry
+        .transition(
+            tx.txid,
+            TxLifecycleState::Pending,
+            Some(&SubmissionDisposition::Accepted),
+            None,
+        )
+        .unwrap();
+    let advanced = fs::read(&registry_path).unwrap();
+    registry.import_legacy_log(&old_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), advanced);
+    assert_eq!(
+        registry.latest(tx.txid).unwrap().state,
+        TxLifecycleState::Pending
+    );
+
+    // A crash can land after the append-only registry merge but before
+    // its manifest entry. The exact source prefix still proves import.
+    let manifest = registry_root.join(LEGACY_IMPORT_MANIFEST_FILE_NAME);
+    fs::remove_file(&manifest).unwrap();
+    registry.import_legacy_log(&old_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), advanced);
+    assert!(manifest.exists());
+
+    drop(registry);
+    let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+    old.transition(
+        tx.txid,
+        TxLifecycleState::Pending,
+        Some(&SubmissionDisposition::Accepted),
+        None,
+    )
+    .unwrap();
+    drop(old);
+    let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+    assert!(registry.import_legacy_log(&old_path).is_err());
+    assert_eq!(fs::read(&registry_path).unwrap(), advanced);
+}
+
+#[test]
+fn legacy_import_resumes_an_append_only_partial_transaction_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_root = dir.path().join("workspace-old");
+    let registry_root = dir.path().join(".broadcast-registry");
+    fs::create_dir_all(&old_root).unwrap();
+    fs::create_dir_all(&registry_root).unwrap();
+    let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
+    let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
+    let tx = fixture();
+    let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+    old.persist_prepared(&tx).unwrap();
+    old.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+        .unwrap();
+    drop(old);
+    let source = fs::read(&old_path).unwrap();
+    let first_line_end = source.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    crate::private_fs::write_private_file(&registry_path, &source[..first_line_end]).unwrap();
+
+    let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+    registry.import_legacy_log(&old_path).unwrap();
+    assert_eq!(fs::read(&registry_path).unwrap(), source);
+    assert_eq!(
+        registry.latest(tx.txid).unwrap().state,
+        TxLifecycleState::SubmissionUnknown
+    );
+}
+
+#[test]
+fn imported_legacy_journal_lock_survives_until_registry_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_root = dir.path().join("workspace-old");
+    let registry_root = dir.path().join(".broadcast-registry");
+    fs::create_dir_all(&old_root).unwrap();
+    fs::create_dir_all(&registry_root).unwrap();
+    let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
+    let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
+    let tx = fixture();
+    let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+    old.persist_prepared(&tx).unwrap();
+    drop(old);
+
+    let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+    registry.import_legacy_log(&old_path).unwrap();
+    assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
+    let attempt = DurableBroadcastLog::open(&old_path)
+        .err()
+        .expect("older signer must not reopen its source while registry operates");
+    assert!(attempt.to_string().contains("in use"), "{attempt}");
+    let guards = registry.into_legacy_source_guards();
+    let attempt = DurableBroadcastLog::open(&old_path)
+        .err()
+        .expect("per-leg registry reopening must not release the old source lock");
+    assert!(attempt.to_string().contains("in use"), "{attempt}");
+    drop(guards);
+    DurableBroadcastLog::open(&old_path).unwrap();
+}
+
+#[test]
+fn jsonl_created_after_absent_hint_is_imported_under_source_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_root = dir.path().join("workspace-old");
+    let registry_root = dir.path().join(".broadcast-registry");
+    fs::create_dir_all(&old_root).unwrap();
+    fs::create_dir_all(&registry_root).unwrap();
+    let old_path = old_root.join(BROADCAST_LOG_FILE_NAME);
+    let registry_path = registry_root.join(BROADCAST_LOG_FILE_NAME);
+    let tx = fixture();
+    assert!(!old_path.exists());
+
+    let mut registry = DurableBroadcastLog::open(&registry_path).unwrap();
+    registry
+        .hold_legacy_source_before_lock(&old_path, || {
+            // Deterministically occupy the gap where a pre-lock absence
+            // check would have been stale in the older implementation.
+            let mut old = DurableBroadcastLog::open(&old_path).unwrap();
+            old.persist_prepared(&tx).unwrap();
+            old.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+                .unwrap();
+        })
+        .unwrap();
+    assert_eq!(registry.blocking_submission(), Some(tx.txid));
+    assert_eq!(registry.latest(tx.txid).unwrap().prepared.raw_tx, tx.raw_tx);
+    assert!(DurableBroadcastLog::open(&old_path).is_err());
+}
+
+#[test]
 fn invalid_new_state_event_does_not_poison_durable_log() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("broadcasts-v1.jsonl");

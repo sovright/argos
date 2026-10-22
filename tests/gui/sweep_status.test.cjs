@@ -355,4 +355,3 @@ test("legacy broadcast from merged seedless routes remains pending", () => {
   assert.equal(h.txStatusKind("broadcast"), "pending");
   assert.equal(h.sweepStatusCounts([result("broadcast")]).pending, 1);
 });
-

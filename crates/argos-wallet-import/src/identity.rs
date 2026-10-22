@@ -8,8 +8,9 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zcash_address::ZcashAddress;
 use zcash_protocol::consensus::NetworkType;
 use zcash_transparent::address::TransparentAddress;
+use zeroize::Zeroizing;
 
-use crate::keys::EmbeddedNetwork;
+use crate::{keys::EmbeddedNetwork, secret_bytes::SecretArray};
 
 pub(crate) fn transparent_matches_pubkey(secret: &[u8; 32], stored: &[u8]) -> bool {
     let Ok(sk) = SecretKey::from_slice(secret) else {
@@ -80,15 +81,21 @@ const SHA256_IV: [u32; 8] = [
     0x5be0_cd19,
 ];
 
-fn prf_addr(a_sk: &[u8; 32], tag: u8) -> [u8; 32] {
-    let mut block = [0u8; 64];
-    block[..32].copy_from_slice(a_sk);
-    block[0] = (block[0] & 0x0f) | 0xc0;
-    block[32] = tag;
-    let mut state = SHA256_IV;
-    compress256(&mut state, &[*GenericArray::from_slice(&block)]);
-    let mut out = [0u8; 32];
-    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+fn prf_addr(a_sk: &[u8; 32], tag: u8) -> SecretArray<32> {
+    let mut block = Zeroizing::new([0u8; 64]);
+    if let Some(prefix) = block.get_mut(..32) {
+        prefix.copy_from_slice(a_sk);
+    }
+    if let Some(first) = block.get_mut(0) {
+        *first = (*first & 0x0f) | 0xc0;
+    }
+    if let Some(tag_byte) = block.get_mut(32) {
+        *tag_byte = tag;
+    }
+    let mut state = Zeroizing::new(SHA256_IV);
+    compress256(&mut state, &[*GenericArray::from_slice(block.as_slice())]);
+    let mut out = SecretArray::new([0u8; 32]);
+    for (chunk, word) in out.as_mut_array().chunks_exact_mut(4).zip(*state) {
         chunk.copy_from_slice(&word.to_be_bytes());
     }
     out
@@ -96,12 +103,61 @@ fn prf_addr(a_sk: &[u8; 32], tag: u8) -> [u8; 32] {
 
 pub(crate) fn sprout_address_from_spending_key(a_sk: &[u8; 32]) -> [u8; 64] {
     let mut address = [0u8; 64];
-    address[..32].copy_from_slice(&prf_addr(a_sk, 0));
+    address[..32].copy_from_slice(prf_addr(a_sk, 0).as_slice());
     let mut sk_enc = prf_addr(a_sk, 1);
-    sk_enc[0] &= 248;
-    sk_enc[31] &= 127;
-    sk_enc[31] |= 64;
-    let pk_enc = X25519PublicKey::from(&StaticSecret::from(sk_enc));
+    sk_enc.as_mut_array()[0] &= 248;
+    sk_enc.as_mut_array()[31] &= 127;
+    sk_enc.as_mut_array()[31] |= 64;
+    let secret = Zeroizing::new(StaticSecret::from(*sk_enc.as_array()));
+    let pk_enc = X25519PublicKey::from(&*secret);
     address[32..].copy_from_slice(pk_enc.as_bytes());
     address
+}
+
+pub(crate) fn retain_sprout_secret(
+    secret: SecretArray<32>,
+    address: &[u8; 64],
+) -> Option<secrecy::Secret<[u8; 32]>> {
+    (sprout_address_from_spending_key(secret.as_array()) == *address).then(|| secret.into_secret())
+}
+
+pub(crate) fn retain_transparent_secret(
+    secret: SecretArray<32>,
+    public_key: &[u8],
+) -> Option<secrecy::Secret<[u8; 32]>> {
+    transparent_matches_pubkey(secret.as_array(), public_key).then(|| secret.into_secret())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn mismatched_fixed_secrets_drop_zeroizing_owners() {
+        let sprout_dropped = Arc::new(AtomicBool::new(false));
+        let sprout = crate::secret_bytes::SecretArray::with_drop_probe(
+            [0xA5; 32],
+            Arc::clone(&sprout_dropped),
+        );
+        assert!(retain_sprout_secret(sprout, &[0u8; 64]).is_none());
+        assert!(sprout_dropped.load(Ordering::SeqCst));
+
+        let transparent_dropped = Arc::new(AtomicBool::new(false));
+        let transparent = crate::secret_bytes::SecretArray::with_drop_probe(
+            [0xA5; 32],
+            Arc::clone(&transparent_dropped),
+        );
+        assert!(retain_transparent_secret(transparent, &[0u8; 33]).is_none());
+        assert!(transparent_dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn project_x25519_owner_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Zeroizing<StaticSecret>>();
+    }
 }

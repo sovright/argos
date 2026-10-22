@@ -6,8 +6,9 @@ use secrecy::{ExposeSecret, Secret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, Weak,
 };
+use std::time::{Duration, Instant};
 use zcash_keys::address::Address;
 use zcash_transparent::{
     address::TransparentAddress,
@@ -17,6 +18,7 @@ use zip32::AccountId;
 
 const MAX_WORK: u64 = 10_000_000;
 const MAX_MATCHES: usize = 256;
+const TERMINAL_RETENTION: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,9 +85,19 @@ struct SearchJob {
     matches: Mutex<Vec<RetainedMatch>>,
     cancelled: AtomicBool,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AddressSearchService {
     current: Arc<Mutex<Option<Arc<SearchJob>>>>,
+    terminal_retention: Duration,
+}
+
+impl Default for AddressSearchService {
+    fn default() -> Self {
+        Self {
+            current: Arc::default(),
+            terminal_retention: TERMINAL_RETENTION,
+        }
+    }
 }
 
 fn invalid(message: &str) -> ZeckError {
@@ -118,6 +130,14 @@ pub fn candidate_seed(
 }
 
 impl AddressSearchService {
+    #[cfg(test)]
+    fn with_terminal_retention(terminal_retention: Duration) -> Self {
+        Self {
+            current: Arc::default(),
+            terminal_retention,
+        }
+    }
+
     pub fn start(&self, request: SearchRequest) -> ZeckResult<String> {
         if request.target.len() > 4096 {
             return Err(invalid("target address is too long"));
@@ -200,27 +220,32 @@ impl AddressSearchService {
             cancelled: AtomicBool::new(false),
         });
         *current = Some(job.clone());
+        let expiry_registry = self.current.clone();
+        let terminal_retention = self.terminal_retention;
         std::thread::Builder::new()
             .name("argos-address-search".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_search(&job, request, transparent, shielded)
                 }));
-                let mut snapshot = job.snapshot.lock().unwrap();
-                match result {
-                    Ok(Ok(())) if job.cancelled.load(Ordering::Relaxed) => {
-                        snapshot.status = SearchStatus::Cancelled
-                    }
-                    Ok(Ok(())) => snapshot.status = SearchStatus::Complete,
-                    Ok(Err(err)) => {
-                        snapshot.status = SearchStatus::Error;
-                        snapshot.error = Some(err.to_string());
-                    }
-                    Err(_) => {
-                        snapshot.status = SearchStatus::Error;
-                        snapshot.error = Some("address search could not finish".to_owned());
+                {
+                    let mut snapshot = job.snapshot.lock().unwrap();
+                    match result {
+                        Ok(Ok(())) if job.cancelled.load(Ordering::Relaxed) => {
+                            snapshot.status = SearchStatus::Cancelled
+                        }
+                        Ok(Ok(())) => snapshot.status = SearchStatus::Complete,
+                        Ok(Err(err)) => {
+                            snapshot.status = SearchStatus::Error;
+                            snapshot.error = Some(err.to_string());
+                        }
+                        Err(_) => {
+                            snapshot.status = SearchStatus::Error;
+                            snapshot.error = Some("address search could not finish".to_owned());
+                        }
                     }
                 }
+                schedule_terminal_expiry(expiry_registry, Arc::downgrade(&job), terminal_retention);
             })
             .map_err(|_| {
                 *current = None;
@@ -273,6 +298,46 @@ impl AddressSearchService {
             .find(|m| m.public.id == match_id)
             .ok_or_else(|| invalid("address match is no longer available"))?;
         Ok((found.public.clone(), found.seed.clone()))
+    }
+}
+
+fn schedule_terminal_expiry(
+    registry: Arc<Mutex<Option<Arc<SearchJob>>>>,
+    job: Weak<SearchJob>,
+    retention: Duration,
+) {
+    // Anchor the deadline to the terminal transition. If the reaper thread is
+    // not scheduled promptly, it expires immediately rather than extending
+    // the secret-retention window by that delay.
+    let deadline = Instant::now() + retention;
+    let fallback_registry = registry.clone();
+    let fallback_job = job.clone();
+    if std::thread::Builder::new()
+        .name("argos-address-search-expiry".into())
+        .spawn(move || {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            expire_registered_job(&registry, &job);
+        })
+        .is_err()
+    {
+        expire_registered_job(&fallback_registry, &fallback_job);
+    }
+}
+
+fn expire_registered_job(registry: &Mutex<Option<Arc<SearchJob>>>, job: &Weak<SearchJob>) {
+    let Some(expired) = job.upgrade() else {
+        return;
+    };
+    let mut current = registry.lock().unwrap();
+    if current
+        .as_ref()
+        .is_some_and(|registered| Arc::ptr_eq(registered, &expired))
+        && !matches!(
+            expired.snapshot.lock().unwrap().status,
+            SearchStatus::Running
+        )
+    {
+        *current = None;
     }
 }
 fn record(job: &SearchJob, public: AddressMatch, seed: &Arc<Secret<[u8; 64]>>) -> ZeckResult<()> {
@@ -468,6 +533,138 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    #[test]
+    fn completed_match_seed_expires_without_later_api_access() {
+        let service = AddressSearchService::with_terminal_retention(Duration::from_millis(50));
+        let target = target(3, 0, AddressScope::External);
+        let mut input = request(target);
+        input.index_count = 1;
+        input.include_change = false;
+        let id = service.start(input).unwrap();
+        let result = terminal(&service, &id);
+        assert!(matches!(result.status, SearchStatus::Complete));
+        let found = &result.matches[0];
+        let (_, retained_seed) = service.matched_seed(&id, &found.id).unwrap();
+        let dropped = Arc::downgrade(&retained_seed);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.snapshot(&id).is_ok() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            service.snapshot(&id).is_err(),
+            "expired job handle remained live"
+        );
+        assert!(
+            service.matched_seed(&id, &found.id).is_err(),
+            "expired match handle remained live"
+        );
+        assert_eq!(
+            retained_seed.expose_secret(),
+            candidate_seed(
+                &SecretString::new(PHRASE.into()),
+                &SecretString::new("TREZOR".into())
+            )
+            .unwrap()
+            .expose_secret(),
+            "an active handoff must remain usable after registry expiry"
+        );
+        assert_eq!(
+            Arc::strong_count(&retained_seed),
+            1,
+            "the expired job must drop its retained seed owner"
+        );
+        drop(retained_seed);
+        assert!(
+            dropped.upgrade().is_none(),
+            "the seed must drop after its last active consumer"
+        );
+    }
+
+    fn test_job(id: &str, status: SearchStatus) -> Arc<SearchJob> {
+        Arc::new(SearchJob {
+            snapshot: Mutex::new(SearchSnapshot {
+                id: id.to_owned(),
+                target: String::new(),
+                network: ZeckNetwork::Mainnet,
+                profile: SearchProfile::Bip44,
+                status,
+                checked: 0,
+                total: 1,
+                matches: vec![],
+                error: None,
+            }),
+            matches: Mutex::new(vec![]),
+            cancelled: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn stale_expiry_cannot_remove_a_newer_job() {
+        let old = test_job("old", SearchStatus::Complete);
+        let new = test_job("new", SearchStatus::Running);
+        let registry = Arc::new(Mutex::new(Some(old.clone())));
+        schedule_terminal_expiry(
+            registry.clone(),
+            Arc::downgrade(&old),
+            Duration::from_millis(25),
+        );
+        *registry.lock().unwrap() = Some(new.clone());
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &new)));
+    }
+
+    #[test]
+    fn expiry_never_removes_a_running_job() {
+        let running = test_job("running", SearchStatus::Running);
+        let registry = Arc::new(Mutex::new(Some(running.clone())));
+        schedule_terminal_expiry(
+            registry.clone(),
+            Arc::downgrade(&running),
+            Duration::from_millis(25),
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &running)));
+    }
+
+    #[test]
+    fn every_terminal_status_expires_autonomously() {
+        for (id, status) in [
+            ("complete", SearchStatus::Complete),
+            ("cancelled", SearchStatus::Cancelled),
+            ("error", SearchStatus::Error),
+        ] {
+            let terminal = test_job(id, status);
+            let registry = Arc::new(Mutex::new(Some(terminal.clone())));
+            schedule_terminal_expiry(
+                registry.clone(),
+                Arc::downgrade(&terminal),
+                Duration::from_millis(25),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while registry.lock().unwrap().is_some() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                registry.lock().unwrap().is_none(),
+                "{id} job did not expire"
+            );
+        }
+    }
+
     #[test]
     fn finds_nonzero_account_change_index_beyond_gap_and_rehydrates_exact_key() {
         let service = AddressSearchService::default();

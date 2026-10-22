@@ -19,17 +19,35 @@
 //! Not a secret: this key exists to hold worthless regtest coins.
 pub const STANDALONE_TRANSPARENT_SECRET: [u8; 32] = [0x11; 32];
 
+/// Resolve one fixture key through the production import path so integration
+/// tests retain the same zeroizing parsed-secret owner as real wallet keys.
+pub fn imported_transparent_key(
+    secret: &mut secp256k1::SecretKey,
+) -> argos_core::imported::ImportedTransparentKey {
+    use argos_core::argos_wallet_import::{
+        keys::{Provenance, TransparentKey},
+        ImportedKeys,
+    };
+    use secrecy::Secret;
+
+    let mut keys = ImportedKeys::default();
+    keys.transparent.push(TransparentKey {
+        secret: Secret::new(secret.secret_bytes()),
+        provenance: Provenance::Standalone,
+        created_at: None,
+    });
+    secret.non_secure_erase();
+
+    argos_core::imported::imported_transparent_keys(&keys)
+        .expect("the fixture transparent key must resolve")
+        .pop()
+        .expect("the fixture must resolve exactly one transparent key")
+}
+
 /// Derive the standalone key through the same path the importer uses, so
 /// the funder and the test cannot disagree about the address.
 pub fn standalone_transparent_key() -> argos_core::imported::ImportedTransparentKey {
-    use zcash_transparent::address::TransparentAddress;
-
-    let secp = secp256k1::Secp256k1::signing_only();
-    let secret = secp256k1::SecretKey::from_slice(&STANDALONE_TRANSPARENT_SECRET)
+    let mut secret = secp256k1::SecretKey::from_slice(&STANDALONE_TRANSPARENT_SECRET)
         .expect("the standalone test key is a valid secp256k1 scalar");
-    let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
-    argos_core::imported::ImportedTransparentKey {
-        secret,
-        address: TransparentAddress::from_pubkey(&pubkey),
-    }
+    imported_transparent_key(&mut secret)
 }

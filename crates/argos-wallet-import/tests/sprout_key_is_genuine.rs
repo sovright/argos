@@ -83,7 +83,7 @@ fn a_pk_from(a_sk: &[u8; 32]) -> [u8; 32] {
     prf_addr(a_sk, 0)
 }
 
-fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn load(fixture: &str) -> Vec<argos_wallet_import::bdb::RawRecord> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
     bdb::walk(&bytes)
@@ -174,11 +174,12 @@ fn assert_one_sprout_rejected(before: &ImportedKeys, after: &ImportedKeys, kind:
     assert!(!message.contains(&format!("{:02x?}", before.sprout[0].a_sk.expose_secret())));
 }
 
-fn mutate_first_sprout_address(pairs: &mut [(Vec<u8>, Vec<u8>)], kind: &str) {
-    let (raw_key, _) = pairs
+fn mutate_first_sprout_address(pairs: &mut [argos_wallet_import::bdb::RawRecord], kind: &str) {
+    let record = pairs
         .iter_mut()
-        .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == kind))
+        .find(|record| zcashd::parse_record_key(&record.key).is_some_and(|r| r.record_type == kind))
         .unwrap();
+    let raw_key = &mut record.key;
     // Corrupt pk_enc, the other half of the address beyond a_pk.
     raw_key[1 + kind.len() + 63] ^= 1;
 }

@@ -30,6 +30,7 @@ fn main() {
             service: RecoveryService::new(),
             address_search: argos_core::address_search::AddressSearchService::default(),
             reviewed_intent: reviewed_intent::ReviewedIntentStore::default(),
+            wallet_reviews: reviewed_intent::WalletReviewRegistry::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::validate_seed,
@@ -45,6 +46,7 @@ fn main() {
             commands::start_scan_from_wallet_file,
             commands::get_scan_progress,
             commands::cancel_scan,
+            commands::release_scan,
             commands::reconcile_sweep,
             commands::retry_unknown_sweep,
             commands::propose_sweep,

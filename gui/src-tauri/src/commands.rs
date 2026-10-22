@@ -1,16 +1,17 @@
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::reviewed_intent::{
-    CheckpointReservation, ReviewedIntentStore, ReviewedSproutSweep, ScanMaterial,
-    SproutIntentSource, SproutProposalId, SproutScanHandle, SproutScanProgressEvent,
-    SproutScanSnapshot, SproutSweepIntent, SproutSweepPreviewData, WalletReverification,
+    CheckpointReservation, ReviewedIntentStore, ReviewedSproutSweep, ReviewedWalletSource,
+    ScanCatchupLease, ScanMaterial, ScanWorkerCompletion, SecretSproutKeys, SproutIntentSource,
+    SproutProposalId, SproutScanHandle, SproutScanProgressEvent, SproutScanSnapshot,
+    SproutSweepIntent, SproutSweepPreviewData, WalletCheckpointAuthority, WalletReviewId,
+    WalletReviewRegistry,
 };
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
@@ -27,6 +28,7 @@ pub struct AppState {
     pub service: RecoveryService,
     pub address_search: argos_core::address_search::AddressSearchService,
     pub reviewed_intent: ReviewedIntentStore,
+    pub wallet_reviews: WalletReviewRegistry,
 }
 
 #[derive(Deserialize)]
@@ -281,7 +283,7 @@ pub async fn start_matched_recovery(
 }
 
 #[tauri::command]
-pub async fn validate_seed(words: Vec<String>) -> Result<bool, String> {
+pub async fn validate_seed(words: Vec<SecretString>) -> Result<bool, String> {
     validate_mnemonic_words(&words)
         .map(|_| true)
         .map_err(|err| err.to_string())
@@ -302,6 +304,8 @@ pub async fn validate_address(
 /// `argos inspect-wallet` prints.
 #[derive(Serialize)]
 pub struct WalletFileSummary {
+    /// Opaque backend authority for the exact file object and bytes inspected.
+    pub review_id: Option<WalletReviewId>,
     pub path: String,
     pub transparent_keys: usize,
     pub sapling_keys: usize,
@@ -481,9 +485,10 @@ async fn compute_sprout_summary(
         Ok(argos_core::sprout_sweep::SproutJournalSnapshot::default())
     } else {
         resolve_data_dir(app, data_dir).and_then(|dir| {
+            let spending_keys = wallet_sprout_keys(keys);
             argos_core::sprout_sweep::SweepJournal::for_keys(
                 &dir,
-                &wallet_sprout_keys(keys),
+                spending_keys.as_slice(),
                 network,
             )
             .load_scoped_snapshot(
@@ -611,8 +616,8 @@ fn sprout_screen_with_journal(
     }
 }
 
-/// Read a legacy wallet file and report what is in it. No network is used;
-/// legacy sweep-journal migration may replace it in the selected data dir.
+/// Read a legacy wallet file and report what is in it. No network is used.
+/// Legacy or unmarked sweep journals are preserved and refused, never migrated.
 ///
 /// The passphrase crosses the IPC boundary as a `SecretString`, the same
 /// treatment the seed phrase gets (audit Issue A). That is a real exposure
@@ -622,6 +627,7 @@ fn sprout_screen_with_journal(
 #[tauri::command]
 pub async fn inspect_wallet_file(
     app: AppHandle,
+    state: State<'_, AppState>,
     path: String,
     passphrase: Option<SecretString>,
     network: Option<String>,
@@ -632,13 +638,17 @@ pub async fn inspect_wallet_file(
     // defaulting to mainnet as everything else here does.
     let network_name = network.unwrap_or_else(|| "mainnet".to_owned());
     let selected = parse_wallet_network(&network_name)?;
-    let bytes = argos_core::wallet_file::read_wallet_file(&path)
+    let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path)
         .map_err(|err| format!("could not read {path}: {err}"))?;
     // Recovery runs only once the core importer has accepted the wallet's
     // embedded network; it is async (a saved scan is named offline), so it
     // follows the import rather than running inside its continuation.
-    let mut keys = match import_gui_wallet_then(&bytes, passphrase.as_ref(), selected, |keys| keys)
-    {
+    let mut keys = match import_gui_wallet_then(
+        snapshot.bytes(),
+        passphrase.as_ref(),
+        selected,
+        |keys| keys,
+    ) {
         Ok(keys) => keys,
         // An encrypted wallet with a missing or wrong passphrase is an
         // ordinary user situation, not a failure to show raw. Matched on
@@ -650,6 +660,7 @@ pub async fn inspect_wallet_file(
             argos_core::argos_wallet_import::ImportError::WrongPassphrase,
         )) => {
             return Ok(WalletFileSummary {
+                review_id: None,
                 path,
                 transparent_keys: 0,
                 sapling_keys: 0,
@@ -678,18 +689,34 @@ pub async fn inspect_wallet_file(
         Err(err) => return Err(err.to_string()),
     };
     let sprout = compute_sprout_summary(&app, &mut keys, selected, data_dir.as_deref()).await;
+    let review_id = if keys.is_empty() {
+        None
+    } else {
+        Some(state.wallet_reviews.register(
+            PathBuf::from(&path),
+            std::sync::Arc::new(snapshot.identity().clone()),
+        )?)
+    };
 
-    Ok(wallet_summary_from_keys(path, keys, sprout, &network_name))
+    Ok(wallet_summary_from_keys(
+        path,
+        review_id,
+        keys,
+        sprout,
+        &network_name,
+    ))
 }
 
 /// Keep IPC coverage and diagnostics bound to the same parsed key set.
 fn wallet_summary_from_keys(
     path: String,
+    review_id: Option<WalletReviewId>,
     keys: argos_core::argos_wallet_import::ImportedKeys,
     sprout: SproutSummary,
     network_name: &str,
 ) -> WalletFileSummary {
     WalletFileSummary {
+        review_id,
         path,
         transparent_keys: keys.transparent.len(),
         sapling_keys: keys.sapling.len(),
@@ -734,11 +761,11 @@ pub struct WalletFileScanInput {
     /// Absent when the user supplied only typed Sapling keys — a key string
     /// is a key source in its own right, with no file behind it.
     #[serde(default)]
-    pub path: Option<String>,
+    pub review_id: Option<WalletReviewId>,
     pub passphrase: Option<SecretString>,
     /// Sapling spending keys typed or pasted in the GUI, one per entry.
     #[serde(default)]
-    pub sapling_keys: Vec<String>,
+    pub sapling_keys: Vec<SecretString>,
     pub birthday: u32,
     pub num_accounts: Option<u32>,
     pub gap_limit: u32,
@@ -760,6 +787,44 @@ pub struct WalletFileScanInput {
     /// as the memo: the config screen has already collected it, and a
     /// destination the sweep cannot reach should not cost hours of scanning.
     pub destination: String,
+}
+
+/// Decode GUI key strings without ever collecting them into an ordinary
+/// `Vec<String>`. The Tauri boundary owns each entry as `SecretString`; this
+/// helper borrows it only long enough to decode into the zeroizing imported
+/// key representation.
+fn keys_from_secret_sapling_strings(
+    lines: &[SecretString],
+    network: ZeckNetwork,
+) -> Result<argos_core::argos_wallet_import::ImportedKeys, String> {
+    use argos_core::argos_wallet_import::{Provenance, SaplingKey};
+    use secrecy::{ExposeSecret, Secret};
+
+    let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
+    for (index, line) in lines.iter().enumerate() {
+        let line = line.expose_secret().trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let extsk = argos_core::sapling_key::decode_sapling_spending_key(line, network)
+            .map_err(|err| format!("line {}: {err}", index + 1))?;
+        let decoded = argos_core::argos_wallet_import::ImportedKeys {
+            sapling: vec![SaplingKey {
+                extsk: Secret::new(extsk.to_bytes().to_vec()),
+                provenance: Provenance::Standalone,
+                created_at: None,
+            }],
+            ..Default::default()
+        };
+        argos_core::sapling_key::merge_sapling_keys(&mut keys, decoded);
+    }
+    if keys.sapling.is_empty() {
+        return Err(
+            "no Sapling spending keys found — expected at least one `secret-extended-key-…` line"
+                .to_owned(),
+        );
+    }
+    Ok(keys)
 }
 
 /// Refuse, before the scan, a destination a seedless sweep cannot pay.
@@ -805,12 +870,11 @@ pub async fn start_scan_from_wallet_file(
     // user may hold a wallet whose keys were never rescanned *and* a paper
     // key for an address it never knew about. Mirrors the CLI's
     // `--wallet-file` + `--sapling-key-file` combination.
-    let mut keys = match &config.path {
-        Some(path) => {
-            let bytes = argos_core::wallet_file::read_wallet_file(path)
-                .map_err(|err| format!("could not read {path}: {err}"))?;
+    let mut keys = match &config.review_id {
+        Some(review_id) => {
+            let (_, snapshot) = state.wallet_reviews.verify(review_id)?;
             argos_core::import_wallet_file_for_network(
-                &bytes,
+                snapshot.bytes(),
                 config.passphrase.as_ref(),
                 config.network,
             )
@@ -823,11 +887,7 @@ pub async fn start_scan_from_wallet_file(
     drop_and_warn_forged_sprout_keys(&app, &mut keys);
 
     if !config.sapling_keys.is_empty() {
-        let typed = argos_core::sapling_key::keys_from_sapling_strings(
-            &config.sapling_keys,
-            config.network,
-        )
-        .map_err(|err| err.to_string())?;
+        let typed = keys_from_secret_sapling_strings(&config.sapling_keys, config.network)?;
         // A wallet file with a mnemonic takes the Combined route, which
         // registers pasted keys beside the seed's accounts. The same helper
         // the CLI calls, so the two surfaces cannot drift on which
@@ -975,6 +1035,18 @@ pub async fn cancel_scan(state: State<'_, AppState>, handle: ScanHandle) -> Resu
     state
         .service
         .cancel_scan(&handle)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+/// Release all in-memory authority for a recovery scan. Unlike cancellation,
+/// this also removes completed sessions and waits for any running worker to
+/// stop before the final key owner is dropped.
+#[tauri::command]
+pub async fn release_scan(state: State<'_, AppState>, handle: ScanHandle) -> Result<(), String> {
+    state
+        .service
+        .release_scan(&handle)
         .await
         .map_err(|err| err.to_string())
 }
@@ -1236,6 +1308,13 @@ fn empty_sprout_proposal_error(
     ))
 }
 
+fn with_chain_notice(message: impl Into<String>, notice: Option<&str>) -> String {
+    match notice {
+        Some(notice) if !notice.is_empty() => format!("{}. {notice}", message.into()),
+        _ => message.into(),
+    }
+}
+
 /// Strict: an unknown network name is refused, never defaulted, on the
 /// paths that bind a scan or a sweep to a chain. [`network_from`] is the
 /// lenient form, built on this one.
@@ -1244,13 +1323,6 @@ fn sprout_network(name: &str) -> Result<ZeckNetwork, String> {
         "mainnet" => Ok(ZeckNetwork::Mainnet),
         "testnet" => Ok(ZeckNetwork::Testnet),
         _ => Err("choose mainnet or testnet".to_owned()),
-    }
-}
-
-fn with_chain_notice(message: String, notice: Option<&str>) -> String {
-    match notice {
-        Some(notice) => format!("{message}. {notice}"),
-        None => message,
     }
 }
 
@@ -1285,7 +1357,7 @@ fn no_sprout_notes_error(
 pub async fn propose_wallet_sprout_sweep(
     app: AppHandle,
     state: State<'_, AppState>,
-    path: String,
+    review_id: WalletReviewId,
     passphrase: Option<SecretString>,
     destination: String,
     lightwalletd_url: String,
@@ -1303,20 +1375,24 @@ pub async fn propose_wallet_sprout_sweep(
     // Validated before the wallet file is decrypted: neither check needs the
     // keys, so a bad address or server is reported without them.
     validate_sweep_request(&destination, network, &lightwalletd_url)?;
-    let bytes = argos_core::wallet_file::read_wallet_file(&path)
-        .map_err(|err| format!("could not read {path}: {err}"))?;
-    let mut keys = import_gui_wallet_then(&bytes, passphrase.as_ref(), network, |keys| keys)
-        .map_err(|err| err.to_string())?;
-    let dir = resolve_data_dir(&app, data_dir.as_deref())?;
+    let (reviewed_source, snapshot) = state.wallet_reviews.verify(&review_id)?;
+    let mut keys =
+        import_gui_wallet_then(snapshot.bytes(), passphrase.as_ref(), network, |keys| keys)
+            .map_err(|err| err.to_string())?;
+    let dir = with_resolved_sprout_data_dir(resolve_data_dir(&app, data_dir.as_deref()), |dir| {
+        Ok(dir.to_path_buf())
+    })?;
+    let raw_peers = peers.unwrap_or_default();
     propose_wallet_sprout_sweep_core(
         &state.reviewed_intent,
+        reviewed_source,
         &mut keys,
         dir,
         destination,
         network,
         lightwalletd_url,
         confirmation_sources,
-        &peers.unwrap_or_default(),
+        &raw_peers,
         |warning| {
             let _ = app.emit("sprout-forged-key", warning);
         },
@@ -1331,6 +1407,7 @@ pub async fn propose_wallet_sprout_sweep(
 #[allow(clippy::too_many_arguments)]
 async fn propose_wallet_sprout_sweep_core(
     store: &ReviewedIntentStore,
+    reviewed_source: std::sync::Arc<ReviewedWalletSource>,
     keys: &mut argos_core::argos_wallet_import::ImportedKeys,
     dir: PathBuf,
     destination: String,
@@ -1357,8 +1434,16 @@ async fn propose_wallet_sprout_sweep_core(
     };
     let recovered = recover_for_sweep_preview(keys, network, Some(dir.clone()), raw_peers).await;
     let notice = recovered.chain_notice.as_deref();
-    let journal =
-        argos_core::sprout_sweep::SweepJournal::for_keys(&dir, &wallet_sprout_keys(keys), network);
+    let wallet_checkpoint = WalletCheckpointAuthority {
+        data_dir: dir.clone(),
+        keys: wallet_sprout_keys(keys),
+        peers,
+    };
+    let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+        &dir,
+        wallet_checkpoint.keys.as_slice(),
+        network,
+    );
     let outpoints = recovered
         .notes
         .iter()
@@ -1380,28 +1465,22 @@ async fn propose_wallet_sprout_sweep_core(
     if plan_empty {
         return Err(no_sprout_notes_error(&recovered, &inventory));
     }
-    // Bound for execute, which verifies the saved scan again through the
-    // same peers (#272) rather than trusting this review's verdict.
-    let wallet_reverify = WalletReverification {
-        data_dir: Some(dir),
-        scan_keys: wallet_sprout_keys(keys),
-        peers,
-    };
-
-    // The reviewed notes, with their keys, are held in the proposal (see
-    // `reviewed_intent`'s key-retention note), so execution never re-reads
-    // the file and no file identity needs recording.
+    // The reviewed notes and backend-owned wallet identity are held together.
+    // Execute reopens only to verify identity; it never re-imports notes or
+    // accepts a path from the webview.
     let mut review = store.insert_proposal(
         SproutSweepIntent {
-            source: SproutIntentSource::Wallet,
+            source: SproutIntentSource::Wallet(reviewed_source),
             notes: recovered.notes,
             destination,
             network,
             lightwalletd_url,
             confirmation_sources,
             journal,
+            wallet_checkpoint: Some(wallet_checkpoint),
+            checkpoint_authority: None,
+            _checkpoint_reservation: None,
             tip_warning: None,
-            wallet_reverify: Some(wallet_reverify),
             peer_error,
         },
         plan,
@@ -1424,12 +1503,11 @@ fn refuse_unverified_review(intent: &SproutSweepIntent) -> Result<(), String> {
     }
 }
 
-/// Everything execute checks before it spends, in order: a review built
-/// with a malformed peer field is refused; then a wallet proposal's saved
-/// scan is verified against live headers again, through the peers it was
-/// reviewed with, exactly as #272's sweep did at execute. Every reviewed
-/// note must still be spendable by that fresh evidence, or the sweep is
-/// refused and must be reviewed again.
+/// After the peer field is accepted, verify a wallet proposal's saved scan
+/// against live headers again, through the peers it was reviewed with,
+/// exactly as #272's sweep did at execute. Every reviewed note must still be
+/// spendable by that fresh evidence, or the sweep is refused and must be
+/// reviewed again.
 ///
 /// The lifecycle journal is not read or written here: recovery does not
 /// drop journaled notes (classification does), and `sweep_sprout_notes`
@@ -1438,52 +1516,58 @@ fn refuse_unverified_review(intent: &SproutSweepIntent) -> Result<(), String> {
 ///
 /// Returns execute's own verdict, which the sweep report carries in place
 /// of the review's. A scan-derived proposal has nothing to re-verify here.
-async fn verify_review_at_execute(intent: &SproutSweepIntent) -> Result<Option<String>, String> {
-    verify_review_with(intent, |dir, network, keys, peers| async move {
-        argos_core::sprout_scan_run::chain_spends_for_wallet(&dir, network, &keys, &peers).await
-    })
-    .await
+fn verify_review_at_execute(
+    intent: &SproutSweepIntent,
+) -> impl std::future::Future<Output = Result<Option<String>, String>> + Send + '_ {
+    // Retained namespace authority makes the whole intent !Sync. Validate its
+    // peer field now, then borrow only the Sync verification inputs across await.
+    let peer_check = refuse_unverified_review(intent);
+    let notes = intent.notes.as_slice();
+    let network = intent.network;
+    let wallet_checkpoint = intent.wallet_checkpoint.as_ref();
+    async move {
+        peer_check?;
+        verify_review_with(
+            notes,
+            network,
+            wallet_checkpoint,
+            |dir, network, keys, peers| async move {
+                argos_core::sprout_scan_run::chain_spends_for_wallet(dir, network, keys, peers)
+                    .await
+            },
+        )
+        .await
+    }
 }
 
-/// The scan evidence a wallet proposal's execute-time check looks up: the
-/// spends the saved scan shows, and the notice describing how it got there.
 type ReverifyEvidence = (
     Option<std::sync::Arc<argos_core::sprout_recovery::ChainSpends>>,
     Option<String>,
 );
 
-/// [`verify_review_at_execute`] with the live-peer lookup of the saved scan
-/// supplied by the caller, so the refusal logic can be driven offline.
-async fn verify_review_with<F, Fut>(
-    intent: &SproutSweepIntent,
+/// Keep the lookup injectable for offline refusal tests. Borrow the reviewed
+/// key wrapper throughout the lookup; do not create an unwrapped key copy.
+async fn verify_review_with<'a, F, Fut>(
+    notes: &'a [argos_core::sprout_recovery::SpendableSproutNote],
+    network: ZeckNetwork,
+    wallet_checkpoint: Option<&'a WalletCheckpointAuthority>,
     lookup: F,
 ) -> Result<Option<String>, String>
 where
-    F: FnOnce(
-        std::path::PathBuf,
-        argos_core::p2p::wire::P2pNetwork,
-        Vec<[u8; 32]>,
-        Vec<String>,
-    ) -> Fut,
+    F: FnOnce(&'a Path, argos_core::p2p::wire::P2pNetwork, &'a [[u8; 32]], &'a [String]) -> Fut,
     Fut: std::future::Future<Output = ReverifyEvidence>,
 {
-    refuse_unverified_review(intent)?;
-    let Some(reverify) = &intent.wallet_reverify else {
+    let Some(reverify) = wallet_checkpoint else {
         return Ok(None);
     };
-    let (chain, notice) = match &reverify.data_dir {
-        Some(dir) => {
-            lookup(
-                dir.clone(),
-                intent.network.into(),
-                reverify.scan_keys.to_vec(),
-                reverify.peers.clone(),
-            )
-            .await
-        }
-        None => (None, None),
-    };
-    reviewed_notes_still_spendable(&intent.notes, chain.as_deref())
+    let (chain, notice) = lookup(
+        &reverify.data_dir,
+        network.into(),
+        reverify.keys.as_slice(),
+        &reverify.peers,
+    )
+    .await;
+    reviewed_notes_still_spendable(notes, chain.as_deref())
         .map_err(|err| with_chain_notice(err, notice.as_deref()))?;
     Ok(notice)
 }
@@ -1539,9 +1623,7 @@ async fn execute_reviewed_sprout_sweep(
     .await
 }
 
-/// Execute's ordering, free of any `AppHandle`: the review is verified
-/// first, and `sweep` (the only step that spends) runs only if it passes,
-/// receiving execute's own verification notice.
+/// Only the closure after successful verification may enter the spending step.
 async fn verified_then_sweep<F, Fut>(
     intent: SproutSweepIntent,
     sweep: F,
@@ -1560,7 +1642,7 @@ async fn sweep_reviewed_intent(
     chain_notice: Option<String>,
 ) -> Result<SproutSweepReport, String> {
     let source = match &intent.source {
-        SproutIntentSource::Wallet => argos_core::sprout_sweep::NoteSource::WalletFile,
+        SproutIntentSource::Wallet(_) => argos_core::sprout_sweep::NoteSource::WalletFile,
         SproutIntentSource::Scan(_) => argos_core::sprout_sweep::NoteSource::Scan,
     };
     let emitter = app.clone();
@@ -1583,6 +1665,24 @@ async fn sweep_reviewed_intent(
     .map_err(|err| with_chain_notice(err.to_string(), chain_notice.as_deref()))?;
 
     apply_sprout_tip_warning(&mut outcome, intent.tip_warning);
+    if let Some(authority) = &intent.checkpoint_authority {
+        match argos_core::sprout_sweep::finalize_scan_checkpoint(
+            authority,
+            &intent.journal,
+            intent.network,
+            outcome.fresh_all_mined,
+        ) {
+            Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::Removed)
+            | Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::AlreadyAbsent) => {}
+            Ok(argos_core::sprout_sweep::ScanCheckpointCleanup::Retained(reason)) => {
+                outcome.fresh_all_mined = false;
+                outcome
+                    .warnings
+                    .push(format!("Checkpoint retained: {reason}."));
+            }
+            Err(err) => apply_checkpoint_cleanup_error(&mut outcome, &err),
+        }
+    }
     // Execute's own verification verdict, not the review's (#272).
     append_chain_notice(&mut outcome.warnings, chain_notice);
     Ok(sprout_sweep_report(outcome))
@@ -1598,6 +1698,16 @@ fn apply_sprout_tip_warning(
     }
 }
 
+fn apply_checkpoint_cleanup_error(
+    outcome: &mut argos_core::sprout_sweep::SproutSweepOutcome,
+    err: &dyn std::fmt::Display,
+) {
+    outcome.fresh_all_mined = false;
+    outcome
+        .warnings
+        .push(format!("Checkpoint cleanup failed: {err}"));
+}
+
 #[tauri::command]
 pub async fn execute_wallet_sprout_sweep(
     app: AppHandle,
@@ -1606,6 +1716,13 @@ pub async fn execute_wallet_sprout_sweep(
 ) -> Result<SproutSweepReport, String> {
     ensure_tos_accepted(&app)?;
     let intent = state.reviewed_intent.take_wallet_proposal(&proposal_id)?;
+    let SproutIntentSource::Wallet(reviewed_source) = &intent.source else {
+        return Err("proposal belongs to a scan-derived sweep".into());
+    };
+    // Consume the one-shot proposal first, then bind every checkpoint query,
+    // proof and send to the same file object and bytes the user inspected.
+    // The proposal's Arc remains valid even if the registry entry expires.
+    let _verified = state.wallet_reviews.verify_source(reviewed_source)?;
     execute_reviewed_sprout_sweep(app, intent).await
 }
 
@@ -1636,10 +1753,13 @@ pub struct SproutScanReport {
 /// hours in. The address is returned so the user can confirm Argos is about
 /// to look for the one they meant.
 #[tauri::command]
-pub async fn check_sprout_key(key: String, network: String) -> Result<String, String> {
+pub async fn check_sprout_key(key: SecretString, network: String) -> Result<String, String> {
+    use secrecy::ExposeSecret;
+
     let network = parse_wallet_network(&network)?;
-    let a_sk = argos_core::sprout_key::decode_sprout_spending_key(key.trim(), network)
-        .map_err(|err| err.to_string())?;
+    let a_sk =
+        argos_core::sprout_key::decode_sprout_spending_key(key.expose_secret().trim(), network)
+            .map_err(|err| err.to_string())?;
     Ok(argos_core::sprout_key::encode_sprout_address(
         &argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk),
         network,
@@ -1652,10 +1772,13 @@ pub async fn check_sprout_key(key: String, network: String) -> Result<String, St
 /// comes back, never the key, so nothing secret crosses the IPC boundary in
 /// the reply or reaches a log.
 #[tauri::command]
-pub async fn check_sapling_key(key: String, network: String) -> Result<String, String> {
+pub async fn check_sapling_key(key: SecretString, network: String) -> Result<String, String> {
+    use secrecy::ExposeSecret;
+
     let network = parse_wallet_network(&network)?;
-    let extsk = argos_core::sapling_key::decode_sapling_spending_key(key.trim(), network)
-        .map_err(|err| err.to_string())?;
+    let extsk =
+        argos_core::sapling_key::decode_sapling_spending_key(key.expose_secret().trim(), network)
+            .map_err(|err| err.to_string())?;
     Ok(argos_core::sapling_key::default_sapling_address(
         &extsk, network,
     ))
@@ -1673,53 +1796,59 @@ pub async fn check_sapling_key(key: String, network: String) -> Result<String, S
 /// the wallet's own records.
 struct ScanKeys {
     /// Every key, deduplicated: what the scan decrypts for.
-    all: Vec<[u8; 32]>,
-    typed: Vec<[u8; 32]>,
+    all: SecretSproutKeys,
+    typed: SecretSproutKeys,
     wallet: Option<argos_core::argos_wallet_import::ImportedKeys>,
 }
 
-fn collect_scan_keys(
-    path: Option<&str>,
+fn collect_scan_keys_from_bytes(
+    wallet_bytes: Option<&[u8]>,
     passphrase: Option<&SecretString>,
-    typed: &[String],
+    typed: &[SecretString],
     network: argos_core::ZeckNetwork,
 ) -> Result<ScanKeys, String> {
     use secrecy::ExposeSecret;
 
-    let mut keys: Vec<[u8; 32]> = Vec::new();
+    let mut typed_values =
+        secrecy::zeroize::Zeroizing::new(Vec::<[u8; 32]>::with_capacity(typed.len()));
 
     for (index, key) in typed.iter().enumerate() {
-        let key = key.trim();
+        let key = key.expose_secret().trim();
         // Blank lines and `#` comments are annotation, as in the CLI key file
         // and `keys_from_sapling_strings`. `typed` is the box's raw lines, so
         // `index` is the line the user sees.
         if key.is_empty() || key.starts_with('#') {
             continue;
         }
-        keys.push(
+        typed_values.push(
             argos_core::sprout_key::decode_sprout_spending_key(key, network)
                 .map_err(|err| format!("line {}: {err}", index + 1))?,
         );
     }
 
-    let typed_keys = keys.clone();
+    let typed_keys = SecretSproutKeys::new(typed_values.to_vec());
     let mut wallet_keys = None;
-    if let Some(path) = path {
-        let bytes = argos_core::wallet_file::read_wallet_file(path)
-            .map_err(|err| format!("could not read {path}: {err}"))?;
-        let mut wallet = argos_core::import_wallet_file_for_network(&bytes, passphrase, network)
+    if let Some(bytes) = wallet_bytes {
+        let mut wallet = argos_core::import_wallet_file_for_network(bytes, passphrase, network)
             .map_err(|err| err.to_string())?;
         // Drop any Sprout key that does not control its stored address before
         // it is trial-decrypted against — parity with the CLI loader and the
         // sweep commands. No AppHandle here to warn on; the sweep/preview
         // paths surface it, and a forged key would find nothing regardless.
         let _ = argos_core::sprout_recovery::reject_forged_sprout_keys(&mut wallet);
-        for key in &wallet.sprout {
-            keys.push(*key.a_sk.expose_secret());
-        }
         wallet_keys = Some(wallet);
     }
 
+    // Allocate the final key set once. Growing a Vec after it contains keys
+    // can leave its old allocation unwiped after reallocation.
+    let wallet_len = wallet_keys.as_ref().map_or(0, |wallet| wallet.sprout.len());
+    let mut keys = secrecy::zeroize::Zeroizing::new(Vec::<[u8; 32]>::with_capacity(
+        typed_values.len() + wallet_len,
+    ));
+    keys.extend_from_slice(&typed_values);
+    if let Some(wallet) = &wallet_keys {
+        keys.extend(wallet.sprout.iter().map(|key| *key.a_sk.expose_secret()));
+    }
     keys.sort_unstable();
     keys.dedup();
     if keys.is_empty() {
@@ -1730,10 +1859,24 @@ fn collect_scan_keys(
         );
     }
     Ok(ScanKeys {
-        all: keys,
+        all: SecretSproutKeys::new(std::mem::take(&mut *keys)),
         typed: typed_keys,
         wallet: wallet_keys,
     })
+}
+
+#[cfg(test)]
+fn collect_scan_keys(
+    path: Option<&str>,
+    passphrase: Option<&SecretString>,
+    typed: &[SecretString],
+    network: argos_core::ZeckNetwork,
+) -> Result<ScanKeys, String> {
+    let bytes = path
+        .map(argos_core::wallet_file::read_wallet_file)
+        .transpose()
+        .map_err(|err| err.to_string())?;
+    collect_scan_keys_from_bytes(bytes.as_deref(), passphrase, typed, network)
 }
 
 /// Where the Sprout scan starts trial-decrypting, and the line saying why.
@@ -1875,16 +2018,20 @@ fn validate_peer(entry: &str) -> Result<(), &'static str> {
 /// Start a resumable Sprout scan and return its backend handle immediately.
 fn begin_sprout_scan_session(
     store: &ReviewedIntentStore,
-    decoded: Vec<[u8; 32]>,
+    decoded: SecretSproutKeys,
     dir: &Path,
     network: ZeckNetwork,
     lightwalletd_url: String,
     confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     peers: Vec<String>,
 ) -> Result<(SproutScanHandle, ScanMaterial, CheckpointReservation), String> {
-    let checkpoint = argos_core::sprout_scan_run::checkpoint_path(dir, &decoded);
+    let checkpoint = argos_core::sprout_scan_run::checkpoint_path_for_network(
+        dir,
+        decoded.as_slice(),
+        network.into(),
+    );
     let reservation = store.reserve_checkpoint(&checkpoint)?;
-    let fingerprint = argos_core::sprout_scan_run::key_set_fingerprint(&decoded);
+    let fingerprint = argos_core::sprout_scan_run::key_set_fingerprint(decoded.as_slice());
     let handle = store.insert_scan(
         decoded,
         fingerprint,
@@ -1915,6 +2062,7 @@ fn finish_sprout_scan_task(
 /// worker (and drops the checkpoint reservation the future owns) rather than
 /// leaving it to run on detached for hours. A release that lands before the
 /// attach is handled by `attach_worker`, which aborts the orphan.
+#[cfg(test)]
 async fn run_attached_scan_worker<F>(
     store: &ReviewedIntentStore,
     handle: &SproutScanHandle,
@@ -1923,7 +2071,9 @@ async fn run_attached_scan_worker<F>(
     F: std::future::Future<Output = Result<SproutScanReport, String>> + Send + 'static,
 {
     let scan_task = tokio::spawn(scan);
-    store.attach_worker(handle, scan_task.abort_handle());
+    let completion = ScanWorkerCompletion::new();
+    let _completion_guard = completion.guard();
+    store.attach_worker(handle, scan_task.abort_handle(), completion);
     finish_sprout_scan_task(store, handle, scan_task.await);
 }
 
@@ -1932,8 +2082,8 @@ async fn run_attached_scan_worker<F>(
 pub async fn start_sprout_scan(
     app: AppHandle,
     state: State<'_, AppState>,
-    keys: Vec<String>,
-    path: Option<String>,
+    keys: Vec<SecretString>,
+    review_id: Option<WalletReviewId>,
     passphrase: Option<SecretString>,
     network: String,
     data_dir: String,
@@ -1955,13 +2105,22 @@ pub async fn start_sprout_scan(
     // can. Previously this took typed keys only, so the one user it exists
     // for — a wallet holding Sprout keys but no note data — was told to
     // leave the box blank and then refused, with no way to see the keys.
-    let scan_keys = collect_scan_keys(path.as_deref(), passphrase.as_ref(), &keys, network)?;
+    let wallet_snapshot = match review_id.as_ref() {
+        Some(review_id) => Some(state.wallet_reviews.verify(review_id)?.1),
+        None => None,
+    };
+    let scan_keys = collect_scan_keys_from_bytes(
+        wallet_snapshot.as_ref().map(|snapshot| snapshot.bytes()),
+        passphrase.as_ref(),
+        &keys,
+        network,
+    )?;
     // Planned here, not in the worker: the wallet file's `ImportedKeys` are
     // needed only for this decision and die with this command rather than
     // living as long as an hours-long scan.
     let plan = sprout_scan_plan(
         scan_keys.wallet.as_ref(),
-        &scan_keys.typed,
+        scan_keys.typed.as_slice(),
         network,
         birthday_floor,
         decrypt_every_block.unwrap_or(false),
@@ -1988,83 +2147,94 @@ pub async fn start_sprout_scan(
         peers,
     )?;
     let worker_handle = handle.clone();
-    tokio::spawn(async move {
-        let scan_app = app.clone();
-        let progress_handle = worker_handle.clone();
-        let scan = async move {
-            let _checkpoint_reservation = checkpoint_reservation;
-            let (tip_anchor, tip_warning) =
-                sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
-            let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
-            let emitter = scan_app;
-            let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
-            argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
-                &material.keys,
-                p2p,
-                &material.peers,
-                tip_anchor,
-                &material.checkpoint,
-                decrypt_from,
-                move |tick| {
-                    let _ = emitter.emit(
-                        "sprout-scan-progress",
-                        SproutScanProgressEvent {
-                            handle: progress_handle.clone(),
-                            height: tick.height,
-                            target: tick.target,
-                            notes_found: tick.notes_found,
-                            joinsplits_seen: tick.joinsplits_seen,
-                            peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
-                        },
-                    );
-                },
-            )
-            .await
-            .map_err(|err| err.to_string())
-            .and_then(|result| {
-                let journal_dir = material
-                    .checkpoint
-                    .parent()
-                    .ok_or_else(|| "invalid Sprout checkpoint location".to_owned())?;
-                let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
-                    journal_dir,
-                    &material.keys,
-                    material.network,
+    let scan_app = app.clone();
+    let progress_handle = worker_handle.clone();
+    let scan_task = tokio::spawn(async move {
+        let _checkpoint_reservation = checkpoint_reservation;
+        let (tip_anchor, tip_warning) =
+            sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
+        let tip_height = tip_anchor.as_ref().map(|anchor| anchor.height);
+        let emitter = scan_app;
+        let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
+        argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
+            material.keys.as_slice(),
+            p2p,
+            &material.peers,
+            tip_anchor,
+            &material.checkpoint,
+            decrypt_from,
+            move |tick| {
+                let _ = emitter.emit(
+                    "sprout-scan-progress",
+                    SproutScanProgressEvent {
+                        handle: progress_handle.clone(),
+                        height: tick.height,
+                        target: tick.target,
+                        notes_found: tick.notes_found,
+                        joinsplits_seen: tick.joinsplits_seen,
+                        peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
+                    },
                 );
-                let outpoints = result
-                    .notes
-                    .iter()
-                    .map(|note| note.outpoint)
-                    .collect::<Vec<_>>();
-                let snapshot = journal
-                    .load_scoped_snapshot(&outpoints)
-                    .map_err(|err| err.to_string())?;
-                let has_lifecycle_status = snapshot.entries().next().is_some();
-                Ok(SproutScanReport {
-                    blocks_scanned: result.progress.blocks_scanned,
-                    joinsplits_seen: result.progress.joinsplits_seen,
-                    notes_found: result.notes.len(),
-                    spent_notes: result.spent_notes,
-                    total_zatoshis: result.total_value(),
-                    has_lifecycle_status,
-                    tip_warning,
-                    decrypt_from_height: result.decrypt_from_height,
-                    // The plan line promised a skip the scan did not apply;
-                    // replace it rather than leave the panel saying otherwise.
-                    decrypt_line: argos_core::sprout_scan_run::dropped_bound_line(
-                        decrypt_from,
-                        tip_height,
-                    )
-                    .unwrap_or(decrypt_line),
-                })
+            },
+        )
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|result| {
+            let journal_dir = argos_core::sprout_scan_run::checkpoint_data_dir(
+                &material.checkpoint,
+                material.keys.as_slice(),
+                material.network.into(),
+            )
+            .map_err(|err| err.to_string())?;
+            let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+                journal_dir,
+                material.keys.as_slice(),
+                material.network,
+            );
+            let outpoints = result
+                .notes
+                .iter()
+                .map(|note| note.outpoint)
+                .collect::<Vec<_>>();
+            let snapshot = journal
+                .load_scoped_snapshot(&outpoints)
+                .map_err(|err| err.to_string())?;
+            let has_lifecycle_status = snapshot.entries().next().is_some();
+            Ok(SproutScanReport {
+                blocks_scanned: result.progress.blocks_scanned,
+                joinsplits_seen: result.progress.joinsplits_seen,
+                notes_found: result.notes.len(),
+                spent_notes: result.spent_notes,
+                total_zatoshis: result.total_value(),
+                has_lifecycle_status,
+                tip_warning,
+                decrypt_from_height: result.decrypt_from_height,
+                // The plan line promised a skip the scan did not apply;
+                // replace it rather than leave the panel saying otherwise.
+                decrypt_line: argos_core::sprout_scan_run::dropped_bound_line(
+                    decrypt_from,
+                    tip_height,
+                )
+                .unwrap_or(decrypt_line),
             })
-        };
-        run_attached_scan_worker(&store, &worker_handle, scan).await;
-
-        if let Ok(snapshot) = store.snapshot(&worker_handle) {
+        })
+    });
+    let abort = scan_task.abort_handle();
+    let completion = ScanWorkerCompletion::new();
+    let completion_guard = completion.guard();
+    let supervisor_store = store.clone();
+    let supervisor_handle = worker_handle.clone();
+    tokio::spawn(async move {
+        let _completion_guard = completion_guard;
+        finish_sprout_scan_task(&supervisor_store, &supervisor_handle, scan_task.await);
+        if let Ok(snapshot) = supervisor_store.snapshot(&supervisor_handle) {
             let _ = app.emit("sprout-scan-complete", snapshot);
         }
     });
+    // Attach before returning the handle. Release can therefore abort the
+    // scan and wait for the supervisor to observe its drop before it reports
+    // that the secret session is gone.
+    store.attach_worker(&worker_handle, abort, completion);
     Ok(handle)
 }
 
@@ -2077,11 +2247,11 @@ pub fn get_sprout_scan(
 }
 
 #[tauri::command]
-pub fn release_sprout_scan(
+pub async fn release_sprout_scan(
     state: State<'_, AppState>,
     handle: SproutScanHandle,
 ) -> Result<(), String> {
-    state.reviewed_intent.release_scan(&handle)
+    state.reviewed_intent.release_scan(&handle).await
 }
 
 #[tauri::command]
@@ -2189,15 +2359,17 @@ fn sprout_sweep_report(
 fn begin_sprout_catchup(
     store: &ReviewedIntentStore,
     handle: &SproutScanHandle,
-) -> Result<(ScanMaterial, CheckpointReservation), String> {
+) -> Result<(ScanMaterial, CheckpointReservation, ScanCatchupLease), String> {
     store.ensure_scan_proposal_capacity(handle)?;
+    let catchup = store.register_catchup(handle)?;
     let material = store.scan_material(handle)?;
-    if argos_core::sprout_scan_run::key_set_fingerprint(&material.keys) != material.key_fingerprint
+    if argos_core::sprout_scan_run::key_set_fingerprint(material.keys.as_slice())
+        != material.key_fingerprint
     {
         return Err("Sprout scan key identity changed".into());
     }
     let reservation = store.reserve_checkpoint(&material.checkpoint)?;
-    Ok((material, reservation))
+    Ok((material, reservation, catchup))
 }
 
 #[tauri::command]
@@ -2208,97 +2380,139 @@ pub async fn propose_sprout_scan_sweep(
     destination: String,
 ) -> Result<ReviewedSproutSweep, String> {
     ensure_tos_accepted(&app)?;
-    let (material, _checkpoint_reservation) =
+    let (material, checkpoint_reservation, catchup) =
         begin_sprout_catchup(&state.reviewed_intent, &scan_handle)?;
-    // Checked before the catch-up: an address with no Sapling receiver or a
-    // server address that cannot work should fail here, not after it.
-    validate_sweep_request(&destination, material.network, &material.lightwalletd_url)?;
-    // The resume continues under the bound the scan actually used, read
-    // from its checkpoint, never one supplied by the form: the birthday
-    // there may have changed since the scan, and a lower one would make the
-    // resume conflict after hours of scanning. Lowering it means a new scan.
-    let Some(decrypt_from) = argos_core::sprout_scan_run::saved_decrypt_from(
-        &material.checkpoint,
-        material.network.into(),
-        &material.keys,
-    )
-    .map_err(|err| err.to_string())?
-    else {
-        return Err(
-            "no saved scan was found for these keys. Run the scan first — its results are \
-             what this sweeps."
-                .to_owned(),
-        );
-    };
-    let (tip_anchor, tip_warning) =
-        sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
-    let emitter = app.clone();
-    let progress_handle = scan_handle.clone();
-    let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
-    let result = argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
-        &material.keys,
-        p2p,
-        &material.peers,
-        tip_anchor,
-        &material.checkpoint,
-        decrypt_from,
-        move |tick| {
-            let _ = emitter.emit(
-                "sprout-scan-progress",
-                SproutScanProgressEvent {
-                    handle: progress_handle.clone(),
-                    height: tick.height,
-                    target: tick.target,
-                    notes_found: tick.notes_found,
-                    joinsplits_seen: tick.joinsplits_seen,
-                    peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
-                },
-            );
-        },
-    )
-    .await
-    .map_err(|err| err.to_string())?;
-    let dir = material
-        .checkpoint
-        .parent()
-        .ok_or("invalid Sprout checkpoint location")?;
-    let journal =
-        argos_core::sprout_sweep::SweepJournal::for_keys(dir, &material.keys, material.network);
-    let outpoints = result
-        .notes
-        .iter()
-        .map(|note| note.outpoint)
-        .collect::<Vec<_>>();
-    let snapshot = journal
-        .load_scoped_snapshot(&outpoints)
+    let work = async move {
+        // Checked before the catch-up: an address with no Sapling receiver or a
+        // server address that cannot work should fail here, not after it.
+        validate_sweep_request(&destination, material.network, &material.lightwalletd_url)?;
+        let dir = argos_core::sprout_scan_run::checkpoint_data_dir(
+            &material.checkpoint,
+            material.keys.as_slice(),
+            material.network.into(),
+        )
         .map_err(|err| err.to_string())?;
-    let plan = sprout_sweep_preview(&result.notes, &snapshot)?;
-    let plan_empty = plan.notes == 0 && plan.active.is_empty() && plan.mined.is_empty();
-    if let Some(message) = empty_sprout_proposal_error(
-        SproutProposalOrigin::SavedScan,
-        plan_empty,
-        snapshot.entries().map(|entry| entry.state),
-    ) {
-        return Err(message);
+        let mut journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+            dir,
+            material.keys.as_slice(),
+            material.network,
+        );
+        if let Some(recovered) =
+            argos_core::sprout_sweep::resume_interrupted_scan_checkpoint_cleanup(
+                &material.checkpoint,
+                &journal,
+                material.network,
+            )
+            .map_err(|err| err.to_string())?
+        {
+            return Err(match recovered {
+            argos_core::sprout_sweep::ScanCheckpointCleanup::Removed
+            | argos_core::sprout_sweep::ScanCheckpointCleanup::AlreadyAbsent => {
+                "Argos completed an interrupted cleanup of the prior Sprout checkpoint. Start a fresh scan before proposing another sweep.".to_owned()
+            }
+            argos_core::sprout_sweep::ScanCheckpointCleanup::Retained(reason) => {
+                format!("interrupted checkpoint cleanup was retained: {reason}")
+            }
+        });
+        }
+        // The resume continues under the bound the scan actually used, read
+        // from its checkpoint, never one supplied by the form: the birthday
+        // there may have changed since the scan, and a lower one would make the
+        // resume conflict after hours of scanning. Lowering it means a new scan.
+        let Some(decrypt_from) = argos_core::sprout_scan_run::saved_decrypt_from(
+            &material.checkpoint,
+            material.network.into(),
+            material.keys.as_slice(),
+        )
+        .map_err(|err| err.to_string())?
+        else {
+            return Err(
+                "no saved scan was found for these keys. Run the scan first — its results are \
+             what this sweeps."
+                    .to_owned(),
+            );
+        };
+        let (tip_anchor, tip_warning) =
+            sprout_tip_anchor(material.network, &material.lightwalletd_url).await;
+        let emitter = app.clone();
+        let progress_handle = scan_handle.clone();
+        let p2p: argos_core::p2p::wire::P2pNetwork = material.network.into();
+        let result = argos_core::sprout_scan_run::run_sprout_scan_with_decrypt_from(
+            material.keys.as_slice(),
+            p2p,
+            &material.peers,
+            tip_anchor,
+            &material.checkpoint,
+            decrypt_from,
+            move |tick| {
+                let _ = emitter.emit(
+                    "sprout-scan-progress",
+                    SproutScanProgressEvent {
+                        handle: progress_handle.clone(),
+                        height: tick.height,
+                        target: tick.target,
+                        notes_found: tick.notes_found,
+                        joinsplits_seen: tick.joinsplits_seen,
+                        peer_wait: tick.peer_wait.map(|wait| wait.to_string()),
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        let outpoints = result
+            .notes
+            .iter()
+            .map(|note| note.outpoint)
+            .collect::<Vec<_>>();
+        let snapshot = journal
+            .load_scoped_snapshot(&outpoints)
+            .map_err(|err| err.to_string())?;
+        let plan = sprout_sweep_preview(&result.notes, &snapshot)?;
+        let plan_empty = plan.notes == 0 && plan.active.is_empty() && plan.mined.is_empty();
+        if let Some(message) = empty_sprout_proposal_error(
+            SproutProposalOrigin::SavedScan,
+            plan_empty,
+            snapshot.entries().map(|entry| entry.state),
+        ) {
+            return Err(message);
+        }
+        if plan_empty {
+            return Err("the saved scan found no unspent Sprout notes to sweep".into());
+        }
+        let checkpoint_authority = argos_core::sprout_sweep::prepare_scan_checkpoint_authority(
+            &material.checkpoint,
+            result
+                .checkpoint_generation
+                .as_ref()
+                .ok_or("the completed scan did not return a checkpoint generation")?,
+            &mut journal,
+            &result.notes,
+            material.network,
+        )
+        .map_err(|err| err.to_string())?;
+        state.reviewed_intent.insert_proposal(
+            SproutSweepIntent {
+                source: SproutIntentSource::Scan(scan_handle),
+                notes: result.notes,
+                destination,
+                network: material.network,
+                lightwalletd_url: material.lightwalletd_url,
+                confirmation_sources: material.confirmation_sources,
+                journal,
+                wallet_checkpoint: None,
+                checkpoint_authority: Some(checkpoint_authority),
+                _checkpoint_reservation: Some(checkpoint_reservation),
+                tip_warning,
+                peer_error: None,
+            },
+            plan,
+        )
+    };
+    tokio::select! {
+        result = work => result,
+        () = catchup.cancelled() => Err("Sprout scan was released while its catch-up was running".into()),
     }
-    if plan_empty {
-        return Err("the saved scan found no unspent Sprout notes to sweep".into());
-    }
-    state.reviewed_intent.insert_proposal(
-        SproutSweepIntent {
-            source: SproutIntentSource::Scan(scan_handle),
-            notes: result.notes,
-            destination,
-            network: material.network,
-            lightwalletd_url: material.lightwalletd_url,
-            confirmation_sources: material.confirmation_sources,
-            journal,
-            tip_warning,
-            wallet_reverify: None,
-            peer_error: None,
-        },
-        plan,
-    )
 }
 
 #[tauri::command]
@@ -2438,14 +2652,14 @@ async fn recover_with_scan_in_dir(
             argos_core::sprout_scan_run::wallet_scan_notice_offline(
                 dir,
                 network.into(),
-                &spending_keys,
+                spending_keys.as_slice(),
             ),
         ),
         (Some(dir), Some(peers)) => {
             argos_core::sprout_scan_run::chain_spends_for_wallet(
                 dir,
                 network.into(),
-                &spending_keys,
+                spending_keys.as_slice(),
                 peers,
             )
             .await
@@ -2462,12 +2676,12 @@ async fn recover_with_scan_in_dir(
 
 /// The data directory the scan panel writes to: the field, else the app
 /// default.
-#[cfg(test)]
 fn with_resolved_sprout_data_dir<T>(
     resolved: Result<PathBuf, String>,
     next: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
     let dir = resolved?;
+    argos_core::service::ensure_recovery_data_dir(&dir).map_err(|err| err.to_string())?;
     next(&dir)
 }
 
@@ -2480,18 +2694,11 @@ fn resolve_data_dir(app: &AppHandle, data_dir: Option<&str>) -> Result<PathBuf, 
 
 /// The wallet file's Sprout spending keys, as the checkpoint and the sweep
 /// journal are keyed.
-/// Wiped on drop: these are raw spending keys, copied out of their
-/// `Secret` wrappers for the journal and chain lookups.
-fn wallet_sprout_keys(
-    keys: &argos_core::argos_wallet_import::ImportedKeys,
-) -> zeroize::Zeroizing<Vec<[u8; 32]>> {
+fn wallet_sprout_keys(keys: &argos_core::argos_wallet_import::ImportedKeys) -> SecretSproutKeys {
     use secrecy::ExposeSecret;
-    zeroize::Zeroizing::new(
-        keys.sprout
-            .iter()
-            .map(|k| *k.a_sk.expose_secret())
-            .collect(),
-    )
+    let mut spending_keys = Vec::with_capacity(keys.sprout.len());
+    spending_keys.extend(keys.sprout.iter().map(|k| *k.a_sk.expose_secret()));
+    SecretSproutKeys::new(spending_keys)
 }
 
 #[tauri::command]
@@ -2500,7 +2707,15 @@ pub fn default_data_dir(app: AppHandle) -> Result<String, String> {
         .path()
         .app_data_dir()
         .map_err(|err| format!("resolving app data dir: {err}"))?;
-    Ok(base.join("workspace").display().to_string())
+    default_data_dir_for_base(&base).map(|dir| dir.display().to_string())
+}
+
+fn default_data_dir_for_base(base: &Path) -> Result<PathBuf, String> {
+    argos_core::service::default_recovery_data_dir(
+        &base.join("workspace"),
+        &base.join("workspace-v2"),
+    )
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -2691,16 +2906,14 @@ fn birthday_route(
 /// undated Sapling keys, they also rule out the transparent-UTXO fallback
 /// (see `argos_core::birthday::needs_chain_fallback`), so a wallet with one
 /// gets no birthday and Sapling is scanned from activation.
-fn birthday_route_for_file(
-    path: &str,
+fn birthday_route_for_bytes(
+    bytes: &[u8],
     passphrase: Option<&SecretString>,
-    sapling_keys: &[String],
+    sapling_keys: &[SecretString],
     network: ZeckNetwork,
 ) -> Result<BirthdayRoute, String> {
-    let bytes = argos_core::wallet_file::read_wallet_file(path)
-        .map_err(|err| format!("could not read {path}: {err}"))?;
-    let format = argos_core::argos_wallet_import::sniff(&bytes).map_err(|err| err.to_string())?;
-    let keys = import_gui_wallet_then(&bytes, passphrase, network, |keys| keys)
+    let format = argos_core::argos_wallet_import::sniff(bytes).map_err(|err| err.to_string())?;
+    let keys = import_gui_wallet_then(bytes, passphrase, network, |keys| keys)
         .map_err(|err| err.to_string())?;
     birthday_route_for_keys(keys, format, sapling_keys, network)
 }
@@ -2710,17 +2923,32 @@ fn birthday_route_for_file(
 fn birthday_route_for_keys(
     mut keys: argos_core::argos_wallet_import::ImportedKeys,
     format: argos_core::argos_wallet_import::WalletFormat,
-    sapling_keys: &[String],
+    sapling_keys: &[SecretString],
     network: ZeckNetwork,
 ) -> Result<BirthdayRoute, String> {
     let mut pasted = 0;
-    if keys.mnemonic.is_none() && sapling_keys.iter().any(|k| !k.trim().is_empty()) {
-        let typed = argos_core::sapling_key::keys_from_sapling_strings(sapling_keys, network)
-            .map_err(|err| err.to_string())?;
+    if keys.mnemonic.is_none()
+        && sapling_keys
+            .iter()
+            .any(|k| !secrecy::ExposeSecret::expose_secret(k).trim().is_empty())
+    {
+        let typed = keys_from_secret_sapling_strings(sapling_keys, network)?;
         pasted = argos_core::sapling_key::merge_standalone_sapling_keys(&mut keys, typed)
             .map_err(|err| err.to_string())?;
     }
     birthday_route(keys, pasted, format)
+}
+
+#[cfg(test)]
+fn birthday_route_for_file(
+    path: &str,
+    passphrase: Option<&SecretString>,
+    sapling_keys: &[SecretString],
+    network: ZeckNetwork,
+) -> Result<BirthdayRoute, String> {
+    let bytes = argos_core::wallet_file::read_wallet_file(path)
+        .map_err(|err| format!("could not read {path}: {err}"))?;
+    birthday_route_for_bytes(&bytes, passphrase, sapling_keys, network)
 }
 
 /// Turn a wallet.dat birthday into what the birthday field shows. No height
@@ -2763,15 +2991,17 @@ fn wallet_dat_birthday_result(
 #[tauri::command]
 pub async fn detect_birthday_from_wallet_file(
     app: AppHandle,
-    path: String,
+    state: State<'_, AppState>,
+    review_id: WalletReviewId,
     passphrase: Option<SecretString>,
-    sapling_keys: Option<Vec<String>>,
+    sapling_keys: Option<Vec<SecretString>>,
     lightwalletd_url: String,
     network: ZeckNetwork,
 ) -> Result<BirthdayDetectResult, String> {
     ensure_tos_accepted(&app)?;
-    let route = birthday_route_for_file(
-        &path,
+    let (_, snapshot) = state.wallet_reviews.verify(&review_id)?;
+    let route = birthday_route_for_bytes(
+        snapshot.bytes(),
         passphrase.as_ref(),
         sapling_keys.as_deref().unwrap_or_default(),
         network,
@@ -2821,46 +3051,22 @@ pub async fn save_recovery_report(
         .as_ref()
         .map(|summary| PathBuf::from(&summary.workspace_dir))
         .ok_or_else(|| "recovery report can only be saved after workspace sync".to_owned())?;
+    let authority = argos_core::workspace::PrivateWorkspaceFileAuthority::acquire(&workspace_dir)
+        .map_err(|err| err.to_string())?;
     let path = resolve_report_path(&workspace_dir, path.trim())?;
-
-    if let Ok(metadata) = fs::symlink_metadata(&path) {
-        if metadata.file_type().is_symlink() {
-            return Err("report path must not be a symlink".to_owned());
-        }
-        if !metadata.is_file() {
-            return Err("report path must refer to a regular file".to_owned());
-        }
-    }
-
-    write_private_report(&path, report.as_bytes())
-        .map_err(|err| format!("writing {}: {err}", path.display()))?;
+    authority
+        .write_private_file(&path, report.as_bytes())
+        .map_err(|err| err.to_string())?;
     Ok(path.display().to_string())
 }
 
-/// Write `contents` to `path` with owner-only (`0o600`) permissions on Unix.
-///
-/// `OpenOptions::mode` only constrains the bits of a *newly created* file, and
-/// the caller deliberately permits writing into an existing regular file (which
-/// with `truncate` would retain its prior, looser mode). So this both creates
-/// at `0o600` AND re-tightens after the write, ensuring a reused report path is
-/// protected too (audit Suggestion 3). Windows has no mode bits; there it is a
-/// plain create+truncate write. The caller owns the symlink/regular-file guard.
+/// Write `contents` to `path` only when it can be created privately or an
+/// existing target already satisfies the platform's exact private policy.
+/// Reused permissive files are preserved and refused rather than repaired in
+/// place after their old readers may already have retained access.
+#[cfg(test)]
 fn write_private_report(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    argos_core::private_fs::write_private_file(path, contents)
 }
 
 /// Recursive-delete the on-disk recovery workspace for a completed scan.
@@ -2912,7 +3118,7 @@ fn resolve_report_path(workspace_dir: &Path, requested: &str) -> Result<PathBuf,
     // mkdir for absolute user-supplied paths — those must already exist so the
     // canonicalize-and-prefix-check below can guard against escapes.
     if !parent.exists() && parent.starts_with(&workspace_root) {
-        fs::create_dir_all(parent)
+        argos_core::private_fs::create_private_dir_all(parent)
             .map_err(|err| format!("creating {}: {err}", parent.display()))?;
     }
 
@@ -2994,6 +3200,8 @@ pub struct SessionRow {
     pub last_run_at_epoch_seconds: Option<i64>,
     pub match_coordinates: Option<argos_core::MatchCoordinates>,
     pub transparent_scan: Option<argos_core::TransparentScanConfig>,
+    pub requires_rescan: bool,
+    pub legacy_untrusted: bool,
 }
 
 impl From<IncompleteSession> for SessionRow {
@@ -3008,33 +3216,44 @@ impl From<IncompleteSession> for SessionRow {
             last_run_at_epoch_seconds: s.last_run_at_epoch_seconds,
             match_coordinates: s.match_coordinates,
             transparent_scan: s.transparent_scan,
+            requires_rescan: s.requires_rescan,
+            legacy_untrusted: s.legacy_untrusted,
         }
     }
 }
 
-/// List any workspaces under `data_dir` that have an incomplete or missing
-/// session sidecar. Called on GUI launch so the user can pick up where
-/// they left off without re-entering all their scan parameters.
+/// List resumable incomplete workspaces and preserved legacy workspaces that
+/// require a fresh scan. Called on GUI launch so the user gets explicit,
+/// non-resumable remediation guidance for untrusted storage.
 #[tauri::command]
 pub async fn list_incomplete_sessions(
     app: AppHandle,
     data_dir: Option<String>,
 ) -> Result<Vec<SessionRow>, String> {
-    let resolved = match data_dir {
-        Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-        _ => {
-            let base = app
-                .path()
-                .app_data_dir()
-                .map_err(|err| format!("resolving app data dir: {err}"))?;
-            base.join("workspace")
-        }
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("resolving app data dir: {err}"))?;
+    sessions_for_data_dir(&base, data_dir.as_deref())
+}
+
+fn sessions_for_data_dir(base: &Path, data_dir: Option<&str>) -> Result<Vec<SessionRow>, String> {
+    let resolved = match data_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => default_data_dir_for_base(base)?,
     };
-    let rows = zeck_list_incomplete_sessions(&resolved)
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .map(SessionRow::from)
-        .collect();
+    let mut sessions = zeck_list_incomplete_sessions(&resolved).map_err(|err| err.to_string())?;
+    if resolved == base.join("workspace-v2") {
+        // The upgraded default must not hide the preserved legacy evidence.
+        // Legacy rows contain only path-derived, non-resumable guidance.
+        sessions.extend(
+            zeck_list_incomplete_sessions(&base.join("workspace"))
+                .map_err(|err| err.to_string())?
+                .into_iter()
+                .filter(|row| row.legacy_untrusted),
+        );
+    }
+    let rows = sessions.into_iter().map(SessionRow::from).collect();
     Ok(rows)
 }
 
@@ -3235,6 +3454,65 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 mod tests {
     use super::{sprout_nu7_warning, summary_nu7_warning};
 
+    fn unused_temp_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("argos-{label}-{}", uuid::Uuid::new_v4()));
+        assert!(!path.exists());
+        path
+    }
+
+    #[test]
+    fn legacy_gui_default_selects_versioned_directory_and_keeps_legacy_rows_visible() {
+        let base = unused_temp_dir("legacy-gui-default");
+        let legacy = base.join("workspace");
+        let wallet =
+            legacy.join("mainnet/workspace-deadbeefdeadbeefdeadbeefdeadbeef/birthday-1528061/auto-gap-20/wallet.sqlite");
+        std::fs::create_dir_all(wallet.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(&wallet, b"v1.5.3 wallet evidence").unwrap();
+        let selected = super::default_data_dir_for_base(&base).unwrap();
+        assert_eq!(selected, base.join("workspace-v2"));
+        assert!(!selected.exists());
+        for requested in [None, Some(selected.to_str().unwrap())] {
+            let rows = super::sessions_for_data_dir(&base, requested).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].legacy_untrusted && rows[0].requires_rescan);
+            assert_eq!(
+                std::path::PathBuf::from(&rows[0].workspace_path),
+                wallet.parent().unwrap()
+            );
+        }
+        assert_eq!(std::fs::read(&wallet).unwrap(), b"v1.5.3 wallet evidence");
+        assert!(!legacy.join(".argos-private-artifact-root-v1").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    fn unused_artifact_data_dir(label: &str) -> std::path::PathBuf {
+        unused_temp_dir(label)
+            .join("publication")
+            .join("recovery-data")
+    }
+
+    fn remove_artifact_fixture(data_dir: &std::path::Path) {
+        let outer = data_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("artifact fixture has publication and outer parents");
+        if outer.exists() {
+            std::fs::remove_dir_all(outer).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_seed_accepts_protected_words_at_the_ipc_boundary() {
+        let words = vec![secrecy::SecretString::new("abandon".to_owned()); 24];
+        let future = super::validate_seed(words);
+        drop(future);
+    }
+
     fn preview_note(value: u64, id: u8) -> argos_core::sprout_recovery::SpendableSproutNote {
         let a_sk = [0x42; 32];
         let address = argos_core::sprout::SproutPaymentAddress::from_spending_key(&a_sk);
@@ -3262,10 +3540,142 @@ mod tests {
 
     fn test_sprout_journal(marker: u8) -> argos_core::sprout_sweep::SweepJournal {
         argos_core::sprout_sweep::SweepJournal::for_keys(
-            &std::env::temp_dir().join(format!("argos-command-journal-{}", uuid::Uuid::new_v4())),
+            &unused_artifact_data_dir("command-journal"),
             &[[marker; 32]],
             argos_core::ZeckNetwork::Mainnet,
         )
+    }
+
+    fn append_unknown_journal_entry(
+        journal: &argos_core::sprout_sweep::SweepJournal,
+        snapshot: &mut argos_core::sprout_sweep::SproutJournalSnapshot,
+        outpoint: argos_core::argos_wallet_import::keys::JsOutPoint,
+        value_zatoshis: u64,
+        fixture: usize,
+    ) {
+        use argos_core::broadcast::BroadcastStore as _;
+
+        let (txid, raw_tx) = match fixture {
+            0 => (
+                zcash_primitives::transaction::TxId::from_bytes([
+                    0xb6, 0x87, 0xca, 0x64, 0xc4, 0x39, 0xe3, 0xc6, 0x0e, 0x5f, 0x72, 0x31, 0x13,
+                    0x88, 0xd9, 0x8b, 0x54, 0x3e, 0xa7, 0xe0, 0xd1, 0xa4, 0x50, 0x61, 0x44, 0x99,
+                    0xae, 0xbf, 0xc1, 0xd5, 0x78, 0x1a,
+                ]),
+                vec![
+                    0x05, 0x00, 0x00, 0x80, 0x0a, 0x27, 0xa7, 0x26, 0xb4, 0xd0, 0xd6, 0xc2, 0x00,
+                    0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ],
+            ),
+            1 => (
+                zcash_primitives::transaction::TxId::from_bytes([
+                    0xd6, 0xe3, 0xf6, 0xc6, 0x75, 0xca, 0xac, 0xdb, 0x2e, 0x4d, 0xeb, 0x56, 0xe9,
+                    0x73, 0xf2, 0x1d, 0xf3, 0x89, 0x17, 0xf3, 0x21, 0x71, 0xd6, 0x36, 0xa1, 0x91,
+                    0x2b, 0x8c, 0x28, 0x65, 0x19, 0xe2,
+                ]),
+                vec![
+                    0x05, 0x00, 0x00, 0x80, 0x0a, 0x27, 0xa7, 0x26, 0xb4, 0xd0, 0xd6, 0xc2, 0x01,
+                    0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ],
+            ),
+            _ => panic!("unsupported transaction fixture"),
+        };
+        let transaction = argos_core::broadcast::PreparedTransaction {
+            txid,
+            raw_tx,
+            fee_zatoshis: 20_000,
+            expiry_height: Some(100),
+        };
+        journal
+            .scoped_store(
+                argos_core::sprout_sweep_journal::JournalNoteContext {
+                    outpoint,
+                    value_zatoshis,
+                },
+                snapshot,
+            )
+            .persist_prepared(&transaction)
+            .unwrap();
+        journal
+            .append_transition(
+                snapshot,
+                transaction.txid,
+                argos_core::TxLifecycleState::SubmissionUnknown,
+                Some(&argos_core::broadcast::SubmissionDisposition::AmbiguousTransport),
+                None,
+            )
+            .unwrap();
+    }
+
+    fn test_wallet_source() -> std::sync::Arc<crate::reviewed_intent::ReviewedWalletSource> {
+        let registry = crate::reviewed_intent::WalletReviewRegistry::default();
+        let dir =
+            std::env::temp_dir().join(format!("argos-command-wallet-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, b"wallet").unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(path, std::sync::Arc::new(snapshot.identity().clone()))
+            .unwrap();
+        registry.resolve(&id).unwrap()
+    }
+
+    fn test_wallet_review() -> (
+        crate::reviewed_intent::WalletReviewRegistry,
+        crate::reviewed_intent::WalletReviewId,
+        std::path::PathBuf,
+    ) {
+        let registry = crate::reviewed_intent::WalletReviewRegistry::default();
+        let dir =
+            std::env::temp_dir().join(format!("argos-command-review-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.dat");
+        std::fs::write(&path, b"wallet-A").unwrap();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let id = registry
+            .register(
+                path.clone(),
+                std::sync::Arc::new(snapshot.identity().clone()),
+            )
+            .unwrap();
+        (registry, id, path)
+    }
+
+    #[test]
+    fn wallet_review_rejects_changed_file_for_scan() {
+        let (registry, id, path) = test_wallet_review();
+        std::fs::write(path, b"wallet-B").unwrap();
+        assert!(registry.verify(&id).is_err());
+    }
+
+    #[test]
+    fn wallet_review_rejects_changed_file_for_sprout_proposal() {
+        let (registry, id, path) = test_wallet_review();
+        std::fs::write(path, b"wallet-B").unwrap();
+        assert!(registry.verify(&id).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_review_rejects_replaced_file_before_sprout_execute() {
+        let (registry, id, path) = test_wallet_review();
+        let source = registry.resolve(&id).unwrap();
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, b"wallet-A").unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        assert!(registry.verify_source(&source).is_err());
+
+        let code = include_str!("commands.rs");
+        let execute = code
+            .split("pub async fn execute_wallet_sprout_sweep")
+            .nth(1)
+            .unwrap();
+        assert!(
+            execute.find("wallet_reviews.verify_source").unwrap()
+                < execute.find("execute_reviewed_sprout_sweep").unwrap(),
+            "wallet verification must precede checkpoint, proving and send work"
+        );
     }
 
     #[test]
@@ -3355,9 +3765,9 @@ mod tests {
     #[test]
     fn scan_keys_skip_comments_and_blank_lines() {
         let typed = vec![
-            "# note".to_string(),
-            String::new(),
-            "  # indented".to_string(),
+            SecretString::new("# note".to_string()),
+            SecretString::new(String::new()),
+            SecretString::new("  # indented".to_string()),
         ];
         // Comments are skipped rather than decoded, so what remains is the
         // "nothing to scan" refusal, not a bad-key error on line 1.
@@ -3369,7 +3779,11 @@ mod tests {
 
     #[test]
     fn scan_key_error_names_the_visible_line() {
-        let typed = vec!["# note".to_string(), String::new(), "not-a-key".to_string()];
+        let typed = vec![
+            SecretString::new("# note".to_string()),
+            SecretString::new(String::new()),
+            SecretString::new("not-a-key".to_string()),
+        ];
         let err = super::collect_scan_keys(None, None, &typed, argos_core::ZeckNetwork::Mainnet)
             .err()
             .expect("refused");
@@ -3391,7 +3805,7 @@ mod tests {
     fn route_for_regtest_fixture(
         name: &str,
         passphrase: Option<&SecretString>,
-        typed: &[String],
+        typed: &[SecretString],
         network: ZeckNetwork,
     ) -> BirthdayRoute {
         let bytes = std::fs::read(fixture(name)).expect("fixture");
@@ -3520,7 +3934,7 @@ mod tests {
     /// later than the pasted key's notes.
     #[test]
     fn a_pasted_sapling_key_counts_as_undated() {
-        let pasted = [TEST_SAPLING_KEY_MAINNET.to_owned()];
+        let pasted = [SecretString::new(TEST_SAPLING_KEY_MAINNET.to_owned())];
         let (keys, pasted) = wallet_dat_route(route_for_regtest_fixture(
             "modern-plaintext.dat",
             None,
@@ -3573,7 +3987,7 @@ mod tests {
         };
 
         // Pasted route.
-        let typed = [TEST_SAPLING_KEY_MAINNET.to_owned()];
+        let typed = [SecretString::new(TEST_SAPLING_KEY_MAINNET.to_owned())];
         let (mut keys, pasted) = wallet_dat_route(route_for_regtest_fixture(
             "modern-plaintext.dat",
             None,
@@ -3831,10 +4245,11 @@ mod tests {
             });
         let store = ReviewedIntentStore::default();
         let reported = std::cell::RefCell::new(Vec::new());
-        let dir = std::env::temp_dir().join(format!("argos-forged-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unused_artifact_data_dir("forged");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let err = super::propose_wallet_sprout_sweep_core(
             &store,
+            test_wallet_source(),
             &mut keys,
             dir.clone(),
             "zs-reviewed".into(),
@@ -3852,7 +4267,7 @@ mod tests {
         let reported = reported.into_inner();
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert!(reported[0].contains("does not control"), "{}", reported[0]);
-        std::fs::remove_dir_all(dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     #[test]
@@ -3905,6 +4320,7 @@ mod tests {
                 service: argos_core::RecoveryService::new(),
                 address_search: argos_core::address_search::AddressSearchService::default(),
                 reviewed_intent: crate::reviewed_intent::ReviewedIntentStore::default(),
+                wallet_reviews: crate::reviewed_intent::WalletReviewRegistry::default(),
             })
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
@@ -4102,7 +4518,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("argos-scan-start-{}", uuid::Uuid::new_v4()));
         let (handle, _, reservation) = super::begin_sprout_scan_session(
             &store,
-            vec![[7; 32]],
+            vec![[7; 32]].into(),
             &dir,
             ZeckNetwork::Mainnet,
             "https://node".into(),
@@ -4112,7 +4528,7 @@ mod tests {
         .unwrap();
         assert!(super::begin_sprout_scan_session(
             &store,
-            vec![[7; 32]],
+            vec![[7; 32]].into(),
             &dir,
             ZeckNetwork::Mainnet,
             "https://node".into(),
@@ -4130,7 +4546,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("argos-catchup-{}", uuid::Uuid::new_v4()));
         let (handle, _, reservation) = super::begin_sprout_scan_session(
             &store,
-            vec![[9; 32]],
+            vec![[9; 32]].into(),
             &dir,
             ZeckNetwork::Mainnet,
             "https://node".into(),
@@ -4163,7 +4579,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("argos-cap-{}", uuid::Uuid::new_v4()));
         let (handle, _, reservation) = super::begin_sprout_scan_session(
             &store,
-            vec![[10; 32]],
+            vec![[10; 32]].into(),
             &dir,
             ZeckNetwork::Mainnet,
             "https://node".into(),
@@ -4190,15 +4606,17 @@ mod tests {
             store
                 .insert_proposal(
                     SproutSweepIntent {
-                        source: SproutIntentSource::Wallet,
+                        source: SproutIntentSource::Wallet(test_wallet_source()),
                         notes: Vec::new(),
                         destination: "zs-reviewed".into(),
                         network: ZeckNetwork::Mainnet,
                         lightwalletd_url: "https://node".into(),
                         confirmation_sources: Vec::new(),
                         journal: test_sprout_journal(10),
+                        wallet_checkpoint: None,
+                        checkpoint_authority: None,
+                        _checkpoint_reservation: None,
                         tip_warning: None,
-                        wallet_reverify: None,
                         peer_error: None,
                     },
                     SproutSweepPreviewData {
@@ -4221,7 +4639,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("argos-panic-{}", uuid::Uuid::new_v4()));
         let (handle, material, reservation) = super::begin_sprout_scan_session(
             &store,
-            vec![[11; 32]],
+            vec![[11; 32]].into(),
             &dir,
             ZeckNetwork::Mainnet,
             "https://node".into(),
@@ -4276,6 +4694,7 @@ mod tests {
         }
         serde_json::to_value(wallet_summary_from_keys(
             "test.dat".to_owned(),
+            None,
             keys,
             empty_sprout_summary(),
             "mainnet",
@@ -4378,6 +4797,7 @@ mod tests {
         )));
         let summary = serde_json::to_value(wallet_summary_from_keys(
             "public-fixture.dat".to_owned(),
+            None,
             keys,
             empty_sprout_summary(),
             "mainnet",
@@ -4402,15 +4822,15 @@ mod tests {
             "../../../crates/argos-wallet-import/tests/fixtures/modern-encrypted.dat"
         )
         .to_vec();
-        let value = bdb::walk(&bytes)
-            .unwrap()
+        let walked = bdb::walk(&bytes).unwrap();
+        let value = walked
             .records
-            .into_iter()
-            .find(|(key, _)| {
-                parse_record_key(key).is_some_and(|record| record.record_type == "mkey")
+            .iter()
+            .find(|record| {
+                parse_record_key(&record.key).is_some_and(|parsed| parsed.record_type == "mkey")
             })
             .unwrap()
-            .1;
+            .value();
         let offset = bytes
             .windows(value.len())
             .position(|window| window == value)
@@ -4446,7 +4866,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("argos-attach-{}", uuid::Uuid::new_v4()));
             let (handle, material, reservation) = super::begin_sprout_scan_session(
                 &store,
-                vec![[12; 32]],
+                vec![[12; 32]].into(),
                 &dir,
                 ZeckNetwork::Mainnet,
                 "https://node".into(),
@@ -4466,7 +4886,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             assert!(store.reserve_checkpoint(&material.checkpoint).is_err());
-            store.release_scan(&handle).unwrap();
+            store.release_scan(&handle).await.unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), driver)
                 .await
                 .expect("release stops the attached worker")
@@ -4513,6 +4933,22 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(report.warnings, vec!["journal"]);
+
+        let mut outcome = argos_core::sprout_sweep::SproutSweepOutcome {
+            fresh_all_mined: true,
+            ..Default::default()
+        };
+        apply_checkpoint_cleanup_error(&mut outcome, &"directory sync failed");
+        let report = sprout_sweep_report(outcome);
+        assert!(!report.fresh_all_mined);
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("Checkpoint cleanup failed")
+                && warning.contains("directory sync failed")
+        }));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning == SPROUT_KEEP_SOURCE_WARNING));
     }
 
     #[test]
@@ -4561,30 +4997,27 @@ mod tests {
     fn sprout_summary_and_preview_count_only_executable_ready_notes() {
         use argos_core::broadcast::{EndpointTxEvidence, TxObservation, TxObservationState};
 
-        let dir =
-            std::env::temp_dir().join(format!("argos-ready-summary-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
-            &dir,
-            &[[0x42; 32]],
-            argos_core::ZeckNetwork::Mainnet,
-        );
-        std::fs::write(
-            journal.path(),
-            format!(
-                "{}:0:0 {}\n{}:0:0 {}\n",
-                "11".repeat(32),
-                "21".repeat(32),
-                "12".repeat(32),
-                "22".repeat(32)
-            ),
-        )
-        .unwrap();
+        let journal = test_sprout_journal(0x42);
         let mut snapshot = journal.load_or_migrate().unwrap();
+        let recovered = [preview_note(1_000_000, 0x11), preview_note(2_000_000, 0x12)];
+        append_unknown_journal_entry(
+            &journal,
+            &mut snapshot,
+            recovered[0].outpoint,
+            recovered[0].note.value,
+            0,
+        );
+        append_unknown_journal_entry(
+            &journal,
+            &mut snapshot,
+            recovered[1].outpoint,
+            recovered[1].note.value,
+            1,
+        );
         let mined_txid = snapshot
             .entries()
             .find(|entry| entry.outpoint.txid == [0x12; 32])
-            .expect("second legacy entry")
+            .expect("second authorized entry")
             .txid();
         let observation = TxObservation {
             state: TxObservationState::Mined,
@@ -4614,7 +5047,6 @@ mod tests {
             )
             .unwrap();
 
-        let recovered = [preview_note(1_000_000, 0x11), preview_note(2_000_000, 0x12)];
         let (notes, value, lifecycle) = sprout_ready_summary(&recovered, &snapshot).unwrap();
         assert_eq!((notes, value, lifecycle), (0, 0, true));
 
@@ -4640,11 +5072,11 @@ mod tests {
         )
         .expect("preview aggregation must not panic or wrap");
         assert_eq!(preview.gross_zatoshis, u64::MAX);
-        std::fs::remove_dir_all(dir).unwrap();
+        remove_artifact_fixture(journal.data_dir());
     }
 
     #[test]
-    fn inspect_comment_acknowledges_legacy_journal_migration() {
+    fn inspect_comment_matches_refused_legacy_journal_policy() {
         let source = include_str!("commands.rs");
         let inspect = source
             .split("pub async fn inspect_wallet_file")
@@ -4655,10 +5087,8 @@ mod tests {
             !comment.contains("nothing is written anywhere"),
             "{comment}"
         );
-        assert!(
-            comment.contains("journal") && comment.contains("migration"),
-            "{comment}"
-        );
+        assert!(comment.contains("journal") && comment.contains("preserved"));
+        assert!(comment.contains("refused") && comment.contains("never migrated"));
     }
 
     #[test]
@@ -4687,31 +5117,22 @@ mod tests {
     }
 
     #[test]
-    fn pending_only_preview_returns_status_without_loading_proving_parameters() {
-        let dir =
-            std::env::temp_dir().join(format!("argos-pending-preview-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
-            &dir,
-            &[[0x42; 32]],
-            argos_core::ZeckNetwork::Mainnet,
-        );
-        std::fs::write(
-            journal.path(),
-            format!("{}:0:0 {}\n", "11".repeat(32), "22".repeat(32)),
-        )
-        .unwrap();
-        let snapshot = journal.load_or_migrate().unwrap();
+    fn unknown_only_preview_returns_status_without_loading_proving_parameters() {
+        let journal = test_sprout_journal(0x42);
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let note = preview_note(1_000_000, 0x11);
+        append_unknown_journal_entry(&journal, &mut snapshot, note.outpoint, note.note.value, 0);
         let preview = super::sprout_sweep_preview(&[], &snapshot).unwrap();
         assert_eq!(preview.notes, 0);
         assert_eq!(preview.active.len(), 1);
-        // A 1.5.x journal entry is Pending: accepted, in flight, not final.
+        // A 1.5.x "broadcast" entry cannot prove node acceptance, so it is
+        // retained as submission-unknown rather than upgraded to pending.
         assert_eq!(
             preview.active[0].state,
-            argos_core::TxLifecycleState::Pending
+            argos_core::TxLifecycleState::SubmissionUnknown
         );
         assert!(preview.mined.is_empty());
-        let _ = std::fs::remove_dir_all(dir);
+        remove_artifact_fixture(journal.data_dir());
     }
 
     #[test]
@@ -4753,6 +5174,21 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!invoked.get(), "proving or sending work must not start");
+    }
+
+    #[test]
+    fn fresh_gui_workspace_is_authenticated_before_sprout_work_starts() {
+        let workspace = unused_artifact_data_dir("fresh-gui-workspace");
+        assert!(!workspace.exists());
+
+        super::with_resolved_sprout_data_dir(Ok(workspace.clone()), |resolved| {
+            assert_eq!(resolved, workspace);
+            argos_core::service::ensure_recovery_data_dir(resolved)
+                .map_err(|err| err.to_string())?;
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        remove_artifact_fixture(&workspace);
     }
 
     #[test]
@@ -4817,15 +5253,17 @@ mod tests {
     #[test]
     fn a_review_built_with_a_malformed_peer_is_refused_at_execute() {
         let intent = |peer_error: Option<String>| SproutSweepIntent {
-            source: SproutIntentSource::Wallet,
+            source: SproutIntentSource::Wallet(test_wallet_source()),
             notes: Vec::new(),
             destination: "zs-reviewed".into(),
             network: ZeckNetwork::Mainnet,
             lightwalletd_url: "https://node".into(),
             confirmation_sources: Vec::new(),
             journal: test_sprout_journal(0x5A),
+            wallet_checkpoint: None,
+            checkpoint_authority: None,
+            _checkpoint_reservation: None,
             tip_warning: None,
-            wallet_reverify: None,
             peer_error,
         };
         let err = parse_custom_peers(&["no-port-here".to_owned()]).unwrap_err();
@@ -4929,6 +5367,7 @@ mod tests {
         let store = ReviewedIntentStore::default();
         let review = propose_wallet_sprout_sweep_core(
             &store,
+            test_wallet_source(),
             &mut keys,
             dir.to_path_buf(),
             "zs-reviewed".into(),
@@ -4952,8 +5391,8 @@ mod tests {
     /// verification touches the sweep journal.
     #[tokio::test]
     async fn execute_uses_its_current_notice_even_when_preview_had_a_different_verdict() {
-        let dir = std::env::temp_dir().join(format!("argos-reverify-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unused_artifact_data_dir("reverify-current-notice");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let (review, intent) = reviewed_one_note_wallet(&dir).await;
         let preview_notice = review.scan_warning.clone().expect("review verdict");
         assert!(
@@ -4989,7 +5428,7 @@ mod tests {
             !intent.journal.path().exists(),
             "verification writes nothing to the sweep journal"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     /// A reviewed note the execute-time scan evidence shows spent on chain
@@ -5017,14 +5456,66 @@ mod tests {
         assert!(err.contains("spent on chain"), "{err}");
     }
 
-    /// Drives the execute-time check end to end, offline, with the live-peer
-    /// lookup replaced by evidence that a reviewed note is now spent: the
-    /// whole check refuses with the "changed since reviewed" error, and
-    /// evidence naming nothing lets it pass with the lookup's notice.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_gui_sprout_review_supports_internal_staging_beyond_max_path() {
+        use std::os::windows::ffi::OsStrExt as _;
+        let outer = unused_temp_dir("staging-gui-data");
+        let mut dir = outer.join("workspace-v2");
+        let (_, a_sk) = wallet_with_one_note(1_000_000);
+        // Exercise the original directory-publication failure while keeping
+        // SQLite filenames within the existing native VFS's Win32 range.
+        let (journal, staging) = loop {
+            let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
+                &dir,
+                &[a_sk],
+                ZeckNetwork::Mainnet,
+            );
+            let root = journal.path().parent().unwrap();
+            let staging = root.with_file_name(format!(
+                ".{}-staging-{}",
+                root.file_name().unwrap().to_str().unwrap(),
+                uuid::Uuid::nil(),
+            ));
+            if staging.as_os_str().encode_wide().count() > 260 {
+                break (journal, staging);
+            }
+            dir.push("nested");
+        };
+        assert!(!dir.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        assert!(staging.as_os_str().encode_wide().count() > 248,
+            "the actual internal staging name must exceed CreateDirectoryW's legacy directory limit");
+        let sqlite = journal
+            .path()
+            .parent()
+            .unwrap()
+            .join(".journal.lock.sqlite");
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let mut filename = sqlite.as_os_str().to_os_string();
+            filename.push(suffix);
+            assert!(filename.encode_wide().count() < 260,
+                "the SQLite database and sidecars must remain below the legacy Win32 file limit: {filename:?}");
+        }
+        argos_core::service::ensure_recovery_data_dir(&dir)
+            .expect("a data path with an oversized internal staging name can be authenticated");
+        let (_, intent) = reviewed_one_note_wallet(&dir).await;
+        assert_eq!(intent.journal.path(), journal.path());
+        assert_eq!(intent.notes.len(), 1);
+        let notice = verify_review_at_execute(&intent)
+            .await
+            .expect("reverification preserves long-path authority")
+            .expect("the fixture has no saved scan");
+        assert!(notice.contains("No full-block scan"), "{notice}");
+        argos_core::service::ensure_recovery_data_dir(&dir)
+            .expect("the same authenticated long data path reopens");
+        drop(intent);
+        std::fs::remove_dir_all(outer).unwrap();
+    }
+
     #[tokio::test]
     async fn execute_check_refuses_when_the_lookup_shows_a_reviewed_note_spent() {
-        let dir = std::env::temp_dir().join(format!("argos-reverify-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unused_artifact_data_dir("execute-lookup");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let (_, intent) = reviewed_one_note_wallet(&dir).await;
         let nullifier =
             argos_core::sprout::prf_nf(&intent.notes[0].a_sk, &intent.notes[0].note.rho);
@@ -5039,21 +5530,29 @@ mod tests {
             }
             (Some(std::sync::Arc::new(chain)), Some("fresh".to_owned()))
         };
-
-        let err = verify_review_with(&intent, |_, _, _, _| async { evidence(true) })
-            .await
-            .unwrap_err();
+        let err = verify_review_with(
+            &intent.notes,
+            intent.network,
+            intent.wallet_checkpoint.as_ref(),
+            |_, _, _, _| async { evidence(true) },
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.contains("changed since this sweep was reviewed"),
             "{err}"
         );
         assert!(err.contains("spent on chain"), "{err}");
-
-        let notice = verify_review_with(&intent, |_, _, _, _| async { evidence(false) })
-            .await
-            .expect("evidence that names no reviewed note lets execute proceed");
+        let notice = verify_review_with(
+            &intent.notes,
+            intent.network,
+            intent.wallet_checkpoint.as_ref(),
+            |_, _, _, _| async { evidence(false) },
+        )
+        .await
+        .expect("a current scan that names no reviewed note permits execute");
         assert_eq!(notice.as_deref(), Some("fresh"));
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     fn empty_sweep_report() -> SproutSweepReport {
@@ -5070,23 +5569,20 @@ mod tests {
         }
     }
 
-    /// Execute's ordering: when verification refuses, the step that spends
-    /// is never invoked; when it passes, the step runs exactly once.
     #[tokio::test]
     async fn the_sweep_step_runs_only_after_verification_passes() {
-        let dir = std::env::temp_dir().join(format!("argos-reverify-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unused_artifact_data_dir("execute-ordering");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let sweep = |_: SproutSweepIntent, _: Option<String>| async {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(empty_sweep_report())
         };
-
-        // Refused: a review built with a malformed peer field.
         let (mut keys, _) = wallet_with_one_note(1_000_000);
         let store = ReviewedIntentStore::default();
         let review = propose_wallet_sprout_sweep_core(
             &store,
+            test_wallet_source(),
             &mut keys,
             dir.clone(),
             "zs-reviewed".into(),
@@ -5097,37 +5593,32 @@ mod tests {
             |_| {},
         )
         .await
-        .expect("a malformed peer degrades the review, not fails it");
+        .expect("a malformed peer degrades the review");
         let refused = store.take_wallet_proposal(&review.proposal_id).unwrap();
         let err = verified_then_sweep(refused, &sweep)
             .await
             .err()
             .expect("verification refuses");
         assert!(err.contains("no-port-here"), "{err}");
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "a refused verification must never reach the sweep"
-        );
-
-        // Passes: nothing to re-verify offline.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let (_, mut passing) = reviewed_one_note_wallet(&dir).await;
-        passing.wallet_reverify = None;
+        passing.wallet_checkpoint = None;
         assert!(verified_then_sweep(passing, &sweep).await.is_ok());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     /// The peer-field refusal comes first: a review built with a malformed
     /// peer list is refused at execute before any verification is tried.
     #[tokio::test]
     async fn execute_refuses_a_malformed_peer_review_before_verifying() {
-        let dir = std::env::temp_dir().join(format!("argos-reverify-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unused_artifact_data_dir("reverify-malformed-peer");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let (mut keys, _) = wallet_with_one_note(1_000_000);
         let store = ReviewedIntentStore::default();
         let review = propose_wallet_sprout_sweep_core(
             &store,
+            test_wallet_source(),
             &mut keys,
             dir.clone(),
             "zs-reviewed".into(),
@@ -5140,23 +5631,20 @@ mod tests {
         .await
         .expect("a malformed peer degrades the review, not fails it");
         let intent = store.take_wallet_proposal(&review.proposal_id).unwrap();
-        let err = verify_review_at_execute(&intent).await.unwrap_err();
+        let err = refuse_unverified_review(&intent).unwrap_err();
         assert!(err.contains("no-port-here"), "{err}");
         assert!(err.contains("review the sweep again"), "{err}");
         assert!(
             !intent.journal.path().exists(),
             "a refused execute records nothing in the sweep journal"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     #[tokio::test]
     async fn inspection_keeps_wallet_file_accounting_when_scan_verification_is_unavailable() {
-        let dir = std::env::temp_dir().join(format!(
-            "argos-gui-unverified-sprout-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unused_artifact_data_dir("gui-unverified-sprout");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let a_sk = [0x52; 32];
         let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
         keys.sprout
@@ -5204,7 +5692,7 @@ mod tests {
         assert!(accounting.contains("not verified offline"), "{accounting}");
         assert!(accounting.contains(&checkpoint.display().to_string()));
         assert!(recovered.spent.is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     /// Review of #272, round 2: a malformed entry in the scan panel's peer
@@ -5214,9 +5702,8 @@ mod tests {
     /// used), and says why in the preview's scan warning.
     #[tokio::test]
     async fn a_malformed_scan_peer_degrades_the_preview_to_a_warning() {
-        let dir =
-            std::env::temp_dir().join(format!("argos-gui-preview-bad-peer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unused_artifact_data_dir("gui-preview-bad-peer");
+        argos_core::service::ensure_recovery_data_dir(&dir).unwrap();
         let a_sk = [0x53; 32];
         let mut keys = argos_core::argos_wallet_import::ImportedKeys::default();
         keys.sprout
@@ -5261,7 +5748,7 @@ mod tests {
         // The sweep itself still refuses the same field, with the format.
         let err = parse_custom_peers(&["no-port-here".to_owned()]).unwrap_err();
         assert!(err.contains("host:port"), "{err}");
-        std::fs::remove_dir_all(&dir).unwrap();
+        remove_artifact_fixture(&dir);
     }
 
     fn spent_note() -> SpentSproutNote {
@@ -5331,22 +5818,10 @@ mod tests {
             spent: vec![spent_note()],
             ..Default::default()
         };
-        let dir = std::env::temp_dir().join(format!(
-            "argos-sprout-summary-journal-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let journal = argos_core::sprout_sweep::SweepJournal::for_keys(
-            &dir,
-            &[[0x42; 32]],
-            argos_core::ZeckNetwork::Mainnet,
-        );
-        std::fs::write(
-            journal.path(),
-            format!("{}:0:0 {}\n", "11".repeat(32), "22".repeat(32)),
-        )
-        .unwrap();
-        let snapshot = journal.load_or_migrate().unwrap();
+        let journal = test_sprout_journal(0x42);
+        let mut snapshot = journal.load_or_migrate().unwrap();
+        let note = preview_note(1_000_000, 0x11);
+        append_unknown_journal_entry(&journal, &mut snapshot, note.outpoint, note.note.value, 0);
         assert!(sprout_has_lifecycle_status(&snapshot));
         let with_orphan = sprout_screen_with_journal(true, &spent, &snapshot, true);
         assert!(!with_orphan.nothing_left);
@@ -5362,7 +5837,7 @@ mod tests {
             false,
         );
         assert!(!unreadable.nothing_left);
-        std::fs::remove_dir_all(dir).unwrap();
+        remove_artifact_fixture(journal.data_dir());
     }
 
     use super::*;
@@ -5817,7 +6292,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_private_report_tightens_a_reused_file_to_0o600() {
+    fn write_private_report_refuses_a_reused_permissive_file_unchanged() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("argos-report-perm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -5826,15 +6301,33 @@ mod tests {
         std::fs::write(&path, b"stale").expect("seed file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
 
-        super::write_private_report(&path, b"fresh").expect("write report");
+        super::write_private_report(&path, b"fresh")
+            .expect_err("a reused permissive report must fail closed");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o600,
-            "a reused report file must be re-tightened to 0o600"
+            mode, 0o644,
+            "a reused permissive report file must not be repaired in place"
         );
-        assert_eq!(std::fs::read(&path).expect("read"), b"fresh");
+        assert_eq!(std::fs::read(&path).expect("read"), b"stale");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_private_report_creates_private_and_refuses_untrusted_reuse() {
+        let outer = unused_temp_dir("windows-private-report");
+        argos_core::private_fs::create_private_dir_all(&outer).unwrap();
+        let private = outer.join("private-report.txt");
+        super::write_private_report(&private, b"private").expect("create private report");
+        assert_eq!(std::fs::read(&private).unwrap(), b"private");
+
+        let reused = outer.join("reused-report.txt");
+        std::fs::write(&reused, b"stale").unwrap();
+        super::write_private_report(&reused, b"replacement")
+            .expect_err("an untrusted reused report must fail closed");
+        assert_eq!(std::fs::read(&reused).unwrap(), b"stale");
+        std::fs::remove_dir_all(&outer).unwrap();
     }
 
     #[test]

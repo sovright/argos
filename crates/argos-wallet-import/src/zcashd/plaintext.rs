@@ -9,6 +9,7 @@ use crate::{
         merge_embedded_network, unrecognized_network, EmbeddedNetwork, ImportedKeys, Provenance,
         SaplingKey, SproutKey, TransparentKey,
     },
+    secret_bytes::SecretArray,
     zcashd::{
         metadata::{is_metadata_record, KeyMetadataIndex, MetadataKind},
         records::{compact_size, parse_record_key},
@@ -100,13 +101,18 @@ fn secret_from_key_der(der: &[u8]) -> Option<&[u8]> {
 /// A record we cannot parse is recorded as a diagnostic and skipped; it
 /// must never prevent a record we *can* parse from being recovered.
 /// Returns which transparent and Sapling keys were actually recovered.
-pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -> RecoveredKeyIds {
+pub fn collect_plaintext(
+    pairs: &[crate::bdb::RawRecord],
+    out: &mut ImportedKeys,
+) -> RecoveredKeyIds {
     let mut recovered = RecoveredKeyIds::default();
     // Unreadable metadata is reported from here and not from
     // `collect_encrypted`, which builds the same index: this collector runs
     // for every zcashd wallet, so each damaged record is reported once.
     let metadata = KeyMetadataIndex::build(pairs, Some(&mut out.diagnostics));
-    for (raw_key, value) in pairs {
+    for record in pairs {
+        let raw_key = &record.key;
+        let value = record.value();
         let Some(rec) = parse_record_key(raw_key) else {
             // Do not include any bytes from the record key itself: it can
             // carry address material, and diagnostics are surfaced to
@@ -129,26 +135,25 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
                 // 32-byte a_sk with NO CompactSize prefix (observed value
                 // length is exactly 32). Do not use read_length_prefixed here
                 // — it would read the first key byte as a length.
-                let a_sk: Option<[u8; 32]> = value.get(..32).and_then(|s| s.try_into().ok());
+                let a_sk = <[u8; 32]>::try_from(value).ok().map(SecretArray::new);
 
                 match (addr, a_sk) {
-                    (Some(address), Some(a_sk))
-                        if identity::sprout_address_from_spending_key(&a_sk) == address =>
-                    {
-                        out.sprout.push(SproutKey {
-                            a_sk: Secret::new(a_sk),
-                            address,
-                            // zcashd Sprout keys were never HD-derived.
-                            provenance: Provenance::Standalone,
-                            created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
-                        })
-                    }
-                    (Some(_), Some(_)) => {
-                        out.diagnostics
-                            .push(ImportDiagnostic::PublicIdentifierMismatch {
-                                record_type: "zkey".to_owned(),
-                                identifier: "payment address",
-                            })
+                    (Some(address), Some(a_sk)) => {
+                        if let Some(a_sk) = identity::retain_sprout_secret(a_sk, &address) {
+                            out.sprout.push(SproutKey {
+                                a_sk,
+                                address,
+                                // zcashd Sprout keys were never HD-derived.
+                                provenance: Provenance::Standalone,
+                                created_at: metadata.created_at(MetadataKind::Sprout, &rec.rest),
+                            });
+                        } else {
+                            out.diagnostics
+                                .push(ImportDiagnostic::PublicIdentifierMismatch {
+                                    record_type: "zkey".to_owned(),
+                                    identifier: "payment address",
+                                });
+                        }
                     }
                     _ => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                         record_type: "zkey".to_owned(),
@@ -194,25 +199,27 @@ pub fn collect_plaintext(pairs: &[(Vec<u8>, Vec<u8>)], out: &mut ImportedKeys) -
                 // of the long form zcashd always emits.
                 match read_length_prefixed(value).and_then(secret_from_key_der) {
                     Some(s) => match <[u8; 32]>::try_from(s) {
-                        Ok(secret)
-                            if read_length_prefixed(&rec.rest).is_some_and(|pubkey| {
-                                identity::transparent_matches_pubkey(&secret, pubkey)
-                            }) =>
-                        {
-                            out.transparent.push(TransparentKey {
-                                secret: Secret::new(secret),
-                                provenance: Provenance::HdDerived,
-                                created_at: metadata
-                                    .created_at(MetadataKind::Transparent, &rec.rest),
-                            });
-                            recovered.transparent.insert(rec.rest);
+                        Ok(secret) => {
+                            let public_key = read_length_prefixed(&rec.rest);
+                            let secret = SecretArray::new(secret);
+                            if let Some(secret) = public_key.and_then(|public_key| {
+                                identity::retain_transparent_secret(secret, public_key)
+                            }) {
+                                out.transparent.push(TransparentKey {
+                                    secret,
+                                    provenance: Provenance::HdDerived,
+                                    created_at: metadata
+                                        .created_at(MetadataKind::Transparent, &rec.rest),
+                                });
+                                recovered.transparent.insert(rec.rest);
+                            } else {
+                                out.diagnostics
+                                    .push(ImportDiagnostic::PublicIdentifierMismatch {
+                                        record_type: "key".to_owned(),
+                                        identifier: "public key",
+                                    });
+                            }
                         }
-                        Ok(_) => out
-                            .diagnostics
-                            .push(ImportDiagnostic::PublicIdentifierMismatch {
-                                record_type: "key".to_owned(),
-                                identifier: "public key",
-                            }),
                         Err(_) => out.diagnostics.push(ImportDiagnostic::UnparseableRecord {
                             record_type: "key".to_owned(),
                             reason: "secret is not 32 bytes".to_owned(),
@@ -247,11 +254,11 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret;
 
-    fn record(kind: &str, key_rest: &[u8], value: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn record(kind: &str, key_rest: &[u8], value: &[u8]) -> crate::bdb::RawRecord {
         let mut k = vec![kind.len() as u8];
         k.extend_from_slice(kind.as_bytes());
         k.extend_from_slice(key_rest);
-        (k, value.to_vec())
+        crate::bdb::RawRecord::new(k, value.to_vec())
     }
 
     fn network_value(package: &str, network: &str) -> Vec<u8> {
@@ -294,7 +301,13 @@ mod tests {
         let main = record("networkinfo", &[], &network_value("zcashd", "main"));
         let test = record("networkinfo", &[], &network_value("zcashd", "test"));
         let mut matching = ImportedKeys::default();
-        collect_plaintext(&[main.clone(), main.clone()], &mut matching);
+        collect_plaintext(
+            &[
+                record("networkinfo", &[], &network_value("zcashd", "main")),
+                record("networkinfo", &[], &network_value("zcashd", "main")),
+            ],
+            &mut matching,
+        );
         assert_eq!(
             matching.embedded_network,
             Some(crate::keys::EmbeddedNetwork::Mainnet)
@@ -313,14 +326,14 @@ mod tests {
         let pairs = crate::bdb::walk(&bytes).unwrap().records;
         pairs
             .into_iter()
-            .find_map(|(raw_key, value)| {
-                let rec = parse_record_key(&raw_key)?;
+            .find_map(|record| {
+                let rec = parse_record_key(&record.key)?;
                 if rec.record_type != "zkey" {
                     return None;
                 }
                 Some((
                     rec.rest.get(..64)?.try_into().ok()?,
-                    value.get(..32)?.try_into().ok()?,
+                    record.value().get(..32)?.try_into().ok()?,
                 ))
             })
             .unwrap()
@@ -340,6 +353,51 @@ mod tests {
         let k = &out.sprout[0];
         assert_eq!(k.address, addr);
         assert_eq!(k.a_sk.expose_secret(), &value);
+    }
+
+    #[test]
+    fn mismatched_plaintext_sprout_key_drops_temporary_owner() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let (mut address, value) = genuine_sprout_pair();
+        address[0] ^= 1;
+        let pairs = vec![record("zkey", &address, &value)];
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut out = ImportedKeys::default();
+        SecretArray::<32>::test_with_drop_probe(Arc::clone(&dropped), || {
+            collect_plaintext(&pairs, &mut out);
+        });
+        assert!(out.sprout.is_empty());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mismatched_plaintext_transparent_key_drops_temporary_owner() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let bytes = std::fs::read("tests/fixtures/modern-plaintext.dat").unwrap();
+        let mut record = crate::bdb::walk(&bytes)
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| {
+                parse_record_key(&record.key).is_some_and(|parsed| parsed.record_type == "key")
+            })
+            .expect("fixture has a transparent key");
+        *record.key.last_mut().unwrap() ^= 1;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut out = ImportedKeys::default();
+        SecretArray::<32>::test_with_drop_probe(Arc::clone(&dropped), || {
+            collect_plaintext(&[record], &mut out);
+        });
+        assert!(out.transparent.is_empty());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     fn metadata(time: i64) -> Vec<u8> {
@@ -467,7 +525,7 @@ mod tests {
         // Claims a 64-byte record type name but the buffer only holds 2
         // bytes after the length prefix — parse_record_key returns None.
         let raw_key = vec![0x40, b'z', b'k'];
-        let pairs = vec![(raw_key, vec![0x00])];
+        let pairs = vec![crate::bdb::RawRecord::new(raw_key, vec![0x00])];
 
         let mut out = ImportedKeys::default();
         collect_plaintext(&pairs, &mut out);

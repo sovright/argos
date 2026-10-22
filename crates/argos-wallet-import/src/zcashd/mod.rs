@@ -92,7 +92,7 @@ pub fn import_zcashd(
 
 /// Every pass over the walked records. `master` is `Some` exactly when the
 /// wallet is encrypted.
-fn import_records(pairs: &[(Vec<u8>, Vec<u8>)], master: Option<&MasterKey>) -> ImportedKeys {
+fn import_records(pairs: &[bdb::RawRecord], master: Option<&MasterKey>) -> ImportedKeys {
     let mut out = ImportedKeys::default();
     let mut recovered = collect_plaintext(pairs, &mut out);
     collect_sprout_notes(pairs, &mut out);
@@ -132,23 +132,13 @@ impl RecoveredKeyIds {
 /// place even after `encryptwallet`) and, for an unencrypted wallet, every
 /// raw key. The parsed keys the caller keeps are wrapped in `Secret`; these
 /// copies were otherwise left in freed heap for the life of the process.
-struct Records(Vec<(Vec<u8>, Vec<u8>)>);
+struct Records(Vec<bdb::RawRecord>);
 
 impl std::ops::Deref for Records {
-    type Target = [(Vec<u8>, Vec<u8>)];
+    type Target = [bdb::RawRecord];
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl Drop for Records {
-    fn drop(&mut self) {
-        use secrecy::Zeroize;
-        for (key, value) in &mut self.0 {
-            key.zeroize();
-            value.zeroize();
-        }
     }
 }
 
@@ -162,12 +152,12 @@ mod tests {
         std::fs::read(format!("tests/fixtures/{name}.dat")).unwrap()
     }
 
-    fn mkey_record(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn mkey_record(bytes: &[u8]) -> bdb::RawRecord {
         bdb::walk(bytes)
             .unwrap()
             .records
             .into_iter()
-            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .find(|record| parse_record_key(&record.key).is_some_and(|r| r.record_type == "mkey"))
             .expect("golden encrypted wallet has an mkey")
     }
 
@@ -198,17 +188,18 @@ mod tests {
     #[test]
     fn encrypted_records_with_truncated_mkey_are_damaged_not_plaintext() {
         let mut bytes = read("modern-encrypted");
-        let (_, value) = mkey_record(&bytes);
-        let mut malformed = value.clone();
+        let record = mkey_record(&bytes);
+        let value = record.value();
+        let mut malformed = value.to_vec();
         malformed[0] = 0xfc; // impossible ciphertext length within this record
-        replace_unique(&mut bytes, &value, &malformed);
+        replace_unique(&mut bytes, value, &malformed);
         assert_damaged_encryption(&bytes);
     }
 
     #[test]
     fn encrypted_records_without_mkey_are_damaged_not_plaintext() {
         let mut bytes = read("modern-encrypted");
-        let (key, _) = mkey_record(&bytes);
+        let key = mkey_record(&bytes).key;
         let mut renamed = key.clone();
         renamed[1..5].copy_from_slice(b"xkey");
         replace_unique(&mut bytes, &key, &renamed);
@@ -220,8 +211,8 @@ mod tests {
         let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
         let seed = pairs
             .into_iter()
-            .find(|(key, _)| {
-                parse_record_key(key).is_some_and(|r| {
+            .find(|record| {
+                parse_record_key(&record.key).is_some_and(|r| {
                     matches!(r.record_type.as_str(), "chdseed" | "cmnemonicphrase")
                 })
             })
@@ -238,9 +229,9 @@ mod tests {
         let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
         let mut mkey = pairs
             .into_iter()
-            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .find(|record| parse_record_key(&record.key).is_some_and(|r| r.record_type == "mkey"))
             .unwrap();
-        let value = &mut mkey.1;
+        let value = mkey.value_mut();
         let (key_len, key_offset) = compact_size(value).unwrap();
         let salt_offset = key_offset + key_len as usize;
         let method_offset = salt_offset + 1 + 8;
@@ -256,12 +247,14 @@ mod tests {
         let pairs = bdb::walk(&read("modern-encrypted")).unwrap().records;
         let mut mkey = pairs
             .into_iter()
-            .find(|(key, _)| parse_record_key(key).is_some_and(|r| r.record_type == "mkey"))
+            .find(|record| parse_record_key(&record.key).is_some_and(|r| r.record_type == "mkey"))
             .unwrap();
         // Keep the serialized record well formed, but shrink the AES-CBC
         // ciphertext from the fixture's 48 bytes to an impossible 32 bytes.
-        mkey.1.drain(33..49);
-        mkey.1[0] = 32;
+        let mut value = mkey.value().to_vec();
+        value.drain(33..49);
+        value[0] = 32;
+        mkey = bdb::RawRecord::new(mkey.key, value);
         assert!(matches!(
             crate::zcashd::crypto::classify_encryption(&[mkey]),
             crate::zcashd::crypto::EncryptionMetadata::Damaged { .. }
@@ -280,7 +273,7 @@ mod tests {
     #[test]
     fn needs_passphrase_propagates_damaged_encryption_metadata() {
         let mut bytes = read("modern-encrypted");
-        let (key, _) = mkey_record(&bytes);
+        let key = mkey_record(&bytes).key;
         let mut renamed = key.clone();
         renamed[1..5].copy_from_slice(b"xkey");
         replace_unique(&mut bytes, &key, &renamed);
@@ -336,7 +329,7 @@ mod tests {
         let walk = bdb::walk(&bytes).expect("metadata-only BDB must parse");
         assert_eq!(walk.records.len(), 1);
         assert_eq!(
-            parse_record_key(&walk.records[0].0).unwrap().record_type,
+            parse_record_key(&walk.records[0].key).unwrap().record_type,
             "version"
         );
         assert!(walk.diagnostics.is_empty());
@@ -442,24 +435,33 @@ mod tests {
 
     /// The record key, after its type, of the first key whose metadata
     /// names a legacy-account keypath containing `branch`.
-    fn derived_key_id(pairs: &[(Vec<u8>, Vec<u8>)], branch: &str) -> Vec<u8> {
+    fn derived_key_id(pairs: &[crate::bdb::RawRecord], branch: &str) -> Vec<u8> {
         pairs
             .iter()
-            .find_map(|(k, v)| {
-                let r = parse_record_key(k)?;
-                (r.record_type == "keymeta" && String::from_utf8_lossy(v).contains(branch))
-                    .then_some(r.rest)
+            .find_map(|record| {
+                let r = parse_record_key(&record.key)?;
+                (r.record_type == "keymeta"
+                    && String::from_utf8_lossy(record.value()).contains(branch))
+                .then_some(r.rest)
             })
             .expect("a derived key")
     }
 
     /// Cut the value of the `record_type` record whose key is `id` to `len`
     /// bytes: the record is still there, its key is not readable.
-    fn truncate_record(pairs: &mut [(Vec<u8>, Vec<u8>)], record_type: &str, id: &[u8], len: usize) {
+    fn truncate_record(
+        pairs: &mut [crate::bdb::RawRecord],
+        record_type: &str,
+        id: &[u8],
+        len: usize,
+    ) {
         let mut hit = 0;
-        for (k, v) in pairs.iter_mut() {
-            if parse_record_key(k).is_some_and(|r| r.record_type == record_type && r.rest == id) {
-                v.truncate(len);
+        for record in pairs.iter_mut() {
+            if parse_record_key(&record.key)
+                .is_some_and(|r| r.record_type == record_type && r.rest == id)
+            {
+                let value = record.value()[..len.min(record.value().len())].to_vec();
+                *record = bdb::RawRecord::new(std::mem::take(&mut record.key), value);
                 hit += 1;
             }
         }

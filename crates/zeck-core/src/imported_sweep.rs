@@ -677,23 +677,25 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
         let built = {
             let mut wallet_db =
                 crate::workspace::open_wallet_db(self.workspace.wallet_db_path(), self.params)?;
-            build_imported_sapling_sweep_reviewed(
-                &mut wallet_db,
-                &self.params,
-                account.wallet_account_id,
-                extsk,
-                self.recipient,
-                self.prover,
-                self.max_fee_zatoshis,
-                prior_fee_zatoshis,
-                self.reviewed_sapling_fees
-                    .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0)),
-                if let Some(plan) = self.planned {
-                    plan.sapling.get(&account.wallet_account_id)
-                } else {
-                    None
-                },
-            )
+            extsk.with_parsed(|parsed| {
+                build_imported_sapling_sweep_reviewed(
+                    &mut wallet_db,
+                    &self.params,
+                    account.wallet_account_id,
+                    parsed,
+                    self.recipient,
+                    self.prover,
+                    self.max_fee_zatoshis,
+                    prior_fee_zatoshis,
+                    self.reviewed_sapling_fees
+                        .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0)),
+                    if let Some(plan) = self.planned {
+                        plan.sapling.get(&account.wallet_account_id)
+                    } else {
+                        None
+                    },
+                )
+            })
         };
         let tx = match built {
             Ok(tx) => tx,
@@ -732,25 +734,11 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
 }
 
 fn open_imported_broadcast_log(
-    runtime: &crate::models::RuntimeScanConfig,
+    registry_lease: &crate::service::NetworkRegistryLease,
 ) -> ZeckResult<DurableBroadcastLog> {
-    let path = crate::service::network_broadcast_log_path(&runtime.data_dir, runtime.network)?;
-    std::fs::create_dir_all(path.parent().expect("registry log has a parent")).map_err(|err| {
-        ZeckError::Storage(format!(
-            "creating network broadcast registry {}: {err}",
-            path.display()
-        ))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            path.parent().expect("registry log has a parent"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .map_err(|err| ZeckError::Storage(format!("securing network broadcast registry: {err}")))?;
-    }
-    let log = DurableBroadcastLog::open(path)?;
+    registry_lease.verify()?;
+    let log = registry_lease.reopen_broadcast_log()?;
+    registry_lease.verify()?;
     // The execution-start gate already refused unresolved history from any
     // earlier review. Here only an unknown outcome blocks: a leg of this same
     // execution that was accepted (Pending) spends disjoint reviewed inputs.
@@ -796,16 +784,35 @@ async fn sweep_imported_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
+    let operation_guard =
+        match crate::service::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network) {
+            Ok(guard) => guard,
+            Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+        };
+    let registry_lease = match operation_guard.registry_lease() {
+        Ok(lease) => lease,
+        Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+    };
     sweep_imported_wallet_reviewed(
         runtime,
         keys,
         destination,
         max_fee_zatoshis,
-        None,
-        None,
-        None,
+        ImportedSweepReview {
+            sapling_fees: None,
+            transparent_fee: None,
+            plan: None,
+            registry_lease: &registry_lease,
+        },
     )
     .await
+}
+
+pub(crate) struct ImportedSweepReview<'a> {
+    pub(crate) sapling_fees: Option<&'a std::collections::HashMap<AccountUuid, u64>>,
+    pub(crate) transparent_fee: Option<u64>,
+    pub(crate) plan: Option<&'a ImportedExecutionPlan>,
+    pub(crate) registry_lease: &'a crate::service::NetworkRegistryLease,
 }
 
 pub(crate) async fn sweep_imported_wallet_reviewed(
@@ -813,9 +820,7 @@ pub(crate) async fn sweep_imported_wallet_reviewed(
     keys: &argos_wallet_import::ImportedKeys,
     destination: &str,
     max_fee_zatoshis: Option<u64>,
-    reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
-    reviewed_transparent_fee: Option<u64>,
-    planned: Option<&ImportedExecutionPlan>,
+    review: ImportedSweepReview<'_>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome::default();
     let result = sweep_imported_wallet_into(
@@ -824,8 +829,7 @@ pub(crate) async fn sweep_imported_wallet_reviewed(
         destination,
         max_fee_zatoshis,
         &mut outcome,
-        (reviewed_sapling_fees, reviewed_transparent_fee),
-        planned,
+        review,
     )
     .await;
     (outcome, result)
@@ -844,6 +848,15 @@ async fn sweep_imported_filtered_wallet(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
+    let operation_guard =
+        match crate::service::NetworkOperationGuard::acquire(&runtime.data_dir, runtime.network) {
+            Ok(guard) => guard,
+            Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+        };
+    let registry_lease = match operation_guard.registry_lease() {
+        Ok(lease) => lease,
+        Err(err) => return (ImportedSweepOutcome::default(), Err(err)),
+    };
     sweep_imported_filtered_wallet_reviewed(
         runtime,
         keys,
@@ -855,6 +868,7 @@ async fn sweep_imported_filtered_wallet(
         None,
         None,
         None,
+        &registry_lease,
     )
     .await
 }
@@ -871,13 +885,14 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
     reviewed_sapling_fees: Option<&std::collections::HashMap<AccountUuid, u64>>,
     reviewed_transparent_fee: Option<u64>,
     planned: Option<&ImportedExecutionPlan>,
+    registry_lease: &crate::service::NetworkRegistryLease,
 ) -> (ImportedSweepOutcome, ZeckResult<()>) {
     let mut outcome = ImportedSweepOutcome {
         sapling_empty_display_index: sapling_accounts.first().map(|account| account.0),
         ..Default::default()
     };
     let result = async {
-        let mut log = open_imported_broadcast_log(runtime)?;
+        let mut log = open_imported_broadcast_log(registry_lease)?;
         sweep_imported_sapling_leg(
             runtime,
             keys,
@@ -896,21 +911,20 @@ pub(crate) async fn sweep_imported_filtered_wallet_reviewed(
             && planned.is_none_or(|plan| plan.transparent.is_some())
         {
             let all_keys = crate::imported::imported_transparent_keys(keys)?;
+            let mut available = all_keys.into_iter().map(Some).collect::<Vec<_>>();
             let selected = transparent_indices
                 .iter()
                 .map(|index| {
-                    all_keys.get(*index).ok_or_else(|| {
-                        ZeckError::Wallet(format!("standalone transparent key {index} is missing"))
-                    })
+                    available
+                        .get_mut(*index)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            ZeckError::Wallet(format!(
+                                "standalone transparent key {index} is missing"
+                            ))
+                        })
                 })
                 .collect::<ZeckResult<Vec<_>>>()?;
-            let selected = selected
-                .into_iter()
-                .map(|key| crate::imported::ImportedTransparentKey {
-                    secret: key.secret,
-                    address: key.address,
-                })
-                .collect::<Vec<_>>();
             submit_transparent_followup(
                 &mut log,
                 &selected,
@@ -946,15 +960,16 @@ async fn sweep_imported_wallet_into(
     destination: &str,
     max_fee_zatoshis: Option<u64>,
     outcome: &mut ImportedSweepOutcome,
-    reviewed_fees: (
-        Option<&std::collections::HashMap<AccountUuid, u64>>,
-        Option<u64>,
-    ),
-    planned: Option<&ImportedExecutionPlan>,
+    review: ImportedSweepReview<'_>,
 ) -> ZeckResult<()> {
     use crate::imported::imported_transparent_keys;
-    let (reviewed_sapling_fees, reviewed_transparent_fee) = reviewed_fees;
-    let mut log = open_imported_broadcast_log(runtime)?;
+    let ImportedSweepReview {
+        sapling_fees: reviewed_sapling_fees,
+        transparent_fee: reviewed_transparent_fee,
+        plan: planned,
+        registry_lease,
+    } = review;
+    let mut log = open_imported_broadcast_log(registry_lease)?;
 
     // Sapling first. A definite failure may leave the independent transparent
     // pool spendable, but an uncertain or retryable submission blocks it.
@@ -1077,7 +1092,7 @@ async fn sweep_imported_sapling_leg(
                 let key = keys.sapling.get(key_index).ok_or_else(|| {
                     ZeckError::Wallet(format!("standalone Sapling key {key_index} is missing"))
                 })?;
-                let extsk = crate::imported::parse_sapling_extsk(
+                let extsk = crate::imported::ImportedSaplingSpendingKey::from_serialized(
                     secrecy::ExposeSecret::expose_secret(&key.extsk),
                 )?;
                 Ok((
@@ -1159,7 +1174,8 @@ fn unique_registered_accounts(
         let identity = account
             .sapling_extsk
             .as_ref()
-            .map(|key| key.to_diversifiable_full_viewing_key().to_bytes());
+            .map(crate::imported::ImportedSaplingSpendingKey::full_viewing_key_identity)
+            .transpose()?;
         if let Some(previous) = seen.get(&account.wallet_account_id) {
             if previous != &identity {
                 return Err(ZeckError::Wallet(
@@ -1257,7 +1273,7 @@ mod fee_cap_tests {
             transparent_scan: None,
             lightwalletd_url: "http://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };
@@ -1293,7 +1309,7 @@ mod fee_cap_tests {
             transparent_scan: None,
             lightwalletd_url: "http://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };
@@ -1364,7 +1380,7 @@ mod fee_cap_tests {
             transparent_scan: None,
             lightwalletd_url: "https://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };
@@ -1439,7 +1455,11 @@ mod registered_account_dedup_tests {
 
     #[test]
     fn duplicate_registered_sapling_uuid_is_swept_once() {
-        let extsk = || sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+        let extsk = || {
+            let parsed = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+            crate::imported::ImportedSaplingSpendingKey::from_serialized(&parsed.to_bytes())
+                .expect("fixture key")
+        };
         let make_account = || crate::imported::ImportedWalletAccount {
             wallet_account_id: AccountUuid::default(),
             sapling_extsk: Some(extsk()),
@@ -1666,7 +1686,7 @@ mod routing_tests {
             transparent_scan: None,
             lightwalletd_url: "https://127.0.0.1:1".to_owned(),
             confirmation_sources: Vec::new(),
-            data_dir: tempdir.path().to_owned(),
+            data_dir: tempdir.path().join("recovery-data"),
             network: crate::models::ZeckNetwork::Mainnet,
             label: String::new(),
         };

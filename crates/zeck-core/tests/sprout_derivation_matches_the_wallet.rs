@@ -22,7 +22,7 @@ use argos_core::sprout;
 use argos_wallet_import::{bdb, keys::ImportedKeys, zcashd};
 use secrecy::ExposeSecret;
 
-fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn load(fixture: &str) -> Vec<bdb::RawRecord> {
     let path = format!(
         "{}/../argos-wallet-import/tests/fixtures/{fixture}.dat",
         env!("CARGO_MANIFEST_DIR")

@@ -17,6 +17,7 @@ use crate::{
     error::{ZeckError, ZeckResult},
     key_source::{KeySource, SeedKeySource},
     models::{RuntimeScanConfig, TransparentScanConfig, ZeckNetwork},
+    private_fs::{self, PrivateOpenMode},
 };
 
 /// Filename for the per-workspace session metadata sidecar. Lives next to
@@ -48,10 +49,134 @@ const SESSION_SCHEMA_VERSION: u32 = 1;
 pub struct RecoveryWorkspace {
     root: PathBuf,
     /// First path component under `data_dir/<network>` that is private to
-    /// this wallet — used to tighten permissions without touching the
+    /// this wallet — used to verify private access without touching the
     /// generic data_dir or network directories above it.
     private_root: PathBuf,
     wallet_db_path: PathBuf,
+}
+
+/// An initialized replacement wallet that has never been written to disk.
+pub(crate) struct WalletDbRebuild {
+    connection: rusqlite::Connection,
+    destination: PathBuf,
+    network: ZeckNetwork,
+}
+
+impl WalletDbRebuild {
+    pub(crate) fn wallet_db(
+        &mut self,
+    ) -> WalletDb<&mut rusqlite::Connection, ArgosParams, SystemClock, OsRng> {
+        WalletDb::from_connection(
+            &mut self.connection,
+            consensus_network(self.network),
+            SystemClock,
+            OsRng,
+        )
+    }
+}
+
+/// Retained create-time authority for files exported into one recovery
+/// workspace. Holding this value pins the private workspace root while a UI
+/// resolves the destination and publishes the file through an exact parent
+/// handle.
+pub struct PrivateWorkspaceFileAuthority {
+    workspace_root: PathBuf,
+    private_root: PathBuf,
+    lineage: private_fs::PrivateRootLineageLease,
+}
+
+impl PrivateWorkspaceFileAuthority {
+    pub fn acquire(workspace_root: impl AsRef<Path>) -> ZeckResult<Self> {
+        let workspace_root = workspace_root.as_ref().to_path_buf();
+        let database = workspace_root.join("wallet.sqlite");
+        let private_root = private_root_for_wallet_database(&database).map_err(|err| {
+            ZeckError::Storage(format!(
+                "deriving private authority for recovery workspace {}: {err}",
+                workspace_root.display()
+            ))
+        })?;
+        let lineage =
+            private_fs::verify_private_workspace_lineage(private_root).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "authenticating recovery workspace {}: {err}",
+                    workspace_root.display()
+                ))
+            })?;
+        verify_private_dirs(private_root, &workspace_root)?;
+        Ok(Self {
+            workspace_root,
+            private_root: private_root.to_path_buf(),
+            lineage,
+        })
+    }
+
+    pub fn write_private_file(&self, path: &Path, bytes: &[u8]) -> ZeckResult<()> {
+        let parent = path.parent().ok_or_else(|| {
+            ZeckError::Storage(format!("private export {} has no parent", path.display()))
+        })?;
+        if !parent.starts_with(&self.workspace_root) || path.file_name().is_none() {
+            return Err(ZeckError::Storage(format!(
+                "private export {} is outside recovery workspace {}",
+                path.display(),
+                self.workspace_root.display()
+            )));
+        }
+
+        self.lineage.verify_current().map_err(|err| {
+            ZeckError::Storage(format!(
+                "revalidating recovery workspace before export: {err}"
+            ))
+        })?;
+        private_fs::create_private_dir_all(parent).map_err(|err| {
+            ZeckError::Storage(format!(
+                "creating private report directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+        verify_private_dirs(&self.private_root, parent)?;
+        let retained_parent = private_fs::open_private_directory_lease(parent).map_err(|err| {
+            ZeckError::Storage(format!(
+                "retaining private report directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+        self.lineage.verify_current().map_err(|err| {
+            ZeckError::Storage(format!(
+                "revalidating recovery workspace before report write: {err}"
+            ))
+        })?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(ZeckError::Storage(format!(
+                    "private export {} is not a regular file",
+                    path.display()
+                )))
+            }
+            Ok(_) => {
+                private_fs::verify_private_child_file(&retained_parent, path).map_err(|err| {
+                    ZeckError::Storage(format!(
+                        "verifying existing private export {}: {err}",
+                        path.display()
+                    ))
+                })?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ZeckError::Storage(format!(
+                    "inspecting private export {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+        private_fs::write_private_file_atomic_in_parent(&retained_parent, path, bytes).map_err(
+            |err| ZeckError::Storage(format!("writing private export {}: {err}", path.display())),
+        )?;
+        self.lineage.verify_current().map_err(|err| {
+            ZeckError::Storage(format!(
+                "revalidating recovery workspace after report write: {err}"
+            ))
+        })
+    }
 }
 
 impl RecoveryWorkspace {
@@ -94,12 +219,11 @@ impl RecoveryWorkspace {
         })
     }
 
-    pub fn initialize(&self, network: ZeckNetwork, seed: &[u8; 64]) -> ZeckResult<()> {
-        create_private_dir_all(&self.root)?;
-        // recursive create only sets mode on newly-created dirs; explicitly
-        // re-tighten every component from the wallet-private root down so
-        // resumes don't quietly inherit looser perms set in a previous run.
-        tighten_private_perms(&self.private_root, &self.root)?;
+    pub(crate) fn initialize(&self, network: ZeckNetwork, seed: &[u8; 64]) -> ZeckResult<()> {
+        self.ensure_private_lineage()?;
+        // Verify every component from the wallet-private root down so resumes
+        // fail closed instead of repairing a previously insecure directory.
+        verify_private_dirs(&self.private_root, &self.root)?;
 
         let mut wallet_db = open_wallet_db(&self.wallet_db_path, consensus_network(network))?;
         init_wallet_db(&mut wallet_db, Some(SecretVec::new(seed.to_vec()))).map_err(|err| {
@@ -108,15 +232,14 @@ impl RecoveryWorkspace {
                 self.wallet_db_path.display()
             ))
         })?;
-        set_private_file_permissions(&self.wallet_db_path)?;
-        // WAL mode adds `-wal`/`-shm` sidecar files; tighten them too.
-        // Best-effort: SQLite recreates them with the DB file's permissions otherwise.
+        verify_private_wallet_file(&self.wallet_db_path)?;
+        // WAL mode adds `-wal`/`-shm` sidecar files; verify them too.
         for suffix in ["-wal", "-shm"] {
             let mut sidecar = self.wallet_db_path.as_os_str().to_owned();
             sidecar.push(suffix);
             let sidecar = PathBuf::from(sidecar);
             if sidecar.exists() {
-                set_private_file_permissions(&sidecar)?;
+                verify_private_wallet_file(&sidecar)?;
             }
         }
 
@@ -125,13 +248,13 @@ impl RecoveryWorkspace {
 
     /// Build the wallet database for any key source. Imported key sets
     /// have no seed, so `init_wallet_db` receives `None` for them.
-    pub fn initialize_from_source(
+    pub(crate) fn initialize_from_source(
         &self,
         network: ZeckNetwork,
         source: &dyn KeySource,
     ) -> ZeckResult<()> {
-        create_private_dir_all(&self.root)?;
-        tighten_private_perms(&self.private_root, &self.root)?;
+        self.ensure_private_lineage()?;
+        verify_private_dirs(&self.private_root, &self.root)?;
 
         let mut wallet_db = open_wallet_db(&self.wallet_db_path, consensus_network(network))?;
         let seed = source.wallet_seed()?.map(|s| SecretVec::new(s.to_vec()));
@@ -141,13 +264,13 @@ impl RecoveryWorkspace {
                 self.wallet_db_path.display()
             ))
         })?;
-        set_private_file_permissions(&self.wallet_db_path)?;
+        verify_private_wallet_file(&self.wallet_db_path)?;
         for suffix in ["-wal", "-shm"] {
             let mut sidecar = self.wallet_db_path.as_os_str().to_owned();
             sidecar.push(suffix);
             let sidecar = PathBuf::from(sidecar);
             if sidecar.exists() {
-                set_private_file_permissions(&sidecar)?;
+                verify_private_wallet_file(&sidecar)?;
             }
         }
         Ok(())
@@ -157,278 +280,213 @@ impl RecoveryWorkspace {
         &self.root
     }
 
+    pub(crate) fn private_root(&self) -> &Path {
+        &self.private_root
+    }
+
     pub fn wallet_db_path(&self) -> &Path {
         &self.wallet_db_path
     }
 
-    /// Where a replacement wallet database is built before it takes the
-    /// place of `wallet.sqlite`. Inside the workspace root, so the final
-    /// rename never crosses a filesystem.
-    fn rebuilt_wallet_db_path(&self) -> PathBuf {
-        self.root.join("wallet.sqlite.rebuild")
-    }
-
-    /// Start building a fresh wallet database alongside the live one.
+    /// Build a fresh wallet database entirely in memory.
     ///
-    /// Accounts must never be imported into a wallet database that has
-    /// already scanned blocks: `zcash_client_sqlite`'s `add_account` rewinds
-    /// the wallet to the new account's birthday, and consecutive rewinds of a
-    /// scanned wallet can leave the pools' note commitment tree checkpoints
-    /// out of step, after which the next import fails as `CorruptedData`
-    /// ("retains checkpoints both above and below height ..."). Building a
-    /// fresh database with every account imported up front avoids that
-    /// path entirely, and costs nothing extra: the rewind already requeued
-    /// the whole range from the birthday.
-    ///
-    /// Returns the new, initialized database. Any leftover from an earlier
-    /// interrupted rebuild is discarded first. The live `wallet.sqlite` is
-    /// untouched until [`Self::commit_wallet_db_rebuild`]; a rebuild dropped
-    /// without being committed (an import failed, or the scan was
-    /// cancelled) deletes its files, since they hold the viewing keys.
+    /// Gap extension sometimes needs a database containing every account
+    /// before any blocks are scanned. Keeping that rebuild in memory avoids a
+    /// second on-disk copy of wallet material and, more importantly, avoids
+    /// introducing another filesystem object whose lineage would have to be
+    /// published and retired safely.
     pub(crate) fn begin_wallet_db_rebuild(
         &self,
         network: ZeckNetwork,
         seed: &[u8; 64],
     ) -> ZeckResult<WalletDbRebuild> {
-        let path = self.rebuilt_wallet_db_path();
-        remove_sqlite_files(&path)?;
-        // Armed before the first write, so even a failed init is cleaned up.
-        let rebuild = WalletDbRebuild {
-            path,
-            committed: false,
-        };
-        let mut wallet_db = open_wallet_db(&rebuild.path, consensus_network(network))?;
-        init_wallet_db(&mut wallet_db, Some(SecretVec::new(seed.to_vec()))).map_err(|err| {
-            ZeckError::Wallet(format!(
-                "initializing replacement wallet database {}: {err}",
-                rebuild.path.display()
+        self.ensure_private_lineage()?;
+        let mut connection = rusqlite::Connection::open_in_memory().map_err(|err| {
+            ZeckError::Storage(format!("opening an in-memory wallet rebuild: {err}"))
+        })?;
+        rusqlite::vtab::array::load_module(&connection).map_err(|err| {
+            ZeckError::Storage(format!(
+                "loading SQLite modules for a wallet rebuild: {err}"
             ))
         })?;
-        drop(wallet_db);
-        set_private_file_permissions(&rebuild.path)?;
-        Ok(rebuild)
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "keeping wallet rebuild temporary data in memory: {err}"
+                ))
+            })?;
+        {
+            let mut wallet_db = WalletDb::from_connection(
+                &mut connection,
+                consensus_network(network),
+                SystemClock,
+                OsRng,
+            );
+            init_wallet_db(&mut wallet_db, Some(SecretVec::new(seed.to_vec()))).map_err(|err| {
+                ZeckError::Wallet(format!("initializing an in-memory wallet rebuild: {err}"))
+            })?;
+        }
+        Ok(WalletDbRebuild {
+            connection,
+            destination: self.wallet_db_path.clone(),
+            network,
+        })
     }
 
-    /// Atomically replace `wallet.sqlite` with a database built by
-    /// [`Self::begin_wallet_db_rebuild`].
-    ///
-    /// The caller must hold no open connection to either database. Both
-    /// databases are folded back to a single file (WAL checkpointed and
-    /// removed) before the rename, and the commit is refused if the old one
-    /// cannot be, so no `-wal` belonging to the old database is ever beside
-    /// the new file for SQLite to replay into it after a crash. A crash
-    /// before the rename leaves the old database intact; after it, the new
-    /// one.
-    ///
-    /// Another process briefly holding `wallet.sqlite` (the launch-time
-    /// resume list, an indexer or antivirus scanner) is waited out with a
-    /// short bounded backoff; one that outlasts it fails the commit with the
-    /// old database unchanged, so resuming the scan rebuilds again.
-    pub(crate) fn commit_wallet_db_rebuild(&self, mut rebuild: WalletDbRebuild) -> ZeckResult<()> {
-        let rebuilt = rebuild.path.clone();
-        if rebuilt != self.rebuilt_wallet_db_path() {
+    /// Transactionally replace the live wallet's contents from a fresh,
+    /// in-memory database while preserving the exact on-disk object bound by
+    /// the private-lineage marker and Windows authority.
+    pub(crate) fn commit_wallet_db_rebuild(&self, rebuilt: WalletDbRebuild) -> ZeckResult<()> {
+        self.commit_wallet_db_rebuild_with_timeout(rebuilt, std::time::Duration::from_secs(5))
+    }
+
+    fn commit_wallet_db_rebuild_with_timeout(
+        &self,
+        rebuilt: WalletDbRebuild,
+        timeout: std::time::Duration,
+    ) -> ZeckResult<()> {
+        if rebuilt.destination != self.wallet_db_path {
             return Err(ZeckError::Internal(format!(
-                "refusing to install {} as the wallet database: not this workspace's rebuild path",
-                rebuilt.display()
+                "refusing to install a wallet rebuild for {} into {}",
+                rebuilt.destination.display(),
+                self.wallet_db_path.display()
             )));
         }
-        let in_use = |what: String| {
+        let rebuilt = rebuilt.connection;
+        let source_path: String = rebuilt
+            .query_row("PRAGMA database_list", [], |row| row.get(2))
+            .map_err(|err| {
+                ZeckError::Storage(format!("verifying the wallet rebuild source: {err}"))
+            })?;
+        if !source_path.is_empty() {
+            return Err(ZeckError::Internal(
+                "refusing to install a wallet rebuild that is not in memory".to_owned(),
+            ));
+        }
+        let integrity: String = rebuilt
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|err| {
+                ZeckError::Storage(format!("checking the in-memory wallet rebuild: {err}"))
+            })?;
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(ZeckError::Storage(format!(
+                "the in-memory wallet rebuild failed SQLite integrity checking: {integrity}"
+            )));
+        }
+
+        let mut destination =
+            open_tuned_wallet_connection(&self.wallet_db_path).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "opening wallet database {} for transactional rebuild: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })?;
+        destination.busy_timeout(timeout).map_err(|err| {
             ZeckError::Storage(format!(
-                "could not replace the wallet database {}: it is in use by another program \
-                 ({what}). The existing database is unchanged; close anything that may have it \
-                 open and resume the scan, which rebuilds it again.",
+                "setting the wallet rebuild lock timeout for {}: {err}",
                 self.wallet_db_path.display()
             ))
-        };
-        collapse_to_single_file(&rebuilt)?;
-        if self.wallet_db_path.exists() {
-            retry_transient(
-                &COMMIT_RETRY_DELAYS,
-                |_| true,
-                || collapse_to_single_file(&self.wallet_db_path),
-            )
-            .map_err(|err| in_use(err.to_string()))?;
+        })?;
+        destination
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "enabling durable wallet rebuild commits for {}: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })?;
+        let destination_mode: String = destination
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|err| {
+                ZeckError::Storage(format!(
+                    "verifying WAL mode before rebuilding {}: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })?;
+        if !destination_mode.eq_ignore_ascii_case("wal") {
+            return Err(ZeckError::Storage(format!(
+                "wallet database {} is in {destination_mode} mode before rebuild",
+                self.wallet_db_path.display()
+            )));
         }
-        // Folded, so these hold no committed data; remove whatever a reader
-        // may have left so nothing of the old database survives the rename.
-        remove_sqlite_sidecars(&self.wallet_db_path)?;
-        fs::File::open(&rebuilt)
-            .and_then(|file| file.sync_all())
-            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", rebuilt.display())))?;
-        retry_transient(&COMMIT_RETRY_DELAYS, is_sharing_violation, || {
-            fs::rename(&rebuilt, &self.wallet_db_path)
-        })
-        .map_err(|err| in_use(format!("renaming {}: {err}", rebuilt.display())))?;
-        rebuild.committed = true;
-        remove_sqlite_sidecars(&self.wallet_db_path)?;
-        // Persist the rename itself. Directories cannot be opened for sync on
-        // Windows, where the rename is already durable on return.
-        #[cfg(unix)]
-        fs::File::open(&self.root)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|err| ZeckError::Storage(format!("syncing {}: {err}", self.root.display())))?;
-        set_private_file_permissions(&self.wallet_db_path)
-    }
-}
 
-/// A replacement wallet database under construction, from
-/// [`RecoveryWorkspace::begin_wallet_db_rebuild`]. Dropping it without a
-/// successful [`RecoveryWorkspace::commit_wallet_db_rebuild`] deletes its
-/// files (best-effort): they hold the same viewing keys as the live
-/// database.
-#[must_use = "an uncommitted rebuild is deleted when dropped"]
-pub(crate) struct WalletDbRebuild {
-    path: PathBuf,
-    committed: bool,
-}
-
-impl WalletDbRebuild {
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for WalletDbRebuild {
-    fn drop(&mut self) {
-        if !self.committed {
-            if let Err(err) = remove_sqlite_files(&self.path) {
-                tracing::warn!("could not remove an abandoned wallet database rebuild: {err}");
-            }
-        }
-    }
-}
-
-/// Backoff for another process briefly holding the wallet database during
-/// a commit: about 1.5 seconds in all.
-const COMMIT_RETRY_DELAYS: [std::time::Duration; 5] = [
-    std::time::Duration::from_millis(50),
-    std::time::Duration::from_millis(100),
-    std::time::Duration::from_millis(200),
-    std::time::Duration::from_millis(400),
-    std::time::Duration::from_millis(800),
-];
-
-/// Run `op`, retrying after each of `delays` while it fails with an error
-/// `transient` accepts. Returns the last error once the delays run out.
-fn retry_transient<T, E>(
-    delays: &[std::time::Duration],
-    mut transient: impl FnMut(&E) -> bool,
-    mut op: impl FnMut() -> Result<T, E>,
-) -> Result<T, E> {
-    let mut delays = delays.iter();
-    loop {
-        match op() {
-            Ok(value) => return Ok(value),
-            Err(err) => match delays.next() {
-                Some(delay) if transient(&err) => std::thread::sleep(*delay),
-                _ => return Err(err),
-            },
-        }
-    }
-}
-
-/// Whether a file operation failed because another process has the file
-/// open. On Windows a rename over an open file fails with
-/// `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION` or
-/// `ERROR_LOCK_VIOLATION`.
-fn is_sharing_violation(err: &std::io::Error) -> bool {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    const ERROR_LOCK_VIOLATION: i32 = 33;
-    err.kind() == std::io::ErrorKind::PermissionDenied
-        || (cfg!(windows)
-            && matches!(
-                err.raw_os_error(),
-                Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        let backup = rusqlite::backup::Backup::new(&rebuilt, &mut destination).map_err(|err| {
+            ZeckError::Storage(format!(
+                "starting transactional wallet rebuild for {}: {err}",
+                self.wallet_db_path.display()
             ))
-}
-
-/// Remove a SQLite database's `-wal`/`-shm`, tolerating either being absent.
-fn remove_sqlite_sidecars(path: &Path) -> ZeckResult<()> {
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = sqlite_sidecar(path, suffix);
-        match fs::remove_file(&sidecar) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(ZeckError::Storage(format!(
-                    "removing stale {}: {err}",
-                    sidecar.display()
-                )))
+        })?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match backup.step(256).map_err(|err| {
+                ZeckError::Storage(format!(
+                    "copying the rebuilt wallet into {}: {err}",
+                    self.wallet_db_path.display()
+                ))
+            })? {
+                rusqlite::backup::StepResult::Done => break,
+                rusqlite::backup::StepResult::More => {}
+                rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ZeckError::Storage(format!(
+                            "timed out waiting to install the rebuilt wallet into {}",
+                            self.wallet_db_path.display()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                _ => {
+                    return Err(ZeckError::Storage(format!(
+                        "SQLite returned an unknown state while rebuilding {}",
+                        self.wallet_db_path.display()
+                    )))
+                }
             }
         }
+        // `Done` is the commit point. Keep this return path infallible: a
+        // caller must never see an error after SQLite has installed the new
+        // contents and mistake a completed rebuild for an unchanged wallet.
+        Ok(())
     }
-    Ok(())
-}
 
-fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut sidecar = path.as_os_str().to_owned();
-    sidecar.push(suffix);
-    PathBuf::from(sidecar)
-}
-
-/// Remove a SQLite database and its WAL sidecars, tolerating any that are
-/// absent.
-fn remove_sqlite_files(path: &Path) -> ZeckResult<()> {
-    for candidate in [
-        path.to_owned(),
-        sqlite_sidecar(path, "-wal"),
-        sqlite_sidecar(path, "-shm"),
-    ] {
-        match fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(ZeckError::Storage(format!(
-                    "removing {}: {err}",
-                    candidate.display()
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Checkpoint a WAL-mode database into its main file and leave it in
-/// rollback-journal mode, so the main file alone holds every committed
-/// write. [`open_wallet_db`] switches it back to WAL on the next open.
-fn collapse_to_single_file(path: &Path) -> ZeckResult<()> {
-    let storage = |err: rusqlite::Error| {
-        ZeckError::Storage(format!(
-            "checkpointing wallet database {}: {err}",
-            path.display()
-        ))
-    };
-    let conn = rusqlite::Connection::open(path).map_err(storage)?;
-    conn.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))
-        .map_err(storage)?;
-    let mode = conn
-        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
-            row.get::<_, String>(0)
+    pub(crate) fn authorize_recreation(&self) -> ZeckResult<()> {
+        private_fs::authorize_private_workspace_recreation(
+            &self.private_root,
+            &self.root,
+            &self.wallet_db_path,
+        )
+        .map_err(|err| {
+            ZeckError::Storage(format!(
+                "authorizing a new recovery generation at {}: {err}",
+                self.root.display()
+            ))
         })
-        .map_err(storage)?;
-    if !mode.eq_ignore_ascii_case("delete") {
-        return Err(ZeckError::Storage(format!(
-            "wallet database {} stayed in {mode} journal mode; another connection may still be open",
-            path.display()
-        )));
     }
-    drop(conn);
-    let wal = sqlite_sidecar(path, "-wal");
-    if wal.exists() {
-        return Err(ZeckError::Storage(format!(
-            "{} still exists after checkpointing; another connection may still be open",
-            wal.display()
-        )));
+
+    pub fn broadcast_log_path(&self) -> PathBuf {
+        self.root.join(crate::broadcast::BROADCAST_LOG_FILE_NAME)
     }
-    // The shared-memory index holds no committed data; with no connection
-    // open it is safe to drop, and must not outlive the file it indexes.
-    match fs::remove_file(sqlite_sidecar(path, "-shm")) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(ZeckError::Storage(format!(
-            "removing shared-memory index for {}: {err}",
-            path.display()
-        ))),
+
+    /// Establish the private workspace before the broadcast lock sidecar is opened.
+    pub(crate) fn ensure_broadcast_log_directory(&self) -> ZeckResult<()> {
+        self.ensure_private_lineage()?;
+        verify_private_dirs(&self.private_root, &self.root)
+    }
+
+    fn ensure_private_lineage(&self) -> ZeckResult<()> {
+        private_fs::ensure_private_workspace_lineage(
+            &self.private_root,
+            &self.root,
+            &self.wallet_db_path,
+        )
+        .map(|_| ())
+        .map_err(|err| {
+            ZeckError::Storage(format!(
+                "establishing private workspace lineage at {}: {err}",
+                self.private_root.display()
+            ))
+        })
     }
 }
 
@@ -580,111 +638,58 @@ fn derive_workspace_id(
     out
 }
 
+#[cfg(test)]
 fn create_private_dir_all(path: &Path) -> ZeckResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-
-        // mode(0o700) only applies to dirs created during this call; pre-
-        // existing parents keep their mode. We explicitly tighten the
-        // wallet-private subtree separately via tighten_private_perms.
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)
-            .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
-    }
-
-    Ok(())
+    private_fs::create_private_dir_all(path)
+        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))
 }
 
 #[allow(unused_variables)]
-fn tighten_private_perms(private_root: &Path, leaf: &Path) -> ZeckResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut current = leaf.to_path_buf();
-        loop {
-            fs::set_permissions(&current, fs::Permissions::from_mode(0o700)).map_err(|err| {
-                ZeckError::Storage(format!(
-                    "setting private permissions on {}: {err}",
-                    current.display()
-                ))
-            })?;
-            if current == private_root {
-                break;
-            }
-            match current.parent() {
-                Some(parent) => current = parent.to_path_buf(),
-                None => break,
-            }
+fn verify_private_dirs(private_root: &Path, leaf: &Path) -> ZeckResult<()> {
+    let mut current = leaf.to_path_buf();
+    loop {
+        private_fs::harden_private_directory(&current).map_err(|err| {
+            ZeckError::Storage(format!(
+                "verifying private permissions on {}: {err}",
+                current.display()
+            ))
+        })?;
+        if current == private_root {
+            break;
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
         }
     }
 
     Ok(())
 }
 
-fn set_private_file_permissions(path: &Path) -> ZeckResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            ZeckError::Storage(format!(
-                "setting private permissions on {}: {err}",
-                path.display()
-            ))
-        })?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-
-    Ok(())
-}
-
-/// Create (or truncate) `path` and write `bytes`, restricting the file to
-/// `0o600` at creation time on Unix via `OpenOptions::mode`. This keeps
-/// file-level protection in place independent of the parent directory's
-/// mode (audit Suggestion 3). On non-Unix platforms there is no mode-bit
-/// equivalent, so this degrades to a plain create-truncate write and the
-/// `0o700` parent directory remains the sole protection.
-fn write_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
-    use std::io::Write;
-
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options
-        .open(path)
-        .map_err(|err| ZeckError::Storage(format!("creating {}: {err}", path.display())))?;
-    // `OpenOptions::mode` only constrains newly-created files. If this path
-    // already existed with looser permissions, tighten it before writing fresh
-    // sensitive contents into the truncated file.
-    set_private_file_permissions(path)?;
-    file.write_all(bytes)
-        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", path.display())))?;
-
-    // Keep the final mode tight even if a platform/filesystem changes metadata
-    // during the write.
-    set_private_file_permissions(path)?;
-
-    Ok(())
+/// Recheck an initialized SQLite file without demanding an exclusive open.
+/// The wallet open path has already authenticated and retained its exact
+/// lineage; this postcondition verifies the current object and access control
+/// through the same private parent while remaining compatible with live
+/// SQLite handles and Windows' retained no-delete authority.
+fn verify_private_wallet_file(path: &Path) -> ZeckResult<()> {
+    let parent_path = path.parent().ok_or_else(|| {
+        ZeckError::Storage(format!(
+            "private wallet file {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    let parent = private_fs::open_private_sqlite_parent(parent_path).map_err(|err| {
+        ZeckError::Storage(format!(
+            "verifying private parent for {}: {err}",
+            path.display()
+        ))
+    })?;
+    private_fs::verify_private_child_file(&parent, path).map_err(|err| {
+        ZeckError::Storage(format!(
+            "verifying private permissions on {}: {err}",
+            path.display()
+        ))
+    })
 }
 
 /// Append one complete JSONL event and make it durable before reporting success.
@@ -692,32 +697,10 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
 pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
     use std::io::Write;
 
-    let mut options = fs::OpenOptions::new();
-    options.append(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let (mut file, created) = match options.open(path) {
-        Ok(file) => (file, true),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = fs::OpenOptions::new()
-                .append(true)
-                .open(path)
-                .map_err(|err| {
-                    ZeckError::Storage(format!("opening {} for append: {err}", path.display()))
-                })?;
-            (file, false)
-        }
-        Err(err) => {
-            return Err(ZeckError::Storage(format!(
-                "creating {}: {err}",
-                path.display()
-            )))
-        }
-    };
-    set_private_file_permissions(path)?;
+    let created = !path.exists();
+    let mut file = private_fs::open_private_file(path, PrivateOpenMode::Append).map_err(|err| {
+        ZeckError::Storage(format!("opening {} for append: {err}", path.display()))
+    })?;
     // One buffer, one write: the event and its terminator are never split
     // across separate writes.
     let mut line = Vec::with_capacity(bytes.len() + 1);
@@ -736,14 +719,12 @@ pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
                 path.display()
             ))
         })?;
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|err| {
-                ZeckError::Storage(format!(
-                    "syncing broadcast log parent {}: {err}",
-                    parent.display()
-                ))
-            })?;
+        private_fs::sync_parent_directory(path).map_err(|err| {
+            ZeckError::Storage(format!(
+                "syncing broadcast log parent {}: {err}",
+                parent.display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -753,6 +734,178 @@ pub(crate) fn append_private_file(path: &Path, bytes: &[u8]) -> ZeckResult<()> {
 /// poller share the file, so lock collisions are routine rather than exceptional.
 const WALLET_DB_BUSY_TIMEOUT_SECS: u64 = 5;
 
+fn private_root_for_wallet_database(path: &Path) -> std::io::Result<&Path> {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "wallet database path does not have the expected private-root/birthday/scope layout",
+            )
+        })
+}
+
+fn open_authorized_wallet_connection(
+    path: &Path,
+    flags: rusqlite::OpenFlags,
+    prepare_wal_sidecars: bool,
+    initialize: impl FnOnce(&rusqlite::Connection, bool) -> Result<(), rusqlite::Error>,
+) -> Result<rusqlite::Connection, rusqlite::Error> {
+    fn sqlite_io(error: std::io::Error) -> rusqlite::Error {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+    }
+
+    let parent_path = path.parent().ok_or_else(|| {
+        sqlite_io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wallet database has no parent directory",
+        ))
+    })?;
+    let private_root = private_root_for_wallet_database(path).map_err(sqlite_io)?;
+    let _open_guard = private_fs::lock_private_sqlite_open(path).map_err(sqlite_io)?;
+    let root = private_fs::verify_private_workspace_lineage(private_root).map_err(sqlite_io)?;
+    let parent = private_fs::open_private_sqlite_parent(parent_path).map_err(sqlite_io)?;
+    let mut sidecars = Vec::with_capacity(3);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        let existed = match fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                private_fs::verify_private_child_file(&parent, &sidecar).map_err(sqlite_io)?;
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(sqlite_io(error)),
+        };
+        sidecars.push((sidecar, existed));
+    }
+    let wal_authority = if prepare_wal_sidecars {
+        Some(private_fs::prepare_private_sqlite_wal_sidecars(&parent, path).map_err(sqlite_io)?)
+    } else {
+        None
+    };
+    private_fs::ensure_private_sqlite_file(&root, &parent, parent_path, path).map_err(sqlite_io)?;
+    let database_was_empty = fs::metadata(path).map_err(sqlite_io)?.len() == 0;
+    let connection = rusqlite::Connection::open_with_flags(path, flags)?;
+    let initialize_result = initialize(&connection, database_was_empty);
+    let sidecar_result = if let Some(authority) = wal_authority {
+        authority
+            .verify_current()
+            .map_err(sqlite_io)
+            .and_then(|()| {
+                let (journal, existed) = &sidecars[0];
+                match fs::symlink_metadata(journal) {
+                    Ok(_) if *existed => Ok(()),
+                    Ok(_) => private_fs::secure_new_private_child_file(&parent, journal)
+                        .map_err(sqlite_io),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(sqlite_io(error)),
+                }
+            })
+    } else {
+        let mut result = Ok(());
+        for (sidecar, existed) in sidecars {
+            let checked = match fs::symlink_metadata(&sidecar) {
+                Ok(_) if existed => Ok(()),
+                Ok(_) => private_fs::secure_new_private_child_file(&parent, &sidecar),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = checked {
+                result = Err(sqlite_io(error));
+                break;
+            }
+        }
+        result
+    };
+    sidecar_result?;
+    initialize_result?;
+    Ok(connection)
+}
+
+pub(crate) fn open_wallet_connection_read_only(
+    path: &Path,
+) -> Result<rusqlite::Connection, rusqlite::Error> {
+    open_authorized_wallet_connection(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        true,
+        |connection, _| {
+            connection.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
+            // A read-only WAL connection can lazily create `-shm` on its
+            // first schema read. Force that open while the pre-created exact
+            // WAL/SHM objects are still retained by private authority.
+            let mut statement = connection.prepare("PRAGMA table_list")?;
+            let mut rows = statement.query([])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        },
+    )
+}
+
+/// Open the wallet database for launch-time session listing without allowing
+/// SQLite to create a journal, WAL, or shared-memory sidecar. `immutable=1`
+/// keeps even a read-only WAL connection from creating `-shm`; `query_only`
+/// adds a second, connection-local refusal for accidental write statements.
+///
+/// This is intentionally separate from [`open_wallet_connection_read_only`].
+/// Runtime readers must observe committed WAL frames while a scan writer is
+/// live. Launch-time listing runs before recovery authority is acquired and
+/// may accept a slightly stale displayed height rather than touch recovery
+/// storage.
+fn open_wallet_connection_for_listing(
+    path: &Path,
+) -> Result<rusqlite::Connection, rusqlite::Error> {
+    fn sqlite_io(error: std::io::Error) -> rusqlite::Error {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+    }
+
+    let parent_path = path.parent().ok_or_else(|| {
+        sqlite_io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wallet database has no parent directory",
+        ))
+    })?;
+    let private_root = private_root_for_wallet_database(path).map_err(sqlite_io)?;
+    let _open_guard = private_fs::lock_private_sqlite_open(path).map_err(sqlite_io)?;
+    let root = private_fs::verify_private_workspace_lineage(private_root).map_err(sqlite_io)?;
+    let parent = private_fs::open_private_sqlite_parent(parent_path).map_err(sqlite_io)?;
+    private_fs::ensure_private_sqlite_file(&root, &parent, parent_path, path).map_err(sqlite_io)?;
+
+    let canonical_path = fs::canonicalize(path).map_err(sqlite_io)?;
+    let path = canonical_path
+        .to_str()
+        .ok_or_else(|| rusqlite::Error::InvalidPath(canonical_path.clone()))?;
+    let mut uri = String::with_capacity(path.len() + 32);
+    uri.push_str("file:");
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':' | b'\\')
+        {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+
+    let connection = rusqlite::Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    connection.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
+    Ok(connection)
+}
+
 /// Opens a raw SQLite connection with the tuning Argos requires:
 /// WAL journal mode, `synchronous=NORMAL`, and a busy timeout.
 ///
@@ -761,15 +914,55 @@ const WALLET_DB_BUSY_TIMEOUT_SECS: u64 = 5;
 /// `synchronous=FULL`, no busy timeout). All production opens of `wallet.sqlite`
 /// should come through [`open_wallet_db`] instead.
 fn open_tuned_wallet_connection(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
-    let conn = rusqlite::Connection::open(path)?;
-    // `WalletDb::from_connection` requires the array module to be loaded.
-    rusqlite::vtab::array::load_module(&conn)?;
-    conn.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
-    // `PRAGMA journal_mode` returns the resulting mode as a row, so it needs
-    // the query form rather than `pragma_update`.
-    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    Ok(conn)
+    open_authorized_wallet_connection(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        true,
+        |conn, database_was_empty| {
+            // `WalletDb::from_connection` requires the array module to be loaded.
+            rusqlite::vtab::array::load_module(conn)?;
+            conn.busy_timeout(std::time::Duration::from_secs(WALLET_DB_BUSY_TIMEOUT_SECS))?;
+            let journal_mode: String =
+                conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+            if !journal_mode.eq_ignore_ascii_case("wal") {
+                if !database_was_empty {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "a non-empty private wallet database is not already in WAL mode",
+                        ),
+                    )));
+                }
+                // SQLite uses a rollback-journal transaction to enter WAL
+                // mode. This is allowed only while the newly staged database
+                // is still empty, before it can contain wallet material. WAL
+                // and SHM are already private and retained before the change.
+                let resulting_mode =
+                    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                if !resulting_mode.eq_ignore_ascii_case("wal") {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "SQLite refused WAL mode for the private wallet database and remained in {resulting_mode} mode"
+                            ),
+                        ),
+                    )));
+                }
+            }
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            // A zero-byte database can enter WAL mode without opening its WAL
+            // object. Exhausting a schema read forces the pager to open and
+            // retain the exact pre-created WAL/SHM files before Argos releases
+            // its no-delete authority handles.
+            let mut statement = conn.prepare("PRAGMA table_list")?;
+            let mut rows = statement.query([])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        },
+    )
 }
 
 /// Opens a wallet database with the connection tuning from
@@ -876,31 +1069,56 @@ pub struct IncompleteSession {
     pub match_coordinates: Option<crate::address_match_recovery::MatchCoordinates>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transparent_scan: Option<TransparentScanConfig>,
+    /// This workspace cannot be resumed from its persisted state and must be
+    /// recreated by rescanning from the original recovery material.
+    #[serde(default)]
+    pub requires_rescan: bool,
+    /// The workspace predates (or fails) the create-time private-storage
+    /// lineage boundary. No file inside it was parsed to construct this row.
+    #[serde(default)]
+    pub legacy_untrusted: bool,
 }
 
 fn session_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(SESSION_FILE_NAME)
 }
 
+fn verify_existing_workspace_authority(
+    workspace_root: &Path,
+) -> std::io::Result<(private_fs::PrivateRootLineageLease, fs::File)> {
+    let private_root = workspace_root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace root does not have the expected private-root/birthday/scope layout",
+            )
+        })?;
+    let root = private_fs::verify_private_workspace_lineage(private_root)?;
+    let parent = private_fs::open_private_sqlite_parent(workspace_root)?;
+    let database = workspace_root.join("wallet.sqlite");
+    private_fs::ensure_private_sqlite_file(&root, &parent, workspace_root, &database)?;
+    Ok((root, parent))
+}
+
 /// Atomic write: write to `<path>.tmp` then rename. Best-effort guarantee
 /// that a crash mid-write does not leave a half-written sidecar.
-pub fn write_session_metadata(workspace_root: &Path, meta: &SessionMetadata) -> ZeckResult<()> {
-    fs::create_dir_all(workspace_root).map_err(|err| {
-        ZeckError::Storage(format!("creating {}: {err}", workspace_root.display()))
-    })?;
-    let final_path = session_path(workspace_root);
-    let tmp_path = workspace_root.join(format!("{SESSION_FILE_NAME}.tmp"));
-    let bytes =
-        serde_json::to_vec_pretty(meta).map_err(|err| ZeckError::Serialization(err.to_string()))?;
-    write_private_file(&tmp_path, &bytes)?;
-    fs::rename(&tmp_path, &final_path).map_err(|err| {
+pub(crate) fn write_session_metadata(
+    workspace_root: &Path,
+    meta: &SessionMetadata,
+) -> ZeckResult<()> {
+    let (_root, parent) = verify_existing_workspace_authority(workspace_root).map_err(|err| {
         ZeckError::Storage(format!(
-            "renaming {} -> {}: {err}",
-            tmp_path.display(),
-            final_path.display(),
+            "verifying workspace authority {}: {err}",
+            workspace_root.display()
         ))
     })?;
-    Ok(())
+    let final_path = session_path(workspace_root);
+    let bytes =
+        serde_json::to_vec_pretty(meta).map_err(|err| ZeckError::Serialization(err.to_string()))?;
+    private_fs::write_private_file_atomic_in_parent(&parent, &final_path, &bytes)
+        .map_err(|err| ZeckError::Storage(format!("writing {}: {err}", final_path.display())))
 }
 
 /// Read the sidecar at `workspace_root/session.json`. Returns `Ok(None)` if
@@ -910,7 +1128,13 @@ pub fn write_session_metadata(workspace_root: &Path, meta: &SessionMetadata) -> 
 /// shows up as legacy.
 pub fn read_session_metadata(workspace_root: &Path) -> ZeckResult<Option<SessionMetadata>> {
     let path = session_path(workspace_root);
-    let bytes = match fs::read(&path) {
+    let (_root, parent) = verify_existing_workspace_authority(workspace_root).map_err(|err| {
+        ZeckError::Storage(format!(
+            "verifying workspace authority {}: {err}",
+            workspace_root.display()
+        ))
+    })?;
+    let bytes = match private_fs::read_private_child_file(&parent, &path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -925,7 +1149,10 @@ pub fn read_session_metadata(workspace_root: &Path) -> ZeckResult<Option<Session
 
 /// Mark an existing in-progress session as completed. Idempotent: if the
 /// sidecar is missing or unparseable, this is a no-op.
-pub fn mark_session_completed(workspace_root: &Path, now_epoch_seconds: i64) -> ZeckResult<()> {
+pub(crate) fn mark_session_completed(
+    workspace_root: &Path,
+    now_epoch_seconds: i64,
+) -> ZeckResult<()> {
     let Some(mut meta) = read_session_metadata(workspace_root)? else {
         return Ok(());
     };
@@ -936,7 +1163,10 @@ pub fn mark_session_completed(workspace_root: &Path, now_epoch_seconds: i64) -> 
 
 /// Update `last_run_at` on an existing sidecar. Best-effort — any error is
 /// returned to the caller, who is expected to swallow it on the hot path.
-pub fn touch_session_last_run(workspace_root: &Path, now_epoch_seconds: i64) -> ZeckResult<()> {
+pub(crate) fn touch_session_last_run(
+    workspace_root: &Path,
+    now_epoch_seconds: i64,
+) -> ZeckResult<()> {
     let Some(mut meta) = read_session_metadata(workspace_root)? else {
         return Ok(());
     };
@@ -944,12 +1174,10 @@ pub fn touch_session_last_run(workspace_root: &Path, now_epoch_seconds: i64) -> 
     write_session_metadata(workspace_root, &meta)
 }
 
-/// Walk `data_dir` and return any workspaces whose sidecar reports
-/// `completed: false` or that have no readable sidecar (legacy). The latter
-/// is treated as incomplete because we can't prove otherwise without the seed.
-///
-/// This function never opens a wallet for writing — the read-only summary
-/// query does not need the seed.
+/// Walk `data_dir` and return resumable incomplete workspaces plus preserved
+/// legacy workspaces that require a fresh scan. A candidate that fails the
+/// create-time lineage boundary is described only from validated path
+/// components; its session metadata and wallet database are never parsed.
 pub fn list_incomplete_sessions(data_dir: &Path) -> ZeckResult<Vec<IncompleteSession>> {
     let mut rows = Vec::new();
     let networks = match fs::read_dir(data_dir) {
@@ -990,12 +1218,7 @@ pub fn list_incomplete_sessions(data_dir: &Path) -> ZeckResult<Vec<IncompleteSes
             }
             // Per-wallet directory is named `workspace-<sha256>`. Skip
             // anything else so we don't try to read sibling files.
-            if !workspace_entry
-                .file_name()
-                .to_str()
-                .map(|s| s.starts_with("workspace-"))
-                .unwrap_or(false)
-            {
+            if !is_workspace_id_segment(&workspace_entry.file_name()) {
                 continue;
             }
             let Ok(birthdays) = fs::read_dir(workspace_entry.path()) else {
@@ -1042,6 +1265,16 @@ fn parse_birthday_segment(name: &std::ffi::OsStr) -> Option<u32> {
     s.strip_prefix("birthday-")?.parse::<u32>().ok()
 }
 
+fn is_workspace_id_segment(name: &std::ffi::OsStr) -> bool {
+    let Some(id) = name
+        .to_str()
+        .and_then(|name| name.strip_prefix("workspace-"))
+    else {
+        return false;
+    };
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Build one row for the launch-time list. Returns `None` when the candidate
 /// workspace is complete, or when the wallet database is missing/unreadable
 /// (i.e. there is nothing to resume).
@@ -1050,10 +1283,28 @@ fn try_build_incomplete_row(
     network: ZeckNetwork,
     birthday: u32,
 ) -> Option<IncompleteSession> {
-    let wallet_db_path = workspace_path.join("wallet.sqlite");
-    if !wallet_db_path.exists() {
+    let keying = parse_workspace_keying(workspace_path).ok()?;
+    if keying.network != network || keying.birthday != birthday {
         return None;
     }
+
+    if verify_existing_workspace_authority(workspace_path).is_err() {
+        return Some(IncompleteSession {
+            workspace_path: workspace_path.to_owned(),
+            label: "Legacy workspace — rescan required".to_owned(),
+            network: keying.network,
+            birthday: keying.birthday,
+            synced_to_height: None,
+            target_height: None,
+            last_run_at_epoch_seconds: None,
+            match_coordinates: None,
+            transparent_scan: keying.transparent_scan,
+            requires_rescan: true,
+            legacy_untrusted: true,
+        });
+    }
+
+    let wallet_db_path = workspace_path.join("wallet.sqlite");
 
     let meta = read_session_metadata(workspace_path).ok().flatten();
     if meta.as_ref().map(|m| m.completed).unwrap_or(false) {
@@ -1081,16 +1332,18 @@ fn try_build_incomplete_row(
         target_height,
         last_run_at_epoch_seconds: last_run_at,
         match_coordinates,
-        // Scope in the hashed workspace path is authoritative, including when
-        // an older session has no sidecar or the sidecar is incomplete.
-        transparent_scan: parse_workspace_keying(workspace_path)
-            .ok()?
-            .transparent_scan,
+        // Scope in the hashed workspace path is authoritative.
+        transparent_scan: keying.transparent_scan,
+        requires_rescan: false,
+        legacy_untrusted: false,
     })
 }
 
 fn read_synced_height(wallet_db_path: &Path, network: ZeckNetwork) -> Option<u32> {
-    let wallet_db = open_wallet_db(wallet_db_path, consensus_network(network)).ok()?;
+    let connection = open_wallet_connection_for_listing(wallet_db_path).ok()?;
+    rusqlite::vtab::array::load_module(&connection).ok()?;
+    let wallet_db =
+        WalletDb::from_connection(connection, consensus_network(network), SystemClock, OsRng);
     let summary = wallet_db
         .get_wallet_summary(ConfirmationsPolicy::MIN)
         .ok()
@@ -1380,6 +1633,19 @@ mod regtest_params_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use secrecy::{ExposeSecret, SecretString};
+    use zip32::fingerprint::SeedFingerprint;
+
+    use super::*;
+    use crate::derivation::mnemonic_seed;
+    use crate::key_source::ImportedKeySource;
+    use crate::models::RuntimeScanConfig;
+
     #[test]
     fn append_private_file_writes_whole_terminated_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -1389,16 +1655,109 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}\n{\"b\":2}\n");
     }
 
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    fn private_test_directory(tempdir: &tempfile::TempDir) -> PathBuf {
+        let private_root = tempdir.path().join("publication/private-root");
+        let workspace = private_root.join("birthday-1/auto-gap-20");
+        let database = workspace.join("wallet.sqlite");
+        crate::private_fs::ensure_private_workspace_lineage(&private_root, &workspace, &database)
+            .expect("lineaged private test workspace");
+        workspace
+    }
 
-    use secrecy::{ExposeSecret, SecretString};
-    use zip32::fingerprint::SeedFingerprint;
+    #[test]
+    fn private_workspace_file_authority_publishes_inside_verified_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = private_test_directory(&dir);
+        let authority = PrivateWorkspaceFileAuthority::acquire(&workspace).unwrap();
+        let report = workspace.join("reports/recovery.json");
 
-    use super::*;
-    use crate::derivation::mnemonic_seed;
-    use crate::key_source::ImportedKeySource;
-    use crate::models::RuntimeScanConfig;
+        authority
+            .write_private_file(&report, b"private recovery report")
+            .unwrap();
+
+        assert_eq!(fs::read(&report).unwrap(), b"private recovery report");
+        authority.write_private_file(&report, b"updated").unwrap();
+        assert_eq!(fs::read(&report).unwrap(), b"updated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_workspace_file_authority_refuses_reused_permissive_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = private_test_directory(&dir);
+        let authority = PrivateWorkspaceFileAuthority::acquire(&workspace).unwrap();
+        let report = workspace.join("recovery.json");
+        fs::write(&report, b"legacy bytes").unwrap();
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = authority
+            .write_private_file(&report, b"new bytes")
+            .expect_err("permissive reuse must remain untrusted")
+            .to_string();
+
+        assert!(error.contains("private export"), "{error}");
+        assert_eq!(fs::read(&report).unwrap(), b"legacy bytes");
+        assert_eq!(
+            fs::metadata(&report).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_workspace_file_authority_refuses_workspace_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = private_test_directory(&dir);
+        let authority = PrivateWorkspaceFileAuthority::acquire(&workspace).unwrap();
+        let private_root = workspace.parent().unwrap().parent().unwrap();
+        let displaced = dir.path().join("displaced-private-root");
+        fs::rename(private_root, &displaced).unwrap();
+        crate::private_fs::create_private_dir_all(&workspace).unwrap();
+        let report = workspace.join("recovery.json");
+
+        authority
+            .write_private_file(&report, b"must not publish")
+            .expect_err("the authenticated workspace pathname was replaced");
+
+        assert!(!report.exists());
+    }
+
+    fn file_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+        fn visit(
+            root: &Path,
+            current: &Path,
+            files: &mut BTreeMap<PathBuf, (Vec<u8>, SystemTime)>,
+        ) {
+            let mut entries = fs::read_dir(current)
+                .expect("read snapshot directory")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect snapshot directory");
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+                if metadata.is_dir() {
+                    visit(root, &path, files);
+                } else if metadata.is_file() {
+                    files.insert(
+                        path.strip_prefix(root)
+                            .expect("snapshot relative path")
+                            .to_owned(),
+                        (
+                            fs::read(&path).expect("snapshot file bytes"),
+                            metadata.modified().expect("snapshot modification time"),
+                        ),
+                    );
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
 
     fn config(
         seed: &str,
@@ -1434,122 +1793,6 @@ mod tests {
                               useful legal winner thank year wave sausage \
                               worth useful legal winner thank year wave \
                               sausage worth title";
-
-    fn rebuild_fixture() -> (tempfile::TempDir, RecoveryWorkspace, [u8; 64]) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = runtime_config(SEED);
-        cfg.data_dir = dir.path().to_owned();
-        let workspace = RecoveryWorkspace::from_runtime(&cfg).unwrap();
-        let seed: [u8; 64] = mnemonic_seed(&SecretString::new(SEED.to_owned()))
-            .unwrap()
-            .expose_secret()
-            .as_slice()
-            .try_into()
-            .unwrap();
-        workspace.initialize(ZeckNetwork::Mainnet, &seed).unwrap();
-        (dir, workspace, seed)
-    }
-
-    fn rebuild_leftovers(workspace: &RecoveryWorkspace) -> Vec<String> {
-        fs::read_dir(workspace.root())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains("rebuild"))
-            .collect()
-    }
-
-    /// Review nit 3 on #279: a rebuild that is abandoned (cancelled, or an
-    /// import failed) must not leave a second copy of the viewing keys on
-    /// disk for a user who never resumes.
-    #[test]
-    fn an_abandoned_wallet_db_rebuild_removes_its_files() {
-        let (_dir, workspace, seed) = rebuild_fixture();
-        let rebuild = workspace
-            .begin_wallet_db_rebuild(ZeckNetwork::Mainnet, &seed)
-            .unwrap();
-        assert!(rebuild.path().exists());
-        drop(rebuild);
-        assert_eq!(rebuild_leftovers(&workspace), Vec::<String>::new());
-        assert!(
-            workspace.wallet_db_path().exists(),
-            "the live DB is untouched"
-        );
-    }
-
-    /// Review nit 2 on #279: when the old database cannot be folded to a
-    /// single file (another connection holds it), the commit must not go
-    /// ahead and leave the old `-wal` next to the new file, where a crash
-    /// would replay it. It fails clearly, keeps the old database, and
-    /// discards the rebuild.
-    #[test]
-    fn a_commit_while_the_old_wallet_db_is_held_open_keeps_it_and_says_why() {
-        let (_dir, workspace, seed) = rebuild_fixture();
-        let holder = open_wallet_db(
-            workspace.wallet_db_path(),
-            consensus_network(ZeckNetwork::Mainnet),
-        )
-        .unwrap();
-        // A reader mid-transaction, as the resume list's summary query is.
-        let reader = rusqlite::Connection::open(workspace.wallet_db_path()).unwrap();
-        reader.execute_batch("BEGIN").unwrap();
-        let _: i64 = reader
-            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
-            .unwrap();
-        let before = fs::read(workspace.wallet_db_path()).unwrap();
-
-        let rebuild = workspace
-            .begin_wallet_db_rebuild(ZeckNetwork::Mainnet, &seed)
-            .unwrap();
-        let err = workspace
-            .commit_wallet_db_rebuild(rebuild)
-            .expect_err("the commit must refuse while the old database is open");
-        let message = err.to_string();
-        assert!(
-            message.contains("in use") && message.contains("unchanged"),
-            "the error must say what happened: {message}"
-        );
-        assert_eq!(fs::read(workspace.wallet_db_path()).unwrap(), before);
-        assert_eq!(rebuild_leftovers(&workspace), Vec::<String>::new());
-        drop(reader);
-        drop(holder);
-    }
-
-    /// Review nit 1 on #279: a sharing violation (Windows, while an
-    /// indexer or the resume list holds the file) is retried with backoff;
-    /// anything else, or a violation that outlasts the retries, is returned.
-    #[test]
-    fn transient_file_errors_are_retried_a_bounded_number_of_times() {
-        use std::io::{Error, ErrorKind};
-        let delays = [std::time::Duration::from_millis(1); 3];
-
-        let mut calls = 0;
-        let result = retry_transient(&delays, is_sharing_violation, || {
-            calls += 1;
-            if calls < 3 {
-                Err(Error::from(ErrorKind::PermissionDenied))
-            } else {
-                Ok(calls)
-            }
-        });
-        assert_eq!(result.unwrap(), 3);
-
-        let mut calls = 0;
-        let result: std::io::Result<()> = retry_transient(&delays, is_sharing_violation, || {
-            calls += 1;
-            Err(Error::from(ErrorKind::PermissionDenied))
-        });
-        assert!(result.is_err());
-        assert_eq!(calls, 4, "one attempt plus one per delay, then give up");
-
-        let mut calls = 0;
-        let result: std::io::Result<()> = retry_transient(&delays, is_sharing_violation, || {
-            calls += 1;
-            Err(Error::from(ErrorKind::NotFound))
-        });
-        assert!(result.is_err());
-        assert_eq!(calls, 1, "a non-transient error is not retried");
-    }
 
     #[test]
     fn identical_args_produce_identical_workspace_path() {
@@ -1718,6 +1961,7 @@ mod tests {
     #[test]
     fn session_metadata_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let root = private_test_directory(&dir);
         let meta = SessionMetadata::new_in_progress(
             "Old Zecwallet".to_owned(),
             ZeckNetwork::Mainnet,
@@ -1725,8 +1969,8 @@ mod tests {
             Some(3_400_000),
             1_715_000_000,
         );
-        write_session_metadata(dir.path(), &meta).expect("write");
-        let read = read_session_metadata(dir.path())
+        write_session_metadata(&root, &meta).expect("write");
+        let read = read_session_metadata(&root)
             .expect("read")
             .expect("present");
         assert_eq!(read, meta);
@@ -1735,19 +1979,23 @@ mod tests {
     #[test]
     fn read_session_metadata_returns_none_for_missing_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(read_session_metadata(dir.path()).expect("read").is_none());
+        let root = private_test_directory(&dir);
+        assert!(read_session_metadata(&root).expect("read").is_none());
     }
 
     #[test]
     fn read_session_metadata_returns_none_for_corrupt_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join(SESSION_FILE_NAME), b"not json").expect("write");
-        assert!(read_session_metadata(dir.path()).expect("read").is_none());
+        let root = private_test_directory(&dir);
+        crate::private_fs::write_private_file(&root.join(SESSION_FILE_NAME), b"not json")
+            .expect("write private corrupt metadata");
+        assert!(read_session_metadata(&root).expect("read").is_none());
     }
 
     #[test]
     fn mark_session_completed_flips_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let root = private_test_directory(&dir);
         let meta = SessionMetadata::new_in_progress(
             "x".to_owned(),
             ZeckNetwork::Testnet,
@@ -1755,9 +2003,9 @@ mod tests {
             None,
             1,
         );
-        write_session_metadata(dir.path(), &meta).expect("write");
-        mark_session_completed(dir.path(), 2).expect("mark");
-        let read = read_session_metadata(dir.path())
+        write_session_metadata(&root, &meta).expect("write");
+        mark_session_completed(&root, 2).expect("mark");
+        let read = read_session_metadata(&root)
             .expect("read")
             .expect("present");
         assert!(read.completed);
@@ -1878,7 +2126,7 @@ mod tests {
     }
 
     #[test]
-    fn list_incomplete_sessions_filters_completed_and_listsboth_legacy_and_marked() {
+    fn list_incomplete_sessions_filters_completed_and_lists_both_legacy_and_marked() {
         let data_dir = tempfile::tempdir().expect("tempdir");
         // Workspace 1: incomplete with sidecar.
         let cfg1 = RuntimeScanConfig {
@@ -1894,11 +2142,7 @@ mod tests {
             label: String::new(),
         };
         let ws1 = RecoveryWorkspace::from_runtime(&cfg1).unwrap();
-        std::fs::create_dir_all(ws1.root()).unwrap();
-        // Stand in for wallet.sqlite — we just need the file to exist for
-        // the listing to consider this dir; reading the summary will fail
-        // gracefully and fall back to None.
-        std::fs::write(ws1.root().join("wallet.sqlite"), b"").unwrap();
+        ws1.ensure_private_lineage().unwrap();
         write_session_metadata(
             ws1.root(),
             &SessionMetadata::new_in_progress(
@@ -1925,7 +2169,7 @@ mod tests {
             label: String::new(),
         };
         let ws2 = RecoveryWorkspace::from_runtime(&cfg2).unwrap();
-        std::fs::create_dir_all(ws2.root()).unwrap();
+        super::create_private_dir_all(ws2.root()).unwrap();
         std::fs::write(ws2.root().join("wallet.sqlite"), b"").unwrap();
 
         // Workspace 3: completed — must be filtered out.
@@ -1942,8 +2186,7 @@ mod tests {
             label: String::new(),
         };
         let ws3 = RecoveryWorkspace::from_runtime(&cfg3).unwrap();
-        std::fs::create_dir_all(ws3.root()).unwrap();
-        std::fs::write(ws3.root().join("wallet.sqlite"), b"").unwrap();
+        ws3.ensure_private_lineage().unwrap();
         let mut completed = SessionMetadata::new_in_progress(
             "done".to_owned(),
             ZeckNetwork::Mainnet,
@@ -1958,15 +2201,200 @@ mod tests {
         assert_eq!(rows.len(), 2, "expected ws1 and ws2, got {rows:?}");
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert!(labels.contains(&"labeled scan"));
-        assert!(labels.contains(&"(unlabeled scan)"));
+        assert!(labels.contains(&"Legacy workspace — rescan required"));
+        let legacy = rows.iter().find(|row| row.legacy_untrusted).unwrap();
+        assert!(legacy.requires_rescan);
+        assert_eq!(legacy.synced_to_height, None);
+        assert_eq!(legacy.target_height, None);
         // Ordering: labeled scan has last_run_at=100, legacy has None — labeled first.
         assert_eq!(rows[0].label, "labeled scan");
+    }
+
+    #[test]
+    fn listing_a_trusted_workspace_does_not_mutate_its_files() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let cfg = RuntimeScanConfig {
+            key_source: Arc::new(SeedKeySource::new(SecretString::new(SEED.to_owned()))),
+            birthday: 3_280_000,
+            num_accounts: None,
+            gap_limit: 20,
+            transparent_scan: None,
+            lightwalletd_url: "https://example.invalid:443".to_owned(),
+            confirmation_sources: Vec::new(),
+            data_dir: data_dir.path().to_owned(),
+            network: ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        let workspace = RecoveryWorkspace::from_runtime(&cfg).unwrap();
+        workspace.ensure_private_lineage().unwrap();
+        let connection =
+            rusqlite::Connection::open(workspace.wallet_db_path()).expect("open staged database");
+        connection
+            .execute_batch("CREATE TABLE listing_sentinel(value BLOB); INSERT INTO listing_sentinel VALUES (x'010203');")
+            .expect("write valid SQLite fixture");
+        drop(connection);
+        write_session_metadata(
+            workspace.root(),
+            &SessionMetadata::new_in_progress(
+                "trusted scan".to_owned(),
+                ZeckNetwork::Mainnet,
+                3_280_000,
+                Some(3_500_000),
+                100,
+            ),
+        )
+        .unwrap();
+
+        let before = file_tree_snapshot(workspace.private_root());
+        let rows = list_incomplete_sessions(data_dir.path()).expect("list");
+        let after = file_tree_snapshot(workspace.private_root());
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "trusted scan");
+        assert!(!rows[0].legacy_untrusted);
+        assert_eq!(
+            after, before,
+            "listing must not create or modify recovery files"
+        );
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = workspace.wallet_db_path().as_os_str().to_owned();
+            sidecar.push(suffix);
+            assert!(!PathBuf::from(sidecar).exists(), "listing created {suffix}");
+        }
+    }
+
+    #[test]
+    fn listing_does_not_recreate_a_missing_trusted_database() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = runtime_config(SEED);
+        cfg.data_dir = data_dir.path().to_owned();
+        let workspace = RecoveryWorkspace::from_runtime(&cfg).unwrap();
+        workspace.ensure_private_lineage().unwrap();
+        fs::remove_file(workspace.wallet_db_path()).expect("remove staged database");
+        let before = file_tree_snapshot(workspace.private_root());
+
+        let rows = list_incomplete_sessions(data_dir.path()).expect("list");
+        let after = file_tree_snapshot(workspace.private_root());
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].legacy_untrusted);
+        assert!(!workspace.wallet_db_path().exists());
+        assert_eq!(
+            after, before,
+            "listing must leave lineage markers unchanged"
+        );
+    }
+
+    #[test]
+    fn listing_reads_an_initialized_trusted_workspace_without_mutation() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = runtime_config(SEED);
+        cfg.data_dir = data_dir.path().to_owned();
+        let workspace = RecoveryWorkspace::from_runtime(&cfg).unwrap();
+        let seed = mnemonic_seed(&SecretString::new(SEED.to_owned())).expect("derive seed");
+        workspace
+            .initialize(ZeckNetwork::Mainnet, seed.expose_secret())
+            .expect("initialize trusted wallet");
+        write_session_metadata(
+            workspace.root(),
+            &SessionMetadata::new_in_progress(
+                "initialized trusted scan".to_owned(),
+                ZeckNetwork::Mainnet,
+                cfg.birthday,
+                Some(cfg.birthday + 100),
+                123,
+            ),
+        )
+        .unwrap();
+        let before = file_tree_snapshot(workspace.private_root());
+
+        let rows = list_incomplete_sessions(data_dir.path()).expect("list initialized workspace");
+        let after = file_tree_snapshot(workspace.private_root());
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "initialized trusted scan");
+        assert!(!rows[0].requires_rescan);
+        assert!(!rows[0].legacy_untrusted);
+        assert_eq!(after, before);
     }
 
     #[test]
     fn list_incomplete_sessions_empty_for_missing_data_dir() {
         let rows = list_incomplete_sessions(Path::new("/tmp/zeck-nonexistent-zzz")).expect("list");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn untrusted_legacy_workspace_is_listed_for_rescan_without_disk_claims() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let workspace = data_dir
+            .path()
+            .join("mainnet")
+            .join("workspace-deadbeefdeadbeefdeadbeefdeadbeef")
+            .join("birthday-3280000")
+            .join("accounts-1-transparent-7-3-both");
+        std::fs::create_dir_all(&workspace).expect("legacy workspace");
+        std::fs::write(
+            workspace.join(SESSION_FILE_NAME),
+            br#"{
+                "schema_version": 1,
+                "label": "must not be trusted",
+                "network": "mainnet",
+                "birthday": 1,
+                "target_height": 9999999,
+                "last_run_at_epoch_seconds": 42,
+                "completed": false
+            }"#,
+        )
+        .expect("legacy session metadata");
+        std::fs::write(
+            workspace.join("wallet.sqlite"),
+            b"must not be parsed as a wallet database",
+        )
+        .expect("legacy wallet database");
+
+        let before = file_tree_snapshot(data_dir.path());
+        let rows = list_incomplete_sessions(data_dir.path()).expect("list");
+        let after = file_tree_snapshot(data_dir.path());
+        assert_eq!(
+            rows.len(),
+            1,
+            "the preserved legacy workspace needs guidance"
+        );
+        assert_eq!(
+            after, before,
+            "legacy listing must not touch untrusted bytes"
+        );
+        let row = serde_json::to_value(&rows[0]).expect("serialize row");
+        assert_eq!(row["requires_rescan"], true);
+        assert_eq!(row["legacy_untrusted"], true);
+        assert_eq!(row["label"], "Legacy workspace — rescan required");
+        assert_eq!(row["network"], "mainnet");
+        assert_eq!(row["birthday"], 3_280_000);
+        assert_eq!(row["synced_to_height"], serde_json::Value::Null);
+        assert_eq!(row["target_height"], serde_json::Value::Null);
+        assert_eq!(row["last_run_at_epoch_seconds"], serde_json::Value::Null);
+        assert_eq!(row["match_coordinates"], serde_json::Value::Null);
+        assert_eq!(row["transparent_scan"]["index_start"], 7);
+        assert_eq!(row["transparent_scan"]["index_count"], 3);
+        assert_eq!(row["transparent_scan"]["include_change"], true);
+    }
+
+    #[test]
+    fn malformed_legacy_workspace_id_is_not_listed() {
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let workspace = data_dir
+            .path()
+            .join("mainnet")
+            .join("workspace-not-a-wallet-id")
+            .join("birthday-3280000")
+            .join("auto-gap-20");
+        std::fs::create_dir_all(&workspace).expect("legacy workspace");
+        std::fs::write(workspace.join("wallet.sqlite"), b"untrusted").unwrap();
+
+        assert!(list_incomplete_sessions(data_dir.path())
+            .expect("list")
+            .is_empty());
     }
 
     #[test]
@@ -2126,24 +2554,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn set_private_file_permissions_sets_mode_0o600_on_file() {
-        // R-W22: a freshly-created file inside the workspace gets `0o600`
-        // applied via `set_private_file_permissions`. Argos invokes this on
-        // wallet.sqlite / blocks.sqlite immediately after creation.
+    fn private_wallet_file_verification_rejects_insecure_reuse_without_repair() {
+        // R-W22: reused files must already be `0o600`; chmod cannot revoke a
+        // stale descriptor held by another process.
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("tempdir");
         let file = temp.path().join("private.bin");
         std::fs::write(&file, b"sensitive").expect("write file");
-        // Force a permissive starting mode so the test actually proves the
-        // tightening step ran, not just that defaults happened to be 0o600.
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
             .expect("seed perms");
-        super::set_private_file_permissions(&file).expect("set perms");
+        super::verify_private_wallet_file(&file).expect_err("permissive reuse must fail closed");
         let mode = std::fs::metadata(&file)
             .expect("metadata")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600, "file mode is {:o}", mode & 0o777);
+        assert_eq!(mode & 0o777, 0o644, "file mode is {:o}", mode & 0o777);
+        assert_eq!(std::fs::read(&file).unwrap(), b"sensitive");
     }
 
     #[cfg(unix)]
@@ -2153,6 +2579,7 @@ mod tests {
         // creation time, not rely solely on the 0o700 parent directory.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
+        let root = private_test_directory(&dir);
         let meta = SessionMetadata::new_in_progress(
             "perm check".to_owned(),
             ZeckNetwork::Mainnet,
@@ -2160,8 +2587,8 @@ mod tests {
             None,
             1,
         );
-        write_session_metadata(dir.path(), &meta).expect("write");
-        let mode = std::fs::metadata(dir.path().join(SESSION_FILE_NAME))
+        write_session_metadata(&root, &meta).expect("write");
+        let mode = std::fs::metadata(root.join(SESSION_FILE_NAME))
             .expect("metadata")
             .permissions()
             .mode();
@@ -2214,10 +2641,19 @@ mod tests {
     // pragmas itself. These tests pin that every wallet DB opened through
     // `open_tuned_wallet_connection` gets WAL + NORMAL + busy-timeout.
 
+    fn private_database_path(tempdir: &tempfile::TempDir) -> PathBuf {
+        let private_root = tempdir.path().join("publication/private-root");
+        let leaf = private_root.join("birthday-1/auto-gap-20");
+        let database = leaf.join("wallet.sqlite");
+        crate::private_fs::ensure_private_workspace_lineage(&private_root, &leaf, &database)
+            .expect("staged private test workspace");
+        database
+    }
+
     #[test]
     fn tuned_wallet_connection_sets_wal_normal_and_busy_timeout() {
         let tempdir = tempfile::tempdir().expect("temp dir");
-        let path = tempdir.path().join("wallet.sqlite");
+        let path = private_database_path(&tempdir);
 
         let conn = super::open_tuned_wallet_connection(&path).expect("open tuned connection");
 
@@ -2248,7 +2684,7 @@ mod tests {
     #[test]
     fn wal_mode_persists_for_untuned_readers() {
         let tempdir = tempfile::tempdir().expect("temp dir");
-        let path = tempdir.path().join("wallet.sqlite");
+        let path = private_database_path(&tempdir);
 
         let conn = super::open_tuned_wallet_connection(&path).expect("open tuned connection");
         drop(conn);
@@ -2263,11 +2699,256 @@ mod tests {
     #[test]
     fn open_wallet_db_succeeds_on_fresh_and_existing_files() {
         let tempdir = tempfile::tempdir().expect("temp dir");
-        let path = tempdir.path().join("wallet.sqlite");
+        let path = private_database_path(&tempdir);
         let network = super::consensus_network(crate::models::ZeckNetwork::Mainnet);
 
         let db = super::open_wallet_db(&path, network).expect("open fresh wallet db");
         drop(db);
         super::open_wallet_db(&path, network).expect("reopen existing wallet db");
+    }
+
+    #[test]
+    fn busy_wallet_rebuild_times_out_without_changing_the_live_database() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let root = path.parent().expect("workspace leaf").to_path_buf();
+        let private_root = root
+            .parent()
+            .and_then(Path::parent)
+            .expect("private root")
+            .to_path_buf();
+        let workspace = RecoveryWorkspace {
+            root,
+            private_root,
+            wallet_db_path: path.clone(),
+        };
+        let seed = [7u8; 64];
+        workspace
+            .initialize(ZeckNetwork::Mainnet, &seed)
+            .expect("initialize live wallet");
+        let live = super::open_tuned_wallet_connection(&path).expect("open live wallet");
+        live.execute_batch("CREATE TABLE live_only(value INTEGER);")
+            .expect("mark live database");
+        drop(live);
+
+        let rebuilt = workspace
+            .begin_wallet_db_rebuild(ZeckNetwork::Mainnet, &seed)
+            .expect("begin in-memory rebuild");
+        rebuilt
+            .connection
+            .execute_batch("CREATE TABLE rebuilt_only(value INTEGER);")
+            .expect("mark rebuilt database");
+
+        let blocker = super::open_tuned_wallet_connection(&path).expect("open lock holder");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold the WAL writer lock");
+        let error = workspace
+            .commit_wallet_db_rebuild_with_timeout(rebuilt, std::time::Duration::from_millis(50))
+            .expect_err("a busy destination must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        blocker.execute_batch("ROLLBACK").expect("release lock");
+        drop(blocker);
+
+        let live = super::open_tuned_wallet_connection(&path).expect("reopen unchanged wallet");
+        let live_only: i64 = live
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'live_only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rebuilt_only: i64 = live
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'rebuilt_only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let journal_mode: String = live
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(live_only, 1);
+        assert_eq!(rebuilt_only, 0);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    }
+
+    #[test]
+    fn nonempty_rollback_database_is_refused_without_a_wal_transition() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let raw = rusqlite::Connection::open(&path).expect("open rollback-mode fixture");
+        raw.execute_batch("CREATE TABLE rollback_fixture(value INTEGER);")
+            .expect("write rollback-mode fixture");
+        let mode: String = raw
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("read fixture journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        drop(raw);
+
+        let error = super::open_tuned_wallet_connection(&path)
+            .expect_err("nonempty rollback-mode databases must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("non-empty private wallet database is not already in WAL mode"),
+            "unexpected refusal: {error}"
+        );
+
+        let raw = rusqlite::Connection::open(&path).expect("reopen unchanged fixture");
+        let mode: String = raw
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("re-read fixture journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+    }
+
+    #[test]
+    fn listing_wallet_connection_is_immutable_and_query_only() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let writer = rusqlite::Connection::open(&path).expect("open fixture writer");
+        writer
+            .execute_batch(
+                "CREATE TABLE listing_guard(value INTEGER); INSERT INTO listing_guard VALUES (7);",
+            )
+            .expect("initialize fixture");
+        drop(writer);
+        let before = fs::read(&path).expect("database bytes before listing open");
+
+        let connection = super::open_wallet_connection_for_listing(&path)
+            .expect("open immutable listing connection");
+        let query_only: bool = connection
+            .pragma_query_value(None, "query_only", |row| row.get(0))
+            .expect("read query_only");
+        assert!(query_only);
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM listing_guard", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read fixture"),
+            7
+        );
+        assert!(connection
+            .execute("INSERT INTO listing_guard VALUES (8)", [])
+            .is_err());
+        drop(connection);
+
+        assert_eq!(fs::read(&path).unwrap(), before);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            assert!(
+                !PathBuf::from(sidecar).exists(),
+                "listing open created {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuned_wallet_connections_allow_a_concurrent_reader() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let writer = super::open_tuned_wallet_connection(&path).expect("open writer connection");
+        #[cfg(windows)]
+        {
+            let parent_path = path.parent().expect("database parent");
+            let parent = crate::private_fs::open_private_sqlite_parent(parent_path)
+                .expect("open retained private parent");
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_owned();
+                sidecar.push(suffix);
+                let sidecar = PathBuf::from(sidecar);
+                let replacement = sidecar.with_extension(format!("{suffix}.replacement"));
+                crate::private_fs::rename_child_file(&parent, &sidecar, &replacement)
+                    .expect_err("SQLite must keep its live WAL sidecar name pinned");
+                assert!(sidecar.exists());
+                assert!(!replacement.exists());
+            }
+        }
+        writer
+            .execute_batch(
+                "CREATE TABLE held_open(value INTEGER); INSERT INTO held_open VALUES (7);",
+            )
+            .expect("initialize through writer");
+
+        let reader = super::open_tuned_wallet_connection(&path)
+            .expect("open reader while writer connection remains live");
+        let value: i64 = reader
+            .query_row("SELECT value FROM held_open", [], |row| row.get(0))
+            .expect("read while writer remains live");
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn runtime_read_only_connection_preserves_private_wal_sidecars() {
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let writer = super::open_tuned_wallet_connection(&path).expect("open writer connection");
+        writer
+            .execute_batch(
+                "CREATE TABLE read_only_guard(value INTEGER); \
+                 INSERT INTO read_only_guard VALUES (7);",
+            )
+            .expect("initialize through writer");
+        drop(writer);
+
+        let reader = super::open_wallet_connection_read_only(&path)
+            .expect("open authenticated read-only connection");
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM read_only_guard", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read initialized wallet"),
+            7
+        );
+        drop(reader);
+
+        let parent =
+            crate::private_fs::open_private_sqlite_parent(path.parent().expect("database parent"))
+                .expect("open private database parent");
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.exists() {
+                crate::private_fs::verify_private_child_file(&parent, &sidecar)
+                    .expect("surviving read-only sidecar must remain exact-private");
+            }
+        }
+        super::open_tuned_wallet_connection(&path)
+            .expect("writer must reopen after authenticated read-only use");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_permissive_sqlite_sidecar_fails_before_connection_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let path = private_database_path(&tempdir);
+        let database_before = fs::metadata(&path).expect("database metadata before preflight");
+        let sidecar = path.with_file_name("wallet.sqlite-wal");
+        fs::write(&sidecar, b"must survive").unwrap();
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::open_tuned_wallet_connection(&path)
+            .expect_err("an insecure existing sidecar must fail before SQLite opens");
+
+        assert_eq!(fs::read(&sidecar).unwrap(), b"must survive");
+        assert_eq!(fs::metadata(&sidecar).unwrap().mode() & 0o7777, 0o644);
+        let database_after = fs::metadata(&path).expect("database remains after refusal");
+        assert_eq!(
+            (
+                database_after.dev(),
+                database_after.ino(),
+                database_after.len()
+            ),
+            (
+                database_before.dev(),
+                database_before.ino(),
+                database_before.len()
+            ),
+            "sidecar refusal must leave the staged database object unchanged"
+        );
     }
 }

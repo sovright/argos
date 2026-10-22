@@ -29,10 +29,10 @@
 
 use crate::{
     error::{ZeckError, ZeckResult},
-    p2p::wire::sha256d,
-    sprout::SproutPaymentAddress,
+    sprout::{sha256d_wipeable, SproutPaymentAddress},
     ZeckNetwork,
 };
+use zeroize::Zeroizing;
 
 const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -61,11 +61,11 @@ fn payment_address_prefix(network: ZeckNetwork) -> [u8; 2] {
 /// Base58 decode. No bignum dependency: the payloads are at most 70 bytes,
 /// so long multiplication over a byte buffer is both sufficient and easier
 /// to audit than pulling in an arbitrary-precision crate.
-fn base58_decode(s: &str) -> Option<Vec<u8>> {
+fn base58_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
     if s.is_empty() {
         return None;
     }
-    let mut out = vec![0u8; s.len()];
+    let mut out = Zeroizing::new(vec![0u8; s.len()]);
     for ch in s.bytes() {
         let mut carry = ALPHABET.iter().position(|c| *c == ch)? as u32;
         for byte in out.iter_mut().rev() {
@@ -82,13 +82,15 @@ fn base58_decode(s: &str) -> Option<Vec<u8>> {
     // significant byte of the buffer is padding from the fixed-size scratch.
     let leading_zeros = s.bytes().take_while(|c| *c == b'1').count();
     let first_significant = out.iter().position(|b| *b != 0).unwrap_or(out.len());
-    let mut result = vec![0u8; leading_zeros];
+    let result_len = leading_zeros.checked_add(out.len() - first_significant)?;
+    let mut result = Zeroizing::new(Vec::with_capacity(result_len));
+    result.resize(leading_zeros, 0);
     result.extend_from_slice(out.get(first_significant..)?);
     Some(result)
 }
 
 fn base58_encode(bytes: &[u8]) -> String {
-    let mut digits: Vec<u8> = Vec::with_capacity(bytes.len() * 2);
+    let mut digits = Zeroizing::new(Vec::<u8>::with_capacity(bytes.len() * 2));
     for byte in bytes {
         let mut carry = u32::from(*byte);
         for digit in digits.iter_mut() {
@@ -102,7 +104,12 @@ fn base58_encode(bytes: &[u8]) -> String {
         }
     }
 
-    let mut out = String::new();
+    // Base58 needs fewer than two characters per input byte. Reserve the
+    // complete output before writing the first character: this string can be
+    // an encoded spending key, and growing it would abandon an old heap
+    // allocation containing a prefix of that key.
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2).max(1));
+    let initial_capacity = out.capacity();
     for _ in bytes.iter().take_while(|b| **b == 0) {
         out.push('1');
     }
@@ -112,6 +119,7 @@ fn base58_encode(bytes: &[u8]) -> String {
     if out.is_empty() {
         out.push('1');
     }
+    debug_assert_eq!(out.capacity(), initial_capacity);
     out
 }
 
@@ -120,22 +128,26 @@ fn base58_encode(bytes: &[u8]) -> String {
 /// The checksum is what turns a mistyped key into an error rather than a
 /// silently wrong one — which for a recovery tool means a wrong address
 /// derived, no notes found, and no indication why.
-fn base58check_decode(s: &str) -> Option<Vec<u8>> {
-    let raw = base58_decode(s.trim())?;
+fn base58check_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let mut raw = base58_decode(s.trim())?;
     if raw.len() < 5 {
         return None;
     }
-    let (body, checksum) = raw.split_at(raw.len() - 4);
-    if sha256d(body).get(..4)? != checksum {
+    let body_len = raw.len() - 4;
+    let (body, checksum) = raw.split_at(body_len);
+    let expected = Zeroizing::new(sha256d_wipeable(body));
+    if expected.get(..4)? != checksum {
         return None;
     }
-    Some(body.to_vec())
+    raw.truncate(body_len);
+    Some(raw)
 }
 
 fn base58check_encode(prefix: [u8; 2], payload: &[u8]) -> String {
-    let mut body = prefix.to_vec();
+    let mut body = Zeroizing::new(Vec::with_capacity(2 + payload.len() + 4));
+    body.extend_from_slice(&prefix);
     body.extend_from_slice(payload);
-    let checksum = sha256d(&body);
+    let checksum = Zeroizing::new(sha256d_wipeable(&body));
     body.extend_from_slice(&checksum[..4]);
     base58_encode(&body)
 }
@@ -373,8 +385,8 @@ mod tests {
         ] {
             let encoded = base58_encode(&case);
             assert_eq!(
-                base58_decode(&encoded).expect("must decode"),
-                case,
+                base58_decode(&encoded).expect("must decode").as_slice(),
+                case.as_slice(),
                 "round trip failed for {case:02x?}"
             );
         }

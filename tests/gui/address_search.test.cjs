@@ -121,6 +121,32 @@ test("submits all scope fields, clears secrets, and renders an exact match", asy
   assert.match(el("address-search-limitation").textContent, /before making any network connection/);
 });
 
+test("the shared recovery lifecycle event clears address-search candidates", async () => {
+  const { el, fireDocument } = harness(async () => null);
+  fillValidForm(el);
+  const row = el("address-search-seeds").children[0];
+  fireDocument("argos:clear-transient-secrets");
+  assert.equal(row.querySelector(".candidate-seed-words").value, "");
+  assert.equal(row.querySelector(".candidate-seed-passphrase").value, "");
+});
+
+test("the shared recovery lifecycle event cancels and releases an active address search", async () => {
+  const calls = [];
+  const { el, fireDocument } = harness(async (command) => {
+    calls.push(command);
+    if (command === "start_address_search") return { id: "opaque-search-1" };
+    if (command === "get_address_search") return { ...snapshot(), status: "completed" };
+    return null;
+  });
+  fillValidForm(el);
+  await el("address-search-form").fire("submit");
+  await new Promise(setImmediate);
+  fireDocument("argos:clear-transient-secrets");
+  await new Promise(setImmediate);
+  assert.ok(calls.includes("cancel_address_search"));
+  assert.ok(calls.includes("release_address_search"));
+});
+
 test("recovery emits only opaque ids and public match metadata without releasing", async () => {
   const calls = [];
   const { el, dispatched } = harness(async (command) => {

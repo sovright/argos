@@ -1,6 +1,7 @@
-# Evaluation: locking secret material into volatile memory (audit Suggestion 9)
+# Evaluation: locking and zeroizing secret material in memory (audit Suggestion 9)
 
-**Status:** recommendation — no code change. **Decision: keep `secrecy` for now.**
+**Status:** implemented lifecycle reduction; page locking remains an evaluated
+follow-up. **Decision: keep `secrecy` and the workspace `zeroize` boundaries.**
 
 ## Background
 
@@ -18,6 +19,53 @@ review confirms it locks the actual secret backing memory Argos would use.
 `secrecy` zeroizes on drop but does **not** `mlock`: nothing stops the kernel
 from paging a live `SecretString` to swap, or capturing it in a core dump,
 before it is dropped.
+
+## Current implementation
+
+Argos now uses best-effort zeroization for the secret owners it controls:
+
+- wallet-file buffers, Berkeley DB record values, passphrases, decrypted
+  plaintext, and fixed key arrays enter zeroizing owners before parsing or
+  decryption writes secret bytes; the parser-facing byte owner cannot be
+  cloned, formatted with `Debug`, serialized, mutably dereferenced, or consumed
+  through an owned-plaintext getter;
+- recovered transparent, Sapling, and Sprout secrets stay in zeroizing owners
+  through validation and error paths, including validation against the address
+  or viewing-key identity recorded by the source wallet;
+- Sprout scan keys, note plaintexts, witness paths, proof randomness, and
+  checkpoint decode/encode scratch wipe on last-owner drop. The durable
+  checkpoint itself remains intentionally spend-capable until the journal's
+  canonical-mined cleanup rule permits exact-generation deletion;
+- completed or failed scan secrets are actively expired after 30 minutes, and
+  an executable proposal after 15 minutes from creation. A proposal carries
+  its exact source identity and spend material until it expires or is consumed.
+  A wallet review ID becomes unusable on the first registry access after 30
+  minutes, but its path and non-secret identity entry is swept lazily and may
+  remain in the backend map longer while idle. Running scans do not expire
+  underneath a worker. Explicit release aborts and waits for workers/catch-up
+  before the final shared owner drops, and expiration atomically removes
+  proposals tied to an expired scan; and
+- the WebView clears seed, passphrase, and pasted-key controls once a scan
+  accepts them; when a running scan finishes, fails, or is cancelled; after Sprout
+  execution; on **Forget this file**, abandonment to the welcome screen,
+  **Start over**, resume-modal close, and window close. Ordinary navigation
+  does not clear active state, and a wallet-inspection error deliberately keeps
+  the passphrase for retry. A rejected scan start also preserves passphrase
+  and pasted-key inputs until the existing 29-minute review deadline; changing
+  the data directory invalidates derived scan/proposal evidence without
+  extending that deadline. Late responses are generation-bound and cannot
+  restore cleared frontend authority.
+
+These measures shorten ordinary plaintext residency; they are not proof that
+every historical byte vanished. Rust may copy fixed arrays through registers
+or stack temporaries, third-party crypto and serialization code may keep its
+own scratch, an allocator may retain freed pages or an earlier allocation after
+growth, and JavaScript strings cannot be reliably overwritten in place.
+Zeroization also cannot clear kernel caches, swap, hibernation images, crash or
+core dumps, DMA captures, forensic snapshots, or memory read by a compromised
+process while Argos is running. Persistent checkpoints, journals, tombstones,
+and filesystem or SSD remnants require encrypted storage and the separate
+on-disk lifecycle controls; memory zeroization does not erase them.
 
 ## Candidates (data as of 2026-06-22, crates.io)
 
@@ -67,9 +115,10 @@ correctness risk in exactly the wrong place.
 
 ## Recommendation
 
-**Do not swap `secrecy` now.** The marginal benefit (anti-swap for short-lived
-in-RAM secrets in a single-use desktop tool) does not justify either (a) a
-libsodium C dependency through the signed cross-platform release pipeline
+**Do not swap `secrecy` now.** The marginal benefit (anti-swap for bounded,
+best-effort-zeroized in-RAM secrets in a single-use desktop tool) does not
+justify either (a) a libsodium C dependency through the signed cross-platform
+release pipeline
 (`secrets`), or (b) moving seed handling onto an immature 0.1.x crate
 (`shush-rs`).
 

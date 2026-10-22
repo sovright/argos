@@ -98,7 +98,7 @@ mod tests {
         let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let types: std::collections::BTreeSet<String> = pairs
             .iter()
-            .filter_map(|(k, _)| parse_record_key(k))
+            .filter_map(|record| parse_record_key(&record.key))
             .map(|r| r.record_type)
             .collect();
         assert!(types.contains("zkey"), "types found: {types:?}");
@@ -111,7 +111,7 @@ mod tests {
         let pairs = crate::bdb::walk(&bytes).unwrap().records;
         let types: std::collections::BTreeSet<String> = pairs
             .iter()
-            .filter_map(|(k, _)| parse_record_key(k))
+            .filter_map(|record| parse_record_key(&record.key))
             .map(|r| r.record_type)
             .collect();
         // walletdb.cpp:125 writes czkey and erases the plaintext zkey.

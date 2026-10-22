@@ -5,14 +5,16 @@
 //! AES-256-CBC-decrypts a random master key stored in the `mkey` record.
 //! Every individual key record is encrypted under that master key.
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-use secrecy::{ExposeSecret, Secret, SecretString, Zeroize};
+use aes::cipher::{block_padding::Pkcs7, generic_array::GenericArray, BlockDecryptMut, KeyIvInit};
+use secrecy::{ExposeSecret, Secret, SecretString};
 use sha2::{Digest, Sha512};
+use zeroize::Zeroizing;
 
 use crate::{
     bdb::RawRecord,
     error::ImportError,
     zcashd::records::{compact_size, parse_record_key},
+    SecretBytes,
 };
 
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -47,7 +49,9 @@ pub fn classify_encryption(pairs: &[RawRecord]) -> EncryptionMetadata {
     let mut mkey = None;
     let mut malformed_mkey = false;
 
-    for (key, value) in pairs {
+    for record in pairs {
+        let key = &record.key;
+        let value = record.value();
         let Some(record) = parse_record_key(key) else {
             continue;
         };
@@ -86,7 +90,6 @@ pub fn classify_encryption(pairs: &[RawRecord]) -> EncryptionMetadata {
 
 /// The decrypted wallet master key. Every `ckey`, `czkey`, and `csapzkey`
 /// record is encrypted under this.
-#[derive(Clone)]
 pub struct MasterKey(pub(crate) Secret<[u8; 32]>);
 
 impl std::fmt::Debug for MasterKey {
@@ -139,10 +142,10 @@ pub fn parse_mkey(value: &[u8]) -> Option<MkeyRecord> {
 }
 
 /// Locate the `mkey` record in a walked wallet, if the wallet is encrypted.
-pub fn find_mkey(pairs: &[(Vec<u8>, Vec<u8>)]) -> Option<MkeyRecord> {
-    pairs.iter().find_map(|(k, v)| {
-        let rec = parse_record_key(k)?;
-        (rec.record_type == "mkey").then(|| parse_mkey(v))?
+pub fn find_mkey(pairs: &[RawRecord]) -> Option<MkeyRecord> {
+    pairs.iter().find_map(|record| {
+        let rec = parse_record_key(&record.key)?;
+        (rec.record_type == "mkey").then(|| parse_mkey(record.value()))?
     })
 }
 
@@ -164,61 +167,61 @@ pub fn derive_master_key(
 
     // Iterated SHA-512 over passphrase||salt, then re-hashing the digest.
     //
-    // Everything derived below is as sensitive as the passphrase itself:
-    // `buf` *is* the key-encryption key and IV concatenated, and `ct`
-    // becomes the plaintext master key in place. All three are scrubbed on
-    // every exit path — including the error paths, which is why the fallible
-    // steps are wrapped in a closure rather than returning with `?` directly.
-    // `Zeroize` for `[u8; N]` and `Vec<u8>` is a volatile write the optimizer
-    // may not elide; a plain assignment would be dead-store-eliminated.
-    let mut buf = [0u8; 64];
+    // Everything derived below is as sensitive as the passphrase itself.
+    // Explicit digest outputs, the KEK/IV split, the AES/CBC key schedule,
+    // and the in-place plaintext buffer all have zeroizing owners. The
+    // `sha2` hasher's internal compression state does not expose a zeroize
+    // feature; compiler-created register/stack copies are likewise outside
+    // Rust's ownership guarantees and remain a documented residual limit.
+    let mut buf = Zeroizing::new([0u8; 64]);
     let mut hasher = Sha512::new();
     hasher.update(passphrase.expose_secret().as_bytes());
     hasher.update(mkey.salt);
-    buf.copy_from_slice(&hasher.finalize());
+    let digest = Zeroizing::new(hasher.finalize());
+    buf.copy_from_slice(digest.as_slice());
 
     for _ in 1..mkey.rounds {
         let mut h = Sha512::new();
-        h.update(buf);
-        buf.copy_from_slice(&h.finalize());
+        h.update(buf.as_slice());
+        let digest = Zeroizing::new(h.finalize());
+        buf.copy_from_slice(digest.as_slice());
     }
 
-    let mut ct = mkey.encrypted_key.clone();
-    let result = (|| {
-        let mut kek = [0u8; 32];
-        let mut iv = [0u8; 16];
+    let mut ct = SecretBytes::copy_from_slice(&mkey.encrypted_key);
+    (|| {
+        let mut kek = Zeroizing::new([0u8; 32]);
+        let mut iv = Zeroizing::new([0u8; 16]);
         kek.copy_from_slice(buf.get(0..32).ok_or(ImportError::WrongPassphrase)?);
         iv.copy_from_slice(buf.get(32..48).ok_or(ImportError::WrongPassphrase)?);
 
-        let decrypted = Aes256CbcDec::new(&kek.into(), &iv.into())
-            .decrypt_padded_mut::<Pkcs7>(&mut ct)
-            // Bad PKCS#7 padding is overwhelmingly a wrong passphrase, and
-            // that is the actionable message for the user.
-            .map_err(|_| ImportError::WrongPassphrase);
+        let decrypted = Aes256CbcDec::new(
+            GenericArray::from_slice(kek.as_slice()),
+            GenericArray::from_slice(iv.as_slice()),
+        )
+        .decrypt_padded_mut::<Pkcs7>(ct.as_mut_slice())
+        // Bad PKCS#7 padding is overwhelmingly a wrong passphrase, and
+        // that is the actionable message for the user.
+        .map_err(|_| ImportError::WrongPassphrase);
 
-        // `kek`/`iv` were consumed by value into the cipher above, so these
-        // are the copies left behind on this stack frame.
-        kek.zeroize();
-        iv.zeroize();
-
-        let master: [u8; 32] = decrypted?
-            .get(..32)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(ImportError::WrongPassphrase)?;
-
-        Ok(MasterKey(Secret::new(master)))
-    })();
-
-    buf.zeroize();
-    ct.zeroize();
-
-    result
+        Ok(MasterKey(Secret::new(
+            decrypted?
+                .try_into()
+                .map_err(|_| ImportError::WrongPassphrase)?,
+        )))
+    })()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use secrecy::SecretString;
+
+    #[test]
+    fn aes_cbc_key_schedule_and_iv_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<aes::Aes256>();
+        assert_zeroize_on_drop::<Aes256CbcDec>();
+    }
 
     #[test]
     fn parses_an_mkey_record() {

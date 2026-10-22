@@ -287,6 +287,7 @@ document.querySelectorAll(".step-list li").forEach((li) => {
     const target = li.dataset.stepIndicator;
     const targetIdx = steps.indexOf(target);
     if (targetIdx <= furthestStep) {
+      if (target === "welcome") abandonRecoveryFlow();
       if (target === "config") {
         $("start-scan").disabled = false;
         setStatus("config-status", "", "");
@@ -309,6 +310,7 @@ document.querySelectorAll("[data-next]").forEach((btn) => {
 
 document.querySelectorAll("[data-prev]").forEach((btn) => {
   btn.addEventListener("click", () => {
+    if (btn.dataset.prev === "welcome") abandonRecoveryFlow();
     if (btn.dataset.prev === "seed" && state.matchedRecovery) {
       returnToAddressMatches();
       return;
@@ -423,6 +425,82 @@ let walletSproutReview = null;
 let walletSproutReviewDestination = null;
 let walletSproutReviewConfig = null;
 let walletSproutProposalGeneration = 0;
+let walletSproutExecutionPending = false;
+// The backend drops an unclaimed wallet review after 30 minutes. Expire the
+// webview's plaintext and opaque review source first, with enough margin that
+// IPC response time cannot make the frontend outlive that backend authority.
+const WALLET_REVIEW_EXPIRY_MS = 29 * 60 * 1000;
+let walletReviewExpiryTimer = null;
+let walletReviewExpiryGeneration = 0;
+
+function cancelWalletReviewExpiry() {
+  ++walletReviewExpiryGeneration;
+  if (walletReviewExpiryTimer !== null) {
+    clearTimeout(walletReviewExpiryTimer);
+    walletReviewExpiryTimer = null;
+  }
+}
+
+function scheduleWalletReviewExpiry() {
+  cancelWalletReviewExpiry();
+  const generation = walletReviewExpiryGeneration;
+  walletReviewExpiryTimer = setTimeout(() => {
+    // clearTimeout cannot retract a callback already queued by the webview.
+    // The generation guard prevents an old callback from revoking newer state.
+    if (generation !== walletReviewExpiryGeneration) return;
+    walletReviewExpiryTimer = null;
+    for (const id of ["sapling-scan-keys", "sprout-scan-keys"]) {
+      const input = $(id);
+      if (input) input.value = "";
+    }
+    forgetLoadedWalletFile();
+    setStatus("wallet-status", "Wallet review expired. Open the wallet file again.", "error");
+  }, WALLET_REVIEW_EXPIRY_MS);
+}
+
+// Clear plaintext authority as soon as the backend has accepted it, and from
+// every exit that abandons the current recovery attempt. The browser event
+// gives the separate address-search module the same lifecycle boundary.
+function clearTransientSecrets({ abandonWallet = false } = {}) {
+  cancelWalletReviewExpiry();
+  for (const id of [
+    "seed-input", "wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys",
+    "resume-seed-input", "resume-bip39-passphrase",
+  ]) {
+    const input = $(id);
+    if (input) input.value = "";
+  }
+  for (const [toggleId, inputId] of [
+    ["seed-visibility", "seed-input"],
+    ["resume-seed-visibility", "resume-seed-input"],
+  ]) {
+    const toggle = $(toggleId);
+    const input = $(inputId);
+    if (toggle) toggle.checked = false;
+    input?.classList?.add("masked");
+  }
+  if (walletFile?.passphrase != null) walletFile.passphraseCleared = true;
+  if (walletFile) walletFile.passphrase = null;
+
+  if (!abandonWallet) return;
+  ++walletOpenGeneration;
+  walletFile = null;
+  sproutPreviewWallet = null;
+  sproutSweepSource = null;
+  invalidateWalletSproutReview();
+  invalidateSproutScanSource();
+  document.dispatchEvent(new CustomEvent("argos:clear-transient-secrets"));
+}
+
+function abandonRecoveryFlow() {
+  // `invalidateScanAuthority` releases every backend session after first
+  // invalidating late replies locally. Release waits for an active worker to
+  // stop before the backend drops its final key owner.
+  invalidateScanAuthority();
+  ++resumeGeneration;
+  pendingResumeRow = null;
+  clearTransientSecrets({ abandonWallet: true });
+}
 
 function walletSproutExecutionConfig() {
   return {
@@ -430,6 +508,7 @@ function walletSproutExecutionConfig() {
     lightwalletdUrl: $("lightwalletd-url").value.trim(),
     confirmationSources: confirmationSourcesFromForm(),
     dataDir: $("data-dir").value.trim() || null,
+    peers: sproutScanPeerEntries(),
   };
 }
 
@@ -464,7 +543,7 @@ function updateWalletSproutSweepButton() {
     walletSproutReviewDestination !== $("sprout-destination").value.trim() ||
     !walletSproutConfigMatches(walletSproutReviewConfig) ||
     sproutPreviewWallet !== walletFile || !$("sprout-sweep-confirm").checked ||
-    sproutSweepSource !== null;
+    walletSproutExecutionPending;
 }
 
 function renderWalletSummary(summary) {
@@ -770,10 +849,10 @@ async function showSproutSweep() {
     try {
       previewPeers = sproutScanPeers();
     } catch {
-      previewPeers = sproutScanPeerEntries();
+      previewPeers = previewConfig.peers;
     }
     const preview = await invoke("propose_wallet_sprout_sweep", {
-      path: source.path,
+      reviewId: source.reviewId,
       passphrase: source.passphrase,
       destination,
       lightwalletdUrl: previewConfig.lightwalletdUrl,
@@ -858,7 +937,7 @@ async function showSproutSweep() {
 }
 
 async function runSproutSweep() {
-  if (sproutSweepSource) return;
+  if (walletSproutExecutionPending) return;
   const source = walletFile;
   const destination = $("sprout-destination").value.trim();
   if (!destination) {
@@ -884,6 +963,7 @@ async function runSproutSweep() {
 
   const button = $("sprout-sweep-run");
   try {
+    walletSproutExecutionPending = true;
     sproutSweepSource = source;
     button.disabled = true;
     $("sprout-sweep-results").innerHTML = "";
@@ -919,9 +999,11 @@ async function runSproutSweep() {
     button.disabled = false;
   } finally {
     sproutSweepSource = null;
+    walletSproutExecutionPending = false;
     if (walletFile === source && walletSproutReview?.proposal_id === proposalId) {
       invalidateWalletSproutReview();
     }
+    clearTransientSecrets();
     updateWalletSproutSweepButton();
   }
 }
@@ -1191,7 +1273,9 @@ function forgetWalletCaveats() {
 // never clears it, so a seed typed afterwards would otherwise be scanned as
 // the old file and its balance shown as the seed's answer.
 function forgetLoadedWalletFile() {
+  cancelWalletReviewExpiry();
   ++walletOpenGeneration;
+  if (walletFile?.passphrase != null) walletFile.passphrase = null;
   walletFile = null;
   sproutPreviewWallet = null;
   invalidateWalletSproutReview();
@@ -1246,7 +1330,9 @@ function renderSproutUncoveredBanners() {
 }
 
 async function openWalletFile() {
+  cancelWalletReviewExpiry();
   const generation = ++walletOpenGeneration;
+  if (walletFile?.passphrase != null) walletFile.passphrase = null;
   walletFile = null;
   sproutPreviewWallet = null;
   invalidateWalletSproutReview();
@@ -1312,7 +1398,11 @@ async function openWalletFile() {
 
     // Rendering can immediately request a Sprout preview, so install the
     // newly opened file before it reads the path and passphrase.
-    walletFile = { path, passphrase, summary };
+    if (!summary.review_id) {
+      throw new Error("wallet inspection did not return review authority; inspect it again");
+    }
+    walletFile = { path, reviewId: summary.review_id, passphrase, summary };
+    scheduleWalletReviewExpiry();
     renderWalletSummary(summary);
     // Carried forward so every later screen can say what the totals leave
     // out. Recorded at open time because the summary is not in scope later.
@@ -1322,6 +1412,8 @@ async function openWalletFile() {
     setStatus("wallet-status", "✓ Wallet file read.", "success");
   } catch (err) {
     if (generation !== walletOpenGeneration) return;
+    cancelWalletReviewExpiry();
+    if (walletFile?.passphrase != null) walletFile.passphrase = null;
     walletFile = null;
     $("wallet-next").disabled = true;
     $("wallet-summary").hidden = true;
@@ -1637,7 +1729,6 @@ function sproutScanKeys() {
 // those come back as the backend's own, more specific error.
 const MAX_CUSTOM_PEERS = 8;
 
-// The scan panel's peer entries, trimmed and deduplicated but not checked.
 function sproutScanPeerEntries() {
   const entries = $("sprout-scan-peers").value
     .split(/[\n,]/)
@@ -1773,7 +1864,7 @@ async function runSproutScan() {
       keys: sproutScanKeyLines(),
       // The wallet file's own Sprout keys are merged in by the backend, so
       // leaving the box blank genuinely works now.
-      path: walletFile ? walletFile.path : null,
+      reviewId: walletFile ? walletFile.reviewId : null,
       passphrase: walletFile ? walletFile.passphrase : null,
       network: $("network-select").value,
       dataDir: $("data-dir").value.trim(),
@@ -1790,6 +1881,7 @@ async function runSproutScan() {
       return;
     }
     sproutScanHandle = handle;
+    clearTransientSecrets();
     // A scan may finish before its listeners are installed. The snapshot
     // closes that race after both event subscriptions become active.
     const listenersReady = await sproutScanListenersReady;
@@ -1810,6 +1902,7 @@ async function runSproutScan() {
     // A failed snapshot request leaves no reliable completion channel. Release
     // local authority and let the user retry; the backend worker checkpoints.
     invalidateSproutScanSource();
+    clearTransientSecrets();
     setStatus("sprout-scan-status", `✗ ${err}`, "error");
   }
   if (generation === sproutScanGeneration && !sproutScanHandle) button.disabled = false;
@@ -1894,6 +1987,7 @@ async function runSproutScanSweep() {
     setStatus("sprout-scan-status", `${earlier ? "Earlier Sprout scan: " : ""}✗ ${err}`, "error");
   } finally {
     sproutScanExecutionPending = false;
+    clearTransientSecrets();
     if (generation === sproutScanGeneration && handle === sproutScanHandle &&
         sproutScanReview?.proposal_id === proposalId) invalidateSproutScanReview();
     updateSproutScanSweepButton();
@@ -1919,7 +2013,7 @@ for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-di
   $(id)?.addEventListener("input", invalidateWalletSproutReview);
   $(id)?.addEventListener("change", invalidateWalletSproutReview);
 }
-for (const id of ["lightwalletd-url", "confirmation-sources"]) {
+for (const id of ["lightwalletd-url", "confirmation-sources", "sprout-scan-peers"]) {
   $(id)?.addEventListener("change", () => {
     if (typeof showSproutSweep === "function") void showSproutSweep();
   });
@@ -1929,9 +2023,24 @@ for (const id of ["network-select", "data-dir"]) {
     $(id)?.addEventListener(event, () => {
       // Inspection and its spendable balance used these settings. Require a
       // fresh read before showing any wallet-derived Sprout evidence again.
-      const path = $("wallet-path").value;
-      forgetLoadedWalletFile();
-      $("wallet-path").value = path;
+      if (id === "data-dir") {
+        // A directory correction must retain the immutable wallet source and
+        // its original expiry for retry. All derived evidence and proposals
+        // are invalidated by the listeners above and hidden until reinspection.
+        ++walletOpenGeneration;
+        $("wallet-open").disabled = false;
+        sproutPreviewWallet = null;
+        $("wallet-summary").hidden = true;
+        $("wallet-sprout-sweep").hidden = true;
+        $("wallet-next").disabled = true;
+        for (const field of ["sprout-sweep-plan", "sprout-sweep-pool", "sprout-sweep-params", "sprout-sweep-spent-status", "sprout-sweep-status"]) {
+          $(field).textContent = "";
+        }
+      } else {
+        const path = $("wallet-path").value;
+        forgetLoadedWalletFile();
+        $("wallet-path").value = path;
+      }
     });
   }
 }
@@ -2069,6 +2178,7 @@ $("transparent-include-change").addEventListener("change", updateTransparentScan
 updateTransparentScanSummary();
 
 window.addEventListener("beforeunload", () => {
+  abandonRecoveryFlow();
   // Backend-owned cleanup survives the webview unloading during configuration.
   const id = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
   if (id) invoke("release_address_search", { id }).catch(() => {});
@@ -2361,7 +2471,7 @@ async function runBirthdayAutodetect() {
       source.kind === "wallet"
         ? await invoke("detect_birthday_from_wallet_file", {
             ...probe,
-            path: walletFile.path,
+            reviewId: walletFile.reviewId,
             passphrase: walletFile.passphrase,
             // Scanned with the file, and undated, so they must be counted.
             saplingKeys: hasSaplingScanKeys() ? saplingScanKeyLines() : [],
@@ -2606,7 +2716,7 @@ go back and provide one.",
       handle = await invoke("start_scan_from_wallet_file", {
         config: {
           ...rest,
-          path: walletFile ? walletFile.path : null,
+          review_id: walletFile ? walletFile.reviewId : null,
           passphrase: walletFile ? walletFile.passphrase : null,
           sapling_keys: typedSaplingKeys,
           // Checked against the key source before the scan starts.
@@ -2621,8 +2731,8 @@ go back and provide one.",
     }
     if (generation !== state.scanAuthorityGeneration) {
       // The backend may have started scan A after its form was edited into B.
-      // It is no longer UI authority; ask it to stop without disturbing B.
-      invoke("cancel_scan", { handle }).catch(() => {});
+      // It is no longer UI authority; release it without disturbing B.
+      invoke("release_scan", { handle }).catch(() => {});
       if (matched && state.matchedRecovery === matched &&
           state.addressMatchRecoveryStartGeneration === generation) {
         state.addressMatchRecoveryLocked = false;
@@ -2639,27 +2749,9 @@ go back and provide one.",
     if (state.retainedAddressSearchId) {
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: true } }));
     }
-    // Drop the wallet passphrase now that the backend holds the decrypted
-    // keys (threat model T-S2). Only on success: the passphrase field lives
-    // on the wallet screen, so clearing it after a failure would strand a
-    // user who retries from the config screen with no way to re-enter it.
-    if (walletFile) {
-      if (walletFile.passphrase != null) walletFile.passphraseCleared = true;
-      walletFile.passphrase = null;
-    }
-    const passphraseInput = $("wallet-passphrase");
-    if (passphraseInput) passphraseInput.value = "";
-    // The backend holds the decoded keys now; a spending key must not sit
-    // in the DOM for the lifetime of the scan→sweep→complete flow (T-S2).
-    //
-    // On the success path only, deliberately — same rule as the wallet
-    // passphrase two lines up. If starting the scan throws, the typed key
-    // stays in the textarea so the user can fix the birthday or the endpoint
-    // and retry; wiping it would strand someone whose only copy is on paper.
-    // No scan is running in that case, so nothing holds the key but this
-    // local WebView, which is already showing it.
-    const saplingBox = $("sapling-scan-keys");
-    if (saplingBox) saplingBox.value = "";
+    // The backend now owns the scan authority. Drop every transient plaintext
+    // input while retaining only the opaque backend handles needed to resume.
+    clearTransientSecrets();
     $("sapling-key-addresses").innerHTML = "";
     goTo("scan");
     await startProgressListeners(handle);
@@ -2679,12 +2771,21 @@ go back and provide one.",
       document.dispatchEvent(new CustomEvent("address-search-lock-recovery", { detail: { locked: false } }));
     }
     setStatus("config-status", `✗ ${err}`, "error");
+    // A rejected start has not accepted these secrets. Keep the wallet
+    // passphrase and pasted keys available for a corrected-directory retry,
+    // without extending an existing wallet review deadline.
+    if (walletReviewExpiryTimer === null && (walletFile || hasTypedSaplingKeys)) scheduleWalletReviewExpiry();
     $("start-scan").disabled = false;
   } finally {
     // Clear the seed phrase from the DOM regardless of whether start_scan
     // succeeded; on failure the user can retype, and a successful scan no
-    // longer needs the cleartext phrase visible.
-    if (generation === state.scanAuthorityGeneration) seedInput.value = "";
+    // longer needs the cleartext phrase visible. Wallet/key inputs are
+    // cleared only after acceptance, abandonment, or their review expiry.
+    if (generation === state.scanAuthorityGeneration) {
+      seedInput.value = "";
+      $("seed-visibility").checked = false;
+      seedInput.classList.add("masked");
+    }
   }
 });
 
@@ -2945,6 +3046,7 @@ function updateScanUI(progress) {
   }
 
   const terminal = ["complete", "cancelled", "error"].includes(progress.phase);
+  if (terminal) clearTransientSecrets();
   if (progress.phase === "cancelled" && !state.retainedAddressSearchId) {
     $("back-to-config").style.display = "";
     $("start-scan").disabled = false;
@@ -2975,6 +3077,8 @@ function canReturnToAddressMatches(progress, retainedSearchId) {
 function returnToAddressMatches() {
   const searchId = state.retainedAddressSearchId || state.matchedRecovery?.searchId;
   if (!searchId) return;
+  const handle = state.scanHandle;
+  if (handle) invoke("release_scan", { handle }).catch(() => {});
   cleanupListeners();
   clearMatchedRecoveryUi();
   state.scanHandle = null;
@@ -3022,9 +3126,7 @@ function appendCell(tr, text) {
 }
 
 $("back-to-config").addEventListener("click", () => {
-  cleanupListeners();
-  invalidateSweepReview();
-  state.scanHandle = null;
+  invalidateScanAuthority();
   $("back-to-config").style.display = "none";
   $("start-scan").disabled = false;
   goTo("config");
@@ -3034,6 +3136,7 @@ $("cancel-scan").addEventListener("click", async () => {
   if (!state.scanHandle) return;
   try {
     await invoke("cancel_scan", { handle: state.scanHandle });
+    clearTransientSecrets();
     $("cancel-scan").disabled = true;
     setStatus("scan-message", "Cancellation requested… waiting for the scan to stop safely.", "");
     // Refresh in case the terminal event arrived before the cancel response.
@@ -3046,9 +3149,16 @@ $("cancel-scan").addEventListener("click", async () => {
 
 function invalidateScanAuthority() {
   state.scanAuthorityGeneration += 1;
+  const handles = [state.scanHandle, state.completedScanHandle]
+    .filter((handle, index, all) => handle &&
+      all.findIndex((candidate) => candidate?.id === handle.id) === index);
+  for (const handle of handles) {
+    invoke("release_scan", { handle }).catch(() => {});
+  }
   cleanupListeners();
   invalidateSweepReview();
   state.scanHandle = null;
+  state.completedScanHandle = null;
   state.lastProgress = null;
   state.scanConfig = null;
   state.savedReportPath = null;
@@ -3475,6 +3585,7 @@ $("execute-sweep").addEventListener("click", async () => {
     invalidateSweepReview();
     setStatus("sweep-execute-status", `✗ Sweep failed: ${err}`, "error");
   } finally {
+    clearTransientSecrets();
     state.sweepExecutionPending = false;
   }
 });
@@ -4042,6 +4153,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
 }
 
 $("restart-flow").addEventListener("click", () => {
+  abandonRecoveryFlow();
   resetRecoveryFlowState();
   goTo("welcome");
 });
@@ -4242,8 +4354,36 @@ function buildSessionRow(row, onDismiss) {
   const info = document.createElement("div");
   const labelEl = document.createElement("div");
   labelEl.className = "session-label";
-  labelEl.textContent = row.label || "(unlabeled scan)";
+  labelEl.textContent = row.legacy_untrusted || row.requires_rescan
+    ? "Legacy workspace — rescan required"
+    : row.label || "(unlabeled scan)";
   info.appendChild(labelEl);
+
+  if (row.legacy_untrusted || row.requires_rescan) {
+    const guidance = document.createElement("div");
+    guidance.className = "session-meta";
+    guidance.textContent =
+      "This workspace is preserved, but it predates private-storage lineage and cannot be safely resumed. " +
+      "Keep the original directory and wallet file. Choose a new empty data directory on the recovery settings screen " +
+      "(the upgraded default is workspace-v2), then start a new recovery and rescan. " +
+      "Reconcile any previously broadcast transactions before recovering those funds again.";
+    info.appendChild(guidance);
+    li.appendChild(info);
+
+    const actions = document.createElement("div");
+    actions.className = "session-actions";
+    const dismissBtn = document.createElement("button");
+    dismissBtn.className = "ghost";
+    dismissBtn.textContent = "Dismiss";
+    dismissBtn.title = "Dismiss from list";
+    dismissBtn.addEventListener("click", () => {
+      dismissSession(row.workspace_path, null);
+      onDismiss();
+    });
+    actions.appendChild(dismissBtn);
+    li.appendChild(actions);
+    return li;
+  }
 
   const synced = row.synced_to_height
     ? Number(row.synced_to_height).toLocaleString()
@@ -4370,8 +4510,7 @@ function closeResumeModal() {
   pendingResumeRow = null;
   $("resume-confirm").disabled = false;
   $("resume-modal").hidden = true;
-  $("resume-seed-input").value = "";
-  $("resume-bip39-passphrase").value = "";
+  clearTransientSecrets();
   $("resume-destination-input").value = "";
   $("resume-memo-input").value = "";
   $("resume-max-fee-zec").value = "";
@@ -4451,7 +4590,7 @@ $("resume-confirm").addEventListener("click", async () => {
       },
     });
     if (!isCurrent()) {
-      await invoke("cancel_scan", { handle: resumed.handle }).catch(() => {});
+      await invoke("release_scan", { handle: resumed.handle }).catch(() => {});
       return;
     }
     resetRecoveryFlowState({ destination, memo, maxFeeZec });
@@ -4477,7 +4616,10 @@ $("resume-confirm").addEventListener("click", async () => {
     goTo("scan");
     await startProgressListeners(resumed.handle);
   } catch (err) {
-    if (isCurrent()) setStatus("resume-modal-status", `✗ ${err}`, "error");
+    if (isCurrent()) {
+      clearTransientSecrets();
+      setStatus("resume-modal-status", `✗ ${err}`, "error");
+    }
   } finally {
     if (isCurrent()) $("resume-confirm").disabled = false;
   }
@@ -4505,7 +4647,16 @@ goTo("welcome");
 invoke("default_data_dir")
   .then((dir) => {
     state.defaultDataDir = dir || null;
-    if (dir && !$("data-dir").value.trim()) $("data-dir").value = dir;
+    if (dir && !$("data-dir").value.trim()) {
+      $("data-dir").value = dir;
+      if (/(?:^|[/\\])workspace-v2$/.test(dir)) {
+        const notice = document.createElement("small");
+        notice.className = "muted";
+        notice.textContent = `Your previous default workspace is preserved. Argos now uses ${dir}; ` +
+          "rescan from your original seed or wallet file. Reconcile any previously broadcast transactions before recovering those funds again.";
+        $("data-dir").insertAdjacentElement("afterend", notice);
+      }
+    }
   })
   .catch(() => {
     // Non-fatal: user can always type a path manually.

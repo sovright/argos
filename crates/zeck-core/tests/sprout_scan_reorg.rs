@@ -13,7 +13,7 @@ mod sprout_note_fixture;
 use argos_core::{
     p2p::wire::P2pNetwork,
     sprout_scan::{SproutScanCheckpoint, SproutScanner},
-    sprout_scan_run::{run_sprout_scan, TipAnchor},
+    sprout_scan_run::{checkpoint_path_for_network, run_sprout_scan, TipAnchor},
 };
 use sprout_note_fixture::{plant_sprout_note, rpc, NODE_P2P};
 
@@ -115,7 +115,8 @@ async fn rewind_and_resume(changes: Arc<Mutex<NodeChanges>>) {
     assert_eq!(old_height, planted.height + 2);
 
     let dir = tempfile::tempdir().expect("private checkpoint directory");
-    let checkpoint = dir.path().join("reorg.checkpoint");
+    let data_dir = dir.path().join("reorg-data");
+    let checkpoint = checkpoint_path_for_network(&data_dir, &[KEY], P2pNetwork::Regtest);
     let peers = [NODE_P2P.to_owned()];
     let first = run_sprout_scan(
         &[KEY],

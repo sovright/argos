@@ -59,6 +59,19 @@ use argos_wallet_import::keys::{ImportedKeys, JsOutPoint, SproutJoinSplit, Sprou
 use secrecy::ExposeSecret;
 
 use crate::sprout::{self, SproutNotePlaintext, SproutPaymentAddress};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_SPENDABLE_DROP_PROBE: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::atomic::AtomicBool>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_spendable_drop_probe() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    NEXT_SPENDABLE_DROP_PROBE.with(|probe| probe.borrow_mut().take())
+}
 
 /// Hex for diagnostics. Inline rather than a dependency: this is the only
 /// place in the crate that needs it, and it is four lines.
@@ -85,32 +98,22 @@ pub struct SpendableSproutNote {
     /// The 966-byte authentication path the JoinSplit prover parses.
     pub witness_path: Vec<u8>,
     pub outpoint: JsOutPoint,
+    #[cfg(test)]
+    pub(crate) drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Wipes the spend-authorising fields: `a_sk`, and the note's `rho`, `r`,
-/// value and memo. The address, commitment, anchor, witness path and
-/// outpoint are public chain data and are kept.
-impl zeroize::Zeroize for SpendableSproutNote {
+/// Wipes the spend-authorising fields: `a_sk`, the note plaintext, and the
+/// authentication path needed to spend it. Public chain identifiers remain.
+impl Zeroize for SpendableSproutNote {
     fn zeroize(&mut self) {
         self.a_sk.zeroize();
         self.note.rho.zeroize();
         self.note.r.zeroize();
         self.note.value.zeroize();
         self.note.memo.zeroize();
+        self.witness_path.zeroize();
     }
 }
-
-/// A reviewed GUI proposal holds these notes for up to its TTL and a sweep
-/// for its whole run; dropping one wipes its key rather than leaving it in
-/// freed memory. Copies made before the drop (a `Vec` reallocation, a
-/// cloned `SproutNotePlaintext`) are not reached.
-impl Drop for SpendableSproutNote {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(self);
-    }
-}
-
-impl zeroize::ZeroizeOnDrop for SpendableSproutNote {}
 
 impl core::fmt::Debug for SpendableSproutNote {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -121,6 +124,36 @@ impl core::fmt::Debug for SpendableSproutNote {
             .field("commitment", &hex(&self.commitment))
             .field("anchor", &hex(&self.anchor))
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpendableSproutNote {
+    fn drop(&mut self) {
+        self.zeroize();
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl ZeroizeOnDrop for SpendableSproutNote {}
+
+impl SpendableSproutNote {
+    /// Copy into a new wiping owner while leaving a boxed source intact so
+    /// its destructor can erase the original allocation before deallocation.
+    fn clone_for_owned_transfer(&self) -> Self {
+        Self {
+            note: self.note.clone(),
+            a_sk: self.a_sk,
+            address: self.address,
+            commitment: self.commitment,
+            anchor: self.anchor,
+            witness_path: self.witness_path.clone(),
+            outpoint: self.outpoint,
+            #[cfg(test)]
+            drop_probe: None,
+        }
     }
 }
 
@@ -585,6 +618,11 @@ pub fn recover_spendable_sprout_notes_with_chain(
         }
     }
 
+    // Moving an inline spendable note during Vec growth would leave its key
+    // and plaintext in the allocator's abandoned block. Reserve before the
+    // first note leaves its stable Box; `order.len()` is a conservative
+    // upper bound because some records resolve to spent/dust/issues.
+    out.notes.reserve(order.len());
     for key in order {
         match best.remove(&key) {
             Some(Ok((
@@ -597,7 +635,7 @@ pub fn recover_spendable_sprout_notes_with_chain(
                 if unconfirmed_spend {
                     out.unconfirmed_spends.push(note.outpoint);
                 }
-                out.notes.push(*note);
+                out.notes.push(note.clone_for_owned_transfer());
             }
             Some(Ok((Recovered::Spent(spent), _))) => out.spent.push(spent),
             Some(Ok((Recovered::Dust(outpoint), _))) => out.dust.push(outpoint),
@@ -791,6 +829,8 @@ impl<'a> RecoveryContext<'a> {
                 anchor: witness.root(),
                 witness_path,
                 outpoint,
+                #[cfg(test)]
+                drop_probe: take_spendable_drop_probe(),
             }),
             unconfirmed_spend: self.unconfirmed.contains(&nullifier),
         })
@@ -827,6 +867,7 @@ mod tests {
                 js_index: 0,
                 output_index: 0,
             },
+            drop_probe: None,
         }
     }
 
@@ -919,6 +960,25 @@ mod tests {
         });
 
         (keys, a_sk)
+    }
+
+    #[test]
+    fn recovery_wipes_the_boxed_source_before_returning_destination() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let (keys, a_sk) = wallet_with_one_note(1_000_000);
+        let dropped = Arc::new(AtomicBool::new(false));
+        NEXT_SPENDABLE_DROP_PROBE.with(|probe| *probe.borrow_mut() = Some(Arc::clone(&dropped)));
+        let recovered = recover_spendable_sprout_notes(&keys);
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the original boxed allocation must be wiped while the returned note remains alive"
+        );
+        assert_eq!(recovered.notes[0].a_sk, a_sk);
     }
 
     /// A key filed under an address it does not control must be dropped,
@@ -1403,7 +1463,7 @@ mod tests {
 
     fn inventory_journal(dir: &std::path::Path) -> crate::sprout_sweep_journal::SweepJournal {
         crate::sprout_sweep_journal::SweepJournal::for_keys(
-            dir,
+            &dir.join("artifact-data"),
             &[[0x42; 32]],
             crate::ZeckNetwork::Mainnet,
         )
@@ -1638,22 +1698,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = inventory_journal(dir.path());
         let outpoint = recovered.notes[0].outpoint;
-        let note_txid: String = outpoint
-            .txid
-            .iter()
-            .rev()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        std::fs::write(
+        let purpose = crate::private_fs::private_artifact_purpose(
+            crate::ZeckNetwork::Mainnet.label(),
+            journal.source_fingerprint(),
+        );
+        let root = crate::private_fs::private_artifact_root_path(journal.data_dir(), &purpose);
+        let access = crate::private_fs::PrivateArtifactAccess::acquire(
+            &root,
+            &purpose,
+            crate::private_fs::PrivateArtifactDomain::Journal,
             journal.path(),
-            format!(
-                "{note_txid}:{}:{} {}\n",
-                outpoint.js_index,
-                outpoint.output_index,
-                "ab".repeat(32)
-            ),
         )
         .unwrap();
+        access
+            .append_child_if_unchanged_with_lineage(None, |authority_anchor, generation| {
+                let header = serde_json::json!({
+                    "record": "header",
+                    "version": crate::sprout_sweep_journal::SPROUT_SWEEP_JOURNAL_VERSION,
+                    "network": crate::ZeckNetwork::Mainnet,
+                    "source_fingerprint": journal.source_fingerprint(),
+                    "authority_anchor": authority_anchor,
+                    "artifact_generation": generation,
+                });
+                let legacy_entry = serde_json::json!({
+                    "record": "legacy_accepted",
+                    "note_id": crate::sprout_sweep_journal::note_id(&outpoint),
+                    "txid": "ab".repeat(32),
+                });
+                Ok(format!("{header}\n{legacy_entry}\n").into_bytes())
+            })
+            .unwrap();
+        drop(access);
         let snapshot = journal.load_or_migrate().unwrap();
 
         let inventory = crate::sprout_sweep::classify_sprout_notes(&recovered.notes, &snapshot);

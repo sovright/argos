@@ -105,6 +105,7 @@ function driveHandler(name, boxText, report) {
     noteSproutBroadcast() {},
     uncoveredSproutKeys: 0,
     renderSproutUncoveredBanners() {},
+    clearTransientSecrets() {},
   };
   // `async function` must be kept whole, so slice from its own keyword.
   const start = source.indexOf(`async function ${name}(`);

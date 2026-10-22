@@ -5,13 +5,45 @@
 //! `get()` and every length is bounds-checked before it is used to size
 //! an allocation.
 
-use crate::error::{ImportDiagnostic, ImportError};
+use crate::{
+    error::{ImportDiagnostic, ImportError},
+    SecretBytes,
+};
 
 const BDB_BTREE_MAGIC: u32 = 0x0005_3162;
 
 /// A raw key/value record as stored in the Berkeley DB btree.
 /// Uninterpreted here — `bdb.rs` has no Zcash knowledge.
-pub type RawRecord = (Vec<u8>, Vec<u8>);
+pub struct RawRecord {
+    pub key: Vec<u8>,
+    pub(crate) value: SecretBytes,
+}
+
+impl RawRecord {
+    pub fn new(key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self {
+            key,
+            value: SecretBytes::new(value),
+        }
+    }
+
+    pub fn value(&self) -> &[u8] {
+        self.value.as_slice()
+    }
+
+    pub fn value_mut(&mut self) -> &mut [u8] {
+        self.value.as_mut_slice()
+    }
+
+    pub fn replace_value(&mut self, value: Vec<u8>) {
+        self.value = SecretBytes::new(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_value_vec_mut(&mut self) -> &mut Vec<u8> {
+        self.value.test_vec_mut()
+    }
+}
 
 #[derive(Default)]
 pub struct BdbWalk {
@@ -263,7 +295,7 @@ fn read_overflow(
     visited: &mut BTreeSet<u32>,
     budget: &mut usize,
     max_value_len: usize,
-) -> Result<Vec<u8>, ImportError> {
+) -> Result<SecretBytes, ImportError> {
     let total_len = total_len as usize;
     if total_len > max_value_len {
         return Err(unwalkable(format!(
@@ -287,7 +319,26 @@ fn read_overflow(
         ));
     }
 
-    let mut out = Vec::with_capacity(total_len);
+    read_overflow_into(
+        bytes,
+        meta,
+        first_page,
+        total_len,
+        visited,
+        budget,
+        SecretBytes::with_capacity(total_len),
+    )
+}
+
+fn read_overflow_into(
+    bytes: &[u8],
+    meta: &BdbMeta,
+    first_page: u32,
+    total_len: usize,
+    visited: &mut BTreeSet<u32>,
+    budget: &mut usize,
+    mut out: SecretBytes,
+) -> Result<SecretBytes, ImportError> {
     let mut page = first_page;
 
     while page != 0 && out.len() < total_len {
@@ -467,7 +518,11 @@ fn walk_from(bytes: &[u8], meta: &BdbMeta, root: u32, state: WalkState<'_>) {
                 }
             }
             PAGE_TYPE_LBTREE => {
-                let mut entries: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+                enum LeafEntry {
+                    Key(Vec<u8>),
+                    Value(SecretBytes),
+                }
+                let mut entries: Vec<Option<LeafEntry>> = Vec::with_capacity(count);
                 for i in 0..count {
                     let location = format!("page {page} slot {i}");
                     let Ok(off) = read_u16(p, OFF_INDEX_START + i * 2, meta.swapped) else {
@@ -491,7 +546,10 @@ fn walk_from(bytes: &[u8], meta: &BdbMeta, root: u32, state: WalkState<'_>) {
                             let start = off.saturating_add(3);
                             let end = start.saturating_add(usize::from(len));
                             match p.get(start..end) {
-                                Some(data) => Some(data.to_vec()),
+                                Some(data) if i % 2 == 0 => Some(LeafEntry::Key(data.to_vec())),
+                                Some(data) => {
+                                    Some(LeafEntry::Value(SecretBytes::copy_from_slice(data)))
+                                }
                                 None => {
                                     damage.push(location, "entry extends past the page");
                                     None
@@ -513,7 +571,10 @@ fn walk_from(bytes: &[u8], meta: &BdbMeta, root: u32, state: WalkState<'_>) {
                                         budget,
                                         limits.max_value_len,
                                     ) {
-                                        Ok(value) => Some(value),
+                                        Ok(value) if i % 2 == 0 => {
+                                            Some(LeafEntry::Key(value.as_slice().to_vec()))
+                                        }
+                                        Ok(value) => Some(LeafEntry::Value(value)),
                                         Err(_) => {
                                             damage.push(
                                                 location,
@@ -545,10 +606,10 @@ fn walk_from(bytes: &[u8], meta: &BdbMeta, root: u32, state: WalkState<'_>) {
                 while let Some(key) = slots.next() {
                     let value = slots.next();
                     match (key, value) {
-                        (Some(k), Some(Some(v))) => {
+                        (Some(LeafEntry::Key(k)), Some(Some(LeafEntry::Value(v)))) => {
                             if out.len() < limits.max_records {
                                 out.push(LocatedRecord {
-                                    record: (k, v),
+                                    record: RawRecord { key: k, value: v },
                                     page,
                                     slot,
                                 });
@@ -600,9 +661,9 @@ fn walk_with_limits(bytes: &[u8], limits: WalkLimits) -> Result<BdbWalk, ImportE
     let mut out = Vec::new();
     let mut real_roots = Vec::new();
     for located in top {
-        match resolve_subdb_root(bytes, &meta, &located.record.1) {
+        match resolve_subdb_root(bytes, &meta, located.record.value()) {
             Some(root) => real_roots.push(root),
-            None if located.record.0 == b"main" => {
+            None if located.record.key == b"main" => {
                 // zcashd's named database lives behind this master key.
                 // A broken pointer must not masquerade as an ordinary record.
                 damage.push(
@@ -639,6 +700,27 @@ fn walk_with_limits(bytes: &[u8], limits: WalkLimits) -> Result<BdbWalk, ImportE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_records(records: &[RawRecord], expected: &[(&[u8], &[u8])]) {
+        assert_eq!(records.len(), expected.len());
+        for (record, (key, value)) in records.iter().zip(expected) {
+            assert_eq!(record.key.as_slice(), *key);
+            assert_eq!(record.value(), *value);
+        }
+    }
+
+    #[test]
+    fn parser_boundaries_require_secret_buffers() {
+        let record = RawRecord {
+            key: b"key".to_vec(),
+            value: crate::SecretBytes::copy_from_slice(b"secret"),
+        };
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<crate::SecretBytes>();
+        assert_eq!(record.key, b"key");
+        assert_eq!(record.value.as_slice(), b"secret");
+        assert_eq!(record.value.len(), record.value.test_capacity());
+    }
 
     fn meta_page(page_size: u32, last_page: u32, root: u32) -> Vec<u8> {
         // Size the buffer to the pages the metadata claims, so the fixture
@@ -749,7 +831,7 @@ mod tests {
         // the type string, length-prefixed by a CompactSize byte.
         let found = pairs
             .iter()
-            .any(|(k, _)| k.windows(4).any(|w| w == b"zkey"));
+            .any(|record| record.key.windows(4).any(|w| w == b"zkey"));
         assert!(found, "no zkey record in the Sprout golden fixture");
     }
 
@@ -786,14 +868,18 @@ mod tests {
 
         let pairs = walk(&v).unwrap().records;
         assert!(
-            !pairs.iter().any(|(k, val)| k == b"AAAA" && val == b"CCCC"),
+            !pairs
+                .iter()
+                .any(|record| record.key == b"AAAA" && record.value() == b"CCCC"),
             "leaf entry desync: AAAA paired with CCCC instead of \
-             being dropped along with its own corrupted neighbour: {pairs:?}"
+             being dropped along with its own corrupted neighbour"
         );
         // The trailing, uncorrupted pair must survive intact.
         assert!(
-            pairs.iter().any(|(k, val)| k == b"CCCC" && val == b"DDDD"),
-            "CCCC/DDDD pair lost even though neither entry was corrupted: {pairs:?}"
+            pairs
+                .iter()
+                .any(|record| record.key == b"CCCC" && record.value() == b"DDDD"),
+            "CCCC/DDDD pair lost even though neither entry was corrupted"
         );
     }
 
@@ -844,8 +930,8 @@ mod tests {
         assert!(
             pairs
                 .iter()
-                .any(|(k, val)| k == b"realkey" && val == b"realvalue"),
-            "subdatabase root colliding with the master walk lost its records: {pairs:?}"
+                .any(|record| record.key == b"realkey" && record.value() == b"realvalue"),
+            "subdatabase root colliding with the master walk lost its records"
         );
     }
 
@@ -902,6 +988,96 @@ mod tests {
         v[base + SIZEOF_PAGE..base + SIZEOF_PAGE + payload.len()].copy_from_slice(payload);
     }
 
+    fn assert_overflow_error_drops_secret_builder(
+        bytes: &[u8],
+        meta: &BdbMeta,
+        first_page: u32,
+        total_len: u32,
+        budget: &mut usize,
+    ) {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let builder =
+            SecretBytes::with_capacity_and_drop_probe(total_len as usize, Arc::clone(&dropped));
+        assert!(read_overflow_into(
+            bytes,
+            meta,
+            first_page,
+            total_len as usize,
+            &mut BTreeSet::new(),
+            budget,
+            builder,
+        )
+        .is_err());
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "overflow error must drop a scrubbed secret builder"
+        );
+    }
+
+    #[test]
+    fn overflow_out_of_range_drops_secret_builder() {
+        let mut v = meta_page(512, 3, 1);
+        put_overflow_page(&mut v, 512, 2, 4, b"part");
+        let meta = read_meta(&v).unwrap();
+        assert_overflow_error_drops_secret_builder(&v, &meta, 2, 8, &mut 2);
+    }
+
+    #[test]
+    fn overflow_budget_exhaustion_drops_secret_builder() {
+        let mut v = meta_page(512, 3, 1);
+        put_overflow_page(&mut v, 512, 2, 3, b"part");
+        put_overflow_page(&mut v, 512, 3, 0, b"rest");
+        let meta = read_meta(&v).unwrap();
+        assert_overflow_error_drops_secret_builder(&v, &meta, 2, 8, &mut 1);
+    }
+
+    #[test]
+    fn overflow_cycle_drops_secret_builder() {
+        let mut v = meta_page(512, 2, 1);
+        put_overflow_page(&mut v, 512, 2, 2, b"part");
+        let meta = read_meta(&v).unwrap();
+        assert_overflow_error_drops_secret_builder(&v, &meta, 2, 8, &mut 2);
+    }
+
+    #[test]
+    fn overflow_wrong_page_type_drops_secret_builder() {
+        let mut v = meta_page(512, 3, 1);
+        put_overflow_page(&mut v, 512, 2, 3, b"part");
+        let meta = read_meta(&v).unwrap();
+        assert_overflow_error_drops_secret_builder(&v, &meta, 2, 8, &mut 2);
+    }
+
+    #[test]
+    fn overflow_invalid_payload_length_drops_secret_builder() {
+        let mut v = meta_page(512, 3, 1);
+        put_overflow_page(&mut v, 512, 2, 3, b"part");
+        v[3 * 512 + OFF_PAGE_TYPE] = PAGE_TYPE_OVERFLOW;
+        let meta = read_meta(&v).unwrap();
+        assert_overflow_error_drops_secret_builder(&v, &meta, 2, 8, &mut 2);
+    }
+
+    #[test]
+    fn short_overflow_page_drops_secret_builder() {
+        let mut v = meta_page(512, 3, 1);
+        put_overflow_page(&mut v, 512, 2, 3, b"part");
+        let meta = read_meta(&v).unwrap();
+        v.truncate(3 * 512 + 100);
+        assert_overflow_error_drops_secret_builder(&v, &meta, 2, 8, &mut 2);
+    }
+
+    #[test]
+    fn early_overflow_terminator_drops_secret_builder() {
+        let mut v = meta_page(512, 2, 1);
+        put_overflow_page(&mut v, 512, 2, 0, b"part");
+        let meta = read_meta(&v).unwrap();
+        assert_overflow_error_drops_secret_builder(&v, &meta, 2, 8, &mut 2);
+    }
+
     #[test]
     fn an_overflow_chain_reassembles_the_whole_value() {
         // A value split across two overflow pages. See put_overflow_page for
@@ -943,7 +1119,8 @@ mod tests {
             expected.len()
         );
         assert_eq!(
-            got, expected,
+            got.as_slice(),
+            expected.as_slice(),
             "overflow chain reassembled the wrong bytes: the per-page length \
              must come from hf_offset (offset 22), not entries (offset 20)"
         );
@@ -989,11 +1166,16 @@ mod tests {
 
         let pairs = walk(&v).unwrap().records;
         assert!(
-            pairs.iter().any(|(k, val)| k == key && *val == payload),
+            pairs
+                .iter()
+                .any(|record| record.key == key && record.value() == payload),
             "an overflowing value must reach the caller intact; got {:?}",
             pairs
                 .iter()
-                .map(|(k, val)| (String::from_utf8_lossy(k).into_owned(), val.len()))
+                .map(|record| (
+                    String::from_utf8_lossy(&record.key).into_owned(),
+                    record.value().len()
+                ))
                 .collect::<Vec<_>>()
         );
     }
@@ -1055,7 +1237,7 @@ mod tests {
         v[512 + OFF_INDEX_START + 2..512 + OFF_INDEX_START + 4]
             .copy_from_slice(&5000u16.to_le_bytes());
         let result = walk(&v).unwrap();
-        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_records(&result.records, &[(b"good", b"kept")]);
         assert_damage_at(&result, "page 1 slot 1");
         let imported = crate::zcashd::import_zcashd(&v, None).unwrap();
         assert!(imported
@@ -1076,7 +1258,7 @@ mod tests {
         v[entry + 8..entry + 12].copy_from_slice(&8u32.to_le_bytes());
         put_overflow_page(&mut v, 512, 2, 0, b"short");
         let result = walk(&v).unwrap();
-        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_records(&result.records, &[(b"good", b"kept")]);
         assert_damage_at(&result, "page 1 slot 1");
     }
 
@@ -1117,7 +1299,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_records(&result.records, &[(b"good", b"kept")]);
         assert_damage_at(&result, "page 1 slot 1");
     }
 
@@ -1195,7 +1377,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(result.records, vec![(b"good".to_vec(), b"value".to_vec())]);
+        assert_records(&result.records, &[(b"good", b"value")]);
         assert!(result
             .diagnostics
             .iter()
@@ -1209,7 +1391,7 @@ mod tests {
             put_leaf_entry(&mut v, 512, 1, 0, 40, b"main");
             put_leaf_entry(&mut v, 512, 1, 1, 60, &invalid_page.to_be_bytes());
             let result = walk(&v).unwrap();
-            assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+            assert_records(&result.records, &[(b"good", b"kept")]);
             assert_damage_at(&result, "page 1");
         }
     }
@@ -1220,7 +1402,7 @@ mod tests {
         put_leaf_entry(&mut v, 512, 2, 0, 40, b"main");
         put_leaf_entry(&mut v, 512, 2, 1, 60, &99u32.to_be_bytes());
         let result = walk(&v).unwrap();
-        assert_eq!(result.records, vec![(b"good".to_vec(), b"value".to_vec())]);
+        assert_records(&result.records, &[(b"good", b"value")]);
         assert_damage_at(&result, "page 2 slot 0");
     }
 
@@ -1233,7 +1415,7 @@ mod tests {
         put_leaf_entry(&mut v, 512, 1, 1, 60, &2u32.to_be_bytes());
         v[1024 + 12..1024 + 16].copy_from_slice(&BDB_BTREE_MAGIC.to_le_bytes());
         let result = walk(&v).unwrap();
-        assert_eq!(result.records, vec![(b"good".to_vec(), b"kept".to_vec())]);
+        assert_records(&result.records, &[(b"good", b"kept")]);
         assert_damage_at(&result, "page 1");
     }
 
@@ -1242,7 +1424,7 @@ mod tests {
         let mut v = two_child_tree();
         v[512 + 40 + 2] = 0; // invalid internal entry kind
         let result = walk(&v).unwrap();
-        assert_eq!(result.records, vec![(b"good".to_vec(), b"value".to_vec())]);
+        assert_records(&result.records, &[(b"good", b"value")]);
         assert_damage_at(&result, "page 1 slot 0");
     }
 

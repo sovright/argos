@@ -309,11 +309,11 @@ fn a_seed_whose_chain_fails_does_not_leak_through_its_diagnostic() {
         .unwrap()
         .records
         .into_iter()
-        .find(|(k, _)| {
-            argos_wallet_import::zcashd::parse_record_key(k)
+        .find(|record| {
+            argos_wallet_import::zcashd::parse_record_key(&record.key)
                 .is_some_and(|r| r.record_type == "mnemonichdchain")
         })
-        .map(|(_, v)| v)
+        .map(|record| record.value().to_vec())
         .expect("the fixture has a mnemonichdchain record");
     let mut tampered = chain.clone();
     tampered[4] ^= 1; // first byte of the chain's seed fingerprint

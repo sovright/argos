@@ -167,7 +167,7 @@ async fn a_shielding_joinsplit_is_accepted_by_the_node() {
             index: utxo.outpoint.n(),
             value: u64::from(utxo.txout.value()),
             script_pubkey: utxo.txout.script_pubkey().0 .0.clone(),
-            secret: key.secret,
+            secret: *key.secret_key(),
         }],
         vec![js],
         &js_key,

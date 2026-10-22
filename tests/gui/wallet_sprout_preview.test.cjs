@@ -76,24 +76,39 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   $("sprout-destination").value = "fixture-destination";
   $("confirmation-sources").value = "backup=https://confirm.example";
   const previews = [];
+  const timers = new Map();
+  let nextTimerId = 1;
   let onProgress;
   let failStatus = false;
   const context = vm.createContext({
     listen: async (name, callback) => { assert.equal(name, "sprout-sweep-progress"); onProgress = callback; },
-    $, document: { createElement: element },
+    $, document: { createElement: element, dispatchEvent() {} },
+    CustomEvent: class { constructor(type) { this.type = type; } },
     fmt: (value) => String(value),
     confirmationSourcesFromForm: () => $("confirmation-sources").value
       .split("\n").map((line) => line.trim()).filter(Boolean),
-    // The scan panel's peer field; replaced by the real helper when a test
+    // The scan panel's peer field; replaced by the real helpers when a test
     // loads the scan panel.
+    sproutScanPeerEntries: () => ["192.0.2.7:8233"],
     sproutScanPeers: () => ["192.0.2.7:8233"],
+    setTimeout(callback, delay) {
+      const id = nextTimerId++;
+      timers.set(id, { callback, delay, cleared: false });
+      return id;
+    },
+    clearTimeout(id) {
+      const timer = timers.get(id);
+      if (timer) timer.cleared = true;
+    },
     setStatus: (id, text) => {
       if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
       $(id).textContent = text;
     },
     invalidateSproutScanSource() {},
-    invoke: (command, args) => intercept(command, args, async () => {
+    invoke: (command, args) => {
+      const result = intercept(command, args, async () => {
       if (command === "inspect_wallet_file") return {
+        review_id: `review:${args.path}`,
         needs_passphrase: false, transparent_keys: 0, sapling_keys: 0,
         sprout_keys: 1, has_mnemonic: false, sprout_spendable_notes: 1,
         sprout_spendable_zatoshis: 100000, sprout_addresses: [], diagnostics: [],
@@ -128,8 +143,18 @@ function harness(intercept = (_, __, fallback) => fallback()) {
           nu7_warning: "NU7: Sprout recovery must be mined before activation.",
         };
       }
-      throw new Error(`Unexpected IPC command: ${command}`);
-    }),
+        throw new Error(`Unexpected IPC command: ${command}`);
+      });
+      if (command !== "inspect_wallet_file") return result;
+      return Promise.resolve(result).then((summary) => {
+        if (summary && !summary.needs_passphrase &&
+            (summary.transparent_keys + summary.sapling_keys + summary.sprout_keys > 0) &&
+            summary.review_id === undefined) {
+          return { ...summary, review_id: `review:${args.path}` };
+        }
+        return summary;
+      });
+    },
   });
   const source = fs.readFileSync("gui/src/main.js", "utf8");
   vm.runInContext(source.slice(
@@ -142,6 +167,12 @@ function harness(intercept = (_, __, fallback) => fallback()) {
     source.indexOf("const sproutScanListenersReady", source.indexOf('for (const id of ["sprout-scan-keys"'))), context);
   return {
     $, previews,
+    timers,
+    fireTimer(id, { includeCleared = false } = {}) {
+      const timer = timers.get(id);
+      assert.ok(timer, `unknown timer ${id}`);
+      if (!timer.cleared || includeCleared) timer.callback();
+    },
     edit(id, value, event = "input") { $(id).value = value; $(id).dispatch(event); },
     failNextStatus: () => { failStatus = true; },
     progress: (payload) => onProgress({ payload }),
@@ -187,8 +218,100 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       await vm.runInContext("openWalletFile()", context);
       await flush();
     },
+    abandonWallet() {
+      vm.runInContext("clearTransientSecrets({ abandonWallet: true })", context);
+    },
   };
 }
+
+test("a successful wallet inspection expires frontend passphrase and review authority", async () => {
+  const h = harness();
+  await h.open("/fixture/encrypted.dat", "wallet secret");
+
+  const [[timerId, timer]] = [...h.timers.entries()];
+  assert.ok(timerId, "successful inspection must schedule an expiry");
+  assert.ok(timer.delay <= 30 * 60 * 1000, "frontend expiry must not outlive the backend review");
+  assert.equal(h.$("wallet-passphrase").value, "wallet secret");
+  assert.equal(h.peek("walletFile.passphrase"), "wallet secret");
+  assert.equal(h.peek("walletFile.reviewId"), "review:/fixture/encrypted.dat");
+
+  h.$("sapling-scan-keys").value = "pasted Sapling secret";
+  h.$("sprout-scan-keys").value = "pasted Sprout secret";
+  h.fireTimer(timerId);
+
+  assert.equal(h.$("sapling-scan-keys").value, "");
+  assert.equal(h.$("sprout-scan-keys").value, "");
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.peek("walletFile"), null);
+  assert.equal(h.peek("sproutPreviewWallet"), null);
+  assert.equal(h.$("wallet-next").disabled, true);
+  assert.equal(h.$("wallet-summary").hidden, true);
+});
+
+test("a stale wallet expiry callback cannot clear a newer successful inspection", async () => {
+  const h = harness();
+  await h.open("/fixture/old.dat", "old secret");
+  const [oldTimerId] = [...h.timers.keys()];
+  h.peek("globalThis.oldWalletReview = walletFile");
+
+  await h.open("/fixture/new.dat", "new secret");
+  const newTimerId = [...h.timers.keys()].at(-1);
+  assert.notEqual(newTimerId, oldTimerId);
+  assert.equal(h.timers.get(oldTimerId).cleared, true);
+
+  // A callback may already be queued when clearTimeout runs. Its generation
+  // guard, rather than timer cancellation alone, must protect the new review.
+  h.fireTimer(oldTimerId, { includeCleared: true });
+
+  assert.equal(h.$("wallet-passphrase").value, "new secret");
+  assert.equal(h.peek("oldWalletReview.passphrase"), null);
+  assert.equal(h.peek("walletFile.path"), "/fixture/new.dat");
+  assert.equal(h.peek("walletFile.passphrase"), "new secret");
+  assert.equal(h.peek("walletFile.reviewId"), "review:/fixture/new.dat");
+});
+
+test("successful secret handoff cancels expiry and a queued callback cannot revoke the accepted source", async () => {
+  const h = harness();
+  await h.open("/fixture/accepted.dat", "accepted secret");
+  const [timerId] = [...h.timers.keys()];
+
+  h.peek("clearTransientSecrets()");
+  assert.equal(h.timers.get(timerId).cleared, true);
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.peek("walletFile.passphrase"), null);
+
+  h.fireTimer(timerId, { includeCleared: true });
+  assert.equal(h.peek("walletFile.path"), "/fixture/accepted.dat");
+  assert.equal(h.peek("walletFile.reviewId"), "review:/fixture/accepted.dat");
+});
+
+test("opaque wallet review ID is passed to every wallet-backed command", async () => {
+  const calls = [];
+  const h = harness((command, args, fallback) => {
+    if (["propose_wallet_sprout_sweep", "start_sprout_scan"].includes(command)) {
+      calls.push({ command, args: { ...args } });
+    }
+    return fallback();
+  });
+  await h.open("/fixture/wallet.dat", "secret");
+  await flush();
+  h.loadScanPanel();
+  await h.scan();
+
+  for (const call of calls) {
+    assert.equal(call.args.reviewId, "review:/fixture/wallet.dat", call.command);
+    assert.equal("path" in call.args, false, call.command);
+  }
+  const source = fs.readFileSync("gui/src/main.js", "utf8");
+  for (const command of ["detect_birthday_from_wallet_file"]) {
+    const invocation = source.slice(source.indexOf(`invoke(\"${command}\"`), source.indexOf(`invoke(\"${command}\"`) + 700);
+    assert.match(invocation, /reviewId:\s*walletFile\.reviewId/, command);
+    assert.doesNotMatch(invocation, /path:\s*walletFile\.path/, command);
+  }
+  const ordinary = source.slice(source.indexOf('invoke("start_scan_from_wallet_file"'), source.indexOf('invoke("start_scan_from_wallet_file"') + 900);
+  assert.match(ordinary, /review_id:\s*walletFile\s*\?\s*walletFile\.reviewId/);
+  assert.doesNotMatch(ordinary, /path:\s*walletFile\s*\?\s*walletFile\.path/);
+});
 
 test("wallet Sprout sweep requires explicit irreversible confirmation", async () => {
   const executions = [];
@@ -318,8 +441,8 @@ test("wallet source and endpoint edits revoke the reviewed proposal", async () =
   }
 });
 
-test("network and data directory edits hide wallet Sprout evidence until reinspection", async () => {
-  for (const id of ["network-select", "data-dir"]) {
+test("network edits forget the wallet and hide Sprout evidence until reinspection", async () => {
+  for (const id of ["network-select"]) {
     const h = harness();
     await h.open("/fixture/wallet.dat");
     assert.equal(h.$("wallet-summary").hidden, false);
@@ -336,11 +459,40 @@ test("network and data directory edits hide wallet Sprout evidence until reinspe
   }
 });
 
-test("first wallet open displays its Sprout preview without a null-path error", async () => {
+test("data directory edits retain scan credentials and expiry while revoking stale Sprout evidence", async () => {
+  const calls = [];
+  const h = harness((command, args, fallback) => { calls.push({ command, args }); return fallback(); });
+  await h.open("/fixture/wallet.dat", "retry secret");
+  const [timerId] = [...h.timers.keys()];
+  const proposal = h.peek("walletSproutReview.proposal_id");
+  h.$("sapling-scan-keys").value = "pasted retry key";
+  h.edit("data-dir", "/new-empty-directory");
+  assert.equal(h.peek("walletFile?.passphrase"), "retry secret");
+  assert.equal(h.peek("walletFile?.reviewId"), "review:/fixture/wallet.dat");
+  assert.equal(h.$("wallet-passphrase").value, "retry secret");
+  assert.equal(h.$("sapling-scan-keys").value, "pasted retry key");
+  assert.equal(h.timers.get(timerId).cleared, false);
+  assert.equal(h.$("wallet-summary").hidden, true);
+  assert.equal(h.$("wallet-sprout-sweep").hidden, true);
+  assert.equal(h.$("wallet-next").disabled, true);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+  assert.equal(h.$("sprout-sweep-plan").textContent, "");
+  assert.equal(h.$("sprout-sweep-spent-status").textContent, "");
+  assert.equal(h.peek("walletSproutReview"), null);
+  assert.ok(calls.some(({ command, args }) => command === "release_sprout_proposal" && args.proposalId === proposal));
+  await h.sweepConfirmed();
+  assert.equal(calls.some(({ command }) => command === "execute_wallet_sprout_sweep"), false);
+  h.fireTimer(timerId);
+  assert.equal(h.peek("walletFile"), null);
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.$("sapling-scan-keys").value, "");
+});
+
+test("first wallet open displays its Sprout preview with reviewed authority", async () => {
   const h = harness();
   await h.open("/fixture/first.dat");
   assert.deepEqual(h.previews, [{
-    path: "/fixture/first.dat", passphrase: null, destination: "fixture-destination",
+    reviewId: "review:/fixture/first.dat", passphrase: null, destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
     network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
   }]);
@@ -362,6 +514,8 @@ test("inspection carries no peers; the review verifies through the scan panel's"
   await h.open("/fixture/peers.dat");
   await flush();
   assert.equal("peers" in seen.inspect_wallet_file, false, "opening a wallet never dials");
+  assert.equal(seen.propose_wallet_sprout_sweep.reviewId, "review:/fixture/peers.dat");
+  assert.equal("path" in seen.propose_wallet_sprout_sweep, false);
   assert.deepEqual(seen.propose_wallet_sprout_sweep.peers, ["192.0.2.7:8233"]);
   h.$("sprout-destination").value = "fixture-destination";
   await h.sweepConfirmed();
@@ -370,12 +524,12 @@ test("inspection carries no peers; the review verifies through the scan panel's"
   assert.deepEqual(Object.keys(seen.execute_wallet_sprout_sweep), ["proposalId"]);
 });
 
-test("opening another wallet previews the new path and passphrase", async () => {
+test("opening another wallet previews the new review and passphrase", async () => {
   const h = harness();
   await h.open("/fixture/first.dat", "fixture-one");
   await h.open("/fixture/second.dat", "fixture-two");
   assert.deepEqual(h.previews.at(-1), {
-    path: "/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
+    reviewId: "review:/fixture/second.dat", passphrase: "fixture-two", destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
     network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
   });
@@ -572,6 +726,62 @@ function deferred() {
 }
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
+test("late wallet reply cannot restore cleared secret state", async () => {
+  const inspection = deferred();
+  const h = harness(async (command, _args, fallback) => {
+    if (command === "inspect_wallet_file") {
+      await inspection.promise;
+      return fallback();
+    }
+    return fallback();
+  });
+  const opening = h.open("/fixture/wallet.dat", "synthetic-passphrase");
+  await flush();
+  h.abandonWallet();
+  inspection.resolve();
+  await opening;
+  await flush();
+  assert.equal(h.peek("walletFile"), null);
+  assert.equal(h.peek("sproutPreviewWallet"), null);
+  assert.equal(h.peek("walletSproutReview"), null);
+  assert.equal(h.$("wallet-passphrase").value, "");
+  assert.equal(h.$("wallet-next").disabled, true);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+});
+
+test("abandoning during wallet Sprout execution cannot start a second sweep", async () => {
+  const execution = deferred();
+  let executions = 0;
+  const h = harness((command, _args, fallback) => {
+    if (command === "execute_wallet_sprout_sweep") {
+      executions++;
+      return execution.promise;
+    }
+    return fallback();
+  });
+  await h.open("/fixture/old.dat");
+  h.$("sprout-destination").value = "zs-old";
+  h.$("sprout-destination").dispatch("change");
+  await flush();
+  const first = h.sweepConfirmed();
+  await flush();
+  assert.equal(executions, 1);
+  assert.equal(h.peek("walletSproutExecutionPending"), true);
+
+  h.abandonWallet();
+  await h.open("/fixture/new.dat");
+  h.$("sprout-destination").value = "zs-new";
+  h.$("sprout-destination").dispatch("change");
+  await flush();
+  await h.sweepConfirmed();
+  assert.equal(executions, 1);
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+
+  execution.resolve(sproutLifecycleReport([]));
+  await first;
+  assert.equal(h.peek("walletSproutExecutionPending"), false);
+});
+
 for (const fails of [false, true]) {
   test(`older wallet inspection ${fails ? "failure" : "success"} cannot replace a newer selection`, async () => {
     const old = deferred();
@@ -599,7 +809,7 @@ for (const fails of [false, true]) {
   test(`older preview ${fails ? "failure" : "success"} cannot overwrite the current preview`, async () => {
     const old = deferred();
     const h = harness(async (command, args, fallback) => {
-      if (command === "propose_wallet_sprout_sweep" && args.path === "/fixture/old.dat") {
+      if (command === "propose_wallet_sprout_sweep" && args.reviewId === "review:/fixture/old.dat") {
         await old.promise;
         return { proposal_id: "old-proposal", notes: 99, gross_zatoshis: 999,
           fee_zatoshis: 1, net_zatoshis: 998, params_present: true };
@@ -622,10 +832,9 @@ test("a new import blocks spending until its own preview is ready", async () => 
   const inspection = deferred(), preview = deferred();
   const executions = [];
   const h = harness(async (command, args, fallback) => {
-    if (args.path === "/fixture/new.dat") {
-      if (command === "inspect_wallet_file") await inspection.promise;
-      if (command === "propose_wallet_sprout_sweep") await preview.promise;
-    }
+    if (command === "inspect_wallet_file" && args.path === "/fixture/new.dat") await inspection.promise;
+    if (command === "propose_wallet_sprout_sweep" &&
+        args.reviewId === "review:/fixture/new.dat") await preview.promise;
     if (command === "execute_wallet_sprout_sweep") {
       executions.push(args.proposalId);
       return sproutLifecycleReport([]);
@@ -934,7 +1143,7 @@ test("lifecycle action label resets for a ready-only preview", async () => {
   const h = harness(async (command, args, fallback) => {
     if (command !== "propose_wallet_sprout_sweep") return fallback();
     const review = await fallback();
-    return args.path.endsWith("status.dat")
+    return args.reviewId.endsWith("status.dat")
       ? { ...review, notes: 0, gross_zatoshis: 0, fee_zatoshis: 0, net_zatoshis: 0,
         active: [sproutTransaction("pending")], params_present: false }
       : { ...review, active: [], mined: [], params_present: true };
@@ -1110,7 +1319,7 @@ test("unverified checkpoint notice stays visible while wallet-file preview remai
   h.$("sprout-sweep-confirm").dispatch("change");
   assert.equal(h.$("sprout-sweep-run").disabled, false);
   assert.deepEqual(h.previews.at(-1), {
-    path: "/fixture/wallet.dat", passphrase: null, destination: "fixture-destination",
+    reviewId: "review:/fixture/wallet.dat", passphrase: null, destination: "fixture-destination",
     lightwalletdUrl: "", confirmationSources: ["backup=https://confirm.example"],
     network: "mainnet", dataDir: null, peers: ["192.0.2.7:8233"],
   });
@@ -1624,7 +1833,7 @@ test("a no-file scan sends only the pasted lines, with no wallet path or passphr
   // decrypt bound, for one) are owned by their own tests.
   const sent = JSON.parse(JSON.stringify(calls[0]));
   assert.deepEqual(sent.keys, ["# paper backup", "SKfixture", ""]);
-  assert.equal(sent.path, null);
+  assert.equal(sent.reviewId, null);
   assert.equal(sent.passphrase, null);
   assert.equal(sent.network, "mainnet");
   assert.equal(sent.dataDir, "");
@@ -1671,7 +1880,7 @@ test("a no-file scan sweep sends the pasted lines and switches the panel to broa
   await h.scan();
   // #271 binds the pasted lines when the scan starts, with no wallet file.
   assert.equal(starts.length, 1);
-  assert.equal(starts[0].path, null);
+  assert.equal(starts[0].reviewId, null);
   assert.equal(starts[0].passphrase, null);
   assert.deepEqual([...starts[0].keys], ["STfixture"]);
   assert.equal(starts[0].network, "testnet");

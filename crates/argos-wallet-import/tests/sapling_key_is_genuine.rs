@@ -71,7 +71,7 @@ const EXTFVK_LEN: usize = 169;
 const FVK_OFFSET: usize = 41;
 const FVK_LEN: usize = 96;
 
-fn load(fixture: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn load(fixture: &str) -> Vec<argos_wallet_import::bdb::RawRecord> {
     let bytes = std::fs::read(format!("tests/fixtures/{fixture}.dat"))
         .unwrap_or_else(|e| panic!("fixture {fixture}: {e}"));
     bdb::walk(&bytes)
@@ -93,11 +93,11 @@ fn viewing_key_from(extsk_bytes: &[u8]) -> ([u8; FVK_LEN], [u8; 32]) {
 /// records independently of `collect_*` so this is a genuine external check.
 /// For both `sapzkey` and `csapzkey` this remainder is the 32-byte incoming
 /// viewing key (zcashd `walletdb.cpp`).
-fn stored_ivks(pairs: &[(Vec<u8>, Vec<u8>)], record_type: &str) -> Vec<[u8; 32]> {
+fn stored_ivks(pairs: &[argos_wallet_import::bdb::RawRecord], record_type: &str) -> Vec<[u8; 32]> {
     pairs
         .iter()
-        .filter_map(|(raw_key, _)| {
-            let rec = zcashd::parse_record_key(raw_key)?;
+        .filter_map(|record| {
+            let rec = zcashd::parse_record_key(&record.key)?;
             if rec.record_type != record_type {
                 return None;
             }
@@ -108,19 +108,23 @@ fn stored_ivks(pairs: &[(Vec<u8>, Vec<u8>)], record_type: &str) -> Vec<[u8; 32]>
 
 /// The plaintext `extfvk.fvk` bytes carried in each `csapzkey` value, in
 /// file order.
-fn stored_fvks(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<[u8; FVK_LEN]> {
+fn stored_fvks(pairs: &[argos_wallet_import::bdb::RawRecord]) -> Vec<[u8; FVK_LEN]> {
     pairs
         .iter()
-        .filter_map(|(raw_key, value)| {
-            let rec = zcashd::parse_record_key(raw_key)?;
+        .filter_map(|record| {
+            let rec = zcashd::parse_record_key(&record.key)?;
             if rec.record_type != "csapzkey" {
                 return None;
             }
             assert!(
-                value.len() > EXTFVK_LEN,
+                record.value().len() > EXTFVK_LEN,
                 "a csapzkey value must carry a 169-byte extfvk plus a ciphertext"
             );
-            value.get(FVK_OFFSET..FVK_OFFSET + FVK_LEN)?.try_into().ok()
+            record
+                .value()
+                .get(FVK_OFFSET..FVK_OFFSET + FVK_LEN)?
+                .try_into()
+                .ok()
         })
         .collect()
 }
@@ -260,19 +264,20 @@ fn a_csapzkey_that_decrypts_to_the_wrong_length_is_rejected_not_kept() {
     // Rewrite the first csapzkey record's ciphertext, fixing up its
     // CompactSize length so the record still parses.
     let mut mauled = 0usize;
-    for (raw_key, value) in pairs.iter_mut() {
-        let is_csapzkey = zcashd::parse_record_key(raw_key)
+    for record in pairs.iter_mut() {
+        let is_csapzkey = zcashd::parse_record_key(&record.key)
             .map(|r| r.record_type == "csapzkey")
             .unwrap_or(false);
         if !is_csapzkey {
             continue;
         }
-        let fvk = value[FVK_OFFSET..FVK_OFFSET + FVK_LEN].to_vec();
+        let fvk = record.value()[FVK_OFFSET..FVK_OFFSET + FVK_LEN].to_vec();
         let ct = encrypt_under(&master, &fvk, &short_key);
         assert!(ct.len() < 0xFD, "ciphertext needs a one-byte CompactSize");
-        value.truncate(EXTFVK_LEN);
+        let mut value = record.value()[..EXTFVK_LEN].to_vec();
         value.push(ct.len() as u8);
         value.extend_from_slice(&ct);
+        record.replace_value(value);
         mauled += 1;
         break;
     }
@@ -357,10 +362,13 @@ fn mutated_sapzkey_ivk_rejects_extsk() {
     let mut pairs = load("modern-plaintext");
     let mut before = ImportedKeys::default();
     zcashd::collect_plaintext(&pairs, &mut before);
-    let (raw_key, _) = pairs
+    let record = pairs
         .iter_mut()
-        .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == "sapzkey"))
+        .find(|record| {
+            zcashd::parse_record_key(&record.key).is_some_and(|r| r.record_type == "sapzkey")
+        })
         .unwrap();
+    let raw_key = &mut record.key;
     raw_key[1 + "sapzkey".len()] ^= 1;
     let mut after = ImportedKeys::default();
     zcashd::collect_plaintext(&pairs, &mut after);
@@ -377,16 +385,18 @@ fn mutated_csapzkey_identifiers_reject_extsk() {
     let mut before = ImportedKeys::default();
     zcashd::collect_encrypted(&pairs, &master, &mut before);
     for identifier in ["incoming viewing key", "extended full viewing key"] {
-        let mut altered = pairs.clone();
-        let (raw_key, value) = altered
+        let mut altered = load("modern-encrypted");
+        let record = altered
             .iter_mut()
-            .find(|(k, _)| zcashd::parse_record_key(k).is_some_and(|r| r.record_type == "csapzkey"))
+            .find(|record| {
+                zcashd::parse_record_key(&record.key).is_some_and(|r| r.record_type == "csapzkey")
+            })
             .unwrap();
         if identifier == "incoming viewing key" {
-            raw_key[1 + "csapzkey".len()] ^= 1;
+            record.key[1 + "csapzkey".len()] ^= 1;
         } else {
             // Mutate the extfvk's depth metadata. IV uses its FVK body, so ciphertext remains genuine.
-            value[0] ^= 1;
+            record.value_mut()[0] ^= 1;
         }
         let mut after = ImportedKeys::default();
         zcashd::collect_encrypted(&altered, &master, &mut after);
