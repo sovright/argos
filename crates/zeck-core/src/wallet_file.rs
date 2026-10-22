@@ -11,8 +11,6 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt as _;
 
 /// Stable identity for the opened wallet object. Fields stay private so IPC
 /// callers cannot manufacture authority from a path, digest, or inode.
@@ -82,11 +80,11 @@ pub fn read_wallet_snapshot(path: impl AsRef<Path>) -> io::Result<WalletFileSnap
     // Check the opened handle too, in case the path changed before open.
     let before = file.metadata()?;
     require_regular(&before)?;
-    let before_object = file_object_id(&before)?;
+    let before_object = file_object_id(&file, &before)?;
     let bytes = read_sized(&file, before.len())?;
     let after = file.metadata()?;
     require_regular(&after)?;
-    let after_object = file_object_id(&after)?;
+    let after_object = file_object_id(&file, &after)?;
     if before.len() != after.len() || before_object != after_object {
         return Err(wallet_changed_while_reading());
     }
@@ -133,7 +131,7 @@ fn wallet_changed_while_reading() -> io::Error {
 }
 
 #[cfg(unix)]
-fn file_object_id(metadata: &fs::Metadata) -> io::Result<FileObjectId> {
+fn file_object_id(_file: &File, metadata: &fs::Metadata) -> io::Result<FileObjectId> {
     Ok(FileObjectId::Unix {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -141,19 +139,27 @@ fn file_object_id(metadata: &fs::Metadata) -> io::Result<FileObjectId> {
 }
 
 #[cfg(windows)]
-fn file_object_id(metadata: &fs::Metadata) -> io::Result<FileObjectId> {
+fn file_object_id(file: &File, _metadata: &fs::Metadata) -> io::Result<FileObjectId> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(FileObjectId::Windows {
-        volume_serial: metadata
-            .volume_serial_number()
-            .ok_or_else(|| io::Error::other("wallet volume identity is unavailable"))?,
-        file_index: metadata
-            .file_index()
-            .ok_or_else(|| io::Error::other("wallet file identity is unavailable"))?,
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
     })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_object_id(_metadata: &fs::Metadata) -> io::Result<FileObjectId> {
+fn file_object_id(_file: &File, _metadata: &fs::Metadata) -> io::Result<FileObjectId> {
     Err(io::Error::other(
         "wallet object identity is unsupported on this platform",
     ))
