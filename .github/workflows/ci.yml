@@ -29,9 +29,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install Tauri system dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          bash scripts/install-ci-apt-deps.sh \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libdbus-1-dev \
@@ -81,6 +81,7 @@ jobs:
           cargo test -p argos-core private_fs --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $exact -Package argos-core -TestName private_fs::tests::windows_workspace_cleanup_uses_retained_directory_handles
+          & $exact -Package argos-core -TestName private_fs::tests::retained_sqlite_authority_can_enumerate_sync_and_delete_its_workspace
           & $exact -Package argos-core -TestName private_fs::windows_tests::windows_reused_permissive_objects_fail_closed_without_repair
           & $exact -Package argos-core -TestName private_fs::windows_tests::windows_owner_verifier_rejects_a_foreign_owner_sid
           & $exact -Package argos-core -TestName private_fs::windows_tests::windows_foreign_owner_verification_never_repairs_the_dacl
@@ -239,9 +240,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install Tauri system dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          bash scripts/install-ci-apt-deps.sh \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libdbus-1-dev \
@@ -295,9 +296,8 @@ jobs:
       # vendored lightwalletd protos and needs `protoc`. The normal test job
       # installs it too for its local argos-network integration tests.
       - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 10
+        run: bash scripts/install-ci-apt-deps.sh protobuf-compiler
 
       # The only regtest chain that can hold Sprout notes: ZIP 211 forbids
       # funding the pool from Canopy onward, and this profile holds Canopy

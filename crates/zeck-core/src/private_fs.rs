@@ -9586,7 +9586,10 @@ mod windows_acl {
     pub(super) fn open_directory_for_cleanup_authority(path: &Path) -> io::Result<std::fs::File> {
         let directory = open_directory_with_share(
             path,
-            DELETE | READ_CONTROL,
+            // SQLite retains this exact handle for the later cleanup handoff.
+            // Cleanup must enumerate its children and durably flush changes,
+            // in addition to renaming and deleting the retained directory.
+            DELETE | FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_TRAVERSE | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
         )?;
         harden(&directory, true)?;
@@ -10807,6 +10810,72 @@ mod tests {
 
         lease.remove_child_directory_all(&tombstone).unwrap();
 
+        assert!(!tombstone.exists());
+        assert_eq!(fs::read(sibling.join("sentinel")).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn retained_sqlite_authority_can_enumerate_sync_and_delete_its_workspace() {
+        let (_outer, publication) = private_publication_parent();
+        let private_root = publication.join("workspace-private-root");
+        let workspace = private_root.join("birthday-1/scope");
+        let database = workspace.join("wallet.sqlite");
+        let root = ensure_private_workspace_lineage(&private_root, &workspace, &database).unwrap();
+        create_private_dir_all(&workspace.join("nested")).unwrap();
+        write_private_file(&workspace.join("nested/secret"), b"delete me").unwrap();
+        let parent = workspace.parent().unwrap();
+        let sibling = parent.join("sibling");
+        create_private_dir_all(&sibling).unwrap();
+        write_private_file(&sibling.join("sentinel"), b"must survive").unwrap();
+        let namespace = NamespaceLease::acquire(parent, &parent.join("cleanup.lock")).unwrap();
+        let tombstone = parent.join("scope.deleting-test");
+        #[cfg(windows)]
+        let registry_key = fs::canonicalize(&database).unwrap();
+        #[cfg(windows)]
+        assert!(
+            trusted_sqlite_authorities()
+                .lock()
+                .unwrap()
+                .authorities
+                .contains_key(&registry_key),
+            "exercise the cached handle handoff, not the fallback mutation opener"
+        );
+
+        let retained =
+            retain_private_workspace_for_cleanup(&namespace, &workspace, &database).unwrap();
+        #[cfg(windows)]
+        {
+            let registry = trusted_sqlite_authorities().lock().unwrap();
+            assert!(!registry.authorities.contains_key(&registry_key));
+            assert!(registry.cleanup_held.contains(&registry_key));
+            assert!(
+                fs::rename(&workspace, parent.join("stolen")).is_err(),
+                "retained cleanup authority must continue to deny delete sharing"
+            );
+        }
+        assert!(
+            parent_child_names(&retained.directory, &workspace)
+                .unwrap()
+                .contains(&OsString::from("nested")),
+            "cached authority must enumerate its exact directory"
+        );
+        sync_private_directory(&retained.directory)
+            .expect("cached authority must durably sync cleanup");
+        let binding =
+            inspect_private_workspace_cleanup_binding(&private_root, &retained, &database).unwrap();
+        revoke_private_workspace_lineage(&private_root, &retained, &database, [0x35; 16], &binding)
+            .unwrap();
+        namespace
+            .rename_retained_workspace_directory(&workspace, &tombstone, &retained)
+            .unwrap();
+        #[cfg(windows)]
+        assert!(fs::rename(&tombstone, parent.join("stolen")).is_err());
+        namespace
+            .remove_retained_workspace_directory_all(&tombstone, &retained)
+            .unwrap();
+        drop(retained);
+        drop(root);
+        assert!(!workspace.exists());
         assert!(!tombstone.exists());
         assert_eq!(fs::read(sibling.join("sentinel")).unwrap(), b"must survive");
     }
