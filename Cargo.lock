@@ -201,6 +201,7 @@ name = "argos-gui"
 version = "1.5.5"
 dependencies = [
  "argos-core",
+ "clap",
  "secrecy",
  "serde",
  "serde_json",

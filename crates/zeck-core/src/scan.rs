@@ -89,8 +89,8 @@ static SYNC_BATCH_BLOCKS: std::sync::atomic::AtomicU32 =
 
 /// Trade scan speed for memory: fewer blocks per batch means a smaller
 /// block cache and less decryption work in flight, at the cost of more
-/// round-trips to lightwalletd. Process-wide, set once by the CLI before a
-/// scan starts (`--scan-batch-size`); the GUI keeps the default. Returns the
+/// round-trips to lightwalletd. Process-wide, set once by the application before a
+/// scan starts (`--scan-batch-size` in the CLI or GUI executable). Returns the
 /// value actually used, after clamping to [`SYNC_BATCH_RANGE`].
 pub fn set_sync_batch_size(blocks: u32) -> u32 {
     let blocks = blocks.clamp(*SYNC_BATCH_RANGE.start(), *SYNC_BATCH_RANGE.end());
