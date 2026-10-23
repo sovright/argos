@@ -3554,6 +3554,13 @@ mod tests {
     }
 
     fn resume_workspace(source: std::sync::Arc<dyn argos_core::KeySource>) -> std::path::PathBuf {
+        resume_workspace_in_data_dir(source, unused_temp_dir("resume-no-mutations"))
+    }
+
+    fn resume_workspace_in_data_dir(
+        source: std::sync::Arc<dyn argos_core::KeySource>,
+        data_dir: std::path::PathBuf,
+    ) -> std::path::PathBuf {
         let config = argos_core::RuntimeScanConfig {
             key_source: source,
             birthday: 419_200,
@@ -3562,7 +3569,7 @@ mod tests {
             transparent_scan: None,
             lightwalletd_url: "https://fixture.invalid".into(),
             confirmation_sources: Vec::new(),
-            data_dir: unused_temp_dir("resume-no-mutations"),
+            data_dir,
             network: argos_core::ZeckNetwork::Mainnet,
             label: String::new(),
         };
@@ -3739,8 +3746,11 @@ mod tests {
         )
         .unwrap();
         let source = std::sync::Arc::new(argos_core::ImportedKeySource::new(keys));
-        let workspace = resume_workspace(source.clone());
-        let data_dir = super::data_dir_from_workspace(&workspace).unwrap();
+        // The publication parent must belong to this test's user. Linux /tmp
+        // is root-owned even though its sticky bit permits creating children.
+        let publication_parent = base.join("publication");
+        let data_dir = publication_parent.join("recovery-data");
+        let workspace = resume_workspace_in_data_dir(source.clone(), data_dir.clone());
         // A loopback listener accepts no application requests. No public node,
         // chain fixture, real wallet or broadcast is involved in this test.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3758,6 +3768,16 @@ mod tests {
             .unwrap();
         assert!(error.contains("Terms of Service"));
         argos_core::record_tos_acceptance(&base, 1_900_000_000).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&publication_parent)
+                .unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&publication_parent).unwrap();
         let service = app.state::<super::AppState>().service.clone();
         let original = service
             .start_scan_from_key_source(
