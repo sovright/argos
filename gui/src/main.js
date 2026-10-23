@@ -2971,6 +2971,22 @@ function scanStatusFields(progress, etaState, era, primaryEndpoint) {
   return { terminal, server, serverTitle, progressText, barPercent, etaText };
 }
 
+function scanAccountTotalText(progress, amount) {
+  const count = progress.accounts.length;
+  const estimate = progress.summary.authoritative_balances ? "" : " (estimates)";
+  if (progress.phase === "complete") return `Scan total: ${amount}${estimate} across ${count} checked accounts.`;
+  if (["cancelled", "error"].includes(progress.phase)) {
+    return `Partial total: ${amount}${estimate} · ${count} accounts loaded; scan unfinished.`;
+  }
+  return `Found so far: ${amount}${estimate} · ${count} accounts loaded; scan in progress.`;
+}
+
+function gapExtensionDetail(extension) {
+  return `Activity was found in account ${extension.trigger_account_index}. ` +
+    `Additional accounts ${extension.accounts_from}–${extension.accounts_to} are being checked ` +
+    `(extension #${extension.pass}). `;
+}
+
 function updateScanUI(progress) {
   state.lastProgress = progress;
 
@@ -3009,9 +3025,7 @@ function updateScanUI(progress) {
 
   if (progress.summary) {
     const s = progress.summary;
-    const acctCount = progress.accounts.length;
-    $("scan-totals").textContent =
-      `Grand total: ${fmt(s.total_zatoshis)} across ${acctCount} account(s).${s.authoritative_balances ? "" : " (estimates)"}`;
+    $("scan-totals").textContent = scanAccountTotalText(progress, fmt(s.total_zatoshis));
     $("scan-workspace").textContent = `Workspace: ${s.workspace_dir}`;
   }
 
@@ -3036,10 +3050,7 @@ function updateScanUI(progress) {
   // Only while actively scanning — the completion screen tells the full story.
   const inTerminalPhase = ["complete", "cancelled", "error"].includes(progress.phase);
   if (progress.gap_extension && !inTerminalPhase) {
-    const g = progress.gap_extension;
-    $("scan-gap-extension-detail").textContent =
-      `Found activity in account ${g.trigger_account_index}, so the search widened to accounts ` +
-      `${g.accounts_from}–${g.accounts_to} (extension #${g.pass}). `;
+    $("scan-gap-extension-detail").textContent = gapExtensionDetail(progress.gap_extension);
     $("scan-gap-extension-banner").style.display = "";
   } else {
     $("scan-gap-extension-banner").style.display = "none";
@@ -3170,7 +3181,7 @@ function invalidateScanAuthority() {
   $("scan-rows").innerHTML = "";
   $("scan-discoveries").innerHTML = "";
   $("scan-discoveries").style.display = "none";
-  $("scan-totals").textContent = "Grand total: 0.00000000 ZEC across 0 accounts.";
+  $("scan-totals").textContent = "Balance: 0.00000000 ZEC · 0 accounts loaded.";
   $("scan-workspace").textContent = "Workspace: not initialized";
   $("scan-sleep-banner").style.display = "none";
   $("scan-sandblasting-banner").style.display = "none";
@@ -4142,7 +4153,7 @@ function resetRecoveryFlowState({ destination = "", memo = "", maxFeeZec = "" } 
   $("scan-rows").innerHTML = "";
   $("scan-discoveries").innerHTML = "";
   $("scan-discoveries").style.display = "none";
-  $("scan-totals").textContent = "Grand total: 0.00000000 ZEC across 0 accounts.";
+  $("scan-totals").textContent = "Balance: 0.00000000 ZEC · 0 accounts loaded.";
   $("scan-workspace").textContent = "Workspace: not initialized";
   setStatus("scan-message", "", "");
   $("review-sweep").disabled = true;
