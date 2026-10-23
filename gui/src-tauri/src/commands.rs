@@ -31,6 +31,14 @@ pub struct AppState {
     pub wallet_reviews: WalletReviewRegistry,
 }
 
+#[tauri::command]
+pub fn release_wallet_review(
+    review_id: WalletReviewId,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.wallet_reviews.release(&review_id)
+}
+
 #[derive(Deserialize)]
 pub struct AddressSearchCandidateInput {
     pub label: String,
@@ -138,7 +146,7 @@ async fn cancel_and_release_address_search(
     }
 }
 
-fn ensure_tos_accepted(app: &AppHandle) -> Result<(), String> {
+fn ensure_tos_accepted<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let base = tos_base_dir(app)?;
     ensure_tos_accepted_for_base(&base)
 }
@@ -970,7 +978,11 @@ struct ScanDiscoveryEvent {
 /// Forward `scan-progress` / `scan-discovery` / `scan-complete` events to
 /// the frontend while a scan is running. Identical for fresh scans and
 /// resumed scans, so it's factored out.
-fn spawn_scan_progress_pump(app: AppHandle, service: RecoveryService, handle: ScanHandle) {
+fn spawn_scan_progress_pump<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    service: RecoveryService,
+    handle: ScanHandle,
+) {
     tokio::spawn(async move {
         let mut emitted_discoveries = 0usize;
         loop {
@@ -2784,7 +2796,7 @@ pub struct TosStatus {
 
 /// Base directory for the TOS acceptance record: the app data dir root, so it
 /// survives "Delete workspace" (which only removes the `workspace` subdir).
-fn tos_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn tos_base_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|err| format!("resolving app data dir: {err}"))
@@ -3255,6 +3267,10 @@ fn sessions_for_data_dir(base: &Path, data_dir: Option<&str>) -> Result<Vec<Sess
 #[derive(Deserialize)]
 pub struct ResumeSessionInput {
     pub workspace_path: String,
+    /// Required at this boundary so older callers cannot bypass preflight.
+    pub destination: String,
+    #[serde(default)]
+    pub sweep_memo: Option<String>,
     #[serde(default)]
     pub seed: Option<SecretString>,
     #[serde(default)]
@@ -3348,6 +3364,11 @@ fn prepare_resume_key_source(
     };
     argos_core::workspace::verify_key_source_for_workspace(workspace_path, source.as_ref())
         .map_err(|err| err.to_string())?;
+    if let Some(keys) = source.imported_keys() {
+        refuse_unreachable_sweep_destination(keys, &input.destination, network)?;
+    }
+    argos_core::refuse_memo_for_key_source(source.as_ref(), input.sweep_memo.as_deref())
+        .map_err(|err| err.to_string())?;
     Ok((source, warnings))
 }
 
@@ -3358,8 +3379,8 @@ fn prepare_resume_key_source(
 /// resolves and the existing resume logic in `scan.rs` picks up where the
 /// previous run left off.
 #[tauri::command]
-pub async fn resume_session(
-    app: AppHandle,
+pub async fn resume_session<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     input: ResumeSessionInput,
 ) -> Result<ResumeSessionResult, String> {
@@ -3512,6 +3533,7 @@ mod tests {
         let input = serde_json::from_value::<super::ResumeSessionInput>(serde_json::json!({
             "workspace_path": "/fixture/workspace",
             "wallet_review_id": "backend-issued-review",
+            "destination": ORCHARD_SAPLING_UA,
             "lightwalletd_url": "https://fixture.invalid"
         }));
         assert!(
@@ -3525,6 +3547,7 @@ mod tests {
     fn resume_input() -> super::ResumeSessionInput {
         serde_json::from_value(serde_json::json!({
             "workspace_path": "/fixture/workspace",
+            "destination": ORCHARD_SAPLING_UA,
             "lightwalletd_url": "https://fixture.invalid"
         }))
         .unwrap()
@@ -3561,6 +3584,239 @@ mod tests {
             )
             .unwrap();
         (reviews, id)
+    }
+
+    #[test]
+    fn resume_refuses_unreachable_destination_and_seedless_memo_before_scanning() {
+        let path = std::path::PathBuf::from(relabeled_fixture("modern-plaintext.dat", "mainnet"));
+        let keys = argos_core::import_wallet_file_for_network(
+            &std::fs::read(&path).unwrap(),
+            None,
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let workspace = resume_workspace(std::sync::Arc::new(argos_core::ImportedKeySource::new(
+            keys,
+        )));
+        let (reviews, id) = reviewed_resume_file(&path);
+        for (destination, memo, expected) in [
+            (ORCHARD_ONLY_UA, None, "Sapling"),
+            (ORCHARD_SAPLING_UA, Some("exchange deposit"), "memo"),
+        ] {
+            let input = serde_json::from_value::<super::ResumeSessionInput>(serde_json::json!({
+                "workspace_path": workspace,
+                "wallet_review_id": id,
+                "destination": destination,
+                "sweep_memo": memo,
+                "lightwalletd_url": "http://127.0.0.1:1"
+            }))
+            .unwrap();
+            let error = super::prepare_resume_key_source(
+                &input,
+                &reviews,
+                &workspace,
+                ZeckNetwork::Mainnet,
+                None,
+            )
+            .err()
+            .expect("refuse before scanning");
+            assert!(error.contains(expected), "{error}");
+            assert!(!workspace.exists());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resume_refuses_added_keys_and_preserves_original_key_order() {
+        let path = std::path::PathBuf::from(relabeled_fixture("modern-plaintext.dat", "mainnet"));
+        let (reviews, id) = reviewed_resume_file(&path);
+        let mut input = resume_input();
+        input.wallet_review_id = Some(id);
+        let (keys, _) = super::reviewed_wallet_scan_keys(
+            &reviews,
+            input.wallet_review_id.as_ref(),
+            None,
+            &[],
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let file_only_workspace = resume_workspace(std::sync::Arc::new(
+            argos_core::ImportedKeySource::new(keys),
+        ));
+        input
+            .sapling_keys
+            .push(SecretString::new(TEST_SAPLING_KEY_MAINNET.into()));
+        assert!(
+            super::prepare_resume_key_source(
+                &input,
+                &reviews,
+                &file_only_workspace,
+                ZeckNetwork::Mainnet,
+                None
+            )
+            .is_err(),
+            "adding a key must not resume the file-only scan"
+        );
+        let (mut combined, _) = super::reviewed_wallet_scan_keys(
+            &reviews,
+            input.wallet_review_id.as_ref(),
+            None,
+            &input.sapling_keys,
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        assert!(combined.sapling.len() >= 2);
+        // The original order is part of the saved identity, even for equal key sets.
+        combined.sapling.swap(0, 1);
+        let reordered_workspace = resume_workspace(std::sync::Arc::new(
+            argos_core::ImportedKeySource::new(combined),
+        ));
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &reordered_workspace,
+            ZeckNetwork::Mainnet,
+            None
+        )
+        .is_err());
+        let (original_order, _) = super::reviewed_wallet_scan_keys(
+            &reviews,
+            input.wallet_review_id.as_ref(),
+            None,
+            &input.sapling_keys,
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let original_workspace = resume_workspace(std::sync::Arc::new(
+            argos_core::ImportedKeySource::new(original_order),
+        ));
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &original_workspace,
+            ZeckNetwork::Mainnet,
+            None
+        )
+        .is_ok());
+        for workspace in [file_only_workspace, reordered_workspace, original_workspace] {
+            assert!(!workspace.exists());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_session_command_restores_reviewed_wallet_with_authenticated_storage_offline() {
+        use tauri::Manager;
+        let base = unused_temp_dir("resume-command");
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        // An absolute test-only identifier makes Tauri's app-data resolver point
+        // to this disposable directory without changing process environment.
+        context.config_mut().identifier = base.to_string_lossy().into_owned();
+        let app = tauri::test::mock_builder()
+            .manage(super::AppState {
+                service: argos_core::RecoveryService::new(),
+                address_search: argos_core::address_search::AddressSearchService::default(),
+                reviewed_intent: crate::reviewed_intent::ReviewedIntentStore::default(),
+                wallet_reviews: crate::reviewed_intent::WalletReviewRegistry::default(),
+            })
+            .build(context)
+            .unwrap();
+        assert_eq!(app.path().app_data_dir().unwrap(), base);
+        let path = std::path::PathBuf::from(relabeled_fixture("modern-plaintext.dat", "mainnet"));
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let review_id = app
+            .state::<super::AppState>()
+            .wallet_reviews
+            .register(
+                path.clone(),
+                std::sync::Arc::new(snapshot.identity().clone()),
+            )
+            .unwrap();
+        let keys = argos_core::import_wallet_file_for_network(
+            snapshot.bytes(),
+            None,
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let source = std::sync::Arc::new(argos_core::ImportedKeySource::new(keys));
+        let workspace = resume_workspace(source.clone());
+        let data_dir = super::data_dir_from_workspace(&workspace).unwrap();
+        // A loopback listener accepts no application requests. No public node,
+        // chain fixture, real wallet or broadcast is involved in this test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let input = || {
+            let mut input = resume_input();
+            input.workspace_path = workspace.to_string_lossy().into_owned();
+            input.wallet_review_id = Some(review_id.clone());
+            input.lightwalletd_url = endpoint.clone();
+            input
+        };
+        let error = super::resume_session(app.handle().clone(), app.state(), input())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("Terms of Service"));
+        argos_core::record_tos_acceptance(&base, 1_900_000_000).unwrap();
+        let service = app.state::<super::AppState>().service.clone();
+        let original = service
+            .start_scan_from_key_source(
+                argos_core::ScanConfig {
+                    birthday: 419_200,
+                    num_accounts: None,
+                    gap_limit: 20,
+                    transparent_scan: None,
+                    lightwalletd_url: endpoint.clone(),
+                    confirmation_sources: Vec::new(),
+                    data_dir: data_dir.clone(),
+                    network: ZeckNetwork::Mainnet,
+                    label: "original offline scan".into(),
+                },
+                source,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !workspace.join("session.json").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial scan writes authenticated session before network work");
+        service.release_scan(&original).await.unwrap();
+        let saved_metadata = std::fs::read(workspace.join("session.json")).unwrap();
+        for bad_memo in [false, true] {
+            let mut rejected = input();
+            if bad_memo {
+                rejected.sweep_memo = Some("exchange deposit".into());
+            } else {
+                rejected.destination = ORCHARD_ONLY_UA.into();
+            }
+            assert!(
+                super::resume_session(app.handle().clone(), app.state(), rejected)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(workspace.join("session.json")).unwrap(),
+                saved_metadata
+            );
+        }
+        let resumed = super::resume_session(app.handle().clone(), app.state(), input())
+            .await
+            .unwrap();
+        assert_eq!(resumed.network, ZeckNetwork::Mainnet);
+        assert_eq!(std::path::PathBuf::from(resumed.data_dir), data_dir);
+        assert_eq!(resumed.lightwalletd_url, endpoint);
+        assert!(service.get_scan_progress(&resumed.handle).await.is_ok());
+        service.release_scan(&resumed.handle).await.unwrap();
+        assert!(argos_core::workspace::read_session_metadata(&workspace)
+            .unwrap()
+            .is_some());
+        drop(listener);
+        std::fs::remove_dir_all(data_dir).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3764,6 +4020,7 @@ mod tests {
                 argos_core::import_wallet_file_for_network(&bytes, None, ZeckNetwork::Mainnet)
                     .unwrap();
             assert!(keys.mnemonic.is_some());
+            let original_mnemonic = keys.mnemonic.as_ref().unwrap().clone();
             if with_pasted {
                 input
                     .sapling_keys
@@ -3787,6 +4044,19 @@ mod tests {
             .unwrap();
             use argos_core::KeySource;
             assert_eq!(actual.fingerprint().unwrap(), source.fingerprint().unwrap());
+            let mut seed_only = resume_input();
+            seed_only.seed = Some(original_mnemonic);
+            assert!(
+                super::prepare_resume_key_source(
+                    &seed_only,
+                    &reviews,
+                    &workspace,
+                    ZeckNetwork::Mainnet,
+                    None
+                )
+                .is_err(),
+                "the recovered seed must not impersonate a mnemonic wallet-file workspace"
+            );
             if with_pasted {
                 input.sapling_keys.clear();
                 assert!(super::prepare_resume_key_source(

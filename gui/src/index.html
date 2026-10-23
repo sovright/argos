@@ -170,7 +170,7 @@
               <h3>Step 4 — Scan</h3>
               <p>Argos first probes transparent UTXOs (results appear within seconds), then syncs all shielded compact blocks. Seed recovery covers transparent, Sapling, and Orchard; a seedless imported wallet covers its transparent and Sapling keys. Sprout is recovered separately so an ordinary total is never presented as the whole wallet.</p>
               <p class="guide-tip">Scans can take anywhere from a few minutes (recent birthday) to several hours (birthday near Sapling activation in 2018). The ETA warms up after about 15 seconds.</p>
-              <p>You can cancel and resume at any time. Re-run Argos with the same recovery source, network, birthday, and account settings to pick up from the last saved block.</p>
+              <p>You can cancel and resume at any time. Re-run Argos with the same recovery source, network, birthday, and account settings to pick up from the last saved block. Older workspaces without the current storage protections are preserved but require a fresh scan in a new data directory. Keep the old data and reconcile pending transactions before recovering those funds again.</p>
             </div>
 
             <div class="guide-section">
@@ -926,6 +926,7 @@
         <label class="field">
           <span>Original recovery source</span>
           <select id="resume-source">
+            <option value="">Choose the original recovery source…</option>
             <option value="seed">Seed phrase</option>
             <option value="wallet">Wallet file (wallet.dat or ZecWallet Lite)</option>
             <option value="sapling">Sapling spending keys</option>
@@ -958,7 +959,7 @@
         <label class="field" id="resume-sapling-field" hidden>
           <span>Sapling spending keys</span>
           <textarea id="resume-sapling-keys" rows="3" autocomplete="off" spellcheck="false" class="masked"></textarea>
-          <small>One key per line. For a wallet file, include any additional Sapling keys used in the original scan.</small>
+          <small>Use the same keys in the same order as the original scan, one per line. For a wallet file, include the same additional Sapling keys in their original order.</small>
         </label>
         <label class="field" id="resume-bip39-passphrase-field" hidden>
           <span>BIP39 passphrase (if used)</span>

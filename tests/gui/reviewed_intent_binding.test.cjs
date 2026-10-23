@@ -660,6 +660,7 @@ test("resume initializes every reviewed field", async () => {
   loadFlow(h, "let pendingResumeRow = null;", "const DISMISSED_SESSIONS_KEY");
   loadFlow(h, "function openResumeModal(", "// ─── Init");
   vm.runInContext('openResumeModal({ workspace_path: "/resumed/ws", network: "testnet", match_coordinates: null })', h.context);
+  h.$("resume-source").value = "seed";
   h.$("resume-seed-input").value = "seed words";
   h.$("resume-destination-input").value = "zs-new";
   h.$("resume-memo-input").value = "new memo";
@@ -709,7 +710,8 @@ for (const outcome of ["resolved", "rejected"]) {
     loadFlow(h, "let pendingResumeRow = null;", "const DISMISSED_SESSIONS_KEY");
     loadFlow(h, "function openResumeModal(", "// ─── Init");
     vm.runInContext('openResumeModal({ workspace_path: "/old/ws", network: "testnet" })', h.context);
-    h.$("resume-seed-input").value = "seed words";
+    h.$("resume-source").value = "seed";
+  h.$("resume-seed-input").value = "seed words";
     h.$("resume-destination-input").value = "zs-new";
     h.$("resume-max-fee-zec").value = "0.02";
     const attempt = h.$("resume-confirm").fire("click");
@@ -727,45 +729,34 @@ for (const outcome of ["resolved", "rejected"]) {
   });
 }
 
-test("a newer resume keeps its handle when an older resume finishes later", async () => {
-  const h = flowHarness();
-  const older = deferred();
-  const newer = deferred();
-  let attempts = 0;
+test("a reopened dialog waits for the prior resume to settle before starting another session", async () => {
+  const h = resumeHarness();
+  const pending = deferred();
+  const original = h.context.invoke;
   h.context.invoke = async (command, args) => {
-    h.calls.push({ command, args });
-    if (command === "validate_address") return { destination_ok: true };
-    if (command === "resume_session") return ++attempts === 1 ? older.promise : newer.promise;
-    if (command === "release_scan" || command === "get_scan_progress") return null;
-    throw new Error(`unexpected ${command}`);
+    if (command === "resume_session") { h.calls.push({ command, args }); return pending.promise; }
+    if (command === "release_scan") { h.calls.push({ command, args }); return null; }
+    return original(command, args);
   };
-  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
-  loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
-  h.context.startProgressListeners = async () => {};
-  loadFlow(h, "let pendingResumeRow = null;", "const DISMISSED_SESSIONS_KEY");
-  loadFlow(h, "function openResumeModal(", "// ─── Init");
-  const open = (path) => {
-    vm.runInContext(`openResumeModal({ workspace_path: "${path}", network: "testnet" })`, h.context);
-    h.$("resume-seed-input").value = "seed words";
-    h.$("resume-destination-input").value = "zs-new";
-    h.$("resume-max-fee-zec").value = "0.02";
-  };
-  open("/older/ws");
+  h.$("resume-source").value = "seed";
+  h.$("resume-seed-input").value = "seed words";
   const first = h.$("resume-confirm").fire("click");
-  await new Promise((resolve) => setImmediate(resolve));
-  open("/newer/ws");
-  const second = h.$("resume-confirm").fire("click");
-  await new Promise((resolve) => setImmediate(resolve));
-  newer.resolve({ handle: { id: "newer" }, network: "testnet",
-    data_dir: "/newer", lightwalletd_url: "newer.example" });
-  await second;
-  older.resolve({ handle: { id: "older" }, network: "testnet",
-    data_dir: "/older", lightwalletd_url: "older.example" });
+  await new Promise(resolve => setImmediate(resolve));
+  vm.runInContext("closeResumeModal(); openResumeModal({workspace_path:'/resumed/ws',network:'mainnet'})", h.context);
+  h.$("resume-source").value = "seed";
+  h.$("resume-seed-input").value = "seed words";
+  h.$("resume-destination-input").value = "zs-new";
+  h.$("resume-max-fee-zec").value = "0.02";
+  h.$("resume-seed-input").fire("input");
+  assert.equal(h.$("resume-confirm").disabled, true);
+  await h.$("resume-confirm").fire("click");
+  assert.equal(h.calls.filter(c => c.command === "resume_session").length, 1);
+  pending.resolve({ handle: {id:'old'}, network:'mainnet',data_dir:'/resumed',lightwalletd_url:'server' });
   await first;
-  assert.equal(h.state.scanHandle.id, "newer");
-  assert.equal(h.state.scanConfig.data_dir, "/newer");
-  assert.deepEqual(h.calls.filter((call) => call.command === "release_scan")
-    .map((call) => call.args.handle.id), ["scan-old", "older"]);
+  assert.equal(h.$("resume-confirm").disabled, false);
+  assert.equal(h.calls.filter(c => c.command === "release_scan").length, 1);
+  await h.$("resume-confirm").fire("click");
+  assert.equal(h.calls.filter(c => c.command === "resume_session").length, 2);
 });
 
 test("start over still drops the loaded wallet", () => {
@@ -980,4 +971,103 @@ test("Escape closes the resume dialog and invalidates the pending attempt", () =
   assert.equal(h.$("resume-modal").hidden, true);
   assert.equal(stopped, true);
   assert.equal(vm.runInContext("pendingResumeRow", h.context), null);
+});
+
+
+test("resume source changes preserve secrets and review timer in the main wizard", () => {
+  const h = resumeHarness();
+  let globalClears = 0;
+  h.context.clearTransientSecrets = () => { globalClears++; h.$("wallet-passphrase").value = ""; };
+  h.$("wallet-passphrase").value = "main password";
+  h.$("resume-wallet-passphrase").value = "resume password";
+  h.$("resume-source").value = "sapling";
+  h.$("resume-source").fire("change");
+  assert.equal(globalClears, 0);
+  assert.equal(h.$("wallet-passphrase").value, "main password");
+  assert.equal(h.$("resume-wallet-passphrase").value, "");
+});
+
+test("unknown workspace source is explicitly chosen; matched recovery keeps seed selection", () => {
+  const h = resumeHarness();
+  assert.equal(h.$("resume-source").value, "");
+  assert.equal(h.$("resume-source").disabled, false);
+  vm.runInContext("openResumeModal({workspace_path:'/ws',network:'mainnet',match_coordinates:{path:'synthetic'}})", h.context);
+  assert.equal(h.$("resume-source").value, "seed");
+  assert.equal(h.$("resume-source").disabled, true);
+});
+
+test("resume holds its submit lock during address validation as well as backend startup", async () => {
+  const h = resumeHarness();
+  const pending = deferred();
+  let validations = 0;
+  h.context.invoke = async (command) => {
+    assert.equal(command, "validate_address");
+    validations++;
+    return pending.promise;
+  };
+  h.$("resume-source").value = "seed";
+  h.$("resume-seed-input").value = "seed words";
+  const attempt = h.$("resume-confirm").fire("click");
+  h.$("resume-destination-input").fire("input");
+  assert.equal(h.$("resume-confirm").disabled, true);
+  await h.$("resume-confirm").fire("click");
+  assert.equal(validations, 1);
+  pending.resolve({ destination_ok: true });
+  await attempt;
+  assert.equal(h.$("resume-confirm").disabled, false);
+});
+
+test("wallet resume releases its temporary review after success, failure, or cancelled inspection", async () => {
+  for (const outcome of ["success", "failure", "cancelled"]) {
+    const h = resumeHarness();
+    const original = h.context.invoke;
+    const pending = deferred();
+    h.context.invoke = async (command, args) => {
+      if (command === "inspect_wallet_file") {
+        return outcome === "cancelled" ? pending.promise : {review_id:'temporary-review'};
+      }
+      if (command === "release_wallet_review") { h.calls.push({command,args}); return null; }
+      if (command === "resume_session" && outcome === "failure") throw new Error("wrong wallet");
+      return original(command,args);
+    };
+    h.$("resume-source").value = "wallet";
+    h.$("resume-wallet-path").value = "/wallet.dat";
+    const attempt = h.$("resume-confirm").fire("click");
+    if (outcome === "cancelled") {
+      await new Promise(resolve => setImmediate(resolve));
+      vm.runInContext("closeResumeModal()",h.context);
+      pending.resolve({review_id:'temporary-review'});
+    }
+    await attempt;
+    const releases = h.calls.filter(c => c.command === "release_wallet_review");
+    assert.equal(releases.length,1,outcome);
+    assert.equal(releases[0].args.reviewId,'temporary-review',outcome);
+    if (outcome === "success") {
+      const input=h.calls.find(c=>c.command==='resume_session').args.input;
+      assert.equal(input.destination,'zs-new');
+      assert.equal(input.sweep_memo,null);
+    }
+  }
+});
+
+test("repeated failed resumes release every review instead of accumulating the sixteen-review cap", async () => {
+  const h = resumeHarness();
+  let issued = 0;
+  const live = new Set();
+  h.context.invoke = async (command,args) => {
+    if(command==='validate_address')return {destination_ok:true};
+    if(command==='inspect_wallet_file') {
+      assert.ok(live.size<16);
+      const review_id=`temporary-${++issued}`; live.add(review_id);return {review_id};
+    }
+    if(command==='resume_session')throw new Error('wrong wallet');
+    if(command==='release_wallet_review'){live.delete(args.reviewId);return null;}
+    throw new Error(command);
+  };
+  for(let n=0;n<20;n++) {
+    h.$('resume-source').value='wallet';h.$('resume-wallet-path').value='/wallet.dat';
+    await h.$('resume-confirm').fire('click');
+  }
+  assert.equal(issued,20);
+  assert.equal(live.size,0);
 });

@@ -191,7 +191,10 @@
               transparent, Sapling, and Orchard. A seedless zcashd import covers its transparent
               and Sapling keys; Sprout is shown and recovered separately so a partial total cannot
               be mistaken for the whole wallet. The local workspace lets you resume or repeat a
-              scan without starting from nothing.
+              scan without starting from nothing. When upgrading to 1.5.5, older workspaces
+              without the current storage protections are preserved but require a fresh scan in
+              a new data directory. Keep the old directory and original recovery source, and
+              reconcile previously broadcast transactions before recovering those funds again.
             </p>
 
             <h3>5. Sweep</h3>

@@ -4317,6 +4317,7 @@ function fmtRelativeTime(epochSeconds) {
 
 let pendingResumeRow = null;
 let resumeGeneration = 0;
+let resumeAttemptPending = false;
 
 const DISMISSED_SESSIONS_KEY = "argos-dismissed-sessions";
 
@@ -4488,9 +4489,9 @@ async function refreshResumePanel() {
 function openResumeModal(row) {
   ++resumeGeneration;
   pendingResumeRow = row;
-  $("resume-confirm").disabled = false;
+  $("resume-confirm").disabled = resumeAttemptPending;
   $("resume-modal-title").textContent = `Resume "${row.label || "(unlabeled scan)"}"`;
-  $("resume-source").value = "seed";
+  $("resume-source").value = row.match_coordinates ? "seed" : "";
   $("resume-source").disabled = !!row.match_coordinates;
   $("resume-wallet-path").value = "";
   $("resume-wallet-passphrase").value = "";
@@ -4508,25 +4509,31 @@ function openResumeModal(row) {
   $("resume-bip39-passphrase-field").hidden = !row.match_coordinates;
   setStatus("resume-modal-status", "", "");
   $("resume-modal").hidden = false;
-  $("resume-seed-input").focus();
+  $(row.match_coordinates ? "resume-seed-input" : "resume-source").focus();
 }
 
 function closeResumeModal() {
   ++resumeGeneration;
   pendingResumeRow = null;
-  $("resume-confirm").disabled = false;
+  $("resume-confirm").disabled = resumeAttemptPending;
   $("resume-modal").hidden = true;
-  clearTransientSecrets();
+  clearResumeSecrets();
   $("resume-destination-input").value = "";
   $("resume-memo-input").value = "";
   $("resume-max-fee-zec").value = "";
+}
+
+function clearResumeSecrets() {
+  for (const id of ["resume-seed-input", "resume-bip39-passphrase", "resume-wallet-passphrase", "resume-sapling-keys"]) $(id).value = "";
+  $("resume-seed-visibility").checked = false;
+  $("resume-seed-input").classList.add("masked");
 }
 
 function syncResumeSourceControls() {
   const source = $("resume-source").value;
   $("resume-seed-fields").hidden = source !== "seed";
   $("resume-wallet-fields").hidden = source !== "wallet";
-  $("resume-sapling-field").hidden = source === "seed";
+  $("resume-sapling-field").hidden = source !== "wallet" && source !== "sapling";
   $("resume-bip39-passphrase-field").hidden = source !== "seed" || !pendingResumeRow?.match_coordinates;
 }
 
@@ -4549,14 +4556,14 @@ function resumeSourceInput() {
 
 $("resume-source").addEventListener("change", () => {
   ++resumeGeneration;
-  clearTransientSecrets();
+  clearResumeSecrets();
   syncResumeSourceControls();
-  $("resume-confirm").disabled = false;
+  $("resume-confirm").disabled = resumeAttemptPending;
 });
 
 function invalidateResumeAttempt() {
   ++resumeGeneration;
-  if (pendingResumeRow) $("resume-confirm").disabled = false;
+  if (pendingResumeRow) $("resume-confirm").disabled = resumeAttemptPending;
 }
 
 for (const id of [
@@ -4598,6 +4605,7 @@ $("resume-seed-clear-clipboard").addEventListener("click", () =>
 );
 
 $("resume-confirm").addEventListener("click", async () => {
+  if (resumeAttemptPending) return;
   if (state.sweepExecutionPending) {
     setStatus("resume-modal-status", "Wait for the current sweep to finish before resuming a scan.", "error");
     return;
@@ -4626,6 +4634,14 @@ $("resume-confirm").addEventListener("click", async () => {
     setStatus("resume-modal-status", "Enter a positive maximum fee in ZEC with at most 8 decimal places.", "error");
     return;
   }
+  const labelOverride = $("resume-label-input").value.trim();
+  const lightwalletdUrl = SERVER_PRESETS[row.network] ?? SERVER_PRESETS.mainnet;
+  const confirmationSources = confirmationSourcesFromForm("resume-confirmation-sources");
+  // Hold the lock from the first await through stale-handle and review cleanup.
+  // Editing or reopening invalidates results, but cannot launch a second worker.
+  resumeAttemptPending = true;
+  $("resume-confirm").disabled = true;
+  let walletReviewId = null;
   try {
     const info = await invoke("validate_address", { address: destination, network: row.network });
     if (!isCurrent()) return;
@@ -4633,18 +4649,7 @@ $("resume-confirm").addEventListener("click", async () => {
       setStatus("resume-modal-status", "Destination must have an Orchard or Sapling receiver.", "error");
       return;
     }
-  } catch (err) {
-    if (!isCurrent()) return;
-    setStatus("resume-modal-status", `Could not validate destination: ${err}`, "error");
-    return;
-  }
-  const labelOverride = $("resume-label-input").value.trim();
-  const lightwalletdUrl = SERVER_PRESETS[row.network] ?? SERVER_PRESETS.mainnet;
-
-  $("resume-confirm").disabled = true;
-  setStatus("resume-modal-status", "Verifying recovery source and resuming…", "");
-  try {
-    let walletReviewId = null;
+    setStatus("resume-modal-status", "Verifying recovery source and resuming…", "");
     let walletSummary = null;
     let transparentOnly = false;
     if (source.walletPath) {
@@ -4654,10 +4659,10 @@ $("resume-confirm").addEventListener("click", async () => {
         network: row.network,
         dataDir: null,
       });
+      walletReviewId = summary.review_id || null;
       if (!isCurrent()) return;
       if (summary.needs_passphrase) throw new Error("Enter the correct wallet encryption password to unlock this file.");
-      if (!summary.review_id) throw new Error("This wallet file contains no recoverable keys.");
-      walletReviewId = summary.review_id;
+      if (!walletReviewId) throw new Error("This wallet file contains no recoverable keys.");
       walletSummary = summary;
       transparentOnly = summary.transparent_only && !source.saplingKeys.length;
     }
@@ -4670,8 +4675,10 @@ $("resume-confirm").addEventListener("click", async () => {
         wallet_review_id: walletReviewId,
         wallet_passphrase: source.walletPassphrase,
         sapling_keys: source.saplingKeys,
+        destination,
+        sweep_memo: memo || null,
         lightwalletd_url: lightwalletdUrl,
-        confirmation_sources: confirmationSourcesFromForm("resume-confirmation-sources"),
+        confirmation_sources: confirmationSources,
         label: labelOverride || null,
       },
     });
@@ -4701,17 +4708,18 @@ $("resume-confirm").addEventListener("click", async () => {
       ? "recommended" : "custom";
     state.scanHandle = resumed.handle;
     closeResumeModal();
-    // Skip the seed/config screens — they don't apply to a resumed scan.
     furthestStep = steps.indexOf("scan");
     goTo("scan");
     await startProgressListeners(resumed.handle);
   } catch (err) {
     if (isCurrent()) {
-      clearTransientSecrets();
+      clearResumeSecrets();
       setStatus("resume-modal-status", `✗ ${err}`, "error");
     }
   } finally {
-    if (isCurrent()) $("resume-confirm").disabled = false;
+    if (walletReviewId) await invoke("release_wallet_review", { reviewId: walletReviewId }).catch(() => {});
+    resumeAttemptPending = false;
+    $("resume-confirm").disabled = false;
   }
 });
 
