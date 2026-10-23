@@ -282,6 +282,13 @@ jobs:
       - name: GUI address discovery interaction tests
         run: node --test tests/gui/*.test.cjs
 
+      - name: GUI dialog layout tests
+        working-directory: gui
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:layout
+
   sprout-node-tests:
     name: Sprout scan against a real node
     runs-on: ubuntu-latest

@@ -35,7 +35,7 @@ function lifecycleHarness() {
   const ids = [
     "seed-input", "seed-visibility", "wallet-passphrase", "sapling-scan-keys",
     "sprout-scan-keys", "resume-seed-input", "resume-seed-visibility",
-    "resume-bip39-passphrase",
+    "resume-bip39-passphrase", "resume-wallet-passphrase", "resume-sapling-keys",
   ];
   const elements = new Map(ids.map((id) => [id, element()]));
   const events = [];
@@ -72,7 +72,7 @@ for (const exit of [
     vm.runInContext("clearTransientSecrets()", h.context);
     for (const id of [
       "seed-input", "wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys",
-      "resume-seed-input", "resume-bip39-passphrase",
+      "resume-seed-input", "resume-bip39-passphrase", "resume-wallet-passphrase", "resume-sapling-keys",
     ]) assert.equal(h.elements.get(id).value, "", `${exit}: ${id}`);
     assert.equal(h.context.walletFile.passphrase, null);
     assert.equal(h.elements.get("seed-visibility").checked, false);

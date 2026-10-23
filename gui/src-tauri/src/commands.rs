@@ -16,9 +16,9 @@ use crate::reviewed_intent::{
 use argos_core::{
     detect_birthday as zeck_detect_birthday, estimate_birthday_from_date as estimate_birthday,
     list_incomplete_sessions as zeck_list_incomplete_sessions, parse_workspace_keying,
-    validate_destination_address, validate_mnemonic_words, verify_seed_for_workspace,
-    BirthdayDetectResult, IncompleteSession, RecoveryService, ReviewedSweepProposal, ScanConfig,
-    ScanHandle, SweepOutcome, SweepProposalId, SweepRequest, ZeckNetwork,
+    validate_destination_address, validate_mnemonic_words, BirthdayDetectResult, IncompleteSession,
+    RecoveryService, ReviewedSweepProposal, ScanConfig, ScanHandle, SweepOutcome, SweepProposalId,
+    SweepRequest, ZeckNetwork,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -407,24 +407,6 @@ pub async fn pick_wallet_file(app: AppHandle) -> Result<Option<String>, String> 
     Ok(picked
         .and_then(|path| path.into_path().ok())
         .map(|path| path.to_string_lossy().into_owned()))
-}
-
-/// Drop any Sprout key that does not control the address it was filed under,
-/// emitting a `sprout-forged-key` event for each so the frontend can surface
-/// it. Mirrors the CLI loader and the `inspect` command, so the GUI's
-/// scan/preview/sweep paths do not silently trial-decrypt against a forged
-/// key. A forged key finds no notes (and the downstream commitment check
-/// stops it from ever spending someone else's), but without this the user
-/// gets an unexplained empty result instead of the reason.
-fn drop_and_warn_forged_sprout_keys(
-    app: &AppHandle,
-    keys: &mut argos_core::argos_wallet_import::ImportedKeys,
-) -> Vec<String> {
-    let warnings = drop_forged_sprout_keys(keys);
-    for warning in &warnings {
-        let _ = app.emit("sprout-forged-key", warning);
-    }
-    warnings
 }
 
 /// Drop every Sprout key that does not control the address it was filed
@@ -827,6 +809,38 @@ fn keys_from_secret_sapling_strings(
     Ok(keys)
 }
 
+/// Reconstruct exactly the source used by a wallet-file or pasted-key scan.
+/// Both fresh scans and resumes use reviewed bytes, network validation,
+/// forged-key rejection and the same ordered merge before fingerprinting.
+fn reviewed_wallet_scan_keys(
+    reviews: &WalletReviewRegistry,
+    review_id: Option<&WalletReviewId>,
+    passphrase: Option<&SecretString>,
+    sapling_keys: &[SecretString],
+    network: ZeckNetwork,
+) -> Result<(argos_core::argos_wallet_import::ImportedKeys, Vec<String>), String> {
+    let mut keys = match review_id {
+        Some(review_id) => {
+            let (_, snapshot) = reviews.verify(review_id)?;
+            argos_core::import_wallet_file_for_network(snapshot.bytes(), passphrase, network)
+                .map_err(|err| err.to_string())?
+        }
+        None => argos_core::argos_wallet_import::ImportedKeys::default(),
+    };
+    let warnings = drop_forged_sprout_keys(&mut keys);
+    if !sapling_keys.is_empty() {
+        let typed = keys_from_secret_sapling_strings(sapling_keys, network)?;
+        argos_core::sapling_key::merge_standalone_sapling_keys(&mut keys, typed)
+            .map_err(|err| err.to_string())?;
+    }
+    if keys.is_empty() {
+        return Err(
+            "no keys to scan — open a wallet file or paste a Sapling spending key.".to_owned(),
+        );
+    }
+    Ok((keys, warnings))
+}
+
 /// Refuse, before the scan, a destination a seedless sweep cannot pay.
 ///
 /// With a mnemonic, transparent keys may overlap HD receivers discovered
@@ -870,36 +884,15 @@ pub async fn start_scan_from_wallet_file(
     // user may hold a wallet whose keys were never rescanned *and* a paper
     // key for an address it never knew about. Mirrors the CLI's
     // `--wallet-file` + `--sapling-key-file` combination.
-    let mut keys = match &config.review_id {
-        Some(review_id) => {
-            let (_, snapshot) = state.wallet_reviews.verify(review_id)?;
-            argos_core::import_wallet_file_for_network(
-                snapshot.bytes(),
-                config.passphrase.as_ref(),
-                config.network,
-            )
-            .map_err(|err| err.to_string())?
-        }
-        None => argos_core::argos_wallet_import::ImportedKeys::default(),
-    };
-    // A forged Sprout key must not survive into the scan, whether the keys
-    // came from a wallet file or from pasted text.
-    drop_and_warn_forged_sprout_keys(&app, &mut keys);
-
-    if !config.sapling_keys.is_empty() {
-        let typed = keys_from_secret_sapling_strings(&config.sapling_keys, config.network)?;
-        // A wallet file with a mnemonic takes the Combined route, which
-        // registers pasted keys beside the seed's accounts. The same helper
-        // the CLI calls, so the two surfaces cannot drift on which
-        // combinations are allowed or on the birthday a pasted key gets.
-        argos_core::sapling_key::merge_standalone_sapling_keys(&mut keys, typed)
-            .map_err(|err| err.to_string())?;
-    }
-
-    if keys.is_empty() {
-        return Err(
-            "no keys to scan — open a wallet file or paste a Sapling spending key.".to_owned(),
-        );
+    let (keys, warnings) = reviewed_wallet_scan_keys(
+        &state.wallet_reviews,
+        config.review_id.as_ref(),
+        config.passphrase.as_ref(),
+        &config.sapling_keys,
+        config.network,
+    )?;
+    for warning in warnings {
+        let _ = app.emit("sprout-forged-key", warning);
     }
 
     // Before the scan, so the check runs on the parsed keys while their
@@ -3262,9 +3255,16 @@ fn sessions_for_data_dir(base: &Path, data_dir: Option<&str>) -> Result<Vec<Sess
 #[derive(Deserialize)]
 pub struct ResumeSessionInput {
     pub workspace_path: String,
-    pub seed: SecretString,
+    #[serde(default)]
+    pub seed: Option<SecretString>,
     #[serde(default)]
     pub passphrase: Option<SecretString>,
+    #[serde(default)]
+    pub wallet_review_id: Option<WalletReviewId>,
+    #[serde(default)]
+    pub wallet_passphrase: Option<SecretString>,
+    #[serde(default)]
+    pub sapling_keys: Vec<SecretString>,
     pub lightwalletd_url: String,
     #[serde(default)]
     pub confirmation_sources: Vec<String>,
@@ -3283,7 +3283,75 @@ pub struct ResumeSessionResult {
     pub confirmation_sources: Vec<String>,
 }
 
-/// Resume an incomplete scan: verify the seed matches the workspace, then
+/// No filesystem writes or service calls: authenticate the supplied authority
+/// against the selected workspace before a scan can create or alter anything.
+fn prepare_resume_key_source(
+    input: &ResumeSessionInput,
+    reviews: &WalletReviewRegistry,
+    workspace_path: &Path,
+    network: ZeckNetwork,
+    coordinates: Option<argos_core::MatchCoordinates>,
+) -> Result<(std::sync::Arc<dyn argos_core::KeySource>, Vec<String>), String> {
+    use std::sync::Arc;
+
+    let imported = input.wallet_review_id.is_some() || !input.sapling_keys.is_empty();
+    if input.seed.is_some() && imported {
+        return Err("choose either the original seed phrase or the original wallet file / Sapling keys, not both".to_owned());
+    }
+    if input.wallet_passphrase.is_some() && input.wallet_review_id.is_none() {
+        return Err("a wallet-file password requires a reviewed wallet file".to_owned());
+    }
+    let (source, warnings): (Arc<dyn argos_core::KeySource>, Vec<String>) = if let Some(
+        seed_phrase,
+    ) = &input.seed
+    {
+        let source: Arc<dyn argos_core::KeySource> = if let Some(coordinates) = coordinates {
+            let empty = SecretString::new(String::new());
+            let passphrase = input.passphrase.as_ref().unwrap_or(&empty);
+            let seed = argos_core::address_search::candidate_seed(seed_phrase, passphrase)
+                .map_err(|err| err.to_string())?;
+            argos_core::prepare_match_recovery(seed.expose_secret(), network, coordinates)
+                .map_err(|err| err.to_string())?
+        } else {
+            if input
+                .passphrase
+                .as_ref()
+                .is_some_and(|p| !p.expose_secret().is_empty())
+            {
+                return Err("this scan was created without a BIP-39 passphrase".to_owned());
+            }
+            Arc::new(argos_core::SeedKeySource::new(seed_phrase.clone()))
+        };
+        (source, Vec::new())
+    } else {
+        if coordinates.is_some() {
+            return Err(
+                "this address-match scan requires its original seed phrase and BIP-39 passphrase"
+                    .to_owned(),
+            );
+        }
+        if input
+            .passphrase
+            .as_ref()
+            .is_some_and(|p| !p.expose_secret().is_empty())
+        {
+            return Err("a BIP-39 passphrase requires a seed phrase; use the wallet-file password for an encrypted file".to_owned());
+        }
+        let (keys, warnings) = reviewed_wallet_scan_keys(
+            reviews,
+            input.wallet_review_id.as_ref(),
+            input.wallet_passphrase.as_ref(),
+            &input.sapling_keys,
+            network,
+        )?;
+        (Arc::new(argos_core::ImportedKeySource::new(keys)), warnings)
+    };
+    argos_core::workspace::verify_key_source_for_workspace(workspace_path, source.as_ref())
+        .map_err(|err| err.to_string())?;
+    Ok((source, warnings))
+}
+
+/// Resume an incomplete scan: verify the recovery source matches the workspace, then
 /// hand off to the existing scan entry point with parameters reconstructed
 /// from the workspace path. The data dir for `ScanConfig` is inferred from
 /// the workspace path's keying segments so the same `RecoveryWorkspace`
@@ -3302,13 +3370,13 @@ pub async fn resume_session(
     if workspace_path.as_os_str().is_empty() {
         return Err("workspace path cannot be empty".to_owned());
     }
-    let seed_phrase = input.seed;
     let keying = parse_workspace_keying(&workspace_path).map_err(|err| err.to_string())?;
     let data_dir = data_dir_from_workspace(&workspace_path)
         .ok_or_else(|| "workspace path is not under a recognizable data dir".to_owned())?;
 
     let label = input
         .label
+        .as_ref()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
@@ -3326,36 +3394,21 @@ pub async fn resume_session(
     };
     let metadata = argos_core::workspace::read_session_metadata(&workspace_path)
         .map_err(|err| err.to_string())?;
-    let handle = if let Some(coordinates) = metadata.and_then(|m| m.match_coordinates) {
-        let passphrase = input
-            .passphrase
-            .unwrap_or_else(|| SecretString::new(String::new()));
-        let seed = argos_core::address_search::candidate_seed(&seed_phrase, &passphrase)
-            .map_err(|err| err.to_string())?;
-        let key_source =
-            argos_core::prepare_match_recovery(seed.expose_secret(), keying.network, coordinates)
-                .map_err(|err| err.to_string())?;
-        argos_core::workspace::verify_key_source_for_workspace(
-            &workspace_path,
-            key_source.as_ref(),
-        )
-        .map_err(|err| err.to_string())?;
-        state
-            .service
-            .start_scan_from_key_source(scan_config, key_source)
-            .await
-    } else {
-        if input
-            .passphrase
-            .as_ref()
-            .is_some_and(|p| !p.expose_secret().is_empty())
-        {
-            return Err("this scan was created without a BIP-39 passphrase".to_owned());
-        }
-        verify_seed_for_workspace(&workspace_path, &seed_phrase).map_err(|err| err.to_string())?;
-        state.service.start_scan(scan_config, seed_phrase).await
+    let (key_source, warnings) = prepare_resume_key_source(
+        &input,
+        &state.wallet_reviews,
+        &workspace_path,
+        keying.network,
+        metadata.and_then(|m| m.match_coordinates),
+    )?;
+    for warning in warnings {
+        let _ = app.emit("sprout-forged-key", warning);
     }
-    .map_err(|err| err.to_string())?;
+    let handle = state
+        .service
+        .start_scan_from_key_source(scan_config, key_source)
+        .await
+        .map_err(|err| err.to_string())?;
 
     spawn_scan_progress_pump(app, state.service.clone(), handle.clone());
     Ok(ResumeSessionResult {
@@ -3453,6 +3506,389 @@ fn parse_zec_to_zatoshis(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{sprout_nu7_warning, summary_nu7_warning};
+
+    #[test]
+    fn resume_wallet_input_does_not_require_a_seed_phrase() {
+        let input = serde_json::from_value::<super::ResumeSessionInput>(serde_json::json!({
+            "workspace_path": "/fixture/workspace",
+            "wallet_review_id": "backend-issued-review",
+            "lightwalletd_url": "https://fixture.invalid"
+        }));
+        assert!(
+            input.is_ok(),
+            "wallet-file resume must accept the original key source"
+        );
+    }
+
+    const RESUME_SEED: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
+    fn resume_input() -> super::ResumeSessionInput {
+        serde_json::from_value(serde_json::json!({
+            "workspace_path": "/fixture/workspace",
+            "lightwalletd_url": "https://fixture.invalid"
+        }))
+        .unwrap()
+    }
+
+    fn resume_workspace(source: std::sync::Arc<dyn argos_core::KeySource>) -> std::path::PathBuf {
+        let config = argos_core::RuntimeScanConfig {
+            key_source: source,
+            birthday: 419_200,
+            num_accounts: None,
+            gap_limit: 20,
+            transparent_scan: None,
+            lightwalletd_url: "https://fixture.invalid".into(),
+            confirmation_sources: Vec::new(),
+            data_dir: unused_temp_dir("resume-no-mutations"),
+            network: argos_core::ZeckNetwork::Mainnet,
+            label: String::new(),
+        };
+        argos_core::workspace::RecoveryWorkspace::from_runtime(&config)
+            .unwrap()
+            .root()
+            .to_owned()
+    }
+
+    fn reviewed_resume_file(
+        path: &std::path::Path,
+    ) -> (super::WalletReviewRegistry, super::WalletReviewId) {
+        let reviews = super::WalletReviewRegistry::default();
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(path).unwrap();
+        let id = reviews
+            .register(
+                path.to_owned(),
+                std::sync::Arc::new(snapshot.identity().clone()),
+            )
+            .unwrap();
+        (reviews, id)
+    }
+
+    #[test]
+    fn resume_wallet_reimports_plaintext_and_encrypted_dat_without_seed() {
+        for (name, password) in [
+            ("modern-plaintext.dat", None),
+            (
+                "modern-encrypted.dat",
+                Some(SecretString::new("argos-test-passphrase".into())),
+            ),
+        ] {
+            let path = std::path::PathBuf::from(relabeled_fixture(name, "mainnet"));
+            let bytes = std::fs::read(&path).unwrap();
+            let mut keys = argos_core::import_wallet_file_for_network(
+                &bytes,
+                password.as_ref(),
+                ZeckNetwork::Mainnet,
+            )
+            .unwrap();
+            super::drop_forged_sprout_keys(&mut keys);
+            assert!(keys.mnemonic.is_none());
+            let source = std::sync::Arc::new(argos_core::ImportedKeySource::new(keys));
+            let workspace = resume_workspace(source.clone());
+            let (reviews, id) = reviewed_resume_file(&path);
+            let mut input = resume_input();
+            input.wallet_review_id = Some(id);
+            input.wallet_passphrase = password;
+            let (actual, _) = super::prepare_resume_key_source(
+                &input,
+                &reviews,
+                &workspace,
+                ZeckNetwork::Mainnet,
+                None,
+            )
+            .unwrap();
+            use argos_core::KeySource;
+            assert_eq!(actual.fingerprint().unwrap(), source.fingerprint().unwrap());
+            assert!(
+                !workspace.exists(),
+                "verification must not create scan artifacts"
+            );
+            if input.wallet_passphrase.is_some() {
+                input.wallet_passphrase = Some(SecretString::new("incorrect-password".into()));
+                assert!(super::prepare_resume_key_source(
+                    &input,
+                    &reviews,
+                    &workspace,
+                    ZeckNetwork::Mainnet,
+                    None
+                )
+                .is_err());
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn resume_wallet_refuses_wrong_source_and_changed_review_without_mutation() {
+        let path = std::path::PathBuf::from(relabeled_fixture("modern-plaintext.dat", "mainnet"));
+        let original = std::fs::read(&path).unwrap();
+        let (reviews, id) = reviewed_resume_file(&path);
+        let other_wallet =
+            std::path::PathBuf::from(relabeled_fixture("sprout-plaintext.dat", "mainnet"));
+        let other_keys = argos_core::import_wallet_file_for_network(
+            &std::fs::read(&other_wallet).unwrap(),
+            None,
+            ZeckNetwork::Mainnet,
+        )
+        .unwrap();
+        let workspace = resume_workspace(std::sync::Arc::new(argos_core::ImportedKeySource::new(
+            other_keys,
+        )));
+        // Existing scan evidence must remain byte-for-byte untouched on refusal.
+        std::fs::create_dir_all(&workspace).unwrap();
+        let wallet_db = workspace.join("wallet.sqlite");
+        std::fs::write(&wallet_db, b"existing scan evidence").unwrap();
+        let mut input = resume_input();
+        input.wallet_review_id = Some(id);
+        let error = super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &workspace,
+            ZeckNetwork::Mainnet,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("does not match the selected scan"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(&wallet_db).unwrap(),
+            b"existing scan evidence"
+        );
+        std::fs::write(&path, b"changed after review").unwrap();
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &workspace,
+            ZeckNetwork::Mainnet,
+            None
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed after review");
+        assert_eq!(
+            std::fs::read(&wallet_db).unwrap(),
+            b"existing scan evidence"
+        );
+        assert_eq!(std::fs::read_dir(&workspace).unwrap().count(), 1);
+        std::fs::remove_dir_all(super::data_dir_from_workspace(&workspace).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(other_wallet).unwrap();
+    }
+
+    #[test]
+    fn resume_address_match_preserves_seed_and_case_sensitive_bip39_passphrase() {
+        let reviews = super::WalletReviewRegistry::default();
+        let mut input = resume_input();
+        input.seed = Some(SecretString::new(RESUME_SEED.into()));
+        input.passphrase = Some(SecretString::new("CaseSensitive".into()));
+        let seed = argos_core::address_search::candidate_seed(
+            input.seed.as_ref().unwrap(),
+            input.passphrase.as_ref().unwrap(),
+        )
+        .unwrap();
+        let account = argos_core::derivation::derive_accounts_from_seed(
+            seed.expose_secret(),
+            ZeckNetwork::Mainnet,
+            1,
+        )
+        .unwrap()
+        .remove(0);
+        let coordinates = argos_core::MatchCoordinates {
+            pool: argos_core::DiscoveryPool::Transparent,
+            account: 0,
+            scope: argos_core::AddressScope::External,
+            index: 0,
+            network: ZeckNetwork::Mainnet,
+            address: account.transparent_receive_address,
+            path: account.transparent_receive_path,
+        };
+        let source = argos_core::prepare_match_recovery(
+            seed.expose_secret(),
+            ZeckNetwork::Mainnet,
+            coordinates.clone(),
+        )
+        .unwrap();
+        let workspace = resume_workspace(source);
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &workspace,
+            ZeckNetwork::Mainnet,
+            Some(coordinates.clone())
+        )
+        .is_ok());
+        input.passphrase = Some(SecretString::new("casesensitive".into()));
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &workspace,
+            ZeckNetwork::Mainnet,
+            Some(coordinates.clone())
+        )
+        .is_err());
+        input.seed = None;
+        input.passphrase = None;
+        input
+            .sapling_keys
+            .push(SecretString::new(TEST_SAPLING_KEY_MAINNET.into()));
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &workspace,
+            ZeckNetwork::Mainnet,
+            Some(coordinates)
+        )
+        .is_err());
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn resume_wallet_keeps_imported_identity_for_mnemonic_and_combined_sources() {
+        // Synthetic plaintext ZecWallet Lite file with no real wallet authority.
+        let mut bytes = 25u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&22u64.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&[0u8; 48]);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0x11u8; 32]);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        let path = unused_temp_dir("resume-zwl");
+        std::fs::write(&path, &bytes).unwrap();
+        let (reviews, id) = reviewed_resume_file(&path);
+        for with_pasted in [false, true] {
+            let mut input = resume_input();
+            input.wallet_review_id = Some(id.clone());
+            let mut keys =
+                argos_core::import_wallet_file_for_network(&bytes, None, ZeckNetwork::Mainnet)
+                    .unwrap();
+            assert!(keys.mnemonic.is_some());
+            if with_pasted {
+                input
+                    .sapling_keys
+                    .push(SecretString::new(TEST_SAPLING_KEY_MAINNET.into()));
+                let typed = super::keys_from_secret_sapling_strings(
+                    &input.sapling_keys,
+                    ZeckNetwork::Mainnet,
+                )
+                .unwrap();
+                argos_core::sapling_key::merge_standalone_sapling_keys(&mut keys, typed).unwrap();
+            }
+            let source = std::sync::Arc::new(argos_core::ImportedKeySource::new(keys));
+            let workspace = resume_workspace(source.clone());
+            let (actual, _) = super::prepare_resume_key_source(
+                &input,
+                &reviews,
+                &workspace,
+                ZeckNetwork::Mainnet,
+                None,
+            )
+            .unwrap();
+            use argos_core::KeySource;
+            assert_eq!(actual.fingerprint().unwrap(), source.fingerprint().unwrap());
+            if with_pasted {
+                input.sapling_keys.clear();
+                assert!(super::prepare_resume_key_source(
+                    &input,
+                    &reviews,
+                    &workspace,
+                    ZeckNetwork::Mainnet,
+                    None
+                )
+                .is_err());
+            }
+            assert!(!workspace.exists());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resume_accepts_original_seed_and_standalone_sapling_sources() {
+        let reviews = super::WalletReviewRegistry::default();
+        let mut input = resume_input();
+        input.seed = Some(SecretString::new(RESUME_SEED.into()));
+        let workspace = resume_workspace(std::sync::Arc::new(argos_core::SeedKeySource::new(
+            input.seed.as_ref().unwrap().clone(),
+        )));
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &workspace,
+            ZeckNetwork::Mainnet,
+            None
+        )
+        .is_ok());
+        input.seed = None;
+        input
+            .sapling_keys
+            .push(SecretString::new(TEST_SAPLING_KEY_MAINNET.into()));
+        let keys =
+            super::keys_from_secret_sapling_strings(&input.sapling_keys, ZeckNetwork::Mainnet)
+                .unwrap();
+        let workspace = resume_workspace(std::sync::Arc::new(argos_core::ImportedKeySource::new(
+            keys,
+        )));
+        assert!(super::prepare_resume_key_source(
+            &input,
+            &reviews,
+            &workspace,
+            ZeckNetwork::Mainnet,
+            None
+        )
+        .is_ok());
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn resume_rejects_missing_conflicting_and_unreviewed_sources() {
+        let reviews = super::WalletReviewRegistry::default();
+        let workspace = resume_workspace(std::sync::Arc::new(argos_core::SeedKeySource::new(
+            SecretString::new(RESUME_SEED.into()),
+        )));
+        let mut input = resume_input();
+        for source_case in 0..6 {
+            input.seed = None;
+            input.wallet_review_id = None;
+            input.wallet_passphrase = None;
+            input.passphrase = None;
+            input.sapling_keys.clear();
+            match source_case {
+                0 => {}
+                1 => {
+                    input.seed = Some(SecretString::new(RESUME_SEED.into()));
+                    input.wallet_review_id = Some(super::WalletReviewId("unissued".into()));
+                }
+                2 => input.wallet_review_id = Some(super::WalletReviewId("unissued".into())),
+                3 => input.wallet_passphrase = Some(SecretString::new("file password".into())),
+                4 => {
+                    input.seed = Some(SecretString::new(RESUME_SEED.into()));
+                    input
+                        .sapling_keys
+                        .push(SecretString::new(TEST_SAPLING_KEY_MAINNET.into()));
+                }
+                5 => {
+                    input.passphrase = Some(SecretString::new("BIP39 password".into()));
+                    input
+                        .sapling_keys
+                        .push(SecretString::new(TEST_SAPLING_KEY_MAINNET.into()));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                super::prepare_resume_key_source(
+                    &input,
+                    &reviews,
+                    &workspace,
+                    ZeckNetwork::Mainnet,
+                    None
+                )
+                .is_err(),
+                "case {source_case}"
+            );
+            assert!(!workspace.exists());
+        }
+    }
 
     fn unused_temp_dir(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("argos-{label}-{}", uuid::Uuid::new_v4()));

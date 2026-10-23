@@ -251,8 +251,8 @@ function flowHarness() {
         if (!handlers.has(type)) handlers.set(type, []);
         handlers.get(type).push(handler);
       },
-      fire(type) {
-        const results = (handlers.get(type) || []).map((handler) => handler({ target: this }));
+      fire(type, details = {}) {
+        const results = (handlers.get(type) || []).map((handler) => handler({ target: this, ...details }));
         return results.at(-1);
       },
       appendChild(child) { this.children.push(child); },
@@ -839,4 +839,145 @@ test("sweep review shows the single-operator confirmation notice", async () => {
   await h.refresh();
   assert.match(h.$("sweep-summary").textContent, /single operator/);
   assert.equal(h.$("execute-sweep").disabled, true, "review alone never executes");
+});
+
+function resumeHarness() {
+  const h = flowHarness();
+  h.context.noteUncoveredSproutKeys = summary => h.calls.push({ command: "noteSproutCaveat", summary });
+  h.context.notePartialImport = summary => h.calls.push({ command: "noteImportCaveat", summary });
+  loadFlow(h, "function invalidateScanAuthority(", "function donationParamsFromForm(");
+  loadFlow(h, "function resetRecoveryFlowState(", '$("restart-flow").addEventListener');
+  loadFlow(h, "async function startProgressListeners(", "function scanCompletionSummary(");
+  loadFlow(h, "let pendingResumeRow = null;", "const DISMISSED_SESSIONS_KEY");
+  loadFlow(h, "function openResumeModal(", "// ─── Init");
+  vm.runInContext('openResumeModal({ workspace_path: "/resumed/ws", network: "mainnet", match_coordinates: null })', h.context);
+  h.$("resume-destination-input").value = "zs-new";
+  h.$("resume-max-fee-zec").value = "0.02";
+  return h;
+}
+
+test("wallet-file resume reviews the original file and submits its authority without a seed", async () => {
+  const h = resumeHarness();
+  const original = h.context.invoke;
+  h.context.invoke = async (command, args) => {
+    if (command === "inspect_wallet_file") {
+      h.calls.push({ command, args });
+      return { review_id: "resume-wallet-review", needs_passphrase: false, transparent_only: false,
+        sprout_keys: 2, coverage_may_hide_funds: true, coverage_notice: "Partial import" };
+    }
+    return original(command, args);
+  };
+  h.$("resume-source").value = "wallet";
+  h.$("resume-wallet-path").value = "/backups/wallet.dat";
+  h.$("resume-wallet-passphrase").value = "wallet password";
+  await h.$("resume-confirm").fire("click");
+  const inspection = h.calls.find(c => c.command === "inspect_wallet_file");
+  assert.ok(inspection, "wallet file must be reviewed before resume");
+  assert.equal(inspection.args.path, "/backups/wallet.dat");
+  assert.equal(inspection.args.passphrase, "wallet password");
+  assert.equal(inspection.args.network, "mainnet");
+  const resumed = h.calls.find(c => c.command === "resume_session");
+  assert.ok(resumed);
+  assert.equal(resumed.args.input.seed, null);
+  assert.equal(resumed.args.input.wallet_review_id, "resume-wallet-review");
+  assert.equal(resumed.args.input.wallet_passphrase, "wallet password");
+  assert.equal(h.calls.find(c => c.command === "noteSproutCaveat")?.summary.sprout_keys, 2);
+  assert.equal(h.calls.find(c => c.command === "noteImportCaveat")?.summary.coverage_notice, "Partial import");
+  assert.equal(h.state.scanHandle.id, "scan-new");
+});
+
+test("a locked wallet does not start a resume and explains the password requirement", async () => {
+  const h = resumeHarness();
+  h.context.invoke = async (command, args) => {
+    h.calls.push({ command, args });
+    if (command === "validate_address") return { destination_ok: true };
+    if (command === "inspect_wallet_file") return { review_id: null, needs_passphrase: true };
+    throw new Error("must not start resume");
+  };
+  h.$("resume-source").value = "wallet";
+  h.$("resume-wallet-path").value = "/backups/wallet.dat";
+  await h.$("resume-confirm").fire("click");
+  assert.equal(h.calls.some(c => c.command === "resume_session"), false);
+  assert.match(h.$("resume-modal-status").textContent, /wallet.*password/i);
+});
+
+test("standalone Sapling resume needs no wallet file or seed and preserves key case", async () => {
+  const h = resumeHarness();
+  h.$("resume-source").value = "sapling";
+  h.$("resume-sapling-keys").value = "# backup\nSecret-Extended-Key-A\nSecret-Extended-Key-B";
+  await h.$("resume-confirm").fire("click");
+  const resumed = h.calls.find(c => c.command === "resume_session");
+  assert.ok(resumed);
+  assert.equal(resumed.args.input.seed, null);
+  assert.deepEqual(Array.from(resumed.args.input.sapling_keys), ["Secret-Extended-Key-A", "Secret-Extended-Key-B"]);
+  assert.equal(h.calls.some(c => c.command === "inspect_wallet_file"), false);
+});
+
+test("wallet-file resume abandons a late inspection after the dialog closes", async () => {
+  const h = resumeHarness();
+  const pending = deferred();
+  const original = h.context.invoke;
+  h.context.invoke = async (command, args) => command === "inspect_wallet_file" ? pending.promise : original(command, args);
+  h.$("resume-source").value = "wallet";
+  h.$("resume-wallet-path").value = "/backups/wallet.dat";
+  const attempt = h.$("resume-confirm").fire("click");
+  await new Promise(resolve => setImmediate(resolve));
+  vm.runInContext("closeResumeModal()", h.context);
+  pending.resolve({ review_id: "late", needs_passphrase: false });
+  await attempt;
+  assert.equal(h.calls.some(c => c.command === "resume_session"), false);
+});
+
+
+test("changing the resume source clears secrets and displays the matching controls", () => {
+  const h = resumeHarness();
+  h.$("resume-source").value = "wallet";
+  h.$("resume-source").fire("change");
+  assert.equal(h.$("resume-seed-fields").hidden, true);
+  assert.equal(h.$("resume-wallet-fields").hidden, false);
+  assert.equal(h.$("resume-sapling-field").hidden, false);
+  assert.equal(h.$("resume-bip39-passphrase-field").hidden, true);
+  h.$("resume-source").value = "sapling";
+  h.$("resume-source").fire("change");
+  assert.equal(h.$("resume-wallet-fields").hidden, true);
+  assert.equal(h.$("resume-sapling-field").hidden, false);
+});
+
+test("missing recovery material is refused before contacting the backend", async () => {
+  for (const source of ["wallet", "sapling"]) {
+    const h = resumeHarness();
+    h.$("resume-source").value = source;
+    await h.$("resume-confirm").fire("click");
+    assert.equal(h.calls.length, 0);
+    assert.match(h.$("resume-modal-status").textContent, source === "wallet" ? /wallet file/ : /Sapling spending keys/);
+  }
+});
+
+test("editing resume credentials invalidates an in-flight wallet inspection", async () => {
+  for (const field of ["resume-wallet-path", "resume-wallet-passphrase", "resume-sapling-keys", "resume-destination-input"]) {
+    const h = resumeHarness();
+    const pending = deferred();
+    const original = h.context.invoke;
+    h.context.invoke = async (command, args) => command === "inspect_wallet_file" ? pending.promise : original(command, args);
+    h.$("resume-source").value = "wallet";
+    h.$("resume-wallet-path").value = "/old-wallet.dat";
+    const attempt = h.$("resume-confirm").fire("click");
+    await new Promise(resolve => setImmediate(resolve));
+    h.$(field).value = "new value";
+    h.$(field).fire("input");
+    pending.resolve({ review_id: "old-wallet-review", needs_passphrase: false });
+    await attempt;
+    assert.equal(h.calls.some(c => c.command === "resume_session"), false, field);
+    assert.equal(h.$("resume-confirm").disabled, false, field);
+  }
+});
+
+
+test("Escape closes the resume dialog and invalidates the pending attempt", () => {
+  const h = resumeHarness();
+  let stopped = false;
+  h.$("resume-modal").fire("keydown", { key: "Escape", stopPropagation() { stopped = true; } });
+  assert.equal(h.$("resume-modal").hidden, true);
+  assert.equal(stopped, true);
+  assert.equal(vm.runInContext("pendingResumeRow", h.context), null);
 });

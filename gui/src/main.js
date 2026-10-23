@@ -465,7 +465,7 @@ function clearTransientSecrets({ abandonWallet = false } = {}) {
   cancelWalletReviewExpiry();
   for (const id of [
     "seed-input", "wallet-passphrase", "sapling-scan-keys", "sprout-scan-keys",
-    "resume-seed-input", "resume-bip39-passphrase",
+    "resume-seed-input", "resume-bip39-passphrase", "resume-wallet-passphrase", "resume-sapling-keys",
   ]) {
     const input = $(id);
     if (input) input.value = "";
@@ -4490,6 +4490,12 @@ function openResumeModal(row) {
   pendingResumeRow = row;
   $("resume-confirm").disabled = false;
   $("resume-modal-title").textContent = `Resume "${row.label || "(unlabeled scan)"}"`;
+  $("resume-source").value = "seed";
+  $("resume-source").disabled = !!row.match_coordinates;
+  $("resume-wallet-path").value = "";
+  $("resume-wallet-passphrase").value = "";
+  $("resume-sapling-keys").value = "";
+  syncResumeSourceControls();
   $("resume-seed-input").value = "";
   $("resume-seed-input").classList.add("masked");
   $("resume-seed-visibility").checked = false;
@@ -4516,11 +4522,74 @@ function closeResumeModal() {
   $("resume-max-fee-zec").value = "";
 }
 
+function syncResumeSourceControls() {
+  const source = $("resume-source").value;
+  $("resume-seed-fields").hidden = source !== "seed";
+  $("resume-wallet-fields").hidden = source !== "wallet";
+  $("resume-sapling-field").hidden = source === "seed";
+  $("resume-bip39-passphrase-field").hidden = source !== "seed" || !pendingResumeRow?.match_coordinates;
+}
+
+function resumeSourceInput() {
+  const source = $("resume-source").value;
+  if (source === "seed") {
+    const seed = $("resume-seed-input").value.trim().toLowerCase();
+    if (!seed) throw new Error("Enter the seed phrase to continue.");
+    return { seed, passphrase: passphraseForResumedSession(pendingResumeRow, $("resume-bip39-passphrase").value),
+      walletPath: null, walletPassphrase: null, saplingKeys: [] };
+  }
+  if (source !== "wallet" && source !== "sapling") throw new Error("Choose the original recovery source.");
+  const walletPath = source === "wallet" ? $("resume-wallet-path").value.trim() : null;
+  if (source === "wallet" && !walletPath) throw new Error("Choose the original wallet file to continue.");
+  const saplingKeys = $("resume-sapling-keys").value.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith("#"));
+  if (source === "sapling" && !saplingKeys.length) throw new Error("Enter the original Sapling spending keys to continue.");
+  return { seed: null, passphrase: null, walletPath,
+    walletPassphrase: source === "wallet" ? $("resume-wallet-passphrase").value || null : null, saplingKeys };
+}
+
+$("resume-source").addEventListener("change", () => {
+  ++resumeGeneration;
+  clearTransientSecrets();
+  syncResumeSourceControls();
+  $("resume-confirm").disabled = false;
+});
+
+function invalidateResumeAttempt() {
+  ++resumeGeneration;
+  if (pendingResumeRow) $("resume-confirm").disabled = false;
+}
+
+for (const id of [
+  "resume-seed-input", "resume-bip39-passphrase", "resume-wallet-path",
+  "resume-wallet-passphrase", "resume-sapling-keys", "resume-destination-input",
+  "resume-memo-input", "resume-max-fee-zec", "resume-label-input", "resume-confirmation-sources",
+]) {
+  for (const event of ["input", "change"]) $(id).addEventListener(event, invalidateResumeAttempt);
+}
+
+$("resume-wallet-pick").addEventListener("click", async () => {
+  const generation = resumeGeneration;
+  try {
+    const path = await invoke("pick_wallet_file");
+    if (generation !== resumeGeneration || !pendingResumeRow || !path) return;
+    $("resume-wallet-path").value = path;
+    invalidateResumeAttempt();
+  } catch (err) {
+    if (generation === resumeGeneration && pendingResumeRow) setStatus("resume-modal-status", `Could not choose wallet file: ${err}`, "error");
+  }
+});
+
 function passphraseForResumedSession(row, value) {
   return row.match_coordinates ? value : null;
 }
 
 $("resume-cancel").addEventListener("click", closeResumeModal);
+$("resume-modal").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.stopPropagation();
+    closeResumeModal();
+  }
+});
 $("resume-seed-visibility").addEventListener("change", () => {
   $("resume-seed-input").classList.toggle("masked", !$("resume-seed-visibility").checked);
 });
@@ -4539,9 +4608,11 @@ $("resume-confirm").addEventListener("click", async () => {
   const scanGeneration = state.scanAuthorityGeneration;
   const isCurrent = () => generation === resumeGeneration && pendingResumeRow === row &&
     scanGeneration === state.scanAuthorityGeneration;
-  const seed = $("resume-seed-input").value.trim().toLowerCase();
-  if (!seed) {
-    setStatus("resume-modal-status", "Enter the seed phrase to continue.", "error");
+  let source;
+  try {
+    source = resumeSourceInput();
+  } catch (err) {
+    setStatus("resume-modal-status", err.message, "error");
     return;
   }
   const destination = $("resume-destination-input").value.trim();
@@ -4568,22 +4639,37 @@ $("resume-confirm").addEventListener("click", async () => {
     return;
   }
   const labelOverride = $("resume-label-input").value.trim();
-  const passphrase = passphraseForResumedSession(
-    row,
-    $("resume-bip39-passphrase").value,
-  );
   const lightwalletdUrl = SERVER_PRESETS[row.network] ?? SERVER_PRESETS.mainnet;
 
   $("resume-confirm").disabled = true;
-  setStatus("resume-modal-status", "Verifying seed and resuming…", "");
+  setStatus("resume-modal-status", "Verifying recovery source and resuming…", "");
   try {
-    // Resume is seed-only, so it always runs the shielded block sync.
-    showScanWarning("shielded");
+    let walletReviewId = null;
+    let walletSummary = null;
+    let transparentOnly = false;
+    if (source.walletPath) {
+      const summary = await invoke("inspect_wallet_file", {
+        path: source.walletPath,
+        passphrase: source.walletPassphrase,
+        network: row.network,
+        dataDir: null,
+      });
+      if (!isCurrent()) return;
+      if (summary.needs_passphrase) throw new Error("Enter the correct wallet encryption password to unlock this file.");
+      if (!summary.review_id) throw new Error("This wallet file contains no recoverable keys.");
+      walletReviewId = summary.review_id;
+      walletSummary = summary;
+      transparentOnly = summary.transparent_only && !source.saplingKeys.length;
+    }
+    showScanWarning(transparentOnly ? "transparent-only" : "shielded");
     const resumed = await invoke("resume_session", {
       input: {
         workspace_path: row.workspace_path,
-        seed,
-        passphrase,
+        seed: source.seed,
+        passphrase: source.passphrase,
+        wallet_review_id: walletReviewId,
+        wallet_passphrase: source.walletPassphrase,
+        sapling_keys: source.saplingKeys,
         lightwalletd_url: lightwalletdUrl,
         confirmation_sources: confirmationSourcesFromForm("resume-confirmation-sources"),
         label: labelOverride || null,
@@ -4594,6 +4680,10 @@ $("resume-confirm").addEventListener("click", async () => {
       return;
     }
     resetRecoveryFlowState({ destination, memo, maxFeeZec });
+    if (walletSummary) {
+      noteUncoveredSproutKeys(walletSummary);
+      notePartialImport(walletSummary);
+    }
     state.scanConfig = {
       network: resumed.network,
       data_dir: resumed.data_dir,
