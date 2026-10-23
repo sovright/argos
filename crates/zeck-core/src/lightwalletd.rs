@@ -44,6 +44,10 @@ pub(crate) fn is_transient_network_error(msg: &str) -> bool {
         "connection refused",
         "connection reset",
         "broken pipe",
+        // Hyper can cancel an in-flight request when its connection closes.
+        // Match that transport cause, not cancellation messages generally:
+        // a user cancellation or closed wallet DB must remain terminal.
+        r#"hyper::error(canceled, "connection closed")"#,
         // A batch that never committed within its budget. Retrying reconnects
         // and restarts the batch, which is the right move for a hung stream
         // and harmless (if wasteful) for a merely slow one.
@@ -1008,6 +1012,30 @@ mod tests {
             "tcp connect error: Connection refused"
         ));
         assert!(is_transient_network_error("Connection reset by peer"));
+    }
+
+    #[test]
+    fn retries_reported_hyper_canceled_connection_closure() {
+        // A transport cancellation is not a user cancellation. This exact
+        // failure used to bypass reconnection and terminate a recovery scan.
+        let reported_error = r#"wallet error: synchronizing wallet workspace: Error while communicating with lightwalletd server: code: 'The operation was cancelled', message: "operation was canceled", source: tonic::transport::Error(Transport, hyper::Error(Canceled, "connection closed"))"#;
+        assert!(super::is_transient_network_error(reported_error));
+    }
+
+    #[test]
+    fn does_not_retry_cancellation_or_wallet_connection_closure() {
+        for error in [
+            crate::error::ZeckError::Cancelled.to_string(),
+            tonic::Status::cancelled("operation was canceled").to_string(),
+            tonic::Status::cancelled("operation was cancelled").to_string(),
+            crate::error::ZeckError::Wallet("database connection closed".to_owned()).to_string(),
+            r#"hyper::Error(Canceled, "request canceled")"#.to_owned(),
+        ] {
+            assert!(
+                !super::is_transient_network_error(&error),
+                "must not retry: {error}"
+            );
+        }
     }
 
     #[test]
