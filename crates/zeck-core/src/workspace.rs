@@ -1385,7 +1385,7 @@ pub fn verify_key_source_for_workspace(
 
     if expected_id != path_id {
         return Err(ZeckError::InvalidConfig(
-            "this seed phrase does not match the selected scan".to_owned(),
+            "this recovery source does not match the selected scan; use the original seed phrase, wallet file, or complete set of spending keys".to_owned(),
         ));
     }
     Ok(())

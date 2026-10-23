@@ -53,6 +53,11 @@
   box-sizing: border-box;
 }
 
+/* Layout classes must not reveal conditionally hidden controls. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -353,6 +358,10 @@ input {
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid var(--line);
   border-radius: 16px;
+}
+
+input[type="range"] {
+  margin: 0;
 }
 
 textarea {
@@ -1023,7 +1032,8 @@ select {
   margin-top: 32px;
 }
 
-/* Resume modal */
+/* Shared resume and address-matcher dialogs. Keep tall content inside the
+   viewport so the first fields and dismiss actions remain reachable. */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -1047,6 +1057,8 @@ select {
   padding: 24px;
   max-width: 560px;
   width: 100%;
+  max-height: 100%;
+  overflow-y: auto;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2);
 }
 
@@ -1164,8 +1176,6 @@ select {
 .address-search-card {
   width: min(920px, 100%);
   max-width: 920px;
-  max-height: calc(100vh - 40px);
-  overflow-y: auto;
   border-radius: 22px;
   padding: 28px;
 }
@@ -1253,7 +1263,7 @@ select {
 .search-outcome h3 { margin-bottom: 5px; }
 .search-outcome p { margin: 0; }
 
-@media (max-width: 760px) {
+@media (max-width: 880px) {
   .address-search-entry,
   .section-title-row { align-items: stretch; flex-direction: column; }
   .candidate-seed,

@@ -170,7 +170,7 @@
               <h3>Step 4 — Scan</h3>
               <p>Argos first probes transparent UTXOs (results appear within seconds), then syncs all shielded compact blocks. Seed recovery covers transparent, Sapling, and Orchard; a seedless imported wallet covers its transparent and Sapling keys. Sprout is recovered separately so an ordinary total is never presented as the whole wallet.</p>
               <p class="guide-tip">Scans can take anywhere from a few minutes (recent birthday) to several hours (birthday near Sapling activation in 2018). The ETA warms up after about 15 seconds.</p>
-              <p>You can cancel and resume at any time. Re-run Argos with the same seed, network, birthday, and account settings to pick up from the last saved block.</p>
+              <p>You can cancel and resume at any time. Re-run Argos with the same recovery source, network, birthday, and account settings to pick up from the last saved block. Older workspaces without the current storage protections are preserved but require a fresh scan in a new data directory. Keep the old data and reconcile pending transactions before recovering those funds again.</p>
             </div>
 
             <div class="guide-section">
@@ -915,25 +915,52 @@
       </main>
     </div>
 
-    <div id="resume-modal" class="modal-overlay" hidden>
+    <div id="resume-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="resume-modal-title" hidden>
       <div class="modal-card">
         <p class="eyebrow">Resume scan</p>
         <h2 id="resume-modal-title">Resume scan</h2>
         <p class="lead">
-          Enter the seed phrase that this scan was started with. Argos verifies it matches
-          before unlocking the saved scan data.
+          Supply the original recovery source. Argos verifies that its keys match the saved
+          scan before resuming. Wallet files do not require a seed phrase.
         </p>
         <label class="field">
-          <span>Seed phrase</span>
-          <textarea id="resume-seed-input" rows="4" class="masked"></textarea>
+          <span>Original recovery source</span>
+          <select id="resume-source">
+            <option value="">Choose the original recovery source…</option>
+            <option value="seed">Seed phrase</option>
+            <option value="wallet">Wallet file (wallet.dat or ZecWallet Lite)</option>
+            <option value="sapling">Sapling spending keys</option>
+          </select>
         </label>
-        <div class="inline-actions">
-          <label class="checkline">
-            <input type="checkbox" id="resume-seed-visibility" />
-            <span>Show words on screen</span>
+        <div id="resume-seed-fields">
+          <label class="field">
+            <span>Seed phrase</span>
+            <textarea id="resume-seed-input" rows="4" class="masked"></textarea>
           </label>
-          <button class="ghost" id="resume-seed-clear-clipboard" type="button" title="Overwrite the OS clipboard with empty text. Does not clear clipboard-history apps.">Clear clipboard</button>
+          <div class="inline-actions">
+            <label class="checkline">
+              <input type="checkbox" id="resume-seed-visibility" />
+              <span>Show words on screen</span>
+            </label>
+            <button class="ghost" id="resume-seed-clear-clipboard" type="button" title="Overwrite the OS clipboard with empty text. Does not clear clipboard-history apps.">Clear clipboard</button>
+          </div>
         </div>
+        <div id="resume-wallet-fields" hidden>
+          <label class="field">
+            <span>Original wallet file</span>
+            <input id="resume-wallet-path" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+          <button class="secondary" id="resume-wallet-pick" type="button">Choose wallet file…</button>
+          <label class="field">
+            <span>Wallet encryption password (if encrypted)</span>
+            <input id="resume-wallet-passphrase" type="password" autocomplete="off" />
+          </label>
+        </div>
+        <label class="field" id="resume-sapling-field" hidden>
+          <span>Sapling spending keys</span>
+          <textarea id="resume-sapling-keys" rows="3" autocomplete="off" spellcheck="false" class="masked"></textarea>
+          <small>Use the same keys in the same order as the original scan, one per line. For a wallet file, include the same additional Sapling keys in their original order.</small>
+        </label>
         <label class="field" id="resume-bip39-passphrase-field" hidden>
           <span>BIP39 passphrase (if used)</span>
           <input id="resume-bip39-passphrase" type="password" autocomplete="off" spellcheck="false" />

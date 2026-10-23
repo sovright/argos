@@ -88,6 +88,20 @@ argos --wallet-file /path/to/wallet.dat sweep --destination u1... --dry-run
 argos --wallet-file /path/to/wallet.dat sweep --destination u1... --confirm-sweep
 ```
 
+## Smaller compact-block batches
+
+Starting with 1.5.5, both executables accept `--scan-batch-size`. To reduce
+regular compact-block batches from the default 1,000 blocks to 100:
+
+```sh
+argos-gui --verbose --scan-batch-size 100
+```
+
+For the CLI, add `--scan-batch-size 100` to your existing `argos ... scan`
+command. The effective size is clamped to 10–10,000 blocks. Smaller batches
+use less memory and commit progress more frequently, with more server requests.
+The desktop app does not currently expose this control in its settings.
+
 ## Automatic transparent address coverage
 
 Ordinary seed recovery checks account 0 receive indices **0–999** in addition

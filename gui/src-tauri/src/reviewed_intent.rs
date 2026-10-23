@@ -175,6 +175,15 @@ impl WalletReviewRegistry {
             .ok_or_else(|| "unknown or expired wallet review; inspect the wallet again".to_owned())
     }
 
+    /// Release a finished or abandoned inspection without disturbing other
+    /// reviews of the same wallet. Repeated cleanup and expired IDs are harmless.
+    pub fn release(&self, id: &WalletReviewId) -> Result<(), String> {
+        let mut inner = self.lock()?;
+        Self::sweep_expired(&mut inner);
+        inner.reviews.remove(id);
+        Ok(())
+    }
+
     pub fn verify(
         &self,
         id: &WalletReviewId,
@@ -1809,6 +1818,43 @@ mod tests {
     }
 
     #[test]
+    fn wallet_review_release_revokes_only_the_requested_capability() {
+        let registry = WalletReviewRegistry::default();
+        let (dir, path, released) = reviewed_wallet(&registry, b"wallet");
+        let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
+        let retained = registry
+            .register(path, Arc::new(snapshot.identity().clone()))
+            .unwrap();
+        let source = registry.resolve(&released).unwrap();
+        let weak = Arc::downgrade(&source);
+        drop(source);
+
+        registry.release(&released).unwrap();
+
+        assert!(registry.resolve(&released).is_err());
+        assert!(
+            weak.upgrade().is_none(),
+            "released registry owner was dropped"
+        );
+        assert!(registry.verify(&retained).is_ok());
+        registry.release(&released).unwrap();
+        assert!(registry.verify(&retained).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wallet_review_release_accepts_expired_and_unissued_ids() {
+        let registry = WalletReviewRegistry::with_ttl(Duration::ZERO);
+        let (dir, _path, id) = reviewed_wallet(&registry, b"wallet");
+        registry.release(&id).unwrap();
+        registry
+            .release(&WalletReviewId("unissued".to_owned()))
+            .unwrap();
+        assert!(registry.resolve(&id).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn changed_wallet_revokes_matching_review_id() {
         let registry = WalletReviewRegistry::default();
         let (dir, path, id) = reviewed_wallet(&registry, b"wallet-A");
@@ -1870,8 +1916,15 @@ mod tests {
         std::fs::write(&path, b"overflow").unwrap();
         let snapshot = argos_core::wallet_file::read_wallet_snapshot(&path).unwrap();
         assert!(registry
-            .register(path, Arc::new(snapshot.identity().clone()))
+            .register(path.clone(), Arc::new(snapshot.identity().clone()))
             .is_err());
+        registry.release(&roots[0].2).unwrap();
+        assert!(
+            registry
+                .register(path, Arc::new(snapshot.identity().clone()))
+                .is_ok(),
+            "explicit release reclaims registry capacity"
+        );
         for (dir, _, _) in roots {
             std::fs::remove_dir_all(dir).unwrap();
         }
