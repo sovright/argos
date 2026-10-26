@@ -92,6 +92,8 @@ function driveHandler(name, boxText, report) {
     // Reviewed-intent state the handlers read (#271). The scan panel holds
     // a completed scan and a proposal reviewed for this destination.
     sproutScanHandle: null,
+    sproutScanRetryHandle: null,
+    sproutScanPausePromise: Promise.resolve(),
     sproutScanGeneration: 0,
     sproutScanResult: null,
     sproutScanReview: null,

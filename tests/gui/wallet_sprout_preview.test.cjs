@@ -80,6 +80,12 @@ function harness(intercept = (_, __, fallback) => fallback()) {
   let nextTimerId = 1;
   let onProgress;
   let failStatus = false;
+  // Listeners register before this harness loads the complete scan panel.
+  // Keep their callback pointed at the real implementation once it is loaded.
+  function initialScanInvalidation(options) {
+    const current = context.invalidateSproutScanSource;
+    if (current !== initialScanInvalidation) return current(options);
+  }
   const context = vm.createContext({
     listen: async (name, callback) => { assert.equal(name, "sprout-sweep-progress"); onProgress = callback; },
     $, document: { createElement: element, dispatchEvent() {} },
@@ -104,7 +110,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
       if (failStatus) { failStatus = false; throw new Error("fixture DOM failure"); }
       $(id).textContent = text;
     },
-    invalidateSproutScanSource() {},
+    invalidateSproutScanSource: initialScanInvalidation,
     invoke: (command, args) => {
       const result = intercept(command, args, async () => {
       if (command === "inspect_wallet_file") return {
@@ -2031,4 +2037,97 @@ test("a malformed scan peer does not fail the preview; the backend warns and the
   await flush();
   assert.equal("execute_wallet_sprout_sweep" in seen, false);
   assert.match(h.$("sprout-sweep-status").textContent, /no-port-here.*host:port/);
+});
+
+function retryScanHarness({ rejectFirstStart = false, rejectSnapshot = false } = {}) {
+  const calls = [];
+  let serial = 0;
+  const h = harness(async (command, args, fallback) => {
+    if (["start_sprout_scan", "retry_sprout_scan", "pause_sprout_scan", "release_sprout_scan"].includes(command)) {
+      calls.push({ command, args: JSON.parse(JSON.stringify(args)) });
+      if (command === "start_sprout_scan" && rejectFirstStart) throw new Error("checkpoint unavailable");
+      if (command === "start_sprout_scan" || command === "retry_sprout_scan") return `retry-fixture-${++serial}`;
+      return null;
+    }
+    if (command === "get_sprout_scan") {
+      if (rejectSnapshot) throw new Error("snapshot unavailable");
+      return { handle: args.handle, status: "failed", report: null, error: "peer timeout" };
+    }
+    return fallback();
+  });
+  h.loadScanPanel();
+  h.$("sprout-scan-peers").value = "192.0.2.7:8233";
+  return { h, calls };
+}
+
+test("an encrypted wallet retries a failed Sprout scan without reopening or resending secrets", async () => {
+  const { h, calls } = retryScanHarness();
+  await h.open("/fixture/encrypted.dat", "synthetic passphrase");
+  await h.scan();
+  assert.equal(h.peek("walletFile.passphrase"), null);
+  assert.equal(h.$("wallet-passphrase").value, "");
+  await h.scan();
+  const starts = calls.filter(({ command }) => command === "start_sprout_scan");
+  const retries = calls.filter(({ command }) => command === "retry_sprout_scan");
+  assert.equal(starts.length, 1, "retry must not reopen the encrypted file");
+  assert.equal(retries.length, 1);
+  assert.deepEqual(retries[0].args, { handle: "retry-fixture-1", peers: ["192.0.2.7:8233"] });
+  assert.equal(h.peek("sproutScanHandle"), "retry-fixture-2");
+});
+
+test("a pasted Sprout key can retry after plaintext inputs have been cleared", async () => {
+  const { h, calls } = retryScanHarness();
+  h.$("sprout-scan-keys").value = "SK-synthetic-fixture";
+  await h.scan();
+  assert.equal(h.$("sprout-scan-keys").value, "");
+  assert.equal(h.peek("walletFile"), null);
+  await h.scan();
+  assert.equal(calls.filter(({ command }) => command === "retry_sprout_scan").length, 1);
+  assert.equal(h.peek("sproutScanHandle"), "retry-fixture-2");
+});
+
+test("editing peers pauses a Sprout scan and retries its retained source with the new peers", async () => {
+  const { h, calls } = retryScanHarness();
+  await h.open("/fixture/encrypted.dat", "synthetic passphrase");
+  await h.scan();
+  h.edit("sprout-scan-peers", "192.0.2.8:8233");
+  await flush();
+  assert.ok(calls.some(({ command, args }) => command === "pause_sprout_scan" && args.handle === "retry-fixture-1"));
+  assert.equal(calls.filter(({ command }) => command === "release_sprout_scan").length, 0);
+  assert.equal(h.peek("sproutScanHandle"), null, "old results lose display authority");
+  await h.scan();
+  assert.deepEqual(calls.find(({ command }) => command === "retry_sprout_scan").args,
+    { handle: "retry-fixture-1", peers: ["192.0.2.8:8233"] });
+});
+
+test("changing the Sprout key source releases the retained retry source", async () => {
+  const { h, calls } = retryScanHarness();
+  h.$("sprout-scan-keys").value = "SK-first-fixture";
+  await h.scan();
+  h.edit("sprout-scan-keys", "SK-second-fixture");
+  await h.scan();
+  assert.ok(calls.some(({ command, args }) => command === "release_sprout_scan" && args.handle === "retry-fixture-1"));
+  assert.equal(calls.filter(({ command }) => command === "retry_sprout_scan").length, 0);
+  assert.equal(calls.filter(({ command }) => command === "start_sprout_scan").length, 2);
+});
+
+test("a rejected Sprout start retains unaccepted wallet credentials for a corrected retry", async () => {
+  const { h } = retryScanHarness({ rejectFirstStart: true });
+  await h.open("/fixture/encrypted.dat", "synthetic passphrase");
+  const timers = [...h.timers.keys()];
+  await h.scan();
+  assert.match(h.$("sprout-scan-status").textContent, /checkpoint unavailable/);
+  assert.equal(h.peek("walletFile.passphrase"), "synthetic passphrase");
+  assert.equal(h.$("wallet-passphrase").value, "synthetic passphrase");
+  assert.ok(timers.some((id) => !h.timers.get(id).cleared), "rejection must not cancel the original expiry");
+});
+
+test("a lost Sprout completion channel pauses the accepted scan without discarding retry authority", async () => {
+  const { h, calls } = retryScanHarness({ rejectSnapshot: true });
+  h.$("sprout-scan-keys").value = "SK-synthetic-fixture";
+  await h.scan();
+  await flush();
+  assert.ok(calls.some(({ command }) => command === "pause_sprout_scan"));
+  await h.scan();
+  assert.equal(calls.filter(({ command }) => command === "retry_sprout_scan").length, 1);
 });

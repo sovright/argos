@@ -72,9 +72,9 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
     invoke: (command, args) => {
       calls.push({ command, args });
       return intercept(command, args, async () => {
-        if (command === "start_sprout_scan") return `scan-${++nextHandle}`;
+        if (command === "start_sprout_scan" || command === "retry_sprout_scan") return `scan-${++nextHandle}`;
         if (command === "get_sprout_scan") return { handle: args.handle, status: "running", report: null, error: null };
-        if (command === "release_sprout_scan" || command === "release_sprout_proposal") return null;
+        if (command === "release_sprout_scan" || command === "pause_sprout_scan" || command === "release_sprout_proposal") return null;
         if (command === "propose_sprout_scan_sweep") return review(`proposal-${args.scanHandle}`);
         if (command === "execute_sprout_scan_sweep") return lifecycle([]);
         throw new Error(`Unexpected IPC command: ${command}`);
@@ -429,4 +429,60 @@ test("an earlier fresh-mined result cannot clear or relabel the current Sprout s
   assert.equal(h.$("sprout-scan-sweep-run").textContent, currentAction);
   assert.equal(h.peek("sproutScanHandle"), null);
   assert.equal(h.peek("sproutScanReview"), null);
+});
+
+test("a peer edit during retry keeps only the rotated source and rejects stale results", async () => {
+  const pending = deferred();
+  let retries = 0;
+  const h = harness((command, args, fallback) => {
+    if (command === "retry_sprout_scan" && ++retries === 1) return pending.promise;
+    if (command === "retry_sprout_scan") return "scan-current";
+    return fallback();
+  });
+  await h.scan();
+  const retrying = h.scan();
+  await flush();
+  h.edit("sprout-scan-peers", "192.0.2.8:8233");
+  pending.resolve("scan-rotated");
+  await retrying;
+  await flush();
+  assert.equal(h.peek("sproutScanHandle"), null);
+  assert.equal(h.peek("sproutScanRetryHandle"), "scan-rotated");
+  assert.ok(h.calls.some(({ command, args }) => command === "pause_sprout_scan" && args.handle === "scan-rotated"));
+  h.emit("sprout-scan-complete", { handle: "scan-rotated", status: "completed", report: report(9), error: null });
+  assert.equal(h.$("sprout-scan-sweep").hidden, true);
+  await h.scan();
+  const latest = h.calls.filter(({ command }) => command === "retry_sprout_scan").at(-1);
+  assert.equal(latest.args.handle, "scan-rotated");
+  assert.deepEqual([...latest.args.peers], ["192.0.2.8:8233"]);
+  assert.equal(h.peek("sproutScanHandle"), "scan-current");
+});
+
+test("a key change during retry releases the rotated source instead of adopting it", async () => {
+  const pending = deferred();
+  const h = harness((command, args, fallback) => command === "retry_sprout_scan" ? pending.promise : fallback());
+  await h.scan();
+  const retrying = h.scan();
+  await flush();
+  h.edit("sprout-scan-keys", "SK-different-source");
+  pending.resolve("scan-obsolete");
+  await retrying;
+  await flush();
+  assert.equal(h.peek("sproutScanHandle"), null);
+  assert.equal(h.peek("sproutScanRetryHandle"), null);
+  assert.ok(h.calls.some(({ command, args }) => command === "release_sprout_scan" && args.handle === "scan-obsolete"));
+});
+
+test("a malformed peer edit does not discard retained Sprout retry keys", async () => {
+  const h = harness();
+  await h.scan();
+  h.edit("sprout-scan-peers", "missing-port");
+  await flush();
+  await h.scan();
+  assert.match(h.$("sprout-scan-status").textContent, /host:port/);
+  assert.equal(h.peek("sproutScanRetryHandle"), "scan-1");
+  assert.equal(h.calls.filter(({ command }) => command === "release_sprout_scan").length, 0);
+  h.edit("sprout-scan-peers", "192.0.2.8:8233");
+  await h.scan();
+  assert.equal(h.calls.filter(({ command }) => command === "retry_sprout_scan").length, 1);
 });

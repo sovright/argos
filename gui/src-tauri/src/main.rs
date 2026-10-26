@@ -106,6 +106,8 @@ fn main() {
             commands::check_sprout_key,
             commands::check_sapling_key,
             commands::start_sprout_scan,
+            commands::retry_sprout_scan,
+            commands::pause_sprout_scan,
             commands::get_sprout_scan,
             commands::release_sprout_scan,
             commands::release_sprout_proposal,

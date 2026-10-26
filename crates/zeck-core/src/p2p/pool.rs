@@ -45,7 +45,7 @@ const MAINNET_SEEDS: &[&str] = &[
     "dnsseed.str4d.xyz:8233",
 ];
 
-/// Public Zcash nodes operated by Sovright, tried after the DNS seeds.
+/// Public Zcash nodes operated by Sovright, tried after sampling the DNS seeds.
 ///
 /// # Why these exist
 ///
@@ -375,8 +375,10 @@ fn is_timeout(err: &PeerError) -> bool {
 
 /// Connect to any usable peer on `network`, trying candidates in batches.
 ///
-/// `extra` is tried first, so a caller with a known-good node (or a regtest
-/// instance) never depends on the seeds at all.
+/// `extra` gets its own priority batches before DNS is resolved. Each of the
+/// custom and public tiers gets at most `max_rounds.max(1)` batches of twelve
+/// distinct addresses. Mainnet operator fallbacks get a final separate batch,
+/// so a large DNS response cannot crowd them out of the bounded public sample.
 pub async fn connect_to_any(
     network: P2pNetwork,
     extra: &[String],
@@ -397,34 +399,117 @@ pub async fn connect_to_any_except(
     excluded: &[String],
     max_rounds: usize,
 ) -> Result<Peer, PoolError> {
-    let mut candidates: Vec<String> = extra.to_vec();
-    if !matches!(network, P2pNetwork::Regtest) {
-        candidates.extend(resolve_seeds(network).await?);
-    }
-    candidates.retain(|candidate| !excluded.contains(candidate));
+    let fallback = if matches!(network, P2pNetwork::Mainnet) {
+        SOVRIGHT_MAINNET_NODES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    connect_with_resolver(network, extra, excluded, max_rounds, &fallback, async {
+        if matches!(network, P2pNetwork::Regtest) {
+            Ok(Vec::new())
+        } else {
+            resolve_seeds(network).await
+        }
+    })
+    .await
+}
 
+async fn connect_with_resolver(
+    network: P2pNetwork,
+    extra: &[String],
+    excluded: &[String],
+    max_rounds: usize,
+    fallback: &[String],
+    resolve: impl std::future::Future<Output = Result<Vec<String>, PoolError>>,
+) -> Result<Peer, PoolError> {
+    // The same address may arrive through custom input, several seeds, and
+    // the fallback list. Keep its first (custom) spelling for peer notices,
+    // but never open two sockets or bypass an exclusion by changing case or
+    // the textual representation of an IP address.
+    let mut seen = excluded
+        .iter()
+        .map(|addr| candidate_identity(addr))
+        .collect();
     let mut tried = 0;
     let mut tally = FailureTally::default();
+    let tier_limit = max_rounds.max(1).saturating_mul(CONCURRENT_ATTEMPTS);
+    let custom = unique_candidates(extra, &mut seen, tier_limit);
+    if let Some(peer) = race_tier(&custom, network, max_rounds, &mut tried, &mut tally).await {
+        return Ok(peer);
+    }
 
+    // A working custom node must not wait on public DNS. If DNS fails after
+    // the custom tier failed, the mainnet fallback can still be reached.
+    let seeded = match resolve.await {
+        Ok(seeded) => seeded,
+        Err(err) if fallback.is_empty() => return Err(err),
+        Err(_) => Vec::new(),
+    };
+    let fallback_ids: BTreeSet<_> = fallback
+        .iter()
+        .map(|addr| candidate_identity(addr))
+        .collect();
+    let public: Vec<_> = seeded
+        .into_iter()
+        .filter(|addr| !fallback_ids.contains(&candidate_identity(addr)))
+        .collect();
+    let public = unique_candidates(&public, &mut seen, tier_limit);
+    if let Some(peer) = race_tier(&public, network, max_rounds, &mut tried, &mut tally).await {
+        return Ok(peer);
+    }
+
+    let fallback = unique_candidates(fallback, &mut seen, CONCURRENT_ATTEMPTS);
+    if let Some(peer) = race_tier(&fallback, network, 1, &mut tried, &mut tally).await {
+        return Ok(peer);
+    }
+    Err(tally.into_error(tried))
+}
+
+fn candidate_identity(addr: &str) -> String {
+    addr.parse::<std::net::SocketAddr>()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| addr.to_ascii_lowercase())
+}
+
+fn unique_candidates(
+    candidates: &[String],
+    seen: &mut BTreeSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|addr| seen.insert(candidate_identity(addr)))
+        // Reserve only addresses that this tier can actually schedule. An
+        // untried custom entry past the cap may also be the operator fallback.
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+async fn race_tier(
+    candidates: &[String],
+    network: P2pNetwork,
+    max_rounds: usize,
+    tried: &mut usize,
+    tally: &mut FailureTally,
+) -> Option<Peer> {
     // Each round takes a *fresh* slice of candidates rather than retrying the
     // ones that just refused: a peer that refused seconds ago will refuse for
     // the next two minutes regardless of why, so re-dialling it wastes the
     // round.
-    for round in 0..max_rounds.max(1) {
-        let start = round * CONCURRENT_ATTEMPTS;
-        let Some(batch) = candidates.get(start..) else {
-            break;
-        };
-        if batch.is_empty() {
-            break;
-        }
-        let batch = &batch[..batch.len().min(CONCURRENT_ATTEMPTS)];
-        tried += batch.len();
+    for batch in candidates
+        .chunks(CONCURRENT_ATTEMPTS)
+        .take(max_rounds.max(1))
+    {
+        *tried += batch.len();
 
         let (peer, failures) = race_batch(batch, network).await;
         tally.absorb(failures);
         if let Some(peer) = peer {
-            return Ok(peer);
+            return Some(peer);
         }
 
         // A short pause between rounds: the refusals are capacity-driven, so
@@ -432,7 +517,7 @@ pub async fn connect_to_any_except(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    Err(tally.into_error(tried))
+    None
 }
 
 #[cfg(test)]
@@ -764,6 +849,10 @@ mod tests {
     enum Answer {
         /// Complete the handshake straight away.
         Now,
+        /// A usable custom node can be slower than a public one.
+        After(Duration),
+        /// Decline the slot immediately, as a busy public peer does.
+        Refuse,
         /// Never answer, so the client is left mid-handshake.
         Never,
     }
@@ -790,6 +879,14 @@ mod tests {
                 // race never reached opened nothing, holds no Zebra slot,
                 // and so has nothing to close.
                 accepted.lock().unwrap().push(peer.clone());
+                if matches!(answer, Answer::Refuse) {
+                    drop(stream);
+                    let _ = closed.send(Closed {
+                        peer: peer.clone(),
+                        handshaken: false,
+                    });
+                    continue;
+                }
                 let closed = closed.clone();
                 let peer = peer.clone();
                 tokio::spawn(async move {
@@ -803,7 +900,10 @@ mod tests {
                         if stream.read_exact(&mut payload).await.is_err() {
                             break;
                         }
-                        if header[4..11] == *b"version" && matches!(answer, Answer::Now) {
+                        if header[4..11] == *b"version" && !matches!(answer, Answer::Never) {
+                            if let Answer::After(delay) = answer {
+                                tokio::time::sleep(delay).await;
+                            }
                             let version = encode_version(170_160, "/Zebra:2.5.0/", 3_500_000, 1, 0);
                             let _ = stream
                                 .write_all(&encode_message(
@@ -825,6 +925,167 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn custom_priority_keeps_a_slower_custom_peer_ahead_of_public_peers() {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let custom = reporting_peer(
+            Answer::After(Duration::from_millis(100)),
+            closed.clone(),
+            accepted.clone(),
+        )
+        .await;
+        let custom = custom.replacen("127.0.0.1", "LOCALHOST", 1);
+        let public = reporting_peer(Answer::Now, closed, accepted.clone()).await;
+        let winner = connect_with_resolver(
+            P2pNetwork::Regtest,
+            std::slice::from_ref(&custom),
+            &[],
+            4,
+            &[],
+            async { Ok(vec![public.clone()]) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            winner.dialled_as(),
+            custom,
+            "a faster public peer must not displace a usable custom peer"
+        );
+        assert!(
+            !accepted.lock().unwrap().contains(&public),
+            "success in the custom tier must avoid public dials"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_priority_does_not_wait_for_dns_when_a_custom_peer_works() {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let custom = reporting_peer(Answer::Now, closed, accepted).await;
+        let winner = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_with_resolver(
+                P2pNetwork::Regtest,
+                std::slice::from_ref(&custom),
+                &[],
+                4,
+                &[],
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("custom peers must be usable even when DNS stalls")
+        .unwrap();
+        assert_eq!(winner.dialled_as(), custom);
+    }
+
+    #[tokio::test]
+    async fn custom_priority_reaches_fallback_after_more_than_48_seed_results() {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut seeds = Vec::new();
+        for _ in 0..60 {
+            seeds.push(reporting_peer(Answer::Refuse, closed.clone(), accepted.clone()).await);
+        }
+        let fallback = reporting_peer(Answer::Now, closed, accepted.clone()).await;
+        let winner = connect_with_resolver(
+            P2pNetwork::Regtest,
+            &[],
+            &[],
+            4,
+            std::slice::from_ref(&fallback),
+            async { Ok(seeds) },
+        )
+        .await
+        .expect("bounded public sampling must still reach the fallback");
+        assert_eq!(winner.dialled_as(), fallback);
+        assert_eq!(
+            accepted.lock().unwrap().len(),
+            49,
+            "at most 48 public attempts before the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_priority_does_not_suppress_fallback_beyond_the_custom_attempt_cap() {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut custom = Vec::new();
+        for _ in 0..48 {
+            custom.push(reporting_peer(Answer::Refuse, closed.clone(), accepted.clone()).await);
+        }
+        let fallback = reporting_peer(Answer::Now, closed, accepted.clone()).await;
+        custom.push(fallback.clone());
+        let winner = connect_with_resolver(
+            P2pNetwork::Regtest,
+            &custom,
+            &[],
+            4,
+            std::slice::from_ref(&fallback),
+            async { Ok(Vec::new()) },
+        )
+        .await
+        .expect("a fallback outside the custom attempt cap has not been tried yet");
+        assert_eq!(winner.dialled_as(), fallback);
+        assert_eq!(accepted.lock().unwrap().len(), 49);
+    }
+
+    #[tokio::test]
+    async fn custom_priority_deduplicates_all_sources_before_dialling() {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = reporting_peer(Answer::Refuse, closed, accepted.clone()).await;
+        let custom = addr.replacen("127.0.0.1", "LOCALHOST", 1);
+        let duplicate = custom.to_ascii_lowercase();
+        let err = connect_with_resolver(
+            P2pNetwork::Regtest,
+            &[custom.clone(), duplicate.clone()],
+            &[],
+            4,
+            std::slice::from_ref(&duplicate),
+            async { Ok(vec![duplicate.clone()]) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PoolError::AllPeersRefused {
+                    tried: 1,
+                    refused: 1,
+                    ..
+                }
+            ),
+            "one address must consume one attempt across all tiers: {err:?}"
+        );
+        assert_eq!(accepted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_priority_exclusions_apply_to_every_source_and_host_spelling() {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = reporting_peer(Answer::Refuse, closed, accepted.clone()).await;
+        let custom = addr.replacen("127.0.0.1", "LOCALHOST", 1);
+        let excluded = custom.to_ascii_lowercase();
+        let err = connect_with_resolver(
+            P2pNetwork::Regtest,
+            &[custom],
+            std::slice::from_ref(&excluded),
+            4,
+            std::slice::from_ref(&excluded),
+            async { Ok(vec![excluded.clone()]) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, PoolError::AllPeersRefused { tried: 0, .. }),
+            "excluded aliases must not be reintroduced: {err:?}"
+        );
+        assert!(accepted.lock().unwrap().is_empty());
     }
 
     /// Every connection the race did not keep must close promptly.

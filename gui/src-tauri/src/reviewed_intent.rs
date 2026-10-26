@@ -376,6 +376,14 @@ impl Drop for SecretSproutKeys {
     }
 }
 
+/// Decided once while the original wallet metadata is available. Retrying
+/// changes peers only and never recomputes a birthday from cleared inputs.
+#[derive(Clone, Default)]
+pub struct ScanDecryptPlan {
+    pub decrypt_from: Option<u32>,
+    pub decrypt_line: String,
+}
+
 pub struct ScanMaterial {
     pub keys: Arc<SecretSproutKeys>,
     pub key_fingerprint: String,
@@ -384,6 +392,7 @@ pub struct ScanMaterial {
     pub lightwalletd_url: String,
     pub confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     pub peers: Vec<String>,
+    pub decrypt_plan: ScanDecryptPlan,
 }
 
 struct SproutScanSession {
@@ -394,6 +403,7 @@ struct SproutScanSession {
     lightwalletd_url: String,
     confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
     peers: Vec<String>,
+    decrypt_plan: ScanDecryptPlan,
     status: SproutScanStatus,
     report: Option<SproutScanReport>,
     error: Option<String>,
@@ -485,6 +495,7 @@ impl Drop for ScanCatchupLease {
     }
 }
 
+#[derive(Clone)]
 struct ScanWorker {
     abort: tokio::task::AbortHandle,
     completion: ScanWorkerCompletion,
@@ -516,6 +527,8 @@ impl ScanWorkerCompletion {
     async fn wait(&self) {
         loop {
             let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.0.finished.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
@@ -538,7 +551,7 @@ impl Drop for ScanWorkerCompletionGuard {
             completion
                 .finished
                 .store(true, std::sync::atomic::Ordering::Release);
-            completion.notify.notify_one();
+            completion.notify.notify_waiters();
         }
     }
 }
@@ -746,10 +759,9 @@ impl ReviewedIntentStore {
 
     pub fn ensure_scan_proposal_capacity(&self, handle: &SproutScanHandle) -> Result<(), String> {
         let inner = StoreInner::lock(&self.0)?;
-        let scan = inner
-            .scans
-            .get(handle)
-            .ok_or("unknown or released Sprout scan")?;
+        let scan = inner.scans.get(handle).ok_or(
+            "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+        )?;
         if !matches!(scan.status, SproutScanStatus::Completed) {
             return Err("wait for the Sprout scan to complete".into());
         }
@@ -759,6 +771,7 @@ impl ReviewedIntentStore {
         Ok(())
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn insert_scan(
         &self,
@@ -769,6 +782,30 @@ impl ReviewedIntentStore {
         lightwalletd_url: String,
         confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
         peers: Vec<String>,
+    ) -> Result<SproutScanHandle, String> {
+        self.insert_scan_with_plan(
+            keys,
+            key_fingerprint,
+            checkpoint,
+            network,
+            lightwalletd_url,
+            confirmation_sources,
+            peers,
+            ScanDecryptPlan::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_scan_with_plan(
+        &self,
+        keys: impl Into<SecretSproutKeys>,
+        key_fingerprint: String,
+        checkpoint: PathBuf,
+        network: ZeckNetwork,
+        lightwalletd_url: String,
+        confirmation_sources: Vec<argos_core::ConfirmationEndpoint>,
+        peers: Vec<String>,
+        decrypt_plan: ScanDecryptPlan,
     ) -> Result<SproutScanHandle, String> {
         let mut inner = StoreInner::lock(&self.0)?;
         if inner.scans.len() >= MAX_SCAN_SESSIONS {
@@ -785,6 +822,7 @@ impl ReviewedIntentStore {
                 lightwalletd_url,
                 confirmation_sources,
                 peers,
+                decrypt_plan,
                 status: SproutScanStatus::Running,
                 report: None,
                 error: None,
@@ -798,10 +836,9 @@ impl ReviewedIntentStore {
 
     pub fn scan_material(&self, handle: &SproutScanHandle) -> Result<ScanMaterial, String> {
         let inner = StoreInner::lock(&self.0)?;
-        let scan = inner
-            .scans
-            .get(handle)
-            .ok_or("unknown or released Sprout scan")?;
+        let scan = inner.scans.get(handle).ok_or(
+            "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+        )?;
         Ok(ScanMaterial {
             keys: Arc::clone(&scan.keys),
             key_fingerprint: scan.key_fingerprint.clone(),
@@ -810,15 +847,15 @@ impl ReviewedIntentStore {
             lightwalletd_url: scan.lightwalletd_url.clone(),
             confirmation_sources: scan.confirmation_sources.clone(),
             peers: scan.peers.clone(),
+            decrypt_plan: scan.decrypt_plan.clone(),
         })
     }
 
     pub fn register_catchup(&self, handle: &SproutScanHandle) -> Result<ScanCatchupLease, String> {
         let mut inner = StoreInner::lock(&self.0)?;
-        let scan = inner
-            .scans
-            .get_mut(handle)
-            .ok_or("unknown or released Sprout scan")?;
+        let scan = inner.scans.get_mut(handle).ok_or(
+            "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+        )?;
         if !matches!(scan.status, SproutScanStatus::Completed) {
             return Err("wait for the Sprout scan to complete".into());
         }
@@ -844,10 +881,9 @@ impl ReviewedIntentStore {
 
     pub fn snapshot(&self, handle: &SproutScanHandle) -> Result<SproutScanSnapshot, String> {
         let inner = StoreInner::lock(&self.0)?;
-        let scan = inner
-            .scans
-            .get(handle)
-            .ok_or("unknown or released Sprout scan")?;
+        let scan = inner.scans.get(handle).ok_or(
+            "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+        )?;
         Ok(SproutScanSnapshot {
             handle: handle.clone(),
             status: scan.status.clone(),
@@ -870,8 +906,10 @@ impl ReviewedIntentStore {
                 Some(scan) => {
                     if matches!(scan.status, SproutScanStatus::Running) {
                         scan.worker = Some(worker);
+                        None
+                    } else {
+                        Some(worker)
                     }
-                    None
                 }
                 None => Some(worker),
             },
@@ -889,6 +927,9 @@ impl ReviewedIntentStore {
             // A released scan was removed; its late result has nowhere to go.
             if let Some(scan) = inner.scans.get_mut(handle) {
                 scan.worker = None;
+                if !matches!(scan.status, SproutScanStatus::Running) {
+                    return;
+                }
                 match result {
                     Ok(report) => {
                         scan.status = SproutScanStatus::Completed;
@@ -908,13 +949,98 @@ impl ReviewedIntentStore {
         }
     }
 
+    /// Stop work and revoke derived spending authority while retaining the
+    /// backend key source. Controls stay in the session until their futures
+    /// drop, so cancellation of this command cannot detach a live worker.
+    pub async fn pause_scan(&self, handle: &SproutScanHandle) -> Result<(), String> {
+        let (worker, catchup, expiry) = {
+            let mut inner = StoreInner::lock(&self.0)?;
+            let scan_ttl = inner.scan_ttl;
+            let scan = inner.scans.get_mut(handle).ok_or(
+                "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+            )?;
+            scan.status = SproutScanStatus::Failed;
+            scan.report = None;
+            scan.error = Some("Sprout scan paused; retry to resume with its retained keys".into());
+            let expiry = if scan.finished_at.is_none() {
+                scan.finished_at = Some(Instant::now());
+                Some(scan_ttl)
+            } else {
+                None
+            };
+            let controls = (scan.worker.clone(), scan.catchup.clone(), expiry);
+            inner.proposals.retain(|_, stored| {
+                !matches!(&stored.intent.source, SproutIntentSource::Scan(source) if source == handle)
+            });
+            controls
+        };
+        if let Some(expiry) = expiry {
+            self.schedule_expiry_sweep(expiry);
+        }
+        if let Some(worker) = &worker {
+            worker.abort.abort();
+        }
+        if let Some(catchup) = &catchup {
+            catchup.cancellation.cancel();
+        }
+        if let Some(worker) = worker {
+            worker.completion.wait().await;
+        }
+        if let Some(catchup) = catchup {
+            catchup.completion.wait().await;
+        }
+        Ok(())
+    }
+
+    /// Atomically consume a stopped session without allocating an additional
+    /// capacity slot. The caller owns the checkpoint reservation first; all
+    /// fallible validation happens before this replacement.
+    pub fn replace_scan_for_retry(
+        &self,
+        handle: &SproutScanHandle,
+        peers: Vec<String>,
+    ) -> Result<SproutScanHandle, String> {
+        let mut inner = StoreInner::lock(&self.0)?;
+        let scan = inner.scans.get(handle).ok_or(
+            "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+        )?;
+        if matches!(scan.status, SproutScanStatus::Running)
+            || scan.worker.as_ref().is_some_and(|worker| {
+                !worker
+                    .completion
+                    .0
+                    .finished
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+            || scan.catchup.is_some()
+        {
+            return Err("pause the Sprout scan before retrying".into());
+        }
+        let mut scan = inner
+            .scans
+            .remove(handle)
+            .expect("session checked under lock");
+        inner.proposals.retain(|_, stored| {
+            !matches!(&stored.intent.source, SproutIntentSource::Scan(source) if source == handle)
+        });
+        scan.peers = peers;
+        scan.status = SproutScanStatus::Running;
+        scan.report = None;
+        scan.error = None;
+        scan.finished_at = None;
+        scan.worker = None;
+        scan.catchup = None;
+        let replacement = SproutScanHandle(Uuid::new_v4().to_string());
+        inner.scans.insert(replacement.clone(), scan);
+        Ok(replacement)
+    }
+
     pub async fn release_scan(&self, handle: &SproutScanHandle) -> Result<(), String> {
         let scan = {
             let mut inner = StoreInner::lock(&self.0)?;
-            let scan = inner
-                .scans
-                .remove(handle)
-                .ok_or("unknown or released Sprout scan")?;
+            let scan = inner.scans.remove(handle).ok_or(
+                "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+            )?;
             inner.proposals.retain(|_, stored| {
                 !matches!(&stored.intent.source, SproutIntentSource::Scan(source) if source == handle)
             });
@@ -953,10 +1079,9 @@ impl ReviewedIntentStore {
             return Err("too many Sprout proposals; release an old proposal first".into());
         }
         if let SproutIntentSource::Scan(handle) = &intent.source {
-            let scan = inner
-                .scans
-                .get(handle)
-                .ok_or("unknown or released Sprout scan")?;
+            let scan = inner.scans.get(handle).ok_or(
+                "unknown, expired or released Sprout scan; reopen the wallet or re-enter its keys",
+            )?;
             if !matches!(scan.status, SproutScanStatus::Completed) {
                 return Err("Sprout scan has not completed".into());
             }
@@ -1502,6 +1627,249 @@ mod tests {
         );
         assert!(store.take_wallet_proposal(&id).is_ok());
         assert_eq!(PROPOSAL_TTL, std::time::Duration::from_secs(15 * 60));
+    }
+
+    #[tokio::test]
+    async fn pause_retains_keys_invalidates_proposals_and_does_not_renew_expiry() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 91);
+        let id = proposal(
+            &store,
+            SproutIntentSource::Scan(handle.clone()),
+            "zs-reviewed",
+        );
+        let keys = store.scan_material(&handle).unwrap().keys;
+        let first_finished = StoreInner::lock(&store.0).unwrap().scans[&handle].finished_at;
+        store.pause_scan(&handle).await.unwrap();
+        store.pause_scan(&handle).await.unwrap();
+        let retained = store.scan_material(&handle).unwrap();
+        assert!(Arc::ptr_eq(&keys, &retained.keys));
+        assert!(store.take_scan_proposal(&id).is_err());
+        assert!(store.snapshot(&handle).unwrap().report.is_none());
+        assert!(matches!(
+            store.snapshot(&handle).unwrap().status,
+            SproutScanStatus::Failed
+        ));
+        assert_eq!(
+            StoreInner::lock(&store.0).unwrap().scans[&handle].finished_at,
+            first_finished
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_retains_same_keys_and_original_plan_after_wallet_review_expiry() {
+        let registry = WalletReviewRegistry::default();
+        let (dir, _path, review) = reviewed_wallet(&registry, b"reviewed wallet snapshot");
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 92);
+        let proposal = proposal(
+            &store,
+            SproutIntentSource::Scan(handle.clone()),
+            "zs-reviewed",
+        );
+        {
+            let mut inner = StoreInner::lock(&store.0).unwrap();
+            let session = inner.scans.get_mut(&handle).unwrap();
+            session.decrypt_plan = ScanDecryptPlan {
+                decrypt_from: Some(123_456),
+                decrypt_line: "immutable wallet birthday bound".into(),
+            };
+            session.confirmation_sources = vec![argos_core::ConfirmationEndpoint {
+                operator_id: "original-operator".into(),
+                endpoint: "https://original-source.invalid".into(),
+            }];
+        }
+        let original = store.scan_material(&handle).unwrap();
+        registry.lock().unwrap().ttl = Duration::ZERO;
+        assert!(registry.verify(&review).is_err());
+        store.pause_scan(&handle).await.unwrap();
+        let replacement = store
+            .replace_scan_for_retry(&handle, vec!["new-peer:8233".into()])
+            .unwrap();
+        let retried = store.scan_material(&replacement).unwrap();
+        assert!(Arc::ptr_eq(&original.keys, &retried.keys));
+        assert_eq!(retried.keys.as_slice(), &[[92; 32]]);
+        assert_eq!(retried.network, original.network);
+        assert_eq!(retried.checkpoint, original.checkpoint);
+        assert_eq!(retried.key_fingerprint, original.key_fingerprint);
+        assert_eq!(retried.lightwalletd_url, original.lightwalletd_url);
+        assert_eq!(
+            retried.confirmation_sources[0].operator_id,
+            "original-operator"
+        );
+        assert_eq!(
+            retried.confirmation_sources[0].endpoint,
+            "https://original-source.invalid"
+        );
+        assert_eq!(retried.decrypt_plan.decrypt_from, Some(123_456));
+        assert_eq!(
+            retried.decrypt_plan.decrypt_line,
+            "immutable wallet birthday bound"
+        );
+        assert_eq!(retried.peers, vec!["new-peer:8233"]);
+        assert_ne!(replacement.0, handle.0);
+        assert!(store.snapshot(&handle).is_err());
+        assert!(store.take_scan_proposal(&proposal).is_err());
+        store.finish_scan(&handle, Err("stale result".into()));
+        assert!(matches!(
+            store.snapshot(&replacement).unwrap().status,
+            SproutScanStatus::Running
+        ));
+        assert!(
+            store
+                .replace_scan_for_retry(&replacement, Vec::new())
+                .is_err(),
+            "running session cannot rotate without stopping its worker"
+        );
+        store.release_scan(&replacement).await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_expiry_wipes_keys_without_access_and_repeated_pause_does_not_renew() {
+        let scan_ttl = Duration::from_secs(60);
+        let store = ReviewedIntentStore::with_retention(Duration::from_secs(900), scan_ttl);
+        let handle = scan(&store, 93);
+        let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_finished = {
+            let mut inner = store.0.lock().unwrap();
+            let scan = inner.scans.get_mut(&handle).unwrap();
+            scan.keys = Arc::new(SecretSproutKeys::with_drop_probe(
+                vec![[93; 32]],
+                probe.clone(),
+            ));
+            scan.finished_at
+        };
+        store.pause_scan(&handle).await.unwrap();
+        store.pause_scan(&handle).await.unwrap();
+        {
+            let mut inner = store.0.lock().unwrap();
+            let scan = inner.scans.get_mut(&handle).unwrap();
+            assert_eq!(
+                scan.finished_at, first_finished,
+                "pause must not renew retention"
+            );
+            // Simulate the retention timer firing without depending on a
+            // narrow sleep window or triggering a sweep through a store API.
+            scan.finished_at = Some(Instant::now() - 2 * scan_ttl);
+        }
+        store.schedule_expiry_sweep(Duration::ZERO);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !probe.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background expiry wipes the retained keys without store access");
+        assert!(store.snapshot(&handle).is_err());
+    }
+
+    #[tokio::test]
+    async fn pause_cancels_catchup_and_retains_only_the_session_key_owner() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 94);
+        let material = store.scan_material(&handle).unwrap();
+        let weak_keys = Arc::downgrade(&material.keys);
+        let catchup = store.register_catchup(&handle).unwrap();
+        let reservation = store.reserve_checkpoint(&material.checkpoint).unwrap();
+        let task = tokio::spawn(async move {
+            let _material = material;
+            let _reservation = reservation;
+            catchup.cancelled().await;
+        });
+        store.pause_scan(&handle).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(
+            weak_keys.strong_count(),
+            1,
+            "only retained backend source remains"
+        );
+        let retained = store.scan_material(&handle).unwrap();
+        assert!(store.reserve_checkpoint(&retained.checkpoint).is_ok());
+        assert!(store.register_catchup(&handle).is_err());
+        drop(retained);
+        store.release_scan(&handle).await.unwrap();
+        assert!(weak_keys.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_reuses_capacity_and_release_zeroizes_the_final_retained_owner() {
+        let store = ReviewedIntentStore::default();
+        let handles = (0..MAX_SCAN_SESSIONS)
+            .map(|marker| scan(&store, marker as u8))
+            .collect::<Vec<_>>();
+        let handle = &handles[0];
+        let probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut inner = StoreInner::lock(&store.0).unwrap();
+            inner.scans.get_mut(handle).unwrap().keys = Arc::new(
+                SecretSproutKeys::with_drop_probe(vec![[0; 32]], probe.clone()),
+            );
+        }
+        store.pause_scan(handle).await.unwrap();
+        let replacement = store
+            .replace_scan_for_retry(handle, vec!["replacement:8233".into()])
+            .unwrap();
+        assert_eq!(
+            StoreInner::lock(&store.0).unwrap().scans.len(),
+            MAX_SCAN_SESSIONS
+        );
+        assert!(!probe.load(std::sync::atomic::Ordering::SeqCst));
+        store.release_scan(&replacement).await.unwrap();
+        assert!(probe.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            StoreInner::lock(&store.0).unwrap().scans.len(),
+            MAX_SCAN_SESSIONS - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_pauses_both_wait_for_worker_completion() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 95);
+        let completion = ScanWorkerCompletion::new();
+        let guard = completion.guard();
+        let task = tokio::spawn(std::future::pending::<()>());
+        // An independent supervisor holds completion open until both pause
+        // callers have registered. They must all wake when the guard drops.
+        StoreInner::lock(&store.0)
+            .unwrap()
+            .scans
+            .get_mut(&handle)
+            .unwrap()
+            .worker = Some(ScanWorker {
+            abort: task.abort_handle(),
+            completion,
+        });
+        let release_guard = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(guard);
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (first, second) =
+                tokio::join!(store.pause_scan(&handle), store.pause_scan(&handle));
+            first.unwrap();
+            second.unwrap();
+        })
+        .await
+        .expect("every pause waiter wakes when the worker drops");
+        release_guard.await.unwrap();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn terminal_scan_results_do_not_extend_retention() {
+        let store = ReviewedIntentStore::default();
+        let handle = scan(&store, 90);
+        let first_finished = StoreInner::lock(&store.0).unwrap().scans[&handle].finished_at;
+        store.finish_scan(&handle, Err("late aborted worker".into()));
+        let inner = StoreInner::lock(&store.0).unwrap();
+        let session = &inner.scans[&handle];
+        assert_eq!(
+            session.finished_at, first_finished,
+            "late completion must not renew retention"
+        );
+        assert!(matches!(session.status, SproutScanStatus::Completed));
     }
 
     #[test]
