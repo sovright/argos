@@ -12,8 +12,8 @@
 //! is account-id driven and accepts raw per-pool keys, which is what makes
 //! this work at all; see `docs/` for the full argument.
 
+use crate::workspace::WalletRng;
 use argos_wallet_import::{ImportedKeys, SecretBytes};
-use rand_core::OsRng;
 use secrecy::ExposeSecret;
 use zcash_address::unified::{Encoding, Fvk, Ufvk};
 use zcash_client_backend::data_api::{
@@ -33,7 +33,7 @@ use crate::{
 };
 
 /// The concrete wallet database Argos opens everywhere.
-pub type ArgosWalletDb = WalletDb<rusqlite::Connection, ArgosParams, SystemClock, OsRng>;
+pub type ArgosWalletDb = WalletDb<rusqlite::Connection, ArgosParams, SystemClock, WalletRng>;
 
 /// Serialized length of a Sapling extended spending key.
 const EXTSK_LEN: usize = 169;
@@ -124,9 +124,14 @@ impl ImportedSaplingSpendingKey {
 /// only route that keeps this working in a release build.
 pub fn sapling_ufvk(extsk: &ExtendedSpendingKey) -> ZeckResult<UnifiedFullViewingKey> {
     let dfvk = extsk.to_diversifiable_full_viewing_key();
-    let ufvk = Ufvk::try_from_items(vec![Fvk::Sapling(dfvk.to_bytes())]).map_err(|err| {
-        ZeckError::Import(format!("assembling a Sapling-only UFVK failed: {err}"))
-    })?;
+    let ufvk = Ufvk::try_from_items(
+        zcash_address::unified::Revision::R0,
+        vec![Fvk::Sapling(dfvk.to_bytes())]
+            .into_iter()
+            .map(zcash_address::unified::Uitem::Data)
+            .collect(),
+    )
+    .map_err(|err| ZeckError::Import(format!("assembling a Sapling-only UFVK failed: {err}")))?;
     UnifiedFullViewingKey::parse(&ufvk)
         .map_err(|err| ZeckError::Import(format!("parsing the assembled UFVK failed: {err}")))
 }
@@ -205,7 +210,7 @@ impl Drop for ImportedTransparentSecret {
         if let Some(probe) = &self.drop_probe {
             // rust-secp256k1 deliberately overwrites a SecretKey with the
             // valid scalar [1; 32], rather than an invalid all-zero scalar.
-            debug_assert_eq!(self.key.as_ref(), &[1; 32]);
+            debug_assert_eq!(self.key.as_secret_bytes(), &[1; 32]);
             probe.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -277,13 +282,14 @@ impl std::fmt::Debug for ImportedTransparentKey {
 /// yielding the same address is a fact about the wallet worth surfacing
 /// rather than silently collapsing.
 pub fn imported_transparent_keys(keys: &ImportedKeys) -> ZeckResult<Vec<ImportedTransparentKey>> {
-    let secp = secp256k1::Secp256k1::signing_only();
     keys.transparent
         .iter()
         .map(|key| {
-            let mut secret = secp256k1::SecretKey::from_slice(key.secret.expose_secret())
-                .map_err(|err| ZeckError::Import(format!("malformed transparent key: {err}")))?;
-            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+            let mut secret = secp256k1::SecretKey::from_secret_bytes(*key.secret.expose_secret())
+                .map_err(|err| {
+                ZeckError::Import(format!("malformed transparent key: {err}"))
+            })?;
+            let pubkey = secp256k1::PublicKey::from_secret_key(&secret);
             Ok(ImportedTransparentKey::new(
                 &mut secret,
                 TransparentAddress::from_pubkey(&pubkey),
@@ -403,13 +409,12 @@ pub fn register_imported_accounts(
         ));
     };
 
-    let secp = secp256k1::Secp256k1::signing_only();
     let existing = wallet_db
         .get_transparent_receivers(anchor.wallet_account_id, true, true)
         .map_err(|err| ZeckError::Wallet(format!("loading transparent receivers: {err}")))?;
 
     for imported in imported_transparent_keys(keys)? {
-        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, imported.secret_key());
+        let pubkey = secp256k1::PublicKey::from_secret_key(imported.secret_key());
         let address = imported.address;
 
         if !existing.contains_key(&address) {
@@ -467,16 +472,15 @@ mod tests {
             Arc,
         };
 
-        let mut secret = secp256k1::SecretKey::from_slice(&[0x42; 32]).expect("valid fixture key");
-        let address = TransparentAddress::from_pubkey(&secp256k1::PublicKey::from_secret_key(
-            &secp256k1::Secp256k1::signing_only(),
-            &secret,
-        ));
+        let mut secret =
+            secp256k1::SecretKey::from_secret_bytes([0x42; 32]).expect("valid fixture key");
+        let address =
+            TransparentAddress::from_pubkey(&secp256k1::PublicKey::from_secret_key(&secret));
         let probe = Arc::new(AtomicBool::new(false));
         let owner =
             ImportedTransparentKey::with_drop_probe(&mut secret, address, Arc::clone(&probe));
         assert_eq!(
-            secret.as_ref(),
+            secret.as_secret_bytes(),
             &[1; 32],
             "constructor must scrub caller local"
         );
@@ -548,7 +552,7 @@ mod tests {
             "an imported Sapling key must not claim an Orchard component"
         );
         assert!(
-            ufvk.transparent().is_none(),
+            ufvk.p2pkh().is_none(),
             "an imported Sapling key must not claim a transparent component"
         );
     }
@@ -652,22 +656,23 @@ mod tests {
         );
     }
 
-    /// The constraint that bounds what Argos can offer: ZIP-316 forbids a
-    /// unified container holding only transparent items
-    /// (`zcash_address/src/kind/unified.rs`, `try_from_items`). A zcashd
-    /// wallet with transparent keys and no shielded keys therefore has no
-    /// UFVK, so it cannot be given an account at all.
-    ///
-    /// Pinned as a test so that if upstream ever relaxes it, this fails and
-    /// tells us the transparent-only path just became possible — rather
-    /// than the limitation quietly outliving its cause.
+    /// Preserve the Revision 0 container used by existing imported accounts.
+    /// Revision 0 forbids a transparent-only UFVK; NU7's newer revisions do
+    /// not change the format of an existing Argos account or its direct
+    /// transparent recovery route.
     #[test]
-    fn a_transparent_only_container_is_still_rejected_upstream() {
+    fn a_revision_zero_transparent_only_container_is_rejected() {
         let items: Vec<Fvk> = vec![Fvk::P2pkh([0u8; 65])];
         assert!(
-            Ufvk::try_from_items(items).is_err(),
-            "ZIP-316 must still forbid a transparent-only UFVK; if this now \
-             succeeds, transparent-only wallet import is unblocked"
+            Ufvk::try_from_items(
+                zcash_address::unified::Revision::R0,
+                items
+                    .into_iter()
+                    .map(zcash_address::unified::Uitem::Data)
+                    .collect()
+            )
+            .is_err(),
+            "ZIP-316 Revision 0 must reject a transparent-only UFVK"
         );
     }
 }
@@ -808,7 +813,9 @@ mod db_tests {
         let base = fixture_keys("sprout-plaintext.dat");
         let first = parse_sapling_extsk(base.sapling[0].extsk.expose_secret())
             .expect("the golden fixture's Sapling key must parse");
-        let second = first.derive_child(zip32::ChildIndex::hardened(7));
+        let second = first
+            .derive_child(zip32::ChildIndex::hardened(7))
+            .expect("valid fixture child key");
         assert_ne!(
             first.to_bytes(),
             second.to_bytes(),

@@ -126,10 +126,9 @@ async fn zcashd_records_no_inbound_sprout_note_so_no_funded_fixture_exists() {
     let recipient = sprout_key::decode_sprout_address(&encoded, argos_core::ZeckNetwork::Testnet)
         .expect("zcashd's address must decode");
 
-    let secret = secp256k1::SecretKey::from_slice(&[0x55; 32]).expect("key");
+    let secret = secp256k1::SecretKey::from_secret_bytes([0x55; 32]).expect("key");
     let t_address = {
-        let secp = secp256k1::Secp256k1::signing_only();
-        let pk = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+        let pk = secp256k1::PublicKey::from_secret_key(&secret);
         zcash_transparent::address::TransparentAddress::from_pubkey(&pk)
     };
 

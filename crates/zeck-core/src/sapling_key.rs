@@ -18,9 +18,9 @@
 
 use argos_wallet_import::{ImportedKeys, Provenance, SaplingKey};
 use secrecy::Secret;
+use zcash_keys::constants;
 use zcash_keys::encoding::{decode_extended_spending_key, AddressCodec};
 use zcash_keys::keys::sapling::ExtendedSpendingKey;
-use zcash_protocol::constants;
 
 use crate::{
     error::{ZeckError, ZeckResult},
@@ -219,8 +219,8 @@ pub fn merge_standalone_sapling_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_keys::constants;
     use zcash_keys::encoding::encode_extended_spending_key;
-    use zcash_protocol::constants;
 
     /// The prefixes users actually type, pinned against ZIP-32 §5.6.3.1.
     /// An upstream rename must break a test, not a recovery.
@@ -238,6 +238,7 @@ mod tests {
 
     fn a_key() -> ExtendedSpendingKey {
         sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32])
+            .expect("valid fixture Sapling key")
     }
 
     #[test]
@@ -390,7 +391,8 @@ mod tests {
     use secrecy::ExposeSecret;
 
     fn encoded_key(seed: [u8; 32], network: ZeckNetwork) -> String {
-        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed);
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed)
+            .expect("valid fixture Sapling key");
         encode_extended_spending_key(
             match network {
                 ZeckNetwork::Mainnet => constants::mainnet::HRP_SAPLING_EXTENDED_SPENDING_KEY,
@@ -495,7 +497,8 @@ mod tests {
     }
 
     fn imported_sapling_key(seed: [u8; 32]) -> SaplingKey {
-        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed);
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed)
+            .expect("valid fixture Sapling key");
         SaplingKey {
             extsk: Secret::new(extsk.to_bytes().to_vec()),
             provenance: Provenance::Standalone,

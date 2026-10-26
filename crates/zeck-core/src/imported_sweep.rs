@@ -148,7 +148,7 @@ pub(crate) fn propose_imported_sapling_sweep<P>(
 where
     P: zcash_protocol::consensus::Parameters + Clone,
 {
-    propose_send_max_transfer::<_, _, _, std::convert::Infallible>(
+    let proposal = propose_send_max_transfer::<_, _, _, std::convert::Infallible>(
         wallet_db,
         params,
         account_id,
@@ -161,7 +161,8 @@ where
         &LockedInputPolicy::Exclude,
         None,
     )
-    .map_err(|err| ZeckError::TransactionBuild(format!("proposing the Sapling sweep: {err}")))
+    .map_err(|err| ZeckError::TransactionBuild(format!("proposing the Sapling sweep: {err}")))?;
+    crate::nu7_limits::bound_send_max(params, proposal)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -224,6 +225,8 @@ where
         propose_imported_sapling_sweep(wallet_db, params, account_id, destination)?
     };
 
+    crate::nu7_limits::validate_proposal(params, &proposal)?;
+
     // First gate, before proving parameters are put to work.
     let planned_fee_zatoshis = crate::service::proposal_fee_zatoshis(&proposal)?;
     if let Some(reviewed) = reviewed_fee_zatoshis {
@@ -246,6 +249,8 @@ where
     >(
         wallet_db,
         params,
+        &zcash_client_backend::util::SystemClock,
+        &mut crate::workspace::wallet_rng(),
         account_id,
         OvkPolicy::Discard,
         &proposal,
@@ -258,7 +263,9 @@ where
     // derivation would otherwise have provided. Internal notes use the
     // account's derived internal nsk (ask is unchanged), so classify every PCZT recipient
     // through the DFVK and fail closed if it is missing or foreign.
-    let internal_extsk = extsk.derive_internal();
+    let internal_extsk = extsk.derive_internal().ok_or_else(|| {
+        ZeckError::TransactionBuild("Sapling internal-key derivation failed".to_owned())
+    })?;
     let mut spend_scopes = Vec::new();
     let pczt = LowLevelSigner::new(pczt)
         .sign_sapling_with(|_, bundle, _| {
@@ -270,8 +277,8 @@ where
             let proof_keys: Vec<_> = spend_scopes
                 .iter()
                 .map(|scope| match scope {
-                    SaplingSpendScope::External => extsk.expsk.proof_generation_key(),
-                    SaplingSpendScope::Internal => internal_extsk.expsk.proof_generation_key(),
+                    SaplingSpendScope::External => extsk.expsk().proof_generation_key(),
+                    SaplingSpendScope::Internal => internal_extsk.expsk().proof_generation_key(),
                 })
                 .collect();
             bundle
@@ -299,7 +306,7 @@ where
     let mut prover_role = Prover::new(pczt);
     if prover_role.requires_sapling_proofs() {
         prover_role = prover_role
-            .create_sapling_proofs(prover, prover)
+            .create_sapling_proofs(crate::workspace::wallet_rng(), prover, prover)
             .map_err(|err| {
                 ZeckError::TransactionBuild(format!("proving the Sapling bundle: {err:?}"))
             })?;
@@ -335,13 +342,13 @@ where
         let orchard_pk = orchard::circuit::ProvingKey::build(version);
         prover_role = if needs_ironwood {
             prover_role
-                .create_ironwood_proof(&orchard_pk)
+                .create_ironwood_proof(crate::workspace::wallet_rng(), &orchard_pk)
                 .map_err(|err| {
                     ZeckError::TransactionBuild(format!("proving the Ironwood bundle: {err:?}"))
                 })?
         } else {
             prover_role
-                .create_orchard_proof(&orchard_pk)
+                .create_orchard_proof(crate::workspace::wallet_rng(), &orchard_pk)
                 .map_err(|err| {
                     ZeckError::TransactionBuild(format!("proving the Orchard bundle: {err:?}"))
                 })?
@@ -355,17 +362,19 @@ where
         .map_err(|err| ZeckError::TransactionBuild(format!("preparing the signer: {err:?}")))?;
     for index in 0..spend_count {
         let ask = match spend_scopes.get(index) {
-            Some(SaplingSpendScope::External) => &extsk.expsk.ask,
-            Some(SaplingSpendScope::Internal) => &internal_extsk.expsk.ask,
+            Some(SaplingSpendScope::External) => extsk.expsk().ask(),
+            Some(SaplingSpendScope::Internal) => internal_extsk.expsk().ask(),
             None => {
                 return Err(ZeckError::TransactionBuild(format!(
                     "Sapling spend {index} has no verified recipient scope"
                 )));
             }
         };
-        signer.sign_sapling(index, ask).map_err(|err| {
-            ZeckError::TransactionBuild(format!("signing Sapling spend {index}: {err:?}"))
-        })?;
+        signer
+            .sign_sapling(crate::workspace::wallet_rng(), index, ask)
+            .map_err(|err| {
+                ZeckError::TransactionBuild(format!("signing Sapling spend {index}: {err:?}"))
+            })?;
     }
     let pczt = signer.finish();
 
@@ -376,10 +385,12 @@ where
     let tx = TransactionExtractor::new(pczt)
         .with_sapling(&spend_vk, &output_vk)
         .with_orchard(&orchard_vk)
-        .extract()
+        .extract(crate::workspace::wallet_rng())
         .map_err(|err| {
             ZeckError::TransactionBuild(format!("extracting the signed transaction: {err:?}"))
         })?;
+
+    crate::nu7_limits::validate_transaction(params, proposal.min_target_height().into(), &tx)?;
 
     // Second gate, on the fee the built transaction actually pays.
     //
@@ -479,8 +490,8 @@ fn transaction_fee_zatoshis(tx: &Transaction) -> ZeckResult<u64> {
 /// that silently moved nothing.
 #[derive(Debug, Clone, Default)]
 pub struct ImportedSweepOutcome {
-    /// One record per Sapling account with a prepared transaction, followed
-    /// by the transparent record when that leg runs.
+    /// One record per prepared Sapling transaction, including every bounded
+    /// batch of a large account, followed by the transparent record when run.
     ///
     /// A `Vec`, not an `Option`: an imported wallet has one account per
     /// Sapling key, each with its own notes, and each sweeps separately.
@@ -611,6 +622,10 @@ where
 
 #[async_trait::async_trait]
 trait SaplingAccountRunner {
+    fn batch_count(&self, _account: &crate::imported::ImportedWalletAccount) -> usize {
+        1
+    }
+
     async fn build_and_submit(
         &mut self,
         account: &crate::imported::ImportedWalletAccount,
@@ -626,21 +641,23 @@ async fn run_sapling_accounts<R: SaplingAccountRunner>(
     runner: &mut R,
 ) -> ZeckResult<()> {
     for (display_index, account) in accounts {
-        let prior_fee = crate::service::at_risk_fee_total(&outcome.transactions)?;
-        let Some(submission) = runner.build_and_submit(account, prior_fee).await? else {
-            continue;
-        };
-        if record_sapling_submission(outcome, *display_index, &submission)? {
-            return Err(ZeckError::Broadcast(format!(
+        for _ in 0..runner.batch_count(account) {
+            let prior_fee = crate::service::at_risk_fee_total(&outcome.transactions)?;
+            let Some(submission) = runner.build_and_submit(account, prior_fee).await? else {
+                continue;
+            };
+            if record_sapling_submission(outcome, *display_index, &submission)? {
+                return Err(ZeckError::Broadcast(format!(
                 "Sapling transaction {} may already have reached the network or was retryably refused; reconcile it before any further sweep",
                 submission.txid,
             )));
-        }
-        if submission.state == TxLifecycleState::Rejected {
-            return Err(ZeckError::Broadcast(format!(
-                "the node rejected Sapling transaction {}: {:?}",
-                submission.txid, submission.disposition,
-            )));
+            }
+            if submission.state == TxLifecycleState::Rejected {
+                return Err(ZeckError::Broadcast(format!(
+                    "the node rejected Sapling transaction {}: {:?}",
+                    submission.txid, submission.disposition,
+                )));
+            }
         }
     }
     Ok(())
@@ -656,10 +673,17 @@ struct RealSaplingAccountRunner<'a> {
     reviewed_sapling_fees: Option<&'a std::collections::HashMap<AccountUuid, u64>>,
     planned: Option<&'a ImportedExecutionPlan>,
     broadcast_log: &'a mut DurableBroadcastLog,
+    next_batch: std::collections::HashMap<AccountUuid, usize>,
 }
 
 #[async_trait::async_trait]
 impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
+    fn batch_count(&self, account: &crate::imported::ImportedWalletAccount) -> usize {
+        self.planned
+            .and_then(|plan| plan.sapling.get(&account.wallet_account_id))
+            .map_or(1, |proposal| proposal.steps().len())
+    }
+
     async fn build_and_submit(
         &mut self,
         account: &crate::imported::ImportedWalletAccount,
@@ -674,6 +698,35 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
         {
             return Ok(None);
         }
+        let batch_index = *self
+            .next_batch
+            .get(&account.wallet_account_id)
+            .unwrap_or(&0);
+        let batch = self
+            .planned
+            .and_then(|plan| plan.sapling.get(&account.wallet_account_id))
+            .map(|proposal| {
+                let total_fee = crate::service::proposal_fee_zatoshis(proposal)?;
+                if let Some(fees) = self.reviewed_sapling_fees {
+                    let reviewed = fees.get(&account.wallet_account_id).copied().unwrap_or(0);
+                    if reviewed != total_fee {
+                        return Err(ZeckError::FeeQuoteChanged {
+                            reviewed,
+                            current: total_fee,
+                        });
+                    }
+                }
+                // Authorize the full account batch before signing the first step.
+                if batch_index == 0 {
+                    enforce_cumulative_fee(prior_fee_zatoshis, total_fee, self.max_fee_zatoshis)?;
+                }
+                crate::nu7_limits::independent_step(proposal, batch_index)
+            })
+            .transpose()?;
+        let batch_fee = batch
+            .as_ref()
+            .map(crate::service::proposal_fee_zatoshis)
+            .transpose()?;
         let built = {
             let mut wallet_db =
                 crate::workspace::open_wallet_db(self.workspace.wallet_db_path(), self.params)?;
@@ -687,19 +740,20 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
                     self.prover,
                     self.max_fee_zatoshis,
                     prior_fee_zatoshis,
-                    self.reviewed_sapling_fees
-                        .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0)),
-                    if let Some(plan) = self.planned {
-                        plan.sapling.get(&account.wallet_account_id)
-                    } else {
-                        None
-                    },
+                    batch_fee.or_else(|| {
+                        self.reviewed_sapling_fees
+                            .map(|fees| fees.get(&account.wallet_account_id).copied().unwrap_or(0))
+                    }),
+                    batch.as_ref(),
                 )
             })
         };
         let tx = match built {
             Ok(tx) => tx,
-            Err(err) if crate::service::is_insufficient_funds_error(&err.to_string()) => {
+            Err(err)
+                if self.planned.is_none()
+                    && crate::service::is_insufficient_funds_error(&err.to_string()) =>
+            {
                 return Ok(None)
             }
             Err(err) => return Err(err),
@@ -720,7 +774,9 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
                 None,
             )
             .await?;
-        submit_prepared_transaction(
+        let tip = crate::nu7::validated_tip_from_client(&mut client, self.runtime.network).await?;
+        crate::nu7::validate_transaction_for_tip(self.runtime.network, tip, &tx)?;
+        let submission = submit_prepared_transaction(
             self.broadcast_log,
             &mut LightwalletdSubmitter {
                 client: &mut client,
@@ -728,8 +784,10 @@ impl SaplingAccountRunner for RealSaplingAccountRunner<'_> {
             prepared,
             std::time::Duration::from_secs(30),
         )
-        .await
-        .map(Some)
+        .await?;
+        self.next_batch
+            .insert(account.wallet_account_id, batch_index + 1);
+        Ok(Some(submission))
     }
 }
 
@@ -1026,7 +1084,8 @@ async fn sweep_imported_wallet_into(
     }
 }
 
-/// Sweep every imported Sapling account, one transaction at a time.
+/// Sweep every imported Sapling account and all of its reviewed batches,
+/// one transaction at a time.
 ///
 /// Writes each submission into `outcome` as it happens, so an abort part-way
 /// through still leaves the caller holding the known txid, fee, and state.
@@ -1159,6 +1218,7 @@ async fn sweep_imported_sapling_leg(
         reviewed_sapling_fees,
         planned,
         broadcast_log,
+        next_batch: Default::default(),
     };
     run_sapling_accounts(&accounts, outcome, &mut runner).await
 }
@@ -1225,11 +1285,11 @@ mod fee_cap_tests {
         let params = crate::workspace::consensus_network(runtime.network);
         let mut wallet_db =
             crate::workspace::open_wallet_db(workspace.wallet_db_path(), params).unwrap();
-        let extsk = ExtendedSpendingKey::master(&[1; 32]);
+        let extsk = ExtendedSpendingKey::master(&[1; 32]).expect("valid fixture Sapling key");
         let (_, address) = extsk.default_address();
         let destination =
             ZcashAddress::try_from_encoded(&zcash_keys::encoding::encode_payment_address(
-                zcash_protocol::constants::mainnet::HRP_SAPLING_PAYMENT_ADDRESS,
+                zcash_address::constants::mainnet::HRP_SAPLING_PAYMENT_ADDRESS,
                 &address,
             ))
             .unwrap();
@@ -1386,11 +1446,18 @@ mod fee_cap_tests {
         };
         let destination = {
             use zcash_address::unified::{Address, Encoding, Receiver};
-            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32]);
+            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32])
+                .expect("valid fixture Sapling key");
             let (_, payment_address) = extsk.default_address();
-            Address::try_from_items(vec![Receiver::Sapling(payment_address.to_bytes())])
-                .expect("a Sapling-only unified address is valid under ZIP 316")
-                .encode(&zcash_protocol::consensus::NetworkType::Main)
+            Address::try_from_items(
+                zcash_address::unified::Revision::R0,
+                vec![Receiver::Sapling(payment_address.to_bytes())]
+                    .into_iter()
+                    .map(zcash_address::unified::Uitem::Data)
+                    .collect(),
+            )
+            .expect("a Sapling-only unified address is valid under ZIP 316")
+            .encode(&zcash_protocol::consensus::NetworkType::Main)
         };
 
         // One zatoshi under the ZIP-317 conventional floor: unsatisfiable by
@@ -1456,7 +1523,8 @@ mod registered_account_dedup_tests {
     #[test]
     fn duplicate_registered_sapling_uuid_is_swept_once() {
         let extsk = || {
-            let parsed = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32]);
+            let parsed = sapling_crypto::zip32::ExtendedSpendingKey::master(&[7u8; 32])
+                .expect("valid fixture Sapling key");
             crate::imported::ImportedSaplingSpendingKey::from_serialized(&parsed.to_bytes())
                 .expect("fixture key")
         };
@@ -1530,6 +1598,99 @@ mod tests {
         );
     }
 
+    struct BatchRunner {
+        results: std::collections::VecDeque<ZeckResult<TxSubmissionResult>>,
+        prior_fees: Vec<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl SaplingAccountRunner for BatchRunner {
+        fn batch_count(&self, _: &crate::imported::ImportedWalletAccount) -> usize {
+            3
+        }
+        async fn build_and_submit(
+            &mut self,
+            _: &crate::imported::ImportedWalletAccount,
+            prior: u64,
+        ) -> ZeckResult<Option<TxSubmissionResult>> {
+            self.prior_fees.push(prior);
+            self.results
+                .pop_front()
+                .expect("only reviewed batches execute")
+                .map(Some)
+        }
+    }
+
+    #[tokio::test]
+    async fn same_account_batches_stop_on_unknown_and_keep_cumulative_evidence() {
+        let mut accepted = unknown();
+        accepted.txid = TxId::from_bytes([8; 32]);
+        accepted.state = TxLifecycleState::Pending;
+        accepted.disposition = SubmissionDisposition::Accepted;
+        let mut runner = BatchRunner {
+            results: [
+                Ok(accepted),
+                Ok(unknown()),
+                Err(ZeckError::Internal("must not execute".to_owned())),
+            ]
+            .into(),
+            prior_fees: vec![],
+        };
+        let account = crate::imported::ImportedWalletAccount {
+            wallet_account_id: AccountUuid::default(),
+            sapling_extsk: None,
+            transparent_addresses: vec![],
+        };
+        let mut outcome = ImportedSweepOutcome::default();
+        assert!(
+            run_sapling_accounts(&[(4, account)], &mut outcome, &mut runner)
+                .await
+                .is_err()
+        );
+        assert_eq!(runner.prior_fees, [0, 10_000]);
+        assert_eq!(runner.results.len(), 1);
+        assert_eq!(outcome.sapling_transaction_count, 2);
+        assert!(outcome.followup_blocked);
+        assert_eq!(
+            crate::service::at_risk_fee_total(&outcome.transactions).unwrap(),
+            20_000
+        );
+        assert_eq!(
+            outcome.transactions[0].txid,
+            Some(TxId::from_bytes([8; 32]).to_string())
+        );
+        assert_eq!(outcome.transactions[1].source_account, 4);
+    }
+
+    #[tokio::test]
+    async fn later_batch_build_failure_retains_earlier_accepted_transaction() {
+        let mut accepted = unknown();
+        accepted.state = TxLifecycleState::Pending;
+        accepted.disposition = SubmissionDisposition::Accepted;
+        let mut runner = BatchRunner {
+            results: [
+                Ok(accepted),
+                Err(ZeckError::TransactionBuild("proof failed".to_owned())),
+            ]
+            .into(),
+            prior_fees: vec![],
+        };
+        let account = crate::imported::ImportedWalletAccount {
+            wallet_account_id: AccountUuid::default(),
+            sapling_extsk: None,
+            transparent_addresses: vec![],
+        };
+        let mut outcome = ImportedSweepOutcome::default();
+        assert!(
+            run_sapling_accounts(&[(4, account)], &mut outcome, &mut runner)
+                .await
+                .is_err()
+        );
+        assert_eq!(runner.prior_fees, [0, 10_000]);
+        assert_eq!(outcome.transactions.len(), 1);
+        assert_eq!(outcome.transactions[0].status, TxLifecycleState::Pending);
+    }
+
     fn unknown() -> TxSubmissionResult {
         TxSubmissionResult {
             txid: TxId::from_bytes([7; 32]),
@@ -1597,9 +1758,9 @@ mod sapling_scope_tests {
 
     #[test]
     fn classifies_external_and_internal_note_authority() {
-        let extsk = ExtendedSpendingKey::master(&[7u8; 32]);
+        let extsk = ExtendedSpendingKey::master(&[7u8; 32]).expect("valid fixture Sapling key");
         let external = extsk.default_address().1;
-        let internal_extsk = extsk.derive_internal();
+        let internal_extsk = extsk.derive_internal().expect("valid fixture internal key");
         let internal = internal_extsk.default_address().1;
 
         assert_eq!(
@@ -1611,21 +1772,24 @@ mod sapling_scope_tests {
             SaplingSpendScope::Internal
         );
         assert_ne!(
-            extsk.expsk.proof_generation_key().nsk,
-            internal_extsk.expsk.proof_generation_key().nsk,
+            extsk.expsk().proof_generation_key().nsk(),
+            internal_extsk.expsk().proof_generation_key().nsk(),
             "internal Sapling notes require the internal nsk proof authority"
         );
         assert_eq!(
-            extsk.expsk.ask.to_bytes(),
-            internal_extsk.expsk.ask.to_bytes(),
+            extsk.expsk().ask().to_bytes(),
+            internal_extsk.expsk().ask().to_bytes(),
             "Sapling internal derivation preserves ask while changing nsk"
         );
     }
 
     #[test]
     fn missing_or_foreign_recipient_fails_closed() {
-        let extsk = ExtendedSpendingKey::master(&[7u8; 32]);
-        let stranger = ExtendedSpendingKey::master(&[8u8; 32]).default_address().1;
+        let extsk = ExtendedSpendingKey::master(&[7u8; 32]).expect("valid fixture Sapling key");
+        let stranger = ExtendedSpendingKey::master(&[8u8; 32])
+            .expect("valid fixture Sapling key")
+            .default_address()
+            .1;
         assert!(matches!(
             classify_spend_scope(&extsk, None),
             Err(ProofKeyError::MissingRecipient)
@@ -1698,11 +1862,18 @@ mod routing_tests {
         // address gate to test anything at all.
         let destination = {
             use zcash_address::unified::{Address, Encoding, Receiver};
-            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32]);
+            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x7u8; 32])
+                .expect("valid fixture Sapling key");
             let (_, payment_address) = extsk.default_address();
-            Address::try_from_items(vec![Receiver::Sapling(payment_address.to_bytes())])
-                .expect("a Sapling-only unified address is valid under ZIP 316")
-                .encode(&zcash_protocol::consensus::NetworkType::Main)
+            Address::try_from_items(
+                zcash_address::unified::Revision::R0,
+                vec![Receiver::Sapling(payment_address.to_bytes())]
+                    .into_iter()
+                    .map(zcash_address::unified::Uitem::Data)
+                    .collect(),
+            )
+            .expect("a Sapling-only unified address is valid under ZIP 316")
+            .encode(&zcash_protocol::consensus::NetworkType::Main)
         };
 
         let err = sweep_imported_wallet(&runtime, &keys, &destination, None)

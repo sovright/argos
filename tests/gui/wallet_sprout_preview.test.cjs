@@ -12,7 +12,7 @@ function nu7Text({ network, broadcast }) {
   }
   return network === "testnet"
     ? "Testnet NU7: the activation height is 4,465,026; broadcast alone is not enough."
-    : "URGENT: NU7 mainnet targeted for about November 5, 2026. Start recovery promptly: " +
+    : "URGENT: NU7 mainnet activation height is 3,543,405. Start recovery promptly: " +
       "must be mined before activation; broadcast alone is not enough.";
 }
 
@@ -123,13 +123,16 @@ function harness(intercept = (_, __, fallback) => fallback()) {
         coverage_notice: null, coverage_may_hide_funds: false, seed_note: null,
       };
       if (command === "sprout_nu7_warning") return nu7Text(args);
+      if (command === "sprout_nu7_status") return { state: "before_activation", allow_new_spends: true,
+        activation_height: args.network === "testnet" ? 4465026 : 3543405,
+        tip_height: 3000000, warning: nu7Text({ ...args, broadcast: false }) };
       if (command === "propose_wallet_sprout_sweep") {
         previews.push({ ...args });
         return {
           proposal_id: `wallet-proposal-${previews.length}`,
           notes: 1, gross_zatoshis: 100000, fee_zatoshis: 10000,
           net_zatoshis: 90000, lands_in_sapling: "Lands in Sapling",
-          params_present: true, params_path: "/fixture/sprout.params",
+          allow_new_spends: true, params_present: true, params_path: "/fixture/sprout.params",
           active: [], mined: [],
           nu7_warning: "NU7: Sprout recovery must be mined before activation; broadcasting alone is not enough. Check the current mainnet activation schedule.",
         };
@@ -144,7 +147,7 @@ function harness(intercept = (_, __, fallback) => fallback()) {
           proposal_id: `scan-proposal-${args.scanHandle}`,
           notes: 1, gross_zatoshis: 100000, fee_zatoshis: 10000,
           net_zatoshis: 90000, lands_in_sapling: "Lands in Sapling",
-          params_present: true, params_path: "/fixture/sprout.params",
+          allow_new_spends: true, params_present: true, params_path: "/fixture/sprout.params",
           active: [], mined: [],
           nu7_warning: "NU7: Sprout recovery must be mined before activation.",
         };
@@ -350,7 +353,7 @@ test("wallet destination edit invalidates the reviewed proposal", async () => {
   assert.equal(h.$("sprout-sweep-confirm").checked, false);
   assert.equal(h.$("sprout-sweep-run").disabled, true);
   pending.resolve({ proposal_id: "new-proposal", notes: 1, gross_zatoshis: 100000,
-    fee_zatoshis: 10000, net_zatoshis: 90000, params_present: true,
+    fee_zatoshis: 10000, net_zatoshis: 90000, allow_new_spends: true, params_present: true,
     lands_in_sapling: "Lands in Sapling" });
   h.$("sprout-destination").dispatch("change");
   await flush();
@@ -382,7 +385,7 @@ test("late wallet preview cannot publish after unannounced config drift", async 
   h.$("lightwalletd-url").value = "https://changed.example";
   pending.resolve({
     proposal_id: "stale-config", notes: 1, gross_zatoshis: 100000,
-    fee_zatoshis: 10000, net_zatoshis: 90000, params_present: true,
+    fee_zatoshis: 10000, net_zatoshis: 90000, allow_new_spends: true, params_present: true,
     lands_in_sapling: "Lands in Sapling",
   });
   await opening;
@@ -401,7 +404,7 @@ test("wallet Sprout execution sends only proposal id", async () => {
   h.$("sprout-sweep-confirm").checked = true;
   h.$("sprout-sweep-confirm").dispatch("change");
   await h.sweep();
-  assert.deepEqual(JSON.parse(JSON.stringify(executed)), { proposalId: "wallet-proposal-1" });
+  assert.deepEqual(JSON.parse(JSON.stringify(executed)), { proposalId: "wallet-proposal-1", observationOnly: false });
 });
 
 test("older wallet Sprout proposal cannot replace the current one", async () => {
@@ -415,7 +418,7 @@ test("older wallet Sprout proposal cannot replace the current one", async () => 
   await flush();
   const plan = h.$("sprout-sweep-plan").textContent;
   old.resolve({ proposal_id: "old-proposal", notes: 99, gross_zatoshis: 999,
-    fee_zatoshis: 1, net_zatoshis: 998, params_present: true,
+    fee_zatoshis: 1, net_zatoshis: 998, allow_new_spends: true, params_present: true,
     lands_in_sapling: "Old pool" });
   await flush();
   assert.equal(h.$("sprout-sweep-plan").textContent, plan);
@@ -527,7 +530,7 @@ test("inspection carries no peers; the review verifies through the scan panel's"
   await h.sweepConfirmed();
   // Under #271 the reviewed proposal carries the verified notes; execute
   // takes only its ID and no peers or other authority.
-  assert.deepEqual(Object.keys(seen.execute_wallet_sprout_sweep), ["proposalId"]);
+  assert.deepEqual(Object.keys(seen.execute_wallet_sprout_sweep), ["proposalId", "observationOnly"]);
 });
 
 test("opening another wallet previews the new review and passphrase", async () => {
@@ -552,7 +555,7 @@ test("the NU7 deadline is visible as soon as Sprout keys are detected, before pr
   const warning = h.$("wallet-sprout-nu7-warning");
   assert.equal(warning.hidden, false);
   assert.match(warning.textContent, /NU7.*mined before activation/);
-  assert.match(warning.textContent, /broadcasting alone is not enough/);
+  assert.match(warning.textContent, /broadcast(?:ing)? alone is not enough/);
   for (const id of ["scan-sprout-uncovered", "complete-sprout-uncovered", "delete-sprout-uncovered"]) {
     assert.equal(h.$(id).hidden, false);
     assert.match(h.$(id).textContent, /NU7.*mined before activation/);
@@ -663,7 +666,7 @@ test("changing the network after opening a Sprout wallet rebuilds the warning fo
   }
   h.$("network-select").value = "mainnet";
   await h.peek("refreshSproutNu7Warning()");
-  for (const id of ids) assert.match(h.$(id).textContent, /November 5, 2026/, id);
+  for (const id of ids) assert.match(h.$(id).textContent, /3,543,405/, id);
 });
 
 test("a network change keeps the post-broadcast wording, for the new network", async () => {
@@ -714,7 +717,7 @@ test("a stale network refresh cannot overwrite a newer network's warning", async
   await h.peek("refreshSproutNu7Warning()");
   slow.resolve();
   await stale;
-  assert.match(h.$("wallet-sprout-nu7-warning").textContent, /November 5, 2026/);
+  assert.match(h.$("wallet-sprout-nu7-warning").textContent, /3,543,405/);
 });
 
 test("the network picker is wired to rebuild the NU7 warning", () => {
@@ -818,7 +821,7 @@ for (const fails of [false, true]) {
       if (command === "propose_wallet_sprout_sweep" && args.reviewId === "review:/fixture/old.dat") {
         await old.promise;
         return { proposal_id: "old-proposal", notes: 99, gross_zatoshis: 999,
-          fee_zatoshis: 1, net_zatoshis: 998, params_present: true };
+          fee_zatoshis: 1, net_zatoshis: 998, allow_new_spends: true, params_present: true };
       }
       return fallback();
     });
@@ -1051,7 +1054,7 @@ test("pending_only_preview_enables_check_status_without_sprout_parameters", asyn
         active: [sproutTransaction("pending", { value_zatoshis: null })],
         mined: [],
         lands_in_sapling: "Lands in Sapling",
-        params_present: false,
+        allow_new_spends: true, params_present: false,
         params_path: "/missing/sprout.params",
         warnings: [],
       };
@@ -1151,8 +1154,8 @@ test("lifecycle action label resets for a ready-only preview", async () => {
     const review = await fallback();
     return args.reviewId.endsWith("status.dat")
       ? { ...review, notes: 0, gross_zatoshis: 0, fee_zatoshis: 0, net_zatoshis: 0,
-        active: [sproutTransaction("pending")], params_present: false }
-      : { ...review, active: [], mined: [], params_present: true };
+        active: [sproutTransaction("pending")], allow_new_spends: true, params_present: false }
+      : { ...review, active: [], mined: [], allow_new_spends: true, params_present: true };
   });
   await h.open("/fixture/status.dat");
   assert.equal(h.$("sprout-sweep-run").textContent, "Check status and continue");
@@ -1458,7 +1461,7 @@ test("the Sprout preview, inspection and sweep look in the scan's data directory
     inspect_wallet_file: "/fixture/workspace",
     propose_wallet_sprout_sweep: "/fixture/workspace",
   });
-  assert.deepEqual(executions, [{ proposalId: "wallet-proposal-1" }]);
+  assert.deepEqual(executions, [{ proposalId: "wallet-proposal-1", observationOnly: false }]);
 });
 
 // A broadcast that could not be written to the sweep journal is worth
@@ -1640,7 +1643,7 @@ test("the scan sweep sends no decrypt bound, whatever the form says now", async 
     assert.deepEqual(Object.keys(proposed[0]).sort(), ["destination", "scanHandle"], JSON.stringify(proposed[0]));
     // Execution carries the reviewed proposal and nothing from the form.
     assert.equal(sent.length, 1, formNow);
-    assert.deepEqual(JSON.parse(JSON.stringify(sent[0])), { proposalId: "scan-proposal-scan-1" });
+    assert.deepEqual(JSON.parse(JSON.stringify(sent[0])), { proposalId: "scan-proposal-scan-1", observationOnly: false });
   }
 });
 
@@ -1747,7 +1750,7 @@ test("with no wallet file, opening the Sprout disclosure shows the panel under t
   await h.peek("onSproutScanEntryToggle()");
   assert.equal(h.peek("walletFile"), null);
   assert.equal(h.$("sprout-scan-panel").hidden, false);
-  assert.match(h.$("sprout-scan-nu7-warning").textContent, /November 5, 2026/);
+  assert.match(h.$("sprout-scan-nu7-warning").textContent, /3,543,405/);
   assertPanelUnderDeadline(h, "opened");
   assert.doesNotMatch(h.$("sprout-scan-keys").placeholder ?? "", /wallet file/);
   // The carried-forward banners belong to a wallet file; none is open, so
@@ -1759,7 +1762,7 @@ test("with no wallet file, opening the Sprout disclosure shows the panel under t
   assert.equal(h.$("sprout-scan-panel").hidden, true);
 });
 
-test("the no-file panel stays hidden until its NU7 text has arrived", async () => {
+test("the no-file panel shows honest unknown eligibility while its NU7 text is pending", async () => {
   const slow = deferred();
   const h = harness(async (command, args, fallback) => {
     if (command === "sprout_nu7_warning") await slow.promise;
@@ -1767,7 +1770,8 @@ test("the no-file panel stays hidden until its NU7 text has arrived", async () =
   });
   h.$("sprout-scan-entry").open = true;
   const pending = h.peek("onSproutScanEntryToggle()");
-  assert.equal(h.$("sprout-scan-panel").hidden, true);
+  assert.equal(h.$("sprout-scan-panel").hidden, false);
+  assert.match(h.$("sprout-scan-nu7-warning").textContent, /unknown/);
   slow.resolve();
   await pending;
   assert.equal(h.$("sprout-scan-panel").hidden, false);
@@ -1897,7 +1901,7 @@ test("a no-file scan sweep sends the pasted lines and switches the panel to broa
   await flush();
   // The sweep executes the reviewed proposal only; no line is re-sent.
   assert.equal(executions.length, 1);
-  assert.deepEqual(JSON.parse(JSON.stringify(executions[0])), { proposalId: "scan-proposal-scan-1" });
+  assert.deepEqual(JSON.parse(JSON.stringify(executions[0])), { proposalId: "scan-proposal-scan-1", observationOnly: false });
   assert.match(h.$("sprout-scan-nu7-warning").textContent, /^testnet NU7: .*confirm it is mined/);
   // Opening a wallet file afterwards must not drop the broadcast wording.
   await h.open("/fixture/sprout.dat");
@@ -2130,4 +2134,180 @@ test("a lost Sprout completion channel pauses the accepted scan without discardi
   assert.ok(calls.some(({ command }) => command === "pause_sprout_scan"));
   await h.scan();
   assert.equal(calls.filter(({ command }) => command === "retry_sprout_scan").length, 1);
+});
+
+test("NU7 availability gates new recovery at A-2, A-1, activation, and unknown height", async () => {
+  for (const [tip, state, allowed] of [[3543403, "before_activation", true],
+    [3543404, "before_activation", false], [3543405, "activated", false], [null, "unknown", false]]) {
+    let executions = 0;
+    const h = harness(async (command, args, fallback) => {
+      if (command === "sprout_nu7_status") return { state, activation_height: 3543405,
+        tip_height: tip, allow_new_spends: allowed, warning: "NU7: retain all recovery material." };
+      if (command === "execute_wallet_sprout_sweep") { executions++; return sproutLifecycleReport([]); }
+      return fallback();
+    });
+    await h.open("/fixture/boundary.dat");
+    h.$("sprout-sweep-confirm").checked = true;
+    h.peek("updateWalletSproutSweepButton()");
+    assert.equal(h.$("sprout-sweep-run").disabled, !allowed, `tip ${tip}`);
+    if (!allowed) {
+      assert.doesNotMatch(h.$("wallet-sprout-headline").textContent, /recovered|recoverable/);
+      await h.sweep();
+      assert.equal(executions, 0, "disabled recovery must not execute through a direct handler call");
+    }
+  }
+});
+
+test("post-NU7 pending history stays available for observation-only status without parameters", async () => {
+  let executions = 0;
+  const h = harness(async (command, args, fallback) => {
+    if (command === "sprout_nu7_status") return { state: "activated", activation_height: 3543405,
+      tip_height: 3543405, allow_new_spends: false, warning: "NU7 activated: status checks only." };
+    if (command === "propose_wallet_sprout_sweep") return { ...await fallback(),
+      allow_new_spends: false, params_present: false, active: [sproutTransaction("pending")], notes: 0 };
+    if (command === "execute_wallet_sprout_sweep") {
+      executions++;
+      return sproutLifecycleReport([sproutTransaction("pending", { unmineable_after_nu7: true })]);
+    }
+    return fallback();
+  });
+  await h.open("/fixture/pending-nu7.dat");
+  assert.equal(h.$("sprout-sweep-confirm").disabled, false);
+  assert.equal(h.$("sprout-sweep-run").textContent, "Check saved status only");
+  assert.match(h.$("sprout-sweep-params").textContent, /observation-only/);
+  await h.sweepConfirmed();
+  assert.equal(executions, 1);
+  assert.match(h.$("sprout-sweep-results").children[0].textContent, /cannot be mined or rebroadcast/);
+  assert.match(h.$("sprout-sweep-status").textContent, /Recovery is not confirmed for those notes/);
+  assert.doesNotMatch(h.$("sprout-sweep-status").textContent, /✓ Mined/);
+});
+
+
+test("an availability refresh revokes a reviewed new sweep before execution", async () => {
+  let allowed = true, executions = 0;
+  const h = harness(async (command, args, fallback) => {
+    if (command === "sprout_nu7_status") return { state: allowed ? "before_activation" : "unknown",
+      activation_height: 3543405, tip_height: allowed ? 3543403 : null,
+      allow_new_spends: allowed, warning: "NU7 availability changed" };
+    if (command === "execute_wallet_sprout_sweep") { executions++; return sproutLifecycleReport([]); }
+    return fallback();
+  });
+  await h.open("/fixture/refreshed.dat");
+  h.$("sprout-sweep-confirm").checked = true;
+  allowed = false;
+  await h.peek("refreshSproutNu7Status()");
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+  await h.sweep();
+  assert.equal(executions, 0);
+});
+
+test("an old availability lease cannot revoke newer evidence; expiry disables new recovery until refreshed", async () => {
+  let pause = false;
+  const held = deferred();
+  const h = harness(async (command, args, fallback) => {
+    if (command === "sprout_nu7_status" && pause) await held.promise;
+    return fallback();
+  });
+  await h.open("/fixture/status-lease.dat");
+  const firstLease = [...h.timers.entries()].find(([, timer]) => timer.delay === 60000)?.[0];
+  assert.ok(firstLease, "network availability evidence must expire");
+  await h.peek("refreshSproutNu7Status()");
+  h.fireTimer(firstLease, { includeCleared: true });
+  assert.equal(h.peek("sproutNu7StatusCurrent().allow_new_spends"), true);
+  const latestLease = [...h.timers.entries()].filter(([, timer]) => timer.delay === 60000).at(-1)[0];
+  pause = true;
+  h.$("sprout-sweep-confirm").checked = true;
+  h.fireTimer(latestLease);
+  assert.equal(h.peek("sproutNu7StatusCurrent().state"), "unknown");
+  assert.equal(h.$("sprout-sweep-run").disabled, true);
+  held.resolve();
+  await flush();
+});
+
+test("Sprout execution mode narrows to observation-only if the review or current availability forbids spending", async () => {
+  for (const surface of ['wallet', 'scan']) {
+    for (const [reviewAllows, currentAllows] of [[true, true], [false, true], [true, false], [false, false]]) {
+      let statusAllows = true, executed;
+      const h = harness(async (command, args, fallback) => {
+        if (command === 'sprout_nu7_status') return { state: statusAllows ? 'before_activation' : 'unknown',
+          activation_height: 3543405, tip_height: statusAllows ? 3543403 : null,
+          allow_new_spends: statusAllows, warning: 'NU7 status' };
+        if (command === 'propose_wallet_sprout_sweep' || command === 'propose_sprout_scan_sweep') {
+          return { ...await fallback(), allow_new_spends: reviewAllows,
+            active: [sproutTransaction('pending')] };
+        }
+        if (command === 'execute_wallet_sprout_sweep' || command === 'execute_sprout_scan_sweep') {
+          executed = args;
+          return sproutLifecycleReport([]);
+        }
+        return fallback();
+      });
+      if (surface === 'wallet') await h.open('/fixture/consent.dat');
+      else {
+        h.loadScanPanel();
+        h.peek('sproutScanHandle="scan-1"; sproutScanResult={notes_found:1};');
+        h.$('sprout-scan-destination').value = 'fixture-destination';
+        await h.peek('refreshSproutScanReview()');
+      }
+      statusAllows = currentAllows;
+      await h.peek('refreshSproutNu7Status()');
+      if (surface === 'wallet') await h.sweepConfirmed();
+      else { h.$('sprout-scan-confirm').checked = true; await h.peek('runSproutScanSweep()'); }
+      assert.equal(executed?.observationOnly, !reviewAllows || !currentAllows,
+        `${surface}: review ${reviewAllows}, current ${currentAllows}`);
+    }
+  }
+});
+
+test("status-only acknowledgement during a pending refresh cannot authorize restored spending", async () => {
+  for (const surface of ['wallet', 'scan']) {
+    let holdRefresh = false, executed;
+    const pendingStatus = deferred();
+    const h = harness(async (command, args, fallback) => {
+      if (command === 'sprout_nu7_status' && holdRefresh) await pendingStatus.promise;
+      if (command === 'propose_wallet_sprout_sweep' || command === 'propose_sprout_scan_sweep') {
+        return { ...await fallback(), active: [sproutTransaction('pending')] };
+      }
+      if (command === 'execute_wallet_sprout_sweep' || command === 'execute_sprout_scan_sweep') {
+        executed = args;
+        return sproutLifecycleReport([]);
+      }
+      return fallback();
+    });
+    if (surface === 'wallet') await h.open('/fixture/mode-change.dat');
+    else {
+      h.loadScanPanel();
+      h.peek('sproutScanHandle="scan-1"; sproutScanResult={notes_found:1};');
+      h.$('sprout-scan-destination').value = 'fixture-destination';
+      await h.peek('refreshSproutScanReview()');
+    }
+    const confirmId = surface === 'wallet' ? 'sprout-sweep-confirm' : 'sprout-scan-confirm';
+    const labelId = surface === 'wallet' ? 'sprout-sweep-confirm-label' : 'sprout-scan-confirm-label';
+    const buttonId = surface === 'wallet' ? 'sprout-sweep-run' : 'sprout-scan-sweep-run';
+    const update = surface === 'wallet' ? 'updateWalletSproutSweepButton()' : 'updateSproutScanSweepButton()';
+    h.$(confirmId).checked = true;
+    h.$(confirmId).dispatch('change');
+    h.peek(update);
+    holdRefresh = true;
+    const refresh = h.peek('refreshSproutNu7Status()');
+    assert.match(h.$(labelId).textContent, /status only/);
+    assert.equal(h.$(confirmId).checked, false, `${surface}: narrowing the mode clears the old acknowledgement`);
+    h.$(confirmId).checked = true;
+    h.$(confirmId).dispatch('change');
+    h.peek(update);
+    assert.equal(h.$(buttonId).disabled, false, `${surface}: status-only check remains available`);
+    pendingStatus.resolve();
+    await refresh;
+    assert.match(h.$(labelId).textContent, /move funds/);
+    assert.equal(h.$(confirmId).checked, false, `${surface}: a mode change needs a new acknowledgement`);
+    assert.equal(h.$(buttonId).disabled, true, `${surface}: restored spending has no consent`);
+    if (surface === 'wallet') await h.sweep(); else await h.peek('runSproutScanSweep()');
+    assert.equal(executed, undefined, `${surface}: the handler refuses unacknowledged spending`);
+    h.$(confirmId).checked = true;
+    h.$(confirmId).dispatch('change');
+    h.peek(update);
+    assert.equal(h.$(buttonId).disabled, false, `${surface}: fresh spending consent enables execution`);
+    if (surface === 'wallet') await h.sweep(); else await h.peek('runSproutScanSweep()');
+    assert.equal(executed?.observationOnly, false, `${surface}: the newly acknowledged mode may spend`);
+  }
 });

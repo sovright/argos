@@ -25,13 +25,34 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 [imports.zcash]
 url = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
 
+[policy.glib]
+audit-as-crates-io = false
+
+[policy.phf_generator]
+audit-as-crates-io = false
+
+[[exemptions.addchain]]
+version = "0.3.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.aead]]
 version = "0.5.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.aead]]
+version = "0.6.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.aes]]
 version = "0.8.4"
 criteria = "safe-to-deploy"
+
+[[exemptions.aes]]
+version = "0.9.3"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.aho-corasick]]
 version = "1.1.4"
@@ -145,6 +166,11 @@ criteria = "safe-to-deploy"
 version = "0.6.0-pre.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.bip32]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.bitflags]]
 version = "2.11.0"
 criteria = "safe-to-deploy"
@@ -169,6 +195,11 @@ criteria = "safe-to-deploy"
 version = "0.11.0-rc.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.block-buffer]]
+version = "0.12.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.block-padding]]
 version = "0.3.3"
 criteria = "safe-to-deploy"
@@ -176,6 +207,16 @@ criteria = "safe-to-deploy"
 [[exemptions.blocking]]
 version = "1.6.2"
 criteria = "safe-to-deploy"
+
+[[exemptions.borsh]]
+version = "1.8.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.borsh-derive]]
+version = "1.8.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.bounded-vec]]
 version = "0.9.0"
@@ -225,6 +266,11 @@ criteria = "safe-to-deploy"
 version = "0.1.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.cbc]]
+version = "0.2.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.cc]]
 version = "1.2.58"
 criteria = "safe-to-deploy"
@@ -245,9 +291,19 @@ criteria = "safe-to-deploy"
 version = "0.10.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.chacha20poly1305]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.chrono]]
 version = "0.4.44"
 criteria = "safe-to-deploy"
+
+[[exemptions.cipher]]
+version = "0.5.2"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.clap]]
 version = "4.6.0"
@@ -264,6 +320,11 @@ criteria = "safe-to-deploy"
 [[exemptions.clap_lex]]
 version = "1.1.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.cmov]]
+version = "0.5.4"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.colorchoice]]
 version = "1.0.5"
@@ -301,6 +362,11 @@ criteria = "safe-to-deploy"
 version = "0.25.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.cpubits]]
+version = "0.1.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.cpufeatures]]
 version = "0.2.17"
 criteria = "safe-to-deploy"
@@ -337,6 +403,11 @@ criteria = "safe-to-deploy"
 version = "0.2.0-rc.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.crypto-common]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.crypto_secretbox]]
 version = "0.1.1"
 criteria = "safe-to-deploy"
@@ -344,6 +415,11 @@ criteria = "safe-to-deploy"
 [[exemptions.ctor]]
 version = "0.2.9"
 criteria = "safe-to-deploy"
+
+[[exemptions.ctutils]]
+version = "0.4.6"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.curve25519-dalek]]
 version = "4.1.3"
@@ -356,6 +432,11 @@ criteria = "safe-to-deploy"
 [[exemptions.daggy]]
 version = "0.8.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.daggy]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.darling]]
 version = "0.20.11"
@@ -421,6 +502,11 @@ criteria = "safe-to-deploy"
 [[exemptions.digest]]
 version = "0.11.0-pre.9"
 criteria = "safe-to-deploy"
+
+[[exemptions.digest]]
+version = "0.11.3"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.dirs]]
 version = "6.0.0"
@@ -514,6 +600,21 @@ notes = "Update for RUSTSEC-2026-0221. Review backlog; this exemption is not a s
 [[exemptions.event-listener-strategy]]
 version = "0.5.4"
 criteria = "safe-to-deploy"
+
+[[exemptions.f4jumble]]
+version = "0.1.2"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.ff]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.ff_derive]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.field-offset]]
 version = "0.3.6"
@@ -643,6 +744,16 @@ criteria = "safe-to-deploy"
 version = "0.18.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.groth16]]
+version = "0.2.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.group]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.gtk]]
 version = "0.18.2"
 criteria = "safe-to-deploy"
@@ -675,6 +786,11 @@ criteria = "safe-to-deploy"
 version = "0.13.0-pre.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.hmac]]
+version = "0.13.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.html5ever]]
 version = "0.29.1"
 criteria = "safe-to-deploy"
@@ -698,6 +814,11 @@ criteria = "safe-to-deploy"
 [[exemptions.hybrid-array]]
 version = "0.2.3"
 criteria = "safe-to-deploy"
+
+[[exemptions.hybrid-array]]
+version = "0.4.10"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.hyper]]
 version = "1.9.0"
@@ -751,6 +872,11 @@ criteria = "safe-to-deploy"
 version = "2.3.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.incrementalmerkletree-testing]]
+version = "0.4.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.indexmap]]
 version = "1.9.3"
 criteria = "safe-to-deploy"
@@ -770,6 +896,11 @@ criteria = "safe-to-deploy"
 [[exemptions.inout]]
 version = "0.1.4"
 criteria = "safe-to-deploy"
+
+[[exemptions.inout]]
+version = "0.2.5"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.ipnet]]
 version = "2.12.0"
@@ -955,6 +1086,11 @@ criteria = "safe-to-deploy"
 version = "0.4.6"
 criteria = "safe-to-deploy"
 
+[[exemptions.num-bigint]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.num_cpus]]
 version = "1.17.0"
 criteria = "safe-to-deploy"
@@ -1007,10 +1143,6 @@ criteria = "safe-to-deploy"
 version = "5.3.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.orchard]]
-version = "0.15.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.ordered-stream]]
 version = "0.2.0"
 criteria = "safe-to-deploy"
@@ -1047,9 +1179,10 @@ criteria = "safe-to-deploy"
 version = "0.9.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.petgraph]]
-version = "0.7.1"
+[[exemptions.pczt]]
+version = "0.10.0"
 criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.petgraph]]
 version = "0.8.3"
@@ -1140,6 +1273,11 @@ criteria = "safe-to-deploy"
 version = "0.8.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.poly1305]]
+version = "0.9.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.portable-atomic]]
 version = "1.13.1"
 criteria = "safe-to-deploy"
@@ -1172,6 +1310,11 @@ criteria = "safe-to-deploy"
 version = "0.5.20+deprecated"
 criteria = "safe-to-deploy"
 
+[[exemptions.proptest]]
+version = "1.12.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.prost]]
 version = "0.14.3"
 criteria = "safe-to-deploy"
@@ -1196,6 +1339,11 @@ criteria = "safe-to-deploy"
 version = "22.0.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.quick-error]]
+version = "1.2.3"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.quick-xml]]
 version = "0.41.0"
 criteria = "safe-to-deploy"
@@ -1212,6 +1360,16 @@ criteria = "safe-to-deploy"
 [[exemptions.radium]]
 version = "0.7.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.rand]]
+version = "0.9.5"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.rand_xorshift]]
+version = "0.5.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.redox_syscall]]
 version = "0.5.18"
@@ -1257,6 +1415,11 @@ criteria = "safe-to-deploy"
 version = "0.2.0-pre.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.ripemd]]
+version = "0.2.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.rusqlite]]
 version = "0.37.0"
 criteria = "safe-to-deploy"
@@ -1281,6 +1444,11 @@ criteria = "safe-to-deploy"
 version = "1.0.22"
 criteria = "safe-to-deploy"
 
+[[exemptions.rusty-fork]]
+version = "0.3.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.salsa20]]
 version = "0.10.2"
 criteria = "safe-to-deploy"
@@ -1300,6 +1468,16 @@ criteria = "safe-to-deploy"
 [[exemptions.schemars_derive]]
 version = "0.8.22"
 criteria = "safe-to-deploy"
+
+[[exemptions.schemerz]]
+version = "0.3.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.schemerz-rusqlite]]
+version = "0.371.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.scopeguard]]
 version = "1.2.0"
@@ -1364,6 +1542,11 @@ criteria = "safe-to-deploy"
 [[exemptions.sha2]]
 version = "0.11.0-pre.4"
 criteria = "safe-to-deploy"
+
+[[exemptions.sha2]]
+version = "0.11.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.shell-words]]
 version = "1.1.1"
@@ -1689,6 +1872,11 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.universal-hash]]
+version = "0.6.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.url]]
 version = "2.5.8"
 criteria = "safe-to-deploy"
@@ -1744,6 +1932,11 @@ criteria = "safe-to-deploy"
 [[exemptions.wagyu-zcash-parameters-6]]
 version = "0.2.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.wait-timeout]]
+version = "0.2.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.walkdir]]
 version = "2.5.0"
@@ -2093,9 +2286,64 @@ criteria = "safe-to-deploy"
 version = "4.3.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.zcash_address]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_client_backend]]
+version = "0.25.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_client_sqlite]]
+version = "0.23.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_keys]]
+version = "0.17.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_note_encryption]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
 [[exemptions.zcash_pool_migration]]
 version = "0.1.0-rc.3"
 criteria = "safe-to-deploy"
+
+[[exemptions.zcash_pool_migration]]
+version = "0.2.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_primitives]]
+version = "0.31.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_proofs]]
+version = "0.31.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_protocol]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_script]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zcash_transparent]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.zerocopy]]
 version = "0.8.48"
@@ -2128,6 +2376,16 @@ criteria = "safe-to-deploy"
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
 criteria = "safe-to-deploy"
+
+[[exemptions.zip32]]
+version = "0.3.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
+
+[[exemptions.zip321]]
+version = "0.10.0"
+criteria = "safe-to-deploy"
+notes = "NU7 SDK migration: exact-version exemption; source audit remains outstanding."
 
 [[exemptions.zvariant]]
 version = "5.10.1"

@@ -124,9 +124,9 @@ async fn rpc_try(method: &str, params: serde_json::Value) -> Result<serde_json::
 }
 
 fn random32() -> [u8; 32] {
-    use rand_core::RngCore;
+    use rand::Rng;
     let mut out = [0u8; 32];
-    rand_core::OsRng.fill_bytes(&mut out);
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut out);
     out
 }
 
@@ -175,7 +175,7 @@ async fn spend_note_with_anchor(
     recipient: sprout::SproutPaymentAddress,
     witness_path: Vec<u8>,
     anchor: [u8; 32],
-    proving_key: &bellman::groth16::Parameters<bls12_381::Bls12>,
+    proving_key: &groth16::Parameters<bls12_381::Bls12>,
     label: &str,
 ) -> Result<String, String> {
     let to_sapling = note.value - SPEND_FEE;
@@ -230,7 +230,8 @@ async fn spend_note_with_anchor(
     let js = sprout_spend::build_js_description(&fields, &proof).expect("build description");
 
     let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
-    let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&random32());
+    let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&random32())
+        .expect("valid fixture seed");
     let (_, sapling_addr) = extsk.default_address();
 
     let mut builder = sapling_crypto::builder::Builder::new(
@@ -249,7 +250,7 @@ async fn spend_note_with_anchor(
     let (bundle, _) = builder
         .build::<zcash_proofs::prover::LocalTxProver, zcash_proofs::prover::LocalTxProver, _, zcash_protocol::value::ZatBalance>(
             &[],
-            rand_core::OsRng,
+            rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         )
         .expect("build the Sapling bundle")
         .expect("the bundle must have an output");
@@ -265,7 +266,7 @@ async fn spend_note_with_anchor(
         bundle,
         &sapling_prover,
         &spend_key,
-        rand_core::OsRng,
+        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
     )
     .expect("assemble the Sprout-to-Sapling transaction");
 
@@ -294,10 +295,9 @@ async fn a_historical_sprout_anchor_is_still_accepted() {
     );
     let proving_key = sprout_spend::load_sprout_proving_key(&params).expect("proving key");
 
-    let secret = secp256k1::SecretKey::from_slice(&[0x11; 32]).expect("key");
+    let secret = secp256k1::SecretKey::from_secret_bytes([0x11; 32]).expect("key");
     let address = {
-        let secp = secp256k1::Secp256k1::signing_only();
-        let pk = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+        let pk = secp256k1::PublicKey::from_secret_key(&secret);
         zcash_transparent::address::TransparentAddress::from_pubkey(&pk)
     };
 

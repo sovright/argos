@@ -12,6 +12,8 @@ pub mod imported_sweep;
 pub mod key_source;
 pub mod lightwalletd;
 pub mod models;
+pub mod nu7;
+pub mod nu7_limits;
 pub mod wallet_file;
 pub mod wallet_file_import;
 // Transfer-based funding for the regtest harness. Test-only: a released
@@ -66,9 +68,10 @@ mod test_support;
 pub use address::validate_destination_address;
 pub use birthday::{
     detect_birthday, detect_wallet_file_birthday, estimate_birthday_from_date,
-    estimate_date_from_height_offline, height_at_or_before_time, plan_sprout_decrypt,
-    sprout_skip_height, unix_time_now, wallet_file_birthday_from_metadata, SproutDecryptPlan,
-    WalletBirthdaySource, WalletFileBirthday,
+    estimate_birthday_from_date_for_network, estimate_date_from_height_offline,
+    height_at_or_before_time, plan_sprout_decrypt, sprout_skip_height, unix_time_now,
+    wallet_file_birthday_from_metadata, SproutDecryptPlan, WalletBirthdaySource,
+    WalletFileBirthday,
 };
 pub use derivation::{derive_accounts, validate_mnemonic_words};
 pub use donation::{

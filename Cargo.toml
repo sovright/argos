@@ -15,7 +15,7 @@ edition = "2021"
 version = "1.5.5"
 license = "MIT OR Apache-2.0"
 authors = ["The Bootstrap Org Inc"]
-rust-version = "1.88"
+rust-version = "1.89"
 repository = "https://github.com/sovright/argos"
 
 [workspace.dependencies]
@@ -37,33 +37,37 @@ chacha20poly1305 = "0.10.1"
 ed25519-zebra = "4.0.3"
 # Named only to load the Sprout Groth16 proving key; both already arrive via
 # zcash_proofs, which exposes the verifying key but not the proving key.
-bellman = "0.14"
-bls12_381 = "0.8"
+bellman = "0.15"
+bls12_381 = "0.9"
+groth16 = "0.2"
 # Named only for script::Code when hand-assembling a V4 transparent bundle;
 # already in the tree via zcash_transparent.
-zcash_script = "0.4.3"
+zcash_script = "0.6"
 base64 = "0.22"
 cbc = { version = "0.1.2", features = ["alloc", "zeroize"] }
 clap = { version = "4.5.53", features = ["derive"] }
 crypto_secretbox = "0.1.1"
 dialoguer = "0.12.0"
 indicatif = "0.18.2"
-orchard = "0.15"
+nonempty = "0.11"
+orchard = "0.16"
 # Already in the tree, pinned by the librustzcash stack; promoted to a direct
 # dependency (as `orchard` already is) so transparent-only recovery can name
 # Sapling payment addresses, anchors, and provers. Adds no new package.
-sapling-crypto = { version = "0.7", default-features = false }
+sapling-crypto = { version = "0.9", default-features = false }
 # Already in the tree via zcash_client_backend; promoted to a direct dependency
 # so the imported-key sweep can drive the PCZT roles. Spending a standalone
 # Sapling key is impossible through `SpendingKeys`, which takes its Sapling
 # authority solely from a `UnifiedSpendingKey`; the PCZT signer accepts a raw
 # spend authorizing key. Adds no new package.
-pczt = { version = "0.9.1", default-features = false, features = ["prover", "signer", "tx-extractor", "io-finalizer", "spend-finalizer", "sapling", "orchard", "transparent"] }
+pczt = { version = "0.10", default-features = false, features = ["prover", "signer", "tx-extractor", "io-finalizer", "spend-finalizer", "sapling", "orchard", "transparent"] }
 prost = "0.14.3"
 rand_core = "0.6.4"
+# NU7 SDK randomness; legacy crypto still uses rand_core 0.6.
+rand = "0.10"
 rusqlite = { version = "0.37.0", features = ["backup"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-secp256k1 = "0.29.1"
+secp256k1 = "0.33"
 secrecy = "0.8.0"
 # Wipes recovered spending material and intermediate derivation state on drop.
 # Already in the lockfile through the Zcash crates; `derive` supports the
@@ -84,28 +88,18 @@ url = "2.5.8"
 keepawake = "0.6"
 sha2 = { version = "0.10", features = ["compress"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
-# ─── Zcash protocol stack — Ironwood (NU6.3) ──────────────────────────────────
-#
-# NU6.3 / Ironwood activates on mainnet at height 3_428_143. Consensus branch
-# IDs for that upgrade first appear in zcash_protocol 0.10.0, so anything below
-# that line signs sweeps with the NU6.2 branch ID and gets them rejected once
-# the chain passes activation.
-#
-# The wallet crates that expose it — zcash_client_backend / zcash_client_sqlite
-# — have no stable release on the 0.10 protocol line yet, only release
-# candidates. Those two are pinned with `=` rather than a caret so an RC bump
-# upstream cannot silently change what we ship; revisit both pins when 0.24.0 /
-# 0.22.0 go final.
-zcash_address = "0.13"
-zcash_client_backend = { version = "=0.24.0-rc.4", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt", "sync", "transparent-inputs", "transparent-key-import"] }
-zcash_client_sqlite = { version = "=0.22.0-rc.4", default-features = false, features = ["orchard", "serde", "transparent-inputs", "transparent-key-import"] }
-zcash_keys = { version = "0.16", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
-zcash_primitives = "0.30"
-zcash_proofs = { version = "0.30", default-features = false, features = ["bundled-prover"] }
-zcash_protocol = "0.10"
-zcash_transparent = { version = "0.10", default-features = false, features = ["std", "transparent-inputs"] }
+# Coordinated stable NU7 release family (2026-10-21). Keep wallet crates
+# pinned together so database and transaction APIs advance coherently.
+zcash_address = "0.14"
+zcash_client_backend = { version = "=0.25.0", default-features = false, features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt", "sync", "transparent-inputs", "transparent-key-import"] }
+zcash_client_sqlite = { version = "=0.23.0", default-features = false, features = ["orchard", "serde", "transparent-inputs", "transparent-key-import"] }
+zcash_keys = { version = "0.17", default-features = false, features = ["std", "sapling", "orchard", "transparent-inputs"] }
+zcash_primitives = "0.31"
+zcash_proofs = { version = "0.31", default-features = false, features = ["bundled-prover"] }
+zcash_protocol = "0.11"
+zcash_transparent = { version = "0.11", default-features = false, features = ["std", "transparent-inputs"] }
 tempfile = "3.20.0"
-zip32 = "0.2.1"
+zip32 = "0.3"
 
 # Dependencies are optimised even in dev/test builds. Sprout proving is
 # Groth16 over BLS12-381, and at opt-level 0 the field arithmetic in

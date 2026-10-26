@@ -30,24 +30,16 @@ use super::wire::{
     encode_version, verify_payload, BlockHeader, Header, P2pNetwork, WireError, MAX_PAYLOAD_LEN,
 };
 
-/// Protocol version to advertise.
-///
-/// This is a *floor set by peers*, not a capability claim about us. ZIP 253
-/// requires nodes compatible with an upgrade to advertise at least that
-/// upgrade's `MIN_NETWORK_PROTOCOL_VERSION`, and peers disconnect anything
-/// below it before the handshake completes — silently, with no message.
-///
-/// 170_160 is the NU6.3 (Ironwood) minimum for mainnet. Advertising the
-/// Sprout-era-sufficient 170_100 instead is rejected by every current node:
-/// confirmed directly from a peer's own metrics, which recorded
-/// `remote_version="170100" min_version="170160"` against this client's user
-/// agent. The failure looks identical to a network problem, so it must be
-/// diagnosed from the far side.
-///
-/// Raise this when the network's minimum rises. Nothing here depends on the
-/// value beyond being accepted — the blocks this scanner reads are two
-/// decades of consensus older than any of it.
-const PROTOCOL_VERSION: u32 = 170_160;
+/// NU7 peer minimums from ZIP 259. Historical scanning still needs to
+/// negotiate with current nodes even though it does not relay transactions.
+fn protocol_version(network: P2pNetwork) -> u32 {
+    match network {
+        P2pNetwork::Mainnet => 170_190,
+        P2pNetwork::Testnet => 170_180,
+        // The retained pre-Canopy Sprout fixture uses historical zcashd.
+        P2pNetwork::Regtest => 170_160,
+    }
+}
 
 /// Presented to peers. Honest about what this is: an unusual client asking
 /// for very old blocks should not look like it is pretending to be zcashd.
@@ -217,7 +209,13 @@ impl Peer {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let version = encode_version(PROTOCOL_VERSION, USER_AGENT, 0, nonce, timestamp);
+        let version = encode_version(
+            protocol_version(self.network),
+            USER_AGENT,
+            0,
+            nonce,
+            timestamp,
+        );
         self.send("version", &version).await?;
 
         let mut got_version = false;
@@ -330,7 +328,7 @@ impl Peer {
         &mut self,
         locator: &[[u8; 32]],
     ) -> Result<Vec<BlockHeader>, PeerError> {
-        let payload = encode_getheaders(PROTOCOL_VERSION, locator, [0u8; 32]);
+        let payload = encode_getheaders(protocol_version(self.network), locator, [0u8; 32]);
         self.send("getheaders", &payload).await?;
         let reply = self.recv_until("headers").await?;
         Ok(decode_headers(&reply)?)
@@ -439,8 +437,21 @@ mod tests {
     use super::*;
     use crate::p2p::wire::write_compact_size;
 
+    #[test]
+    fn peer_versions_meet_each_nu7_network_minimum() {
+        assert_eq!(protocol_version(P2pNetwork::Mainnet), 170_190);
+        assert_eq!(protocol_version(P2pNetwork::Testnet), 170_180);
+        assert_eq!(protocol_version(P2pNetwork::Regtest), 170_160);
+    }
+
     fn version_payload(user_agent: &str, start_height: u32) -> Vec<u8> {
-        encode_version(PROTOCOL_VERSION, user_agent, start_height, 7, 1_700_000_000)
+        encode_version(
+            protocol_version(P2pNetwork::Mainnet),
+            user_agent,
+            start_height,
+            7,
+            1_700_000_000,
+        )
     }
 
     /// The scan now runs through the 2022-23 spam era, whose blocks approach

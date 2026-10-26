@@ -94,10 +94,9 @@ pub async fn plant_sprout_note(a_sk: [u8; 32]) -> PlantedSproutNote {
     );
     let proving_key = sprout_spend::load_sprout_proving_key(&params).expect("proving key");
 
-    let secret = secp256k1::SecretKey::from_slice(&[0x33; 32]).expect("key");
+    let secret = secp256k1::SecretKey::from_secret_bytes([0x33; 32]).expect("key");
     let address = {
-        let secp = secp256k1::Secp256k1::signing_only();
-        let pk = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+        let pk = secp256k1::PublicKey::from_secret_key(&secret);
         zcash_transparent::address::TransparentAddress::from_pubkey(&pk)
     };
 

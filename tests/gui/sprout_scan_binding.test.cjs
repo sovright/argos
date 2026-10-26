@@ -13,7 +13,7 @@ const report = (notes) => ({ blocks_scanned: 100, joinsplits_seen: 3,
   notes_found: notes, spent_notes: 0, total_zatoshis: notes * 100000,
   tip_warning: null });
 const review = (id) => ({ proposal_id: id, notes: 1, gross_zatoshis: 100000,
-  fee_zatoshis: 10000, net_zatoshis: 90000, params_present: true,
+  fee_zatoshis: 10000, net_zatoshis: 90000, allow_new_spends: true, params_present: true,
   params_path: "/fixture/sprout.params", lands_in_sapling: "Lands in Sapling",
   active: [], mined: [] });
 const lifecycle = (transactions, overrides = {}) => ({
@@ -62,6 +62,9 @@ function harness(intercept = (_, __, fallback) => fallback(), { failCompletionLi
     $, document: { createElement: element }, fmt: (n) => String(n),
     confirmationSourcesFromForm: () => ["backup=https://confirm.example"],
     clearTransientSecrets() {},
+    invalidateSproutNu7Status() {},
+    sproutNu7StatusCurrent: () => ({state: "before_activation", allow_new_spends: true}),
+    refreshSproutNu7Status: async () => ({state: "before_activation", allow_new_spends: true}),
     setTimeout: (callback) => setImmediate(callback),
     setStatus: (id, message) => { $(id).textContent = message; },
     listen: async (name, callback) => {
@@ -141,7 +144,7 @@ test("zero-note saved scan with lifecycle status opens and executes reconciliati
     gross_zatoshis: 0,
     fee_zatoshis: 0,
     net_zatoshis: 0,
-    params_present: false,
+    allow_new_spends: true, params_present: false,
     active: [{ txid: "pending-tx", value_zatoshis: 7, state: "pending", mined_height: null }],
   };
   const h = harness((command, args, fallback) => {
@@ -240,7 +243,7 @@ test("scan source edit releases its handle and hides sweep controls", async () =
   assert.ok(h.calls.some((call) => call.command === "release_sprout_scan" && call.args.handle === "scan-1"));
 });
 
-test("scan-derived execution sends only proposal id", async () => {
+test("scan-derived execution sends proposal id and explicit execution mode", async () => {
   const h = harness();
   await h.scan();
   await flush();
@@ -251,7 +254,7 @@ test("scan-derived execution sends only proposal id", async () => {
   h.$("sprout-scan-confirm").dispatch("change");
   await h.sweep();
   assert.deepEqual(h.calls.filter((call) => call.command === "execute_sprout_scan_sweep")
-    .map((call) => JSON.parse(JSON.stringify(call.args))), [{ proposalId: "proposal-scan-1" }]);
+    .map((call) => JSON.parse(JSON.stringify(call.args))), [{ proposalId: "proposal-scan-1", observationOnly: false }]);
 });
 
 test("destination edit invalidates scan-derived proposal", async () => {
@@ -274,7 +277,7 @@ test("destination edit invalidates scan-derived proposal", async () => {
 
 test("scan review without proving parameters cannot execute", async () => {
   const h = harness((command, args, fallback) => command === "propose_sprout_scan_sweep"
-    ? { ...review("missing-params"), params_present: false }
+    ? { ...review("missing-params"), allow_new_spends: true, params_present: false }
     : fallback());
   await h.scan();
   await flush();

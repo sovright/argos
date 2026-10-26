@@ -7,12 +7,11 @@ standalone Sapling or Sprout spending keys.
 > **Urgent: recover Sprout funds before NU7 activates.** NU7 disables version 4
 > transactions, including all Sprout spends. Your recovery transaction must be
 > **mined before activation**; broadcasting it is not enough. Start promptly:
-> a full Sprout scan can take days. Mainnet activation is targeted for about
-> November 5, 2026; the final height is not yet assigned (proposed in
-> [zcash/zips#1405](https://github.com/zcash/zips/pull/1405); see the
-> [NU7 timeline](https://forum.zcashcommunity.com/t/nu7-timeline/57655)). Check
-> [ZIP 259](https://zips.z.cash/zip-0259) for the assigned height. Funds remaining in
-> Sprout after activation will be unspendable under the current NU7 rules.
+> a full Sprout scan can take days. NU7 activates at mainnet block **3,543,405**
+> and testnet block **4,465,026** ([ZIP 259](https://zips.z.cash/zip-0259)).
+> Funds remaining in Sprout after activation are unspendable under the NU7 rules.
+> Argos uses a fresh, validated network height, rather than a calendar date,
+> to permit recovery. Historical inspection and mined-status checks remain available.
 
 This repository now contains:
 
@@ -147,11 +146,9 @@ cannot authorize the sweep Argos is promising.
 
 > **Sprout recovery deadline:** the sweep must be **mined before NU7 activation**.
 > NU7 disables version 4 transactions and therefore Sprout spends. A broadcast
-> or completed scan alone does not meet this deadline. Mainnet activation is
-> targeted for about November 5, 2026; the final height is not yet assigned
-> (proposed in [zcash/zips#1405](https://github.com/zcash/zips/pull/1405); see the
-> [NU7 timeline](https://forum.zcashcommunity.com/t/nu7-timeline/57655)). Start
-> promptly and check [ZIP 259](https://zips.z.cash/zip-0259) for the assigned height.
+> or completed scan alone does not meet this deadline. Mainnet activates at
+> **3,543,405** and testnet at **4,465,026** ([ZIP 259](https://zips.z.cash/zip-0259)).
+> Start promptly; recovery must be included in a block below the activation height.
 > After a sweep broadcasts, confirm the transaction is mined before activation.
 > Remaining Sprout funds will be unspendable under the current NU7 rules.
 > Historical scanning and reporting can still identify funds after activation.
@@ -235,9 +232,16 @@ nullifier is already spent, its witness anchor is unknown, another mempool
 transaction spends it, or the mempool evicted it) records that note as
 rejected, and the sweep continues with the next note. Any other reply from the
 primary submission endpoint remains **SubmissionUnknown** until observation
-resolves its lifecycle. On a network whose NU7 activation height is assigned
-(testnet: 4,465,026), Argos refuses to build a Sprout transaction for a block
-at or past activation, because NU7 disables the version 4 format Sprout needs.
+resolves its lifecycle. Argos refuses to build or rebroadcast a Sprout transaction
+for inclusion at or past NU7 activation (mainnet: 3,543,405; testnet: 4,465,026),
+because NU7 disables the version 4 format Sprout needs. This includes exact-byte
+retries, even when a saved transaction has a later encoded expiry. At tip height
+one block below activation, the final valid block has already been mined, so new
+recovery is disabled. Missing, stale, or mismatched network height also disables
+new recovery. Historical scanning, wallet inspection, and observation-only mined-status
+reconciliation remain available; an unmined transaction invalidated by NU7 never
+counts as confirmed recovery. Keep the original wallet, keys, backups, checkpoints,
+and journals; activation does not delete recovery material.
 
 The journal (`sprout-sweep-<fingerprint>.journal` inside the authenticated
 per-key root under the data directory) holds each note's outpoint and swept
@@ -360,7 +364,7 @@ The findings and their fixes are tracked in this repository's pull-request histo
 - Transparent funds are imported into the wallet workspace using Argos's audited legacy derivation, not modern per-account transparent derivation.
 - Public lightwalletd servers learn scan metadata such as requested block ranges. Use your own lightwalletd or a local privacy proxy when that metadata matters.
 - Custom lightwalletd endpoints must use HTTPS unless they target localhost/loopback for local testing.
-- Sprout transactions are journaled before submission in version-4 authenticated roots bound to the network, full key-set fingerprint, lineage anchor, and artifact generation. Argos rejects overlapping note claims across sibling roots. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes while they remain valid. A saved transaction is rebuilt only after a configured source reports it absent more than 20 blocks past its expiry height; the old transaction remains visible as superseded. A refusal about one note alone records that note as rejected and the sweep continues; any other non-accept reply from the primary submission endpoint remains SubmissionUnknown until observation resolves it.
+- Sprout transactions are journaled before submission in version-4 authenticated roots bound to the network, full key-set fingerprint, lineage anchor, and artifact generation. Argos rejects overlapping note claims across sibling roots. Accepted transactions remain pending, and an unknown submission stops later work until reconciliation. Argos retries the saved exact bytes only while they remain valid for inclusion before NU7. A saved transaction is rebuilt only after a configured source reports it absent more than 20 blocks past its expiry height; the old transaction remains visible as superseded. A refusal about one note alone records that note as rejected and the sweep continues; any other non-accept reply from the primary submission endpoint remains SubmissionUnknown until observation resolves it.
 - Keep the original wallet or Sprout key, scan checkpoint, and journal until Argos reports fresh canonical mined evidence for every saved Sprout transaction. A scan-derived sweep may remove the exact checkpoint through guarded cleanup only after the same canonical mined height and block hash survive the two newest independently corroborated depth-100 reconciliation rounds; otherwise Argos retains it and reports why. A broadcast, visible arrival, node acceptance, or one confirmation is insufficient.
 - A ZecWallet Lite seed alone cannot recover Sprout funds because those keys were generated independently. Use the original `wallet.dat` or a standalone Sprout spending key instead.
 - A balance reconstructed only from cached `wallet.dat` records is the file's claim until the sweep is accepted by consensus. A full-block Sprout scan derives its result from the chain.

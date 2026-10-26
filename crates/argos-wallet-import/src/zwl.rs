@@ -1396,15 +1396,21 @@ mod tests {
 
     #[test]
     fn truncated_later_tkey_retains_earlier_testnet_identity() {
-        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use secp256k1::{PublicKey, SecretKey};
         use zcash_protocol::consensus::NetworkType;
         use zcash_transparent::address::TransparentAddress;
 
         let secret = [0x55; TRANSPARENT_SECRET_LEN];
-        let public =
-            PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&secret).unwrap());
-        let address = TransparentAddress::from_pubkey(&public)
-            .to_zcash_address(NetworkType::Test)
+        let public = PublicKey::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap());
+        let TransparentAddress::PublicKeyHash(hash) = TransparentAddress::from_pubkey(&public)
+        else {
+            panic!("fixture public key must produce P2PKH");
+        };
+        let address =
+            <zcash_address::ZcashAddress as zcash_address::ToAddress>::from_transparent_p2pkh(
+                NetworkType::Test,
+                hash,
+            )
             .encode();
         let mut first = tkey_hd(0x55);
         let address_start = 1 + 4 + 1 + 1 + TRANSPARENT_SECRET_LEN + 8;
@@ -1586,7 +1592,8 @@ mod tests {
 
     fn zkey_hd(extsk_byte: u8) -> Vec<u8> {
         use sapling_crypto::zip32::ExtendedSpendingKey;
-        let extsk = ExtendedSpendingKey::master(&[extsk_byte; 32]);
+        let extsk =
+            ExtendedSpendingKey::master(&[extsk_byte; 32]).expect("valid fixture Sapling key");
         let mut extfvk = Vec::new();
         #[allow(deprecated)]
         extsk
@@ -1630,14 +1637,21 @@ mod tests {
     }
 
     fn tkey_hd(secret_byte: u8) -> Vec<u8> {
-        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use secp256k1::{PublicKey, SecretKey};
         use zcash_protocol::consensus::NetworkType;
         use zcash_transparent::address::TransparentAddress;
         let secret = [secret_byte; TRANSPARENT_SECRET_LEN];
-        let sk = SecretKey::from_slice(&secret).unwrap();
-        let pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &sk);
-        let address = TransparentAddress::from_pubkey(&pubkey)
-            .to_zcash_address(NetworkType::Main)
+        let sk = SecretKey::from_secret_bytes(secret).unwrap();
+        let pubkey = PublicKey::from_secret_key(&sk);
+        let TransparentAddress::PublicKeyHash(hash) = TransparentAddress::from_pubkey(&pubkey)
+        else {
+            panic!("fixture public key must produce P2PKH");
+        };
+        let address =
+            <zcash_address::ZcashAddress as zcash_address::ToAddress>::from_transparent_p2pkh(
+                NetworkType::Main,
+                hash,
+            )
             .encode();
         let mut v = vec![1u8];
         v.extend_from_slice(&u32le(0));
@@ -1689,7 +1703,9 @@ mod tests {
         assert_eq!(keys.sapling.len(), 1);
         assert_eq!(
             keys.sapling[0].extsk.expose_secret(),
-            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x11; 32]).to_bytes()
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x11; 32])
+                .expect("valid fixture Sapling key")
+                .to_bytes()
         );
         assert_ne!(keys.coverage(), crate::keys::ImportCoverage::Complete);
         assert!(keys.diagnostics.iter().any(|d| matches!(d,
@@ -1764,7 +1780,9 @@ mod tests {
                 assert_eq!(keys.sapling.len(), 1, "first zkey lost at cut {cut}");
                 assert_eq!(
                     keys.sapling[0].extsk.expose_secret(),
-                    &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x12; 32]).to_bytes()
+                    &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x12; 32])
+                        .expect("valid fixture Sapling key")
+                        .to_bytes()
                 );
             }
             if cut >= first_tkey_end {
@@ -1936,7 +1954,9 @@ mod tests {
         assert_eq!(keys.sapling.len(), 1);
         assert_eq!(
             keys.sapling[0].extsk.expose_secret(),
-            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0xEF; 32]).to_bytes()
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0xEF; 32])
+                .expect("valid fixture Sapling key")
+                .to_bytes()
         );
         assert_eq!(keys.sapling[0].provenance, Provenance::HdDerived);
 
@@ -1971,7 +1991,9 @@ mod tests {
         assert_eq!(keys.sapling.len(), 1);
         assert_eq!(
             keys.sapling[0].extsk.expose_secret(),
-            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x11; 32]).to_bytes()
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x11; 32])
+                .expect("valid fixture Sapling key")
+                .to_bytes()
         );
         assert_eq!(keys.transparent.len(), 1);
         assert_eq!(
@@ -2190,7 +2212,8 @@ mod tests {
     /// spending key is dropped and only `enc_key`/`nonce` remain.
     fn zkey_standalone_sealed(extsk_byte: u8, key: &[u8; 32], nonce: [u8; NONCE_LEN]) -> Vec<u8> {
         use sapling_crypto::zip32::ExtendedSpendingKey;
-        let extsk = ExtendedSpendingKey::master(&[extsk_byte; 32]);
+        let extsk =
+            ExtendedSpendingKey::master(&[extsk_byte; 32]).expect("valid fixture Sapling key");
         let mut extfvk = Vec::new();
         #[allow(deprecated)]
         extsk
@@ -2256,7 +2279,9 @@ mod tests {
         assert_eq!(keys.sapling[0].provenance, Provenance::Standalone);
         assert_eq!(
             keys.sapling[0].extsk.expose_secret(),
-            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x41; 32]).to_bytes()
+            &sapling_crypto::zip32::ExtendedSpendingKey::master(&[0x41; 32])
+                .expect("valid fixture Sapling key")
+                .to_bytes()
         );
         assert_eq!(keys.transparent.len(), 1, "{:?}", keys.diagnostics);
         assert_eq!(keys.transparent[0].provenance, Provenance::Standalone);

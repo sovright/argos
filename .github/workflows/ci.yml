@@ -20,10 +20,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
           components: clippy
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -65,10 +65,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -208,10 +208,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
@@ -249,10 +249,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
@@ -274,7 +274,7 @@ jobs:
       # Runs the local fake-lightwalletd tests. Real-node cases remain ignored
       # unless a provisioned regtest harness is explicitly supplied.
       - name: cargo test (local argos-network integration)
-        run: cargo test -p argos-core --features argos-network --test regtest_integration
+        run: cargo test -p argos-core --features argos-network --locked --test regtest_integration --test nu7_readiness
 
       - name: Install Node for GUI interaction tests
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -309,10 +309,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
@@ -424,10 +424,40 @@ jobs:
             exit 1
           fi
 
+      # Separate volumes preserve the pre-Canopy Sprout chain. This fast
+      # profile proves real branch/block/proxy compatibility, not funded PCZT
+      # acceptance (which needs the documented full-height profile).
+      - name: Start independent NU7 boundary nodes
+        working-directory: tests/regtest
+        run: |
+          docker compose --profile nu7-fast up -d zebrad-nu7-fast lightwalletd-nu7-fast
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 2 -H 'content-type: application/json' \
+                 --data '{"jsonrpc":"2.0","id":"ci","method":"getblockcount","params":[]}' \
+                 http://127.0.0.1:18262/ >/dev/null; then
+              ARGOS_NU7_PROFILE=fast ./nu7.sh before
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "NU7 node did not accept RPC within the startup budget"
+          exit 1
+
+      - name: NU7 actual block and proxy boundary test
+        run: |
+          set -o pipefail
+          cargo test -p argos-core --features argos-network --locked --test nu7_readiness \
+            private_ \
+            -- --ignored --nocapture --test-threads=1 2>&1 | tee nu7-node-test.log
+          passed=$(grep -cE '^test .* \.\.\. ok$|^ok$' nu7-node-test.log || true)
+          test "$passed" -ge 2
+
       - name: Node logs on failure
         if: failure()
         working-directory: tests/regtest
-        run: docker compose --profile sprout logs --tail=200 zcashd-sprout
+        run: |
+          docker compose --profile sprout logs --tail=200 zcashd-sprout
+          docker compose --profile nu7-fast logs --tail=200 zebrad-nu7-fast lightwalletd-nu7-fast
 
   cargo-deny:
     name: Cargo deny (advisories + bans + licenses + sources)
@@ -454,10 +484,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master@2026-05-27
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
@@ -466,6 +496,6 @@ jobs:
 
       # `--locked` uses the committed imports.lock; no network for fresh
       # import resolution. Refreshing the imports is a deliberate local
-      # action (`cargo vet update-imports`) so an upstream rewrite of any
+      # action (`cargo vet regenerate imports`) so an upstream rewrite of any
       # imported audits.toml cannot silently change our trust set.
       - run: cargo vet --locked

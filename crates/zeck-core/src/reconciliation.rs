@@ -7,8 +7,9 @@ use zcash_primitives::transaction::TxId;
 
 use crate::{
     broadcast::{
-        observe_transaction, resubmit_prepared_transaction, BroadcastStore, DurableBroadcastLog,
-        SubmissionDisposition, TxObservation, TxObservationState, TxObserver, TxSubmitter,
+        observe_transaction, resubmit_prepared_transaction, validate_retry_at_tip, BroadcastStore,
+        DurableBroadcastLog, SubmissionDisposition, TxObservation, TxObservationState, TxObserver,
+        TxSubmitter,
     },
     error::{ZeckError, ZeckResult},
     models::{TxLifecycleState, ZeckNetwork},
@@ -244,6 +245,13 @@ pub async fn retry_unknown_transaction<O: TxObserver, N: TxSubmitter>(
         .latest(txid)
         .ok_or_else(|| ZeckError::Storage(format!("missing prepared transaction {txid}")))?
         .prepared;
+    // Observation alone cannot authorize a send: its sources may be lagging
+    // or unavailable. Ask the submission endpoint for fresh network-validated
+    // evidence, then check the branch encoded in these exact durable bytes.
+    let tip = submitter.validated_tip(network).await.map_err(|err| {
+        ZeckError::Broadcast(format!("cannot validate the retry chain tip ({err}); keep the stored transaction bytes and reconcile their status before replanning"))
+    })?;
+    validate_retry_at_tip(&stored.raw_tx, network, tip)?;
     let submitted = resubmit_prepared_transaction(log, submitter, &stored, deadline).await?;
     Ok(ReconciledTransaction {
         txid: txid.to_string(),
@@ -295,6 +303,119 @@ mod tests {
                 .pop_front()
                 .expect("one scripted observation per call"))
         }
+    }
+
+    struct RetryTipSubmitter {
+        network: ZeckNetwork,
+        tip: Option<u32>,
+        sent: Vec<Vec<u8>>,
+        tip_queries: usize,
+    }
+
+    impl RetryTipSubmitter {
+        fn new(network: ZeckNetwork, tip: Option<u32>) -> Self {
+            Self {
+                network,
+                tip,
+                sent: Vec::new(),
+                tip_queries: 0,
+            }
+        }
+
+        fn nu5() -> Self {
+            use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+            let network = ZeckNetwork::Testnet;
+            let tip = crate::workspace::consensus_network(network)
+                .activation_height(NetworkUpgrade::Nu5)
+                .unwrap();
+            Self::new(network, Some(u32::from(tip)))
+        }
+    }
+
+    #[async_trait]
+    impl crate::broadcast::TxSubmitter for RetryTipSubmitter {
+        async fn validated_tip(&mut self, network: ZeckNetwork) -> ZeckResult<u32> {
+            assert_eq!(network, self.network);
+            self.tip_queries += 1;
+            self.tip
+                .ok_or_else(|| crate::ZeckError::Lightwalletd("fresh tip unavailable".into()))
+        }
+
+        async fn send_raw(
+            &mut self,
+            raw: Vec<u8>,
+        ) -> Result<zcash_client_backend::proto::service::SendResponse, tonic::Status> {
+            self.sent.push(raw);
+            Ok(zcash_client_backend::proto::service::SendResponse {
+                error_code: 0,
+                error_message: String::new(),
+            })
+        }
+    }
+
+    struct UnavailableObserver(ZeckNetwork);
+
+    #[async_trait]
+    impl TxObserver for UnavailableObserver {
+        async fn observe(
+            &mut self,
+            network: ZeckNetwork,
+            _txid: TxId,
+            expiry: Option<u32>,
+        ) -> ZeckResult<TxObservation> {
+            assert_eq!(network, self.0);
+            Ok(observe_transaction(Vec::new(), expiry))
+        }
+    }
+
+    fn prepared_for_branch(
+        version: zcash_primitives::transaction::TxVersion,
+        branch: zcash_protocol::consensus::BranchId,
+        expiry: u32,
+    ) -> PreparedTransaction {
+        use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+        use zcash_protocol::consensus::BlockHeight;
+        let transaction = if version == TxVersion::V6 {
+            TransactionData::<Authorized>::from_parts_v6(
+                branch,
+                0,
+                BlockHeight::from_u32(expiry),
+                None,
+                None,
+                None,
+                None,
+            )
+        } else {
+            TransactionData::<Authorized>::from_parts(
+                version,
+                branch,
+                0,
+                BlockHeight::from_u32(expiry),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .freeze()
+        .unwrap();
+        let mut raw_tx = Vec::new();
+        transaction.write(&mut raw_tx).unwrap();
+        PreparedTransaction {
+            txid: transaction.txid(),
+            raw_tx,
+            fee_zatoshis: 10_000,
+            expiry_height: Some(expiry),
+        }
+    }
+
+    fn nu5_retry_prepared() -> PreparedTransaction {
+        let tip = RetryTipSubmitter::nu5().tip.unwrap();
+        prepared_for_branch(
+            zcash_primitives::transaction::TxVersion::V5,
+            zcash_protocol::consensus::BranchId::Nu5,
+            tip + 200,
+        )
     }
 
     fn evidence(operator: &str, height: Option<u32>, in_block: bool) -> EndpointTxEvidence {
@@ -877,10 +998,232 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_unknown_retry_sends_only_the_stored_transaction() {
+    async fn exact_retry_rejects_prior_branch_at_nu7_without_mutating_durable_bytes() {
+        use zcash_primitives::transaction::TxVersion;
+        use zcash_protocol::consensus::BranchId;
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let activation = crate::nu7::activation_height(network).unwrap();
+            for version in [TxVersion::V5, TxVersion::V6] {
+                // A future expiry does not make a prior-branch signature valid.
+                let tx = prepared_for_branch(version, BranchId::Nu6_3, activation + 100);
+                for tip in [activation - 2, activation - 1, activation] {
+                    for state in [
+                        TxLifecycleState::NotSubmitted,
+                        TxLifecycleState::SubmissionUnknown,
+                    ] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let path = dir.path().join("broadcasts-v1.jsonl");
+                        let mut log = DurableBroadcastLog::open(&path).unwrap();
+                        log.persist_prepared(&tx).unwrap();
+                        if state == TxLifecycleState::SubmissionUnknown {
+                            log.transition(tx.txid, state, None, None).unwrap();
+                        }
+                        let before = std::fs::read(&path).unwrap();
+                        let mut observer = UnavailableObserver(network);
+                        let mut submitter = RetryTipSubmitter::new(network, Some(tip));
+                        let result = super::retry_unknown_transaction(
+                            &mut log,
+                            &mut observer,
+                            &mut submitter,
+                            network,
+                            tx.txid,
+                            Duration::from_secs(1),
+                        )
+                        .await;
+                        assert_eq!(submitter.tip_queries, 1);
+                        if tip < activation - 1 {
+                            assert_eq!(result.unwrap().status, TxLifecycleState::Pending);
+                            assert_eq!(submitter.sent, vec![tx.raw_tx.clone()]);
+                        } else {
+                            let err = result.unwrap_err().to_string();
+                            assert!(err.contains("branch") && err.contains("reconcile"), "{err}");
+                            assert!(submitter.sent.is_empty());
+                            assert_eq!(log.latest(tx.txid).unwrap().state, state);
+                            assert_eq!(std::fs::read(&path).unwrap(), before);
+                        }
+                        assert_eq!(log.latest(tx.txid).unwrap().prepared, tx);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_retry_accepts_current_nu7_branch_and_rejects_retired_v4() {
+        use zcash_primitives::transaction::TxVersion;
+        use zcash_protocol::consensus::BranchId;
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let activation = crate::nu7::activation_height(network).unwrap();
+            for (version, branch, allowed) in [
+                (TxVersion::V5, BranchId::Nu7, true),
+                (TxVersion::V6, BranchId::Nu7, true),
+                (TxVersion::V4, BranchId::Nu6_3, false),
+            ] {
+                let tx = prepared_for_branch(version, branch, activation + 100);
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("broadcasts-v1.jsonl");
+                let mut log = DurableBroadcastLog::open(&path).unwrap();
+                log.persist_prepared(&tx).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let mut observer = UnavailableObserver(network);
+                let mut submitter = RetryTipSubmitter::new(network, Some(activation - 1));
+                let result = super::retry_unknown_transaction(
+                    &mut log,
+                    &mut observer,
+                    &mut submitter,
+                    network,
+                    tx.txid,
+                    Duration::from_secs(1),
+                )
+                .await;
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "{network:?} {version:?}: {result:?}"
+                );
+                if allowed {
+                    assert_eq!(submitter.sent, vec![tx.raw_tx.clone()]);
+                } else {
+                    assert!(submitter.sent.is_empty());
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        log.latest(tx.txid).unwrap().state,
+                        TxLifecycleState::NotSubmitted
+                    );
+                }
+                assert_eq!(log.latest(tx.txid).unwrap().prepared, tx);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_retry_fails_closed_on_unknown_or_unsupported_height() {
+        use zcash_primitives::transaction::TxVersion;
+        use zcash_protocol::consensus::BranchId;
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let activation = crate::nu7::activation_height(network).unwrap();
+            let tx = prepared_for_branch(TxVersion::V6, BranchId::Nu6_3, activation + 100);
+            for tip in [None, Some(0), Some(u32::MAX)] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("broadcasts-v1.jsonl");
+                let mut log = DurableBroadcastLog::open(&path).unwrap();
+                log.persist_prepared(&tx).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let mut observer = UnavailableObserver(network);
+                let mut submitter = RetryTipSubmitter::new(network, tip);
+                let result = super::retry_unknown_transaction(
+                    &mut log,
+                    &mut observer,
+                    &mut submitter,
+                    network,
+                    tx.txid,
+                    Duration::from_secs(1),
+                )
+                .await;
+                assert!(result.is_err());
+                assert!(submitter.sent.is_empty());
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert_eq!(log.latest(tx.txid).unwrap().prepared, tx);
+                assert_eq!(
+                    log.latest(tx.txid).unwrap().state,
+                    TxLifecycleState::NotSubmitted
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_retry_uses_encoded_expiry_and_retains_expired_transaction_status() {
+        use zcash_primitives::transaction::TxVersion;
+        use zcash_protocol::consensus::BranchId;
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let activation = crate::nu7::activation_height(network).unwrap();
+            for tip in [activation + 9, activation + 10, activation + 11] {
+                let mut tx = prepared_for_branch(TxVersion::V6, BranchId::Nu7, activation + 10);
+                // Durable metadata cannot override the expiry inside signed bytes.
+                tx.expiry_height = Some(activation + 100);
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("broadcasts-v1.jsonl");
+                let mut log = DurableBroadcastLog::open(&path).unwrap();
+                log.persist_prepared(&tx).unwrap();
+                log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+                    .unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let mut observer = UnavailableObserver(network);
+                let mut submitter = RetryTipSubmitter::new(network, Some(tip));
+                let result = super::retry_unknown_transaction(
+                    &mut log,
+                    &mut observer,
+                    &mut submitter,
+                    network,
+                    tx.txid,
+                    Duration::from_secs(1),
+                )
+                .await;
+                if tip < activation + 10 {
+                    assert_eq!(result.unwrap().status, TxLifecycleState::Pending);
+                    assert_eq!(submitter.sent, vec![tx.raw_tx.clone()]);
+                } else {
+                    let err = result.unwrap_err().to_string();
+                    assert!(
+                        err.contains("expired") && err.contains("reconcile"),
+                        "{err}"
+                    );
+                    assert!(submitter.sent.is_empty());
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        log.latest(tx.txid).unwrap().state,
+                        TxLifecycleState::SubmissionUnknown
+                    );
+                }
+                assert_eq!(log.latest(tx.txid).unwrap().prepared, tx);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_without_validated_tip_retains_bytes_and_does_not_send() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
         let tx = prepared();
+        let mut log = DurableBroadcastLog::open(&path).unwrap();
+        log.persist_prepared(&tx).unwrap();
+        log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut observer = ScriptedObserver(VecDeque::from([observe_transaction(
+            Vec::new(),
+            tx.expiry_height,
+        )]));
+        // The ordinary submission adapter supplies no fresh validated height.
+        let mut submitter = AcceptingSubmitter::default();
+        let result = super::retry_unknown_transaction(
+            &mut log,
+            &mut observer,
+            &mut submitter,
+            ZeckNetwork::Testnet,
+            tx.txid,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unknown tip must prevent exact-byte retry"
+        );
+        assert!(submitter.0.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(log.latest(tx.txid).unwrap().prepared, tx);
+        assert_eq!(
+            log.latest(tx.txid).unwrap().state,
+            TxLifecycleState::SubmissionUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_unknown_retry_sends_only_the_stored_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broadcasts-v1.jsonl");
+        let tx = nu5_retry_prepared();
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&tx).unwrap();
         log.transition(tx.txid, TxLifecycleState::SubmissionUnknown, None, None)
@@ -890,7 +1233,7 @@ mod tests {
             tx.expiry_height,
         );
         let mut observer = ScriptedObserver(VecDeque::from([absent]));
-        let mut submitter = AcceptingSubmitter::default();
+        let mut submitter = RetryTipSubmitter::nu5();
         let result = super::retry_unknown_transaction(
             &mut log,
             &mut observer,
@@ -901,7 +1244,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(submitter.0, vec![tx.raw_tx]);
+        assert_eq!(submitter.sent, vec![tx.raw_tx]);
         assert_eq!(result.status, TxLifecycleState::Pending);
         drop(log);
         assert_eq!(
@@ -952,7 +1295,7 @@ mod tests {
     async fn prepared_before_submission_crash_retries_only_stored_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broadcasts-v1.jsonl");
-        let tx = prepared();
+        let tx = nu5_retry_prepared();
         let mut log = DurableBroadcastLog::open(&path).unwrap();
         log.persist_prepared(&tx).unwrap();
         let absent = observe_transaction(
@@ -960,7 +1303,7 @@ mod tests {
             tx.expiry_height,
         );
         let mut observer = ScriptedObserver(VecDeque::from([absent]));
-        let mut submitter = AcceptingSubmitter::default();
+        let mut submitter = RetryTipSubmitter::nu5();
         let result = super::retry_unknown_transaction(
             &mut log,
             &mut observer,
@@ -971,7 +1314,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(submitter.0, vec![tx.raw_tx]);
+        assert_eq!(submitter.sent, vec![tx.raw_tx]);
         assert_eq!(result.status, TxLifecycleState::Pending);
         drop(log);
         assert_eq!(

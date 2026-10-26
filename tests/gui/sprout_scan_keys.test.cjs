@@ -75,6 +75,7 @@ function driveHandler(name, boxText, report) {
   const context = {
     $,
     walletFile: null,
+    sproutNu7StatusCurrent: () => ({state: "before_activation", allow_new_spends: true}),
     birthdayTouched: false,
     document: { createElement: el },
     fmt: String,
@@ -168,10 +169,10 @@ test("runSproutScanSweep sends only the reviewed proposal, never the box's lines
   });
   context.sproutScanHandle = "scan-1";
   context.sproutScanResult = { notes_found: 1 };
-  context.sproutScanReview = { proposal_id: "proposal-1", params_present: true };
+  context.sproutScanReview = { proposal_id: "proposal-1", allow_new_spends: true, params_present: true };
   context.sproutScanReviewDestination = "zs1destination";
   await run();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].command, "execute_sprout_scan_sweep");
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].args)), { proposalId: "proposal-1" });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].args)), { proposalId: "proposal-1", observationOnly: false });
 });

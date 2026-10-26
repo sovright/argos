@@ -35,8 +35,10 @@ const SAPLING_ACTIVATION_DATE: CalendarDate = CalendarDate {
 };
 /// Pre-Blossom block target was 150 s.  Used by the offline fallback only.
 const PRE_BLOSSOM_BLOCK_SECONDS: i64 = 150;
-/// Post-Blossom (and current) block target is 75 s.
+/// Post-Blossom and pre-NU7 block target is 75 s.
 const POST_BLOSSOM_BLOCK_SECONDS: i64 = 75;
+/// NU7 reduces the target to 25 seconds at its network-specific height.
+const POST_NU7_BLOCK_SECONDS: i64 = 25;
 /// Mainnet Blossom activation: block 653,600 ≈ 2019-12-11.
 const BLOSSOM_ACTIVATION_HEIGHT: u32 = 653_600;
 const BLOSSOM_ACTIVATION_DATE: CalendarDate = CalendarDate {
@@ -66,99 +68,56 @@ struct CalendarDate {
     day: u8,
 }
 
-/// Offline piecewise estimator: 150 s/block from Sapling activation through
-/// Blossom (block 653,600), then 75 s/block thereafter.  Used as the fallback
-/// when lightwalletd is unreachable, and as the round-trip helper below.
-pub fn estimate_birthday_from_date_offline(date: &str) -> ZeckResult<u32> {
-    let parsed = CalendarDate::parse(date)?;
-    if parsed <= SAPLING_ACTIVATION_DATE {
-        return Ok(SAPLING_ACTIVATION_HEIGHT);
-    }
-
-    if parsed <= BLOSSOM_ACTIVATION_DATE {
-        let seconds = parsed
-            .days_since_unix_epoch()
-            .saturating_sub(SAPLING_ACTIVATION_DATE.days_since_unix_epoch())
-            .saturating_mul(DAY_SECONDS);
-        let blocks = (seconds / PRE_BLOSSOM_BLOCK_SECONDS).max(0) as u32;
-        return Ok(SAPLING_ACTIVATION_HEIGHT.saturating_add(blocks));
-    }
-
-    let seconds = parsed
-        .days_since_unix_epoch()
-        .saturating_sub(BLOSSOM_ACTIVATION_DATE.days_since_unix_epoch())
-        .saturating_mul(DAY_SECONDS);
-    let blocks = (seconds / POST_BLOSSOM_BLOCK_SECONDS).max(0) as u32;
-    Ok(BLOSSOM_ACTIVATION_HEIGHT.saturating_add(blocks))
-}
-
-/// Estimate a wallet birthday from a date by binary-searching lightwalletd for
-/// the first block whose timestamp meets-or-exceeds the target.  Falls back to
-/// the offline piecewise heuristic if any RPC fails.
-///
-/// A safety margin of ~1 week (`DATE_SAFETY_BUFFER_BLOCKS`) is subtracted so
-/// we err toward over-scanning rather than missing notes.
-pub async fn estimate_birthday_from_date(date: &str, lightwalletd_url: &str) -> ZeckResult<u32> {
-    let parsed = CalendarDate::parse(date)?;
-    if parsed <= SAPLING_ACTIVATION_DATE {
-        return Ok(SAPLING_ACTIVATION_HEIGHT);
-    }
-
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let target_unix = parsed.days_since_unix_epoch().saturating_mul(DAY_SECONDS);
-
-    let probed = match probe_lightwalletd_endpoints(lightwalletd_url).await {
-        Ok(probe) => probe,
-        Err(_) => return estimate_birthday_from_date_offline(date),
-    };
-    let (mut client, _endpoint, chain_info) = probed;
-
-    let chain_tip = match u32::try_from(chain_info.block_height) {
-        Ok(h) => h,
-        Err(_) => return estimate_birthday_from_date_offline(date),
-    };
-    let sapling_floor =
-        u32::try_from(chain_info.sapling_activation_height).unwrap_or(SAPLING_ACTIVATION_HEIGHT);
-
-    let tip_time = match fetch_block_time(&mut client, chain_tip).await {
-        Ok(t) => t,
-        Err(_) => return estimate_birthday_from_date_offline(date),
-    };
-    if target_unix >= tip_time {
-        return Ok(chain_tip
-            .saturating_sub(DATE_SAFETY_BUFFER_BLOCKS)
-            .max(sapling_floor));
-    }
-
-    let mut lo = sapling_floor;
-    let mut hi = chain_tip;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let mid_time = match fetch_block_time(&mut client, mid).await {
-            Ok(t) => t,
-            Err(_) => return estimate_birthday_from_date_offline(date),
-        };
-        if mid_time < target_unix {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+/// Consensus spacing at a known height. This never infers activation from a
+/// calendar date, including when a local regtest schedule is installed.
+fn birthday_block_seconds(network: ZeckNetwork, height: u32) -> i64 {
+    if crate::nu7::activation_height(network).is_some_and(|activation| height >= activation) {
+        POST_NU7_BLOCK_SECONDS
+    } else if height
+        >= match network {
+            ZeckNetwork::Mainnet => BLOSSOM_ACTIVATION_HEIGHT,
+            ZeckNetwork::Testnet => 584_000,
         }
+    {
+        POST_BLOSSOM_BLOCK_SECONDS
+    } else {
+        PRE_BLOSSOM_BLOCK_SECONDS
     }
-
-    Ok(lo
-        .saturating_sub(DATE_SAFETY_BUFFER_BLOCKS)
-        .max(sapling_floor))
 }
 
-/// Inverse of the offline estimator: given a block height, return the
-/// approximate calendar date as `YYYY-MM-DD`.
-///
-/// Below Sapling activation it counts back from Sapling at the same 150 s
-/// target, floored at the mainnet genesis date: a wallet.dat birthday can be
-/// pre-Sapling, and a date stuck at 2018 beside it would misstate its age.
-pub fn estimate_date_from_height_offline(height: u32) -> String {
-    let (anchor_date, anchor_height, block_seconds) = if height <= BLOSSOM_ACTIVATION_HEIGHT {
+/// Preserve the historical margin, and at least its one-week duration when
+/// the target spacing falls to 25 seconds. This is a dating margin, not a
+/// transaction-confirmation or finality threshold.
+fn date_safety_buffer_blocks(network: ZeckNetwork, height: u32) -> u32 {
+    DATE_SAFETY_BUFFER_BLOCKS.max(
+        u32::try_from(7 * DAY_SECONDS / birthday_block_seconds(network, height))
+            .unwrap_or(DATE_SAFETY_BUFFER_BLOCKS),
+    )
+}
+
+/// Conservative mainnet offline estimate. Historical 150/75-second anchors
+/// are retained. An offline clock cannot establish when NU7 actually mined,
+/// so dates beyond that historical extrapolation stop before activation
+/// rather than guessing a calendar date for the 25-second transition.
+pub fn estimate_birthday_from_date_offline(date: &str) -> ZeckResult<u32> {
+    estimate_birthday_from_date_offline_for_network(date, ZeckNetwork::Mainnet)
+}
+
+/// Network-aware offline fallback. Testnet has no reliable calendar anchors
+/// because its production includes stalls and minimum-difficulty bursts;
+/// scanning from Sapling activation is safer than inventing a later birthday.
+pub fn estimate_birthday_from_date_offline_for_network(
+    date: &str,
+    network: ZeckNetwork,
+) -> ZeckResult<u32> {
+    let parsed = CalendarDate::parse(date)?;
+    if network == ZeckNetwork::Testnet {
+        return Ok(280_000);
+    }
+    if parsed <= SAPLING_ACTIVATION_DATE {
+        return Ok(SAPLING_ACTIVATION_HEIGHT);
+    }
+    let (anchor_date, anchor_height, seconds_per_block) = if parsed <= BLOSSOM_ACTIVATION_DATE {
         (
             SAPLING_ACTIVATION_DATE,
             SAPLING_ACTIVATION_HEIGHT,
@@ -171,12 +130,129 @@ pub fn estimate_date_from_height_offline(height: u32) -> String {
             POST_BLOSSOM_BLOCK_SECONDS,
         )
     };
-
-    let delta_blocks = i64::from(height) - i64::from(anchor_height);
-    let delta_days = (delta_blocks * block_seconds).div_euclid(DAY_SECONDS);
-    let absolute_days = anchor_date
+    let seconds = parsed
         .days_since_unix_epoch()
-        .saturating_add(delta_days)
+        .saturating_sub(anchor_date.days_since_unix_epoch())
+        .saturating_mul(DAY_SECONDS);
+    let blocks = u32::try_from((seconds / seconds_per_block).max(0)).unwrap_or(u32::MAX);
+    let mut height = anchor_height.saturating_add(blocks);
+    let target_time = parsed.days_since_unix_epoch().saturating_mul(DAY_SECONDS);
+    // Recent dates also use the observed mainnet anchors and their existing
+    // four-week dating margin. The display estimator's synthetic continuity
+    // date for NU7 can precede its actual mined timestamp; it must never
+    // advance a scan past history that the conservative anchors still cover.
+    if target_time >= MAINNET_HEIGHT_ANCHORS[MAINNET_HEIGHT_ANCHORS.len() - 1].1 {
+        if let Some(conservative) = height_at_or_before_time(network, target_time) {
+            height = height.min(conservative);
+        }
+    }
+    Ok(
+        crate::nu7::activation_height(network).map_or(height, |activation| {
+            height.min(activation.saturating_sub(1))
+        }),
+    )
+}
+
+/// Estimate a wallet birthday from a date by binary-searching lightwalletd for
+/// the first block whose timestamp meets-or-exceeds the target.  Falls back to
+/// the offline piecewise heuristic if any RPC fails.
+///
+/// A safety margin of ~1 week (`DATE_SAFETY_BUFFER_BLOCKS`) is subtracted so
+/// we err toward over-scanning rather than missing notes.
+pub async fn estimate_birthday_from_date(date: &str, lightwalletd_url: &str) -> ZeckResult<u32> {
+    estimate_birthday_from_date_for_network(date, lightwalletd_url, ZeckNetwork::Mainnet).await
+}
+
+/// Estimate against the selected network's live block timestamps. The
+/// binary search naturally spans NU7's spacing transition without assigning
+/// the upgrade a speculative calendar date.
+pub async fn estimate_birthday_from_date_for_network(
+    date: &str,
+    lightwalletd_url: &str,
+    network: ZeckNetwork,
+) -> ZeckResult<u32> {
+    let parsed = CalendarDate::parse(date)?;
+    let network_floor = match network {
+        ZeckNetwork::Mainnet => SAPLING_ACTIVATION_HEIGHT,
+        ZeckNetwork::Testnet => 280_000,
+    };
+    if parsed <= SAPLING_ACTIVATION_DATE {
+        return Ok(network_floor);
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let target_unix = parsed.days_since_unix_epoch().saturating_mul(DAY_SECONDS);
+
+    let probed = match probe_lightwalletd_endpoints(lightwalletd_url).await {
+        Ok(probe) => probe,
+        Err(_) => return estimate_birthday_from_date_offline_for_network(date, network),
+    };
+    let (mut client, _endpoint, chain_info) = probed;
+    validate_lightwalletd_network(network, &chain_info)?;
+
+    let chain_tip = match u32::try_from(chain_info.block_height) {
+        Ok(h) => h,
+        Err(_) => return estimate_birthday_from_date_offline_for_network(date, network),
+    };
+    let sapling_floor =
+        u32::try_from(chain_info.sapling_activation_height).unwrap_or(network_floor);
+
+    let tip_time = match fetch_block_time(&mut client, chain_tip).await {
+        Ok(t) => t,
+        Err(_) => return estimate_birthday_from_date_offline_for_network(date, network),
+    };
+    if target_unix >= tip_time {
+        return Ok(chain_tip
+            .saturating_sub(date_safety_buffer_blocks(network, chain_tip))
+            .max(sapling_floor));
+    }
+
+    let mut lo = sapling_floor;
+    let mut hi = chain_tip;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mid_time = match fetch_block_time(&mut client, mid).await {
+            Ok(t) => t,
+            Err(_) => return estimate_birthday_from_date_offline_for_network(date, network),
+        };
+        if mid_time < target_unix {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    Ok(lo
+        .saturating_sub(date_safety_buffer_blocks(network, lo))
+        .max(sapling_floor))
+}
+
+/// Display-only piecewise estimate: historical 150/75-second targets, then
+/// 25 seconds from the assigned mainnet NU7 height. The derived continuity
+/// anchor is not an observed activation timestamp and is never inverted to
+/// determine a post-NU7 scan birthday.
+///
+/// Below Sapling activation it counts back from Sapling at the same 150 s
+/// target, floored at the mainnet genesis date: a wallet.dat birthday can be
+/// pre-Sapling, and a date stuck at 2018 beside it would misstate its age.
+pub fn estimate_date_from_height_offline(height: u32) -> String {
+    let seconds = if height <= BLOSSOM_ACTIVATION_HEIGHT {
+        SAPLING_ACTIVATION_DATE.days_since_unix_epoch() * DAY_SECONDS
+            + (i64::from(height) - i64::from(SAPLING_ACTIVATION_HEIGHT)) * PRE_BLOSSOM_BLOCK_SECONDS
+    } else {
+        let pre_nu7_height = crate::nu7::activation_height(ZeckNetwork::Mainnet)
+            .map_or(height, |activation| height.min(activation));
+        let post_nu7_blocks = height.saturating_sub(pre_nu7_height);
+        BLOSSOM_ACTIVATION_DATE.days_since_unix_epoch() * DAY_SECONDS
+            + (i64::from(pre_nu7_height) - i64::from(BLOSSOM_ACTIVATION_HEIGHT))
+                * POST_BLOSSOM_BLOCK_SECONDS
+            + i64::from(post_nu7_blocks) * birthday_block_seconds(ZeckNetwork::Mainnet, height)
+    };
+    // This date is an approximate display hint, never evidence that NU7
+    // activated on a particular date or permission to skip unscanned blocks.
+    let absolute_days = seconds
+        .div_euclid(DAY_SECONDS)
         .max(MAINNET_GENESIS_DATE.days_since_unix_epoch());
     CalendarDate::from_days_since_unix_epoch(absolute_days).format()
 }
@@ -282,8 +358,10 @@ pub fn unix_time_now() -> i64 {
 /// `unix_time`, less a four-week margin. Clamped to at least 1.
 ///
 /// Interpolates between [`MAINNET_HEIGHT_ANCHORS`] and extrapolates past the
-/// last at [`EXTRAPOLATION_BLOCK_SECONDS`], rounding down throughout. Pure;
-/// no network.
+/// last at [`EXTRAPOLATION_BLOCK_SECONDS`], rounding down throughout. Keeping
+/// this deliberately slow extrapolation after NU7 can only lower the bound
+/// relative to the new 25-second target; no upgrade timestamp is guessed.
+/// Pure; no network.
 ///
 /// `None` on testnet. Testnet's block production has been irregular —
 /// stalls and minimum-difficulty bursts — so no anchor table there could be
@@ -1625,6 +1703,79 @@ mod tests {
         assert!(note.contains("rescan"));
         // The mainnet-calibrated estimator must not emit a (wrong) testnet date.
         assert!(!note.contains("around 20"));
+    }
+
+    #[test]
+    fn nu7_birthday_spacing_follows_network_height_not_calendar_date() {
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let activation = crate::nu7::activation_height(network).unwrap();
+            assert_eq!(birthday_block_seconds(network, activation - 1), 75);
+            assert_eq!(birthday_block_seconds(network, activation), 25);
+            assert_eq!(birthday_block_seconds(network, activation + 1), 25);
+        }
+        assert_eq!(birthday_block_seconds(ZeckNetwork::Mainnet, 500_000), 150);
+        assert_eq!(birthday_block_seconds(ZeckNetwork::Mainnet, 1_000_000), 75);
+    }
+
+    #[test]
+    fn nu7_height_date_segment_uses_twenty_five_seconds_and_preserves_history() {
+        let activation = crate::nu7::activation_height(ZeckNetwork::Mainnet).unwrap();
+        let day = |height| {
+            CalendarDate::parse(&estimate_date_from_height_offline(height))
+                .unwrap()
+                .days_since_unix_epoch()
+        };
+        assert_eq!(day(activation) - day(activation - 1_152), 1);
+        assert_eq!(day(activation + 3_456) - day(activation), 1);
+        assert_eq!(day(activation + 6_912) - day(activation), 2);
+        assert_eq!(estimate_date_from_height_offline(419_200), "2018-10-28");
+        assert!(CalendarDate::parse(&estimate_date_from_height_offline(u32::MAX)).is_ok());
+    }
+
+    #[test]
+    fn birthday_margin_keeps_a_week_at_nu7_without_changing_finality_thresholds() {
+        for network in [ZeckNetwork::Mainnet, ZeckNetwork::Testnet] {
+            let activation = crate::nu7::activation_height(network).unwrap();
+            assert_eq!(date_safety_buffer_blocks(network, activation - 1), 8_064);
+            assert_eq!(date_safety_buffer_blocks(network, activation), 24_192);
+            assert_eq!(date_safety_buffer_blocks(network, activation + 1), 24_192);
+        }
+        assert_eq!(date_safety_buffer_blocks(ZeckNetwork::Mainnet, 1), 8_064);
+        assert_eq!(birthday_block_seconds(ZeckNetwork::Testnet, 583_999), 150);
+        assert_eq!(birthday_block_seconds(ZeckNetwork::Testnet, 584_000), 75);
+    }
+
+    #[test]
+    fn recent_offline_dates_stay_below_the_observed_anchor_bound() {
+        let activation = crate::nu7::activation_height(ZeckNetwork::Mainnet).unwrap();
+        for height in [activation - 1, activation, activation + 3_456] {
+            let date = estimate_date_from_height_offline(height);
+            let timestamp =
+                CalendarDate::parse(&date).unwrap().days_since_unix_epoch() * DAY_SECONDS;
+            let conservative = height_at_or_before_time(ZeckNetwork::Mainnet, timestamp).unwrap();
+            assert!(estimate_birthday_from_date_offline(&date).unwrap() <= conservative);
+        }
+    }
+
+    #[test]
+    fn offline_dates_never_guess_when_nu7_activated() {
+        let activation = crate::nu7::activation_height(ZeckNetwork::Mainnet).unwrap();
+        for date in ["2030-01-01", "9999-12-31", "2147483647-12-31"] {
+            assert_eq!(
+                estimate_birthday_from_date_offline(date).unwrap(),
+                activation - 1
+            );
+        }
+        // Testnet has no reliable calendar anchor; the pool floor is safe.
+        assert_eq!(
+            estimate_birthday_from_date_offline_for_network("2030-01-01", ZeckNetwork::Testnet)
+                .unwrap(),
+            280_000
+        );
+        assert!(
+            estimate_birthday_from_date_offline_for_network("invalid", ZeckNetwork::Testnet)
+                .is_err()
+        );
     }
 
     #[test]

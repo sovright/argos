@@ -415,6 +415,17 @@ $("seed-clear-clipboard")?.addEventListener("click", () => clearOsClipboard("see
 // `start_scan`: the backend needs it again to re-read the file when the scan
 // actually starts. It is cleared as soon as the scan is under way.
 let walletFile = null;
+let sproutNu7Status = { state: "unknown", tip_height: null };
+let sproutNu7StatusSource = null;
+let sproutNu7StatusBinding = null;
+let sproutNu7StatusGeneration = 0;
+let sproutNu7StatusTimer = null;
+// This timer expires evidence; only backend-validated height decides activation.
+const SPROUT_NU7_STATUS_MAX_AGE_MS = 60_000;
+const SPROUT_NU7_UNKNOWN = "NU7 status is unknown: a fresh, independently corroborated network height is unavailable. " +
+  "New Sprout recovery and rebroadcast are disabled. Historical inspection and saved mined-status checks remain available. " +
+  "Keep your wallet, keys, checkpoint, and backups.";
+
 // Only the newest import may publish state; previews are bound to that exact
 // wallet object, including when the same path is reopened with a new password.
 let walletOpenGeneration = 0;
@@ -512,6 +523,104 @@ function walletSproutExecutionConfig() {
   };
 }
 
+function sproutNu7StatusConfig() {
+  return JSON.stringify({
+    network: $("network-select").value,
+    lightwalletdUrl: $("lightwalletd-url").value.trim(),
+    confirmationSources: confirmationSourcesFromForm(),
+  });
+}
+
+function sproutNu7StatusCurrent() {
+  return sproutNu7StatusSource === walletFile &&
+    sproutNu7StatusBinding === sproutNu7StatusConfig()
+    ? sproutNu7Status : { state: "unknown", tip_height: null };
+}
+
+function invalidateSproutNu7Status() {
+  ++sproutNu7StatusGeneration;
+  if (sproutNu7StatusTimer !== null) clearTimeout(sproutNu7StatusTimer);
+  sproutNu7StatusTimer = null;
+  sproutNu7Status = { state: "unknown", tip_height: null };
+  sproutNu7StatusBinding = null;
+  sproutNu7StatusSource = null;
+  renderSproutNu7Availability();
+}
+
+function renderSproutNu7Availability() {
+  const status = sproutNu7StatusCurrent();
+  const allowed = status.state === "before_activation" && status.allow_new_spends === true;
+  const warning = status.warning || SPROUT_NU7_UNKNOWN;
+  const broadcastWarning = `${$("network-select").value} NU7: your Sprout recovery transaction was broadcast, ` +
+    "but it must be mined before NU7 activation; confirm it is mined. " + warning;
+  if ((walletFile?.summary?.sprout_keys ?? 0) > 0) {
+    sproutNu7Warning = allowed && sproutNu7Broadcast ? broadcastWarning : warning;
+    showSproutNu7Warning(sproutNu7Warning);
+    if (allowed) {
+      const summary = walletFile.summary;
+      $("wallet-sprout-headline").textContent = summary.sprout_spendable_notes > 0
+        ? "Sprout note data is available for recovery before NU7."
+        : summary.sprout_has_lifecycle_status
+          ? "Sprout transaction status is available for this file."
+          : summary.sprout_nothing_left ? "No Sprout funds are left in this file."
+          : summary.sprout_history_read ? "No spendable Sprout notes were recovered from this file."
+          : "Sprout funds need a full-block scan before NU7.";
+    } else {
+      $("wallet-sprout-headline").textContent = status.state === "activated"
+        ? "Sprout history is available. New recovery is disabled after NU7."
+        : status.state === "before_activation"
+          ? "The Sprout mining deadline has passed. Historical status remains available."
+          : "Sprout history is available. Recovery eligibility is unknown.";
+    }
+    renderSproutUncoveredBanners();
+  }
+  sproutScanNu7Warning = allowed && sproutScanNu7Broadcast ? broadcastWarning : warning;
+  $("sprout-scan-run").textContent = allowed ? "Start scan" : "Scan Sprout history";
+  $("sprout-sweep-heading").textContent = allowed ? "Move these funds before NU7" : "Saved Sprout transaction status";
+  renderSproutScanPanel();
+  updateWalletSproutSweepButton();
+  if (typeof updateSproutScanSweepButton === "function") updateSproutScanSweepButton();
+}
+
+async function refreshSproutNu7Status() {
+  const source = walletFile;
+  const binding = sproutNu7StatusConfig();
+  const generation = ++sproutNu7StatusGeneration;
+  if (sproutNu7StatusTimer !== null) clearTimeout(sproutNu7StatusTimer);
+  sproutNu7StatusTimer = null;
+  sproutNu7Status = { state: "unknown", tip_height: null };
+  sproutNu7StatusSource = source;
+  sproutNu7StatusBinding = binding;
+  renderSproutNu7Availability();
+  let result;
+  try {
+    result = await invoke("sprout_nu7_status", JSON.parse(binding));
+  } catch {
+    result = { state: "unknown", warning: SPROUT_NU7_UNKNOWN };
+  }
+  if (generation !== sproutNu7StatusGeneration || source !== walletFile ||
+      binding !== sproutNu7StatusConfig()) return null;
+  const activation = { mainnet: 3_543_405, testnet: 4_465_026 }[$("network-select").value];
+  const validHeight = Number.isInteger(result?.tip_height) && result.tip_height >= 0 &&
+    result.activation_height === activation;
+  const coherent = validHeight && (
+    (result.state === "before_activation" && result.tip_height < activation) ||
+    (result.state === "activated" && result.tip_height >= activation));
+  sproutNu7Status = coherent
+    ? { ...result, allow_new_spends: result.allow_new_spends === true && result.tip_height + 1 < activation }
+    : { state: "unknown", tip_height: null, allow_new_spends: false, warning: SPROUT_NU7_UNKNOWN };
+  renderSproutNu7Availability();
+  sproutNu7StatusTimer = setTimeout(() => {
+    if (generation !== sproutNu7StatusGeneration || source !== walletFile ||
+        binding !== sproutNu7StatusConfig()) return;
+    invalidateSproutNu7Status();
+    if ((walletFile?.summary?.sprout_keys ?? 0) > 0 || $("sprout-scan-entry").open) {
+      void refreshSproutNu7Status();
+    }
+  }, SPROUT_NU7_STATUS_MAX_AGE_MS);
+  return sproutNu7Status;
+}
+
 function walletSproutConfigMatches(left, right = walletSproutExecutionConfig()) {
   return left !== null && JSON.stringify(left) === JSON.stringify(right);
 }
@@ -535,11 +644,26 @@ function sproutReviewHasLifecycleStatus(review) {
 }
 
 function sproutReviewMayRun(review) {
-  return !!review && (sproutReviewHasLifecycleStatus(review) || review.params_present === true);
+  return !!review && (sproutReviewHasLifecycleStatus(review) ||
+    (review.allow_new_spends === true && review.params_present === true));
 }
 
 function updateWalletSproutSweepButton() {
+  const allowed = sproutNu7StatusCurrent().state === "before_activation" &&
+    sproutNu7StatusCurrent().allow_new_spends === true && walletSproutReview?.allow_new_spends === true;
+  const confirmationLabel = allowed
+    ? "I understand this may rebroadcast a saved transaction or move funds and cannot be undone."
+    : "Check saved transaction status only. No new proof or rebroadcast is allowed.";
+  // Consent belongs to the displayed mode, so a status-only acknowledgement
+  // cannot become spending authority when a pending height refresh succeeds.
+  if ($("sprout-sweep-confirm-label").textContent !== confirmationLabel) {
+    $("sprout-sweep-confirm").checked = false;
+  }
+  $("sprout-sweep-confirm-label").textContent = confirmationLabel;
+  $("sprout-sweep-run").textContent = sproutReviewHasLifecycleStatus(walletSproutReview)
+    ? (allowed ? "Check status and continue" : "Check saved status only") : "Sweep Sprout funds";
   $("sprout-sweep-run").disabled = !sproutReviewMayRun(walletSproutReview) ||
+    (!allowed && !sproutReviewHasLifecycleStatus(walletSproutReview)) ||
     walletSproutReviewDestination !== $("sprout-destination").value.trim() ||
     !walletSproutConfigMatches(walletSproutReviewConfig) ||
     sproutPreviewWallet !== walletFile || !$("sprout-sweep-confirm").checked ||
@@ -716,6 +840,9 @@ function renderWalletSummary(summary) {
 
   $("wallet-summary").hidden = false;
   renderSproutScanPanel();
+  if (summary.sprout_keys > 0 && !summary.sprout_spendable_notes && !summary.sprout_has_lifecycle_status) {
+    void refreshSproutNu7Status();
+  }
 }
 
 // ─── Sprout sweep ───────────────────────────────────────────────────────────
@@ -832,13 +959,17 @@ async function showSproutSweep() {
 
   const destination = $("sprout-destination").value.trim();
   if (!destination) {
-    $("sprout-sweep-plan").textContent = "Enter a destination to review this sweep.";
+    $("sprout-sweep-plan").textContent = "Enter the saved or intended destination to review recovery or transaction status.";
+    void refreshSproutNu7Status();
     return;
   }
   const generation = walletSproutProposalGeneration;
   const previewConfig = walletSproutExecutionConfig();
 
   try {
+    const availability = await refreshSproutNu7Status();
+    if (!availability || walletFile !== source || generation !== walletSproutProposalGeneration ||
+        !walletSproutConfigMatches(previewConfig)) return;
     const previewNetwork = previewConfig.network;
     // A malformed entry in the scan panel's peer field must not cost the
     // preview: the raw entries go to the backend, which skips live
@@ -878,12 +1009,17 @@ async function showSproutSweep() {
     setStatus("sprout-sweep-status", preview.scan_warning || "", "");
     // A preview for a network the user has since moved off, or one that
     // lands after a broadcast, would put back the wrong warning.
-    if (preview.nu7_warning && previewNetwork === $("network-select").value && !sproutNu7Broadcast) {
+    if (preview.nu7_warning && availability.allow_new_spends === true &&
+        sproutNu7StatusCurrent().allow_new_spends === true &&
+        previewNetwork === $("network-select").value && !sproutNu7Broadcast) {
       showSproutNu7Warning(preview.nu7_warning);
     }
 
+    preview.allow_new_spends = preview.allow_new_spends === true && availability.state === "before_activation" && availability.allow_new_spends === true;
     const lifecycleCount = (preview.active ?? []).length + (preview.mined ?? []).length;
-    const readyPlan = preview.notes > 0
+    const readyPlan = !preview.allow_new_spends
+      ? "Historical Sprout notes cannot be spent while NU7 recovery is disabled. Keep all recovery material."
+      : preview.notes > 0
       ? `${preview.notes} note(s): ${fmt(preview.gross_zatoshis)} gross, ` +
         `${fmt(preview.fee_zatoshis)} fee, ${fmt(preview.net_zatoshis)} to your address.`
       : "No note is ready for a new transaction.";
@@ -908,7 +1044,9 @@ async function showSproutSweep() {
       : "Sweep Sprout funds";
     if (sproutReviewMayRun(preview)) {
       $("sprout-sweep-params").textContent = "";
-      if (!preview.params_present) {
+      if (!preview.allow_new_spends) {
+        $("sprout-sweep-params").textContent = "Saved status checks are observation-only: no new proof or rebroadcast.";
+      } else if (!preview.params_present) {
         $("sprout-sweep-params").textContent =
           "Sprout proving parameters are missing. Saved transaction status and exact-byte " +
           "retries can still be checked; a new transaction cannot be proved.";
@@ -920,8 +1058,9 @@ async function showSproutSweep() {
       $("sprout-sweep-confirm").disabled = false;
       updateWalletSproutSweepButton();
     } else {
-      $("sprout-sweep-params").textContent =
-        `Sprout proving parameters are missing. Download the 725 MB file to ` +
+      $("sprout-sweep-params").textContent = !preview.allow_new_spends
+        ? "New Sprout recovery is disabled. Historical records and backups are retained."
+        : `Sprout proving parameters are missing. Download the 725 MB file to ` +
         `${preview.params_path} before sweeping:  ` +
         `curl -o ${preview.params_path} https://download.z.cash/downloads/sprout-groth16.params`;
       $("sprout-sweep-run").disabled = true;
@@ -955,6 +1094,12 @@ async function runSproutSweep() {
     setStatus("sprout-sweep-status", "Wait for this wallet’s Sprout preview before sweeping.", "error");
     return;
   }
+  if (!sproutReviewMayRun(walletSproutReview) ||
+      (!sproutReviewHasLifecycleStatus(walletSproutReview) &&
+       sproutNu7StatusCurrent().allow_new_spends !== true)) {
+    setStatus("sprout-sweep-status", "New Sprout recovery is unavailable. Saved status checks remain available; keep all recovery material.", "error");
+    return;
+  }
   if (!$("sprout-sweep-confirm").checked) {
     setStatus("sprout-sweep-status", "Tick the box to confirm this moves funds irreversibly.", "error");
     return;
@@ -977,7 +1122,11 @@ async function runSproutSweep() {
 
     // Refuses a malformed scan peer field before anything is sent (#272).
     sproutScanPeers();
-    const report = await invoke("execute_wallet_sprout_sweep", { proposalId });
+    const report = await invoke("execute_wallet_sprout_sweep", {
+      proposalId,
+      observationOnly: walletSproutReview.allow_new_spends !== true ||
+        sproutNu7StatusCurrent().allow_new_spends !== true,
+    });
 
     if (walletFile !== source) return;
 
@@ -1034,7 +1183,10 @@ let sproutNu7Broadcast = false;
 /// before the network picker, so text built at wallet open can name the
 /// wrong network. Asks for nothing unless one of them is in use.
 async function refreshSproutNu7Warning() {
-  await Promise.all([refreshWalletSproutNu7Warning(), refreshSproutScanNu7Warning()]);
+  const availability = await refreshSproutNu7Status();
+  if (availability?.state === "before_activation" && availability.allow_new_spends === true) {
+    await Promise.all([refreshWalletSproutNu7Warning(), refreshSproutScanNu7Warning()]);
+  }
 }
 
 /// The scan panel's alert, while the panel is open. If the core text cannot
@@ -1057,7 +1209,8 @@ async function refreshSproutScanNu7Warning() {
   if (
     !text ||
     $("network-select").value !== network ||
-    sproutScanNu7Broadcast !== broadcast
+    sproutScanNu7Broadcast !== broadcast ||
+    sproutNu7StatusCurrent().allow_new_spends !== true
   ) {
     return;
   }
@@ -1086,7 +1239,8 @@ async function refreshWalletSproutNu7Warning() {
     !sproutNu7Warning ||
     !text ||
     $("network-select").value !== network ||
-    sproutNu7Broadcast !== broadcast
+    sproutNu7Broadcast !== broadcast ||
+    sproutNu7StatusCurrent().allow_new_spends !== true
   ) {
     return;
   }
@@ -1122,6 +1276,7 @@ function sproutSourceWarningMayClear(report) {
     transactions.length > 0 &&
     transactions.every((transaction) =>
       transaction?.state === "mined" &&
+      transaction.unmineable_after_nu7 !== true &&
       Number.isInteger(transaction.mined_height) &&
       transaction.mined_height >= 0) &&
     !report.error &&
@@ -1140,6 +1295,10 @@ function sproutLifecycleAmount(transaction) {
 
 function sproutLifecycleRow(transaction) {
   const subject = `${sproutLifecycleAmount(transaction)} — ${transaction.txid}`;
+  if (transaction.unmineable_after_nu7 === true) {
+    return `${subject}: unmined when NU7 activated; this Sprout transaction cannot be mined or rebroadcast. ` +
+      "Historical mined-status checks remain available. Keep the source, checkpoint, and backups.";
+  }
   switch (transaction.state) {
     case "pending":
       return `${subject}: broadcast pending; it is not mined. Keep the source and checkpoint.`;
@@ -1207,12 +1366,17 @@ function renderSproutSweepReport(report, { list, statusId, destination, statusPr
   ).length;
   const unknown = count("submission_unknown");
   const pending = count("pending");
+  const retired = transactions.filter((transaction) => transaction.unmineable_after_nu7 === true &&
+    transaction.superseded !== true).length;
   const expired = count("expired");
   const rejected = count("rejected") + (report?.rejected ?? []).length;
   const mined = count("mined");
   let text;
   let kind = "";
-  if (report?.error) {
+  if (retired > 0) {
+    text = `${retired} unmined Sprout transaction(s) became invalid at NU7. ` +
+      "Recovery is not confirmed for those notes; keep the source, checkpoint, and backups and check historical mined status.";
+  } else if (report?.error) {
     text = `✗ The sweep did not finish: ${report.error} ` +
       "Reconcile every saved transaction before another proposal.";
     kind = "error";
@@ -1302,7 +1466,7 @@ function forgetLoadedWalletFile() {
 }
 
 function renderSproutUncoveredBanners() {
-  const tail = `Open it on the wallet screen to recover Sprout funds separately.`;
+  const tail = "Open it on the wallet screen to inspect Sprout history, recovery eligibility, and saved transaction status.";
   const parts = [];
   if (uncoveredSproutKeys > 0) {
     parts.push(
@@ -1603,7 +1767,20 @@ function invalidateSproutScanReview() {
 }
 
 function updateSproutScanSweepButton() {
-  $("sprout-scan-sweep-run").disabled = !sproutScanResult || !sproutScanReview ||
+  const allowed = sproutNu7StatusCurrent().state === "before_activation" &&
+    sproutNu7StatusCurrent().allow_new_spends === true && sproutScanReview?.allow_new_spends === true;
+  const confirmationLabel = allowed
+    ? "I understand this may rebroadcast a saved transaction or move funds and cannot be undone."
+    : "Check saved transaction status only. No new proof or rebroadcast is allowed.";
+  // Consent belongs to the displayed mode, so a status-only acknowledgement
+  // cannot become spending authority when a pending height refresh succeeds.
+  if ($("sprout-scan-confirm-label").textContent !== confirmationLabel) {
+    $("sprout-scan-confirm").checked = false;
+  }
+  $("sprout-scan-confirm-label").textContent = confirmationLabel;
+  $("sprout-scan-sweep-run").textContent = sproutReviewHasLifecycleStatus(sproutScanReview)
+    ? (allowed ? "Check status and continue" : "Check saved status only") : "Sweep found funds";
+  $("sprout-scan-sweep-run").disabled = (!allowed && !sproutReviewHasLifecycleStatus(sproutScanReview)) || !sproutScanResult || !sproutScanReview ||
     !sproutReviewMayRun(sproutScanReview) ||
     sproutScanReviewDestination !== $("sprout-scan-destination").value.trim() ||
     !$("sprout-scan-confirm").checked || sproutScanExecutionPending;
@@ -1686,17 +1863,22 @@ async function refreshSproutScanReview() {
   const generation = sproutScanGeneration;
   const proposalGeneration = sproutScanProposalGeneration;
   try {
+    const availability = await refreshSproutNu7Status();
+    if (!availability || generation !== sproutScanGeneration || proposalGeneration !== sproutScanProposalGeneration) return;
     const review = await invoke("propose_sprout_scan_sweep", { scanHandle: handle, destination });
     if (generation !== sproutScanGeneration || proposalGeneration !== sproutScanProposalGeneration ||
         handle !== sproutScanHandle || destination !== $("sprout-scan-destination").value.trim()) {
       invoke("release_sprout_proposal", { proposalId: review.proposal_id }).catch(() => {});
       return;
     }
+    review.allow_new_spends = review.allow_new_spends === true && availability.state === "before_activation" && availability.allow_new_spends === true;
     sproutScanReview = review;
     sproutScanReviewDestination = destination;
     const lifecycleCount = (review.active ?? []).length + (review.mined ?? []).length;
     $("sprout-scan-sweep-plan").textContent =
-      (review.notes > 0
+      (!review.allow_new_spends
+        ? "Historical Sprout notes cannot be spent while NU7 recovery is disabled. Keep all recovery material. "
+        : review.notes > 0
         ? `${review.notes} note(s): ${fmt(review.gross_zatoshis)} gross, ` +
           `${fmt(review.fee_zatoshis)} fee, ${fmt(review.net_zatoshis)} to your address. `
         : "No note is ready for a new transaction. ") +
@@ -1707,7 +1889,9 @@ async function refreshSproutScanReview() {
       ? "Check status and continue"
       : "Sweep found funds";
     $("sprout-scan-confirm").disabled = !sproutReviewMayRun(review);
-    if (!review.params_present) {
+    if (!review.allow_new_spends) {
+      $("sprout-scan-sweep-plan").textContent += " Saved status checks are observation-only: no new proof or rebroadcast.";
+    } else if (!review.params_present) {
       $("sprout-scan-sweep-plan").textContent += canCheckLifecycle
         ? " Sprout proving parameters are missing. Saved transaction status and exact-byte retries " +
           "can still be checked; a new transaction cannot be proved."
@@ -1953,6 +2137,7 @@ async function runSproutScanSweep() {
   }
   if (!sproutScanHandle || !sproutScanResult || !sproutScanReview ||
       !sproutReviewMayRun(sproutScanReview) ||
+      (!sproutReviewHasLifecycleStatus(sproutScanReview) && sproutNu7StatusCurrent().allow_new_spends !== true) ||
       sproutScanReviewDestination !== destination || !$("sprout-scan-confirm").checked) {
     setStatus(
       "sprout-scan-status",
@@ -1987,7 +2172,11 @@ async function runSproutScanSweep() {
   );
 
   try {
-    const report = await invoke("execute_sprout_scan_sweep", { proposalId });
+    const report = await invoke("execute_sprout_scan_sweep", {
+      proposalId,
+      observationOnly: sproutScanReview.allow_new_spends !== true ||
+        sproutNu7StatusCurrent().allow_new_spends !== true,
+    });
     // The panel may have moved on to another scan source while proving ran.
     // These funds moved regardless, so the report is always shown, labelled
     // as the earlier scan's, never dropped.
@@ -2052,6 +2241,8 @@ for (const event of ["input", "change"]) {
 for (const id of ["wallet-path", "wallet-passphrase", "network-select", "data-dir", "lightwalletd-url", "confirmation-sources", "server-preset", "sprout-scan-peers"]) {
   $(id)?.addEventListener("input", invalidateWalletSproutReview);
   $(id)?.addEventListener("change", invalidateWalletSproutReview);
+  $(id)?.addEventListener("input", invalidateSproutNu7Status);
+  $(id)?.addEventListener("change", invalidateSproutNu7Status);
 }
 for (const id of ["lightwalletd-url", "confirmation-sources", "sprout-scan-peers"]) {
   $(id)?.addEventListener("change", () => {
@@ -2371,8 +2562,9 @@ function updateScanEstimate() {
   }
 }
 
-// Piecewise height→date (Sapling 150 s/block until Blossom @ 653,600,
-// then 75 s/block). Mirrors crates/argos-core/src/birthday.rs and lets us
+// Approximate height→date with historical 150/75-second timing, then
+// 25 seconds from each network's NU7 height. Calendar estimates never decide
+// whether a transaction may spend. This lets us
 // give the user instant round-trip feedback as they type a height.
 const SAPLING_ACTIVATION_HEIGHT_JS = 419_200;
 const SAPLING_ACTIVATION_DATE_JS = Date.UTC(2018, 9, 28); // Oct 28 2018
@@ -2380,13 +2572,15 @@ const BLOSSOM_ACTIVATION_HEIGHT_JS = 653_600;
 const BLOSSOM_ACTIVATION_DATE_JS = Date.UTC(2019, 11, 11); // Dec 11 2019
 const PRE_BLOSSOM_BLOCK_SECONDS = 150;
 const POST_BLOSSOM_BLOCK_SECONDS = 75;
+const POST_NU7_BLOCK_SECONDS = 25;
+const NU7_ACTIVATION_HEIGHTS_JS = { mainnet: 3_543_405, testnet: 4_465_026 };
 
 // Below Sapling it counts back at the same 150 s, floored at the genesis
 // date: a wallet.dat birthday can be pre-Sapling, and a hint stuck at 2018
 // beside it would misstate the wallet's age.
 const MAINNET_GENESIS_DATE_JS = Date.UTC(2016, 9, 28); // Oct 28 2016
 
-function approxDateFromHeight(height) {
+function approxDateFromHeight(height, network = "mainnet") {
   if (!Number.isFinite(height)) {
     return new Date(SAPLING_ACTIVATION_DATE_JS);
   }
@@ -2399,6 +2593,12 @@ function approxDateFromHeight(height) {
     anchorMs = BLOSSOM_ACTIVATION_DATE_JS;
     anchorHeight = BLOSSOM_ACTIVATION_HEIGHT_JS;
     blockSeconds = POST_BLOSSOM_BLOCK_SECONDS;
+    const activation = NU7_ACTIVATION_HEIGHTS_JS[network];
+    if (activation != null && height >= activation) {
+      anchorMs += (activation - anchorHeight) * POST_BLOSSOM_BLOCK_SECONDS * 1000;
+      anchorHeight = activation;
+      blockSeconds = POST_NU7_BLOCK_SECONDS;
+    }
   }
   return new Date(
     Math.max(MAINNET_GENESIS_DATE_JS, anchorMs + (height - anchorHeight) * blockSeconds * 1000),
@@ -2424,7 +2624,7 @@ function updateBirthdayHint() {
     setBirthdayHint("", "");
     return;
   }
-  const approx = formatApproxMonth(approxDateFromHeight(height));
+  const approx = formatApproxMonth(approxDateFromHeight(height, $("network-select").value));
   setBirthdayHint(`Block ${height.toLocaleString()} ≈ ${approx}.`, "");
 }
 
@@ -2525,7 +2725,7 @@ async function runBirthdayAutodetect() {
     invalidateScanAuthority();
     birthdayTouched = true;
     updateScanEstimate();
-    const approx = formatApproxMonth(approxDateFromHeight(result.birthday));
+    const approx = formatApproxMonth(approxDateFromHeight(result.birthday, probe.network));
     setBirthdayHint(birthdayDetectHint(result, approx), "success");
   } catch (err) {
     if (isCurrent()) setBirthdayHint(`✗ Auto-detect failed: ${err}`, "error");
@@ -2550,15 +2750,16 @@ $("birthday-estimate").addEventListener("click", async () => {
   try {
     const height = await invoke("estimate_birthday_from_date", {
       date: dateVal,
+      network: $("network-select").value,
       lightwalletdUrl: $("lightwalletd-url").value.trim(),
     });
     $("birthday-height").value = height;
     invalidateScanAuthority();
     birthdayTouched = true;
     updateScanEstimate();
-    const approx = formatApproxMonth(approxDateFromHeight(height));
+    const approx = formatApproxMonth(approxDateFromHeight(height, $("network-select").value));
     setBirthdayHint(
-      `✓ Birthday set to block ${Number(height).toLocaleString()} (≈ ${approx}, with ~1 week safety margin).`,
+      `✓ Birthday set to block ${Number(height).toLocaleString()} (≈ ${approx}, with a conservative safety margin).`,
       "success",
     );
   } catch (err) {

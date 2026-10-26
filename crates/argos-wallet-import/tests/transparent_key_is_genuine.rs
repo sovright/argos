@@ -15,7 +15,7 @@ use argos_wallet_import::{
     keys::{ImportCoverage, ImportedKeys},
     zcashd, ImportDiagnostic,
 };
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use secp256k1::{PublicKey, SecretKey};
 use secrecy::{ExposeSecret, SecretString};
 
 const FIXTURE_PASSPHRASE: &str = "argos-test-passphrase";
@@ -52,9 +52,9 @@ fn stored_pubkeys(
 }
 
 fn derive_pubkey(secret: &[u8; 32]) -> [u8; 33] {
-    let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(secret).expect("recovered secret must be a valid scalar");
-    PublicKey::from_secret_key(&secp, &sk).serialize()
+    let sk =
+        SecretKey::from_secret_bytes(*secret).expect("recovered secret must be a valid scalar");
+    PublicKey::from_secret_key(&sk).serialize()
 }
 
 fn assert_keys_control_their_pubkeys(

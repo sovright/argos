@@ -74,3 +74,35 @@ test("manual and matched network changes both synchronize an untouched birthday"
     /syncUntouchedBirthdayToNetwork\(snapshot\.network\)/,
   );
 });
+
+function estimateHarness(network, afterRequest = () => {}) {
+  const elements = new Map();
+  let click;
+  const $ = (id) => {
+    if (!elements.has(id)) elements.set(id, { value: '', addEventListener(event, callback) { click = callback; } });
+    return elements.get(id);
+  };
+  $('network-select').value = network;
+  $('birthday-date').value = '2030-01-01';
+  $('lightwalletd-url').value = 'https://fixture.example';
+  const calls = [];
+  const ctx = vm.createContext({ $, birthdayTouched: false, setBirthdayHint() {}, setStatus() {},
+    invalidateScanAuthority() {}, updateScanEstimate() {}, formatApproxMonth: () => 'Jan 2030',
+    approxDateFromHeight: () => new Date(),
+    invoke: async (command, args) => { calls.push({command, args}); afterRequest($); return 123456; },
+  });
+  const start = source.indexOf('$("birthday-estimate").addEventListener("click"');
+  const end = source.indexOf('async function validateDestination()', start);
+  vm.runInContext(source.slice(start, end), ctx);
+  return { $, calls, run: () => click() };
+}
+
+test('date estimation sends the selected network explicitly to the backend', async () => {
+  for (const network of ['mainnet', 'testnet']) {
+    const h = estimateHarness(network);
+    await h.run();
+    assert.equal(h.calls[0].command, 'estimate_birthday_from_date');
+    assert.equal(h.calls[0].args.network, network);
+    assert.equal(h.$('birthday-height').value, 123456);
+  }
+});

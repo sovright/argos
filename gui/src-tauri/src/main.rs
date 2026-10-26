@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod nu7;
 mod reviewed_intent;
 
 use argos_core::RecoveryService;
@@ -79,6 +80,7 @@ fn main() {
             wallet_reviews: reviewed_intent::WalletReviewRegistry::default(),
         })
         .invoke_handler(tauri::generate_handler![
+            nu7::sprout_nu7_status,
             commands::validate_seed,
             commands::validate_address,
             commands::start_address_search,

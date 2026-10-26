@@ -101,9 +101,9 @@ async fn rpc(method: &str, params: serde_json::Value) -> serde_json::Value {
 /// documents that production callers must pass fresh randomness; a test that
 /// runs twice against one chain has the same requirement.
 fn random32() -> [u8; 32] {
-    use rand_core::RngCore;
+    use rand::Rng;
     let mut out = [0u8; 32];
-    rand_core::OsRng.fill_bytes(&mut out);
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut out);
     out
 }
 
@@ -422,7 +422,8 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
 
     // A Sapling output consuming what the JoinSplit released.
     let sapling_prover = zcash_proofs::prover::LocalTxProver::bundled();
-    let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&random32());
+    let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&random32())
+        .expect("valid fixture seed");
     let (_, sapling_addr) = extsk.default_address();
 
     // No Sapling spends, so the anchor is unused — but the builder still
@@ -444,7 +445,7 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
     let (sapling_bundle, _meta) = sapling_builder
         .build::<zcash_proofs::prover::LocalTxProver, zcash_proofs::prover::LocalTxProver, _, zcash_protocol::value::ZatBalance>(
             &[],
-            rand_core::OsRng,
+            rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         )
         .expect("build the Sapling bundle")
         .expect("the bundle must have an output");
@@ -460,7 +461,7 @@ async fn a_sprout_note_can_be_created_and_spent_under_consensus() {
         sapling_bundle,
         &sapling_prover,
         &spend_key,
-        rand_core::OsRng,
+        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
     )
     .expect("assemble the Sprout-to-Sapling transaction");
 

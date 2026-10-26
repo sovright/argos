@@ -6,7 +6,7 @@ use crate::{
 use std::collections::BTreeSet;
 use zcash_address::unified::{Address as UnifiedAddress, Container, Encoding, Receiver};
 use zcash_keys::{encoding::AddressCodec, keys::sapling};
-use zcash_protocol::consensus::{NetworkConstants, NetworkType, MAIN_NETWORK, TEST_NETWORK};
+use zcash_protocol::consensus::{NetworkType, MAIN_NETWORK, TEST_NETWORK};
 use zip32::AccountId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -23,7 +23,7 @@ pub struct TargetReceivers {
 impl TargetReceivers {
     pub fn parse(target: &str, network: ZeckNetwork) -> ZeckResult<Self> {
         let mut receivers = BTreeSet::new();
-        if let Ok((actual, ua)) = UnifiedAddress::decode(target) {
+        if let Ok((actual, _, ua)) = UnifiedAddress::decode(target) {
             if actual != net(network) {
                 return Err(ZeckError::WrongNetwork {
                     expected: network.label().into(),
@@ -45,11 +45,11 @@ impl TargetReceivers {
         }
         let address = match network {
             ZeckNetwork::Mainnet => zcash_keys::encoding::decode_payment_address(
-                MAIN_NETWORK.hrp_sapling_payment_address(),
+                zcash_address::constants::hrp_sapling_payment_address(NetworkType::Main),
                 target,
             ),
             ZeckNetwork::Testnet => zcash_keys::encoding::decode_payment_address(
-                TEST_NETWORK.hrp_sapling_payment_address(),
+                zcash_address::constants::hrp_sapling_payment_address(NetworkType::Test),
                 target,
             ),
         };
@@ -86,11 +86,16 @@ impl AccountMatcher {
         let id = AccountId::try_from(account).map_err(|_| {
             ZeckError::InvalidConfig(format!("account index {account} is out of range"))
         })?;
-        let sapling_sk = sapling::spending_key(seed, network.coin_type(), id);
+        let sapling_sk = sapling::spending_key(seed, network.coin_type(), id).ok_or_else(|| {
+            ZeckError::Internal("Sapling spending-key derivation failed".to_owned())
+        })?;
         let orchard_sk = orchard::keys::SpendingKey::from_zip32_seed(seed, network.coin_type(), id)
             .map_err(|e| ZeckError::Internal(e.to_string()))?;
         let sapling_internal_fvk = sapling_sk
             .derive_internal()
+            .ok_or_else(|| {
+                ZeckError::Internal("Sapling internal-key derivation failed".to_owned())
+            })?
             .to_diversifiable_full_viewing_key();
         Ok(Self {
             network,
@@ -140,9 +145,13 @@ impl AccountMatcher {
             .receivers
             .contains(&ShieldedReceiver::Orchard(address.to_raw_address_bytes()))
         {
-            let ua = UnifiedAddress::try_from_items(vec![Receiver::Orchard(
-                address.to_raw_address_bytes(),
-            )])
+            let ua = UnifiedAddress::try_from_items(
+                zcash_address::unified::Revision::R0,
+                vec![Receiver::Orchard(address.to_raw_address_bytes())]
+                    .into_iter()
+                    .map(zcash_address::unified::Uitem::Data)
+                    .collect(),
+            )
             .map_err(|e| ZeckError::Internal(e.to_string()))?;
             out.push(MatchedReceiver {
                 pool: DiscoveryPool::Orchard,
@@ -173,9 +182,13 @@ mod tests {
         let external = m
             .orchard_fvk
             .address_at(7u32, orchard::keys::Scope::External);
-        let ua = UnifiedAddress::try_from_items(vec![Receiver::Orchard(
-            external.to_raw_address_bytes(),
-        )])
+        let ua = UnifiedAddress::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Orchard(external.to_raw_address_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
         .unwrap();
         let target =
             TargetReceivers::parse(&ua.encode(&NetworkType::Main), ZeckNetwork::Mainnet).unwrap();
@@ -186,9 +199,13 @@ mod tests {
         let internal = m
             .orchard_fvk
             .address_at(7u32, orchard::keys::Scope::Internal);
-        let ua = UnifiedAddress::try_from_items(vec![Receiver::Orchard(
-            internal.to_raw_address_bytes(),
-        )])
+        let ua = UnifiedAddress::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Orchard(internal.to_raw_address_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
         .unwrap();
         let target =
             TargetReceivers::parse(&ua.encode(&NetworkType::Main), ZeckNetwork::Mainnet).unwrap();
@@ -212,10 +229,16 @@ mod tests {
                     .map(|address| (i, address))
             })
             .unwrap();
-        let ua = UnifiedAddress::try_from_items(vec![
-            Receiver::Orchard(orchard.to_raw_address_bytes()),
-            Receiver::Sapling(sapling.to_bytes()),
-        ])
+        let ua = UnifiedAddress::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![
+                Receiver::Orchard(orchard.to_raw_address_bytes()),
+                Receiver::Sapling(sapling.to_bytes()),
+            ]
+            .into_iter()
+            .map(zcash_address::unified::Uitem::Data)
+            .collect(),
+        )
         .unwrap();
         let target =
             TargetReceivers::parse(&ua.encode(&NetworkType::Main), ZeckNetwork::Mainnet).unwrap();
@@ -231,8 +254,14 @@ mod tests {
         let (valid, sapling) = (invalid + 1..1000)
             .find_map(|i| ivk.address_at(i).map(|address| (i, address)))
             .unwrap();
-        let ua =
-            UnifiedAddress::try_from_items(vec![Receiver::Sapling(sapling.to_bytes())]).unwrap();
+        let ua = UnifiedAddress::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Sapling(sapling.to_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
+        .unwrap();
         let target =
             TargetReceivers::parse(&ua.encode(&NetworkType::Main), ZeckNetwork::Mainnet).unwrap();
         assert_eq!(
@@ -256,9 +285,14 @@ mod tests {
         let (internal_index, internal_address) = (1u32..1000)
             .find_map(|i| internal_fvk.to_external_ivk().address_at(i).map(|a| (i, a)))
             .unwrap();
-        let internal_ua =
-            UnifiedAddress::try_from_items(vec![Receiver::Sapling(internal_address.to_bytes())])
-                .unwrap();
+        let internal_ua = UnifiedAddress::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Sapling(internal_address.to_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
+        .unwrap();
         let internal_target = TargetReceivers::parse(
             &internal_ua.encode(&NetworkType::Main),
             ZeckNetwork::Mainnet,
@@ -280,8 +314,14 @@ mod tests {
         let a = m
             .orchard_fvk
             .address_at(0u32, orchard::keys::Scope::External);
-        let ua = UnifiedAddress::try_from_items(vec![Receiver::Orchard(a.to_raw_address_bytes())])
-            .unwrap();
+        let ua = UnifiedAddress::try_from_items(
+            zcash_address::unified::Revision::R0,
+            vec![Receiver::Orchard(a.to_raw_address_bytes())]
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
+        .unwrap();
         assert!(matches!(
             TargetReceivers::parse(&ua.encode(&NetworkType::Main), ZeckNetwork::Testnet),
             Err(ZeckError::WrongNetwork { .. })

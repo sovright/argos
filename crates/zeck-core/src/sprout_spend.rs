@@ -9,7 +9,7 @@
 //!   back in, which is the only way to populate those private fields.
 //! * `sprout::Bundle`'s fields — all three are public.
 //! * `TransactionData::from_parts`, which accepts a `sprout_bundle`.
-//! * `sighash_v4::v4_signature_hash`.
+//! * `sighash::PrecomputedSighashData`, including historical V4 digests.
 //!
 //! Same conclusion as the PCZT work reached for Sapling: the low-level
 //! surfaces are open, only the convenience APIs refuse. No upstream change
@@ -35,11 +35,10 @@
 //! whole transaction including the JoinSplit — the circularity is broken
 //! only because the signature itself is excluded from the sighash.
 
-use bellman::groth16::Parameters;
 use bls12_381::Bls12;
+use groth16::Parameters;
 use zcash_primitives::transaction::components::sprout as sprout_tx;
-use zcash_primitives::transaction::sighash::SignableInput;
-use zcash_primitives::transaction::sighash_v4::v4_signature_hash;
+use zcash_primitives::transaction::sighash::{PrecomputedSighashData, SignableInput};
 use zcash_primitives::transaction::{Authorized, Transaction, TransactionData, TxVersion};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_transparent::bundle as transparent;
@@ -51,6 +50,68 @@ use crate::sprout::{
     SproutPaymentAddress, NOTE_CIPHERTEXT_LEN,
 };
 use crate::sprout_witness::WITNESS_PATH_SIZE;
+
+/// ZIP 243 does not consume the previous-output context required by ZIP 244.
+/// The SDK's shared sighash entrypoint nevertheless requires that trait for
+/// every version. Keep this adapter private and strictly V4-only: if a future
+/// SDK starts consulting that context here, fail closed instead of inventing
+/// input values or scripts. Script signatures are preserved by the mapping.
+#[derive(Debug)]
+struct V4TransparentContext;
+
+impl transparent::Authorization for V4TransparentContext {
+    type ScriptSig = zcash_transparent::address::Script;
+}
+
+impl zcash_transparent::sighash::TransparentAuthorizingContext for V4TransparentContext {
+    fn input_amounts(&self) -> Vec<zcash_protocol::value::Zatoshis> {
+        unreachable!("ZIP 243 does not read ZIP 244 input context")
+    }
+    fn input_scriptpubkeys(&self) -> Vec<zcash_transparent::address::Script> {
+        unreachable!("ZIP 243 does not read ZIP 244 input context")
+    }
+}
+
+impl transparent::MapAuth<transparent::Authorized, V4TransparentContext> for V4TransparentContext {
+    fn map_script_sig(
+        &self,
+        script: zcash_transparent::address::Script,
+    ) -> zcash_transparent::address::Script {
+        script
+    }
+    fn map_authorization(&self, _: transparent::Authorized) -> V4TransparentContext {
+        V4TransparentContext
+    }
+}
+
+struct V4SighashAuthorization;
+impl zcash_primitives::transaction::Authorization for V4SighashAuthorization {
+    type TransparentAuth = V4TransparentContext;
+    type SaplingAuth = sapling_crypto::bundle::Authorized;
+    type OrchardAuth = <Authorized as zcash_primitives::transaction::Authorization>::OrchardAuth;
+}
+
+fn authorized_v4_sighash(
+    tx: TransactionData<Authorized>,
+    input: &SignableInput<'_>,
+) -> zcash_primitives::transaction::sighash::SignatureHash {
+    assert_eq!(
+        tx.version(),
+        TxVersion::V4,
+        "historical sighash adapter only supports V4"
+    );
+    let mapped = tx.map_authorization::<V4SighashAuthorization>(V4TransparentContext, (), ());
+    PrecomputedSighashData::new(mapped).signature_hash(input)
+}
+
+pub(crate) fn require_sprout_branch(branch: BranchId) -> ZeckResult<()> {
+    if !TxVersion::V4.valid_in_branch(branch) {
+        return Err(ZeckError::TransactionBuild(
+            "version 4 transactions are invalid in this consensus branch; NU7 disables Sprout spending".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Groth16 JoinSplit proof size: three compressed group elements.
 pub const GROTH_PROOF_SIZE: usize = 48 + 96 + 48;
@@ -185,7 +246,7 @@ impl JoinSplitRandomness {
     /// The only correct way to build this outside a test. The `CryptoRng`
     /// bound makes "someone passed a reproducible RNG" a compile error
     /// rather than a review item.
-    pub fn sample(rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng)) -> Self {
+    pub fn sample(rng: &mut (impl rand::Rng + rand::CryptoRng)) -> Self {
         let mut draw = || {
             let mut out = Zeroizing::new([0u8; 32]);
             rng.fill_bytes(&mut *out);
@@ -368,6 +429,7 @@ pub fn build_and_sign_v4(
     joinsplits: Vec<sprout_tx::JsDescription>,
     key: &JoinSplitSigningKey,
 ) -> ZeckResult<Transaction> {
+    require_sprout_branch(consensus_branch_id)?;
     if joinsplits.is_empty() {
         return Err(ZeckError::TransactionBuild(
             "a Sprout transaction needs at least one JoinSplit".to_owned(),
@@ -391,9 +453,9 @@ pub fn build_and_sign_v4(
         None,
     );
 
-    let sighash = v4_signature_hash(&unsigned, &SignableInput::Shielded);
+    let sighash = authorized_v4_sighash(unsigned.clone(), &SignableInput::Shielded);
     let mut sighash_bytes = [0u8; 32];
-    sighash_bytes.copy_from_slice(sighash.as_bytes());
+    sighash_bytes.copy_from_slice(sighash.as_ref());
 
     let signed = TransactionData::<Authorized>::from_parts(
         TxVersion::V4,
@@ -528,9 +590,9 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
 /// of a node doing it.
 pub fn load_sprout_verifying_key(
     path: &std::path::Path,
-) -> ZeckResult<bellman::groth16::PreparedVerifyingKey<Bls12>> {
+) -> ZeckResult<groth16::PreparedVerifyingKey<Bls12>> {
     let params = load_sprout_proving_key(path)?;
-    Ok(bellman::groth16::prepare_verifying_key(&params.vk))
+    Ok(groth16::prepare_verifying_key(&params.vk))
 }
 
 /// Prove a JoinSplit.
@@ -556,6 +618,7 @@ pub fn prove_joinsplit(
     }
 
     let proof = zcash_proofs::sprout::create_proof(
+        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         fields.phi,
         fields.anchor,
         fields.h_sig,
@@ -621,6 +684,7 @@ pub fn build_and_sign_v4_shielding(
     joinsplits: Vec<sprout_tx::JsDescription>,
     key: &JoinSplitSigningKey,
 ) -> ZeckResult<Transaction> {
+    require_sprout_branch(consensus_branch_id)?;
     use zcash_transparent::address::Script;
     use zcash_transparent::bundle::{Authorized as TAuthorized, OutPoint, TxIn};
     use zcash_transparent::sighash::SighashType;
@@ -630,8 +694,6 @@ pub fn build_and_sign_v4_shielding(
             "a shielding transaction needs at least one transparent input".to_owned(),
         ));
     }
-
-    let secp = secp256k1::Secp256k1::new();
 
     // Pass one: an unsigned bundle, so the sighash has the right shape. Each
     // script_sig is empty; the sighash for a given input substitutes that
@@ -691,15 +753,15 @@ pub fn build_and_sign_v4_shielding(
         )
         .map_err(|err| ZeckError::TransactionBuild(format!("signable input {i}: {err:?}")))?;
 
-        let sighash = v4_signature_hash(&unsigned, &SignableInput::Transparent(signable));
-        let msg = secp256k1::Message::from_digest_slice(sighash.as_bytes())
-            .map_err(|err| ZeckError::TransactionBuild(format!("sighash {i}: {err}")))?;
-        let sig = secp.sign_ecdsa(&msg, &f.secret);
+        let sighash =
+            authorized_v4_sighash(unsigned.clone(), &SignableInput::Transparent(signable));
+        let msg = secp256k1::Message::from_digest(*sighash.as_ref());
+        let sig = secp256k1::ecdsa::sign(msg, &f.secret);
 
         // scriptSig = PUSH(der||SIGHASH_ALL) PUSH(pubkey)
         let mut der = sig.serialize_der().to_vec();
         der.push(SighashType::ALL.encode());
-        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &f.secret).serialize();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&f.secret).serialize();
 
         let mut script_sig = Vec::with_capacity(der.len() + pubkey.len() + 2);
         script_sig.push(der.len() as u8);
@@ -721,9 +783,9 @@ pub fn build_and_sign_v4_shielding(
         None,
         None,
     );
-    let js_sighash = v4_signature_hash(&with_scripts, &SignableInput::Shielded);
+    let js_sighash = authorized_v4_sighash(with_scripts, &SignableInput::Shielded);
     let mut js_bytes = [0u8; 32];
-    js_bytes.copy_from_slice(js_sighash.as_bytes());
+    js_bytes.copy_from_slice(js_sighash.as_ref());
 
     let signed = TransactionData::<Authorized>::from_parts(
         TxVersion::V4,
@@ -765,8 +827,9 @@ pub fn build_and_sign_v4_sprout_to_sapling(
     >,
     prover: &zcash_proofs::prover::LocalTxProver,
     key: &JoinSplitSigningKey,
-    mut rng: impl rand_core::RngCore + rand_core::CryptoRng + Clone,
+    mut rng: impl rand::Rng + rand::CryptoRng + Clone,
 ) -> ZeckResult<Transaction> {
+    require_sprout_branch(consensus_branch_id)?;
     if joinsplits.is_empty() {
         return Err(ZeckError::TransactionBuild(
             "a Sprout spend needs at least one JoinSplit".to_owned(),
@@ -799,9 +862,9 @@ pub fn build_and_sign_v4_sprout_to_sapling(
         Some(sapling_proven.clone()),
         None,
     );
-    let sighash = v4_signature_hash(&unsigned, &SignableInput::Shielded);
+    let sighash = PrecomputedSighashData::new(unsigned).signature_hash(&SignableInput::Shielded);
     let mut sighash_bytes = [0u8; 32];
-    sighash_bytes.copy_from_slice(sighash.as_bytes());
+    sighash_bytes.copy_from_slice(sighash.as_ref());
 
     // No Sapling spends, so no spend authorizing keys — only the binding
     // signature, which `apply_signatures` produces from the value balance.
@@ -1059,13 +1122,14 @@ mod tests {
     /// public, so `random_seed == phi` publishes the private witness.
     #[test]
     fn sampling_draws_every_field_independently() {
-        let r = JoinSplitRandomness::sample(&mut rand_core::OsRng);
+        let r = JoinSplitRandomness::sample(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng));
         assert_ne!(r.phi, r.random_seed, "phi must not equal the public seed");
         assert_ne!(r.phi, r.esk);
         assert_ne!(r.rcm[0], r.rcm[1], "the two trapdoors must differ");
         assert_ne!(r.rcm[0], r.phi);
 
-        let again = JoinSplitRandomness::sample(&mut rand_core::OsRng);
+        let again =
+            JoinSplitRandomness::sample(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng));
         assert_ne!(r.phi, again.phi, "two samplings must not repeat");
         assert_ne!(r.rcm, again.rcm);
     }
@@ -1088,6 +1152,54 @@ mod tests {
     /// zcash_primitives' builder cannot produce this — it hardcodes
     /// `sprout_bundle: None` — so this exercises the hand-assembled path
     /// end to end, short of the proof itself.
+    /// Fixed published digests independently pin the SDK migration adapter;
+    /// verifying signatures against our own newly computed hash is insufficient.
+    #[test]
+    fn historical_v4_adapter_matches_published_zip243_vectors() {
+        use zcash_primitives::transaction::tests::data::zip_0243::make_test_vectors;
+        use zcash_protocol::value::Zatoshis;
+        use zcash_transparent::sighash::SighashType;
+        for vector in make_test_vectors() {
+            let tx = Transaction::read(&vector.tx[..], vector.consensus_branch_id).unwrap();
+            let input = match vector.transparent_input {
+                Some(index) => SignableInput::Transparent(
+                    zcash_transparent::sighash::SignableInput::from_parts(
+                        tx.transparent_bundle().unwrap(),
+                        SighashType::parse(vector.hash_type as u8).unwrap(),
+                        index as usize,
+                        &vector.script_code,
+                        &vector.script_code,
+                        Zatoshis::from_nonnegative_i64(vector.amount).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                None => SignableInput::Shielded,
+            };
+            assert_eq!(
+                authorized_v4_sighash(tx.into_data(), &input).as_ref(),
+                &vector.sighash
+            );
+        }
+    }
+
+    #[test]
+    fn nu7_branch_cannot_construct_a_new_v4_sprout_transaction() {
+        let fields = fields_for_test();
+        let joinsplit = build_js_description(&fields, &[0u8; GROTH_PROOF_SIZE]).unwrap();
+        let result = build_and_sign_v4(
+            BranchId::Nu7,
+            BlockHeight::from_u32(3_543_445),
+            None,
+            vec![joinsplit],
+            &JoinSplitSigningKey::from_bytes([9u8; 32]),
+        );
+        assert!(
+            result.is_err(),
+            "a v4 transaction cannot target the NU7 branch"
+        );
+        assert!(result.unwrap_err().to_string().contains("NU7"));
+    }
+
     #[test]
     fn a_v4_transaction_carries_a_signed_joinsplit() {
         let key = JoinSplitSigningKey::from_bytes([9u8; 32]);
@@ -1130,12 +1242,12 @@ mod tests {
             None,
             None,
         );
-        let sighash = v4_signature_hash(&unsigned, &SignableInput::Shielded);
+        let sighash = authorized_v4_sighash(unsigned.clone(), &SignableInput::Shielded);
         let vk = ed25519_zebra::VerificationKey::try_from(bundle.joinsplit_pubkey)
             .expect("published key is valid");
         vk.verify(
             &ed25519_zebra::Signature::from(bundle.joinsplit_sig),
-            sighash.as_bytes(),
+            sighash.as_ref(),
         )
         .expect("the JoinSplit signature must verify over the zeroed-signature sighash");
 

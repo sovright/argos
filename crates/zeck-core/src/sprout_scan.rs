@@ -182,7 +182,10 @@ pub struct ScanCursor {
     pub last_height: u32,
 }
 
-pub const SPROUT_REORG_WINDOW: usize = 100;
+// ZIP 218 recommends retaining at least 600 rollback blocks with 25-second
+// blocks. V5 checkpoints already encode a variable-length history, so old
+// checkpoints with at most 100 frames remain readable without migration.
+pub const SPROUT_REORG_WINDOW: usize = 600;
 
 struct BlockUndo {
     applied: ScanCursor,
@@ -1645,32 +1648,57 @@ mod tests {
         assert_eq!(scanner.checkpoint().as_bytes(), before);
     }
 
+    fn history_block_hash(height: u32) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&height.to_le_bytes());
+        hash
+    }
+
     #[test]
-    fn rollback_history_keeps_exactly_one_hundred_blocks() {
+    fn rollback_history_keeps_six_hundred_blocks() {
+        let mut scanner = SproutScanner::new(&[]);
+        for height in 1..=601u32 {
+            scanner
+                .scan_block_at(&[], history_block_hash(height), height)
+                .unwrap();
+        }
+        assert_eq!(scanner.history.len(), 600);
+        let locators = scanner.rollback_locators();
+        assert_eq!(locators.len(), 601);
+        assert_eq!(locators[0].last_height, 601);
+        assert_eq!(locators[600].last_height, 1);
+        assert_eq!(scanner.rewind_to(history_block_hash(1)), Ok(600));
+    }
+
+    #[test]
+    fn legacy_checkpoint_with_hundred_undo_frames_remains_readable() {
         let mut scanner = SproutScanner::new(&[]);
         for height in 1..=101u32 {
             scanner
-                .scan_block_at(&[], [height as u8; 32], height)
+                .scan_block_at(&[], history_block_hash(height), height)
                 .unwrap();
         }
-        assert_eq!(scanner.history.len(), SPROUT_REORG_WINDOW);
-        let locators = scanner.rollback_locators();
-        assert_eq!(locators.len(), 101);
-        assert_eq!(locators[0].last_height, 101);
-        assert_eq!(locators[100].last_height, 1);
+        // The old writer retained only heights 2..=101, plus their parent
+        // cursor. The V5 wire format is unchanged; reproduce that history.
+        scanner.history.pop_front();
+        let checkpoint = scanner.checkpoint();
+        let mut resumed = SproutScanner::resume(&checkpoint).unwrap();
+        assert_eq!(resumed.history.len(), 100);
+        assert_eq!(resumed.cursor().unwrap().last_height, 101);
+        assert_eq!(resumed.rewind_to(history_block_hash(1)), Ok(100));
     }
 
     #[test]
     fn ancestor_older_than_the_window_is_refused_without_mutation() {
         let mut scanner = SproutScanner::new(&[]);
-        for height in 1..=102u32 {
+        for height in 1..=602u32 {
             scanner
-                .scan_block_at(&[], [height as u8; 32], height)
+                .scan_block_at(&[], history_block_hash(height), height)
                 .unwrap();
         }
         let before = scanner.checkpoint().as_bytes().to_vec();
         assert_eq!(
-            scanner.rewind_to([1; 32]),
+            scanner.rewind_to(history_block_hash(1)),
             Err(RewindError::BeyondRetainedWindow)
         );
         assert_eq!(scanner.checkpoint().as_bytes(), before);
@@ -1722,7 +1750,7 @@ mod tests {
                 .scan_block_at(&joinsplits, [height as u8; 32], height)
                 .unwrap();
         }
-        assert_eq!(scanner.history.len(), SPROUT_REORG_WINDOW);
+        assert_eq!(scanner.history.len(), 100);
         assert_eq!(scanner.pending.len(), 3);
         assert_eq!(scanner.spent.len(), 64);
         assert_eq!(scanner.history[0].spent_before.len(), 60);
