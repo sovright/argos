@@ -246,7 +246,7 @@ impl JoinSplitRandomness {
     /// The only correct way to build this outside a test. The `CryptoRng`
     /// bound makes "someone passed a reproducible RNG" a compile error
     /// rather than a review item.
-    pub fn sample(rng: &mut (impl rand::Rng + rand::CryptoRng)) -> Self {
+    pub fn sample(rng: &mut impl rand::CryptoRng) -> Self {
         let mut draw = || {
             let mut out = Zeroizing::new([0u8; 32]);
             rng.fill_bytes(&mut *out);
@@ -827,7 +827,7 @@ pub fn build_and_sign_v4_sprout_to_sapling(
     >,
     prover: &zcash_proofs::prover::LocalTxProver,
     key: &JoinSplitSigningKey,
-    mut rng: impl rand::Rng + rand::CryptoRng + Clone,
+    mut rng: impl rand::CryptoRng + Clone,
 ) -> ZeckResult<Transaction> {
     require_sprout_branch(consensus_branch_id)?;
     if joinsplits.is_empty() {

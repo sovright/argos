@@ -2268,9 +2268,9 @@ async fn print_sprout_inspection(
         if !journal_read {
             return;
         }
-        if preview_plan.is_none() && lifecycle_guidance.is_some() {
+        if let (true, Some(guidance)) = (preview_plan.is_none(), lifecycle_guidance) {
             println!("  No Sprout note is ready for a new sweep.");
-            for line in wrap_text(lifecycle_guidance.expect("checked above"), 74) {
+            for line in wrap_text(guidance, 74) {
                 println!("  {line}");
             }
             println!();

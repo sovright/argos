@@ -25,10 +25,10 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 [imports.zcash]
 url = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
 
-[policy.glib]
+[policy."glib:0.18.5"]
 audit-as-crates-io = false
 
-[policy.phf_generator]
+[policy."phf_generator:0.8.0"]
 audit-as-crates-io = false
 
 [[exemptions.addchain]]

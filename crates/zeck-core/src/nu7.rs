@@ -244,7 +244,7 @@ pub async fn query_sprout_availability(
             "no configured endpoint supplied usable evidence",
         );
     };
-    if !activation_height(network).is_some_and(|a| max >= a)
+    if activation_height(network).is_none_or(|a| max < a)
         && heights.iter().any(|h| max.abs_diff(*h) > 12)
     {
         return SproutAvailability::unknown(

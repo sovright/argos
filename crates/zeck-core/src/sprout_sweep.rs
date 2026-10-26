@@ -263,7 +263,7 @@ pub fn build_sweep_for_note(
     proving_key: &groth16::Parameters<bls12_381::Bls12>,
     sapling_prover: &zcash_proofs::prover::LocalTxProver,
     memo: [u8; 512],
-    mut rng: impl rand::Rng + rand::CryptoRng + Clone,
+    mut rng: impl rand::CryptoRng + Clone,
 ) -> ZeckResult<BuiltSproutSweep> {
     sprout_spend::require_sprout_branch(branch_id)?;
     if note.note.value <= SPROUT_SWEEP_FEE {
@@ -2228,7 +2228,7 @@ fn refresh_outcome(
         && outcome.rejected.is_empty();
 }
 
-fn random_bytes(rng: &mut (impl rand::Rng + rand::CryptoRng)) -> Zeroizing<[u8; 32]> {
+fn random_bytes(rng: &mut impl rand::CryptoRng) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     rng.fill_bytes(&mut *out);
     out

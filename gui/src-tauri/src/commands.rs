@@ -4558,7 +4558,8 @@ mod tests {
     #[test]
     fn summary_nu7_warning_follows_the_selected_network() {
         let mainnet = summary_nu7_warning(1, "mainnet");
-        assert!(mainnet.contains("November 5, 2026"), "{mainnet}");
+        assert!(mainnet.contains("3,543,405"), "{mainnet}");
+        assert!(!mainnet.contains("not yet assigned"), "{mainnet}");
         assert!(!mainnet.contains("4,465,026"), "{mainnet}");
         let testnet = summary_nu7_warning(2, "testnet");
         assert!(testnet.contains("4,465,026"), "{testnet}");
