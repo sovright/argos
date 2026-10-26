@@ -19,14 +19,6 @@ version = 2
 yanked = "deny"
 
 ignore = [
-    # `time` 0.3.x DoS via stack exhaustion when parsing untrusted input.
-    # Pinned transitively by `zcash_client_backend` (rusqlite + tauri/cookie).
-    # Argos is a single-use desktop recovery tool; time values come from
-    # lightwalletd (TLS-pinned) and the local SQLite DB, not arbitrary
-    # attacker-controlled input. Upgrading requires bumping zcash deps; track
-    # for the next zcash_client_backend bump.
-    "RUSTSEC-2026-0009",
-
     # Unmaintained crates pulled in transitively through Tauri's GTK3 stack
     # on Linux. No fixes available upstream; would require Tauri itself to
     # migrate to GTK4. Track upstream rather than block CI on them.
@@ -49,7 +41,7 @@ ignore = [
     "RUSTSEC-2025-0057", # fxhash unmaintained (transitive)
     "RUSTSEC-2025-0075", # unic-char-property et al. unmaintained
     "RUSTSEC-2025-0098", # unic-* unmaintained
-    "RUSTSEC-2025-0100", # glib VariantStrIter unsoundness (Tauri stack)
+    "RUSTSEC-2025-0100", # unic-ucd-ident unmaintained
 
     # zbus 5 split `zvariant`, `zbus_names`, and `zvariant_derive` into
     # standalone crates. zbus 6 merged them back into zbus, so RustSec marks
@@ -62,17 +54,6 @@ ignore = [
     "RUSTSEC-2026-0371", # zbus_names standalone crate unmaintained
     "RUSTSEC-2026-0372", # zvariant_derive standalone crate unmaintained
 
-    # quick-xml 0.38 DoS advisories (quadratic attribute scan; unbounded
-    # namespace-declaration allocation in NsReader). Pulled in transitively by
-    # `plist 1.8` <- Tauri; `plist` parses macOS bundle Info.plist files at
-    # build/package time, not attacker-controlled input at runtime. The fix is
-    # quick-xml >=0.41 via `plist >=1.10`, but `plist 1.10` requires
-    # `time-core 0.1.8` while `zcash_client_backend 0.23` pins `time-core
-    # =0.1.2` — the same blocker tracked for RUSTSEC-2026-0009. Rides the next
-    # zcash_client_backend bump; a Tauri-only bump (2.10 -> 2.11) does not move
-    # plist.
-    "RUSTSEC-2026-0194", # quick-xml quadratic run time on duplicate attributes
-    "RUSTSEC-2026-0195", # quick-xml unbounded NsReader namespace allocation
 ]
 
 # ── Licenses ─────────────────────────────────────────────────────────────────
