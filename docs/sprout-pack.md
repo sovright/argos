@@ -1,0 +1,111 @@
+# The Sprout pack
+
+A Sprout scan has to read every JoinSplit ever mined. Without a pack it gets
+them by downloading every full block over p2p, roughly 280 GB on mainnet.
+A Sprout pack holds just those JoinSplits, block by block, up to a fixed
+height, so a user can scan from a few gigabytes of files and download only
+the blocks after the pack. The result is identical to a full walk.
+
+Users never need a node. Maintainers need one to build the pack.
+
+## Using a pack
+
+- CLI: `argos scan-sprout --sprout-pack <folder> …`
+- GUI: Sprout scan panel → "Use a Sprout pack instead of downloading the
+  whole chain" → choose the folder.
+
+The folder holds `manifest.bin` and `chunk-0000.bin`, `chunk-0001.bin`, …
+On mainnet only a pack whose manifest hash is pinned in `PINNED_PACKS`
+(`crates/zeck-core/src/sprout_pack.rs`) for this release is accepted.
+Testnet and regtest accept any well-formed pack.
+
+## Format
+
+All integers are little-endian and fixed width. No compression, no
+timestamps: the bytes are a pure function of the chain.
+
+**Chunk** `chunk-NNNN.bin` covers heights `N × 100,000 + 1` to
+`(N + 1) × 100,000`, the last chunk ending at the pack's end height.
+
+| Field | Bytes |
+| --- | --- |
+| magic `ARGOSSPC`, format version, network | 8 + 1 + 1 |
+| first height, last height | 4 + 4 |
+| then for every block: block hash (wire order), JoinSplit count | 32 + 4 |
+| then per JoinSplit: txid, index in tx, anchor, 2 nullifiers, 2 commitments, ephemeral key, random seed, JoinSplit pubkey, 2 ciphertexts | 32 + 8 + 32 + 64 + 64 + 32 + 32 + 32 + 1,202 |
+
+Every block appears, including blocks with no JoinSplits (36 bytes each),
+so the scanner sees the same contiguous heights a p2p walk gives it and the
+pinned checkpoint hashes are checked against the pack.
+
+**Manifest** `manifest.bin`: magic `ARGOSSPM`, format version, network,
+chunk size, end height, end block hash, Sprout tree root at the end height,
+total JoinSplits, then per chunk its height range, last block hash,
+JoinSplit count, byte length and SHA-256. The SHA-256 of this file is what
+gets pinned.
+
+## How a scan uses it
+
+1. Open the manifest; refuse a wrong network, and on mainnet an unpinned
+   hash.
+2. Stream each chunk into the scanner through the same page check a p2p
+   page goes through (pinned checkpoints, `TipAnchor`, cursor continuity).
+3. At the end of each chunk, compare its length and SHA-256 with the
+   manifest. Only then is the scan checkpoint saved. A corrupt chunk
+   therefore keeps nothing; a re-run resumes at the last verified chunk.
+4. After the last chunk, the rebuilt Sprout tree root must equal the
+   manifest's before it is saved.
+5. Continue over p2p from the pack's end hash. The cursor reconciliation
+   every resumed scan performs asks live peers to confirm that hash first.
+
+## Building a pack (maintainers)
+
+You need a fully synced zcashd or zebrad reachable on its p2p port.
+
+```sh
+cargo build --release -p argos-sprout-pack
+
+# End at least 1,000 blocks below your node's tip.
+target/release/argos-sprout-pack build \
+  --network mainnet --peer 127.0.0.1:8233 \
+  --end-height <H> --out sprout-pack-<H>/
+```
+
+Only the `--peer` nodes are dialled. Every block passes the scan's own
+checks: Equihash proof of work, header linkage, pinned checkpoints, and the
+body's txid Merkle root. The build reads the whole chain once, so expect
+hours. Interrupt it freely: re-running with the same `--out` reuses every
+complete chunk.
+
+When it finishes it prints the manifest SHA-256 and a ready-to-paste
+`PINNED_PACKS` entry. `argos-sprout-pack verify --network mainnet <dir>`
+re-reads every chunk and prints the same summary.
+
+## Release procedure
+
+1. Pick an end height `H` at least 1,000 blocks below the tip, on a chunk
+   boundary or not (fixed boundaries mean earlier chunks are reusable
+   across releases either way).
+2. Maintainer A builds from their node. Maintainer B builds independently
+   from a different node, ideally the other implementation (one zcashd,
+   one zebrad). **The two manifest SHA-256 values must match.**
+3. Cross-check the printed Sprout tree root against `zcash-cli
+   z_gettreestate <H>` (`sprout.commitments.finalRoot`) on a zcashd node.
+4. Add the printed entry to `PINNED_PACKS` in
+   `crates/zeck-core/src/sprout_pack.rs` and ship it in the release.
+5. Upload `manifest.bin` and every chunk as release assets. Each chunk is
+   far under GitHub's 2 GiB per-asset limit. Mirrors (CDN, torrent) are
+   fine: the pinned hash makes the download source irrelevant.
+
+## Not done yet
+
+- **No pinned pack yet.** `PINNED_PACKS` is empty until the first mainnet
+  pack has been built and reproduced, so mainnet scans refuse every pack
+  until then.
+- **No in-app download.** Users download the release assets themselves.
+  Fetching them from the app needs an HTTP client dependency, which is a
+  separate dependency-review decision.
+- **P2P only.** The builder reads blocks over p2p. A `getblock` RPC source
+  would be faster but needs RPC credentials and a new client.
+- **Size unmeasured.** Each JoinSplit is 1,498 bytes and each block adds
+  36; the real mainnet total is printed by the first build.

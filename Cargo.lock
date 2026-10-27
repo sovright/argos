@@ -217,6 +217,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "argos-sprout-pack"
+version = "1.5.5"
+dependencies = [
+ "anyhow",
+ "argos-core",
+ "clap",
+ "tokio",
+]
+
+[[package]]
 name = "argos-wallet-import"
 version = "1.5.5"
 dependencies = [

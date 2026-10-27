@@ -401,6 +401,31 @@ pub async fn connect_to_any_except(
     if !matches!(network, P2pNetwork::Regtest) {
         candidates.extend(resolve_seeds(network).await?);
     }
+    race_candidates(network, candidates, excluded, max_rounds).await
+}
+
+/// [`connect_to_any_except`] restricted to `listed`: no DNS seeds and no
+/// fallback nodes are ever dialled.
+///
+/// For a caller that has its own node and must not drift off it, such as
+/// the Sprout pack builder: a pack must be a function of one node's chain,
+/// and a scan that wanders onto a public peer mid-walk would make it a
+/// function of whichever peer answered.
+pub async fn connect_to_listed_except(
+    network: P2pNetwork,
+    listed: &[String],
+    excluded: &[String],
+    max_rounds: usize,
+) -> Result<Peer, PoolError> {
+    race_candidates(network, listed.to_vec(), excluded, max_rounds).await
+}
+
+async fn race_candidates(
+    network: P2pNetwork,
+    mut candidates: Vec<String>,
+    excluded: &[String],
+    max_rounds: usize,
+) -> Result<Peer, PoolError> {
     candidates.retain(|candidate| !excluded.contains(candidate));
 
     let mut tried = 0;

@@ -111,7 +111,7 @@ use crate::{
     p2p::{
         block::joinsplits_in_block,
         peer::{Peer, READ_TIMEOUT},
-        pool::{connect_to_any_except, PoolError, PEER_RECONNECT_DELAY},
+        pool::{connect_to_any_except, connect_to_listed_except, PoolError, PEER_RECONNECT_DELAY},
         wire::P2pNetwork,
     },
     sprout_scan::{
@@ -1827,6 +1827,17 @@ struct PinRules {
     tip_anchor: Option<TipAnchor>,
 }
 
+/// True when no pinned checkpoint on `network` contradicts `hash` at
+/// `height`. For callers outside a scan, such as the pack builder.
+pub(crate) fn agrees_with_checkpoints(network: P2pNetwork, height: u32, hash: [u8; 32]) -> bool {
+    PinRules {
+        network,
+        floor: 0,
+        tip_anchor: None,
+    }
+    .agrees(height, hash)
+}
+
 impl PinRules {
     /// True when no pin at `height` contradicts `hash`.
     fn agrees(&self, height: u32, hash: [u8; 32]) -> bool {
@@ -2205,8 +2216,49 @@ pub async fn run_sprout_scan_with_decrypt_from(
     tip_anchor: Option<TipAnchor>,
     checkpoint_file: &Path,
     decrypt_from: Option<u32>,
+    progress: impl FnMut(ScanTick),
+) -> ZeckResult<SproutScanResult> {
+    run_sprout_scan_with_options(
+        spending_keys,
+        network,
+        extra_peers,
+        tip_anchor,
+        checkpoint_file,
+        SproutScanOptions {
+            decrypt_from,
+            pack: None,
+        },
+        progress,
+    )
+    .await
+}
+
+/// What a Sprout scan can be given beyond its keys, network and peers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SproutScanOptions<'a> {
+    /// See [`run_sprout_scan_with_decrypt_from`].
+    pub decrypt_from: Option<u32>,
+    /// Read blocks up to the pack's end height from this
+    /// [`SproutPack`](crate::sprout_pack::SproutPack) instead of the network.
+    ///
+    /// The walk after it, and every check on that walk, is unchanged. The
+    /// pack's last block hash becomes the scan cursor, and the cursor
+    /// reconciliation that every resumed scan already performs asks live
+    /// peers to confirm it before the walk continues.
+    pub pack: Option<&'a crate::sprout_pack::SproutPack>,
+}
+
+/// [`run_sprout_scan`] with every option.
+pub async fn run_sprout_scan_with_options(
+    spending_keys: &[[u8; 32]],
+    network: P2pNetwork,
+    extra_peers: &[String],
+    tip_anchor: Option<TipAnchor>,
+    checkpoint_file: &Path,
+    options: SproutScanOptions<'_>,
     mut progress: impl FnMut(ScanTick),
 ) -> ZeckResult<SproutScanResult> {
+    let decrypt_from = options.decrypt_from;
     if spending_keys.is_empty() {
         return Err(ZeckError::TransactionBuild(
             "a Sprout scan needs at least one spending key".to_owned(),
@@ -2250,6 +2302,18 @@ pub async fn run_sprout_scan_with_decrypt_from(
         }
         None => SproutScanner::with_decrypt_from(spending_keys, decrypt_from),
     };
+
+    if let Some(pack) = options.pack {
+        let feed = PackFeed {
+            lease: &checkpoint_lease,
+            pack,
+            network,
+            tip_anchor,
+            floor,
+            checkpoint_file,
+        };
+        feed_pack(&feed, &mut scanner, &mut progress)?;
+    }
 
     let mut height = first_scan_height(scanner.cursor());
 
@@ -2331,6 +2395,7 @@ pub async fn run_sprout_scan_with_decrypt_from(
         silent: Vec::new(),
         silence_exclusion: PEER_RECONNECT_DELAY,
         waits: wait_tx,
+        peers_only: false,
     };
     // Aborted when this future is dropped, not only when it finishes.
     // Dropping the scan is how it is cancelled, and a detached fetcher would
@@ -2454,12 +2519,138 @@ pub async fn run_sprout_scan_with_decrypt_from(
     Ok(result)
 }
 
+/// Blocks per page while reading a pack: the size a peer serves, so the
+/// per-page pin check in [`consume_page`] covers the same span either way.
+const PACK_PAGE_BLOCKS: usize = crate::p2p::peer::MAX_PAGE_BLOCKS;
+
+/// What [`feed_pack`] needs besides the scanner.
+struct PackFeed<'a> {
+    lease: &'a CheckpointLease,
+    pack: &'a crate::sprout_pack::SproutPack,
+    network: P2pNetwork,
+    tip_anchor: Option<TipAnchor>,
+    floor: u32,
+    checkpoint_file: &'a Path,
+}
+
+/// Feed the scanner every pack block it has not yet seen.
+///
+/// Blocks go through [`consume_page`], the same function a p2p page goes
+/// through, so the pinned checkpoint hashes, the [`TipAnchor`] and the
+/// cursor-continuity check apply to a pack exactly as to a peer.
+///
+/// # Nothing unverified is saved
+///
+/// A chunk's SHA-256 is only known once the whole chunk has been read, so
+/// the checkpoint is written only at chunk boundaries, after
+/// [`ChunkReader::finish`](crate::sprout_pack::ChunkReader::finish) has
+/// matched the chunk against the pinned manifest. Every error here returns
+/// without saving: the scanner may hold blocks from a chunk that turned out
+/// to be corrupt, and the caller drops it, so the checkpoint on disk still
+/// ends at the last verified chunk. Before the last chunk is saved, the
+/// rebuilt Sprout tree root must also equal the manifest's.
+fn feed_pack(
+    feed: &PackFeed<'_>,
+    scanner: &mut SproutScanner,
+    progress: &mut dyn FnMut(ScanTick),
+) -> ZeckResult<()> {
+    // Checked again here, not only in `SproutPack::open`: a pack opened for
+    // inspection must not reach a mainnet scan by another route.
+    if feed.pack.manifest().network != feed.network {
+        return Err(ZeckError::InvalidConfig(
+            "the Sprout pack is for a different network than this scan".to_owned(),
+        ));
+    }
+    if feed.pack.trust() == crate::sprout_pack::PackTrust::Unpinned
+        && matches!(feed.network, P2pNetwork::Mainnet)
+    {
+        return Err(crate::sprout_pack::unpinned_mainnet(feed.pack));
+    }
+    let start = first_scan_height(scanner.cursor());
+    let manifest = feed.pack.manifest();
+    if start > manifest.end_height {
+        return Ok(());
+    }
+    let dir = feed.pack.dir().display().to_string();
+    let rejected = |at: u32, err: ZeckError| {
+        ZeckError::InvalidConfig(format!(
+            "the Sprout pack in {dir} was rejected at height {at}: {}. Nothing past the \
+             last verified chunk was saved. Re-run without the pack to walk the chain over \
+             p2p instead.",
+            err.to_string().trim_end_matches('.')
+        ))
+    };
+    let tick = |scanner: &SproutScanner, height: u32| {
+        let p = scanner.progress();
+        ScanTick {
+            height,
+            target: feed.floor.max(height),
+            notes_found: p.notes_found,
+            joinsplits_seen: p.joinsplits_seen,
+            peer_wait: None,
+        }
+    };
+
+    for (index, entry) in manifest.chunks.iter().enumerate() {
+        if entry.last_height < start {
+            continue;
+        }
+        let mut reader = feed.pack.open_chunk(index)?;
+        let mut page = Page {
+            parent: index
+                .checked_sub(1)
+                .map_or([0u8; 32], |prev| manifest.chunks[prev].last_hash),
+            blocks: Vec::with_capacity(PACK_PAGE_BLOCKS),
+        };
+        let mut page_start = start.max(entry.first_height);
+        let mut flush = |page: &mut Page, page_start: &mut u32| -> ZeckResult<()> {
+            if page.blocks.is_empty() {
+                return Ok(());
+            }
+            let mut height = *page_start;
+            consume_page(scanner, page, feed.network, feed.tip_anchor, &mut height)
+                .map_err(|err| rejected(*page_start, err))?;
+            let last = page.blocks.last().expect("non-empty").0;
+            *page = Page {
+                parent: last,
+                blocks: Vec::with_capacity(PACK_PAGE_BLOCKS),
+            };
+            *page_start = height;
+            progress(tick(scanner, height.saturating_sub(1)));
+            Ok(())
+        };
+        while let Some(block) = reader.next_block()? {
+            if block.height < start {
+                // Skipped on resume, but still the parent of what follows.
+                page.parent = block.hash;
+                continue;
+            }
+            page.blocks.push((block.hash, block.joinsplits));
+            if page.blocks.len() == PACK_PAGE_BLOCKS {
+                flush(&mut page, &mut page_start)?;
+            }
+        }
+        flush(&mut page, &mut page_start)?;
+        reader.finish()?;
+        if entry.last_height == manifest.end_height && scanner.anchor() != manifest.sprout_root {
+            return Err(rejected(
+                entry.last_height,
+                ZeckError::InvalidConfig(
+                    "its blocks do not rebuild the Sprout commitment tree root it pins".to_owned(),
+                ),
+            ));
+        }
+        save_checkpoint_while_leased(feed.lease, scanner, feed.network, feed.checkpoint_file)?;
+    }
+    Ok(())
+}
+
 /// One page of blocks, in chain order: each block's hash and the JoinSplits
 /// of its authenticated body, with the first header's parent for the
 /// consumer to compare against the last accepted scanner cursor.
-struct Page {
-    parent: [u8; 32],
-    blocks: Vec<([u8; 32], Vec<argos_wallet_import::keys::SproutJoinSplit>)>,
+pub(crate) struct Page {
+    pub(crate) parent: [u8; 32],
+    pub(crate) blocks: Vec<([u8; 32], Vec<argos_wallet_import::keys::SproutJoinSplit>)>,
 }
 
 impl Page {
@@ -2589,7 +2780,7 @@ fn consume_page(
 /// them `&mut` out-params — carried through a function that needed an
 /// `#[allow(clippy::too_many_arguments)]` to exist. They are one thing: the
 /// fetcher's own state.
-struct PageFetcher {
+pub(crate) struct PageFetcher {
     peer: crate::p2p::peer::Peer,
     locator: [u8; 32],
     empty_replies: u32,
@@ -2611,9 +2802,45 @@ struct PageFetcher {
     silence_exclusion: Duration,
     /// Where a wait for a peer is announced; see `run_sprout_scan`.
     waits: tokio::sync::mpsc::UnboundedSender<PeerWait>,
+    /// Reconnect only to `peers`, never to seeds or fallback nodes.
+    peers_only: bool,
 }
 
 impl PageFetcher {
+    /// A fetcher that dials only `peers`, for the Sprout pack builder.
+    ///
+    /// `fetched` is the height of the next block to fetch and `locator` the
+    /// hash of the block before it (all zero from genesis). `floor` is the
+    /// height the walk must reach before an empty reply may count as the tip.
+    pub(crate) fn for_listed_peers(
+        peer: Peer,
+        locator: [u8; 32],
+        fetched: u32,
+        floor: u32,
+        network: P2pNetwork,
+        peers: Vec<String>,
+        waits: tokio::sync::mpsc::UnboundedSender<PeerWait>,
+    ) -> Self {
+        Self {
+            peer,
+            locator,
+            empty_replies: 0,
+            fetched,
+            floor,
+            network,
+            peers,
+            silent: Vec::new(),
+            silence_exclusion: PEER_RECONNECT_DELAY,
+            waits,
+            peers_only: true,
+        }
+    }
+
+    /// Record that a page of `blocks` blocks was taken.
+    pub(crate) fn advance(&mut self, blocks: usize) {
+        self.fetched += blocks as u32;
+    }
+
     /// Replace the peer, announcing any wait that takes.
     ///
     /// A failed send means the consumer has gone, and the page send that
@@ -2629,9 +2856,15 @@ impl PageFetcher {
     async fn reconnect(&mut self) -> ZeckResult<()> {
         self.peer.close().await;
         let waits = &self.waits;
-        self.peer = connect_peer(self.network, &self.peers, &self.silent, |wait| {
-            let _ = waits.send(wait);
-        })
+        self.peer = connect_peer_from(
+            self.network,
+            &self.peers,
+            &self.silent,
+            self.peers_only,
+            |wait| {
+                let _ = waits.send(wait);
+            },
+        )
         .await?;
         Ok(())
     }
@@ -2732,7 +2965,7 @@ impl PageFetcher {
     /// What deliberately does *not* live here is anything positional —
     /// checkpoint comparison and the tree append stay with the consumer, keyed
     /// on the true height, so this cannot affect where a commitment lands.
-    async fn next_page(&mut self) -> ZeckResult<Option<Page>> {
+    pub(crate) async fn next_page(&mut self) -> ZeckResult<Option<Page>> {
         let height = self.fetched;
 
         let headers = match self.peer.get_headers(&[self.locator]).await {
@@ -3171,11 +3404,44 @@ async fn connect_peer(
     connect_peer_with_budget(network, extra, excluded, PEER_ACQUISITION_BUDGET, on_wait).await
 }
 
+/// [`connect_peer`], dialling only `listed` when `peers_only` is set.
+///
+/// The Sprout pack builder needs this: a pack must come from the maintainer's
+/// own node, never from a public peer the pool happened to reach.
+pub(crate) async fn connect_peer_from(
+    network: P2pNetwork,
+    listed: &[String],
+    excluded: &[(String, tokio::time::Instant)],
+    peers_only: bool,
+    on_wait: impl FnMut(PeerWait),
+) -> ZeckResult<Peer> {
+    connect_peer_inner(
+        network,
+        listed,
+        excluded,
+        PEER_ACQUISITION_BUDGET,
+        peers_only,
+        on_wait,
+    )
+    .await
+}
+
 async fn connect_peer_with_budget(
     network: P2pNetwork,
     extra: &[String],
     excluded: &[(String, tokio::time::Instant)],
     requested_budget: Duration,
+    on_wait: impl FnMut(PeerWait),
+) -> ZeckResult<Peer> {
+    connect_peer_inner(network, extra, excluded, requested_budget, false, on_wait).await
+}
+
+async fn connect_peer_inner(
+    network: P2pNetwork,
+    extra: &[String],
+    excluded: &[(String, tokio::time::Instant)],
+    requested_budget: Duration,
+    peers_only: bool,
     on_wait: impl FnMut(PeerWait),
 ) -> ZeckResult<Peer> {
     // Regtest gets no patience. Its only candidates are the addresses the
@@ -3203,7 +3469,13 @@ async fn connect_peer_with_budget(
                 .filter(|(_, until)| now < *until)
                 .map(|(addr, _)| addr.clone())
                 .collect();
-            async move { connect_to_any_except(network, extra, &active, 4).await }
+            async move {
+                if peers_only {
+                    connect_to_listed_except(network, extra, &active, 4).await
+                } else {
+                    connect_to_any_except(network, extra, &active, 4).await
+                }
+            }
         },
         on_wait,
     )
@@ -4846,6 +5118,7 @@ mod tests {
             silent: Vec::new(),
             silence_exclusion: PEER_RECONNECT_DELAY,
             waits,
+            peers_only: false,
         };
 
         fetcher.reconnect().await.unwrap();
@@ -5001,6 +5274,7 @@ mod tests {
             silent: Vec::new(),
             silence_exclusion: PEER_RECONNECT_DELAY,
             waits,
+            peers_only: false,
         };
 
         let outcome = fetcher
@@ -5062,6 +5336,7 @@ mod tests {
             silent: Vec::new(),
             silence_exclusion: PEER_RECONNECT_DELAY,
             waits,
+            peers_only: false,
         }
     }
 
@@ -6249,5 +6524,185 @@ mod tests {
         assert!(text.contains("Nothing had been scanned yet"), "{text}");
         assert!(text.contains("--peer"), "{text}");
         assert_eq!(height, 1);
+    }
+
+    // ─── Sprout pack ───────────────────────────────────────────────────────
+
+    fn feed_from(
+        pack: &crate::sprout_pack::SproutPack,
+        scanner: &mut SproutScanner,
+        path: &Path,
+        keys: &[[u8; 32]],
+    ) -> ZeckResult<()> {
+        let lease = CheckpointLease::acquire_for(path, P2pNetwork::Regtest, keys)?;
+        let feed = PackFeed {
+            lease: &lease,
+            pack,
+            network: P2pNetwork::Regtest,
+            tip_anchor: None,
+            floor: 0,
+            checkpoint_file: path,
+        };
+        feed_pack(&feed, scanner, &mut |_| {})
+    }
+
+    fn scanned_directly(keys: &[[u8; 32]], end_height: u32) -> SproutScanner {
+        use crate::sprout_pack::test_support::{block_hash, block_joinsplits};
+        let mut scanner = SproutScanner::new(keys);
+        for height in 1..=end_height {
+            scanner
+                .scan_block_at(&block_joinsplits(height), block_hash(height), height)
+                .unwrap();
+        }
+        scanner
+    }
+
+    fn assert_same_scan(a: &SproutScanner, b: &SproutScanner) {
+        assert_eq!(a.anchor(), b.anchor(), "tree root");
+        assert_eq!(a.cursor(), b.cursor(), "cursor");
+        assert_eq!(a.progress(), b.progress(), "progress");
+        assert_eq!(
+            a.spent_nullifiers(),
+            b.spent_nullifiers(),
+            "spent nullifiers"
+        );
+    }
+
+    /// A pack must leave the scanner exactly where a p2p walk over the same
+    /// blocks would: same tree, same cursor, same nullifiers.
+    #[test]
+    fn a_pack_scans_exactly_like_the_blocks_it_holds() {
+        let dir = ScratchDir::new("pack-equivalence");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        let pack_dir = pack_tmp.path().to_owned();
+        crate::sprout_pack::test_support::write_pack(&pack_dir, P2pNetwork::Regtest, 700);
+        let pack = crate::sprout_pack::SproutPack::open(&pack_dir, P2pNetwork::Regtest).unwrap();
+
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+        let mut scanner = SproutScanner::new(&keys);
+        feed_from(&pack, &mut scanner, &path, &keys).unwrap();
+        assert_same_scan(&scanner, &scanned_directly(&keys, 700));
+
+        // Saved at the end of the chunk, and resumable as an ordinary scan.
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+            .unwrap()
+            .expect("saved");
+        assert_same_scan(&saved, &scanner);
+
+        // Feeding again from the saved state is a no-op.
+        let mut again = saved;
+        feed_from(&pack, &mut again, &path, &keys).unwrap();
+        assert_same_scan(&again, &scanner);
+        discard_checkpoint(&path).unwrap();
+    }
+
+    /// A corrupt chunk keeps nothing from itself: the checkpoint ends at the
+    /// last verified chunk, and a re-run with a good chunk finishes the job.
+    #[test]
+    fn a_corrupt_chunk_keeps_nothing_and_a_rerun_resumes_at_the_chunk_boundary() {
+        use crate::sprout_pack::{chunk_file_name, CHUNK_BLOCKS};
+        let dir = ScratchDir::new("pack-corrupt");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        let pack_dir = pack_tmp.path().to_owned();
+        let end = CHUNK_BLOCKS + 500;
+        crate::sprout_pack::test_support::write_pack(&pack_dir, P2pNetwork::Regtest, end);
+        let pack = crate::sprout_pack::SproutPack::open(&pack_dir, P2pNetwork::Regtest).unwrap();
+
+        let chunk = pack_dir.join(chunk_file_name(1));
+        let good = std::fs::read(&chunk).unwrap();
+        let mut bad = good.clone();
+        // Inside the hash of the second-to-last block: structurally fine,
+        // so only the chunk's SHA-256 can catch it, after the whole chunk
+        // has been fed to the scanner.
+        let inside = bad.len() - 50;
+        bad[inside] ^= 1;
+        std::fs::write(&chunk, &bad).unwrap();
+
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+        let mut scanner = SproutScanner::new(&keys);
+        let err = feed_from(&pack, &mut scanner, &path, &keys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match the manifest"), "{err}");
+
+        let saved = load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+            .unwrap()
+            .expect("the first chunk was verified and saved");
+        assert_eq!(saved.cursor().unwrap().last_height, CHUNK_BLOCKS);
+
+        std::fs::write(&chunk, &good).unwrap();
+        let mut resumed = saved;
+        feed_from(&pack, &mut resumed, &path, &keys).unwrap();
+        assert_same_scan(&resumed, &scanned_directly(&keys, end));
+        discard_checkpoint(&path).unwrap();
+    }
+
+    /// The manifest's tree root is checked before the last chunk is saved.
+    #[test]
+    fn a_pack_that_does_not_rebuild_its_root_is_rejected_before_saving() {
+        let dir = ScratchDir::new("pack-root");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        let pack_dir = pack_tmp.path().to_owned();
+        let mut manifest =
+            crate::sprout_pack::test_support::write_pack(&pack_dir, P2pNetwork::Regtest, 60);
+        manifest.sprout_root = [0x99; 32];
+        crate::sprout_pack::write_manifest(&pack_dir, &manifest).unwrap();
+        let pack = crate::sprout_pack::SproutPack::open(&pack_dir, P2pNetwork::Regtest).unwrap();
+
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+        let mut scanner = SproutScanner::new(&keys);
+        let err = feed_from(&pack, &mut scanner, &path, &keys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Sprout commitment tree root"), "{err}");
+        assert!(load_checkpoint(&path, P2pNetwork::Regtest, &keys)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A checkpoint already past the pack's end leaves the pack unread.
+    #[test]
+    fn a_scan_already_past_the_pack_skips_it() {
+        let dir = ScratchDir::new("pack-past");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        let pack_dir = pack_tmp.path().to_owned();
+        crate::sprout_pack::test_support::write_pack(&pack_dir, P2pNetwork::Regtest, 30);
+        let pack = crate::sprout_pack::SproutPack::open(&pack_dir, P2pNetwork::Regtest).unwrap();
+        // Delete a chunk: if the feed touched the pack at all, it would fail.
+        std::fs::remove_file(pack_dir.join(crate::sprout_pack::chunk_file_name(0))).unwrap();
+
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+        let mut scanner = scanned_directly(&keys, 40);
+        feed_from(&pack, &mut scanner, &path, &keys).unwrap();
+        assert_eq!(scanner.cursor().unwrap().last_height, 40);
+    }
+
+    /// A resumed scan on a different chain than the pack is refused rather
+    /// than appended onto.
+    #[test]
+    fn a_checkpoint_from_another_chain_does_not_continue_into_the_pack() {
+        let dir = ScratchDir::new("pack-fork");
+        let pack_tmp = tempfile::tempdir().unwrap();
+        let pack_dir = pack_tmp.path().to_owned();
+        crate::sprout_pack::test_support::write_pack(&pack_dir, P2pNetwork::Regtest, 30);
+        let pack = crate::sprout_pack::SproutPack::open(&pack_dir, P2pNetwork::Regtest).unwrap();
+
+        let keys = [[0x11; 32]];
+        let path = checkpoint_path_for_network(&dir.0, &keys, P2pNetwork::Regtest);
+        let mut scanner = SproutScanner::new(&keys);
+        for height in 1..=10u32 {
+            scanner
+                .scan_block_at(&[], [height as u8; 32], height)
+                .unwrap();
+        }
+        let err = feed_from(&pack, &mut scanner, &path, &keys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rejected at height 11"), "{err}");
+        assert!(!path.exists());
     }
 }

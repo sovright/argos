@@ -425,6 +425,26 @@
               <button id="sprout-scan-check" type="button">Check keys</button>
               <ul id="sprout-scan-addresses" class="session-list"></ul>
 
+              <!-- Mirrors `scan-sprout --sprout-pack`. A pack replaces the
+                   download of every block up to its end height; the scan
+                   continues over the network from there. -->
+              <details id="sprout-scan-pack-details">
+                <summary>Use a Sprout pack instead of downloading the whole chain</summary>
+                <p class="muted">
+                  A Sprout pack is a folder of files published with Argos releases that holds
+                  every Sprout transaction up to a fixed block. With it, the scan reads those
+                  blocks from disk and downloads only the rest of the chain, which cuts the
+                  download from hundreds of gigabytes to a few. The result is the same as a
+                  full scan. On mainnet only the pack this version of Argos was released
+                  with is accepted.
+                </p>
+                <label for="sprout-scan-pack">Pack folder (holds <code>manifest.bin</code>)</label>
+                <input id="sprout-scan-pack" type="text" spellcheck="false" autocomplete="off"
+                  placeholder="Leave blank to download every block" />
+                <button class="ghost" id="sprout-scan-pack-browse" type="button">Choose folder…</button>
+                <p id="sprout-scan-pack-status" class="muted" role="status"></p>
+              </details>
+
               <!-- The escape hatch for when every public peer is full.
                    Collapsed, because almost nobody needs it; the CLI's
                    equivalent is `scan-sprout --peer`. -->
