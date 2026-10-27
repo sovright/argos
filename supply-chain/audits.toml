@@ -206,6 +206,46 @@ the inspected configuration. Static automated review, no platform/browser tests;
 this entry does not audit dom_query, ctor, plist or other dependencies.
 """
 
+[[audits.tokio]]
+who = "Claude (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.50.0 -> 1.51.6"
+notes = """
+Reviewed the complete published source delta (7,172 diff lines). Contains the
+RUSTSEC-2026-0386 fix: AsyncFd gains unsafe register/register_with_interest
+constructors with a documented fd-validity contract, the safe new/with_interest/
+try_new/try_with_interest constructors are deprecated (still present and still
+unsound if misused), and the I/O driver no longer frees a ScheduledIo when epoll
+deregistration fails, turning the use-after-free into a leak. Also inspected
+the sync fixes (RwLock max_readers == 0, Semaphore permit bounds and CLOSED bit,
+mpsc block reclamation and len), wakers moved outside locks, runtime naming and
+LocalRuntime stabilization, UDP ERROR interest, WASIp2 cfgs and io_uring
+cancelled-open fd closing. New unsafe is limited to the AsyncFd register API,
+OwnedFd::from_raw_fd on cancelled io_uring opens (unstable feature) and
+receiver-side block derefs in mpsc len; all judged sound. Still build = false:
+no build script, and no new network, process or env access in library code
+(test-only process, procfs and loopback use). Manifest raises mio to 1.2.0 and
+socket2 to 0.6.3, both already resolved on main, and adds an optional wasi-only
+libc. Argos source does not use AsyncFd; transitive users were not enumerated.
+Source review only; upstream tests, loom and miri were not executed.
+Details: docs/dependency-review-tokio-2026-10.md.
+"""
+
+[[audits.tokio-macros]]
+who = "Claude (automated source review)"
+criteria = "safe-to-deploy"
+delta = "2.6.1 -> 2.7.1"
+notes = """
+Reviewed the complete published source delta (366 diff lines). Adds a
+name = "..." attribute to #[tokio::main] and #[tokio::test] that emits
+Builder::name(<string literal>), and removes the tokio_unstable guard for
+flavor = "local" now that LocalRuntime is stable; the rest is error-message and
+documentation changes. No new dependency, build script (build = false), unsafe
+code, or file, network or env access at expansion time. Source review only;
+macro expansion tests were not executed.
+Details: docs/dependency-review-tokio-2026-10.md.
+"""
+
 [[audits.tray-icon]]
 who = "OpenAI Codex (automated source review)"
 criteria = "safe-to-deploy"
