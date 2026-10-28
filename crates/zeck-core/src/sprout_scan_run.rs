@@ -2632,10 +2632,17 @@ async fn feed_pack(
             progress(tick(scanner, height.saturating_sub(1)));
             Ok(())
         };
+        let mut skipped = 0usize;
         while let Some(block) = reader.next_block()? {
             if block.height < start {
                 // Skipped on resume, but still the parent of what follows.
                 page.parent = block.hash;
+                skipped += 1;
+                if skipped.is_multiple_of(PACK_PAGE_BLOCKS) {
+                    // Up to a chunk of reading before the resume point: keep
+                    // it abortable like the pages after it.
+                    tokio::task::yield_now().await;
+                }
                 continue;
             }
             page.blocks.push((block.hash, block.joinsplits));
