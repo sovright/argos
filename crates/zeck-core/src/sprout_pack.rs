@@ -111,10 +111,21 @@ pub struct PinnedPack {
 
 /// The packs this release vouches for.
 ///
-/// Empty until the first mainnet pack has been built and independently
-/// reproduced; see `docs/sprout-pack.md` for the release procedure. Until
-/// then a mainnet scan refuses every pack and walks the chain over p2p.
-pub const PINNED_PACKS: &[PinnedPack] = &[];
+/// See `docs/sprout-pack.md` for the release procedure. A mainnet scan
+/// refuses any pack not listed here and walks the chain over p2p instead.
+///
+/// Mainnet, blocks 1 to 3,500,000: built twice on 2026-10-28 from two
+/// Zebra 7.0.0 nodes in different regions (us-east4 and europe-west4), and
+/// both builds produced this manifest hash. End block hash
+/// `000000000008a15f5db2c10ddec496dd3466f624cbb5100e09497e7addbfb531`,
+/// Sprout tree root
+/// `0f68d989a0a2b6d5608b7bc18507c4b2c32125cb10b864cd18019faf5ac9213d`,
+/// 773,651 JoinSplits.
+pub const PINNED_PACKS: &[PinnedPack] = &[PinnedPack {
+    network: P2pNetwork::Mainnet,
+    manifest_sha256: "805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d",
+    end_height: 3500000,
+}];
 
 /// One chunk, as the manifest describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1198,6 +1209,20 @@ mod tests {
         }
         let hex = to_hex(&[0xab; 32]);
         assert_eq!(from_hex32(&hex), Some([0xab; 32]));
+    }
+
+    #[test]
+    fn mainnet_pins_the_reproduced_3_500_000_pack() {
+        let mainnet: Vec<_> = PINNED_PACKS
+            .iter()
+            .filter(|pin| pin.network == P2pNetwork::Mainnet)
+            .collect();
+        assert_eq!(mainnet.len(), 1);
+        assert_eq!(
+            mainnet[0].manifest_sha256,
+            "805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d"
+        );
+        assert_eq!(mainnet[0].end_height, 3_500_000);
     }
 
     #[test]

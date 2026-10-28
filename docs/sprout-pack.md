@@ -87,10 +87,15 @@ re-reads every chunk and prints the same summary.
    boundary or not (fixed boundaries mean earlier chunks are reusable
    across releases either way).
 2. Maintainer A builds from their node. Maintainer B builds independently
-   from a different node, ideally the other implementation (one zcashd,
-   one zebrad). **The two manifest SHA-256 values must match.**
-3. Cross-check the printed Sprout tree root against `zcash-cli
-   z_gettreestate <H>` (`sprout.commitments.finalRoot`) on a zcashd node.
+   from a different node, on a different machine and network.
+   **The two manifest SHA-256 values must match.** With zcashd retired,
+   the nodes left are Zebra and Zakura, a Zebra fork, so two builds from
+   different implementations no longer add much independence.
+3. No live node can cross-check the Sprout tree root. zcashd's
+   `z_gettreestate` (`sprout.commitments.finalRoot`) was the only RPC that
+   returned it; Zebra and Zakura leave the Sprout section out. Record the
+   root in the release notes. The builder already checks it: `verify`
+   rebuilds the root from the chunks and compares it with the manifest.
 4. Check the builder itself, not only the node. Steps 2 and 3 cannot catch
    a builder bug: both maintainers run the same builder, so a bug gives
    both the same hash, and the tree root covers only commitments. A
@@ -114,13 +119,17 @@ re-reads every chunk and prints the same summary.
   hand today; a command that runs both scans and diffs the results is not
   written yet.
 
-- **No pinned pack yet.** `PINNED_PACKS` is empty until the first mainnet
-  pack has been built and reproduced, so mainnet scans refuse every pack
-  until then.
+- **The first mainnet pin has not passed step 4.** The pack for blocks 1
+  to 3,500,000 (manifest
+  `805435e69ae7a28c2045abcb5fa7b049de7e4c288f1f7c3d8d9529eb143ba57d`) was
+  built twice on 2026-10-28, from two Zebra 7.0.0 nodes in different
+  regions, and both builds produced the same hash. It is pinned. Both the
+  regtest pack test and the pack-versus-p2p mainnet comparison are still
+  to run, and both must pass before a release ships with this pin.
 - **No in-app download.** Users download the release assets themselves.
   Fetching them from the app needs an HTTP client dependency, which is a
   separate dependency-review decision.
 - **P2P only.** The builder reads blocks over p2p. A `getblock` RPC source
   would be faster but needs RPC credentials and a new client.
-- **Size unmeasured.** Each JoinSplit is 1,498 bytes and each block adds
-  36; the real mainnet total is printed by the first build.
+- **Size.** The mainnet pack to height 3,500,000 is 1.28 GB in 35
+  chunks, with 773,651 JoinSplits.
