@@ -213,8 +213,9 @@ notes (ciphertexts are not bound by the tree root) or omit real spends.
 manifest hash two Zebra nodes in different regions reproduced. Reproduction
 is not enough on its own, since identical builders reproduce identical bugs:
 no release may ship with a pin until the builder is checked independently
-(regtest pack test plus a mainnet pack-vs-p2p equivalence scan), and the
-3,500,000 pin has not passed that check yet. No live node returns the Sprout
+(regtest pack test plus a mainnet pack-vs-p2p equivalence scan). The
+regtest test (`sprout_pack_regtest`, run in CI) passes; the mainnet scan for
+the 3,500,000 pin has not been run yet. No live node returns the Sprout
 tree root any more (Zebra omits it from `z_gettreestate`), so `verify`
 rebuilding it from the chunks is the only root check. `feed_pack` yields after every
 page so aborting a scan (the GUI's release) stops it promptly. The
