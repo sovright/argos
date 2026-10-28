@@ -25,6 +25,9 @@ use sprout_note_fixture::{plant_sprout_note, random32, rpc, NODE_P2P};
 async fn a_pack_built_from_a_node_scans_like_the_chain() {
     let a_sk = random32();
     let planted = plant_sprout_note(a_sk).await;
+    // Planting mines the note into the tip block. Mine past it so the pack
+    // can end between the note and the tip.
+    rpc("generate", serde_json::json!([10])).await;
     let tip = rpc("getblockcount", serde_json::json!([]))
         .await
         .as_u64()
