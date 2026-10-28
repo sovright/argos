@@ -65,13 +65,28 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub const READ_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long a peer may go quiet, part-way through answering a `getdata`,
+/// before the blocks it has not sent are asked for again.
+///
+/// Zebra can answer a batch with only some of the blocks and then nothing,
+/// not even `notfound`: measured against Zebra 7.0.0 at mainnet heights
+/// 9153..9168 (two of them about 744 KB), where 11 of 16 arrived. Its
+/// replies to one request arrive back to back, so a pause this long after
+/// some of them means it has stopped, not that it is slow. Only the wait
+/// for the next message to begin is bounded; a large block still has
+/// [`READ_TIMEOUT`] to arrive once it has started.
+#[cfg(not(test))]
+const PARTIAL_ANSWER_QUIET: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const PARTIAL_ANSWER_QUIET: Duration = Duration::from_millis(200);
+
 /// How long to wait for the TCP connection itself.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many blocks to name in one `getdata`.
+/// How many blocks to have requested at once.
 ///
-/// Peers do not answer a request for a whole 160-hash header page, so this
-/// stays well under it. Small enough to be served reliably, large enough
+/// Each is its own one-block `getdata` (see [`Peer::get_blocks`]), so this
+/// bounds what is in flight, not the size of any one request. Large enough
 /// that a million-block sweep is not a million round trips.
 const GETDATA_BATCH: usize = 16;
 
@@ -346,13 +361,18 @@ impl Peer {
     /// witnesses prove a tree that never existed. The hash is recomputed
     /// from the bytes, so a peer cannot claim a block is one it is not.
     ///
-    /// Requested in small batches. A single `getdata` naming a whole
-    /// `getheaders` page is accepted and then simply not answered —
-    /// measured against a real node, where one block returns instantly and
-    /// 160 produce nothing before the read timeout. That failure is
-    /// indistinguishable from a dead connection, so the cap lives here
-    /// rather than waiting for a caller to hit it part-way through a scan
-    /// of a million blocks.
+    /// Requested one block per `getdata`, [`GETDATA_BATCH`] at a time. A
+    /// `getdata` naming many blocks is answered only in part: Zebra 7.0.0
+    /// stops after about 2 MB of blocks, so near-full blocks came back one
+    /// per 16-hash request (mainnet ~106,500), and a whole 160-hash page
+    /// produced nothing before the read timeout. One block per request is
+    /// always answered whole.
+    ///
+    /// Blocks can still go missing with no `notfound` (see
+    /// [`PARTIAL_ANSWER_QUIET`]). When some have arrived and the peer then
+    /// goes quiet, the ones still missing are requested again. Each
+    /// re-request must make progress: one that brings nothing for a full
+    /// [`READ_TIMEOUT`] fails as before, so this cannot loop.
     pub async fn get_blocks(
         &mut self,
         hashes: &[[u8; 32]],
@@ -362,42 +382,100 @@ impl Peer {
         let mut held = 0usize;
 
         for chunk in hashes.chunks(GETDATA_BATCH) {
-            self.send("getdata", &encode_getdata_blocks(chunk)).await?;
-
             // Track what this chunk still owes rather than reading a fixed
             // number of messages: counting an unsolicited block as a reply
             // would leave one we asked for unread and desynchronise the
             // stream for every later request.
-            let mut outstanding = chunk.iter().filter(|h| !blocks.contains_key(*h)).count();
-            let mut budget = outstanding * 4 + 8;
+            let mut missing: Vec<[u8; 32]> = chunk
+                .iter()
+                .filter(|h| !blocks.contains_key(*h))
+                .copied()
+                .collect();
 
-            while outstanding > 0 {
-                if budget == 0 {
-                    return Err(PeerError::Unanswered {
-                        what: "the blocks this peer was asked for".to_owned(),
-                    });
+            // One round per request. Every round but the first follows one
+            // that made progress, so a chunk takes at most GETDATA_BATCH.
+            while !missing.is_empty() {
+                // One block per `getdata`, all written at once. Zebra stops
+                // answering a request after about 2 MB of blocks, so a
+                // request naming several near-full blocks gets one and then
+                // silence; each request naming one is answered whole.
+                let mut requests = Vec::new();
+                for hash in &missing {
+                    requests.extend(encode_message(
+                        self.network,
+                        "getdata",
+                        &encode_getdata_blocks(std::slice::from_ref(hash)),
+                    ));
                 }
-                budget -= 1;
+                self.stream.write_all(&requests).await?;
+                let mut budget = missing.len() * 4 + 8;
+                // Not-block messages, capped as `recv_until` caps them, so a
+                // peer cannot keep a round alive with chatter alone.
+                let mut chatter = 0usize;
+                let mut progressed = false;
 
-                let bytes = self.recv_until("block").await?;
-                let Ok(hash) = super::block::block_hash(&bytes) else {
-                    continue;
-                };
-                if !wanted.contains(&hash) {
-                    continue; // unsolicited relay; not ours to use
-                }
-                held += bytes.len();
-                if bytes.len() > MAX_BLOCK_BYTES || held > MAX_BLOCKS_BYTES {
-                    return Err(PeerError::Oversized {
-                        mb: held / 1_000_000,
-                    });
-                }
-                if blocks.insert(hash, bytes).is_none() && chunk.contains(&hash) {
-                    outstanding -= 1;
+                while !missing.is_empty() {
+                    // Once this request has been answered in part, a pause
+                    // means the peer has stopped. Checked before every
+                    // message, not only before each block: a node announces
+                    // new blocks and transactions at any time, and one such
+                    // message must not start a full read timeout. Peeking
+                    // consumes nothing, so giving up on the wait cannot
+                    // desynchronise the stream.
+                    if progressed && !self.next_message_within(PARTIAL_ANSWER_QUIET).await {
+                        break;
+                    }
+                    let (header, bytes) = self.recv().await?;
+                    if header.command != "block" {
+                        if header.command == "ping" {
+                            self.send("pong", &bytes).await?;
+                        }
+                        chatter += 1;
+                        if chatter > 256 {
+                            return Err(PeerError::Unanswered {
+                                what: "the blocks this peer was asked for".to_owned(),
+                            });
+                        }
+                        continue;
+                    }
+                    if budget == 0 {
+                        return Err(PeerError::Unanswered {
+                            what: "the blocks this peer was asked for".to_owned(),
+                        });
+                    }
+                    budget -= 1;
+
+                    let Ok(hash) = super::block::block_hash(&bytes) else {
+                        continue;
+                    };
+                    if !wanted.contains(&hash) {
+                        continue; // unsolicited relay; not ours to use
+                    }
+                    held += bytes.len();
+                    if bytes.len() > MAX_BLOCK_BYTES || held > MAX_BLOCKS_BYTES {
+                        return Err(PeerError::Oversized {
+                            mb: held / 1_000_000,
+                        });
+                    }
+                    if blocks.insert(hash, bytes).is_none() {
+                        if let Some(at) = missing.iter().position(|h| *h == hash) {
+                            missing.remove(at);
+                            progressed = true;
+                        }
+                    }
                 }
             }
         }
         Ok(blocks)
+    }
+
+    /// Whether the peer starts another message within `wait`.
+    ///
+    /// True on EOF or a socket error too, so the read that follows reports
+    /// them rather than this treating them as a pause.
+    async fn next_message_within(&mut self, wait: Duration) -> bool {
+        let mut byte = [0u8; 1];
+        timeout(wait, self.stream.peek(&mut byte)).await.is_ok()
     }
 }
 
@@ -499,5 +577,179 @@ mod tests {
         write_compact_size(&mut payload, u64::MAX);
         payload.extend_from_slice(&[0u8; 8]);
         assert!(parse_start_height(&payload).is_none());
+    }
+
+    /// How a fake peer answers `getdata`.
+    #[derive(Clone, Copy)]
+    enum Serve {
+        /// Only the first block each request names, then nothing for the
+        /// rest — measured against Zebra 7.0.0, which stops answering a
+        /// request after about 2 MB of blocks. Near-full blocks around
+        /// mainnet height 106,500 got one block per 16-hash request.
+        FirstOfEach,
+        /// Every request in full, except that each odd-indexed block is
+        /// left out the first time it is asked for. With `inv`, an
+        /// unrelated `inv` follows each request that left one out.
+        OddLeftOutOnce { inv: bool },
+        /// Odd-indexed blocks never, the rest in full.
+        OddNever,
+    }
+
+    /// A peer that handshakes, then answers `getdata` as `serve` says.
+    /// Each request's hashes are recorded, in order.
+    async fn partial_peer(
+        blocks: Vec<Vec<u8>>,
+        serve: Serve,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Vec<[u8; 32]>>>>) {
+        use crate::p2p::wire::{encode_message, encode_version};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let hashes: Vec<[u8; 32]> = blocks
+            .iter()
+            .map(|b| super::super::block::block_hash(b).unwrap())
+            .collect();
+        let odd: HashSet<[u8; 32]> = hashes.iter().skip(1).step_by(2).copied().collect();
+        let by_hash: HashMap<[u8; 32], Vec<u8>> = hashes.into_iter().zip(blocks).collect();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut asked: HashSet<[u8; 32]> = HashSet::new();
+            let mut header = [0u8; 24];
+            while stream.read_exact(&mut header).await.is_ok() {
+                let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+                let mut payload = vec![0u8; len];
+                if stream.read_exact(&mut payload).await.is_err() {
+                    break;
+                }
+                if header[4..11] == *b"version" {
+                    let version = encode_version(170_190, "/Zebra:7.0.0/", 10_000, 1, 0);
+                    let mut out = encode_message(P2pNetwork::Regtest, "version", &version);
+                    out.extend(encode_message(P2pNetwork::Regtest, "verack", &[]));
+                    stream.write_all(&out).await.unwrap();
+                } else if header[4..11] == *b"getdata" {
+                    // One-byte count (tests stay under 253), then 36-byte
+                    // inventory entries: type, hash.
+                    let wanted: Vec<[u8; 32]> = payload[1..]
+                        .chunks_exact(36)
+                        .map(|inv| inv[4..].try_into().unwrap())
+                        .collect();
+                    seen.lock().unwrap().push(wanted.clone());
+                    let mut left_out = false;
+                    for (i, hash) in wanted.iter().enumerate() {
+                        let first_ask = asked.insert(*hash);
+                        let send = match serve {
+                            Serve::FirstOfEach => i == 0,
+                            Serve::OddLeftOutOnce { .. } => !(odd.contains(hash) && first_ask),
+                            Serve::OddNever => !odd.contains(hash),
+                        };
+                        if send {
+                            let msg = encode_message(P2pNetwork::Regtest, "block", &by_hash[hash]);
+                            stream.write_all(&msg).await.unwrap();
+                        } else {
+                            left_out = true;
+                        }
+                    }
+                    if left_out && matches!(serve, Serve::OddLeftOutOnce { inv: true }) {
+                        // An empty inventory: one CompactSize zero.
+                        let msg = encode_message(P2pNetwork::Regtest, "inv", &[0]);
+                        stream.write_all(&msg).await.unwrap();
+                    }
+                }
+            }
+        });
+        (addr, requests)
+    }
+
+    fn distinct_blocks(n: u8) -> (Vec<Vec<u8>>, Vec<[u8; 32]>) {
+        use super::super::block::test_support::{legacy_test_transaction, test_block};
+        let blocks: Vec<Vec<u8>> = (0..n)
+            .map(|tag| test_block(&[legacy_test_transaction(tag)]))
+            .collect();
+        let hashes = blocks
+            .iter()
+            .map(|b| super::super::block::block_hash(b).unwrap())
+            .collect();
+        (blocks, hashes)
+    }
+
+    /// Zebra answers each request on its own but stops one after about
+    /// 2 MB of blocks. Naming one block per request keeps every answer
+    /// whole, so near-full blocks arrive at full speed instead of one per
+    /// quiet window: measured at mainnet 106,528..106,687, 160 blocks
+    /// (118 MB) in 3.9 s this way, against minutes for 16-hash requests.
+    #[tokio::test]
+    async fn each_request_names_one_block_so_a_byte_capped_peer_answers_it_whole() {
+        let (blocks, hashes) = distinct_blocks(20);
+        let (addr, requests) = partial_peer(blocks, Serve::FirstOfEach).await;
+        let mut peer = Peer::connect(&addr, P2pNetwork::Regtest).await.unwrap();
+
+        let got = peer.get_blocks(&hashes).await.expect("every block arrives");
+        assert_eq!(got.len(), 20);
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.iter().all(|r| r.len() == 1),
+            "every getdata names exactly one block: {:?}",
+            requests.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        let asked: Vec<[u8; 32]> = requests.iter().map(|r| r[0]).collect();
+        assert_eq!(asked, hashes, "each block asked for once, in order");
+    }
+
+    /// Zebra has also left blocks out with no `notfound`. Once some of a
+    /// batch has arrived and the peer goes quiet, what is missing is asked
+    /// for again, and only that.
+    #[tokio::test]
+    async fn blocks_left_out_are_re_requested_and_nothing_else() {
+        let (blocks, hashes) = distinct_blocks(16);
+        let (addr, requests) = partial_peer(blocks, Serve::OddLeftOutOnce { inv: false }).await;
+        let mut peer = Peer::connect(&addr, P2pNetwork::Regtest).await.unwrap();
+
+        let got = peer.get_blocks(&hashes).await.expect("every block arrives");
+        assert_eq!(got.len(), 16);
+
+        let requests = requests.lock().unwrap();
+        let again: Vec<[u8; 32]> = requests[16..].iter().flatten().copied().collect();
+        let odd: Vec<[u8; 32]> = hashes.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(again, odd);
+    }
+
+    /// Seen against Zebra on mainnet: the partial answer was followed by an
+    /// unrelated message. The quiet window must cover every message, not
+    /// just the wait for the next block, or that message starts a full
+    /// read timeout and the peer is dropped as dead.
+    #[tokio::test]
+    async fn an_unrelated_message_after_a_partial_answer_does_not_stall_it() {
+        let (blocks, hashes) = distinct_blocks(16);
+        let (addr, _requests) = partial_peer(blocks, Serve::OddLeftOutOnce { inv: true }).await;
+        let mut peer = Peer::connect(&addr, P2pNetwork::Regtest).await.unwrap();
+
+        let got = peer.get_blocks(&hashes).await.expect("every block arrives");
+        assert_eq!(got.len(), 16);
+    }
+
+    /// Re-requesting must not become a loop: a peer that answers part of a
+    /// batch and then nothing ever again still fails, after one full
+    /// read timeout with no progress.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_still_fails() {
+        let (blocks, hashes) = distinct_blocks(16);
+        let (addr, requests) = partial_peer(blocks, Serve::OddNever).await;
+        let mut peer = Peer::connect(&addr, P2pNetwork::Regtest).await.unwrap();
+
+        let err = peer
+            .get_blocks(&hashes)
+            .await
+            .expect_err("the peer went quiet");
+        assert!(matches!(err, PeerError::Silent { .. }), "got {err:?}");
+        let asked: usize = requests.lock().unwrap().iter().map(Vec::len).sum();
+        assert_eq!(
+            asked,
+            16 + 8,
+            "the eight left out asked for once more, then give up"
+        );
     }
 }

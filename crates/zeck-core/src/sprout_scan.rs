@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 
 use argos_wallet_import::keys::{JsOutPoint, SproutJoinSplit};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use zeroize::Zeroize;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -231,6 +232,10 @@ pub struct SproutScanner {
     /// Blocks below this height are walked but not trial-decrypted. See
     /// [`SproutScanner::with_decrypt_from`].
     decrypt_from: Option<u32>,
+    /// A running SHA-256 over every block and every JoinSplit field fed in,
+    /// when enabled. See [`SproutScanner::enable_joinsplit_digest`]. Not
+    /// saved in checkpoints.
+    joinsplit_digest: Option<Sha256>,
 }
 
 // All spend-authorizing fields are owned by `ScanKey` or `PendingNote`,
@@ -272,6 +277,57 @@ impl SproutScanner {
             complete: false,
             history: VecDeque::new(),
             decrypt_from,
+            joinsplit_digest: None,
+        }
+    }
+
+    /// Start a running SHA-256 over every block and JoinSplit this scanner
+    /// is fed, in chain order.
+    ///
+    /// For comparing two scans of the same range field by field (release
+    /// procedure step 4). Each field is written out here, not through the
+    /// pack's encoder, so a pack serialization bug cannot cancel out. Only
+    /// from the start of a walk, since the digest must cover every block. A
+    /// rewind discards it: the digest cannot be rolled back.
+    pub fn enable_joinsplit_digest(&mut self) -> Result<(), &'static str> {
+        if self.cursor().is_some() {
+            return Err("the JoinSplit digest must start before the first block");
+        }
+        self.joinsplit_digest = Some(Sha256::new());
+        Ok(())
+    }
+
+    /// The digest so far, if enabled and not discarded by a rewind.
+    pub fn joinsplit_digest(&self) -> Option<[u8; 32]> {
+        self.joinsplit_digest
+            .as_ref()
+            .map(|hasher| hasher.clone().finalize().into())
+    }
+
+    fn digest_block(&mut self, joinsplits: &[SproutJoinSplit], block_hash: [u8; 32], height: u32) {
+        let Some(hasher) = self.joinsplit_digest.as_mut() else {
+            return;
+        };
+        hasher.update(height.to_le_bytes());
+        hasher.update(block_hash);
+        hasher.update((joinsplits.len() as u64).to_le_bytes());
+        for js in joinsplits {
+            hasher.update(js.txid);
+            hasher.update(js.js_index.to_le_bytes());
+            hasher.update(js.anchor);
+            for nullifier in &js.nullifiers {
+                hasher.update(nullifier);
+            }
+            for commitment in &js.commitments {
+                hasher.update(commitment);
+            }
+            hasher.update(js.ephemeral_key);
+            hasher.update(js.random_seed);
+            hasher.update(js.joinsplit_pubkey);
+            for ciphertext in &js.ciphertexts {
+                hasher.update((ciphertext.len() as u64).to_le_bytes());
+                hasher.update(ciphertext);
+            }
         }
     }
 
@@ -415,6 +471,7 @@ impl SproutScanner {
                 return Err(err);
             }
         }
+        self.digest_block(joinsplits, block_hash, height);
         self.progress.blocks_scanned += 1;
         self.progress.last_height = height;
         // The tip has moved past wherever a previous run ended.
@@ -483,6 +540,9 @@ impl SproutScanner {
     /// Restore all state after a retained ancestor. Validate the whole
     /// suffix first so a corrupt in-memory history cannot partially rewind.
     pub fn rewind_to(&mut self, ancestor_hash: [u8; 32]) -> Result<u32, RewindError> {
+        // A running digest cannot be rolled back; a comparison that needs it
+        // sees `None` rather than a digest of blocks no longer on the chain.
+        self.joinsplit_digest = None;
         let current = self
             .cursor()
             .filter(|cursor| cursor.last_height > 0 && cursor.last_block_hash != [0; 32]);
@@ -648,6 +708,7 @@ impl SproutScanner {
     /// nullifiers were published on the same chain this scan just read, so
     /// offering them would promise funds that cannot move.
     pub fn finish(self) -> Result<SproutScanResult, WitnessError> {
+        let joinsplit_digest = self.joinsplit_digest();
         let mut notes = Vec::with_capacity(self.pending.len());
         let mut spent_notes = 0usize;
 
@@ -679,6 +740,7 @@ impl SproutScanner {
             progress: self.progress,
             decrypt_from_height: self.decrypt_from,
             checkpoint_generation: None,
+            joinsplit_digest,
         })
     }
 }
@@ -701,6 +763,9 @@ pub struct SproutScanResult {
     /// held. Sweep review must bind this generation, never a later object at
     /// the same pathname.
     pub checkpoint_generation: Option<crate::sprout_scan_run::CheckpointGeneration>,
+    /// The running digest of every block and JoinSplit scanned, when the
+    /// scan was asked for one and was not rewound.
+    pub joinsplit_digest: Option<[u8; 32]>,
 }
 
 impl SproutScanResult {
@@ -1485,6 +1550,9 @@ impl SproutScanner {
             complete,
             history,
             decrypt_from,
+            // Never saved: a restored scan has no digest of the blocks
+            // before it.
+            joinsplit_digest: None,
         })
     }
 }
@@ -1504,6 +1572,78 @@ pub fn joinsplits_by_transaction(joinsplits: &[SproutJoinSplit]) -> HashMap<[u8;
 mod tests {
     use super::*;
     use crate::sprout::SproutNotePlaintext;
+
+    fn digest_of(blocks: &[Vec<SproutJoinSplit>]) -> [u8; 32] {
+        use crate::sprout_pack::test_support::block_hash;
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner.enable_joinsplit_digest().unwrap();
+        for (i, joinsplits) in blocks.iter().enumerate() {
+            let height = i as u32 + 1;
+            scanner
+                .scan_block_at(joinsplits, block_hash(height), height)
+                .unwrap();
+        }
+        scanner.joinsplit_digest().expect("enabled")
+    }
+
+    /// Review of #293: the mainnet comparison only saw commitments (through
+    /// the tree root) and nullifiers, txid and js_index (through the spent
+    /// map). The digest must move when any field changes, including the ones
+    /// that only decide whether a note decrypts.
+    #[test]
+    fn the_joinsplit_digest_covers_every_field() {
+        use crate::sprout_pack::test_support::joinsplit;
+        let base = || vec![vec![joinsplit(1), joinsplit(2)], vec![], vec![joinsplit(3)]];
+        let reference = digest_of(&base());
+        assert_eq!(digest_of(&base()), reference, "deterministic");
+
+        type Edit = fn(&mut SproutJoinSplit);
+        let edits: Vec<(&str, Edit)> = vec![
+            ("txid", |js| js.txid[0] ^= 1),
+            ("js_index", |js| js.js_index ^= 1),
+            ("anchor", |js| js.anchor[0] ^= 1),
+            ("nullifier 0", |js| js.nullifiers[0][0] ^= 1),
+            ("nullifier 1", |js| js.nullifiers[1][31] ^= 1),
+            ("commitment 0", |js| js.commitments[0][0] ^= 1),
+            ("commitment 1", |js| js.commitments[1][31] ^= 1),
+            ("ephemeral key", |js| js.ephemeral_key[0] ^= 1),
+            ("random seed", |js| js.random_seed[0] ^= 1),
+            ("joinsplit pubkey", |js| js.joinsplit_pubkey[0] ^= 1),
+            ("ciphertext 0", |js| js.ciphertexts[0][600] ^= 1),
+            ("ciphertext 1", |js| js.ciphertexts[1][0] ^= 1),
+        ];
+        for (field, edit) in edits {
+            // The second JoinSplit of the first block: not only the first
+            // record of the chain is covered.
+            let mut blocks = base();
+            edit(&mut blocks[0][1]);
+            assert_ne!(digest_of(&blocks), reference, "{field} is not covered");
+        }
+
+        // Moving a JoinSplit to the next block changes it too.
+        let mut moved = base();
+        let js = moved[0].pop().unwrap();
+        moved[1].push(js);
+        assert_ne!(
+            digest_of(&moved),
+            reference,
+            "block boundaries are not covered"
+        );
+    }
+
+    #[test]
+    fn the_joinsplit_digest_is_off_unless_enabled_and_only_from_the_start() {
+        use crate::sprout_pack::test_support::{block_hash, joinsplit};
+        let mut scanner = SproutScanner::new(&[[0x11; 32]]);
+        scanner
+            .scan_block_at(&[joinsplit(1)], block_hash(1), 1)
+            .unwrap();
+        assert_eq!(scanner.joinsplit_digest(), None);
+        assert!(
+            scanner.enable_joinsplit_digest().is_err(),
+            "a digest started mid-walk would not cover the blocks before it"
+        );
+    }
 
     #[test]
     fn checkpoint_secret_buffer_owners_zeroize_on_drop() {

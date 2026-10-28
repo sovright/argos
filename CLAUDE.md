@@ -6,6 +6,8 @@ Argos is a Zcash wallet recovery tool for ZecWallet Lite seeds. It has three com
 - `crates/zeck-core` — shared Rust library (derivation, scanning, sweeping); package name `argos-core`
 - `crates/zeck-cli` — command-line interface; package name `argos-cli`, binary name `argos`
 - `gui/` — Tauri v2 desktop app (static HTML/JS frontend + Rust backend); package name `argos-gui`
+- `crates/argos-sprout-pack` — maintainer-only tool that builds and verifies
+  the Sprout pack from a local node; package and binary `argos-sprout-pack`
 - `crates/argos-wallet-import` — read-only legacy wallet file parser
   (zcashd `wallet.dat` via a hand-rolled Berkeley DB 6.2 reader, and
   ZecWallet Lite); package name `argos-wallet-import`
@@ -194,6 +196,32 @@ migrated note read as spendable. Past the last pinned checkpoint the walk is
 tied to a `TipAnchor` from lightwalletd; see `sprout_scan_run`. Its tree is validated against zcashd's own root, and it has
 been driven end to end on regtest: given only a spending key it finds a
 planted note and derives a witness anchoring to the chain's root.
+
+**A Sprout pack can replace most of that walk** (`sprout_pack`,
+`docs/sprout-pack.md`): every block's JoinSplits from height 1 to a fixed
+end height, in 100,000-block chunks, behind a manifest whose SHA-256 is
+pinned per release in `PINNED_PACKS`. `SproutScanOptions::pack` feeds it
+through `consume_page` (so checkpoint pins and cursor continuity apply), and
+the walk continues over p2p from the pack's end hash, so the "do not bound
+it at Canopy" rule is untouched. Two invariants: the scan checkpoint is
+saved only at chunk boundaries after the chunk's hash is confirmed, so a
+corrupt chunk keeps nothing; and a mainnet scan refuses an unpinned pack
+(checked in `SproutPack::open` and again in `feed_pack`). A bad pack cannot
+mark a live note spent (nullifiers are keyed by `a_sk`), but it can hide
+notes (ciphertexts are not bound by the tree root) or omit real spends.
+`PINNED_PACKS` holds one mainnet pack (blocks 1 to 3,500,000), whose
+manifest hash two Zebra nodes in different regions reproduced. Reproduction
+is not enough on its own, since identical builders reproduce identical bugs:
+no release may ship with a pin until the builder is checked independently
+(regtest pack test plus a mainnet pack-vs-p2p equivalence scan). The
+regtest test (`sprout_pack_regtest`, run in CI) passes; the mainnet scan for
+the 3,500,000 pin has not been run yet. No live node returns the Sprout
+tree root any more (Zebra omits it from `z_gettreestate`), so `verify`
+rebuilding it from the chunks is the only root check. `feed_pack` yields after every
+page so aborting a scan (the GUI's release) stops it promptly. The
+pack is built by the maintainer-only `argos-sprout-pack` binary
+(`sprout_pack_build`), which dials only the named nodes
+(`connect_to_listed_except`) and reuses the scan's `PageFetcher` checks.
 
 The Sprout checkpoint is spend-capable: it contains raw spending keys,
 note plaintexts, and witnesses. `save_checkpoint` creates it atomically at
