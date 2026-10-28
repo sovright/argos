@@ -106,8 +106,13 @@ re-reads every chunk and prints the same summary.
      must pass against the regtest Sprout node at the release commit
      (CI's `sprout-node-tests` job runs it on every push);
    - a pack-assisted mainnet scan and a plain p2p scan over the same
-     range must agree on the tree root, the cursor, the full nullifier
-     set, and the notes found for known test keys.
+     range must agree on a running digest of every JoinSplit field in
+     chain order, the tree root, the cursor, the full nullifier set and
+     the notes. `argos-sprout-pack compare --peer <node> --pack <dir>
+     --work-dir <new dir>` runs both scans, stopped at the pack's end
+     height, and exits non-zero on any difference. The digest is what
+     covers the ciphertexts, ephemeral key, `random_seed` and JoinSplit
+     pubkey, which otherwise show only as found notes.
 5. Add the printed entry to `PINNED_PACKS` in
    `crates/zeck-core/src/sprout_pack.rs` and ship it in the release.
 6. Upload `manifest.bin` and every chunk as release assets. Each chunk is
@@ -116,9 +121,8 @@ re-reads every chunk and prints the same summary.
 
 ## Not done yet
 
-- **No equivalence tool.** Step 4's mainnet comparison has to be done by
-  hand today; a command that runs both scans and diffs the results is not
-  written yet.
+- **`compare` does not resume.** Both scans start from an empty
+  directory, so an interrupted p2p scan starts again from height 1.
 
 - **The first mainnet pin has passed half of step 4.** The pack for blocks 1
   to 3,500,000 (manifest
@@ -129,10 +133,11 @@ re-reads every chunk and prints the same summary.
   field-level encoding a tree root cannot see: the planted note is found
   from the pack, so `random_seed`, nullifiers, the JoinSplit pubkey, the
   ciphertext, the ephemeral key, `js_index` and txid byte order all
-  round-trip. The pack-versus-p2p mainnet comparison is still to run. It
-  adds what regtest cannot: the mainnet walk itself, Zebra-specific
-  behaviour, and spent-nullifier equivalence. It must pass before a
-  release ships with this pin.
+  round-trip. The pack-versus-p2p mainnet comparison
+  (`argos-sprout-pack compare`) is still to run. It adds what regtest
+  cannot: every mainnet JoinSplit field compared through the digest, the
+  mainnet walk itself, Zebra-specific behaviour, and spent-nullifier
+  equivalence. It must pass before a release ships with this pin.
 - **No in-app download.** Users download the release assets themselves.
   Fetching them from the app needs an HTTP client dependency, which is a
   separate dependency-review decision.

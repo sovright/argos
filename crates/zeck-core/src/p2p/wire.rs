@@ -751,9 +751,53 @@ pub fn checkpoint_at(network: P2pNetwork, height: u32) -> Option<[u8; 32]> {
     Some(bytes)
 }
 
+/// The network's genesis block hash, in wire order.
+///
+/// Unlike [`checkpoint_at`] this covers every network: a genesis block is
+/// fixed by the network's parameters, so even a rebuilt regtest chain starts
+/// from it. A fresh walk checks it on its first page, which anchors the walk
+/// at block 0 rather than at the first pinned checkpoint.
+pub fn genesis_hash(network: P2pNetwork) -> [u8; 32] {
+    // As zcashd's chainparams.cpp asserts them, in display order.
+    let display = match network {
+        P2pNetwork::Mainnet => "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08",
+        P2pNetwork::Testnet => "05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38",
+        P2pNetwork::Regtest => "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327",
+    };
+    let mut bytes = [0u8; 32];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&display[i * 2..i * 2 + 2], 16).expect("a hex constant");
+    }
+    bytes.reverse();
+    bytes
+}
+
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
+
+    /// Mainnet as our Zebra 7.0.0 served it on 2026-10-28; all three as
+    /// zcashd's `chainparams.cpp` asserts them.
+    #[test]
+    fn genesis_hashes_are_the_networks() {
+        let display = |network| {
+            let mut hash = genesis_hash(network);
+            hash.reverse();
+            hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        assert_eq!(
+            display(P2pNetwork::Mainnet),
+            "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08"
+        );
+        assert_eq!(
+            display(P2pNetwork::Testnet),
+            "05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38"
+        );
+        assert_eq!(
+            display(P2pNetwork::Regtest),
+            "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327"
+        );
+    }
 
     #[test]
     fn checkpoints_are_mainnet_only() {
